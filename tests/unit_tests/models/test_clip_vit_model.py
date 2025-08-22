@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.vision.clip_vit_model import CLIPViTModel
+from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -54,3 +54,22 @@ class TestCLIPViTModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "vision_model,pixel_shuffle,tile_tags,expected",
+    [
+        ("clip", False, False, 1024),
+        ("internvit300M", False, False, 1024),
+        ("clip", True, False, 256),
+        ("internvit300M", True, True, 262),
+    ],
+)
+def test_get_num_image_embeddings(vision_model, pixel_shuffle, tile_tags, expected):
+    assert (
+        get_num_image_embeddings(
+            448, 448, 14, vision_model, True, 1, pixel_shuffle, tile_tags, 0, "nemotron5"
+        )
+        == expected
+    )

@@ -173,7 +173,7 @@ class BertModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, bert_model_input, attention_mask,
-                tokentype_ids=None, lm_labels=None):
+                tokentype_ids=None, lm_labels=None, inference_context=None):
 
         extended_attention_mask = bert_extended_attention_mask(attention_mask)
         input_ids = bert_model_input

@@ -21,6 +21,10 @@ DEFAULT_CONVERSION_DICT = {
     'decoder.layers.mlp.linear_fc1.bias': TRTLLMLayers.mlp_fc_bias,
     'decoder.layers.mlp.linear_fc2.weight': TRTLLMLayers.mlp_projection_weight,
     'decoder.layers.mlp.linear_fc2.bias': TRTLLMLayers.mlp_projection_bias,
+    # EXPERTS
+    'decoder.layers.mlp.experts.experts.linear_fc1.weight': TRTLLMLayers.mlp_fc_weight_mixture_of_experts,
+    'decoder.layers.mlp.experts.experts.linear_fc2.weight': TRTLLMLayers.mlp_projection_weight_mixture_of_experts,
+    'decoder.layers.mlp.router.weight': TRTLLMLayers.mlp_router_weight,
     # FINAL LAYER NORM
     'decoder.final_layernorm.weight': TRTLLMLayers.final_layernorm_weight,
     'decoder.final_layernorm.bias': TRTLLMLayers.final_layernorm_bias,
@@ -33,4 +37,14 @@ DEFAULT_CONVERSION_DICT = {
     # MLP
     'decoder.layers.mlp.linear_fc1.layer_norm_weight': TRTLLMLayers.post_layernorm_weight,
     'decoder.layers.mlp.linear_fc1.layer_norm_bias': TRTLLMLayers.post_layernorm_bias,
+}
+
+NEMOTRON_NAS_CONVERSION_DICT = {
+    # Deci's (nemotron-nas) replace_with_linear Attention
+    'decoder.layers.self_attention.weight': TRTLLMLayers.attention_linear_weight,
+    # Deci's (nemotron-nas) replace_with_linear MLP
+    'decoder.layers.mlp.weight': TRTLLMLayers.ffn_linear_weight,
+    # Deci's (nemotron-nas) MLP
+    'decoder.layers.mlp.linear_fc1.weight': TRTLLMLayers.ffn_fc_weight,
+    'decoder.layers.mlp.linear_fc2.weight': TRTLLMLayers.ffn_projection_weight,
 }

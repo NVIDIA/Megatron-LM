@@ -26,7 +26,7 @@ from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True, vp_stage=None):
     """Build the model."""
 
     print_rank_0('building BERT model ...')
@@ -62,7 +62,8 @@ def model_provider(pre_process=True, post_process=True):
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             parallel_output=True,
             pre_process=pre_process,
-            post_process=post_process)
+            post_process=post_process,
+            vp_stage=vp_stage)
 
     return model
 
@@ -154,7 +155,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path)
         ],
-        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         path_to_cache=args.data_cache_path,
         tokenizer=tokenizer,
@@ -166,6 +166,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masking_use_longer_ngrams=False,
         masking_use_geometric_distribution=False,
         classification_head=args.bert_binary_head,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
     )
 
     print_rank_0('> building train, validation, and test datasets '

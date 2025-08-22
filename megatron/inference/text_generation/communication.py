@@ -17,7 +17,7 @@ def recv_from_prev_pipeline_rank_(recv_buffer=None):
         assert recv_buffer is not None
         recv_prev_op = torch.distributed.P2POp(
             torch.distributed.irecv, recv_buffer,
-            mpu.get_pipeline_model_parallel_prev_rank())
+            mpu.get_pipeline_model_parallel_prev_rank(), group=parallel_state.get_pipeline_model_parallel_group())
         reqs = torch.distributed.batch_isend_irecv([recv_prev_op])
         for req in reqs:
             req.wait()
@@ -31,7 +31,7 @@ def send_to_next_pipeline_rank(tensor=None):
         assert tensor is not None
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor,
-            mpu.get_pipeline_model_parallel_next_rank())
+            mpu.get_pipeline_model_parallel_next_rank(), group=parallel_state.get_pipeline_model_parallel_group())
         reqs = torch.distributed.batch_isend_irecv([send_next_op])
         for req in reqs:
             req.wait()
@@ -85,12 +85,12 @@ def _send_and_recv_from_last_to_first_pipeline_stage(tensor=None):
         if is_first_stage:
             recv_prev_op = torch.distributed.P2POp(
                 torch.distributed.irecv, tensor,
-                mpu.get_pipeline_model_parallel_last_rank())
+                mpu.get_pipeline_model_parallel_last_rank(), group=parallel_state.get_pipeline_model_parallel_group())
             reqs = torch.distributed.batch_isend_irecv([recv_prev_op])
         elif is_last_stage:
             send_next_op = torch.distributed.P2POp(
                 torch.distributed.isend, tensor,
-                mpu.get_pipeline_model_parallel_first_rank())
+                mpu.get_pipeline_model_parallel_first_rank(), group=parallel_state.get_pipeline_model_parallel_group())
             reqs = torch.distributed.batch_isend_irecv([send_next_op])
 
         for req in reqs:

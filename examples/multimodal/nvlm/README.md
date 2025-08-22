@@ -5,6 +5,13 @@ Please refer to the [NVLM paper](https://arxiv.org/pdf/2409.11402) for details.
 
 *NOTE: VLMs in Megatron are under active development and are expected to change.*
 
+# Checkpoints
+
+NVLM 1.0 model weights are publicly available in HuggingFace and Megatron format.
+
+- NVLM-1.0-D 72B [HuggingFace version](https://huggingface.co/nvidia/NVLM-D-72B)
+- NVLM-1.0-D 72B [Megatron-Core version](https://huggingface.co/nvidia/NVLM-D-72B-mcore) 
+
 # Setup
 
 ## Docker image
@@ -32,7 +39,7 @@ NVLM 1.0 34B starts from [NousResearch/Nous-Hermes-2-Yi-34B](https://huggingface
 Please download it and run the following command to convert it to Megatron format.
 ```
 python tools/checkpoint/convert.py --bf16 --model-type GPT --loader llama_mistral --saver mcore --target-tensor-parallel-size 8 --checkpoint-type hf \
-    --load-dir <hf model directory> --save-dir <output dir> --tokenizer-model <hf model directory> \
+    --load-dir <hf model directory> --save-dir <output dir> --tokenizer-model <hf model name/directory> \
     --saver-transformer-impl transformer_engine --model-size yi-34B --make-vocab-size-divisible-by 1
 ```
 
@@ -42,7 +49,7 @@ NVLM 1.0 72B starts from [Qwen/Qwen2-72B-Instruct](https://huggingface.co/Qwen/Q
 Please download it and run the following command to convert it to Megatron format.
 ```
 python tools/checkpoint/convert.py --bf16 --model-type GPT --loader llama_mistral --saver mcore --target-tensor-parallel-size 8 --checkpoint-type hf \
-    --load-dir <hf model directory> --save-dir <output directory> --tokenizer-model <hf model directory> \
+    --load-dir <hf model directory> --save-dir <output directory> --tokenizer-model <hf model name/directory> \
     --saver-transformer-impl transformer_engine --model-size qwen2.5-72Bf
 ```
 

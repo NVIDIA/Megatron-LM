@@ -110,7 +110,6 @@ def get_gpt_chunk_datasets(config):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path)
         ],
-        renormalize_blend_weights=args.renormalize_blend_weights,
         split=config.retro_gpt_split,
         split_preprocessing=config.retro_gpt_split,
         path_to_cache=config.retro_gpt_data_cache_path,
@@ -119,6 +118,7 @@ def get_gpt_chunk_datasets(config):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
     )
 
     # GPT datasets.

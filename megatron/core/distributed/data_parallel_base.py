@@ -70,7 +70,7 @@ class _BaseDataParallel(MegatronModule):
         """
         pass
 
-    def state_dict(self, prefix='', keep_vars=False):
+    def state_dict(self, prefix='', keep_vars=False, destination=None):
         """
         Returns a dictionary containing references to the whole state of the
         wrapped module.
@@ -79,7 +79,7 @@ class _BaseDataParallel(MegatronModule):
         Keys are corresponding parameter and buffer names. Parameters and buffers
         set to None are not included.
         """
-        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
+        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars, destination=destination)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """

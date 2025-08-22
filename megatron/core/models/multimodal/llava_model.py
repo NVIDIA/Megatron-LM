@@ -6,36 +6,43 @@ from typing import List, Optional
 
 import torch
 
-from megatron.core import InferenceParams, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.mamba import MambaModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group, get_context_parallel_world_size
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_batch_on_this_cp_rank, log_single_rank
+from megatron.core.utils import deprecate_inference_params, log_single_rank
 
 try:
     import transformer_engine  # pylint: disable=unused-import
-    from transformer_engine.pytorch.distributed import gather_along_first_dim
 
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from megatron.core.utils import is_te_min_version
 
     HAVE_TE = True
+    try:
+        import transformer_engine_torch as tex
+
+        HAVE_TEX = True
+    except:
+        HAVE_TEX = False
 except:
     HAVE_TE = False
-    if get_context_parallel_world_size() > 1:
-        raise RuntimeError("ContextParallelism requires TransformerEngine support, but not found.")
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
 # Image token index can be tokenizer dependent so the default value does not work in all cases.
 DEFAULT_IMAGE_TOKEN_INDEX = -200
 IMAGE_TOKEN = "<image>"
+VIDEO_TOKEN = "<video>"
 
 
 # Note: This is under development and may be missing features.
@@ -57,6 +64,7 @@ class LLaVAModel(MegatronModule):
             missing when loading a checkpoint. Default False.
         parallel_output (bool): Keep outputs split across tensor parallel ranks.
             This is typically True for training and False for inference.
+        share_embeddings_and_output_weights (bool): Input embedding and output layer share weights.
         language_position_embedding_type (str): Language model position embedding type.
         language_rotary_percent (float): RoPE percent. Defaults to 1.0.
         pre_process (bool): Include embedding layer in the decoder (used with pipeline parallel).
@@ -70,9 +78,12 @@ class LLaVAModel(MegatronModule):
         patch_dim (int): The size of each image patch side.
         language_rotary_base (int): RoPE base.
         language_rope_scaling (bool): Toggle RoPE scaling.
+        language_rope_scaling_factor (float): RoPE scaling factor. Defaults to 8.
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         tile_tags (list): Optional tile tags.
+        model_comm_pgs (ModelCommProcessGroups): Model communication process groups.
+        vp_stage (int): Virtual pipeline stage.
     """
 
     def __init__(
@@ -89,6 +100,7 @@ class LLaVAModel(MegatronModule):
         vision_projection_type: str = "mlp",
         allow_missing_vision_projection_checkpoint: bool = False,
         parallel_output: bool = True,
+        share_embeddings_and_output_weights: bool = False,
         language_position_embedding_type: str = 'learned_absolute',
         language_rotary_percent: float = 1.0,
         pre_process: bool = True,
@@ -100,9 +112,18 @@ class LLaVAModel(MegatronModule):
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
+        language_rope_scaling_factor: float = 8.0,
+        hybrid_attention_ratio: float = 1.0,
+        hybrid_mlp_ratio: float = 1.0,
+        hybrid_override_pattern: str = None,
+        fp16_lm_cross_entropy: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        max_num_tiles: int = 0,
+        tokenizer_type: str = "",
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -119,74 +140,191 @@ class LLaVAModel(MegatronModule):
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
+        self.vp_stage = vp_stage
 
         self.encoder_hidden_state = None
         self.vision_model = None
         self.vision_projection = None
         self.language_model = None
 
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+        self.model_comm_pgs = model_comm_pgs
+
+        language_model_type = getattr(language_transformer_config, "language_model_type", "")
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
-            assert (
-                language_transformer_layer_spec.submodules.self_attention.submodules.core_attention
-                == TEDotProductAttention
-                and HAVE_TE
-            ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
+            if not language_model_type.startswith('nemotron5-hybrid'):
+                attn_module = language_transformer_layer_spec.submodules.self_attention
+                assert (
+                    attn_module.submodules.core_attention == TEDotProductAttention and HAVE_TE
+                ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
+                self.cp_group = self.model_comm_pgs.cp
+                assert (
+                    self.cp_group.size() == self.context_parallel_lm
+                ), "CP Group size should match the Language Model CP size"
                 assert is_te_min_version(
                     "1.10.0"
                 ), "Context Parallelism in LLaVA requires TE v1.10 or higher"
+            else:
+                self.cp_group = None
         self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
 
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
-        self.share_embeddings_and_output_weights = False
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+
         if self.add_decoder:
-            self.language_model = GPTModel(
-                config=language_transformer_config,
-                transformer_layer_spec=language_transformer_layer_spec,
-                vocab_size=language_vocab_size,
-                max_sequence_length=language_max_sequence_length,
-                parallel_output=parallel_output,
-                position_embedding_type=language_position_embedding_type,
-                rotary_percent=language_rotary_percent,
-                pre_process=self.pre_process,
-                post_process=self.post_process,
-                rotary_base=language_rotary_base,
-                rope_scaling=language_rope_scaling,
-                scatter_embedding_sequence_parallel=False,
-            )
-            self.share_embeddings_and_output_weights = (
-                self.language_model.share_embeddings_and_output_weights
-            )
+            if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.language_model = build_hf_model(
+                    language_transformer_config, language_transformer_config.language_model_type
+                )
+                self.language_model = build_hf_model(language_transformer_config)
+            elif language_model_type.startswith('nemotron5-hybrid'):
+                self.language_model = MambaModel(
+                    config=language_transformer_config,
+                    mamba_stack_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    pre_process=self.pre_process,
+                    hybrid_attention_ratio=hybrid_attention_ratio,
+                    hybrid_mlp_ratio=hybrid_mlp_ratio,
+                    hybrid_override_pattern=hybrid_override_pattern,
+                    post_process=self.post_process,
+                    rotary_percent=language_rotary_percent,
+                    rotary_base=language_rotary_base,
+                    fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+                    scatter_embedding_sequence_parallel=False,
+                    model_comm_pgs=self.model_comm_pgs,
+                )
+            else:
+                self.language_model = GPTModel(
+                    config=language_transformer_config,
+                    transformer_layer_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    rotary_percent=language_rotary_percent,
+                    pre_process=self.pre_process,
+                    post_process=self.post_process,
+                    rotary_base=language_rotary_base,
+                    rope_scaling=language_rope_scaling,
+                    rope_scaling_factor=language_rope_scaling_factor,
+                    scatter_embedding_sequence_parallel=False,
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                    model_comm_pgs=self.model_comm_pgs,
+                    vp_stage=self.vp_stage,
+                )
+
             self._language_max_sequence_length = language_max_sequence_length
             self._language_is_pipeline_parallel = (
                 language_transformer_config.pipeline_model_parallel_size > 1
+            )
+
+            # Newer Transformer Engine versions add _extra_state keys in state_dict when using FP8.
+            # Older models may not have _extra_state and can be ignored.
+            self.language_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
             )
 
         class_token_len = 1
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
             add_class_token = True
-            if vision_transformer_config.vision_model_type == "siglip":
-                class_token_len = 0
-                add_class_token = False
-                error_msg = (
-                    "Siglip does not support vision class token, "
-                    "set disable-vision-class-token to False."
+            if vision_transformer_config.vision_model_type.startswith(
+                ("clip", "siglip", "internvit")
+            ):
+                if vision_transformer_config.vision_model_type == "siglip":
+                    class_token_len = 0
+                    add_class_token = False
+                    error_msg = (
+                        "Siglip does not support vision class token, "
+                        "set disable-vision-class-token to False."
+                    )
+                    assert not self._drop_vision_class_token, error_msg
+                self.vision_model = CLIPViTModel(
+                    vision_transformer_config,
+                    vision_transformer_layer_spec,
+                    img_h=img_h,
+                    img_w=img_w,
+                    class_token_len=class_token_len,
+                    patch_dim=patch_dim,
+                    model_subtype=vision_transformer_config.vision_model_type,
+                    add_class_token=add_class_token,
+                    model_comm_pgs=self.model_comm_pgs,
+                    vp_stage=self.vp_stage,
                 )
-                assert not self._drop_vision_class_token, error_msg
-            self.vision_model = CLIPViTModel(
-                vision_transformer_config,
-                vision_transformer_layer_spec,
-                img_h=img_h,
-                img_w=img_w,
-                class_token_len=class_token_len,
-                patch_dim=patch_dim,
-                model_subtype=vision_transformer_config.vision_model_type,
-                add_class_token=add_class_token,
+            elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
+                # TODO: should refactor into model code itself?
+                class_token_len = 0
+                max_img_h = 0
+                max_img_w = 0
+                embedder_bias = False
+                ln_post_impl = None
+                use_mask_token = False
+
+                if vision_transformer_config.vision_model_type == "radio":
+                    class_token_len = 8
+                    max_img_h = 2048
+                    max_img_w = 2048
+                    embedder_bias = False
+                    ln_post_impl = None
+                    use_mask_token = False
+                elif vision_transformer_config.vision_model_type == "radio-g":
+                    class_token_len = 5
+                    max_img_h = 1792
+                    max_img_w = 1792
+                    embedder_bias = True
+                    from megatron.core.extensions.transformer_engine import TENorm
+
+                    ln_post_impl = TENorm
+                    use_mask_token = True
+                elif vision_transformer_config.vision_model_type == "cradio-g":
+                    class_token_len = 8
+                    max_img_h = 2048
+                    max_img_w = 2048
+                    embedder_bias = False
+                    ln_post_impl = None
+                    use_mask_token = False
+                self.vision_model = RADIOViTModel(
+                    vision_transformer_config,
+                    vision_transformer_layer_spec,
+                    ln_post_impl=ln_post_impl,
+                    img_h=img_h,
+                    img_w=img_w,
+                    max_img_h=max_img_h,
+                    max_img_w=max_img_w,
+                    class_token_len=class_token_len,
+                    patch_dim=patch_dim,
+                    add_class_token=add_class_token,
+                    embedder_bias=embedder_bias,
+                    use_mask_token=use_mask_token,
+                    model_comm_pgs=self.model_comm_pgs,
+                    vp_stage=self.vp_stage,
+                )
+            elif vision_transformer_config.vision_model_type.startswith("hf://"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.vision_model = build_hf_model(
+                    vision_transformer_config, vision_transformer_config.vision_model_type
+                )
+            else:
+                raise ValueError(
+                    "Vision model "
+                    f"{vision_transformer_config.vision_model_type} is not "
+                    "supported."
+                )
+
+            self.vision_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
             )
 
             vision_projection_input_size = vision_transformer_config.hidden_size
@@ -198,6 +336,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_layer_spec,
                 vision_projection_type,
                 vision_projection_input_size,
+                tp_group=self.model_comm_pgs.tp,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
@@ -212,7 +351,11 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
-        self._img_seq_len = get_num_image_embeddings(
+            self.vision_projection.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
+
+        self.img_seq_len = get_num_image_embeddings(
             img_h,
             img_w,
             patch_dim,
@@ -221,11 +364,14 @@ class LLaVAModel(MegatronModule):
             class_token_len,
             pixel_shuffle,
             tile_tags is not None,  # Tile tags enabled/disabled.
+            max_num_tiles,
+            tokenizer_type,
         )
 
         self.image_token_index = image_token_index
         self._pixel_shuffle = pixel_shuffle
         self._tile_tags = tile_tags
+        self._max_num_tiles = max_num_tiles
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -283,10 +429,11 @@ class LLaVAModel(MegatronModule):
         loss_mask,
         labels,
         use_inference_kv_cache,
-        inference_params,
+        inference_context,
         image_token_index,
         num_image_tiles,
-        image_token_mask=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Preprocess input data before input to language model.
 
@@ -323,6 +470,9 @@ class LLaVAModel(MegatronModule):
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
             final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         assert self.add_decoder, "input text preprocessing is only needed for the language model"
 
         # No pre- or postprocessing needed.
@@ -334,11 +484,8 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             return language_embeddings, loss_mask, labels
 
-        img_seq_len = self._img_seq_len
+        img_seq_len = self.img_seq_len
         batch_size, text_seq_len = input_ids.shape
-        # input_ids seq len is expected to be sharded by CP size
-        if self.context_parallel_lm:
-            text_seq_len *= self.context_parallel_lm
 
         has_labels = labels is not None
         if has_labels:
@@ -348,12 +495,7 @@ class LLaVAModel(MegatronModule):
 
         # Create indices for new text and label positions.
         with torch.no_grad():
-            if image_token_mask is None:
-                assert (
-                    self.context_parallel_lm <= 1
-                ), "image_token_mask cannot be inferred from input_ids if using \
-                        Context Parallelism. Please provide in forward_step"
-                image_token_mask = input_ids == image_token_index
+            image_token_mask = input_ids == image_token_index
             num_images_per_sample = torch.sum(image_token_mask, dim=-1)
 
             # Number of tiles per sample.
@@ -371,7 +513,7 @@ class LLaVAModel(MegatronModule):
             if (
                 self._language_is_pipeline_parallel
                 and max_seq_len < self._language_max_sequence_length
-                and inference_params is None
+                and inference_context is None
             ):
                 max_seq_len = self._language_max_sequence_length
 
@@ -387,8 +529,10 @@ class LLaVAModel(MegatronModule):
             new_position_ids = torch.cumsum((image_token_mask_lens + 1), dim=-1) - 1
             text_position_ids = new_position_ids[batch_indices, non_image_indices]
 
+            label_batch_indices = None  # dummy value to pass formatting
             # Labels are shifted to left by one.
             # So, shift text position ids and non-image indices to left by one.
+            label_batch_indices = None
             if has_labels:
                 label_text_position_ids = text_position_ids - 1
                 valid_label_text_position_ids = label_text_position_ids >= 0
@@ -433,9 +577,17 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = (
-                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
-            )
+            # NOTE: FSDP can hang with text-only samples so we use a workaround to run a dummy image
+            # through the vision model and then zero-out the impact of the output here.
+            if num_image_tiles.shape[0] == 0 and image_embeddings.shape[0] > 0:
+                assert images_mask.sum() == 0 and getattr(
+                    self.vision_model, "_is_fsdp_managed_module", False
+                ), "expected FSDP and dummy image"
+                final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
+            else:
+                final_embedding[images_mask] = (
+                    image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+                )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -488,7 +640,7 @@ class LLaVAModel(MegatronModule):
             # Truncate if exceeding the language model's max sequence length.
             if final_embedding.shape[1] > self._language_max_sequence_length:
                 final_embedding = final_embedding[:, : self._language_max_sequence_length]
-            # Transpose to [s,b,h] if not using CP because CP Sharding expects seq in dim=1
+            # Transpose to [s,b,h] only if not using CP because CP Sharding expects seq in dim=1
             if self.context_parallel_lm == 1:
                 final_embedding = final_embedding.transpose(1, 0).contiguous()
 
@@ -507,18 +659,12 @@ class LLaVAModel(MegatronModule):
         """Processes the input data for model parallelism support.
 
         When using sequence parallelism (SP) or context parallelism (CP), the sequence is sharded
-        across different GPUs. This function helps ensure that the sharding is done correctly by
-        1. Calculates `padding_factor` which determines based on how many chunks we expect to shard
-           the sequence
-        2. Calculates and pads the inputs to necessary length to ensure equal sized chunks
-        3. Creates/Modifies PackedSeqParams which helps mask padded tokens during calculations
-        4. Performs any layout changes if necessary
-        5. Distributes the sequence across GPUs for SP and CP
+        across different GPUs. This function performs the sharding and distributes the sequence
+        across GPUs for SP and CP
 
         Context Parallelism is a feature that helps improve memory efficiency for
         long sequence training by distributing sequence across CP ranks.
         It requires token length to be divisible by (CP size *2) to ensure proper load balance.
-        Please refer to `get_batch_on_this_cp_rank` function for more details.
 
         Sequence Parallelism is a feature that helps improve memory efficiency for
         long sequence training by distributing sequence across TP ranks.
@@ -531,141 +677,68 @@ class LLaVAModel(MegatronModule):
             packed_seq_params (PackedSeqParams): Dict with padded token information.
 
         """
-        # combined_embeddings - `s,b,h` if not using CP, `b,s,h` if using CP
-        batch_size = (
-            combined_embeddings.shape[0]
-            if self.context_parallel_lm > 1
-            else combined_embeddings.shape[1]
-        )
-        seq_dim = 1 if self.context_parallel_lm > 1 else 0
 
-        padding_mask_type = 'padding' in str(
-            self.language_model.transformer_layer_spec.submodules.self_attention.params.get(
-                'attn_mask_type', ''
-            )
-        )
-        if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
-            assert (
-                combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
-            ) or padding_mask_type, f"TP Comm overlap either requires Vision+Text token length \
-             == language_max_sequence_length or mask type to be set to padding/padding_causal"
+        # No pre or post processing needed with PP middle chunks.
+        if not self.pre_process and not self.post_process:
+            return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
 
-        if padding_mask_type:
-            # Calculate the padded sequence length needed to support SP and CP
-            # SP and CP are used to distributed the sequence across GPUs to improve
-            # memory efficiency and enable very long context training.
-            # To distribute workload equally, we need to ensure that the sequence is
-            # divisible by the appropriate padding factor calculated below.
-            padding_factor = None
-            padded_seq_len = None
-            mp_padding_needed = 0
+        shard_factor = seq_dim = None
+        if self.pre_process:
             if self.context_parallel_lm > 1 and self.sequence_parallel_lm:
-                padding_factor = self.tensor_model_parallel_size_lm * self.context_parallel_lm * 2
+                shard_factor = self.tensor_model_parallel_size_lm * self.context_parallel_lm * 2
+                seq_dim = 1
             elif self.context_parallel_lm > 1:
-                padding_factor = self.context_parallel_lm * 2
+                shard_factor = self.context_parallel_lm * 2
+                seq_dim = 1
             elif self.sequence_parallel_lm:
-                padding_factor = self.tensor_model_parallel_size_lm
-
-            padded_seq_len = int(
-                (combined_embeddings.shape[seq_dim] + (padding_factor - 1))
-                // padding_factor
-                * padding_factor
-            )
+                shard_factor = self.tensor_model_parallel_size_lm
+                seq_dim = 0
 
             assert (
-                padded_seq_len <= self._language_max_sequence_length
-            ), f"Sequence length after padding {padded_seq_len} for SP/CP has exceeded \
-                language_max_sequence_length. Ensure language_max_sequence_length is \
-                divisible by SP/CP factor: {padding_factor}"
-
+                combined_embeddings.shape[seq_dim] % shard_factor == 0
+            ), f"Sequence length should be divisible by {shard_factor} for \
+                Sequence/Context parallelism"
             if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
-                # TP Comm overlap initializes the user buffer shape used for communication
-                # at the beginning of training run and the same shape is expected to be
-                # used throughout the training.
-                # Pad to language_max_sequence_length to use TP Comm overlap.
                 assert (
-                    self._language_max_sequence_length % padding_factor == 0
-                ), f"TP Comm overlap uses language_max_sequence_length \
-                    which needs to be divisible by SP/CP factor {padding_factor}"
-                padded_seq_len = self._language_max_sequence_length
-
-            assert (
-                packed_seq_params is not None
-            ), "Please provide PackedSeqParams dict when using SP or CP with padding"
-            valid_seqlens = packed_seq_params.cu_seqlens_q[1:] - packed_seq_params.cu_seqlens_q[:-1]
-            valid_seq_len = max(valid_seqlens)
-            assert (
-                padded_seq_len >= valid_seq_len
-            ), f"Padded Seq Len calculated for model parallelism: {padded_seq_len} \
-                    is shorter than expected valid token len {valid_seq_len} provided."
-
-            mp_padding_needed = padded_seq_len - combined_embeddings.shape[seq_dim]
-            if mp_padding_needed > 0:
-                new_labels = torch.nn.functional.pad(
-                    new_labels, (0, mp_padding_needed), value=IGNORE_INDEX
-                )
-                new_loss_mask = torch.nn.functional.pad(new_loss_mask, (0, mp_padding_needed))
-                if self.context_parallel_lm > 1:
-                    combined_embeddings = torch.nn.functional.pad(
-                        combined_embeddings, (0, 0, 0, mp_padding_needed)
-                    )
-                else:
-                    combined_embeddings = torch.nn.functional.pad(
-                        combined_embeddings, (0, 0, 0, 0, 0, mp_padding_needed)
-                    )
-
-                # Update PackedSeqParams if padding needed beyond user provided PackedSeqParams
-                packed_seq_params.max_seqlen_q = padded_seq_len
-                packed_seq_params.max_seqlen_kv = padded_seq_len
-                cu_seqlens_padded = None
-                # We need cu_seqlens_q_padded/cu_seqlens_kv_padded when doing
-                # CP+Padding to support accurate Attention with THD format.
-                if self.context_parallel_lm > 1:
-                    cu_seqlens_padded = torch.arange(
-                        0,
-                        (batch_size + 1) * (padded_seq_len),
-                        step=(padded_seq_len),
-                        dtype=torch.int32,
-                        device=combined_embeddings.device,
-                    )
-                    packed_seq_params.cu_seqlens_q_padded = cu_seqlens_padded
-                    packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_padded
-                    packed_seq_params.qkv_format = 'thd'
-                else:
-                    packed_seq_params.qkv_format = 'sbhd'
+                    combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
+                ), f"TP Comm overlap either requires Vision+Text token length \
+                == language_max_sequence_length"
 
         if self.context_parallel_lm > 1:
+            batch = dict()
+            if self.pre_process:
+                batch["combined_embeddings"] = combined_embeddings
+            if self.post_process:
+                batch["new_labels"] = new_labels
+                batch["new_loss_mask"] = new_loss_mask
             # Distribute sequence across CP ranks
-            batch = get_batch_on_this_cp_rank(
-                {
-                    "combined_embeddings": combined_embeddings,
-                    "new_labels": new_labels,
-                    "new_loss_mask": new_loss_mask,
-                }
-            )
+            if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
+                from megatron.training.utils import get_batch_on_this_cp_rank
 
-            combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]
-            new_labels = batch["new_labels"]
-            new_loss_mask = batch["new_loss_mask"]
-
-            if getattr(packed_seq_params, 'qkv_format', None) == 'thd':
-                # If PackedSeqParams requires THD format,
-                # reshape embedding from [B,S,H] to [T,1,H] where T=B*S
-                combined_embeddings = (
-                    combined_embeddings.contiguous()
-                    .view(combined_embeddings.shape[0] * combined_embeddings.shape[1], -1)
-                    .unsqueeze(1)
-                )
-                new_labels = new_labels.view(new_labels.shape[0] * new_labels.shape[1]).unsqueeze(0)
-                new_loss_mask = new_loss_mask.view(
-                    new_loss_mask.shape[0] * new_loss_mask.shape[1]
-                ).unsqueeze(0)
+                batch = get_batch_on_this_cp_rank(batch)
             else:
+                assert HAVE_TEX and is_te_min_version(
+                    "1.10.0"
+                ), "Please update Transformer Engine to >= 1.10 to use \
+                    Context Parallel with THD format data"
+                cp_size = self.cp_group.size()
+                cp_rank = self.cp_group.rank()
+                for key, data in batch.items():
+                    index = tex.thd_get_partitioned_indices(
+                        packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
+                    )
+                    batch[key] = data.index_select(1, index)
+
+            if self.pre_process:
+                combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]
                 combined_embeddings = combined_embeddings.transpose(
                     1, 0
                 ).contiguous()  # [B,S/CP,H] -> [S/CP,B,H]
+            if self.post_process:
+                new_labels = batch["new_labels"]
+                new_loss_mask = batch["new_loss_mask"]
 
-        if self.sequence_parallel_lm:
+        if self.sequence_parallel_lm and self.pre_process:
             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
                 combined_embeddings
             )  # [S/(CP*TP),B,H]
@@ -716,12 +789,13 @@ class LLaVAModel(MegatronModule):
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         num_image_tiles: Optional[List[int]] = None,
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
-        image_token_mask: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -736,14 +810,12 @@ class LLaVAModel(MegatronModule):
                 attn_mask_type in layer specs determines the attention mask used.
             labels (torch.Tensor): Optional target text labels [batch, combined_seq_len].
             loss_mask (torch.Tensor): Text loss mask [batch, text_seq_len].
-            inference_params (InferenceParams): Inference-time parameters including KV cache.
+            inference_context (BaseInferenceContext): Inference-time parameters including KV cache.
             num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
             image_token_index (int): ID for input images. Default None means `image_token_index`
                 arg in the constructor will be used.
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
-            image_token_mask (torch.Tensor): Tensor indicating the location of
-                image token index in input_ids.
             packed_seq_params (PackedSeqParams): 1) If using sequence packing, must contain
                 subsample length information. 2) If using SP/CP with padding mask type,
                 must contain padded token information.
@@ -753,9 +825,12 @@ class LLaVAModel(MegatronModule):
                 otherwise logits of shape [b, s, vocab_size].
             loss_mask (torch.Tensor): Loss mask expanded to combined sequence length. Shape [b, s].
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         use_inference_kv_cache = (
-            inference_params is not None
-            and "image_tokens_count" in inference_params.key_value_memory_dict
+            inference_context is not None
+            and "image_tokens_count" in inference_context.key_value_memory_dict
         )
         has_images = images is not None and images.shape[0] > 0
 
@@ -795,8 +870,8 @@ class LLaVAModel(MegatronModule):
             # TODO: Support batched inference.
             # In inference, the language model KV cache will be updated for image token positions.
             # Store the image tokens sequence length to be used as an offset to the KV cache later.
-            if inference_params is not None:
-                inference_params.key_value_memory_dict["image_tokens_count"] = (
+            if inference_context is not None:
+                inference_context.key_value_memory_dict["image_tokens_count"] = (
                     image_embeddings.shape[0] * image_embeddings.shape[1]
                 )
         else:
@@ -815,18 +890,13 @@ class LLaVAModel(MegatronModule):
             language_embeddings = self.language_model.embedding(
                 input_ids=input_ids_text, position_ids=position_ids
             )  # [text_seq_len, b, h_language]
-            # Gather the language embeddings back. We need the full embedding to insert
-            # image embeddings and then scatter again to avoid load imbalance.
-            if self.context_parallel_lm > 1:
-                cp_group = get_context_parallel_group()
-                language_embeddings, _ = gather_along_first_dim(language_embeddings, cp_group)
 
             language_embeddings = language_embeddings.transpose(
                 1, 0
             ).contiguous()  # [b, text_seq_len, h_language]
 
         # Assume 1 tile per image if the number of tiles is not provided.
-        if num_image_tiles is None:
+        if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
@@ -836,10 +906,9 @@ class LLaVAModel(MegatronModule):
             loss_mask,
             labels,
             use_inference_kv_cache,
-            inference_params,
+            inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
-            image_token_mask,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
@@ -849,16 +918,27 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
-        output = self.language_model(
-            input_ids=None,
-            position_ids=None,
-            attention_mask=attention_mask,
-            decoder_input=combined_embeddings,
-            labels=new_labels,
-            inference_params=inference_params,
-            runtime_gather_output=runtime_gather_output,
-            packed_seq_params=packed_seq_params,
-        )
+        if isinstance(self.language_model, MambaModel):
+            output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                attention_mask=attention_mask,
+                decoder_input=combined_embeddings,
+                labels=new_labels,
+                inference_context=inference_context,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                attention_mask=attention_mask,
+                decoder_input=combined_embeddings,
+                labels=new_labels,
+                inference_context=inference_context,
+                runtime_gather_output=runtime_gather_output,
+                packed_seq_params=packed_seq_params,
+            )
 
         return output, new_loss_mask
 
@@ -885,6 +965,28 @@ def _load_state_dict_hook_ignore_param_names(
                 f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
             )
             incompatible_keys.missing_keys.remove(param_name)
+
+
+def _load_state_dict_hook_ignore_extra_state(
+    module: torch.nn.Module, incompatible_keys: namedtuple
+):
+    """Hook to ignore Transformer Engine _extra_state used for FP8.
+
+    This is for backwards-compatibility. Newer TE versions add _extra_state keys to the state dict,
+    while older models might not have those keys. Those keys can be ignored when not using FP8.
+
+    Args:
+        module (torch.nn.Module): The torch module this hook applies to. Required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys,
+            which collect the missing and unexpected keys, respectively.
+    """
+    for name, keys in incompatible_keys._asdict().items():
+        for key in keys[::-1]:
+            if "extra_state" in key:
+                logging.getLogger(__name__).warning(
+                    f"_extra_state key {key} being removed from {name}"
+                )
+                keys.remove(key)
 
 
 # pylint: disable-next=line-too-long

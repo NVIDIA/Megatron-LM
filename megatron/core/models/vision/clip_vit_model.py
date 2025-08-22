@@ -6,6 +6,7 @@ import torch
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -34,6 +35,8 @@ class CLIPViTModel(VisionModule):
         patch_dim (int): Image patch size.
         img_h (int): Input image height.
         img_w (int): Input image width.
+        model_comm_pgs (ModelCommProcessGroups): Model communication process groups
+        vp_stage (int): Virtual pipeline stage
     """
 
     def __init__(
@@ -48,10 +51,12 @@ class CLIPViTModel(VisionModule):
         img_h: int = 336,
         img_w: int = 336,
         model_subtype: str = "clip",
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
 
         error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
-        assert model_subtype in ["clip", "siglip", "internvit"], error_msg
+        assert model_subtype in ["clip", "siglip", "internvit", "internvit300M"], error_msg
 
         if model_subtype == "siglip":
             assert class_token_len == 0, "SigLIP does not support class tokens."
@@ -81,6 +86,8 @@ class CLIPViTModel(VisionModule):
 
         self.ln_pre = None
         self.ln_post = None
+        self.model_comm_pgs = model_comm_pgs
+        self.vp_stage = vp_stage
         if model_subtype == "clip":
             self.ln_pre = build_module(
                 ln_pre_impl,
@@ -99,7 +106,7 @@ class CLIPViTModel(VisionModule):
             )
             conv_bias = True
             padding = "valid"
-        elif model_subtype == "internvit":
+        elif model_subtype.startswith("internvit"):
             conv_bias = True
             padding = 0
         else:
@@ -116,12 +123,19 @@ class CLIPViTModel(VisionModule):
 
         self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
-        self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
+        self.position_embeddings = torch.nn.Embedding(
+            self.seq_length, self.visual_hidden_size, dtype=transformer_config.params_dtype
+        )
 
         self.add_class_token = add_class_token
         if self.add_class_token:
             self.class_token = torch.nn.Parameter(
-                torch.randn(1, self.class_token_len, self.visual_hidden_size)
+                torch.randn(
+                    1,
+                    self.class_token_len,
+                    self.visual_hidden_size,
+                    dtype=transformer_config.params_dtype,
+                )
             )
 
         self.model_type = ModelType.encoder_or_decoder
@@ -135,6 +149,8 @@ class CLIPViTModel(VisionModule):
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=False,
+            model_comm_pgs=self.model_comm_pgs,
+            vp_stage=self.vp_stage,
         )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
@@ -193,16 +209,32 @@ def get_num_image_embeddings(
     vision_model_type,
     disable_vision_class_token,
     class_token_len,
-    pixel_shuffle=False,
+    pixel_shuffle,
     use_tile_tags=False,
+    max_num_tiles=0,
+    tokenizer_type=None,
 ):
     """Get the number of image embeddings per image tile."""
     if vision_model_type == "siglip":
         keep_class_token = False
-    elif vision_model_type in ("clip", "internvit"):
+    elif vision_model_type in ("clip", "internvit", "internvit300M"):
         keep_class_token = not disable_vision_class_token
+    elif vision_model_type.startswith("radio"):
+        keep_class_token = not disable_vision_class_token
+    elif vision_model_type == "cradio-g":
+        class_token_len = 8
+        keep_class_token = not disable_vision_class_token
+    elif vision_model_type.startswith("hf://"):
+        from megatron.core.models.huggingface.module import get_hf_model_type
+
+        model_type = get_hf_model_type(vision_model_type)
+
+        if "siglip" in model_type:
+            keep_class_token = False
+        else:
+            raise NotImplementedError(f"unsupported huggingface vision model: {vision_model_type}")
     else:
-        raise ValueError(f"unsupported vision model: {vision_model_type}")
+        raise NotImplementedError(f"unknown vision model type {vision_model_type}")
 
     num_patches_per_dim_h = img_h // patch_dim
     num_patches_per_dim_w = img_w // patch_dim
@@ -213,7 +245,17 @@ def get_num_image_embeddings(
         num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
 
     if use_tile_tags:
-        # The length of tile tags tokenized. Currently, the same across tokenizers used.
-        num_image_embeddings_per_tile += 5
+        if tokenizer_type in ("llama3p1", "chatml", "qwen2p0", "qwen2p5"):
+            num_image_embeddings_per_tile += 5
+        elif tokenizer_type.startswith("nemotron5"):
+            num_image_embeddings_per_tile += 6
+        else:
+            raise ValueError("tokenizer type not defined")
+
+        if 10 < max_num_tiles < 100:
+            if tokenizer_type.startswith("qwen"):
+                num_image_embeddings_per_tile += 1  # add padding 0
+        elif max_num_tiles > 100:
+            raise ValueError(f"max number of tiles {max_num_tiles} not supported")
 
     return num_image_embeddings_per_tile

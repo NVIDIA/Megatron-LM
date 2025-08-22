@@ -18,8 +18,13 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.moe.moe_utils import ModelCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_torch_min_version, make_sharded_tensor_for_checkpoint
+from megatron.core.utils import (
+    is_te_min_version,
+    is_torch_min_version,
+    make_sharded_tensor_for_checkpoint,
+)
 
 
 class SharedExpertMLP(MLP):
@@ -31,12 +36,19 @@ class SharedExpertMLP(MLP):
     # The shared experts are scheduled into this stream to be overlapped with the dispatcher.
     stream = None
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules, gate: bool):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        gate: bool,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+    ):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
+        # TODO(Hepteract): pass model_comm_pgs to MLP after refactoring MLP
         super().__init__(config=config, submodules=submodules)
 
         self.use_shared_expert_gate = gate
@@ -50,12 +62,39 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
+        if self.config.fp8 and is_te_min_version("2.6.0dev0"):
+            # For fp8 training, the output of pre_mlp_layernorm is saved by router, and
+            # the shared expert linear_fc1 also saves the quantized tensor of this output.
+            # Here we set the linear_fc1 to save the original input tensors to avoid the extra
+            # memory usage of the quantized tensor.
+            shared_experts_recompute = (
+                config.recompute_granularity == 'selective'
+                and "shared_experts" in config.recompute_modules
+            )
+            if not shared_experts_recompute:
+                try:
+                    HAVE_TE = True
+                    from megatron.core.extensions.transformer_engine import (
+                        TELinear,
+                        set_save_original_input,
+                    )
+                except ImportError:
+                    HAVE_TE = False
+                    TELinear, set_save_original_input = None, None
+
+                if HAVE_TE and isinstance(self.linear_fc1, TELinear):
+                    set_save_original_input(self.linear_fc1)
+
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module
             for linear in [self.linear_fc1, self.linear_fc2]:
                 if hasattr(linear, 'parallel_mode'):
                     # TELinear
                     linear.parallel_mode = None
+                    linear.ub_overlap_rs_fprop = False
+                    linear.ub_overlap_ag_dgrad = False
+                    linear.ub_overlap_ag_fprop = False
+                    linear.ub_overlap_rs_dgrad = False
                 else:
                     # MCore legacy Linear
                     linear.explicit_expert_comm = True

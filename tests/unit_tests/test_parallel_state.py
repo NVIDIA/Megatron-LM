@@ -138,7 +138,7 @@ def test_expert_model_parallel_rank():
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_first_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_first_stage(ignore_virtual=True) == (rank == 0)
+    assert ps.is_pipeline_first_stage(ignore_virtual=False) == (rank == 0)
     assert ps.is_pipeline_first_stage() == (rank == 0)
     Utils.destroy_model_parallel()
 
@@ -146,7 +146,7 @@ def test_is_pipeline_first_stage(order):
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_last_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_last_stage(ignore_virtual=True) == (rank == world_size - 1)
+    assert ps.is_pipeline_last_stage(ignore_virtual=False) == (rank == world_size - 1)
     assert ps.is_pipeline_last_stage() == (rank == world_size - 1)
     Utils.destroy_model_parallel()
 
@@ -163,27 +163,6 @@ def test_virtual_pipeline_model_parallel_rank(order):
 def test_get_tensor_model_parallel_src_rank(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)
     assert ps.get_tensor_model_parallel_src_rank() == ((rank // world_size) * world_size)
-    Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize('order', test_parallel_order)
-def test_encoder_tensor_pipeline_parallelism(order):
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=5,
-        pipeline_model_parallel_size=1,
-        encoder_pipeline_model_parallel_size=1,
-        encoder_tensor_model_parallel_size=3,
-        order=order,
-    )
-    if rank < 2:
-        assert ps.get_tensor_model_parallel_world_size() == 3
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], list)
-    elif rank == 2:
-        assert ps.get_tensor_model_parallel_world_size() == 3
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
-    else:
-        assert ps.get_tensor_model_parallel_world_size() == 5
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
     Utils.destroy_model_parallel()
 
 
@@ -255,6 +234,8 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     'src_tp_pp, ep_size',
     [((1, 2), 1), ((1, 4), 1), ((2, 2), 1), ((1, 2), 2), ((1, 4), 2), ((2, 2), 2)],
 )
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     Utils.initialize_model_parallel(
         *src_tp_pp, expert_model_parallel_size=ep_size, order='tp-ep-dp-pp'

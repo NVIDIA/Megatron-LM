@@ -3,5 +3,6 @@
 from enum import Enum
 
 ModelType = Enum(
-    'ModelType', ["gpt", "gptnext", "llama", "falcon", "starcoder", "mixtral", "gemma"]
+    'ModelType',
+    ["gpt", "gptnext", "llama", "falcon", "starcoder", "mixtral", "gemma", "nemotron_nas"],
 )

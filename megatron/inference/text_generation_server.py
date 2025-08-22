@@ -1,19 +1,27 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import datetime
 import json
+import os
+import sys
 
 from flask import Flask, request, jsonify
 from flask_restful import Resource, Api
 
-from megatron.inference.text_generation import generate_and_post_process
-from megatron.inference.text_generation import beam_search_and_post_process
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.endpoints.common import send_do_generate, send_do_beam_search, LOCK
 from megatron.inference.endpoints.completions import MegatronCompletions
+from megatron.inference.text_generation import beam_search_and_post_process
+from megatron.inference.text_generation.mcore_engine_server import run_mcore_engine
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
 
 
 class MegatronGenerate(Resource):
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, engine, args):
+        self.engine = engine
+        self.args = args
 
     def put(self):
         if not "prompts" in request.get_json():
@@ -172,7 +180,7 @@ class MegatronGenerate(Resource):
                 if beam_width is not None:
                     send_do_beam_search()  # Tell other ranks we're doing beam_search
                     response, response_seg, response_scores = beam_search_and_post_process(
-                        self.model,
+                        self.engine.text_generation_controller.inference_wrapped_model.model,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,
                         beam_size=beam_width,
@@ -188,44 +196,21 @@ class MegatronGenerate(Resource):
                     )
                 else:
                     send_do_generate()  # Tell other ranks we're doing generate
-                    result = generate_and_post_process(
-                        self.model,
-                        prompts=prompts,
-                        tokens_to_generate=tokens_to_generate,
-                        return_output_log_probs=logprobs,
-                        top_k_sampling=top_k,
-                        top_p_sampling=top_p,
-                        top_p_decay=top_p_decay,
-                        top_p_bound=top_p_bound,
-                        temperature=temperature,
-                        add_BOS=add_BOS,
-                        use_eod_token_for_early_termination=True,
-                        stop_on_double_eol=stop_on_double_eol,
-                        stop_on_eol=stop_on_eol,
-                        prevent_newline_after_colon=prevent_newline_after_colon,
-                        random_seed=random_seed,
-                    )
 
-                    response, response_seg, response_logprobs = result[:3]
-                    response = {
-                        "text": response,
-                        "segments": response_seg,
-                        "logprobs": response_logprobs,
-                    }
+                    response_dict = run_mcore_engine(self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate)
 
-                    return jsonify(response)
+                    return jsonify(response_dict)
 
             except ValueError as ve:
                 return ve.args[0]
-            print("end time: ", datetime.datetime.now())
 
 
 class MegatronServer(object):
-    def __init__(self, model):
+    def __init__(self, model, args=None):
         self.app = Flask(__name__, static_url_path='')
         api = Api(self.app)
-        api.add_resource(MegatronGenerate, '/api', resource_class_args=[model])
-        api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model])
+        api.add_resource(MegatronGenerate, '/api', resource_class_args=[model, args])
+        api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model, args])
 
     def run(self, url, port):
         self.app.run(url, threaded=True, debug=False, port=port)

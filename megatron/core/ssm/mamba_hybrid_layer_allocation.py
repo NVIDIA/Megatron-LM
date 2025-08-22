@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 
 
 class Symbols:
-    MAMBA = 'M'
-    ATTENTION = '*'
-    MLP = '-'
+    MAMBA = "M"
+    ATTENTION = "*"
+    MLP = "-"
     VALID = {MAMBA, ATTENTION, MLP}
 
 
@@ -69,7 +69,7 @@ def _allocate_override(total_layers_count: int, override_pattern: str) -> list:
         )
     for l in layer_type_list:
         if l not in Symbols.VALID:
-            raise ValueError(f"In hybrid override pattern, '{l}' is not " f"one of {Symbols.VALID}")
+            raise ValueError(f"In hybrid override pattern, '{l}' is not one of {Symbols.VALID}")
 
     return layer_type_list
 
@@ -121,7 +121,7 @@ def allocate_layers(
         actual_attention_ratio = actual_attention_layers_count / total_layers_count
         actual_mlp_layers_count = layer_type_list.count(Symbols.MLP)
         actual_mlp_ratio = actual_mlp_layers_count / total_layers_count
-        allocation_string = ''.join(layer_type_list)
+        allocation_string = "".join(layer_type_list)
         log_single_rank(
             logger,
             logging.INFO,

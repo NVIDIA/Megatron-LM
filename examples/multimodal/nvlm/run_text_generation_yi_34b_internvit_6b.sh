@@ -95,7 +95,7 @@ do
         --decoder-seq-length ${DECODER_SEQ_LEN} \
         --max-position-embeddings ${MAX_POS_EMBED} \
         --tokenizer-type MultimodalTokenizer \
-        --tokenizer-model <tokenizer model path> \
+        --tokenizer-model NousResearch/Nous-Hermes-2-Yi-34B \
         --tokenizer-prompt-format nvlm-yi-34b \
         --vocab-size 64000 \
         --make-vocab-size-divisible-by 1 \
@@ -135,6 +135,6 @@ do
         --gt-path ${GROUNDTRUTH_PATH} \
         ${EXTRA_ARGS} \
         --task ${TASK} \
-        --image-tag-type nlvm \
+        --image-tag-type nvlm \
         --ckpt-format torch
 done

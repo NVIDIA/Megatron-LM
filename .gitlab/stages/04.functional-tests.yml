@@ -1,0 +1,254 @@
+.functional_tests_rules:
+  stage: functional_tests
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes"
+      when: on_success
+    - when: never
+default:
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: https://stg.vault.nvidia.com
+
+include:
+  - project: dl/jet/gitlab-templates
+    ref: main
+    file: downstreams.yml
+
+functional:configure:
+  needs:
+    - test:build_image
+    - test:build_nemo_image
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
+      optional: true
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
+      optional: true
+    - job: integration:run_lts_dgx_a100
+      optional: true
+    - job: integration:run_dev_dgx_a100
+      optional: true
+    - job: integration:run_lts_dgx_h100
+      optional: true
+    - job: integration:run_dev_dgx_h100
+      optional: true
+  extends: [.functional_tests_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  before_script:
+    - git rm -r tests/test_utils/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+    - ls tests/test_utils/local_recipes
+  script:
+    - set -x
+    - |
+      A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+      H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+    - |
+      RECORD_CHECKPOINTS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Record checkpoints"* || "$FUNCTIONAL_TEST_RECORD_CHECKPOINTS" == "yes" ]] && echo "true" || echo "false")
+    - |
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "release" || "$FUNCTIONAL_TEST_SCOPE" == "pre-release" ]]; then
+        FUNCTIONAL_TEST_NAME=$(eval echo $FUNCTIONAL_TEST_NAME)
+        RELEASE_ARGS=(
+          "--run-name"
+          $FUNCTIONAL_TEST_NAME
+          "--wandb-experiment"
+          $(echo $FUNCTIONAL_TEST_NAME | tr '/' '-')
+        )
+      else
+        RELEASE_ARGS=()
+      fi
+    - |
+      ARGS=(
+        "--scope $FUNCTIONAL_TEST_SCOPE"
+        "--n-repeat $FUNCTIONAL_TEST_REPEAT"
+        "--time-limit $FUNCTIONAL_TEST_TIME_LIMIT"
+        "--test-cases $FUNCTIONAL_TEST_CASES"
+        "--container-image ${UTILITY_IMAGE}"
+        "--container-tag ${CI_PIPELINE_ID}"
+        "--dependent-job functional:configure"
+        "--record-checkpoints ${RECORD_CHECKPOINTS}"
+        "--slurm-account ${CI_SLURM_ACCOUNT}"
+        "--no-enable-warmup"
+      )
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-dev-A100.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-dev-H100.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-lts-A100.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-lts-H100.yaml" \
+        ${RELEASE_ARGS[@]}
+  artifacts:
+    paths:
+      - functional-test-job-lts-A100.yaml
+      - functional-test-job-lts-H100.yaml
+      - functional-test-job-dev-A100.yaml
+      - functional-test-job-dev-H100.yaml
+      - tests/test_utils/local_recipes
+
+.functional_run:
+  needs:
+    - functional:configure
+    - test:build_image
+  extends: [.functional_tests_rules]
+  trigger:
+    include:
+      - artifact: functional-test-job-$ENVIRONMENT-$CLUSTER.yaml
+        job: functional:configure
+    strategy: depend
+  variables:
+    RO_API_TOKEN: $PAT
+    CONTAINER_TAG: $CI_PIPELINE_ID
+    CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
+    GITLAB_ENDPOINT: $GITLAB_ENDPOINT
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    DASHBOARD_ENDPOINT: $DASHBOARD_ENDPOINT
+    MCORE_MR_COMMIT: $MCORE_MR_COMMIT
+    MCORE_BACKWARDS_COMMIT: $MCORE_BACKWARDS_COMMIT
+    CLUSTER: $CLUSTER
+
+  inherit:
+    variables: true
+
+functional:run_lts_dgx_a100:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: A100
+
+functional:run_lts_dgx_h100:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: H100
+
+functional:run_dev_dgx_a100:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: A100
+
+functional:run_dev_dgx_h100:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: H100
+
+functional:run_nemo:
+  extends: [.functional_tests_rules]
+  trigger:
+    project: "dl/joc/nemo-ci"
+    branch: main-mirror
+    strategy: depend
+  inherit:
+    variables: true
+  variables:
+    MCORE_COMMIT: $CI_COMMIT_SHA
+    TEST_NEMO2_MODULE: "True"
+    ALLOW_FAILURE_DEPENDENCY: "True"
+    TESTS_TO_RUN_ON_THIS_COMMIT: nightly
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes"
+      when: manual
+      allow_failure: true
+    - when: never
+
+functional:x_notify:
+  extends: [.functional_tests_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  needs:
+    - functional:run_lts_dgx_a100
+    - functional:run_dev_dgx_a100
+    - functional:run_lts_dgx_h100
+    - functional:run_dev_dgx_h100
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  variables:
+    WEBHOOK_URL: ${MCORE_NOTIFICATION_HOOK}
+    RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
+    CONTEXT: $FUNCTIONAL_TEST_SCOPE
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TEAM_SLUG=$SLACK_ADMIN
+    - |
+      python tests/test_utils/python_scripts/notify.py \
+        --pipeline-id "${CI_PIPELINE_ID}" \
+        --check-for functional-tests \
+        --pipeline-context $CONTEXT \
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
+
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  rules:
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
+      when: always
+    - when: never
+
+functional:x_download_golden_values:
+  extends: [.functional_tests_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - python tests/test_utils/python_scripts/download_golden_values.py --pipeline-id ${CI_PIPELINE_ID}
+  artifacts:
+    paths:
+      - tests/
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes"
+      when: manual
+      allow_failure: true
+    - when: never

@@ -34,8 +34,8 @@ MODEL_ARGS:
   --tokenizer-type: BertWordPieceCase
   --calculate-per-token-loss: true
   --split: 99982,9,9
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --log-params-norm: true
   --log-num-zeros-in-grad: true
@@ -48,8 +48,9 @@ MODEL_ARGS:
   --eval-iters: 10
   --distributed-backend: nccl
   --data-cache-path: ${DATA_CACHE_PATH}
-  --encoder-pipeline-model-parallel-size: 0
   --deterministic-mode: true
   --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --attention-backend: unfused
+  --log-memory-to-tensorboard: true
 TEST_TYPE: regular

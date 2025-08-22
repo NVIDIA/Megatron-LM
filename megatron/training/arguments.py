@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2023 Alibaba PAI Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,29 +19,49 @@ import argparse
 import dataclasses
 import json
 import os
+from pathlib import Path
+import re
 import types
 import warnings
-from packaging.version import Version as PkgVersion
 
 import torch
 import torch.nn.functional as F
+from packaging.version import Version as PkgVersion
 
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
 )
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.rerun_state_machine import RerunStateMachine
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.utils import get_torch_version, is_torch_min_version
-from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
+    MLPConfig,
+)
+from megatron.core.utils import (
+    get_torch_version,
+    is_te_min_version,
+    is_torch_min_version,
+)
+from megatron.core.activations import squared_relu
+from megatron.training.utils import (
+    get_device_arch_version,
+    update_use_dist_ckpt,
+    print_rank_0,
+    warn_rank_0,
+)
+from megatron.core.msc_utils import MultiStorageClientFeature
 
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 
-def parse_args(extra_args_provider=None, ignore_unknown_args=False):
-    """Parse all arguments."""
-    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
-                                     allow_abbrev=False)
+def add_megatron_arguments(parser: argparse.ArgumentParser):
+    """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
@@ -60,16 +80,31 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
+    parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
+    parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
+    parser = _add_msc_args(parser)
+    parser = _add_kitchen_quantization_arguments(parser)
+    parser = _add_sft_args(parser)
+
+    return parser
+
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
+    """Parse all arguments."""
+    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
+                                     allow_abbrev=False)
+
+    parser = add_megatron_arguments(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -93,7 +128,87 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
+    # Args to disable MSC
+    if not args.enable_msc:
+        MultiStorageClientFeature.disable()
+        assert MultiStorageClientFeature.is_enabled() is False
+        print('WARNING: The MSC feature is disabled.')
+
     return args
+
+
+def validate_model_config_args_from_heterogeneous_config(args):
+    """Validate model config arguments from heterogeneous config.
+
+    This function takes model arguments and validates them based on a heterogeneous layer configuration.
+    The heterogeneous config can be provided either as a path to a JSON file or as an encoded JSON string.
+
+    The function enforces certain model architecture choices like SiLU activation, RMSNorm, grouped query attention,
+    and RoPE positional embeddings. It also sets model dimensions like number of layers, hidden size, and attention heads
+    based on the heterogeneous config.
+
+    Args:
+        args: Model configuration arguments to be overridden. Expected to have attributes:
+            - heterogeneous_layers_config_path (str): Path to JSON config file
+            - heterogeneous_layers_config_encoded_json (str): Encoded JSON config string
+
+    Returns:
+        None
+    """
+    if (
+        args.heterogeneous_layers_config_path is None
+        and args.heterogeneous_layers_config_encoded_json is None
+    ):
+        return
+
+    if args.heterogeneous_layers_config_encoded_json is None:
+        args.heterogeneous_layers_config_encoded_json = Path(
+            args.heterogeneous_layers_config_path
+        ).read_text()
+
+    hf_config_dict = types.SimpleNamespace(**json.loads(args.heterogeneous_layers_config_encoded_json))
+
+    assert hf_config_dict.hidden_act == "silu", (
+        f"hidden_act in heterogeneous config is {hf_config_dict.hidden_act}, should be silu"
+    )
+
+    n_kv_heads_in_group = [
+        config["attention"]["n_heads_in_group"] for config in hf_config_dict.block_configs 
+        if config["attention"]["n_heads_in_group"] is not None
+    ]
+    assert all(num == n_kv_heads_in_group[0] for num in n_kv_heads_in_group), "num query head must be consistent across all layers"
+
+    args_to_validate = {
+        "swiglu": True,
+        "normalization": "RMSNorm",
+        "group_query_attention": True,
+        "position_embedding_type": "rope",
+        "rotary_percent": 1.0,
+        "use_rope_scaling": True,
+        "use_rotary_position_embeddings": True,
+        "num_layers": hf_config_dict.num_hidden_layers,
+        "hidden_size": hf_config_dict.hidden_size,
+        "num_attention_heads": hf_config_dict.num_attention_heads,
+        "untie_embeddings_and_output_weights": not hf_config_dict.tie_word_embeddings,
+        "rotary_base": hf_config_dict.rope_theta,
+        "rope_scaling_factor": hf_config_dict.rope_scaling["factor"],
+        "num_query_groups": hf_config_dict.num_attention_heads // n_kv_heads_in_group[0],
+    }
+
+    incompatible_args = {}
+    for key, value in args_to_validate.items():
+        provided_value = getattr(args, key, None)
+        if provided_value != value:
+            incompatible_args[key] = (provided_value, value)
+
+    if incompatible_args:
+        incompatible_args_str = ', '.join([
+            f"{k}: {provided_value} (provided) != {value} (expected)"
+            for k, (provided_value, value) in incompatible_args.items()
+        ])
+        raise ValueError(
+            f"Arguments differ from heterogeneous config: {incompatible_args_str}"
+        )
 
 
 def load_retro_config(retro_project_dir):
@@ -170,6 +285,39 @@ def load_retro_args(args):
     args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
     args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
 
+def _eval_pattern(pattern):
+    """ Validate and evaluate a string containing a Python list expression """
+    assert isinstance(pattern, str)
+
+    # validate input, only allow comma, digits, [, ], (, ), +, and *
+    if bool(re.compile(r'[^,\d\[\]\(\)\+\*]').search(pattern)):
+        raise ValueError(f"Invalid pattern: {pattern}")
+
+    return eval(pattern)
+
+def no_rope_freq_type(x):
+    """ Controls which layers to skip performing Rotary Position Embedding.
+    - An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers.
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([0]*3+[1]*1)*3" evaluates to [0,0,0,1,0,0,0,1,0,0,0,1]
+      where 1 indicates rope is skipped on the layer.
+      This allows defining arbitrary patterns of rope skipping.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([1]+[0]*23)": Only first layer has rope skipped for a 24-layer network.
+          "([0]*3+[1]*1)*2": Every 4 layers the rope is skipped on the last layer. Repeat twice.
+    """
+    if x is None or isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        return _eval_pattern(x)
+    else:
+        # it's a single int but in str
+        return int(x)
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -190,8 +338,7 @@ def moe_freq_type(x):
     assert isinstance(x, str)
     if '[' in x:
         # it's a custom pattern
-        pattern = eval(x)
-        return pattern
+        return _eval_pattern(x)
     else:
         # it's a single int but in str
         return int(x)
@@ -200,34 +347,32 @@ def moe_freq_type(x):
 def validate_args(args, defaults={}):
 
     # Temporary
-    assert args.non_persistent_ckpt_type in ['global', None], \
-        'Currently only global checkpoints are supported'
+    assert args.non_persistent_ckpt_type in ['global', 'local', None], \
+        'Currently only global and local checkpoints are supported'
+    if args.non_persistent_ckpt_type == 'local':
+        try:
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                LocalCheckpointManager
+        except ModuleNotFoundError as e:
+            raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
+
+    # validate model config args from heterogeneous config (if provided).
+    validate_model_config_args_from_heterogeneous_config(args)
 
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
     # Set args.use_dist_ckpt from args.ckpt_format.
+    if args.use_legacy_models:
+        assert args.ckpt_format == "torch", \
+            "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
-
-    if args.encoder_pipeline_model_parallel_size == 0 and args.num_experts == 0:
-        assert args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size,  "If non-MOE encoder shares first decoder pipeline rank it must have the same TP as the decoder."
-
-    if args.encoder_tensor_model_parallel_size > 0:
-        assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be defined."
-        assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
-        assert args.encoder_tensor_model_parallel_size <= args.tensor_model_parallel_size, "We do not support encoders with more TP than the decoder."
-
-    if args.encoder_pipeline_model_parallel_size > 0 and args.encoder_tensor_model_parallel_size == 0:
-        args.encoder_tensor_model_parallel_size = args.tensor_model_parallel_size
-
-    encoder_model_size = args.encoder_tensor_model_parallel_size * args.encoder_pipeline_model_parallel_size * args.context_parallel_size
-    decoder_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
-    total_model_size = encoder_model_size + decoder_model_size
+    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
     # Total model size.
     assert args.world_size % total_model_size == 0, (
-        f"world size ({args.world_size}) is not divisible by total_model_size ({encoder_model_size=} + {decoder_model_size=})"
+        f"world size ({args.world_size}) is not divisible by total_model_size ({total_model_size=})"
     )
 
     # Tensor model parallel size.
@@ -244,12 +389,9 @@ def validate_args(args, defaults={}):
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
-    args.transformer_pipeline_model_parallel_size = (
-        args.pipeline_model_parallel_size - 1
-        if args.standalone_embedding_stage else
-        args.pipeline_model_parallel_size
-    )
+    args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
+    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
     # Checks.
@@ -264,28 +406,16 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
-              'hierarchical context-parallel sizes: {}'
+              'hierarchical context-parallel sizes: {}, '
               'tensor-model-parallel size: {}, '
-              'encoder-tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {}, '
-              'encoder-pipeline-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
                   args.hierarchical_context_parallel_sizes,
                   args.tensor_model_parallel_size,
-                  args.encoder_tensor_model_parallel_size,
-                  args.pipeline_model_parallel_size,
-                  args.encoder_pipeline_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
 
     # Checks.
-
-    # Backwards compatibility.
-    if args.pipeline_model_parallel_split_rank is not None:
-        args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
-        args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
-        assert args.pipeline_model_parallel_size > 0
 
     if args.pipeline_model_parallel_size > 1:
         if args.pipeline_model_parallel_split_rank is not None:
@@ -369,13 +499,79 @@ def validate_args(args, defaults={}):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
-    if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
-        # Divisibility check not applicable for T5 models which specify encoder_num_layers
-        # and decoder_num_layers.
-        if args.num_layers is not None:
-            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                'Number of layers should be divisible by the pipeline-model-parallel size'
-    if args.num_layers_per_virtual_pipeline_stage is not None:
+
+    # Uneven virtual pipeline parallelism
+    assert (
+        int(args.num_layers_per_virtual_pipeline_stage is not None)
+        + int(args.num_virtual_stages_per_pipeline_rank is not None)
+        + int(args.pipeline_model_parallel_layout is not None)
+    ) <= 1, (
+        'No more than one of the following arguments can be set at the same time: '
+        '--num-layers-per-virtual-pipeline-stage, --num-virtual-stages-per-pipeline-rank,'
+        '--pipeline-model-parallel-layout. '
+        f'{args.num_layers_per_virtual_pipeline_stage=}, '
+        f'{args.num_virtual_stages_per_pipeline_rank=}, '
+        f'{args.pipeline_model_parallel_layout=}.'
+    )
+
+    if args.pipeline_model_parallel_layout is not None:
+        # Parse the input flattened layout to a list and get the vpp size.
+        # We will validate the layout more carefully in the TransformerConfig constructor.
+        num_stages = PipelineParallelLayerLayout.get_num_stages_from_str(args.pipeline_model_parallel_layout)
+        assert num_stages % args.pipeline_model_parallel_size == 0, (
+            f"The length of pipeline_model_parallel_layout must be divisible"
+            f" by pipeline_model_parallel_size ({num_stages=},"
+            f" {args.pipeline_model_parallel_size=})"
+        )
+        args.virtual_pipeline_model_parallel_size = num_stages // args.pipeline_model_parallel_size
+        if args.virtual_pipeline_model_parallel_size == 1:
+            args.virtual_pipeline_model_parallel_size = None
+    elif args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
+        if args.num_virtual_stages_per_pipeline_rank is None:
+            assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
+                'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+            else:
+                num_layers = args.decoder_num_layers
+
+            if args.account_for_embedding_in_pipeline_split:
+                num_layers += 1
+
+            if args.account_for_loss_in_pipeline_split:
+                num_layers += 1
+
+            assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'number of layers of the model must be divisible pipeline model parallel size'
+            num_layers_per_pipeline_stage = num_layers // args.transformer_pipeline_model_parallel_size
+
+            assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
+                'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+            args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
+                args.num_layers_per_virtual_pipeline_stage
+        else:
+            args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
+        if args.virtual_pipeline_model_parallel_size == 1:
+            args.virtual_pipeline_model_parallel_size = None
+    else:
+        args.virtual_pipeline_model_parallel_size = None
+
+        if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
+            # Divisibility check not applicable for T5 models which specify encoder_num_layers
+            # and decoder_num_layers.
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+
+                if args.account_for_embedding_in_pipeline_split:
+                    num_layers += 1
+
+                if args.account_for_loss_in_pipeline_split:
+                    num_layers += 1
+
+                assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                    'Number of layers should be divisible by the pipeline-model-parallel size'
+    
+    if args.virtual_pipeline_model_parallel_size is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
@@ -385,37 +581,29 @@ def validate_args(args, defaults={}):
                 'When interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
-        
-        assert args.num_layers is not None
-        # Double check divisibility check here since check above is if guarded.
-        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-            'Number of layers should be divisible by the pipeline-model-parallel size'
-        num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
-        assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'Number of layers per pipeline stage must be divisible by number of layers per virtual pipeline stage'
-        args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
-            args.num_layers_per_virtual_pipeline_stage
     else:
-        args.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.overlap_p2p_comm = False
         args.align_param_gather = False
         # Only print warning if PP size > 1.
         if args.rank == 0 and args.pipeline_model_parallel_size > 1:
             print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
-                  'since non-interleaved schedule does not support overlapping p2p communication '
-                  'and aligned param AG')
+                'since non-interleaved schedule does not support overlapping p2p communication '
+                'and aligned param AG')
+
+    if args.rank == 0:
+        print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
+        assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
+            '--overlap-param-gather only supported with distributed optimizer or megatron fsdp'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
-    if getattr(args, "use_torch_fsdp2", False):
-        assert get_torch_version() >= PkgVersion("2.4"), \
+    if args.use_torch_fsdp2:
+        assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert args.pipeline_model_parallel_size == 1, \
             '--use-torch-fsdp2 is not supported with pipeline parallelism'
@@ -425,12 +613,22 @@ def validate_args(args, defaults={}):
             "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
         assert not args.gradient_accumulation_fusion, \
             '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
-        assert args.ckpt_format == 'torch_dist', \
-            '--use-torch-fsdp2 requires --ckpt-format torch_dist'
+        assert args.ckpt_format in ('torch_dist', 'torch_dcp'), \
+            '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert args.untie_embeddings_and_output_weights, \
             '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
         assert not args.fp16, \
             '--use-torch-fsdp2 not supported with fp16 yet'
+        assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
+            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+
+        if args.fp8_param_gather and is_te_min_version("2.0.0"):
+            args.fp8_param_gather = False
+            warn_rank_0(
+                'FSDP2 FP8 param gather is not supported yet in TE 2.0, will fallback to bf16'
+                'all_gather instead, turning off fp8_param_gather',
+                args.rank,
+            )
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -442,9 +640,41 @@ def validate_args(args, defaults={}):
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
+    dtype_map = {
+        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
+    }
+    map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
+
+    args.main_grads_dtype = map_dtype(args.main_grads_dtype)
+    args.main_params_dtype = map_dtype(args.main_params_dtype)
+    args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
+    args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
+
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--fp8-param-gather only supported with distributed optimizer'
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
+            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
+
+    if args.use_megatron_fsdp:
+        # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
+        #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
+        #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
+        args.use_custom_fsdp = True
+
+        if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
+            warn_rank_0(
+                'Please make sure your TransformerEngine support FSDP + gradient accumulation fusion',
+                args.rank,
+            )
+
+        if args.data_parallel_sharding_strategy == "optim_grads_params":
+            assert args.check_weight_hash_across_dp_replicas_interval is None, \
+                'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
+
+        assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
+            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+
+        assert args.ckpt_format == "fsdp_dtensor", \
+            "Megatron FSDP only supports fsdp_dtensor checkpoint format"
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -463,11 +693,20 @@ def validate_args(args, defaults={}):
         args.params_dtype = torch.bfloat16
         # bfloat16 requires gradient accumulation and all-reduce to
         # be done in fp32.
-        if not args.accumulate_allreduce_grads_in_fp32:
+        if args.accumulate_allreduce_grads_in_fp32:
+            assert args.main_grads_dtype == torch.float32, \
+                "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
+
+        if args.grad_reduce_in_bf16:
+            args.accumulate_allreduce_grads_in_fp32 = False
+        elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
+    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+        assert not args.check_for_nan_in_loss_and_grad, \
+            "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
@@ -566,13 +805,19 @@ def validate_args(args, defaults={}):
         args.seq_length = args.encoder_seq_length
 
     if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
+        assert args.max_position_embeddings >= args.seq_length, \
+            f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+            f"or equal to seq_length ({args.seq_length})."
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
         assert args.save_interval is not None
+        assert args.save_interval > 0
+        if args.save_retain_interval is not None:
+            assert args.save_retain_interval > 0
+            assert args.save_retain_interval % args.save_interval == 0
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -628,7 +873,10 @@ def validate_args(args, defaults={}):
     # sequence_parallelism is enabled.
     if args.tensor_model_parallel_size == 1:
         if args.sequence_parallel:
-            warnings.warn("Disabling sequence parallelism because tensor model parallelism is disabled")
+            warn_rank_0(
+                "Disabling sequence parallelism because tensor model parallelism is disabled",
+                args.rank,
+            )
         args.sequence_parallel = False
 
     if args.tp_comm_overlap:
@@ -640,25 +888,42 @@ def validate_args(args, defaults={}):
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if args.sequence_parallel:
-        args.async_tensor_model_parallel_allreduce = False
-        if getattr(args, "use_torch_fsdp2", False):
-            warnings.warn(
-                "Using sequence parallelism with FSDP2 together. Try not to using them "
-                "together since they require different CUDA_MAX_CONNECTIONS settings "
-                "for best performance. sequence parallelism requires setting the "
-                "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while FSDP2 "
-                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
+    if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
+        and get_device_arch_version() < 10:
+        # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Megatron-FSDP"
+            warn_rank_0(
+                f"Using tensor model parallelism or context parallelism with {fsdp_impl} together. "
+                "Try not to using them together since they require different CUDA_MAX_CONNECTIONS "
+                "settings for best performance. sequence parallelism requires setting the "
+                f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
+                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.",
+                args.rank,
+            )
+        elif args.overlap_moe_expert_parallel_comm:
+            warn_rank_0(
+                "For Hopper and before, try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
+                "Using tensor/context model parallelism requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1 to maximize the performance. "
+                "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
+                "for better parallelization. If you want to use both, you can set CUDA_DEVICE_MAX_CONNECTIONS to 1 or 32, "
+                "which depends on which parallelization you want to prioritize.",
+                args.rank,
+            )
+        else:
+            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
+                "Using tensor model parallelism or context parallelism require setting the environment variable " \
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
-        if args.sequence_parallel:
-            raise RuntimeError(
-                "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+    # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
+    # Assigning high priority to communication streams ensures that communication kernels are scheduled
+    # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
+    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
+        if 'dp_cp' not in args.high_priority_stream_groups:
+            args.high_priority_stream_groups.append('dp_cp')
+        if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
+            args.high_priority_stream_groups.append('ep_dp')
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -690,8 +955,6 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.rotary_interleaved and args.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     if args.rotary_interleaved and args.use_legacy_models:
         raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
     if args.rotary_interleaved and not args.deprecated_use_mcore_models:
@@ -704,6 +967,17 @@ def validate_args(args, defaults={}):
     if not args.add_position_embedding and args.position_embedding_type != 'rope':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
+    # Relative position embeddings arguments
+    if args.position_embedding_type == 'relative':
+        assert (
+            args.transformer_impl == "transformer_engine"
+        ), 'Local transformer implementation currently does not support attention bias-based position embeddings.'
+
+    # MultiModal rotary embeddings arguments
+    if args.position_embedding_type == "mrope":
+        assert args.mrope_section is not None, \
+            '--mrope-section should be set when using --position-embedding-type mrope.'
+
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
@@ -713,9 +987,9 @@ def validate_args(args, defaults={}):
     if args.tensor_model_parallel_size > 1:
             assert args.sequence_parallel, \
                 "When using MoE and tensor parallelism, sequence parallelism must be used."
-                
-    if args.moe_ffn_hidden_size is None:
+    if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
+        print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Context parallel
     if args.context_parallel_size > 1:
@@ -729,19 +1003,33 @@ def validate_args(args, defaults={}):
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
 
+    # MoE router check
+    if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
+        args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
+    if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
+        args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+
     # Distributed checkpointing checks
     if args.use_dist_ckpt and args.use_legacy_models:
         raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
+
+    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
+    if args.ckpt_format == "torch_dcp":
+        assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
+        assert args.tensor_model_parallel_size <= 1, \
+            "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
+        assert args.pipeline_model_parallel_size <= 1, \
+            "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
+
+    # fsdp_dtensor checkpointing format checks.
+    if args.ckpt_format == "fsdp_dtensor":
+        assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
            any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
            <= 1, "A single data source must be provided in training mode, else None"
-
-    if args.use_tp_pp_dp_mapping:
-        assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
-            "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
 
     # Deterministic mode
     if args.deterministic_mode:
@@ -757,6 +1045,21 @@ def validate_args(args, defaults={}):
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
+
+    if args.result_rejected_tracker_filename is not None:
+        # Append to passed-in args.iterations_to_skip.
+        iterations_to_skip_from_file = RerunStateMachine.get_skipped_iterations_from_tracker_file(
+            args.result_rejected_tracker_filename
+        )
+        args.iterations_to_skip.extend(iterations_to_skip_from_file)
+
+    # Make sure all functionality that requires Gloo process groups is disabled.
+    if not args.enable_gloo_process_groups:
+        if args.use_distributed_optimizer:
+            # If using distributed optimizer, must use distributed checkpointing.
+            # Legacy checkpointing uses Gloo process groups to collect full distributed
+            # optimizer state in the CPU memory of DP rank 0.
+            assert args.use_dist_ckpt
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -778,10 +1081,19 @@ def validate_args(args, defaults={}):
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
 
+    if args.load_main_params_from_ckpt:
+        assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
             "--inference-batch-times-seqlen-threshold requires setting --pipeline-model-parallel-size > 1."
+        assert not args.enable_cuda_graph, "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
+
+    if args.inference_dynamic_batching:
+        assert args.inference_dynamic_batching_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_chunk_size % 256 == 0, "chunk size should be a multiple of 256"
+        assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
 
     # MoE upcycling check
     if args.moe_use_upcycling:
@@ -792,6 +1104,57 @@ def validate_args(args, defaults={}):
         if not args.no_load_rng:
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
+
+    # Optimizer CPU offload check
+    if args.optimizer_cpu_offload:
+        assert args.use_precision_aware_optimizer, (
+            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
+            "as the hybrid device optimizer reuses the code path of this flag."
+        )
+        assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
+            "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
+            "must be used in conjunction with `--fp8-recipe delayed`."
+        )
+
+    if args.non_persistent_ckpt_type == "local":
+        assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
+    if args.replication:
+        assert args.replication_jump is not None, "--replication requires the value of --replication-jump!"
+        assert args.non_persistent_ckpt_type == "local", f"--replication requires args.non_persistent_ckpt_type == 'local', but got: {args.non_persistent_ckpt_type}"
+    elif args.replication_jump:
+        print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
+        args.replication_jump = None
+
+    if args.delay_wgrad_compute:
+        assert args.transformer_impl == 'transformer_engine', \
+            "Delaying wgrad compute is only supported with transformer_engine implementation"
+        assert not args.overlap_grad_reduce, \
+            "Delaying wgrad compute is not supported with overlap_grad_reduce"
+
+    if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
+        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
+            + f"The supported position embedding types are rope and none."
+        )
+
+    # CUDA Graphs
+    if args.enable_cuda_graph or args.external_cuda_graph:
+        assert (
+            not args.enable_cuda_graph or not args.external_cuda_graph
+        ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+            args.te_rng_tracker = True
+            warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
+
+    if args.external_cuda_graph:
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
+            "The training may crash with illegal memory access."
+        )
+        assert (
+            args.recompute_granularity != 'full'
+        ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
     # Print arguments.
     _print_args("arguments", args)
@@ -827,6 +1190,10 @@ def core_transformer_config_from_args(args, config_class=None):
 
     # if args.multi_latent_attention:
     #     config_class = MLATransformerConfig
+    
+    if args.heterogeneous_layers_config_path is not None:
+        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        config_class = HeterogeneousTransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
@@ -841,8 +1208,9 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['first_pipeline_num_layers']= args.decoder_first_pipeline_num_layers
-    kw_args['last_pipeline_num_layers']= args.decoder_last_pipeline_num_layers
+    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -860,10 +1228,30 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['num_query_groups'] = None
     kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.rope_type is None:
+        # Pop 'rope_type' to let the config class use the default value.
+        kw_args.pop('rope_type', None)
+    else:
+        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
+            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+        )
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
-    
+        if args.is_hybrid_model:
+        kw_args['is_hybrid_model'] = args.is_hybrid_model
+
+    # handle quantization config
+    # NOTE: Kitchen arguments are only added to the namespace when
+    # Kitchen library is available.
+    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
+    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+
+
     if args.disable_te_fused_rope:
         kw_args['disable_te_fused_rope'] = args.disable_te_fused_rope
         
@@ -879,6 +1267,12 @@ def _add_transformer_engine_args(parser):
                        choices=['e4m3', 'hybrid'],
                        help='Which fp8 format scheme to use for FP8 tensors in the forward and backward pass',
                        dest='fp8')
+    # per tensor current scaling recipe selection
+    group.add_argument('--fp8-recipe', default='delayed',
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
+                       help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
+                       dest='fp8_recipe')
+    # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
                        dest='fp8_margin')
@@ -905,6 +1299,17 @@ def _add_transformer_engine_args(parser):
                        help='Keep the fp8 weight transpose cache in memory to avoid recomputing it '
                             ' This will use more memory')
 
+    group.add_argument('--first-last-layers-bf16', action='store_true',
+                       help='Construct first and last layers in bf16 when doing FP8 training.')
+    group.add_argument('--num-layers-at-start-in-bf16', type=int, default=1,
+                       help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
+                       help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    group.add_argument('--te-rng-tracker', action='store_true', default=False,
+                       help='Use the Transformer Engine version of the random number generator. '
+                            'Required for CUDA graphs support.')
+    group.add_argument('--inference-rng-tracker', action='store_true', default=False,
+                       help='Use a random number generator configured for inference.')
     return parser
 
 def _add_inference_args(parser):
@@ -931,9 +1336,77 @@ def _add_inference_args(parser):
                        'Bert embedder.')
     group.add_argument('--flash-decode', default=False, action="store_true",
                        help='Whether to use the flash decoding kernel.')
+    group.add_argument('--enable-cuda-graph', default=False, action="store_true",
+                       help='Use CUDA graph capture and replay. --cuda-graph-scope=\"full_iteration\" '
+                       'enables whole iteration CUDA graph. ')
+    group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
+                       help="Number of CUDA graph warmup steps")
+    group.add_argument('--external-cuda-graph', action='store_true',
+                       help='Use CUDA graph capture and replay. The CUDA graphs are'
+                       'manually captured in the training script.')
+    group.add_argument('--cuda-graph-scope', type=str, default='full',
+                       choices=['full', 'attn', 'full_iteration'],
+                       help='Determines the CUDA graphs capturing scope. Valid values are '
+                       '\"full\", \"attn\" and \"full_iteration\". \"Full\" scope captures a whole '
+                       'Transformer layer. \"Attn\" scope only captures operations in '
+                       'TransformerLayer._forward_attention(). \"ful_iteration\" scope captures a '
+                       'whole iteration.')
+    group.add_argument('--inference-max-requests', type=int, default=8,
+                       help='Maximum number of requests for inference.',
+                       dest='inference_max_batch_size')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
-                       help='Maximum sequence length allocated for prefill during inference.',
+                       help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
+    group.add_argument('--inference-dynamic-batching',
+                       action='store_true', default=False,
+                       help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
+                       type=float, default=40.,
+                       help='Total buffer size (GB) allocated for the chunked KV '
+                       'memory.')
+    group.add_argument('--inference-dynamic-batching-chunk-size',
+                       type=int, default=256,
+                       help='KV cache chunk size. '
+                       'It should be a multiple of 256')
+    group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
+                       type=float, default=0.2,
+                       help='Space is reserved within the inference context '
+                       'memory buffer to guarantee that a minimum number of '
+                       'active requests will always be able to run to '
+                       'completion. This is to avoid the context being blocked '
+                       'by paused requests.')
+    group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
+                       type=float, default=None,
+                       help='Scaling factor over the memory buffer size for auto '
+                       'computing `max_requests` and `max_tokens`. This scaling '
+                       'factor is used for fitting more requests and tokens in '
+                       'the memory buffer than it can safely hold, which in turn '
+                       'increases throughput.')
+    group.add_argument('--inference-dynamic-batching-max-requests-override',
+                       type=int, default=None,
+                       help='If set, this overrides the max requests as computed '
+                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+    group.add_argument('--inference-dynamic-batching-max-tokens-override',
+                       type=int, default=None,
+                       help='If set, this overrides the max tokens as computed '
+                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+    group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
+                       type=int, default=16,
+                       help='Maximum number of cuda graphs to capture, where the '
+                       'cuda graph batch sizes range from 1 to `max_requests`. '
+                       '(See `dynamic_context.py` for details on how '
+                       '`max_requests` is computed). Due to rounding, the actual '
+                       'number of cuda graphs may not equal this argument.')
+    group.add_argument('--symmetric-ar-type', type=str, default=None,
+                       choices=['two_shot', "one_shot", "multimem_all_reduce", None],
+                       help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')
+    group.add_argument('--nccl-all-reduce-for-prefill',
+                       action='store_true', default=False,
+                       help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
+    group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
+                       help='Number of chunks along sequence dimension for MLP '
+                       'computation during prefill')
+
     return parser
 
 
@@ -1015,8 +1488,12 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                       choices=['learned_absolute', 'rope', 'none'],
-                       help='Position embedding type.')
+                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+                        help='Position embedding type.')
+    group.add_argument('--relative-attention-num-buckets', type=int, default=32,
+                        help='Number of buckets for relative position embeddings.')
+    group.add_argument('--relative-attention-max-distance', type=int, default=128,
+                        help='Maximum distance for relative position embeddings calculation.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
@@ -1029,13 +1506,26 @@ def _add_network_size_args(parser):
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--use-rope-scaling', action='store_true',
-                       help='Apply rope scaling as used in llama3.1')
+                       help='Apply rope scaling as used in llama3.x')
+    group.add_argument('--rope-scaling-factor', type=float, default=8.0,
+                       help='Rope scaling factor in llama3.x models')
+    group.add_argument('--no-rope-freq', type=no_rope_freq_type, default=None,
+                       help='Controls which layers to skip performing Rotary Position Embedding. Accepts either: '
+                            '- An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers. '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([0]*3+[1]*1)*3" evaluates to [0,0,0,1,0,0,0,1,0,0,0,1] '
+                            'where 1 indicates no-rope layer. This patten is equivalent to --no-rope-freq=4.'
+                            'By default this is disabled and set to None, indicating RoPE will be performed'
+                            'on every layer.'
+                       )
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
     group.add_argument('--disable-te-fused-rope', action='store_true', default = False,
                        help='Disable fused rope from transformer-engine: use --disable_te_fused_rope')
+    group.add_argument('--mrope-section', nargs='+', type=int, default=None,
+                       help='Multimodal rope section is for channel dimension, empty by default.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
@@ -1077,6 +1567,16 @@ def _add_network_size_args(parser):
                        help='k attention sink tokens.')
     parser.add_argument("--window-size", type=int, nargs=2, help="sliding window size")
 
+    group.add_argument('--mtp-num-layers', type=int, default=None,
+                       help='Number of Multi-Token Prediction (MTP) Layers.'
+                       'MTP extends the prediction scope to multiple future tokens at each position.'
+                       'This MTP implementation sequentially predict additional tokens '
+                       'by using D sequential modules to predict D additional tokens.')
+    group.add_argument('--mtp-loss-scaling-factor', type=float, default=0.1,
+                       help='Scaling factor of Multi-Token Prediction (MTP) loss. '
+                       'We compute the average of the MTP losses across all depths, '
+                       'and multiply it the scaling factor to obtain the overall MTP loss, '
+                       'which serves as an additional training objective.')
     return parser
 
 
@@ -1092,6 +1592,60 @@ def _add_straggler_detector_args(parser):
                        help='Number of ranks to report with high/low estimated throughput')
     return parser
 
+def _add_workload_inspector_server_args(parser):
+    group = parser.add_argument_group(title='workload inspector')
+    group.add_argument('--run-workload-inspector-server', action='store_true',
+                       help='If set, enables workload inspector server for on-demand profiling.')
+    return parser
+
+def _add_inprocess_restart_args(parser):
+    group = parser.add_argument_group(title='In-process restart')
+
+    group.add_argument('--inprocess-restart', action='store_true',
+                       help='Enables in-process restart.')
+
+    group.add_argument('--inprocess-max-iterations', default=None, type=int,
+                       help='Maximum number of in-process restart iterations.')
+    group.add_argument('--inprocess-monitor-thread-interval', default=1.0, type=float,
+                       help='Monitoring interval (in seconds) for the monitoring thread.')
+    group.add_argument('--inprocess-monitor-process-interval', default=1.0, type=float,
+                       help='Monitoring interval (in seconds) for the monitoring process.')
+    group.add_argument('--inprocess-progress-watchdog-interval', default=1.0, type=float,
+                       help='Interval (in seconds) for automatic progress watchdog timestamp '
+                       'updates.')
+    group.add_argument('--inprocess-heartbeat-interval', default=30, type=float,
+                       help='Monitoring interval (in seconds) for detecting unresponsive ranks.')
+
+    group.add_argument('--inprocess-soft-timeout', default=60, type=float,
+                       help='Soft progress timeout (in seconds).')
+    group.add_argument('--inprocess-hard-timeout', default=90, type=float,
+                       help='Hard progress timeout (in seconds).')
+    group.add_argument('--inprocess-heartbeat-timeout', default=60, type=float,
+                       help='Timeout (in seconds) for a missing rank detection heartbeat.')
+
+    group.add_argument('--inprocess-barrier-timeout', default=120, type=float,
+                       help='Timeout (in seconds) for internal distributed barrier')
+    group.add_argument('--inprocess-completion-timeout', default=120, type=float,
+                       help='Timeout (in seconds) for barrier on completion on all ranks')
+
+    group.add_argument('--inprocess-last-call-wait', default=1, type=float,
+                       help='Time interval (in seconds) for other ranks to report concurrent '
+                       'terminal failures.')
+    group.add_argument('--inprocess-termination-grace-time', default=1, type=float,
+                       help='Interval (in seconds) between SIGTERM and SIGKILL issued on hard '
+                       'timeout')
+
+    group.add_argument('--inprocess-granularity', default='node', type=str,
+                       choices=['node', 'rank'],
+                       help='Granularity for in-process restart.')
+    group.add_argument('--inprocess-active-world-size',
+                       default=int(os.getenv('WORLD_SIZE', '1')), type=int,
+                       help='The number of ranks initially executing the workload. '
+                       'The remaining ranks from the allocation are set aside '
+                       'as warm reserve.')
+    group.add_argument('--inprocess-empty-cuda-cache', action='store_true',
+                       help='Release all unoccupied cached GPU memory on every in-process restart.')
+    return parser
 
 def _add_one_logger_args(parser):
     group = parser.add_argument_group(title='one logger')
@@ -1126,6 +1680,9 @@ def _add_ft_package_args(parser):
     group = parser.add_argument_group(title='ft_package')
     group.add_argument('--enable-ft-package', action='store_true',
                        help='If set, Fault Tolerance package is enabled. '
+                       'Note: This feature is for Nvidia internal use only.')
+    group.add_argument('--calc-ft-timeouts', action='store_true',
+                       help='If set, FT package will try to automatically compute the timeouts. '
                        'Note: This feature is for Nvidia internal use only.')
     return parser
 
@@ -1163,6 +1720,8 @@ def _add_logging_args(parser):
                        '      executed numerous times during each iteration. '
                        'Note that setting the level to 1 or 2 might '
                        'cause increase in iteration time.')
+    group.add_argument('--log-energy', action='store_true',
+                       help='If set, log energy consumption (in Joules)')
     group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
                        help='If not set, use barrier with level 1 time '
                        'measurements. Note that this is up to the user '
@@ -1181,7 +1740,7 @@ def _add_logging_args(parser):
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
                        help='Size of the tensorboard queue for pending events '
-                       'and summaries before one of the ‘add’ calls forces a '
+                       'and summaries before one of the "add" calls forces a '
                        'flush to disk.')
     group.add_argument('--log-timers-to-tensorboard', action='store_true',
                        help='If set, write timers to tensorboard.')
@@ -1289,14 +1848,17 @@ def _add_training_args(parser):
                        'with larger models, sequences, and batch sizes. '
                        'It is supported at two granularities 1) full: '
                        'whole transformer layer is recomputed, '
-                       '2) selective: core attention part of the transformer '
-                       'layer is recomputed.')
+                       '2) selective: submodules set in --recompute-modules '
+                       'are recomputed, default is core_attn.')
     group.add_argument('--no-check-for-nan-in-loss-and-grad', action='store_false',
                        help='Check for NaNs in loss and grad',
                        dest='check_for_nan_in_loss_and_grad')
     group.add_argument('--check-for-spiky-loss', action='store_true',
                        help='Check for spiky loss',
                        dest='check_for_spiky_loss')
+    group.add_argument('--check-for-large-grads', action='store_true',
+                       help='Check for unexpectedly large grads',
+                       dest='check_for_large_grads')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
@@ -1315,6 +1877,20 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--recompute-modules', nargs='*', type=str, default=None,
+                       help='The submodules to recompute. '
+                       'choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", '
+                       '         "mlp", "moe", "shared_experts". '
+                       'default: ["core_attn"].'
+                       '"core_attn": recompute the core attention part of the transformer layer. '
+                       '"moe_act": recompute the MoE MLP activation function. '
+                       '"layernorm": recompute the input_layernorm and pre_mlp_layernorm. '
+                       '"mla_up_proj": recompute the MLA up projection and RoPE applying parts.'
+                       '"mlp": recompute the dense MLP layer.'
+                       '"moe": recompute the MoE layer.'
+                       '"shared_experts": recompute the shared experts in the MoE layer.'
+                       '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
+                       '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -1329,6 +1905,13 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
+    group.add_argument('--iterations-to-skip', nargs='+', type=int, default=[],
+                       help='List of iterations to skip, empty by default.')
+    group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
+                       help='Optional name of file tracking `result_rejected` events.')
+    group.add_argument('--disable-gloo-process-groups', action='store_false',
+                       dest='enable_gloo_process_groups',
+                       help='Disables creation and usage of Gloo process groups.')
     group.add_argument('--use-pytorch-profiler', action='store_true',
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
@@ -1419,6 +2002,8 @@ def _add_training_args(parser):
                        help='Disable bias and swiglu fusion, the fusion is '
                        'available only when using megatron-core.',
                        dest='bias_swiglu_fusion')
+    group.add_argument('--use-fused-weighted-squared-relu', action='store_true',
+                       help='Use fused weighted squared relu when using MoE.')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
@@ -1426,9 +2011,16 @@ def _add_training_args(parser):
                        help='Disable rope fusion, the fusion is available '
                        'only when using megatron-core.',
                        dest='apply_rope_fusion')
+    group.add_argument('--rope-type', type=str, default=None,
+                      choices=['rope', 'yarn'],
+                      help='Type of rope to use. Note that MLA takes yarn by default, '
+                      'and common attention takes rope by default.')
     group.add_argument('--cross-entropy-loss-fusion', action='store_true',
                        help='Enabled fusion of cross entropy loss calculation.',
                        dest='cross_entropy_loss_fusion')
+    group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
+                       choices=['native', 'te'],
+                       help='Implementation of cross entropy loss calculation.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
@@ -1441,6 +2033,18 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
+    group.add_argument('--optimizer-cpu-offload', action='store_true',
+                       help='Offload optimizer state to CPU')
+    group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
+                          help='Ratio of optimizer state to offload to CPU')
+    group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
+                       help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
+    group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
+                       help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
+    group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
+                       help='Disable pinning of CPU memory for gradients.')
+    group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
+                       help='Disable pinning of CPU memory for parameters.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
@@ -1491,6 +2095,12 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
+    group.add_argument('--pipeline-model-parallel-comm-backend', type=str, default=None,
+                       choices=['nccl', 'ucc'],
+                       help='Select a communicator backend for pipeline parallel communication. '
+                       'If None, the default backend will be used.')
+    group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
+                       help='The communicator group names to use high priority streams.')
 
     return parser
 
@@ -1504,7 +2114,7 @@ def _add_rerun_machine_args(parser):
     group.add_argument('--error-injection-type', type=str, default='transient_error',
                        choices=['correct_result', 'transient_error', 'persistent_error'],
                        help='Type of error to inject. ')
-    group.add_argument('--rerun-mode', type=str, default='disabled',
+    group.add_argument('--rerun-mode', type=str, default='validate_results',
                        choices=['disabled', 'validate_results', 'report_stats'],
                        help='Use re-run engine to validate results (default) '
                        'or to emit stats on variability of computations due to '
@@ -1525,6 +2135,16 @@ def _add_initialization_args(parser):
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
+    group.add_argument('--embedding-init-method-std', type=float, default=None,
+                       help='Standard deviation of the zero mean normal '
+                       'distribution used for embedding weight initialization. '
+                       'If unset, embeddings will be initialized the same way '
+                       'as other weights. Setting this to a value around 1.0 '
+                       'may avoid loss spikes in training. Setting this to any '
+                       'value will also skip applying weight decay on embedding '
+                       'weights to avoid shrinkage towards zero. See '
+                       'https://arxiv.org/abs/2312.16903 for more details.'
+                       )
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')
 
@@ -1542,7 +2162,7 @@ def _add_learning_rate_args(parser):
                        choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
-                       choices=['exponential', 'linear', 'cosine'],
+                       choices=['exponential', 'linear', 'cosine', 'minus_sqrt'],
                        help='Decay style for the annealing phase of WSD'),
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -1599,6 +2219,9 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
                        help='Number of iterations between persistent checkpoint saves.')
+    group.add_argument('--save-retain-interval', type=int, default=None,
+                       help='Number of iterations between retained checkpoints (other'
+                       'checkpoints _except the last checkpoint_ are automatically deleted).')
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
@@ -1607,16 +2230,19 @@ def _add_checkpointing_args(parser):
                        help='Directory containing a model checkpoint.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
+    group.add_argument('--load-main-params-from-ckpt', action='store_true', default=None,
+                       help='Load main parameters from checkpoint directly.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--no-strict-fsdp-dtensor-load', action='store_false', dest='strict_fsdp_dtensor_load',
+                       help='Do not strict loading for fsdp_dtensor checkpoint format.')
     group.add_argument('--non-persistent-save-interval', type=int, default=None,
                        help='Number of iterations between non-persistent saves.')
     group.add_argument('--non-persistent-ckpt-type', type=str, default=None,
                        choices=['global', 'local', 'in_memory', None],
                        help='Type of non-persistent model checkpoints. '
                            '"global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed. '
-                           '"local" - [TBD] Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
-                           '"in_memory" - [TBD] A special kind of local checkpoint that avoids serialization. '
+                           '"local" - Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
                            'None - No non-persistent checkpointing (default option).')
     group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
                        help='Directory containing global non-persistent model checkpoints.')
@@ -1652,6 +2278,9 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--use-persistent-ckpt-worker', action='store_true',
+                       help='Enables a persitent checkpoint worker for async save')
+
     group.add_argument('--auto-detect-ckpt-format', action='store_true',
                        help='Determine if the checkpoint format is in legacy or distributed format.'
                             ' If False, expects distributed checkpoint iff args.ckpt_format != "torch".'
@@ -1660,8 +2289,11 @@ def _add_checkpointing_args(parser):
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'zarr'],
-                       help='Checkpoint format to use.')
+                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp', 'fsdp_dtensor'],
+                       help='Checkpoint format to use. torch is the format used by torch.save/load.'
+                       ' torch_dist is a megatron built-in distributed checkpointing format.'
+                       ' torch_dcp is the torch.distributed.checkpoint format.'
+                       ' fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.')
     group.add_argument('--ckpt-convert-format', default=None,
                        choices=['torch', 'torch_dist', 'zarr'],
                        help='Checkpoint format for conversion.')
@@ -1697,6 +2329,9 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
+    group.add_argument('--load-model-opt-format', action='store_true',
+                       help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
+                            'This function can also be used to load NeMo .nemo sharded checkpoints.')
     return parser
 
 
@@ -1707,6 +2342,8 @@ def _add_mixed_precision_args(parser):
                        help='Run model in fp16 mode.')
     group.add_argument('--bf16', action='store_true',
                        help='Run model in bfloat16 mode.')
+    group.add_argument('--grad-reduce-in-bf16', action='store_true',
+                       help='Reduce gradients in bfloat16.')
     group.add_argument('--loss-scale', type=float, default=None,
                        help='Static loss scaling, positive power of 2 '
                        'values can improve fp16 convergence. If None, dynamic'
@@ -1732,6 +2369,11 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--disable-bf16-reduced-precision-matmul', action='store_true',
+                       help='If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to '
+                       'prevent matmul from using reduced precision accumulation when using BF16.')
+    group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
+                       help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
 
     return parser
 
@@ -1741,17 +2383,8 @@ def _add_distributed_args(parser):
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
-    group.add_argument('--encoder-tensor-model-parallel-size', type=int, default=0,
-                       help='Degree of tensor model parallelism for the encoder.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
-    group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=0,
-                       help=('Degree of pipeline model parallelism in the encoder. This is '
-                             'independent of the amount of pipeline in the decoder.'))
-    group.add_argument('--pipeline-model-parallel-split-rank',
-                       type=int, default=None,
-                       help=('Rank where encoder and decoder should be split. '
-                             'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
@@ -1760,11 +2393,21 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('The number of transformer layers on the last pipeline stage of the decoder. '
                        'Default None is even split of transformer layers across all pipeline stages'))
+    group.add_argument('--pipeline-model-parallel-layout',
+                       type=str, default=None,
+                       help=('A string that describes a custom pipeline model parallel layout. '
+                       'e.g., "E|(t|)*3,m|m||L". E, L, t, m denotes embedding, loss, transformer '
+                       'decoder layer, and mtp layer, respectively. Stages are split by "|". '
+                       'Replicated stages or layers can be described with multiplication. '
+                       'Commas can be used cosmetically. '
+                       'Default None is not using this argument to set the layout.'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--num-virtual-stages-per-pipeline-rank', type=int, default=None,
+                       help='Number of virtual pipeline stages per pipeline parallelism rank')
     group.add_argument('--microbatch-group-size-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of contiguous microbatches per virtual pipeline stage',
                        dest='microbatch_group_size_per_vp_stage')
@@ -1792,8 +2435,15 @@ def _add_distributed_args(parser):
                        help='If not set, all PP stages will launch gradient reduces simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
                        dest='align_grad_reduce')
+    group.add_argument('--ddp-num-buckets', type=int, default=None,
+                       help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
+    group.add_argument('--ddp-pad-buckets-for-high-nccl-busbw', action='store_true',
+                       default=False, help='If set, make sure the bucket size is divisible by a large power '
+                       'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
+                       'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
+                       'apparently needs to be divisible by a power of 2 for high busbw.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -1816,21 +2466,58 @@ def _add_distributed_args(parser):
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() '
                        'skips DDP initialization and returns function to '
-                       'complete it instead.Also turns on '
+                       'complete it instead. Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
-    group.add_argument('--standalone-embedding-stage', action='store_true',
-                       default=False, help='If set, *input* embedding layer '
-                       'is placed on its own pipeline stage, without any '
-                       'transformer layers. (For T5, this flag currently only '
-                       'affects the encoder embedding.)')
+    group.add_argument('--account-for-embedding-in-pipeline-split', action='store_true',
+                       default=False, help='If set, *input* embedding layer will be treated as a standard transformer'
+                       'layer in the context of partition and placement for pipeline parallelism.')
+    group.add_argument('--account-for-loss-in-pipeline-split', action='store_true',
+                       default=False, help='If set, loss layer will be treated as a standard transformer'
+                       'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub', 
+                       help='Use the userbuffer registration for DP/FSDP communication buffers.'
+                       'This option will reduce GPU SM usage for the DP/FSDP communication,'
+                       'which is improving the performance of the overlapped computation.')
+    group.add_argument('--use-sharp', action='store_true', 
+                       help='Required to enable SHARP communication.')
+    group.add_argument('--sharp-enabled-group', type=str, default=None,
+                       choices=['dp', 'dp_replica'],
+                       help='IB SHARP can be enabled from only one communication group. '
+                       'By default, it is enabled from dp group. '
+                       'Available options: [dp, dp_replica]')
+    group.add_argument('--use-megatron-fsdp', action='store_true',
+                       help='Use the Megatron FSDP code path in DDP.')
+    group.add_argument('--init-model-with-meta-device', action='store_true')
+    group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
+                       choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
+                       help='Sharding strategy of data parallelism.')
+    group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
+                       help='If not set, fuse the division in gradient reduce.')
+    group.add_argument('--fsdp-double-buffer', action='store_true',
+                       help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
+                        "Double-buffering the communication memory improves memory management efficiency by "
+                        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
+                        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+    group.add_argument('--suggested-communication-unit-size', type=int, default=None,
+                   help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
+                        'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
+                        'while a smaller value disables prefetching and may degrade performance. Adjust this value based on your system\'s memory '
+                        'and performance requirements.')
+    group.add_argument('--keep-fp8-transpose-cache', action='store_true',
+                       help='If set, keep the fp8 transpose cache when using Megatron FSDP.')
+    group.add_argument('--enable-full-sharding-in-hsdp', action='store_true',
+                       help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',
-                       help="Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel."
-                       "It is still not in a stable release stage, and may therefore contain bugs or other potential issues.")
+                       help='Use the torch FSDP2 implementation. FSDP2 has not been tested with pipeline parallelism, '
+                       'and may contain bugs.')
+    group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
+                       help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
+                       'Set to enable FSDP ZeRO-2.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
@@ -1852,14 +2539,25 @@ def _add_distributed_args(parser):
                        'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
     group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
                         help='If set, distributed ranks initialize order is changed '
-                        'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
-                        'with this option enabled')
+                        'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
+    group.add_argument('--replication', action='store_true', default=False,
+                       help="If set, replication of local checkpoints is enabled. "
+                       "Needs to be enabled on all ranks.")
+    group.add_argument('--replication-jump', default=None, type=int,
+                       help="Specifies `J`, the spacing between ranks storing replicas of a given rank's data. "
+                       "Replicas for rank `n` may be on ranks `n+J`, `n+2J`, ..., or `n-J`, `n-2J`, etc. "
+                       "This flag has an effect only if --replication is used. "
+                       "and must be consistent across all ranks.")
+    group.add_argument('--replication-factor', default=2, type=int,
+                       help="Number of machines storing the replica of a given rank's data.")
     return parser
 
 
 def _add_validation_args(parser):
     group = parser.add_argument_group(title='validation')
 
+    group.add_argument('--full-validation', action='store_true', help='If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!')
+    group.add_argument('--multiple-validation-sets', action='store_true', help='If set, multiple datasets listed in the validation split are evaluated independently with a separate loss for each dataset in the list. This argument requires that no weights are included in the list')
     group.add_argument('--eval-iters', type=int, default=100,
                        help='Number of iterations to run for evaluation'
                        'validation/test for.')
@@ -1878,6 +2576,10 @@ def _add_tokenizer_args(parser):
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
+    group.add_argument('--padded-vocab-size', type=int, default=None,
+                       help='Vocabulary size of the model (padded to be divisible by '
+                       'tensor model parallel size). If not provided, it will be '
+                       'automatically calculated from vocab-size.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -1898,7 +2600,9 @@ def _add_tokenizer_args(parser):
                                 'MultimodalTokenizer',
                                 'NullTokenizer',
                                 'DeepSeekV2Tokenizer',
-                                'DeepSeekV3Tokenizer'],
+                                'DeepSeekV3Tokenizer',
+                                'NullMultimodalTokenizer',
+                                'SFTTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
@@ -1922,11 +2626,6 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
-    group.add_argument('--renormalize-blend-weights', action='store_true',
-                       help='Renormalize the blend weights to account for the mid-level dataset '
-                       'oversampling done to ensure fulfillment of the requested number of '
-                       'samples. Use this option if prompted. Defaults to False for backward '
-                       'comparability in the data sample order.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -1991,8 +2690,10 @@ def _add_data_args(parser):
                        dest='create_attention_mask_in_dataloader')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
-    group.add_argument('--s3-cache-path', type=str, default=None,
-                       help='Path to cache index files when using s3 dataloader')
+    group.add_argument('--object-storage-cache-path', type=str, default=None,
+                       help='Path to cache index files when using s3 or msc dataloader')
+    group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
+                       help='The sample surplus to build for the mid-level datasets(s)')
     return parser
 
 def get_patch_args(parser):
@@ -2562,6 +3263,8 @@ def _add_vision_args(parser):
     # regularization arguments
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
+    group.add_argument('--qk-l2-norm', action='store_true',
+                       help='Use llama 4 qk l2 norm')
 
     return parser
 
@@ -2595,11 +3298,30 @@ def _add_moe_args(parser):
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
+                       help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
+    group.add_argument('--moe-layer-recompute', action='store_true',
+                       help='Enable checkpointing for moe_layer, should be used when memory is not sufficient. '
+                       'Deprecated. Use "--recompute-granularity selective --recompute-modules moe" instead.')
+    group.add_argument('--moe-extended-tp', action='store_true',
+                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
+    group.add_argument('--moe-use-upcycling', action='store_true',
+                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
+                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
-    group.add_argument('--moe-router-load-balancing-type', type=str,
+    group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-dtype', type=str,
+                       choices=['fp32', 'fp64'],
+                       default=None,
+                       help='Data type for routing computation and expert output weighted averaging. '
+                            'Fp32/fp64 enhances numerical stability, especially with numerous experts. '
+                            'The perf impact should be negligible when used with permute fusion. '
+                            'None means no changes for dtype.')
+    group.add_argument('--moe-router-fusion', action='store_true',
+                       help='Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above.')
     group.add_argument('--moe-router-score-function', type=str,
                        choices=['softmax', 'sigmoid'],
                        default='softmax',
@@ -2612,7 +3334,7 @@ def _add_moe_args(parser):
                        help='Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.'
                        'Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)')
     group.add_argument('--moe-router-group-topk', type=int, default=None,
-                        help='Number of selected groups for group-limited routing.')
+                       help='Number of selected groups for group-limited routing.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
     group.add_argument('--moe-router-enable-expert-bias', action='store_true',
@@ -2624,20 +3346,33 @@ def _add_moe_args(parser):
                        'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
                        'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
-    group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
-                       help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
-    group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
+    group.add_argument('--moe-router-force-load-balancing', action='store_true',
+                       help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+                       help='Pad the routing_map to make sure the number of tokens each expert received '
+                       'is a multiple of 16/32 for FP8 precision. It is suggested to enable this for '
+                       'dropless training with FP8 precision when num_local_experts > 1. This is a more '
+                       'efficient way to pad for FP8 which eliminates the explicit padding in the '
+                       'GroupedMLP layer.')
+    group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
     group.add_argument('--moe-input-jitter-eps', type=float, default=None,
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
-    group.add_argument('--moe-token-dispatcher-type', type=str,
-                       choices=['allgather', 'alltoall', 'alltoall_seq'],
-                       default='allgather',
-                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    # Token dispatcher arguments
+    group.add_argument('--moe-token-dispatcher-type', type=str,
+                       choices=['allgather', 'alltoall', 'flex'],
+                       default='allgather',
+                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+    group.add_argument('--moe-enable-deepep', action='store_true',
+                       help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
+    group.add_argument('--moe-deepep-num-sms', type=int, default=20,
+                       help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-permute-fusion', action='store_true',
+                       help='Fuse token rearrangement ops during token dispatching.')
     # Token dropping arguments
     group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
                        help='The capacity factor for each expert, None means no token will be dropped.')
@@ -2645,16 +3380,17 @@ def _add_moe_args(parser):
                        help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
     group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
-    group.add_argument('--moe-layer-recompute', action='store_true',
-                       help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
-    group.add_argument('--moe-extended-tp', action='store_true',
-                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
-    group.add_argument('--moe-use-upcycling', action='store_true',
-                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
-                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
-    group.add_argument('--moe-permute-fusion', action='store_true',
-                       help='Fuse token rearrangement ops during token dispatching.')
+    group.add_argument('--moe-apply-probs-on-input', action='store_true',
+                       help='Apply probs before mlp activation for moe routing.')
+    # MoE communication overlap arguments
+    group.add_argument('--overlap-moe-expert-parallel-comm', action='store_true',
+                       help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
+    group.add_argument('--delay-wgrad-compute', action='store_true',
+                       help='Delay the wgrad compute for batch-level overlapping')
 
+    group.add_argument('--moe-upcycling-granularity', type=int, default=1,
+                       help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
+                       'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
     return parser
 
 def _add_mla_args(parser):
@@ -2671,12 +3407,70 @@ def _add_mla_args(parser):
                        help="Dimension of the head in the V projection.")
     group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
                        help="Rotary scaling factor for the rotary embeddings.")
+    group.add_argument('--mscale', type=float, default=1.0,
+                       help="Mscale for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--mscale-all-dim', type=float, default=0.0,
+                       help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--cache-mla-latents', action='store_true', default=False,
+                       help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_heterogeneous_args(parser):
+    """
+    Heterogeneous models refer to transformer architectures where individual layers can differ 
+    in configuration. Specifically:
+        - Attention or MLP layers can be replaced with either a linear layer or a no-op 
+        - MLP intermediate dimensions can vary between layers
+    We use the format of the HuggingFace config files in llama nemotron models to define the architecture.
+    For example, https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json
+
+    Most notably, the "block_config" maps to a list of attention and mlp configurations for each layer.
+    For example, the "block_config" for a 2 layer model is:
+     "block_configs": [
+        {
+            "attention": {
+                "n_heads_in_group": 8,
+                "no_op": false,
+                "replace_with_linear": false,
+            },
+            "ffn": {
+                "ffn_mult": 2.625,
+                "no_op": false,
+                "replace_with_linear": false,
+            }
+        },
+        {
+            "attention": {
+                "n_heads_in_group": null,
+                "no_op": true,
+                "replace_with_linear": false,
+            },
+            "ffn": {
+                "ffn_mult": 2.625,
+                "no_op": false,
+                "replace_with_linear": false,
+            }
+        }
+    ]
+    """
+    group = parser.add_argument_group(title="heterogeneous architecture")
+    group.add_argument('--heterogeneous-layers-config-path', type=str, default=None,
+                       help='Path to json file containing heterogeneous model configuration. '
+                       'Use the format of the HuggingFace config files in llama nemotron '
+                       'models, e.g. https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json.')
+    group.add_argument('--heterogeneous-layers-config-encoded-json', type=str, default=None,
+                       help='This is encoded json string of the heterogeneous model configuration. Used to keep the content '
+                       'of the heterogeneous model specification in args when the model is loaded from a checkpoint. '
+                       'Use the format of the HuggingFace config files in llama nemotron '
+                       'models, e.g. https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json.')
     return parser
 
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
+    group.add_argument('--enable-experimental', action='store_true',
+                       help='Enable experimental features.')
     group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '
@@ -2692,14 +3486,93 @@ def _add_experimental_args(parser):
                        'range [0.0, 1.0].')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Force a specific hybrid layer pattern. The value'
-                       'should be a string of characters chosen from'
-                       'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
-                       'If a value greater than 0.0 is supplied to any of the '
-                       'hybrid ratio arguments, then the number of each type'
-                       'of layer in the override pattern must match number in'
-                       'the overidden pattern')
+                            'should be a string of characters chosen from'
+                            'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
+                            'If a value greater than 0.0 is supplied to any of the '
+                            'hybrid ratio arguments, then the number of each type'
+                            'of layer in the override pattern must match number in'
+                            'the overidden pattern')
+    group.add_argument('--mamba-state-dim', type=int, default=128,
+                       help='State dimension for Mamba layers.')
+    group.add_argument('--mamba-head-dim', type=int, default=64,
+                       help='Head dimension for Mamba layers.')
+    group.add_argument('--mamba-num-groups', type=int, default=8,
+                       help='Number of groups for Mamba layers.')
+    group.add_argument('--mamba-num-heads', type=int, default=None,
+                       help='Number of heads for Mamba layers.'
+                       'If not set, then the number of heads will be '
+                       '--hidden-size * expand // --mamba-head-dim')
+    group.add_argument('--is-hybrid-model', default=False, action="store_true",
+                       help='Indicates whether the model is a hybrid model.')
+    group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",
+                       help='Disable Mamba efficient path.')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
-    group.add_argument('--moe-router-force-load-balancing',action='store_true',
-                       help = 'Enforce token dispatch balancing to MoE routing')
+
+    # Args of precision-aware optimizer
+    group.add_argument('--use-precision-aware-optimizer', action='store_true',
+                       help='Use the precision-aware optimizer in TransformerEngine, which allows '
+                       'setting the main params and optimizer states to lower precision, such as '
+                       'fp16, bf16 and fp8.')
+    group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
+                       help='Dtype of main grads when enabling precision-aware-optimizer')
+    group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
+                       help='Dtype of main params when enabling precision-aware-optimizer')
+    group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
+                       help='Dtype of exp_avg (1st moment in adam optimizer) when enabling '
+                            'precision-aware-optimizer. This dtype is used for storing the '
+                            'optimizer state in memory during training but does not affect '
+                            'the precision in the kernel computation.')
+    group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
+                       help='Dtype of exp_avg_sq (2nd moment in adam optimizer) when enabling '
+                            'precision-aware-optimizer. This dtype is used for storing the '
+                            'optimizer state in memory during training but does not affect '
+                            'the precision in the kernel computation.')
+    return parser
+
+
+def _add_msc_args(parser):
+    group = parser.add_argument_group(title="msc")
+    group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
+                       help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
+    return parser
+
+def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
+    """Add quant-specific arguments to the main parser
+
+    If kitchen isn't available, nothing to do here, return unchanged parser
+    """
+    try:
+        from megatron.core.extensions.kitchen import KitchenSpecProvider
+
+        have_kitchen = True
+    except (ImportError, ModuleNotFoundError):
+        have_kitchen = False
+
+    if have_kitchen:
+        group = parser.add_argument_group(title="kitchen")
+        recipe_or_config_group = group.add_mutually_exclusive_group(required=False)
+        recipe_or_config_group.add_argument(
+            '--kitchen-config-file',
+            type=str,
+            default=None,
+            help="Use the config .yaml file at the specified location to "
+            "configure kitchen quantization.",
+        )
+        recipe_or_config_group.add_argument(
+            '--kitchen-recipe-number',
+            type=int,
+            default=None,
+            help="Use a default kitchen recipe for all layers as defined by QAT_PARAMS index",
+        )
+        return parser
+
+    else:
+        return parser
+
+def _add_sft_args(parser):
+    group = parser.add_argument_group(title='sft')
+    group.add_argument('--sft', action="store_true", help='Megatron SFT training')
+    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned", 
+                       help='SFT prompt format.')
     return parser

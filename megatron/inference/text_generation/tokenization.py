@@ -22,6 +22,7 @@ def detokenize_generations(tokens_gpu_tensor,
 
     tokens = tokens_gpu_tensor.cpu().numpy().tolist()
     lengths = lengths_gpu_tensor.cpu().numpy().tolist()
+
     for sequence_tokens, length in zip(tokens, lengths):
         sequence_tokens = sequence_tokens[:length]
         detok_str = tokenizer.detokenize(sequence_tokens)

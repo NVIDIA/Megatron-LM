@@ -4,23 +4,19 @@ export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_APPLY_QK_LAYER_SCALING=0
 
+INPUT_IMAGE_PATH="placeholder"
 GROUNDTRUTH_PATH="placeholder"
 NUM_FRAMES=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --input-image-path)
+        -i|--input-image-path)
             INPUT_IMAGE_PATH="$2"
             shift
             shift
             ;;
         --num-frames)
             NUM_FRAMES="$2"
-            shift
-            shift
-            ;;
-        -g|--groundtruth-path)
-            GROUNDTRUTH_PATH="$2"
             shift
             shift
             ;;
@@ -34,12 +30,7 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
-        -t|--tokenizer-path)
-            TOKENIZER_PATH="$2"
-            shift
-            shift
-            ;;
-        --task)
+        -t|--task)
             TASK="$2"
             shift
             shift
@@ -92,7 +83,7 @@ do
         --no-masked-softmax-fusion \
         --load ${MODEL_PATH} \
         --tokenizer-type MultimodalTokenizer \
-        --tokenizer-model ${TOKENIZER_PATH} \
+        --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
         --tokenizer-prompt-format mistral \
         --bf16 \
         --micro-batch-size 1 \

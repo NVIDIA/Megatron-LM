@@ -34,11 +34,11 @@ class BlendedMegatronDatasetConfig:
        'blend'. Defauls to None.
     """
 
-    renormalize_blend_weights: bool = False
-    """Renormalize the blend weights to account for mid-level dataset oversampling done to ensure 
-       fulfillmenet of the of the requested number of samples. Defaults to False for backward
-       comparability in the data sample order.
-    """
+    multiple_validation_sets: Optional[bool] = None
+    """Whether the validation split should be treated as multiple seperate datasets."""
+
+    full_validation: Optional[bool] = None
+    """Whether to run a full epoch of validation each time validation occurs."""
 
     split: Optional[str] = None
     """The split string, a comma separated weighting for the dataset splits when drawing samples
@@ -67,7 +67,15 @@ class BlendedMegatronDatasetConfig:
     """
 
     tokenizer: Optional[MegatronTokenizer] = None
-    """The MegatronTokenizer instance or None. Required for datasets which do online tokenization."""
+    """The MegatronTokenizer instance. Required for datasets that do online tokenization."""
+
+    mid_level_dataset_surplus: float = 0.005
+    """The sample surplus to build for the mid-level datasets(s). Defaults arbitrarily to 0.005.
+       This value is irrelevant for single source data blends. This value may need to be increased
+       if the top level dataset oversamples the mid level dataset(s). This value may be set to 0.0
+       in future if the top level dataset is constrained to not oversample the mid level
+       datasets(s).
+    """
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -149,7 +157,8 @@ def convert_split_vector_to_split_matrix(
     Args:
         vector_a (List[float]): The primary split vector
 
-        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the primary split vector. Defaults to None.
+        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the
+            primary split vector. Defaults to None.
 
     Returns:
         List[Tuple[float, float]]: The split matrix consisting of book-ends of each split in order

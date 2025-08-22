@@ -21,13 +21,28 @@ def resolve_cluster_config(cluster: str) -> str:
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
+def resolve_artifact_config(cluster: str) -> str:
+    if cluster == "dgxh100_eos":
+        return "eos_lustre"
+    if cluster == "dgxa100_dracooci":
+        return "draco-oci_lustre"
+    if cluster == "dgxa100_dracooci-ord":
+        return "draco-oci-ord_lustre"
+    if cluster == "dgxh100_coreweave":
+        return "coreweave_lustre"
+    raise ValueError(f"Unknown cluster {cluster} provided.")
+
+
 def flatten_products(
     workload_manifest: jetclient.JETWorkloadManifest,
 ) -> jetclient.JETWorkloadManifest:
     """Flattens a nested dict of products"""
+
     workload_manifest.products = [
-        dict(zip(inp.keys(), values))
-        for inp in workload_manifest.products
+        dict(**dict(zip(inp.keys(), values)), **{"test_case": product['test_case'][0]})
+        for product in workload_manifest.products
+        if "products" in product
+        for inp in product['products']
         for values in itertools.product(*inp.values())
     ]
 
@@ -132,6 +147,25 @@ def filter_by_environment(
     return workload_manifests
 
 
+def filter_by_platform(
+    workload_manifests: List[jetclient.JETWorkloadManifest], platform: str
+) -> List[jetclient.JETWorkloadManifest]:
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if (
+            hasattr(workload_manifest.spec, "platforms")
+            and workload_manifest.spec.platforms == platform
+        )
+    )
+
+    if len(workload_manifests) == 0:
+        print("No test_case found!")
+        return []
+
+    return workload_manifests
+
+
 def filter_by_model(
     workload_manifests: List[jetclient.JETWorkloadManifest], model: str
 ) -> List[jetclient.JETWorkloadManifest]:
@@ -190,11 +224,13 @@ def load_workloads(
     time_limit: int = 1800,
     tag: Optional[str] = None,
     environment: Optional[str] = None,
+    platform: Optional[str] = None,
     test_cases: str = "all",
     scope: Optional[str] = None,
     model: Optional[str] = None,
     test_case: Optional[str] = None,
     container_image: Optional[str] = None,
+    record_checkpoints: Optional[str] = None,
 ) -> List[jetclient.JETWorkloadManifest]:
     """Return all workloads from disk that match scope and platform."""
     recipes_dir = BASE_PATH / ".." / "recipes"
@@ -219,6 +255,9 @@ def load_workloads(
     if workloads and tag:
         workloads = filter_by_tag(workload_manifests=workloads, tag=tag)
 
+    if workloads and platform:
+        workloads = filter_by_platform(workload_manifests=workloads, platform=platform)
+
     if workloads and test_cases != "all":
         workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
 
@@ -238,4 +277,29 @@ def load_workloads(
                 workloads.append(build_workload)
         workload.spec.n_repeat = n_repeat
         workload.spec.time_limit = time_limit
+        workload.spec.artifacts = {
+            key: value.replace(r'{platforms}', workload.spec.platforms)
+            for key, value in workload.spec.artifacts.items()
+        }
+
+        if record_checkpoints == 'true':
+            workload.outputs = [
+                {
+                    "type": "artifact",
+                    "key": f"unverified/model/mcore-ci/{container_tag}/{{model}}/{{name}}",
+                    "subdir": "checkpoints",
+                    "name": r"{model}/{name}",
+                    "description": r"Checkpoint of {model}/{name}",
+                    "pic": {"name": "Mcore CI", "email": "okoenig@nvidia.com"},
+                    "labels": {"origin": "ADLR/Megatron-LM"},
+                }
+            ]
     return workloads
+
+
+if __name__ == "__main__":
+    workflows = load_workloads(container_tag="main")
+    # Save workflows to YAML file
+    output_file = "workflows.yaml"
+    with open(output_file, "w") as f:
+        yaml.dump([workflow.model_dump() for workflow in workflows], f)

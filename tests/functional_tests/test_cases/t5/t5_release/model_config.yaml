@@ -1,8 +1,7 @@
 ENV_VARS:
-  CUDA_DEVICE_MAX_CONNECTIONS: '1'
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
-
-TEST_TYPE: 'release'
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+TEST_TYPE: "release"
 MODEL_ARGS:
   # T5 model args
   --encoder-num-layers: 12
@@ -16,11 +15,11 @@ MODEL_ARGS:
   --max-position-embeddings: 512
   --init-method-std: 0.015
   --attention-backend: unfused
-
   # Training args
   --micro-batch-size: 32
   --global-batch-size: 512
   --train-iters: 100000
+  --exit-interval: 100000
   --weight-decay: 1e-2
   --clip-grad: 1.0
   --bf16: true
@@ -35,7 +34,6 @@ MODEL_ARGS:
   # Model parallel
   --tensor-model-parallel-size: 4
   --pipeline-model-parallel-size: 1
-  --encoder-pipeline-model-parallel-size: 0
   # Data args
   --data-path: ${DATA_BLEND}
   --vocab-file: ${DATA_PATH}/bert-large-cased-vocab.txt
@@ -47,8 +45,8 @@ MODEL_ARGS:
   --log-interval: 100
   --save-interval: 2000
   --eval-interval: 1000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --eval-iters: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --log-timers-to-tensorboard: true

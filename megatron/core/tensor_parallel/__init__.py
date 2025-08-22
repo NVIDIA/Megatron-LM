@@ -26,6 +26,7 @@ from .mappings import (
     scatter_to_tensor_model_parallel_region,
 )
 from .random import (
+    CheckpointWithoutOutput,
     checkpoint,
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -65,6 +66,7 @@ __all__ = [
     "get_cuda_rng_tracker",
     "model_parallel_cuda_manual_seed",
     "get_expert_parallel_rng_tracker_name",
+    "CheckpointWithoutOutput",
     # utils.py
     "split_tensor_along_last_dim",
     "split_tensor_into_1d_equal_chunks",

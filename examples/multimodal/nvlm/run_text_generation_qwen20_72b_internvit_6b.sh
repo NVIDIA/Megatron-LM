@@ -97,7 +97,7 @@ do
         --decoder-seq-length ${DECODER_SEQ_LEN} \
         --max-position-embeddings ${MAX_POS_EMBED} \
         --tokenizer-type MultimodalTokenizer \
-        --tokenizer-model <tokenizer model path> \
+        --tokenizer-model Qwen/Qwen2-72B-Instruct \
         --tokenizer-prompt-format qwen2p0 \
         --position-embedding-type rope \
         --rotary-percent 1.0 \
