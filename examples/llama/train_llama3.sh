@@ -254,6 +254,7 @@ EXTRA_ARGS="
     --distributed-backend nccl \
     --distributed-timeout-minutes 120 \
     --overlap-grad-reduce \
+    --rerun-mode disabled \
 "
 
 if [ "$FSDP" -eq 1 ]; then

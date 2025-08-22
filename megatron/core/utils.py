@@ -1833,7 +1833,7 @@ def configure_nvtx_profiling(enabled: bool) -> None:
         enabled (bool): Whether to enable NVTX range profiling
     """
     global _nvtx_enabled
-    _nvtx_enabled = enabled
+    _nvtx_enabled = enabled and HAVE_NVTX
 
 
 def _nvtx_range_get_func_path():

@@ -186,6 +186,11 @@ markers = [
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
+    "failing_on_rocm: Currently Failing Tests on ROCm",
+    "failing_on_rocm_mi250: Tests failing on MI250",
+    "test_on_rocm: Tests run on ROCm specifically",
+    "failing_on_upstream: Failing on upsteam",
+    "experimental: marks a test as an experimental feature."
 ]
 
 [tool.coverage.run]
