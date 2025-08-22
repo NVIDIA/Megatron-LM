@@ -2,8 +2,9 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
-from typing import Any, Callable, Dict, Deque, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 from functools import lru_cache
+from collections import deque
 import math
 import heapq
 

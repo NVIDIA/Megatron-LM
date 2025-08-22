@@ -38,7 +38,7 @@ PROFILE=0
 # Remember to update model and job name if running in batch mode!!
 if [[ $BATCH -eq 0 ]]; then
     DATETIME=`date +'%y-%m-%d-%H-%M-%S'`
-    MODEL_NAME="interactive_hybrid_cp_${DATETIME}"
+    MODEL_NAME="interactive_hybrid_cp"
     DEBUG=1
 else
     MODEL_NAME="hybrid_cp_0821_exp"
@@ -52,6 +52,9 @@ OUTPUT="${OUTPUT_BASE}/${MODEL_NAME}"
 FINETUNE_DIR=${OUTPUT}/checkpoints
 LOGS_DIR="${OUTPUT}/logs"
 TENSORBOARD_DIR="${OUTPUT}/tensorboard"
+DATACACHE_DIR="${OUTPUT}/data_cache"
+
+export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/lustre/fs1/portfolios/llmservice/users/adithyare/sft/nano_v2_fake_packed_131072_10000_rndm//stage1_stage2_multiling_128k_seq_packed.empty_assist_filtered.shuf.jsonl"
 
@@ -107,7 +110,6 @@ fi
 TP=1
 EXTRA_ARGS+=" --ckpt-format torch --use-distributed-optimizer "
 # EXTRA_ARGS+=" --overlap-param-gather --overlap-grad-reduce "
-EXTRA_ARGS+=" --recompute-vision-projection "
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 EXTRA_ARGS+=" --use-precision-aware-optimizer --main-grads-dtype bf16 --main-params-dtype fp16 --exp-avg-dtype fp16 --exp-avg-sq-dtype fp16 "
@@ -131,12 +133,12 @@ OPTIONS=" \
     --swiglu \
     --tensor-model-parallel-size ${TP}  \
     --pipeline-model-parallel-size 1  \
+    --rerun-mode disabled \
     --num-layers 2 \
     --hidden-size 2048 \
     --ffn-hidden-size 8192 \
     --add-qkv-bias \
     --num-attention-heads 16 \
-    --use-te \
     --num-workers ${NW} \
     --exit-duration-in-mins 230 \
     --seq-length ${SEQ_LEN} \
@@ -155,8 +157,9 @@ OPTIONS=" \
     --save-interval 1000 \
     --save ${FINETUNE_DIR} \
     --load ${FINETUNE_DIR} \
-    --dataloader-save ${FINETUNE_DIR}/dataloader \
+    --data-cache-path ${DATACACHE_DIR} \
     --use-mcore-models \
+    --no-create-attention-mask-in-dataloader \
     --no-mmap-bin-files \
     --split 100,0,0 \
     --clip-grad 1.0 \
@@ -165,11 +168,9 @@ OPTIONS=" \
     --adam-beta2 0.999 \
     --init-method-std 0.014 \
     --bf16 \
-    --dataloader-type external \
     --tensorboard-dir ${TENSORBOARD_DIR} \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
-    --packing-seq-length ${SEQ_LEN} \
     --calculate-per-token-loss \
 "
 
