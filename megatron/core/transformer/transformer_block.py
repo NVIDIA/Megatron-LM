@@ -15,12 +15,6 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import (
-    is_pp_first_stage,
-    is_pp_last_stage,
-    is_vp_first_stage,
-    is_vp_last_stage,
-)
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import MegatronModule
@@ -85,6 +79,13 @@ def get_num_layers_to_build(
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    from megatron.core.pipeline_parallel.utils import (
+        is_pp_first_stage,
+        is_pp_last_stage,
+        is_vp_first_stage,
+        is_vp_last_stage,
+    )
+
     # If we have a custom PP layout, straightforwardly
     # return the number of decoders in the layout array.
     if config.pipeline_model_parallel_layout is not None:

@@ -14,7 +14,6 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.utils import is_vp_first_stage
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, is_graph_capturing
 from megatron.core.transformer.enums import LayerType
@@ -174,6 +173,7 @@ def get_transformer_layer_offset(
                 offset = vp_stage * total_virtual_chunks + (
                     pipeline_rank * num_layers_per_virtual_rank
                 )
+                from megatron.core.pipeline_parallel.utils import is_vp_first_stage
 
                 # Reduce the offset of embedding layer from the total layer number
                 if config.account_for_embedding_in_pipeline_split and not is_vp_first_stage(
