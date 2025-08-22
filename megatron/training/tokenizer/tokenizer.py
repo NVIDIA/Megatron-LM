@@ -30,12 +30,6 @@ from .gpt2_tokenization import GPT2Tokenizer
 from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
 
-_GLOBAL_TOKENIZER = None
-
-def get_tokenizer():
-    """Return tokenizer."""
-    return _GLOBAL_TOKENIZER
-
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
     if args.rank == 0:

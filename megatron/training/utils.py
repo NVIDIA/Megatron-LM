@@ -54,7 +54,7 @@ from megatron.core.utils import (
 )
 from megatron.legacy.model.module import param_is_not_shared
 
-from megatron.training.tokenizer import get_tokenizer
+from megatron.training.global_vars import get_tokenizer
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters"""

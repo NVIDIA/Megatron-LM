@@ -1238,7 +1238,7 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
-        if args.is_hybrid_model:
+    if args.is_hybrid_model:
         kw_args['is_hybrid_model'] = args.is_hybrid_model
 
     # handle quantization config
@@ -3084,13 +3084,6 @@ def get_patch_args(parser):
         "valid if base optimizer is HybridAdam.",
     )
 
-    group.add_argument(
-        "--optimizer-offload-fraction",
-        type=float,
-        default=0.5,
-        help="Optimizer Offload Fraction used by static offload policy, "
-        "valid if base optimizer is HybridAdam",
-    )
     group.add_argument(
         "--train-mode", default="pretrain", type=str, help="pretrain or finetune"
     )
