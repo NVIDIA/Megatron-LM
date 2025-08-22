@@ -29,12 +29,14 @@ sys.path.append(
 )
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
+from megatron.core.utils import configure_nvtx_profiling
 from pretrain_gpt import model_provider
 import json
 
 from examples.inference.gpt.utils import (
     add_common_inference_args,
     build_requests,
+    build_fixed_io_requests,
     build_dynamic_engine_setup_prefix,
     get_curr_time,
     Request,
@@ -58,6 +60,20 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Number of tokens to prefill for chunked prefill.",
     )
+
+    group.add_argument(
+        "--frontend-add-request-batch-size",
+        type=int,
+        default=None,
+        help="Number of requests to add to the fengine in one batch.",
+    )
+    group.add_argument(
+        "--frontend-input-length",
+        type=int,
+        default=None,
+        help="Length of the input sequence.",
+    )
+
     return parser
 
 
@@ -199,9 +215,8 @@ def run_inference(
             if request.time_arrival > curr_time:
                 break
             try:
-                # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
                 engine.add_request(
-                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
+                    num_requests_added, request.prompt_tokens, sampling_params.num_tokens_to_generate
                 )
                 request.time_start = get_curr_time()
                 request.state = "started"
@@ -256,6 +271,8 @@ def main():
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
+    
+    configure_nvtx_profiling(True)
 
     args = get_args()
     tokenizer = get_tokenizer()
@@ -271,7 +288,10 @@ def main():
 
     # Requests, context, conroller.
     model = get_model()
-    requests = build_requests(args, tokenizer)
+    if args.frontend_input_length is not None and args.frontend_add_request_batch_size is not None:
+        requests = build_fixed_io_requests(args, tokenizer)
+    else:
+        requests = build_requests(args, tokenizer)
     context = get_inference_context(requests, sampling_params)
     controller = get_inference_controller(model, context)
 

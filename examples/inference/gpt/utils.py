@@ -5,7 +5,7 @@ import random
 import time
 import torch
 from argparse import ArgumentParser, Namespace
-from typing import Any
+from typing import Any, List
 import json
 import itertools
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -123,9 +123,9 @@ class Request:
         tokenizer (Any): Tokenizer for tokenizing the prompt.
     """
 
-    def __init__(self, prompt_text: str, time_offset: float, tokenizer: Any):
+    def __init__(self, prompt_text: str, time_offset: float, tokenizer: Any,  prompt_tokens: List[int] = None):
         self.prompt_text = prompt_text
-        self.prompt_tokens = tokenizer.tokenize(prompt_text)
+        self.prompt_tokens = tokenizer.tokenize(prompt_text) if prompt_tokens is None else prompt_tokens
         self.output_text = None
         self.output_tokens = []
         self.time_offset = time_offset
@@ -239,6 +239,13 @@ def build_requests(args: Namespace, tokenizer: Any) -> list[Request]:
     else:
         return get_auto_requests(args, tokenizer)
 
+def build_fixed_io_requests(args: Namespace, tokenizer: Any) -> list[Request]:
+    prompt_tokens = [1] * args.frontend_input_length
+    requests = [
+        Request(prompt_text=str(i), time_offset=0, tokenizer=tokenizer, prompt_tokens=prompt_tokens)
+        for i in range(args.frontend_add_request_batch_size)
+    ]
+    return requests
 
 def get_model_size_str(model):
     n = sum(p.numel() for p in model.parameters())
