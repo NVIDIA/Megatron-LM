@@ -5,6 +5,7 @@
 import os
 import warnings
 from datetime import timedelta
+from math import log2
 from typing import Callable, List, Optional
 
 import numpy as np

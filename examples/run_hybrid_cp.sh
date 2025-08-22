@@ -33,7 +33,7 @@ USE_TE_CE=0
 USE_FLASH_ATTN=0
 USE_FSDP=0
 USE_CUSTOM_FSDP=0
-PROFILE=0
+PROFILE=1
 
 # Remember to update model and job name if running in batch mode!!
 if [[ $BATCH -eq 0 ]]; then
@@ -62,7 +62,7 @@ SEQ_LEN=131072 #131072 #81920 #65536
 
 if [[ $DEBUG -eq 1 ]]; then
     MBZ=1
-    BZ=2
+    BZ=8
     NW=4
     AD=0.0
     HD=0.0
@@ -103,7 +103,7 @@ if [[ $USE_TE_CE -eq 1 ]]; then
 fi
 
 if [[ $PROFILE -eq 1 ]]; then
-    EXTRA_ARGS+="--profile --profile-step-start 1 --profile-step-end 2 --profile-ranks 0 1 2 3 4 5 6 7"
+    EXTRA_ARGS+="--profile --profile-step-start 7 --profile-step-end 8 "
 fi
 
 # CHECKPOINT_DIR="/lustre/fsw/portfolios/llmservice/users/trintamaki/workspace/output/video_sft_stage2_qwen_2p5_7b_radio_research_cp_0429_tp2/checkpoints"
@@ -172,12 +172,17 @@ OPTIONS=" \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
     --calculate-per-token-loss \
+    --hybrid-context-parallel \
+    --max-seqlen-per-cp-rank 16384 \
+    --attention-backend flash \
 "
+# --hybrid-context-parallel \
+#     --max-seqlen-per-cp-rank 16384 \
 
 # Interactive or batch mode
 if [[ $BATCH -eq 0 ]]; then
     if [[ $PROFILE -eq 1 ]]; then
-        nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o hetero_cp_iter1_%q{SLURM_PROCID} torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
+        nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o gpt_sft_hetero_cp_iter7_8_flash torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
     else
         torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
     fi

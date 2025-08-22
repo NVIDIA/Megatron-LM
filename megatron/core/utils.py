@@ -29,6 +29,7 @@ import torch
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from torch.distributed._tensor import DTensor
@@ -1886,6 +1887,8 @@ def get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_se
     end_index = cu_lengths[scheduled_id+1]
     # TODO (flexible HCP): New CP size also means new padding requirement. CP4 to CP3 changes padding requirement.
     for key, data in batch.items():
+        if key in {'attention_mask', 'cu_seqlens', 'max_seqlen', 'scheduled_id', 'local_cp_size'}:
+            continue
         batch[key] = data[:, start_index:end_index]
 
     # TODO (milestone 2): Enable this when we do DPxCP

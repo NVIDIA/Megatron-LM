@@ -36,7 +36,7 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.utils import is_te_min_version, StragglerDetector
+from megatron.core.utils import is_te_min_version, StragglerDetector, get_sub_sample_on_this_cp_rank
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.utils import (
@@ -228,21 +228,41 @@ def get_batch(data_iterator):
     # slice batch along sequence dimension for context parallelism
     # batch = get_batch_on_this_cp_rank(batch)
 
-    cu_seqlens = batch['cu_seqlens']
+    cu_seqlens = batch.pop('cu_seqlens')
+    max_seqlen = batch.pop('max_seqlen')
+    scheduled_id = batch.pop('scheduled_id')
+    local_cp_size = batch.pop('local_cp_size')
+    if scheduled_id is not None:
+        scheduled_id = int(scheduled_id.item())
+        local_cp_size = int(local_cp_size.item())
+
+    if cu_seqlens is not None:
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens[0],
+            cu_seqlens_kv=cu_seqlens[0],
+            cu_seqlens_q_padded=cu_seqlens[0],
+            cu_seqlens_kv_padded=cu_seqlens[0],
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+        )
+    else:
+        packed_seq_params = None
+
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-    else:  # Packed THD format
-        assert (
-            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-        ), "micro-batch-size must be 1 for packing"
+    elif local_cp_size is None:  # Packed THD format
+        # assert (
+        #     cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
+        # ), "micro-batch-size must be 1 for packing"
         cu_seqlens = cu_seqlens[0]
-        batch['cu_seqlens'] = cu_seqlens
+        # batch['cu_seqlens'] = cu_seqlens
 
-        max_seqlen = batch['max_seqlen']
+        # max_seqlen = batch['max_seqlen']
         assert max_seqlen.dim() == 1
         # TODO(duncan): can this be kept as a 0-D tensor?
-        batch['max_seqlen'] = int(max_seqlen[0].item())
+        # batch['max_seqlen'] = int(max_seqlen[0].item())
 
         cp_size = get_context_parallel_world_size()
         if cp_size > 1:  # slice batch along sequence dimension for context parallelism
@@ -261,8 +281,20 @@ def get_batch(data_iterator):
                 if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
                     continue
                 batch[key] = data.index_select(1, index)
+    else: # Hybrid CP format
+        assert local_cp_size is not None
+        assert scheduled_id is not None
+        batch, cp_group, packed_seq_params = get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_seq_params)
+        packed_seq_params.cp_group = cp_group
+        if cp_group is not None and cp_group.size() > 1:
+            # print(f"rank: {torch.distributed.get_rank()} has partner ranks {torch.distributed.get_process_group_ranks(cp_group)} and got keys: {batch.keys()}")
+            batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
+            # print(f"rank: {torch.distributed.get_rank()} has partner ranks {torch.distributed.get_process_group_ranks(cp_group)} and got tokens: {batch['tokens'].shape}")
+        # else:
+            # print(f"rank: {torch.distributed.get_rank()} has no partner ranks and got tokens: {batch['tokens'].shape}")
 
-    return batch.values()
+    
+    return (*batch.values(), packed_seq_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -346,19 +378,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(data_iterator)
-    if cu_seqlens is None:
-        packed_seq_params = None
-    else:
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=None,
-            cu_seqlens_kv_padded=None,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-        )
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator)
     
     timers('batch-generator').stop()
 

@@ -5,7 +5,7 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 from functools import lru_cache
 from collections import deque
-import math
+from math import ceil, log2
 import heapq
 
 class HybridCPWrapper():
@@ -43,8 +43,8 @@ class HybridCPWrapper():
         Get the next item from the dataset, pull scheduling metadata and return it.
         """
         sample = next(self.data_iterator)
-        assert "cu_lengths" in sample, "cu_lengths must be in the sample"
-        # TODO(milestone 2): Get cu_lengths and all-gather the entire global batch worth cu_lengths and then perform the scheduling.
+        assert "cu_seqlens" in sample, "cu_seqlens must be in the sample"
+        # TODO(milestone 2): Get cu_seqlens and all-gather the entire global batch worth cu_seqlens and then perform the scheduling.
         # But why should this scheduling information be integrated back into the data?
         groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(sample, self.config)
         sample["groups"] = groups
@@ -74,105 +74,6 @@ class BalancedCPScheduler:
         if cp_size is None:
             cp_size = self.gpus_needed(seq_length)
         return (seq_length * seq_length) / cp_size
-
-    def get_heterogeneous_cp_assignment(
-        self,
-        cu_seqlens: List[int],
-        max_seqlen_per_cp_rank: int,
-        cp_size: int,
-        compute_estimator: Optional[Callable] = None,
-    ):
-        """
-        cu_seqlens: list of sub-sample sequence lengths
-        max_seqlen_per_cp_rank: list of max sequence length per CP rank
-        cp_size: total number of CP ranks
-        flops_calculator: function to calculate flops from cu_seqlens
-
-        Returns:
-        start_time[j]: the time job j begins
-        assignment[j]: list of resource IDs assigned to job j
-        """
-        if compute_estimator is None:
-            compute_estimator = self.get_total_workload
-        #TODO: Account for nvlink - IBlink boundaries. How to dynamically get this information?
-        #TODO: is cu_seqlens a list of ints or tensors? Correct the type hint
-        sub_sample_lens = cu_seqlens[0][1:] - cu_seqlens[0][:-1]
-        cp_rank = torch.distributed.get_rank()  # Get rank from CP group
-        cp_size_per_sample = [math.ceil(x / max_seqlen_per_cp_rank) for x in sub_sample_lens]
-        total_workload_per_cp_rank = [
-            compute_estimator(x, cp) for x, cp in zip(sub_sample_lens, cp_size_per_sample)
-        ]
-        # Sort workloads in descending order
-        num_sub_samples = len(sub_sample_lens)
-        jobs = sorted(range(num_sub_samples), key=lambda j: total_workload_per_cp_rank[j], reverse=True)
-
-        # a min-heap of free resource IDs (CP rank IDs)
-        if len(self.free_resources) == 0:
-            self.free_resources = list(range(cp_size))
-            heapq.heapify(self.free_resources)
-
-        # events: (release_time, [list of resource IDs freeing then])
-        events = []
-        # Trackers used in scheduling algorithm
-        current_time = 0
-        start_time = [None] * num_sub_samples
-        assignment = [None] * num_sub_samples
-        num_sub_samples_processed = 0
-
-        while jobs:
-            made_progress = True
-            # try to schedule any sub-sample that fits in the currently free resources
-            while made_progress:
-                made_progress = False
-                for j in list(jobs):
-                    if cp_size_per_sample[j] <= len(self.free_resources):
-                        # grab the lowest‐ID CP ranks available
-                        assigned = [heapq.heappop(self.free_resources) for _ in range(cp_size_per_sample[j])]
-                        if cp_rank in assigned:
-                            num_sub_samples_processed += 1
-                        start_time[j] = current_time
-                        assignment[j] = assigned
-                        # schedule the completion of the sub-sample compute
-                        release_time = current_time + total_workload_per_cp_rank[j]
-                        heapq.heappush(events, (release_time, assigned))
-                        jobs.remove(j)
-                        made_progress = True
-                        break
-
-            # if nothing fits right now, advance to the next release event
-            if not made_progress and events:
-                t, freed_ids = heapq.heappop(events)
-                current_time = t
-                for rid in freed_ids:
-                    heapq.heappush(self.free_resources, rid)
-            elif not events:
-                # should not happen when cp_size ≥ max(cp_size_per_sample)
-                break
-
-        return num_sub_samples_processed, assignment
-
-    # def get_per_microbatch_assignment(
-    #     self,
-    #     cu_seqlens: List[int],
-    #     cp_size: int,
-    #     compute_estimator: Optional[Callable] = None,
-    # ):
-    #     """
-    #     cu_seqlens: list of sub-sample sequence lengths
-    #     cp_size: total number of CP ranks
-    #     compute_estimator: function to calculate flops from cu_seqlens
-    #     """
-    #     micro_batches = []
-    #     exec_times = []
-    #     if compute_estimator is None:
-    #         compute_estimator = self.get_total_workload
-    #     sub_sample_lens = cu_seqlens[0][1:] - cu_seqlens[0][:-1]
-    #     while sub_sample_lens:
-    #         sub_sample_lens = sorted(sub_sample_lens, reverse=True)
-    #         microbatch, sub_sample_lens, exec_times = self.next_hdp_group(sub_sample_lens, compute_estimator, cp_size)
-    #         micro_batches.append(microbatch)
-    #         exec_times.append(exec_times)
-    #     return micro_batches
 
     @lru_cache(maxsize=128)
     def gpus_needed(self, seq_len: int) -> int:
@@ -528,20 +429,19 @@ class BalancedCPScheduler:
     def get_groups_and_subsamples(
         self,
         data,
-        model,
         config,
     ):
         # TODO: Protect for model parallelism
         # TODO: Reduce access to file system as much as possible.
         groups = []
         sample_id_groups = []
-        assert "cu_lengths" in data, (
+        assert "cu_seqlens" in data, (
             "data must have a cu_seqlens attribute to define the valid sequenece lengths "
             "of each sub-sample in a packed sample to use hybrid context parallel"
         )
         # We assign a sample_id to each sub-sample in order to track the right assignment to each GPU.
         # TODO (Milestone 2): Sample ID logic will have to change once we have global batch
-        sample_id_seqlens = [(i, int(data["cu_lengths"][0][i+1] - data["cu_lengths"][0][i])) for i in range(0, data["cu_lengths"][0].shape[0] - 1)]
+        sample_id_seqlens = [(i, int(data["cu_seqlens"][0][i+1] - data["cu_seqlens"][0][i])) for i in range(0, data["cu_seqlens"][0].shape[0] - 1)]
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
         while sample_id_seqlens:
             mb, sample_id_seqlens, exec_times, sample_ids = self.next_hdp_group(sample_id_seqlens, self.get_total_workload, config.context_parallel_size)
@@ -611,8 +511,8 @@ def hybrid_context_parallel_forward_backward(
                     partner_cp_size = len([True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids])
                     if partner_cp_size == 0:
                         assert False, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} j: {j} k: {k} sample_ids_group: {sample_id_groups}"
-                    data["local_cp_size"] = partner_cp_size
-                    data["scheduled_id"] = sub_sample_id
+                    data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+                    data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
                     new_data_iterator = RerunDataIterator(iter([data]))
                     # TODO: Change data iterator to the right sub-sample
                     # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
@@ -651,8 +551,8 @@ def hybrid_context_parallel_forward_backward(
                 partner_cp_size = len([True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids])
                 if partner_cp_size == 0:
                     assert False, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} j: {j} k: {k} sample_ids_group: {sample_id_groups}"
-                data["local_cp_size"] = partner_cp_size
-                data["scheduled_id"] = sub_sample_id
+                data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+                data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
                 # TODO: What else should I update in data so that we can get the right sub-sample?
                 new_data_iterator = RerunDataIterator(iter([data]))
                 # TODO: Change data iterator to the right sub-sample
@@ -683,8 +583,8 @@ def hybrid_context_parallel_forward_backward(
         for k in range(len(sample_ids_per_group) - 1):
             sub_sample_id = sample_ids_per_group[k]
             partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
-            data["local_cp_size"] = partner_cp_size
-            data["scheduled_id"] = sub_sample_id
+            data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+            data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
             # TODO: What else should I update in data so that we can get the right sub-sample?
             new_data_iterator = RerunDataIterator(iter([data]))
             # TODO: Change data iterator to the right sub-sample
@@ -711,8 +611,8 @@ def hybrid_context_parallel_forward_backward(
     partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
     if partner_cp_size == 0:
         assert False, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} j: {j} k: {k} sample_ids_group: {sample_id_groups}"
-    data["local_cp_size"] = partner_cp_size
-    data["scheduled_id"] = sub_sample_id
+    data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+    data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
     # TODO: What else should I update in data so that we can get the right sub-sample?
     new_data_iterator = RerunDataIterator(iter([data]))
     # TODO: Change data iterator to the right sub-sample

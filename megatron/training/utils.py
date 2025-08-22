@@ -471,6 +471,16 @@ def get_batch_on_this_tp_rank(data_iterator):
                 if "max_seqlen" not in data
                 else data["max_seqlen"].cuda(non_blocking=True)
             ),
+            'scheduled_id': (
+                None
+                if "scheduled_id" not in data
+                else data["scheduled_id"].cuda(non_blocking=True)
+            ),
+            'local_cp_size': (
+                None
+                if "local_cp_size" not in data
+                else data["local_cp_size"].cuda(non_blocking=True)
+            ),
         }
 
         def _broadcast_cu_seqlens(cu_seqlens):
@@ -498,6 +508,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
+            _broadcast(batch['scheduled_id'])
+            _broadcast(batch['local_cp_size'])
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
@@ -551,14 +563,21 @@ def get_batch_on_this_tp_rank(data_iterator):
         )
 
         cu_seqlens = None
-        if args.sft:
-            max_seqlen = torch.empty(
-                1,
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            max_seqlen = None
+        max_seqlen = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
+        scheduled_id = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
+        local_cp_size = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
@@ -583,6 +602,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
+            _broadcast(scheduled_id)
+            _broadcast(local_cp_size)
 
         elif mpu.is_pipeline_first_stage():
             labels = None
@@ -621,6 +642,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
+            'scheduled_id': scheduled_id,
+            'local_cp_size': local_cp_size,
         }
 
     return batch

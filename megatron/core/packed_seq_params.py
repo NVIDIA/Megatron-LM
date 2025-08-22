@@ -20,7 +20,6 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
-    cp_assignment: List[int] = None
     local_cp_size: int = None
-    schedule_id: int = None
+    scheduled_id: int = None
     cp_group: dist.ProcessGroup = None
