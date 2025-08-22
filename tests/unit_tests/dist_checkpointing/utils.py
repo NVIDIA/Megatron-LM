@@ -160,7 +160,7 @@ def setup_model_and_optimizer(
     initialize_fn=initialize_gpt_model,
     bf16=True,
     dist_opt=True,
-    use_custom_fsdp=False,
+    use_megatron_fsdp=False,
     data_parallel_sharding_strategy="optim_grads_params",
 ):
     mock_args = parse_args(ignore_unknown_args=True)
