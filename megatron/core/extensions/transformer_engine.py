@@ -1681,11 +1681,23 @@ except ImportError:
 try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
+    _TE_SUPPORTS_CG_CAPTURABLE = is_te_min_version("2.7.0")
+    current_te_version = get_te_version()
+
     def te_parallel_cross_entropy(
-        logits: torch.Tensor, labels: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        tp_group: torch.distributed.ProcessGroup,
+        is_cg_capturable: bool = False,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel"""
-        return parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
+        if _TE_SUPPORTS_CG_CAPTURABLE:
+            # According to TE CrossEntropyFunction, ignore_idx defaults to -100
+            return parallel_cross_entropy(
+                logits, labels, 0.0, False, tp_group, -100, is_cg_capturable
+            )
+        else:
+            return parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
