@@ -17,10 +17,14 @@ MLM_DEFAULT_ARGS=" \
     --finetune \
 "
 
+EAGLE3_CONVERT_ARGS=" \
+    --export-num-eagle-layers 1 \
+    --export-eagle-algorithm eagle3 \
+"
 
 if [ -z ${MLM_MODEL_SAVE} ]; then
-    MLM_MODEL_SAVE=${MLM_MODEL_CKPT}
-    printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_CKPT})!\n"
+    MLM_MODEL_SAVE=${MLM_WORK_DIR}/${MLM_MODEL_CFG}-Eagle3
+    printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_SAVE})!\n"
 fi
 
 if [ -z ${MLM_DATA_ARGS} ]; then
@@ -68,6 +72,21 @@ if [ -z ${MLM_EVAL_ARGS} ]; then
     "
 fi
 
+# Convert HF checkpoint to Megatron EAGLE3 model if not exist
+if [[ ! -d ${MLM_MODEL_SAVE} ]]; then
+    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/convert_model.py \
+        ${MODEL_ARGS} \
+        --tensor-model-parallel-size ${TP} \
+        --expert-tensor-parallel-size ${ETP} \
+        --pipeline-model-parallel-size ${PP} \
+	--expert-model-parallel-size ${EP} \
+        --tokenizer-model ${TOKENIZER_MODEL} \
+        --pretrained-model-path ${HF_MODEL_CKPT} \
+        --save ${MLM_MODEL_SAVE} \
+        ${MLM_DEFAULT_ARGS} ${EAGLE3_CONVERT_ARGS}
+fi
+
+
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
@@ -75,7 +94,7 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     --expert-model-parallel-size ${EP} \
     --pipeline-model-parallel-size ${PP} \
     --tokenizer-model ${TOKENIZER_MODEL} \
-    --load ${MLM_MODEL_CKPT} \
+    --load ${MLM_MODEL_SAVE} \
     --save ${MLM_MODEL_SAVE} \
     ${MLM_DATA_ARGS} \
     ${MLM_OPTIM_ARGS} \

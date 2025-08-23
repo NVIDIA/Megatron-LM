@@ -47,7 +47,9 @@ def build_tokenizer(args, **kwargs):
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
-        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model, **kwargs)
+        tokenizer = _HuggingFaceTokenizer(
+            args.tokenizer_model, trust_remote_code = args.trust_remote_code, **kwargs,
+        )
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
@@ -129,7 +131,7 @@ def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
 
 
 class _HuggingFaceTokenizer(MegatronTokenizer):
-    def __init__(self, pretrained_model_name_or_path, **kwargs):
+    def __init__(self, pretrained_model_name_or_path, trust_remote_code=False, **kwargs):
         super().__init__(pretrained_model_name_or_path, **kwargs)
         try:
             import transformers
@@ -140,7 +142,9 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
 
         # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs
         )
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
