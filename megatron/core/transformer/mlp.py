@@ -41,7 +41,13 @@ logger = logging.getLogger(__name__)
 # pylint: disable=missing-class-docstring
 @dataclass
 class MLPSubmodules:
+    """
+    The dataclass for ModuleSpecs of MLP submodules
+    including  linear fc1, activation function, linear fc2.
+    """
+
     linear_fc1: Union[ModuleSpec, type] = None
+    activation_func: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
 
 
@@ -108,7 +114,10 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+            self.activation_func = build_module(submodules.activation_func, config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -132,7 +141,15 @@ class MLP(MegatronModule):
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
-        if self.config.bias_activation_fusion:
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        elif self.config.bias_activation_fusion:
             if per_token_scale is not None:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
@@ -197,6 +214,7 @@ class MLP(MegatronModule):
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
+        """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():

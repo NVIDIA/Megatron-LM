@@ -2028,6 +2028,8 @@ def _add_training_args(parser):
                        'If None, the default backend will be used.')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
+    group.add_argument('--use-te-activation-func', action='store_true',
+                       help='Use activation function kernel from Transformer Engine in MLP module.')
 
     return parser
 

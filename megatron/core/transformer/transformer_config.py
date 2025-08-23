@@ -611,6 +611,9 @@ class TransformerConfig(ModelParallelConfig):
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
 
+    use_te_activation_func: bool = False
+    """Whether to use ffn activation functions implemented by TransformerEngine"""
+
     use_te_rng_tracker: bool = False
     """ Whether to use the TE or MCore version of the RNG tracker. """
 
@@ -1132,6 +1135,21 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "When bias_activation_fusion is True, gated_linear_unit is False, "
                     "and activation function is gelu, add_bias_linear must also be True."
+                )
+
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "bias_activation_fusion and use_te_activation_func cannot be both true. "
+                    "If you use bias in MLP FC1, we recommend setting bias_activation_fusion "
+                    "to True and use_te_activation_func to False."
+                )
+
+        if self.use_te_activation_func:
+            if self.activation_func not in (F.gelu, F.silu, F.relu):
+                raise ValueError(
+                    "TransformerEngine only support gelu, geglu, silu, swiglu, relu, reglu. "
+                    "If you don't want to use TransformerEngine activation function, set "
+                    "use_te_activation_func to False"
                 )
 
         if self.activation_func_fp8_input_store:
