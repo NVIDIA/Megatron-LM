@@ -42,19 +42,25 @@ def get_moe_module_spec_for_backend(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    use_te_activation_func: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
     assert num_experts is not None
 
     linear_fc1 = backend.column_parallel_linear()
     linear_fc2 = backend.row_parallel_linear()
+    activation_func = backend.activation_func()
 
-    mlp = MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+    mlp = MLPSubmodules(
+        linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
+    )
 
     expert_module, expert_submodule = backend.grouped_mlp_modules(
         moe_grouped_gemm is not None and moe_grouped_gemm,
         moe_use_legacy_grouped_gemm is not None and moe_use_legacy_grouped_gemm,
     )
+    if expert_submodule is not None:
+        expert_submodule.activation_func = activation_func
 
     experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
 

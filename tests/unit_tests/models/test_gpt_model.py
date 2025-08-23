@@ -195,6 +195,66 @@ class TestGPTWithFusedOps:
         assert logits.shape[2] == self.gpt_model.vocab_size
 
 
+@pytest.mark.skipif(
+    not is_te_min_version("1.13.0"), reason="TEFusedMLP is only supported with TE 1.13+."
+)
+@pytest.mark.parametrize("num_experts", [None, 4])
+@pytest.mark.parametrize("gated_linear_unit", [True, False])
+def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
+    """Test GPT model with Transformer Engine activation function"""
+
+    # setup
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    transformer_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=512,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        add_bias_linear=False,
+        use_te_activation_func=True,
+        bias_activation_fusion=False,
+        gated_linear_unit=gated_linear_unit,
+        num_moe_experts=num_experts,
+        moe_grouped_gemm=(num_experts is not None),
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_experts, use_te_activation_func=True
+        ),
+        vocab_size=128,
+        max_sequence_length=128,
+    )
+
+    # test
+    sequence_length = gpt_model.max_sequence_length
+    micro_batch_size = 2
+
+    gpt_model.cuda()
+
+    data = list(range(sequence_length))
+    input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+    position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+    attention_mask = torch.ones(
+        (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+    ).cuda()
+
+    logits = gpt_model.forward(
+        input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+    )
+
+    assert logits.shape[0] == micro_batch_size
+    assert logits.shape[1] == sequence_length
+    assert logits.shape[2] == gpt_model.vocab_size
+
+    # teardown
+    Utils.destroy_model_parallel()
+
+
 class TestGPTModelWithCustomPG:
     def setup_method(self, method):
         Utils.destroy_model_parallel()
