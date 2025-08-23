@@ -793,6 +793,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     # return the engine output to the coordinator. The coordinator will take
                     # care of the post-processing.
                     request_ids, finished_request_ids, sample, logprobs = engine_output
+                    # Include chunked prefill request id, use -1 if None
+                    chunked_prefill_id = self.chunked_prefill_request_id if self.chunked_prefill_request_id is not None else -1
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
@@ -800,6 +802,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             finished_request_ids.tolist(),
                             sample.tolist(),
                             logprobs,
+                            chunked_prefill_id,
                         ],
                         use_bin_type=True,
                     )

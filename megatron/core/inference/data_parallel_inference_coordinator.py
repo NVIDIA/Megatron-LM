@@ -148,6 +148,7 @@ class DataParallelInferenceCoordinator:
         finished_request_ids: List[int],
         generated_tokens: List[int],
         log_probs: List[int],
+        chunked_prefill_request_id: int = -1,
     ):
         """
         Processes replies from the engine, appending tokens and handling finished requests.
@@ -163,6 +164,9 @@ class DataParallelInferenceCoordinator:
                 generation in this step.
             generated_tokens (List[int]): The list of new tokens, one for each ID in
                 `request_ids`.
+            log_probs (List[int]): Log probabilities for each token.
+            chunked_prefill_request_id (int): The request ID currently undergoing chunked prefill,
+                -1 if no chunked prefill is active.
         """
         # Todo [Siddharth]: This is duplicated logic from the engine.
         # We should refactor this to avoid duplication.
@@ -171,17 +175,33 @@ class DataParallelInferenceCoordinator:
             request_ids, generated_tokens, log_probs_iter
         ):
             request: DynamicInferenceRequest = self.requests[request_id]
-            request.generated_tokens.append(token)
-            if request_log_probs is not None:
-                # If prompt log probs is None we are in prefill
-                if request.prompt_log_probs is None:
-                    request.prompt_log_probs = request_log_probs
-                    request.generated_log_probs = []
-                else:
-                    request.generated_log_probs.extend(request_log_probs)
+            # Handle chunked prefill similar to the engine logic
+            if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
+                request.generated_tokens.append(token)
+                
+                if request_log_probs is not None:
+                    if not request.prompt_log_probs:
+                        request.prompt_log_probs = []
+                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
+                    # If the request log probs span > 1 token we are in prefill
+                    if len(request_log_probs) > 1:
+                        request.prompt_log_probs.extend(request_log_probs)
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
+            else:
+                # This is the chunked prefill request, handle log probs but don't append tokens
+                if request_log_probs is not None:
+                    if not request.prompt_log_probs:
+                        request.prompt_log_probs = []
+                    request.prompt_log_probs.extend(request_log_probs)
+                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
 
         if finished_request_ids:
             for fid in finished_request_ids:
+                if fid == chunked_prefill_request_id:
+                    continue # skip chunked prefill request, this is not a finished request
                 request = self.requests.pop(fid)
                 request.generated_length = len(request.generated_tokens)
                 request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
@@ -283,10 +303,10 @@ class DataParallelInferenceCoordinator:
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                request_ids, finished_request_ids, generated_tokens, logprobs = (
+                request_ids, finished_request_ids, generated_tokens, logprobs, chunked_prefill_request_id = (
                     deserialized_payload[1:]
                 )
-                self.postprocess(request_ids, finished_request_ids, generated_tokens, logprobs)
+                self.postprocess(request_ids, finished_request_ids, generated_tokens, logprobs, chunked_prefill_request_id)
 
     @classmethod
     def entrypoint(
