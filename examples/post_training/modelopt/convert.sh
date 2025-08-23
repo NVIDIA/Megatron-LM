@@ -6,7 +6,12 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
 # Default arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
+MLM_DEFAULT_ARGS="
+    --distributed-timeout-minutes 60 \
+    --finetune \
+    --auto-detect-ckpt-format \
+    --export-te-mcore-model \
+"
 
 if [ -z ${HF_TOKEN} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}HF_TOKEN${WHITE} is not set! HF snapshot download may fail!\n"

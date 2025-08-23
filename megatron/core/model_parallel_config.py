@@ -384,8 +384,8 @@ class ModelParallelConfig:
 
         if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
-                raise ValueError(
-                    "When using expert parallelism and tensor parallelism, "
+                warnings.warn(
+                    "When using expert parallelism and tensor parallelism for training, "
                     "sequence parallelism must be used"
                 )
 

@@ -118,6 +118,7 @@ from .utils import (
     report_memory,
     unwrap_model,
     update_use_dist_ckpt,
+    to_empty_if_meta_device,
 )
 from .global_vars import (
     destroy_global_vars,
@@ -1158,6 +1159,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if args.fp16 or args.bf16:
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
+
+    # Materialize tensors on meta device (GPU allocation) if not using FSDP2.
+    if args.init_model_with_meta_device and not args.use_torch_fsdp2:
+        #for model_module in model:
+        model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
+
+
+
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated

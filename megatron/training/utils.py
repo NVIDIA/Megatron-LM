@@ -607,3 +607,31 @@ def get_batch_on_this_tp_rank(data_iterator):
 
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
+
+
+def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, recurse=True):
+    """Move tensors to device if not meta device; otherwise materialize with empty_like().
+
+    Officially, torch suggests to_empty() for meta device materialization. Under the hood,
+    torch.empty_like() is applied to all parameters or buffers (see _apply). This may
+    accidently overwrite buffers with precomputed values during construction. Given the
+    goal is to only materialize those tensors on meta device, this function checks the
+    device first and only move the tensor to the destination if it is not on meta device.
+   
+    Args:
+        module: The target module to apply this transformation.
+        device: The desired device of the parameters
+            and buffers in this module.
+        recurse: Whether parameters and buffers of submodules should
+            be recursively moved to the specified device.
+    """
+
+    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
+        if tensor.device == torch.device("meta"):
+            return torch.empty_like(tensor, device=device)
+        else:
+            return tensor.to(device)
+
+    return module._apply(
+        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
+    )
