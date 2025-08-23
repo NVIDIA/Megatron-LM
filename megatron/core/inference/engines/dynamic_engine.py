@@ -536,7 +536,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-
+        # schedule requests
+        self.schedule_waiting_requests()
+        
         # Previous context state, for printing output below.
         prev_is_decode_only = self.context.is_decode_only()
         prev_total_request_count = self.context.total_request_count
@@ -612,6 +614,7 @@ class DynamicInferenceEngine(AbstractEngine):
             print(output_str)
 
         self.step_count += 1
+        self.is_decode_only = is_decode_only
         range_pop()
         return active_requests, finished_requests, step_time
 

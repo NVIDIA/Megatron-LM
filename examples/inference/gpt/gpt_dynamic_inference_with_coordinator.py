@@ -134,7 +134,8 @@ if __name__ == "__main__":
             context,
             termination_id=tokenizer.eod,
             enable_cuda_graph=args.enable_cuda_graph,
-            random_seed=args.seed
+            random_seed=args.seed,
+            chunked_prefill_token_count=args.inference_chunked_prefill_token_count
         )
 
         

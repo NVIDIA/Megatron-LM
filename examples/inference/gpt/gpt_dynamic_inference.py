@@ -227,9 +227,9 @@ def run_inference(
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
-        engine.schedule_waiting_requests()
-        is_decode_only = engine.context.is_decode_only()
+        
         active_requests, finished_requests, step_time = engine.step(sampling_params, verbose=True)
+        is_decode_only = engine.is_decode_only
         step_id += 1
 
         if len(active_requests) > 0 or len(finished_requests) > 0:
