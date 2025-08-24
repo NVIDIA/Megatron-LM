@@ -374,7 +374,7 @@ def main(
     n_attempts = 0
     n_nondeterminism_attemps = 0
     n_iteration = 0
-    while True and n_attempts < 3 and n_nondeterminism_attemps < 2:
+    while True and n_attempts < 3 and n_nondeterminism_attemps < 4:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
@@ -479,7 +479,7 @@ def main(
 
             if is_flaky_failure(concat_allranks_logs):
                 logger.error("Detected flaky failure, attempt restart.")
-                n_attempts += 1
+                n_nondeterminism_attemps += 1
                 continue
 
             if "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log:
