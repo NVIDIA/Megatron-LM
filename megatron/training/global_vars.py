@@ -207,6 +207,8 @@ def _set_wandb_writer(args):
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
             'config': wandb_config}
+        if args.wandb_entity:
+            wandb_kwargs['entity'] = args.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
