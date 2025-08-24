@@ -1571,7 +1571,7 @@ requires-dist = [
     { name = "nvtx", marker = "extra == 'lts'" },
     { name = "onnxscript", marker = "extra == 'dev'" },
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = "~=1.33.1" },
-    { name = "packaging" },
+    { name = "packaging", specifier = ">=24.2" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },
     { name = "setuptools", marker = "extra == 'dev'", specifier = "<80.0.0" },
     { name = "setuptools", marker = "extra == 'lts'", specifier = "<80.0.0" },
@@ -1593,7 +1593,7 @@ provides-extras = ["mlm", "dev", "lts"]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
-    { name = "packaging" },
+    { name = "packaging", specifier = ">=24.2" },
     { name = "pybind11" },
     { name = "setuptools", specifier = "<80.0.0" },
     { name = "torch" },
