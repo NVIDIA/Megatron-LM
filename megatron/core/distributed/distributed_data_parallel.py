@@ -161,11 +161,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.intra_expt_dp_group = grad_comm_pgs.intra_expt_dp
                 self.inter_dist_opt_group = grad_comm_pgs.inter_dist_opt
 
-            # 5. pp and ep group
-            if not all([hasattr(model_comm_pgs, 'pp'), hasattr(model_comm_pgs, 'ep')]):
+            # 5. tp, pp and ep group
+            if not all(
+                [
+                    hasattr(model_comm_pgs, 'tp'),
+                    hasattr(model_comm_pgs, 'pp'),
+                    hasattr(model_comm_pgs, 'ep'),
+                ]
+            ):
                 raise ValueError(
-                    "pp and ep process groups are required but not provided in model_comm_pgs"
+                    "tp, pp and ep process groups are required but not provided in model_comm_pgs"
                 )
+            self.tp_group = model_comm_pgs.tp
             self.pp_group = model_comm_pgs.pp
             self.ep_group = model_comm_pgs.ep
 
@@ -279,6 +286,11 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Allocate the grad buffers and map the grads.
             buffers = []
+            model_comm_pgs = ModelCommProcessGroups()
+            model_comm_pgs.tp = self.tp_group
+            grad_comm_pgs = GradCommProcessGroups()
+            grad_comm_pgs.dp = self.dp_group
+            grad_comm_pgs.dp_cp = self.dp_cp_group
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
                     _ParamAndGradBuffer(
@@ -286,12 +298,13 @@ class DistributedDataParallel(_BaseDataParallel):
                         param_dtype,
                         grad_dtype,
                         params,
-                        data_parallel_group,
                         self.bucket_size,
                         param_to_name,
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                         self.ddp_config.nccl_ub,
+                        model_comm_pgs,
+                        grad_comm_pgs,
                     )
                 )
 
