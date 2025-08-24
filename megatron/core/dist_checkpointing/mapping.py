@@ -135,16 +135,22 @@ class ShardedTensor(ShardedBase):
                 f"equal to global shape dimensions for {self}"
             )
 
-        for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
-            if sh != 0 and off % sh != 0:
-                raise CheckpointingException(
-                    f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
-                )
+        if self.axis_fragmentations is not None:
+            for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
+                if sh != 0 and off % sh != 0:
+                    raise CheckpointingException(
+                        f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
+                    )
 
         if has_flattened_range and self.flattened_range.step is not None:
             raise CheckpointingException(
                 f"`step` argument in the flattened range of a ShardedTensor is not supported."
             )
+
+    @property
+    def has_regular_grid(self):
+        """Alias for having a regular sharding grid."""
+        return self.axis_fragmentations is not None
 
     def global_slice(self) -> Tuple[Union[int, slice], ...]:
         """
