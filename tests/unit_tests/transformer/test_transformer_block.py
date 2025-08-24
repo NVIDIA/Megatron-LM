@@ -199,7 +199,7 @@ class TestPipelineParallelTransformerBlock:
         last_pipeline_num_layers,
         should_assert_error,
     ):
-        Utils.fake_initialize_model_parallel(
+        Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
@@ -234,8 +234,7 @@ class TestPipelineParallelTransformerBlock:
             assert (
                 total_build_layers == num_layers
             ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
-        parallel_state.set_pipeline_model_parallel_world_size(None)
-        parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+        Utils.destroy_model_parallel()
 
 
 class TestProcessGroupTransformerBlock:
