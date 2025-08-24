@@ -199,7 +199,7 @@ class TestPipelineParallelTransformerBlock:
         last_pipeline_num_layers,
         should_assert_error,
     ):
-        Utils.initialize_model_parallel(
+        Utils.fake_initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
