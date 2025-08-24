@@ -66,26 +66,18 @@ logger = logging.getLogger(__name__)
 
 
 def get_num_layers_to_build(
-    config: TransformerConfig,
-    vp_stage: Optional[int] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = 0
 ) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
-    from megatron.core.pipeline_parallel.utils import (
-        is_pp_first_stage,
-        is_pp_last_stage,
-        is_vp_first_stage,
-        is_vp_last_stage,
-    )
-
     # If we have a custom PP layout, straightforwardly
     # return the number of decoders in the layout array.
     if config.pipeline_model_parallel_layout is not None:
@@ -131,10 +123,13 @@ def get_num_layers_to_build(
         # If the uneven first (last) pipeline stage is enabled, return the specified number
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
         # parallel stage.
-        if is_pp_first_stage(pp_group) and config.num_layers_in_first_pipeline_stage is not None:
+        if pp_rank == 0 and config.num_layers_in_first_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
 
-        if is_pp_last_stage(pp_group) and config.num_layers_in_last_pipeline_stage is not None:
+        if (
+            pp_rank == config.pipeline_model_parallel_size - 1
+            and config.num_layers_in_last_pipeline_stage is not None
+        ):
             num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
         # Include the embedding layer and loss layer into pipeline parallelism partition
@@ -150,10 +145,8 @@ def get_num_layers_to_build(
         ), "num_layers should be divisible by pipeline_model_parallel_size"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
-    if (
-        config.virtual_pipeline_model_parallel_size is not None
-        and config.pipeline_model_parallel_size > 1
-    ):
+    vp_size = config.virtual_pipeline_model_parallel_size
+    if vp_size is not None and config.pipeline_model_parallel_size > 1:
         # Interleaved pipeline parallelism:
         # Number of layers in each model chunk is the number of layers in the stage,
         # divided by the number of model chunks in a stage.
@@ -165,7 +158,6 @@ def get_num_layers_to_build(
         # layers to stages like (each list is a model chunk):
         # Stage 0: [0, 1]  [4, 5]
         # Stage 1: [2, 3]  [6, 7]
-        vp_size = config.virtual_pipeline_model_parallel_size
 
         assert (
             num_layers_per_pipeline_rank % vp_size == 0
@@ -184,14 +176,18 @@ def get_num_layers_to_build(
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
     if (
-        is_vp_first_stage(vp_stage, config.virtual_pipeline_model_parallel_size)
+        pp_rank == 0
+        and vp_size is not None
+        and vp_stage == 0
         and config.account_for_embedding_in_pipeline_split
     ):
         num_layers_to_build -= 1
         assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
 
     if (
-        is_vp_last_stage(vp_stage, config.virtual_pipeline_model_parallel_size)
+        pp_rank == config.pipeline_model_parallel_size - 1
+        and vp_size is not None
+        and vp_stage == (vp_size - 1)
         and config.account_for_loss_in_pipeline_split
     ):
         num_layers_to_build -= 1
