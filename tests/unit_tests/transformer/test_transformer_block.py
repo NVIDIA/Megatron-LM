@@ -268,14 +268,15 @@ class TestProcessGroupTransformerBlock:
                 torch.distributed.init_process_group(backend='nccl')
 
             # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
-            grid = HyperCommGrid([cp_size, tp_size, dp_size], ["cp", "tp", "dp"])
+            grid = HyperCommGrid([cp_size, tp_size, dp_size, 1], ["cp", "tp", "dp", "pp"])
 
             # Get process groups from HyperCommGrid
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
 
             # Create ModelCommProcessGroups with custom process groups
-            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group)
         else:
             # Rely on TransformerBlock to create default process groups
             model_comm_pgs = None
