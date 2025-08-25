@@ -208,6 +208,50 @@ def depth_first_allocation(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return z, x_rerouted
 
 @triton.jit
+def reroute_tokens_w_permute_map_kernel(
+    x_indices_sorted_ptr, 
+    expert_for_offload_ptr,
+    num_tokens_to_route_ptr,
+    cumulative_offsets_ptr,
+    y_ptr,
+    permute_map_ptr,
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    num_offloading_experts: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offload_expert_id = tl.program_id(0)
+    
+    source_expert_id = tl.load(expert_for_offload_ptr + offload_expert_id).to(tl.int64)
+    if source_expert_id < 0:
+        return
+    num_tokens_to_route = tl.load(num_tokens_to_route_ptr + offload_expert_id).to(tl.int64)
+    offset = tl.load(cumulative_offsets_ptr + offload_expert_id).to(tl.int64)
+    
+    token_positions = tl.arange(0, BLOCK_SIZE)
+    valid_mask = (token_positions < num_tokens_to_route)
+    
+    # No conditional check needed - masked operations handle empty cases
+    base_offset = source_expert_id * num_tokens + offset
+    token_indices = tl.load(x_indices_sorted_ptr + base_offset + token_positions, 
+                           mask=valid_mask, other=0)
+    
+    total_experts = num_experts + num_offloading_experts
+    
+    # These stores are safe even with all-False masks
+    x_flat_idx = token_indices * total_experts + source_expert_id
+    tl.store(y_ptr + x_flat_idx, False, mask=valid_mask)
+    
+    # Store source_expert_id to permute_map for valid tokens
+    permute_map_idx = token_indices * num_offloading_experts + offload_expert_id
+    tl.store(permute_map_ptr + permute_map_idx, source_expert_id, mask=valid_mask)
+    
+    offload_col = num_experts + offload_expert_id
+    y_flat_idx = token_indices * total_experts + offload_col
+    tl.store(y_ptr + y_flat_idx, True, mask=valid_mask)
+
+
+@triton.jit
 def reroute_tokens_kernel(
     x_indices_sorted_ptr, 
     expert_for_offload_ptr,
@@ -292,20 +336,30 @@ def reroute_tokens_triton(x, probs, num_offloading_from, num_offloading_to, rero
                     dtype=torch.bool, device=device)
     y[:, :num_experts] = x.clone()
     
-    # Step 6b: Initialize rerouted_probs tensor
-    rerouted_probs = torch.zeros(num_tokens, num_experts + num_offloading_experts, 
-                                dtype=probs.dtype, device=device)
-    rerouted_probs[:, :num_experts] = probs.clone()
+    # Step 6b: Initialize permute_map tensor with 0
+    permute_map = torch.zeros((num_tokens, num_offloading_experts), 
+                             dtype=torch.int32, device=device)
     
-    # Step 7: Launch Triton kernel
+    # Step 7: Launch Triton kernel with permute map
     max_tokens = num_tokens
     BLOCK_SIZE = triton.next_power_of_2(max_tokens)
     grid = (num_offloading_experts,)
     
-    reroute_tokens_kernel[grid](
+    reroute_tokens_w_permute_map_kernel[grid](
         x_indices_sorted, expert_for_offload, num_offloading_to,
-        cumulative_offsets, y, rerouted_probs, num_tokens, num_experts, num_offloading_experts, BLOCK_SIZE
+        cumulative_offsets, y, permute_map, num_tokens, num_experts, num_offloading_experts, BLOCK_SIZE
     )
+    
+    # Step 8: Apply permute map to probabilities using gather
+    # Gather probabilities from source experts for offloading tokens
+    gathered_probs = torch.gather(probs, 1, permute_map)
+    
+    # Concatenate original probs with gathered probs
+    rerouted_probs = torch.cat([probs, gathered_probs], dim=1)
+    
+    # Mask with y to zero out probabilities for tokens that are not routed
+    rerouted_probs = rerouted_probs * y
+    
     return y, rerouted_probs
 
 def gen_offloading_plan(
