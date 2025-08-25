@@ -34,6 +34,7 @@ from megatron.core.utils import (
 
 logger = logging.getLogger(__name__)
 
+
 def _is_vp_first_stage(vp_stage: int, vp_size: int | None):
     """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
     if vp_size is None or vp_size <= 1:
@@ -43,6 +44,7 @@ def _is_vp_first_stage(vp_stage: int, vp_size: int | None):
         )
         return True
     return vp_stage == 0
+
 
 def get_transformer_layer_offset(
     config: TransformerConfig,
