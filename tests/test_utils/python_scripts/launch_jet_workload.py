@@ -277,6 +277,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "Connection reset by peer" in concat_allranks_logs
         or "invalid pointer" in concat_allranks_logs
         or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
     )
 
 
