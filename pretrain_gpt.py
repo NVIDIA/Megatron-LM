@@ -290,10 +290,13 @@ def forward_step(data_iterator, model: GPTModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank():
+def is_dataset_built_on_rank(vp_stage=None):
+    ignore_virtual = True
+    if vp_stage is not None:
+        ignore_virtual = False
     return (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-        or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        parallel_state.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+        or parallel_state.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
@@ -324,7 +327,7 @@ def core_gpt_dataset_config_from_args(args):
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
 
     Args:
@@ -345,7 +348,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
+        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")

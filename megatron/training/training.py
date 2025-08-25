@@ -873,7 +873,13 @@ def pretrain(
         valid_data_iterator = []
         test_data_iterator = []
         for i in range(len(model)):
-            iterators = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            vp_stage_train_valid_test_dataset_provider = \
+                functools.partial(train_valid_test_dataset_provider, vp_stage=i)
+            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                vp_stage_train_valid_test_dataset_provider.is_distributed = True
+            iterators = build_train_valid_test_data_iterators(
+                vp_stage_train_valid_test_dataset_provider
+            )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
