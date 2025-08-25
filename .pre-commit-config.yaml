@@ -9,7 +9,7 @@ repos:
   rev: v3.2.6
   hooks:
   - id: pylint
-    files: ^megatron/core/.* 
+    files: ^megatron/core/.*|^tests/unit_tests/.*
 - repo: https://github.com/pycqa/isort
   rev: 5.13.2
   hooks:

@@ -226,7 +226,6 @@ class TestPipelineParallelTransformerBlock:
                     for j in range(virtual_pipeline_model_parallel_size):
                         num_layers_to_build = get_num_layers_to_build(transformer_config, vp_stage=j, pp_rank=i)
                         total_build_layers += num_layers_to_build
-                        # print(f"pp_rank {i} vp_stage {j} num_layers_to_build {num_layers_to_build}")
                 else:
                     num_layers_to_build = get_num_layers_to_build(transformer_config, pp_rank=i)
                     total_build_layers += num_layers_to_build
