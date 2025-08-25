@@ -527,7 +527,7 @@ class _ParamAndGradBuffer:
                 with_context_parallel=True
             )
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        else:
+        elif model_comm_pgs is not None and grad_comm_pgs is not None:
             assert (
                 hasattr(model_comm_pgs, 'tp')
                 and hasattr(grad_comm_pgs, 'dp')
@@ -536,6 +536,10 @@ class _ParamAndGradBuffer:
             self.data_parallel_group = grad_comm_pgs.dp
             self.dp_cp_group = grad_comm_pgs.dp_cp
             self.tp_group = model_comm_pgs.tp
+        else:
+            raise ValueError(
+                "Either model_comm_pgs and grad_comm_pgs must be provided or both must be None"
+            )
 
         self.ddp_config = ddp_config
         self.params = params
