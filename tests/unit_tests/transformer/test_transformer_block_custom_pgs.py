@@ -396,9 +396,8 @@ class TestTransformerBlockWithProcessGroups:
         actual_world_size = torch.cuda.device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
-        Utils.initialize_model_parallel()
+        Utils.initialize_distributed()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
 
         # Create transformer configuration
         transformer_config = TransformerConfig(

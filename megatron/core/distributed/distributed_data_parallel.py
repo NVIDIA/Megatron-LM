@@ -91,7 +91,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.inter_dist_opt_group = (
                     parallel_state.get_inter_distributed_optimizer_instance_group()
                 )
-
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
             self.ep_group = parallel_state.get_expert_model_parallel_group()
         elif grad_comm_pgs is not None and model_comm_pgs is not None:
