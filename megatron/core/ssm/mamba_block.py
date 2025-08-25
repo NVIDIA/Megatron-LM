@@ -316,13 +316,14 @@ class MambaStack(MegatronModule):
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
+            for l_no, layer in enumerate(self.layers):
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1)
                     if use_inner_fp8_context
                     else nullcontext()
                 )
                 with inner_fp8_context:
+                    input_hidden_states = hidden_states.clone()
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
@@ -343,6 +344,13 @@ class MambaStack(MegatronModule):
                 # for cross-attention, and is not needed in our model.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+                if torch.distributed.get_rank() == 0 and l_no == 0:
+                    print(
+                        f"inference_context.active_token_count={inference_context.active_token_count}, hidden_states.shape={hidden_states.shape}"
+                    )
+                if hidden_states[: inference_context.active_token_count].isnan().any():
+                    torch.distributed.breakpoint(0)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

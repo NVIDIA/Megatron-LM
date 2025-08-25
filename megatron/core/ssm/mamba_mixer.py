@@ -459,12 +459,12 @@ class MambaMixer(MegatronModule):
 
             if self.rmsnorm:
                 y = self.norm(y)
-        else:
-            # Prefill path for inference, or non-mem-eff training path
-            out, out_bias = self.ssm_block(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
-            return out, out_bias
 
-        out, out_bias = self.out_proj(y)
+            out, out_bias = self.out_proj(y)
+        else:
+            # Prefill path for static inference, or non-mem-eff training path
+            out, out_bias = self.ssm_block(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+
         return out, out_bias
 
     def compute_in_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -486,10 +486,11 @@ class MambaMixer(MegatronModule):
         seq_idx: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         return_varlen_states: bool = False,
+        active_token_count: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encapsulates the core selective scan block logic which is shared between
-        the training/prefill forward pass and the dynamic inference prefill pass.
+        the training forward pass and the inference prefill pass.
 
         Args:
             x_ssm_in: The input tensor of shape (b, l, d), which is a concatenation of
@@ -518,6 +519,9 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
 
+        if torch.isnan(xBC[:, :active_token_count, :]).any():
+            torch.distributed.breakpoint(0)
+
         # Compute short convolution
         if conv_state is not None and is_dynamic_batching:
             # xBC should have shape (b l d) for causal_conv1d_varlen_states
@@ -532,7 +536,7 @@ class MambaMixer(MegatronModule):
         else:
             # transpose: b l pd --> b pd l
             xBC = rearrange(xBC, "b l d -> b d l").contiguous()
-            if conv_state is not None:  # This is for static batching inference
+            if conv_state is not None:
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 conv_state.copy_(
@@ -554,6 +558,9 @@ class MambaMixer(MegatronModule):
                 causal_conv1d_kwargs["seq_idx"] = seq_idx
             xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
             del causal_conv1d_kwargs
+
+        if torch.isnan(xBC[:, :, :active_token_count]).any():
+            torch.distributed.breakpoint(0)
 
         # transpose b pd l --> b l pd
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -615,6 +622,9 @@ class MambaMixer(MegatronModule):
         if ssm_state is not None:
             if return_varlen_states:
                 y, _, varlen_states = y
+
+                if torch.isnan(y[:, :active_token_count]).any():
+                    torch.distributed.breakpoint(0)
                 # This has to be varlen_states, NOT last_state
                 # See reference implementation:
                 # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
@@ -632,6 +642,10 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         out, out_bias = self.out_proj(y)
+
+        if torch.isnan(out[:active_token_count]).any():
+            torch.distributed.breakpoint(0)
+
         return out, out_bias
 
     def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
@@ -658,6 +672,7 @@ class MambaMixer(MegatronModule):
             # Run decode step. We swap the input batch dimension and sequence dimension
             # and then restore the original shape before returning.
             out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
+
             return (out.transpose(0, 1), out_bias)
 
         # Compute the split between decode and prefill
@@ -673,9 +688,10 @@ class MambaMixer(MegatronModule):
 
         # Decode
         if first_prefill_request_idx > 0:
-            hidden_states_decode = hidden_states[:first_prefill_token_idx]
-            conv_state_decode = conv_state[:first_prefill_request_idx]
-            ssm_state_decode = ssm_state[:first_prefill_request_idx]
+            # Slice original tensors for the decode part.
+            hidden_states_decode = hidden_states[:first_prefill_token_idx].clone()
+            conv_state_decode = conv_state[:first_prefill_request_idx].clone()
+            ssm_state_decode = ssm_state[:first_prefill_request_idx].clone()
 
             # Run decode step. We swap the input batch dimension and sequence dimension
             # and then restore the original shape before returning.
@@ -684,26 +700,36 @@ class MambaMixer(MegatronModule):
             )
             out_decode = out_decode.transpose(0, 1)
 
-        # Prefill
-        hidden_states_prefill = hidden_states[first_prefill_token_idx:]
-        conv_state_prefill = conv_state[first_prefill_request_idx:]
-        ssm_state_prefill = ssm_state[first_prefill_request_idx:]
-        # Account for the leading 0
-        cu_seqlens_prefill = F.pad(
-            cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
-        )
-        seq_idx_prefill = seq_idx[:, first_prefill_token_idx:] - first_prefill_request_idx
+            if torch.isnan(out_decode).any():
+                torch.distributed.breakpoint(0)
 
-        zxBCdt = self.compute_in_proj(hidden_states_prefill)
+        # Prefill
+        zxBCdt = self.compute_in_proj(hidden_states)
         out_prefill, out_bias_prefill = self.ssm_block(
             zxBCdt,
-            conv_state=conv_state_prefill,
-            ssm_state=ssm_state_prefill,
-            seq_idx=seq_idx_prefill,
-            cu_seqlens=cu_seqlens_prefill,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
             return_varlen_states=return_varlen_states,
+            active_token_count=context.active_token_count,
         )
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"active_token_count={context.active_token_count}, padded_active_token_count={context.padded_active_token_count}, first_prefill_token_idx={first_prefill_token_idx}"
+            )
+        if torch.isnan(out_prefill[first_prefill_token_idx : context.active_token_count]).any():
+            torch.distributed.breakpoint(0)
+        out_prefill = out_prefill[first_prefill_token_idx:]
+        if out_bias_prefill is not None:
+            out_bias_prefill = out_bias_prefill[first_prefill_token_idx:]
 
+        # Update decode part of Mamba states
+        if first_prefill_request_idx > 0:
+            conv_state[:first_prefill_request_idx].copy_(conv_state_decode)
+            ssm_state[:first_prefill_request_idx].copy_(ssm_state_decode)
+
+        # Concatenate the un-padded outputs from decode and prefill.
         out = maybe_cat(out_decode, out_prefill, required=True)
         out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)
 

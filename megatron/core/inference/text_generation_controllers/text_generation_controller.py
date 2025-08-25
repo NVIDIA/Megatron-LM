@@ -30,6 +30,7 @@ from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_model_config, unwrap_model
+from megatron.training import print_rank_0
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -504,6 +505,18 @@ class TextGenerationController:
         new_sample = self.sample_from_logits(
             last_token_logits, sampling_params, vocab_size=vocab_size
         )
+
+        if not context.is_decode_only():
+            cu_seqlens, _ = context.cu_query_lengths()
+            print_rank_0(f"cu_seqlens={cu_seqlens}")
+            print_rank_0(f"new_sample={new_sample}")
+            for i in range(len(new_sample)):
+                tokens = context.token_to_input_ids[cu_seqlens[i] : cu_seqlens[i + 1]].tolist()
+                tokens.append(new_sample[i])
+                print_rank_0(f"Request {i} generation so far: {self._detokenize(tokens)}")
+
+            if torch.min(new_sample) == 0:
+                torch.distributed.breakpoint(0)
 
         # Active sequence lengths.
         current_request_ids = context.request_ids[
