@@ -25,7 +25,12 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    get_pg_rank,
+    make_viewless_tensor,
+)
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -226,7 +231,7 @@ def _get_block_submodules(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     vp_stage: Optional[int] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """
     Retrieve or construct TransformerBlockSubmodules based on the provided specification.
@@ -253,7 +258,7 @@ def _get_block_submodules(
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
-            num_layers = get_num_layers_to_build(config, vp_stage, pp_group)
+            num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
             )
@@ -282,8 +287,9 @@ class TransformerBlock(MegatronModule):
         self.model_comm_pgs = model_comm_pgs
 
         pp_group = self.model_comm_pgs.pp if hasattr(self.model_comm_pgs, 'pp') else None
+        pp_rank = get_pg_rank(pp_group)
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_group)
+        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
