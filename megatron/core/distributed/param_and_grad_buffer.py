@@ -512,6 +512,7 @@ class _ParamAndGradBuffer:
         param_dtype: torch.dtype,
         grad_dtype: torch.dtype,
         params: List[torch.nn.Parameter],
+        data_parallel_group: torch.distributed.ProcessGroup,
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
         gradient_scaling_factor: float,
@@ -522,18 +523,12 @@ class _ParamAndGradBuffer:
     ):
 
         if model_comm_pgs is None and grad_comm_pgs is None:
-            self.data_parallel_group = parallel_state.get_data_parallel_group()
             self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
                 with_context_parallel=True
             )
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         elif model_comm_pgs is not None and grad_comm_pgs is not None:
-            assert (
-                hasattr(model_comm_pgs, 'tp')
-                and hasattr(grad_comm_pgs, 'dp')
-                and hasattr(grad_comm_pgs, 'dp_cp')
-            )
-            self.data_parallel_group = grad_comm_pgs.dp
+            assert hasattr(model_comm_pgs, 'tp') and hasattr(grad_comm_pgs, 'dp_cp')
             self.dp_cp_group = grad_comm_pgs.dp_cp
             self.tp_group = model_comm_pgs.tp
         else:
@@ -555,6 +550,7 @@ class _ParamAndGradBuffer:
         # Store attributes that will be needed later.
         self.param_dtype = param_dtype
         self.grad_dtype = grad_dtype
+        self.data_parallel_group = data_parallel_group
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
