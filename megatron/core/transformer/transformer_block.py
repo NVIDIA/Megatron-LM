@@ -175,23 +175,17 @@ def get_num_layers_to_build(
     # The embedding (or loss) layer cannot function as a standalone transformer layer
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
-    if (
-        pp_rank == 0
-        and vp_size is not None
-        and vp_stage == 0
-        and config.account_for_embedding_in_pipeline_split
-    ):
-        num_layers_to_build -= 1
-        assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
+    if config.account_for_embedding_in_pipeline_split:
+        if (vp_size is not None and vp_stage == 0) or pp_rank == 0:
+            num_layers_to_build -= 1
+            assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
 
-    if (
-        pp_rank == config.pipeline_model_parallel_size - 1
-        and vp_size is not None
-        and vp_stage == (vp_size - 1)
-        and config.account_for_loss_in_pipeline_split
-    ):
-        num_layers_to_build -= 1
-        assert num_layers_to_build >= 0, "Not enough layers in the last virtual pipeline stage"
+    if config.account_for_loss_in_pipeline_split:
+        if (
+            vp_size is not None and vp_stage == (vp_size - 1)
+        ) or pp_rank == config.pipeline_model_parallel_size - 1:
+            num_layers_to_build -= 1
+            assert num_layers_to_build >= 0, "Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
 
