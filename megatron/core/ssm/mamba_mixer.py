@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -31,6 +31,7 @@ from megatron.core.utils import (
     check_mamba_sequence_packing_support,
     deprecate_inference_params,
     log_single_rank,
+    maybe_cat,
 )
 
 from .mamba_context_parallel import MambaContextParallel
@@ -408,62 +409,39 @@ class MambaMixer(MegatronModule):
         in_inference_mode = inference_context is not None and not self.training
 
         if in_inference_mode and inference_context.is_dynamic_batching():
-            sequence_packing_available, reason_for_no_sequence_packing = (
-                check_mamba_sequence_packing_support()
-            )
-            assert sequence_packing_available, reason_for_no_sequence_packing
+            return self.dynamic_inference(hidden_states, inference_context)
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None
-        seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(
-            inference_context
-        )
 
         if in_inference_mode:
             assert not self.config.sequence_parallel
+            assert inference_context.is_static_batching()
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-            if (
-                inference_context.is_static_batching() and inference_context.sequence_len_offset > 0
-            ) or (inference_context.is_dynamic_batching() and inference_context.is_decode_only()):
+            if inference_context.sequence_len_offset > 0:
                 # The states are updated inplace
-                if inference_context.is_dynamic_batching():
-                    # Make batch dimension first and sequence dimension second
-                    # (batch size will be 1)
-                    hidden_states = hidden_states.transpose(0, 1)
-                out, out_bias, _, _ = self.step(
-                    hidden_states,
-                    conv_state,
-                    ssm_state,
-                    is_dynamic_batching=inference_context.is_dynamic_batching(),
-                )
-                if inference_context.is_dynamic_batching():
-                    # Restore original shape of sequence dimension first followed by batch dimension
-                    out = out.transpose(0, 1)
+                out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
 
-        zxBCdt, _ = self.in_proj(hidden_states)
+        zxBCdt = self.compute_in_proj(hidden_states)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
-
-        # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-
-        # (nheads_local_tpcp)
-        A = -torch.exp(self.cp.get_A_log().float())
-
-        if self.use_mem_eff_path and inference_context is None:
+        # Training path using memory-efficient kernel
+        if self.use_mem_eff_path and not in_inference_mode:
             assert ssm_state is None
 
             # TODO(duncan): Can this code be removed?
             if self.conv1d.bias is not None:
                 self.conv1d.bias.data_ptr()
 
+            # (nheads_local_tpcp)
+            A = -torch.exp(self.cp.get_A_log().float())
+
             y = mamba_split_conv1d_scan_combined(
                 zxBCdt,
                 rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                 self.cp.get_conv1d_bias(),
                 self.cp.get_dt_bias().float(),
-                A,
+                A=A,
                 D=(
                     rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                     if self.D_has_hdim
@@ -482,145 +460,256 @@ class MambaMixer(MegatronModule):
             if self.rmsnorm:
                 y = self.norm(y)
         else:
-            # This path is always used for the inference prefill phase.
-            # `mamba_split_conv1d_scan_combined`, used in the other branch above, reduces the size
-            # of forward activations stored for backprop, which reduces memory pressure during
-            # training, and does not provide increased speed in the forward direction.
-            z, xBC, dt = torch.split(
-                zxBCdt,
-                [
-                    self.cp.d_inner_local_tpcp,
-                    self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
-                    self.cp.nheads_local_tpcp,
-                ],
-                dim=-1,
-            )
-
-            if inference_context.is_static_batching():
-                # transpose: b l pd --> b pd l
-                xBC = rearrange(xBC, "b l d -> b d l").contiguous()
-
-            # Compute short convolution
-            if conv_state is not None:
-                if inference_context.is_dynamic_batching():
-                    # xBC should have shape (b l d) for causal_conv1d_varlen_states
-                    conv_state.copy_(
-                        causal_conv1d_varlen_states(
-                            xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
-                        )
-                    )
-
-                    # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
-                    # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
-                    xBC = xBC.transpose(1, 2)
-                else:
-                    # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                    # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                    conv_state.copy_(
-                        F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
-                    )  # Update state (B D W)
-
-            seqlen = xBC.size(2)
-            if causal_conv1d_fn is None:
-                xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                # TODO(ksanthanam): Remove the separate args construction once we upgrade the
-                # minimum `causal_conv1d` version
-                causal_conv1d_kwargs = {
-                    "x": xBC,
-                    "weight": rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                    "bias": self.cp.get_conv1d_bias(),
-                    "activation": self.activation,
-                }
-                if inference_context.is_dynamic_batching():
-                    causal_conv1d_kwargs["seq_idx"] = seq_idx
-                xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
-                del causal_conv1d_kwargs
-
-            # transpose b pd l --> b l pd
-            xBC = rearrange(xBC, "b d l ->  b l d").contiguous()
-
-            x, B, C = torch.split(
-                xBC,
-                [
-                    self.cp.d_inner_local_tpcp,
-                    self.cp.ngroups_local_tpcp * self.d_state,
-                    self.cp.ngroups_local_tpcp * self.d_state,
-                ],
-                dim=-1,
-            )
-
-            # TODO Vijay: fuse most of the transposes with the GEMMS
-            x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-            dt = dt.contiguous()
-            B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-            C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-            z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-
-            # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
-            # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
-            # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
-            # mathematically incorrect, and potentially arithmetically unstable.
-            assert (
-                self.cp.cp_size == 1 or self.rmsnorm
-            ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
-
-            # Note that both `seq_idx` and `cu_seqlens` must be passed in
-            # for variable length generation.
-            # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
-            # TODO(ksanthanam): Remove the separate args construction once we upgrade the
-            # minimum `mamba_ssm` version
-            mamba_chunk_scan_combined_args = [x, dt, A, B, C, self.chunk_size]
-            mamba_chunk_scan_combined_kwargs = {
-                "D": (
-                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.cp.get_D()
-                ),
-                "z": z if not self.rmsnorm else None,
-                "dt_bias": self.cp.get_dt_bias().float(),
-                "dt_softplus": True,
-                "return_final_states": ssm_state is not None,
-            }
-            if inference_context.is_dynamic_batching():
-                mamba_chunk_scan_combined_kwargs.update(
-                    {
-                        "seq_idx": seq_idx,
-                        "cu_seqlens": cu_seqlens,
-                        "return_varlen_states": return_varlen_states,
-                    }
-                )
-            y = mamba_chunk_scan_combined(
-                *mamba_chunk_scan_combined_args, **mamba_chunk_scan_combined_kwargs
-            )
-            del mamba_chunk_scan_combined_args
-            del mamba_chunk_scan_combined_kwargs
-
-            if ssm_state is not None:
-                if return_varlen_states:
-                    y, last_state, varlen_states = y
-                    # This has to be varlen_states, NOT last_state
-                    # See reference implementation:
-                    # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
-                    ssm_state.copy_(varlen_states)
-                else:
-                    y, last_state = y
-                    ssm_state.copy_(last_state)
-
-            y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-            y = self.cp.post_conv_ssm(y)
-
-            if self.rmsnorm:
-                z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-                z = self.cp.post_conv_ssm(z)
-                y = self.norm(y, z)
+            # Prefill path for inference, or non-mem-eff training path
+            out, out_bias = self.ssm_block(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            return out, out_bias
 
         out, out_bias = self.out_proj(y)
+        return out, out_bias
+
+    def compute_in_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Computes the input projection given the input hidden states."""
+        zxBCdt, _ = self.in_proj(hidden_states)
+
+        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
+
+        # transpose: l b pd --> b l pd
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        return zxBCdt
+
+    def ssm_block(
+        self,
+        x_ssm_in: torch.Tensor,
+        conv_state: Optional[torch.Tensor] = None,
+        ssm_state: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        return_varlen_states: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encapsulates the core selective scan block logic which is shared between
+        the training/prefill forward pass and the dynamic inference prefill pass.
+
+        Args:
+            x_ssm_in: The input tensor of shape (b, l, d), which is a concatenation of
+                z, x, B, C, and dt projections.
+            conv_state: The convolution state tensor for inference.
+            ssm_state: The selective scan state tensor for inference.
+            seq_idx: A map from token index to request index for variable-length sequences.
+            cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+            return_varlen_states: Whether to return variable-length states from the SSM kernel.
+
+        Returns:
+            A tuple containing the output tensor and the output bias tensor.
+        """
+        is_dynamic_batching = seq_idx is not None
+
+        # (nheads_local_tpcp)
+        A = -torch.exp(self.cp.get_A_log().float())
+
+        z, xBC, dt = torch.split(
+            x_ssm_in,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp,
+            ],
+            dim=-1,
+        )
+
+        # Compute short convolution
+        if conv_state is not None and is_dynamic_batching:
+            # xBC should have shape (b l d) for causal_conv1d_varlen_states
+            conv_state.copy_(
+                causal_conv1d_varlen_states(
+                    xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+                )
+            )
+            # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
+            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
+            xBC = xBC.transpose(1, 2)
+        else:
+            # transpose: b l pd --> b pd l
+            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+            if conv_state is not None:  # This is for static batching inference
+                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                conv_state.copy_(
+                    F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
+                )  # Update state (B D W)
+
+        seqlen = xBC.size(2)
+        if causal_conv1d_fn is None:
+            xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
+        else:
+            assert self.activation in ["silu", "swish"]
+            causal_conv1d_kwargs = {
+                "x": xBC,
+                "weight": rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                "bias": self.cp.get_conv1d_bias(),
+                "activation": self.activation,
+            }
+            if is_dynamic_batching:
+                causal_conv1d_kwargs["seq_idx"] = seq_idx
+            xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
+            del causal_conv1d_kwargs
+
+        # transpose b pd l --> b l pd
+        xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+
+        x, B, C = torch.split(
+            xBC,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.ngroups_local_tpcp * self.d_state,
+            ],
+            dim=-1,
+        )
+
+        # TODO Vijay: fuse most of the transposes with the GEMMS
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+        dt = dt.contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+
+        # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
+        # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
+        # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
+        # mathematically incorrect, and potentially arithmetically unstable.
+        assert (
+            self.cp.cp_size == 1 or self.rmsnorm
+        ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+
+        # Note that both `seq_idx` and `cu_seqlens` must be passed in
+        # for variable length generation.
+        # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
+        mamba_chunk_scan_combined_args = [x, dt, A, B, C, self.chunk_size]
+        mamba_chunk_scan_combined_kwargs = {
+            "D": (
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            "z": z if not self.rmsnorm else None,
+            "dt_bias": self.cp.get_dt_bias().float(),
+            "dt_softplus": True,
+            "return_final_states": ssm_state is not None,
+        }
+        if is_dynamic_batching:
+            mamba_chunk_scan_combined_kwargs.update(
+                {
+                    "seq_idx": seq_idx,
+                    "cu_seqlens": cu_seqlens,
+                    "return_varlen_states": return_varlen_states,
+                }
+            )
+        y = mamba_chunk_scan_combined(
+            *mamba_chunk_scan_combined_args, **mamba_chunk_scan_combined_kwargs
+        )
+        del mamba_chunk_scan_combined_args
+        del mamba_chunk_scan_combined_kwargs
+
+        if ssm_state is not None:
+            if return_varlen_states:
+                y, _, varlen_states = y
+                # This has to be varlen_states, NOT last_state
+                # See reference implementation:
+                # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
+                ssm_state.copy_(varlen_states)
+            else:
+                y, last_state = y
+                ssm_state.copy_(last_state)
+
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+        y = self.cp.post_conv_ssm(y)
+
+        if self.rmsnorm:
+            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            z = self.cp.post_conv_ssm(z)
+            y = self.norm(y, z)
+
+        out, out_bias = self.out_proj(y)
+        return out, out_bias
+
+    def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
+        """
+        Executes dynamic inference by separating decode and prefill requests and
+        running them independently.
+
+        Args:
+            hidden_states (torch.Tensor): The input hidden states.
+            context (DynamicInferenceContext): The inference context.
+
+        Returns:
+            (out, out_bias): The forward pass output.
+        """
+        sequence_packing_available, reason_for_no_sequence_packing = (
+            check_mamba_sequence_packing_support()
+        )
+        assert sequence_packing_available, reason_for_no_sequence_packing
+        assert not self.config.sequence_parallel
+
+        conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
+
+        if context.is_decode_only():
+            # Run decode step. We swap the input batch dimension and sequence dimension
+            # and then restore the original shape before returning.
+            out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
+            return (out.transpose(0, 1), out_bias)
+
+        # Compute the split between decode and prefill
+        seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(context)
+        active_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+        first_prefill_request_idx = torch.nonzero(active_query_lengths > 1)[0].int()
+        first_prefill_token_idx = cu_seqlens[first_prefill_request_idx]
+
+        out_decode, out_bias_decode = None, None
+        out_prefill, out_bias_prefill = None, None
+
+        # Decode
+        if first_prefill_request_idx > 0:
+            hidden_states_decode = hidden_states[:first_prefill_token_idx]
+            conv_state_decode = conv_state[:first_prefill_request_idx]
+            ssm_state_decode = ssm_state[:first_prefill_request_idx]
+
+            # Run decode step. We swap the input batch dimension and sequence dimension
+            # and then restore the original shape before returning.
+            out_decode, out_bias_decode, _, _ = self.step(
+                hidden_states_decode.transpose(0, 1), conv_state_decode, ssm_state_decode
+            )
+            out_decode = out_decode.transpose(0, 1)
+
+        # Prefill
+        hidden_states_prefill = hidden_states[first_prefill_token_idx:]
+        conv_state_prefill = conv_state[first_prefill_request_idx:]
+        ssm_state_prefill = ssm_state[first_prefill_request_idx:]
+        # Account for the leading 0
+        cu_seqlens_prefill = F.pad(
+            cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
+        )
+        seq_idx_prefill = seq_idx[:, first_prefill_token_idx:] - first_prefill_request_idx
+
+        zxBCdt = self.compute_in_proj(hidden_states_prefill)
+        out_prefill, out_bias_prefill = self.ssm_block(
+            zxBCdt,
+            conv_state=conv_state_prefill,
+            ssm_state=ssm_state_prefill,
+            seq_idx=seq_idx_prefill,
+            cu_seqlens=cu_seqlens_prefill,
+            return_varlen_states=return_varlen_states,
+        )
+
+        out = maybe_cat(out_decode, out_prefill, required=True)
+        out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)
 
         return out, out_bias
 
-    def step(self, hidden_states, conv_state, ssm_state, is_dynamic_batching=False):
+    def step(self, hidden_states, conv_state, ssm_state):
         """
         Performs inference step for decoding
         """
@@ -628,13 +717,6 @@ class MambaMixer(MegatronModule):
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
         dtype = hidden_states.dtype
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
-
-        if is_dynamic_batching:
-            batch_indices = torch.arange(
-                hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
-            )
-        else:
-            batch_indices = None
 
         in_fp8_mode = HAVE_TE and FP8GlobalStateManager.is_fp8_enabled()
 
@@ -671,21 +753,13 @@ class MambaMixer(MegatronModule):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=dtype)
         else:
-            # TODO(ksanthanam): Remove the separate args construction once we upgrade the
-            # minimum `causal_conv1d` version
-            causal_conv1d_update_args = [
+            xBC = causal_conv1d_update(
                 xBC,
                 conv_state,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
-            ]
-            causal_conv1d_update_kwargs = {}
-            if is_dynamic_batching:
-                causal_conv1d_update_kwargs["conv_state_indices"] = batch_indices
-            xBC = causal_conv1d_update(*causal_conv1d_update_args, **causal_conv1d_update_kwargs)
-            del causal_conv1d_update_args
-            del causal_conv1d_update_kwargs
+            )
 
         x, B, C = torch.split(
             xBC,
@@ -754,21 +828,18 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
-            # TODO(ksanthanam): Remove the separate args construction once we upgrade the
-            # minimum `mamba_ssm` version
-            selective_state_update_args = [ssm_state, x_reshaped, dt, A, B, C, D]
-            selective_state_update_kwargs = {
-                "z": z if not self.rmsnorm else None,
-                "dt_bias": dt_bias,
-                "dt_softplus": True,
-            }
-            if is_dynamic_batching:
-                selective_state_update_kwargs["state_batch_indices"] = batch_indices
             y = selective_state_update(
-                *selective_state_update_args, **selective_state_update_kwargs
+                ssm_state,
+                x_reshaped,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z=z if not self.rmsnorm else None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
             )
-            del selective_state_update_args
-            del selective_state_update_kwargs
             y = rearrange(y, "b h p -> b (h p)")
 
         if self.rmsnorm:
@@ -852,10 +923,8 @@ class MambaMixer(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         assert inference_context is not None
+        assert inference_context.is_static_batching()
         assert self.layer_number is not None
-
-        if inference_context.is_dynamic_batching():
-            return inference_context.mamba_states_cache(self.layer_number)
 
         if (
             self.layer_number not in inference_context.key_value_memory_dict

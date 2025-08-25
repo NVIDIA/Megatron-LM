@@ -1027,6 +1027,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : (self.active_token_count + context_length)
         ] = (arange_context_length % self.chunk_size_tokens)
 
+        """
+        if self.is_hybrid_model:
+            self.mamba_conv_states[:, self.total_request_count] = 0.0
+            self.mamba_ssm_states[:, self.total_request_count] = 0.0
+        """
+
         # Increment request and token counts.
         self.total_request_count += 1
         self.active_token_count += context_length

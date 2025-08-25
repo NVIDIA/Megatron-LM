@@ -2083,3 +2083,13 @@ def unwrap_model(model, module_instances=None):
     if not return_list:
         return unwrapped_model[0]
     return unwrapped_model
+
+
+def maybe_cat(a, b, dim=0, *, required=False):
+    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
+    xs = [t for t in (a, b) if t is not None]
+    if not xs:
+        if required:
+            raise ValueError("both tensors are None")
+        return None
+    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)

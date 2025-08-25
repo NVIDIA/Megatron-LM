@@ -350,7 +350,7 @@ def main():
             output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
             output_text_escaped = request.output_text.replace("\n", "\\n")
             print(
-                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
+                f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
                 f"{prompt_text} ... {output_text_escaped}"
             )
 
