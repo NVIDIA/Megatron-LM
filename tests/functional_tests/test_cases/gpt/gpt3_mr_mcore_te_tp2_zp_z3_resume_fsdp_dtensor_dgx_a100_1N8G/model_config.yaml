@@ -38,7 +38,7 @@ MODEL_ARGS:
   --eval-iters: 10
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 2
-  --use-custom-fsdp: true
+  --use-megatron-fsdp: true
   --calculate-per-token-loss: true
   --data-parallel-sharding-strategy: optim_grads_params
   --use-distributed-optimizer: true
@@ -47,7 +47,7 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
-  --ckpt-format: torch_dist
+  --ckpt-format: fsdp_dtensor
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular

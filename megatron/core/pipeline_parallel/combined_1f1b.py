@@ -9,7 +9,7 @@ import torch
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, set_streams
-from megatron.core.utils import get_attr_wrapped_model, unwrap_model
+from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -47,8 +47,6 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 4: 4th microbatch backward
     """
 
-    f_context = contextlib.nullcontext()
-    b_context = contextlib.nullcontext()
     set_streams()
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
@@ -63,8 +61,6 @@ def combined_1f1b_schedule_for_no_pipelining(
         None,  # b_output_tensor
         None,  # b_output_tensor_grad
         config,
-        f_context=f_context,
-        b_context=b_context,
         collect_non_loss_data=collect_non_loss_data,
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
@@ -88,8 +84,6 @@ def combined_1f1b_schedule_for_no_pipelining(
                 output_tensor,  # b_output_tensor
                 output_tensor_grad,  # b_output_tensor_grad
                 config,
-                f_context=f_context,
-                b_context=b_context,
                 collect_non_loss_data=collect_non_loss_data,
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
@@ -110,10 +104,134 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor,  # b_output_tensor
         output_tensor_grad,  # b_output_tensor_grad
         config,
-        f_context=f_context,
-        b_context=b_context,
     )
     return forward_data_store, total_num_tokens
+
+
+def combined_1f1b_schedule_for_interleaved_pipelining(
+    config,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    forward_data_store,
+    forward_step_helper_preprocess,
+    forward_step_helper_postprocess,
+    backward_step_helper_preprocess,
+    backward_step_helper_postprocess,
+    get_microbatch_id_in_model_chunk,
+    get_model_chunk_id,
+    check_first_val_step,
+    is_first_microbatch_for_model_chunk,
+    collect_non_loss_data,
+    f_virtual_microbatch_id=None,
+    b_virtual_microbatch_id=None,
+    pre_forward=None,
+    pre_backward=None,
+    post_forward=None,
+    post_backward=None,
+):
+    """Helper method to run combined forward and backward step for A2A communication hiding.
+    This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
+    eventually calls `combined_forward_backward_step` method defined in `combined_1f1b.py`.
+    This method is called only if `overlap_moe_expert_parallel_comm` is true.
+
+    Args:
+        The arguments could be categorized into 2 groups:
+        - Common arguments
+          - f_virtual_microbatch_id, b_virtual_microbatch_id,
+        - Arguments for combined_forward_backward_step()
+          - config, forward_step_func, data_iterator, model, num_microbatches, forward_data_store
+          - check_first_val_step, is_first_microbatch_for_model_chunk, collect_non_loss_data
+          - pre_forward, pre_backward, post_forward, post_backward
+        - Callables for the forward_step_helper() and backward_step_helper()
+          - forward_step_helper_preprocess, forward_step_helper_postprocess
+          - backward_step_helper_preprocess, backward_step_helper_postprocess
+          - get_microbatch_id_in_model_chunk, get_model_chunk_id
+
+    Returns:
+        output_tensor (Tensor or list[Tensor]): The output object(s) from the forward step.
+        input_tensor_grad (Tensor): The grad of the input tensor.
+
+    Descriptions:
+        This method merges the forward_step_helper() and backward_step_helper() in schedules.py.
+        Assuming that:
+            def forward_step_helper():
+                # forward_step_helper_preprocess()
+                # forward_step()
+                # forward_step_helper_postprocess()
+            def backward_step_helper():
+                # backward_step_helper_preprocess()
+                # backward_step()
+                # backward_step_helper_postprocess()
+        Then the combined_1f1b_schedule_for_interleaved_pipelining() method will be:
+            def combined_1f1b_schedule_for_interleaved_pipelining():
+                # forward_step_helper_preprocess()
+                # backward_step_helper_preprocess()
+                # combined_forward_backward_step() // merged forward_step() and backward_step()
+                # forward_step_helper_postprocess()
+                # backward_step_helper_postprocess()
+    """
+
+    set_streams()
+    # forward prepare
+    f_model_chunk_id = None
+    f_microbatch_id = None
+    input_tensor = None
+    if f_virtual_microbatch_id is not None:
+        f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
+    if f_virtual_microbatch_id is not None:
+        f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
+        input_tensor = forward_step_helper_preprocess(
+            f_virtual_microbatch_id, f_model_chunk_id, f_microbatch_id
+        )
+    # backward prepare
+    b_model_chunk_id = None
+    b_input_tensor = None
+    b_output_tensor = None
+    b_output_tensor_grad = None
+    if b_virtual_microbatch_id is not None:
+        b_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
+        b_input_tensor, b_output_tensor, b_output_tensor_grad = backward_step_helper_preprocess(
+            b_virtual_microbatch_id, b_model_chunk_id
+        )
+    # Call combined forward and backward step to overlap the communication and computation
+    output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
+        forward_step_func,
+        data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
+        model[f_model_chunk_id] if f_model_chunk_id is not None else None,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        model[b_model_chunk_id] if b_model_chunk_id is not None else None,
+        b_input_tensor,
+        b_output_tensor,
+        b_output_tensor_grad,
+        config,
+        f_model_chunk_id=f_model_chunk_id,
+        pre_forward=pre_forward,
+        pre_backward=pre_backward,
+        post_forward=post_forward,
+        post_backward=post_backward,
+        collect_non_loss_data=collect_non_loss_data,
+        checkpoint_activations_microbatch=None,
+        is_first_microbatch=check_first_val_step(
+            is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
+            if f_virtual_microbatch_id is not None
+            else None
+        ),
+        current_microbatch=f_microbatch_id,
+    )
+    # forward post process
+    if f_model_chunk_id is not None:
+        forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
+    # backward post process
+    if b_model_chunk_id:
+        # The same as the backward_step_helper
+        backward_step_helper_postprocess(b_virtual_microbatch_id)
+        if input_tensor is not None:
+            assert input_tensor_grad is not None
+    return output_tensor, input_tensor_grad
 
 
 def combined_forward_backward_step(
@@ -128,8 +246,7 @@ def combined_forward_backward_step(
     b_output_tensor,
     b_output_tensor_grad,
     config,
-    f_context=None,
-    b_context=None,
+    f_model_chunk_id=None,
     pre_forward=None,
     pre_backward=None,
     post_forward=None,
@@ -146,8 +263,6 @@ def combined_forward_backward_step(
         Need to accept the argument of both forward_step() and backward_step().
         forward_step_func (callable): A function returning a forward schedule plan which is
             an input of schedule_chunk_1f1b function.
-        f_context (VppContextManager or nullcontext): The context manager for setting vpp ranks.
-        b_context (VppContextManager or nullcontext): The context manager for setting vpp ranks.
 
         Only exists in 1f1b steady state with p2p overlap.
             pre_forward (callable): The function to call before the forward_step.
@@ -198,38 +313,38 @@ def combined_forward_backward_step(
     unwrap_output_tensor = False
     f_schedule_plan = None
     if f_model is not None:
-        with f_context:
-            if is_first_microbatch and hasattr(f_model, 'set_is_first_microbatch'):
-                f_model.set_is_first_microbatch()
-            if current_microbatch is not None:
-                set_current_microbatch(f_model, current_microbatch)
-            if not isinstance(input_tensor, list):
-                input_tensor = [input_tensor]
-                unwrap_output_tensor = True
+        if is_first_microbatch and hasattr(f_model, 'set_is_first_microbatch'):
+            f_model.set_is_first_microbatch()
+        if current_microbatch is not None:
+            set_current_microbatch(f_model, current_microbatch)
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_output_tensor = True
 
-            set_input_tensor = get_attr_wrapped_model(f_model, "set_input_tensor")
-            set_input_tensor(input_tensor)
+        set_input_tensor = get_attr_wrapped_model(f_model, "set_input_tensor")
+        set_input_tensor(input_tensor)
 
     # build the schedule plan and get loss function for forward step
     if f_model is not None:
-        with f_context:
-            # GPTModel.build_schedule_plan(model_forward_inputs) is called in the forward_step_func.
-            # The return value becomes (forward_schedule_plan, loss_function),
-            # which is used to be (forward_output_tensor, loss_function).
-            with context_manager:  # autocast context
-                unwrapped_model = unwrap_model(f_model)
-                from megatron.core.models.gpt.gpt_model import GPTModel
+        # GPTModel.build_schedule_plan(model_forward_inputs) is called in the forward_step_func.
+        # The return value becomes (forward_schedule_plan, loss_function),
+        # which is used to be (forward_output_tensor, loss_function).
+        with context_manager:  # autocast context
+            unwrapped_model = get_attr_wrapped_model(
+                f_model, "build_schedule_plan", return_model_obj=True
+            )
+            from megatron.core.models.gpt.gpt_model import GPTModel
 
-                assert isinstance(unwrapped_model, GPTModel), (
-                    "The final unwrapped model must be a GPTModel instance "
-                    "since only GPTModel is supported for EP A2A overlapping."
-                )
-                f_schedule_plan, loss_func = forward_step_func(
-                    data_iterator, unwrapped_model, return_schedule_plan=True
-                )
-                assert isinstance(
-                    f_schedule_plan, AbstractSchedulePlan
-                ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
+            assert isinstance(unwrapped_model, GPTModel), (
+                "The final unwrapped model must be a GPTModel instance "
+                "since only GPTModel is supported for EP A2A overlapping."
+            )
+            f_schedule_plan, loss_func = forward_step_func(
+                data_iterator, unwrapped_model, return_schedule_plan=True
+            )
+            assert isinstance(
+                f_schedule_plan, AbstractSchedulePlan
+            ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
@@ -278,8 +393,6 @@ def combined_forward_backward_step(
             f_schedule_plan,
             b_schedule_plan,
             b_grad=b_grad,
-            f_context=f_context,
-            b_context=b_context,
             pre_forward=pre_forward,
             pre_backward=pre_backward,
             post_forward=post_forward,
@@ -289,30 +402,30 @@ def combined_forward_backward_step(
     # forward post process
     num_tokens = None
     if f_model is not None:
-        with f_context:
-            from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
+        from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
 
-            loss_node = ScheduleNode(
-                loss_func, torch.cuda.current_stream(), f_schedule_plan.event, name="loss_func"
-            )
-            loss_func = loss_node.forward
-            output_tensor, num_tokens = forward_step_calc_loss(
-                f_model,
-                output_tensor,
-                loss_func,
-                config,
-                f_context.vpp_rank if hasattr(f_context, 'vpp_rank') else None,
-                collect_non_loss_data,
-                num_microbatches,
-                forward_data_store,
-            )
-            # Set the schedule plan and loss function to the output tensor
-            # This is used to get the schedule plan and loss function in the backward pass
-            output_tensor.schedule_plan = f_schedule_plan
-            output_tensor.loss_func = loss_node
+        loss_node = ScheduleNode(
+            loss_func, torch.cuda.current_stream(), f_schedule_plan.event, name="loss_func"
+        )
+        loss_func = loss_node.forward
+        output_tensor, num_tokens = forward_step_calc_loss(
+            f_model,
+            output_tensor,
+            loss_func,
+            config,
+            f_model_chunk_id,
+            collect_non_loss_data,
+            num_microbatches,
+            forward_data_store,
+        )
+        # Set the schedule plan and loss function to the output tensor
+        # This is used to get the schedule plan and loss function in the backward pass
+        output_tensor.schedule_plan = f_schedule_plan
+        output_tensor.loss_func = loss_node
 
-            if not unwrap_output_tensor:
-                output_tensor, num_tokens = [output_tensor], num_tokens
+        if not unwrap_output_tensor:
+            output_tensor, num_tokens = [output_tensor], num_tokens
+
     # backward post process, the same as the backward_step()
     input_tensor_grad = None
     if b_model is not None:

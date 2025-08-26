@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy<2.0.0", "packaging"]
+dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -71,7 +71,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "transformers~=4.53",
-    "multi-storage-client~=0.20",
+    "multi-storage-client~=0.25,<0.26",
     "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
     "mamba-ssm~=2.2",
@@ -106,11 +106,14 @@ test = [
     "pytest-random-order",
     "pytest-asyncio",
     "pygithub",
+    "pydantic",
+    "tensorboard",
+    "pyyaml",
 ]
 
 build = [
     "setuptools<80.0.0",
-    "packaging",
+    "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",

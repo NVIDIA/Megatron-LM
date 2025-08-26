@@ -88,20 +88,7 @@ def _get_param_groups(
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:
-        ddp_config = model_chunk.ddp_config
-        if ddp_config.use_custom_fsdp:
-            named_parameters = model_chunk.optimizer_named_parameters()
-        else:
-            named_parameters = model_chunk.named_parameters()
-
-        for name, param in named_parameters:
-            if (
-                ddp_config.use_custom_fsdp
-                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-            ):
-                param_shard = param
-                param = param.orig_param
-
+        for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
 
@@ -145,13 +132,7 @@ def _get_param_groups(
             key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
             if key not in params_map:
                 params_map[key] = []
-            if (
-                ddp_config.use_custom_fsdp
-                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-            ):
-                params_map[key].append(param_shard)
-            else:
-                params_map[key].append(param)
+            params_map[key].append(param)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -651,7 +632,7 @@ def get_megatron_optimizer(
     optimizers = []
     model_chunk_offset = 0
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
-    if ddp_config.use_custom_fsdp:
+    if ddp_config.use_megatron_fsdp:
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):

@@ -2,54 +2,31 @@
 
 """Pretrain and SFT GPT."""
 
-import datetime
-import os
 import torch
 
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 from megatron.core import parallel_state
-from megatron.training import get_args
 from megatron.training import inprocess_restart
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.training import get_tokenizer
-from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_mtp_block_spec,
-)
-from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
-    get_gpt_heterogeneous_layer_spec,
-)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
 )
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.training.datasets.sft_dataset import SFTDataset
-
-import megatron.legacy.model  # isort: skip
-
-# NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
+from model_provider import model_provider
+from gpt_builders import gpt_builder
 
 try:
     from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_provider import model_provider as model_provider_modelopt
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -58,149 +35,8 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def _get_transformer_layer_spec(use_te, config):
-    """Get transformer layer specification based on configuration.
-    
-    Args:
-        use_te (bool): Whether to use Transformer Engine
-        args: Training arguments
-        config: Model configuration
-        
-    Returns:
-        transformer_layer_spec: The transformer layer specification
-    """
-    args = get_args()
-    if use_te:
-        return get_gpt_layer_with_transformer_engine_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=args.qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-        )
-    else:
-        return get_gpt_layer_local_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-            normalization=args.normalization,
-            use_kitchen=config.use_kitchen,
-        )
-
-
-def model_provider(
-    pre_process=True, post_process=True, vp_stage: Optional[int] = None
-) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
-    """Builds the model.
-
-    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
-
-    Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
-
-    Returns:
-        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
-    """
-    args = get_args()
-
-    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
-        return model_provider_modelopt(pre_process, post_process)
-
-    use_te = args.transformer_impl == "transformer_engine"
-
-    if args.record_memory_history:
-        torch.cuda.memory._record_memory_history(
-            True,
-            # keep 100,000 alloc/free events from before the snapshot
-            trace_alloc_max_entries=100000,
-            # record stack information for the trace events
-            trace_alloc_record_context=True,
-        )
-
-        def oom_observer(device, alloc, device_alloc, device_free):
-            # snapshot right after an OOM happened
-            print('saving allocated state during OOM')
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
-
-            dump(
-                snapshot,
-                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'),
-            )
-
-        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
-    print_rank_0('building GPT model ...')
-    # Experimental loading arguments from yaml
-    if args.yaml_cfg is not None:
-        config = core_transformer_config_from_yaml(args, "language_model")
-    else:
-        config = core_transformer_config_from_args(args)
-
-    if args.use_legacy_models:
-        model = megatron.legacy.model.GPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
-        )
-    else:  # using core models
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            if args.num_experts:
-                # Define the decoder block spec
-                transformer_layer_spec = get_gpt_decoder_block_spec(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
-                )
-            elif args.heterogeneous_layers_config_path is not None:
-                transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
-            else:
-                # Define the decoder layer spec
-                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
-        mtp_block_spec = None
-        if args.mtp_num_layers is not None:
-            if hasattr(transformer_layer_spec, 'layer_specs') and len(transformer_layer_spec.layer_specs) == 0:
-                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
-            else:
-                transformer_layer_spec_for_mtp = transformer_layer_spec
-            mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
-            )
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base,
-            rope_scaling=args.use_rope_scaling,
-            mtp_block_spec=mtp_block_spec,
-            vp_stage=vp_stage,
-        )
-
-    return model
-
-
 def get_batch(data_iterator):
     """Generate a batch."""
-
     # TODO: this is pretty hacky, find a better way
     if (not parallel_state.is_pipeline_first_stage(ignore_virtual=True)) and (
         not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
@@ -395,7 +231,7 @@ if __name__ == "__main__":
 
     pretrain(
         train_valid_test_datasets_provider,
-        model_provider,
+        partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
