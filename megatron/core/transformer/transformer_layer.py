@@ -48,9 +48,7 @@ def _is_vp_first_stage(vp_stage: int, vp_size: int | None):
 
 
 def get_transformer_layer_offset(
-    config: TransformerConfig,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
     if pp_rank is None:
