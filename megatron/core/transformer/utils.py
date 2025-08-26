@@ -266,3 +266,120 @@ def set_model_to_sequence_parallel(model, set_to=False, exclude_modules=None):
     for attr, modules in _sequence_parallel_attr_cache[model_id].items():
         for module in modules:
             setattr(module, attr, set_to)
+
+
+# Initialize cache for modules
+cuda_graph_attr_cache = None
+
+
+def init_cuda_graph_cache(model):
+    """
+    Initialize the cache of modules for cuda graphs
+    """
+    global cuda_graph_attr_cache
+    model_id = id(model)
+    if cuda_graph_attr_cache is not None and model_id in cuda_graph_attr_cache:
+        return  # Cache already initialized
+
+    cuda_graph_attrs = ["enable_cuda_graph", "flash_decode", "cudagraph_manager"]
+
+    # Special case handling for activation recomputation
+    if model.config.recompute_granularity is not None:
+        cuda_graph_attrs.append("recompute_granularity")
+
+    # Initialize dictionary to hold attributes -> list of modules
+    if cuda_graph_attr_cache is None:
+        cuda_graph_attr_cache = {}
+
+    cuda_graph_attr_cache[model_id] = {attr: [] for attr in cuda_graph_attrs}
+
+    # Get the model
+    model_modules = model
+
+    # Recursive function to find all modules with our target attributes
+    def find_modules_with_attrs(module):
+        # Check if this module has any of our target attributes
+        for attr in ["enable_cuda_graph", "flash_decode"]:
+            if hasattr(module, attr) and isinstance(getattr(module, attr), bool):
+                cuda_graph_attr_cache[model_id][attr].append(module)
+
+            # Check for config variables
+            if hasattr(module, "config"):
+                if hasattr(module.config, attr):
+                    cuda_graph_attr_cache[model_id][attr].append(module.config)
+
+        # Specific caching for cuda graph managers
+        if hasattr(module, "cudagraph_manager"):
+            cuda_graph_attr_cache[model_id]["cudagraph_manager"].append(
+                [module, module.cudagraph_manager]
+            )
+
+        # Specific caching for recompute granularity
+        if hasattr(module, "recompute_granularity"):
+            cuda_graph_attr_cache[model_id]["recompute_granularity"].append(
+                [module, module.recompute_granularity]
+            )
+
+        # Check all children modules recursively
+        for child in module._modules.values():
+            if child is not None:
+                find_modules_with_attrs(child)
+
+    # Start the search from each major component
+    find_modules_with_attrs(model_modules)
+
+
+def toggle_cuda_graphs(model, set_to=False, reset_cuda_graphs=True):
+    """
+    Toggle CUDA graph-related attributes for the model and its modules.
+
+    Args:
+        set_to (bool): Value to set for CUDA graph-related attributes.
+        reset_cuda_graphs (bool): If True, remake the CUDA graph;
+            if False, use cached CUDA graph managers.
+    """
+    global cuda_graph_attr_cache
+    model_id = id(model)
+
+    # Initialize cache if needed
+    if cuda_graph_attr_cache is None or model_id not in cuda_graph_attr_cache:
+        init_cuda_graph_cache(model)
+
+    model.config.enable_cuda_graph = set_to
+
+    # Collect all modules that have any of the CUDA graph attributes
+    for attribute, modules in cuda_graph_attr_cache[model_id].items():
+        if attribute == "enable_cuda_graph":
+            for module in modules:
+                setattr(module, attribute, set_to)
+        elif attribute == "recompute_granularity":
+            for module in modules:
+                if set_to:
+                    # If we are turning on cuda graphs we need to turn of activation recomputation
+                    setattr(module[0], attribute, None)
+                else:
+                    # If we are turning off cuda graphs we can set it to the cached value
+                    setattr(module[0], attribute, module[1])
+        # Cuda Graph manager case
+        elif attribute == "cudagraph_manager":
+            for module in modules:
+                if set_to:
+                    if reset_cuda_graphs:
+                        from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+                        # If we are resetting cuda graphs we create a new cuda graph manager
+                        setattr(module[0], attribute, CudaGraphManager(model.config))
+                    else:
+                        # If we are not resetting cuda graphs we set it to its cached cuda graph
+                        setattr(module[0], attribute, module[1])
+                else:
+                    for module in modules:
+                        # If we are deleting the cuda graph, we delete its attribute
+                        if hasattr(module[0], "cudagraph_manager"):
+                            delattr(module[0], "cudagraph_manager")
+
+    from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+
+    # if we are resetting cuda graphs we need to reset all the state
+    if reset_cuda_graphs and set_to == False:
+        delete_cuda_graphs()

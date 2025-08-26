@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import warnings
+from contextlib import contextmanager
 from datetime import datetime
 from collections import defaultdict
 
@@ -309,9 +310,13 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(
-    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss
-):
+def get_ltor_masks_and_position_ids(data,
+                                    eod_token,
+                                    pad_token,
+                                    reset_position_ids,
+                                    reset_attention_mask,
+                                    eod_mask_loss,
+                                    pad_mask_loss):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -330,6 +335,8 @@ def get_ltor_masks_and_position_ids(
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
     if eod_mask_loss:
         loss_mask[data == eod_token] = 0.0
+    if pad_mask_loss:
+        loss_mask[data == pad_token] = 0.0
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
@@ -343,7 +350,7 @@ def get_ltor_masks_and_position_ids(
         for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
-            eod_index = position_ids[b, data[b] == eod_token]
+            eod_index = position_ids[b, data[b] == eod_token] & position_ids[b, data[b] == pad_token]
             # Detach indecies from positions if going to modify positions.
             if reset_position_ids:
                 eod_index = eod_index.clone()
@@ -635,3 +642,24 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
     return module._apply(
         lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
     )
+
+
+def get_nvtx_range():
+    """Create an NVTX range context manager."""
+    try:
+        from torch.cuda import nvtx
+
+        @contextmanager
+        def nvtx_range(msg):
+            try:
+                nvtx.range_push(msg)
+                yield
+            finally:
+                nvtx.range_pop()
+
+        return nvtx_range
+    except:
+        @contextmanager
+        def dummy_range(msg):
+            yield
+        return dummy_range

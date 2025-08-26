@@ -160,7 +160,7 @@ class _CudagraphGlobalRecord:
     fwd and bwd passes will be performed using their cudagraphed versions."""
     cudagraph_created = False
 
-    """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and 
+    """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and
     'record_bwd_graph."""
     cudagraph_record = []
 
@@ -331,6 +331,22 @@ def create_cudagraphs():
     memory pool, minimizing cudagraph memory usage."""
 
     _CudagraphGlobalRecord.create_cudagraphs()
+
+
+def delete_cuda_graphs():
+    """Delete all CUDA graphs."""
+
+    # Reset global tracking state
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+
+    # TODO: Optional?: Force garbage collection to clean up memory
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempool = None
 
 
 class _GraphStatus(Enum):
@@ -642,8 +658,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.training and torch.is_grad_enabled():
             assert (
                 len(self.fwd_graph_output_surface) > 0
-            ), """Tried graphing a moudule that returned no tensors in training mode, 
-                however the graphed module must output at least one tensor, 
+            ), """Tried graphing a moudule that returned no tensors in training mode,
+                however the graphed module must output at least one tensor,
                 so that a corresponding backward node may be registered in the autograd graph."""
 
             # restore cached grads
@@ -965,7 +981,7 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8, and warmup steps.
             share_cudagraph_io_buffers (bool, optional): (DEPRECATED, will be replaced by
-                config.cuda_graph_share_io_buffers) If None (default) or True, enables 
+                config.cuda_graph_share_io_buffers) If None (default) or True, enables
                 buffer reuse optimizations for transformer and mamba layers. If False,
                 disables buffer reuse.
         """

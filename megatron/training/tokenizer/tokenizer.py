@@ -193,6 +193,10 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
     def bos(self):
         return self._tokenizer.bos_token_id
 
+    @property
+    def pad(self):
+        return self._tokenizer.pad_token_id
+
 
 class _BertWordPieceTokenizer(MegatronTokenizer):
     """Original BERT wordpiece tokenizer."""
@@ -743,6 +747,10 @@ class CustomTikTokenizer(MegatronTokenizer):
     @property
     def eos(self) -> int:
         return self._eos_id
+    
+    @property
+    def pad(self) -> int:
+        return self._pad_id
 
     @property
     def unk(self) -> int:
