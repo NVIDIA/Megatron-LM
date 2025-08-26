@@ -126,6 +126,9 @@ class DistributedDataParallelConfig:
     This option is only effective when Hybrid FSDP is enabled.
     """
 
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
     def __post_init__(self):
         import os
 

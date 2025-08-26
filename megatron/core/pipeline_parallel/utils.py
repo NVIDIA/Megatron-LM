@@ -7,7 +7,6 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core import parallel_state
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
 
 
@@ -306,18 +305,3 @@ def get_comm_stream():
     """Get the stream for communication"""
     global _COMM_STREAM
     return _COMM_STREAM
-
-
-class VppContextManager:
-    """A reusable context manager for switch vpp stage"""
-
-    def __init__(self, vpp_rank):
-        self.vpp_rank = vpp_rank
-
-    def __enter__(self):
-        self.origin_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-        parallel_state.set_virtual_pipeline_model_parallel_rank(self.vpp_rank)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)

@@ -42,6 +42,7 @@ class LanguageModule(MegatronModule):
         self._set_attention_backend()
         if model_comm_pgs is None:
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+        self.cp_group = model_comm_pgs.cp
         self.model_comm_pgs = model_comm_pgs
         self.pp_group = model_comm_pgs.pp
         assert hasattr(self.model_comm_pgs, 'embd'), (
