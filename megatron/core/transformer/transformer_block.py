@@ -15,6 +15,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import MegatronModule
@@ -31,7 +32,6 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
-from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -189,7 +189,9 @@ def get_num_layers_to_build(
     if config.account_for_embedding_in_pipeline_split:
         if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
             num_layers_to_build -= 1
-            assert num_layers_to_build >= 1, f"Not enough layers in the first virtual pipeline stage"
+            assert (
+                num_layers_to_build >= 1
+            ), f"Not enough layers in the first virtual pipeline stage"
 
     if config.account_for_loss_in_pipeline_split:
         if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
