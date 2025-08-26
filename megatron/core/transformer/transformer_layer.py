@@ -425,6 +425,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
+        self.offload_self_attn = (
+            self.config.offload_activation
+            and "self_attn" in self.config.offload_modules
+        )
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -515,17 +519,48 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
+        if self.offload_self_attn:
+            from megatron.core.pipeline_parallel.cpu_offload import (
+                PipelineOffloadManager,
+                group_prefetch_offload_start,
+                group_prefetch_offload_commit,
+            )
+            if not input_layernorm_output.is_contiguous():
+                input_layernorm_output = input_layernorm_output.contiguous()
+            input_layernorm_output = group_prefetch_offload_start(input_layernorm_output)
+            handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
+            handler.register_offload_tensor(input_layernorm_output)
+            input_layernorm_output.offloading_self_attn = True
+            with PipelineOffloadManager.get_instance():
+                attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+            def call_back():
+                cur_stream = torch.cuda.current_stream()
+                input_layernorm_output.record_stream(cur_stream)
+                input_layernorm_output.untyped_storage().resize_(0)
+
+            attention_output_with_bias = group_prefetch_offload_commit(attention_output_with_bias, call_back)
+        else:
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
