@@ -41,6 +41,7 @@ from .optimizer import (
     MegatronOptimizer,
     param_group_identifier_keys,
 )
+from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer_config import OptimizerConfig
 logger = logging.getLogger(__name__)
 
@@ -846,5 +847,11 @@ def get_megatron_muon_optimizer(
 
     # chain everything together
     optimizers += chained_adam.chained_optimizers
+    if True:
+        print("using LayerWiseDistributedOptimizer ===========================")
+        return LayerWiseDistributedOptimizer(
+                optimizers,
+                parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
     return ChainedOptimizer(optimizers)
 
