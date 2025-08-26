@@ -316,14 +316,13 @@ class MambaStack(MegatronModule):
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with outer_fp8_context:
-            for l_no, layer in enumerate(self.layers):
+            for layer in enumerate(self.layers):
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1)
                     if use_inner_fp8_context
                     else nullcontext()
                 )
                 with inner_fp8_context:
-                    input_hidden_states = hidden_states.clone()
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
