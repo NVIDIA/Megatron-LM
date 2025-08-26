@@ -21,8 +21,9 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 import torch
 
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -147,9 +148,9 @@ def main(model_provider: str = "gpt"):
         load_context = fp8_model_init()
     with load_context:
         if model_provider == "gpt":
-            model = get_model(gpt_model_provider, wrap_with_ddp=False)
+            model = get_model(model_provider(gpt_builder), wrap_with_ddp=False)
         elif model_provider == "mamba":
-            model = get_model(mamba_model_provider, wrap_with_ddp=False)
+            model = get_model(model_provider(mamba_builder), wrap_with_ddp=False)
         else:
             raise ValueError(f"Invalid model provider {model_provider}")
 

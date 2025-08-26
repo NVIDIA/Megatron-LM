@@ -34,7 +34,7 @@ def initialize_gpt_model(
     vocab_size=128,
     virtual_pipeline_model_parallel_size=None,
     is_moe=False,
-    **config_kwargs
+    **config_kwargs,
 ):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
@@ -149,6 +149,7 @@ def create_args():
     args.no_load_optim = True
     args.no_load_rng = True
     args.use_distributed_optimizer = True
+    args.use_megatron_fsdp = False
 
     yield args
 
@@ -322,11 +323,10 @@ def test_save_and_load_checkpoint_vpp(
     opt_param_scheduler = None
     num_floating_point_operations_so_far = 456
 
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B,
+    ):
         set_ckpt_path(ckpt_dir_A)
         save_checkpoint(
             iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far

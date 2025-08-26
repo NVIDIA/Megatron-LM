@@ -3,14 +3,15 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 import argparse
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
 import random
 import torch
 import sys
 import time
 import tqdm
 import warnings
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -279,11 +280,11 @@ def main():
 
     # Set up model and load checkpoint
     if args.model_provider == "gpt":
-        model_provider = gpt_model_provider
+        model_builder = gpt_builder
     elif args.model_provider == "mamba":
-        model_provider = mamba_model_provider
+        model_builder = mamba_builder
 
-    model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(model_provider(model_builder), wrap_with_ddp=False)
     tokenizer = get_tokenizer()
     load_checkpoint(model, None, None)
     model = model[0]
