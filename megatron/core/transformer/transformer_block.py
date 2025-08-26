@@ -337,7 +337,7 @@ class TransformerBlock(MegatronModule):
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
             global_layer_number = layer_number + get_transformer_layer_offset(
-                self.config, self.vp_stage, self.model_comm_pgs.pp
+                self.config, self.vp_stage, get_pg_rank(self.model_comm_pgs.pp)
             )  # 1-based index
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
@@ -684,7 +684,7 @@ class TransformerBlock(MegatronModule):
         num_layers = self.config.num_layers
         for layer in self.layers:
             offset = get_transformer_layer_offset(
-                self.config, self.vp_stage, self.model_comm_pgs.pp
+                self.config, self.vp_stage, get_pg_rank(self.model_comm_pgs.pp)
             )
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1

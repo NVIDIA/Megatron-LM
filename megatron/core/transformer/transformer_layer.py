@@ -50,13 +50,13 @@ def _is_vp_first_stage(vp_stage: int, vp_size: int | None):
 def get_transformer_layer_offset(
     config: TransformerConfig,
     vp_stage: Optional[int] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_rank: Optional[int] = None,
 ):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
-    if pp_group is None:
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
-    pipeline_rank = get_pg_rank(pp_group)
+    if pp_rank is None:
+        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    else:
+        pipeline_rank = pp_rank
 
     is_first_pp_stage = pipeline_rank == 0
 
@@ -325,7 +325,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(
-            self.config, vp_stage, model_comm_pgs.pp
+            self.config, vp_stage, get_pg_rank(model_comm_pgs.pp)
         )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
