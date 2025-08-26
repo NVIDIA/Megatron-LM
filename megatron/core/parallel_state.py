@@ -617,7 +617,8 @@ def initialize_model_parallel(
     # NCCL restricts IB SHARP usage to a single communicator group—the first one created
     # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
     # set to 0 for subsequent groups.
-    os.environ["NCCL_COLLNET_ENABLE"] = "0"
+    if "NCCL_COLLNET_ENABLE" in os.environ:
+        del os.environ["NCCL_COLLNET_ENABLE"]
 
     if use_sharp:
         if sharp_enabled_group is None:
@@ -831,7 +832,8 @@ def initialize_model_parallel(
         )
         torch.cuda.synchronize()
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
-        os.environ["NCCL_COLLNET_ENABLE"] = "0"
+        if "NCCL_COLLNET_ENABLE" in os.environ:
+            del os.environ["NCCL_COLLNET_ENABLE"]
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1201,7 +1203,8 @@ def initialize_model_parallel(
                     )
                     torch.cuda.synchronize()
                 # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
-                os.environ["NCCL_COLLNET_ENABLE"] = "0"
+                if "NCCL_COLLNET_ENABLE" in os.environ:
+                    del os.environ["NCCL_COLLNET_ENABLE"]
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
