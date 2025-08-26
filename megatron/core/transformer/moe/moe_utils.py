@@ -215,6 +215,53 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
+class MoEPositiveAuxLossAutoScaler(torch.autograd.Function):
+    """An AutoScaler that compute and scales the grad for positive auxiliary loss."""
+
+    main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
+        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+
+        Args:
+            output (torch.Tensor): The output tensor.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Compute and scale the gradient for positive auxiliary loss..
+
+        Args:
+            grad_output (torch.Tensor): The gradient of the output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled positive 
+                                               auxiliary loss gradient.
+        """
+        (aux_loss,) = ctx.saved_tensors
+        aux_loss_backward_scale = MoEPositiveAuxLossAutoScaler.main_loss_backward_scale
+        aux_loss_backward_scale = aux_loss_backward_scale * (aux_loss > 0.0)
+        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        return grad_output, scaled_aux_loss_grad
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor):
+        """set the scale of the aux loss.
+
+        Args:
+            scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
+                                  matches the scale of the main_loss.
+        """
+        MoEPositiveAuxLossAutoScaler.main_loss_backward_scale = scale
+
+
 def permute(
     tokens,
     routing_map,
