@@ -22,7 +22,6 @@ Megatron-FSDP can provide up to 25% speed up and 23% memory savings compared to 
 - **[Megatron Core](https://github.com/NVIDIA/Megatron-LM)**
 - **[TransformerEngine](https://github.com/NVIDIA/TransformerEngine)**
 
-
 ## ✨ Features
 
 - **Easy Integration**: Simple `fully_shard` function for quick model parallelization
@@ -42,9 +41,7 @@ Megatron-FSDP can provide up to 25% speed up and 23% memory savings compared to 
 
 <!-- ## 📊 Performance  -->
 
-
 <!-- ## 📦 Installation -->
-
 
 ## 🚀 Quick Start
 
@@ -54,7 +51,7 @@ Transform your PyTorch model to use Fully Sharded Data Parallelism with just a f
 
 ```python
 import torch
-from megatron-fsdp import fully_shard
+from megatron_fsdp import fully_shard
 
 # Your existing model and optimizer
 model = YourModel()
