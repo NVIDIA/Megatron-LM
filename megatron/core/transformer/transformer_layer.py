@@ -10,7 +10,8 @@ import torch
 import torch.distributed
 from torch import Tensor
 
-from megatron.core import tensor_parallel, parallel_state
+import megatron.core
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -34,15 +35,6 @@ from megatron.core.utils import (
 
 logger = logging.getLogger(__name__)
 
-def _is_vp_first_stage(vp_stage: int, vp_size: int | None):
-    """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
-    if vp_size is None or vp_size <= 1:
-        assert vp_stage is None or vp_stage == 0, (
-            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
-            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
-        )
-        return True
-    return vp_stage == 0
 
 def get_transformer_layer_offset(
     config: TransformerConfig,
@@ -52,8 +44,10 @@ def get_transformer_layer_offset(
     """Get the index offset of current pipeline stage, given the level of pipelining."""
     if pp_group is None:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
-   
+
     pipeline_rank = get_pg_rank(pp_group)
+
+    is_first_pp_stage = pipeline_rank == 0
 
     if config.pipeline_model_parallel_size > 1:
 
@@ -185,20 +179,23 @@ def get_transformer_layer_offset(
                 offset = vp_stage * total_virtual_chunks + (
                     pipeline_rank * num_layers_per_virtual_rank
                 )
-                # from megatron.core.pipeline_parallel.utils import is_vp_first_stage
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not _is_vp_first_stage(
-                    vp_stage, vp_size
-                ):
+                is_pipeline_first_stage = (
+                    megatron.core.pipeline_parallel.utils.is_vp_first_stage(vp_stage, vp_size)
+                    and is_first_pp_stage
+                )
+                if config.account_for_embedding_in_pipeline_split and not is_pipeline_first_stage:
                     offset -= 1
             else:
                 offset = pipeline_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not _is_vp_first_stage(
-                    vp_stage, vp_size
-                ):
+                is_pipeline_first_stage = (
+                    megatron.core.pipeline_parallel.utils.is_vp_first_stage(vp_stage, vp_size)
+                    and is_first_pp_stage
+                )
+                if config.account_for_embedding_in_pipeline_split and not is_pipeline_first_stage:
                     offset -= 1
     else:
         offset = 0
@@ -316,7 +313,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage, model_comm_pgs.pp)
+        self.layer_number = layer_number + get_transformer_layer_offset(
+            self.config, vp_stage, model_comm_pgs.pp
+        )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
