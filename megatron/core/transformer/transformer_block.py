@@ -31,6 +31,7 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
+from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -185,25 +186,15 @@ def get_num_layers_to_build(
     # The embedding (or loss) layer cannot function as a standalone transformer layer
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
-    def _dec_num_layers_to_build(num_layers_to_build: int, stage_str: str):
-        assert num_layers_to_build >= 1, f"Not enough layers in the {stage_str} pipeline stage"
-        return num_layers_to_build - 1
+    if config.account_for_embedding_in_pipeline_split:
+        if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
+            num_layers_to_build -= 1
+            assert num_layers_to_build >= 1, f"Not enough layers in the first virtual pipeline stage"
 
-    if vp_size is not None:
-        if config.account_for_embedding_in_pipeline_split:
-            if vp_stage == 0 and is_first_pp_stage:
-                num_layers_to_build = _dec_num_layers_to_build(num_layers_to_build, "first virtual")
-
-        if config.account_for_loss_in_pipeline_split:
-            if vp_stage == (vp_size - 1) and is_last_pp_stage:
-                num_layers_to_build = _dec_num_layers_to_build(num_layers_to_build, "last virtual")
-    else:
-        if config.account_for_embedding_in_pipeline_split:
-            if is_first_pp_stage:
-                num_layers_to_build = _dec_num_layers_to_build(num_layers_to_build, "first")
-        if config.account_for_loss_in_pipeline_split:
-            if is_last_pp_stage:
-                num_layers_to_build = _dec_num_layers_to_build(num_layers_to_build, "last")
+    if config.account_for_loss_in_pipeline_split:
+        if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
+            num_layers_to_build -= 1
+            assert num_layers_to_build >= 1, f"Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
 

@@ -169,6 +169,8 @@ def get_transformer_layer_offset(
 
             num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
+            # import here to avoid circular import
+            from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
                 assert (
                     vp_stage is not None
@@ -181,21 +183,19 @@ def get_transformer_layer_offset(
                 )
 
                 # Reduce the offset of embedding layer from the total layer number
-                is_pipeline_first_stage = (
-                    megatron.core.pipeline_parallel.utils.is_vp_first_stage(vp_stage, vp_size)
+                if config.account_for_embedding_in_pipeline_split and not (
+                    is_vp_first_stage(vp_stage, vp_size)
                     and is_first_pp_stage
-                )
-                if config.account_for_embedding_in_pipeline_split and not is_pipeline_first_stage:
+                ):
                     offset -= 1
             else:
                 offset = pipeline_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
-                is_pipeline_first_stage = (
-                    megatron.core.pipeline_parallel.utils.is_vp_first_stage(vp_stage, vp_size)
+                if config.account_for_embedding_in_pipeline_split and not (
+                    is_vp_first_stage(vp_stage, vp_size)
                     and is_first_pp_stage
-                )
-                if config.account_for_embedding_in_pipeline_split and not is_pipeline_first_stage:
+                ):
                     offset -= 1
     else:
         offset = 0
