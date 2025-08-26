@@ -10,7 +10,7 @@ import torch
 import torch.distributed
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import tensor_parallel, parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -50,6 +50,9 @@ def get_transformer_layer_offset(
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
+    if pp_group is None:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+   
     pipeline_rank = get_pg_rank(pp_group)
 
     if config.pipeline_model_parallel_size > 1:
@@ -313,7 +316,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage)
+        self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage, model_comm_pgs.pp)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
