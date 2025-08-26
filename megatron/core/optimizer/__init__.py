@@ -26,6 +26,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.emerging_optimizers.orthogonalized_optimizers.muon import Muon
+from megatron.core.emerging_optimizers.experimental.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 
@@ -847,4 +848,56 @@ def get_megatron_muon_optimizer(
     # chain everything together
     optimizers += chained_adam.chained_optimizers
     return ChainedOptimizer(optimizers)
+
+# self-contained change depends on this but doesn't modify existing function.
+# will move to optimizer implementation directory
+def get_megatron_layer_wise_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    # no_weight_decay_cond: Optional[Callable] = None,
+    # scale_lr_cond: Optional[Callable] = None,
+    # lr_mult: float = 1.0,
+    # use_gloo_process_groups: bool = True,
+) -> MegatronOptimizer:
+    # currently it is only supporting muon, will add soaps later
+
+    # dist-optim is not supported due to strong coupling with how DDP init grad buffer
+    # in thoery we can put some weight to use non-dist-muon and rest to dist-adam
+    # but there are strong dependency and assumption in DDP that prevent it
+    if config.use_distributed_optimizer:
+        raise Exception('muon with dist optimizer is not supported.')
+
+    log_single_rank(logger, logging.INFO, f'Setting up layer-wise optimizer with config {config}')
+
+    layer_wise_optimizer = LayerWiseDistributedOptimizer(
+        model_chunks,
+        linear_optimizer_cls=Muon,
+        linear_optimizer_kwargs={
+            'lr': config.lr,
+            'weight_decay': config.weight_decay,
+            'momentum_beta': config.muon_momentum,
+            'use_nesterov': config.muon_use_nesterov,
+            'num_ns_steps': config.muon_num_ns_steps,
+            'fp32_matmul_prec': config.muon_fp32_matmul_prec,
+            'scale_mode': config.muon_scale_mode,
+            'split_qkv': False,
+            'qkv_split_shapes': None,
+        },
+        embed_optimizer_cls=Adam,
+        embed_optimizer_kwargs={
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "betas": (config.adam_beta1, config.adam_beta2),
+            "eps": config.adam_eps,
+        },
+        default_optimizer_cls=Adam,
+        default_optimizer_kwargs={
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "betas": (config.adam_beta1, config.adam_beta2),
+            "eps": config.adam_eps,
+        },
+        mcore_optimizer_config=config,
+    )
+    return layer_wise_optimizer
 
