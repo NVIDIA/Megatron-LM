@@ -253,9 +253,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             cost_per_request_bytes = (
                 mamba_states_memory_per_request + max_sequence_length * bytes_per_token
             )
-            if self.is_hybrid_model:
-                # Leave room for a buffer request in the case of padding
-                n_bytes -= cost_per_request_bytes
+            # TODO(ksanthanam): Leave room for an extra request in the event of padding
+            # for non-decode CUDA graphs
             n_requests = n_bytes / cost_per_request_bytes
             n_tokens = n_requests * max_sequence_length
             n_requests = self.round_up_requests(int(n_requests), tp_size=tp_size)
@@ -445,15 +444,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Optional state tensors for hybrid models
-        # We allocate for an additional buffer request in the event of padding
+        # TODO(ksanthanam): Allocate an additional buffer request in the event of padding
+        # for non-decode CUDA graphs
         if self.is_hybrid_model:
             self.mamba_conv_states = torch.zeros(
-                (self.num_mamba_layers, self.max_requests + 1) + mamba_conv_states_shape,
+                (self.num_mamba_layers, self.max_requests) + mamba_conv_states_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
             self.mamba_ssm_states = torch.zeros(
-                (self.num_mamba_layers, self.max_requests + 1) + mamba_ssm_states_shape,
+                (self.num_mamba_layers, self.max_requests) + mamba_ssm_states_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -626,10 +626,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         paused_request_count = self.paused_request_count
         total_request_count = paused_request_count + self.padded_active_request_count
 
-        # Account for an extra request during non-decode steps if we include padding tokens.
-        if not self.is_decode_only() and self.padded_active_token_count > self.active_token_count:
-            total_request_count += 1
-
+        # TODO(ksanthanam): Handle padding tokens for non-decode CUDA graphs
         layer_number = self.layer_map[layer_number - 1]
         conv_state = self.mamba_conv_states[layer_number][paused_request_count:total_request_count]
         ssm_state = self.mamba_ssm_states[layer_number][paused_request_count:total_request_count]

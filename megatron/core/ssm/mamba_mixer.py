@@ -519,9 +519,6 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
 
-        if torch.isnan(xBC[:, :active_token_count, :]).any():
-            torch.distributed.breakpoint(0)
-
         # Compute short convolution
         if conv_state is not None and is_dynamic_batching:
             # xBC should have shape (b l d) for causal_conv1d_varlen_states
@@ -558,9 +555,6 @@ class MambaMixer(MegatronModule):
                 causal_conv1d_kwargs["seq_idx"] = seq_idx
             xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
             del causal_conv1d_kwargs
-
-        if torch.isnan(xBC[:, :, :active_token_count]).any():
-            torch.distributed.breakpoint(0)
 
         # transpose b pd l --> b l pd
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -623,8 +617,6 @@ class MambaMixer(MegatronModule):
             if return_varlen_states:
                 y, _, varlen_states = y
 
-                if torch.isnan(y[:, :active_token_count]).any():
-                    torch.distributed.breakpoint(0)
                 # This has to be varlen_states, NOT last_state
                 # See reference implementation:
                 # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
@@ -642,9 +634,6 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         out, out_bias = self.out_proj(y)
-
-        if torch.isnan(out[:active_token_count]).any():
-            torch.distributed.breakpoint(0)
 
         return out, out_bias
 
@@ -668,14 +657,14 @@ class MambaMixer(MegatronModule):
 
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
 
+        # Run the decode step and return immediately if there are no prefill requests.
         if context.is_decode_only():
-            # Run decode step. We swap the input batch dimension and sequence dimension
-            # and then restore the original shape before returning.
+            # The step function requires swapping the input batch dimension and sequence dimension.
             out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
 
             return (out.transpose(0, 1), out_bias)
 
-        # Compute the split between decode and prefill
+        # Compute the split between decode and prefill.
         seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(context)
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
@@ -686,52 +675,61 @@ class MambaMixer(MegatronModule):
         out_decode, out_bias_decode = None, None
         out_prefill, out_bias_prefill = None, None
 
-        # Decode
+        # Run the decode step.
         if first_prefill_request_idx > 0:
             # Slice original tensors for the decode part.
             hidden_states_decode = hidden_states[:first_prefill_token_idx].clone()
             conv_state_decode = conv_state[:first_prefill_request_idx].clone()
             ssm_state_decode = ssm_state[:first_prefill_request_idx].clone()
 
-            # Run decode step. We swap the input batch dimension and sequence dimension
-            # and then restore the original shape before returning.
+            # The step function requires swapping the input batch dimension and sequence dimension.
             out_decode, out_bias_decode, _, _ = self.step(
                 hidden_states_decode.transpose(0, 1), conv_state_decode, ssm_state_decode
             )
             out_decode = out_decode.transpose(0, 1)
 
-            if torch.isnan(out_decode).any():
-                torch.distributed.breakpoint(0)
+        # Run the prefill step. We truncate padded tokens as these can cause numerical instability
+        # in the Mamba kernels.
+        active_token_count = context.active_token_count
+        active_request_count = context.get_active_request_count()
+        hidden_states_prefill = hidden_states[first_prefill_token_idx:active_token_count]
+        conv_state_prefill = conv_state[first_prefill_request_idx:active_request_count]
+        ssm_state_prefill = ssm_state[first_prefill_request_idx:active_request_count]
+        cu_seqlens_prefill = F.pad(
+            cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
+        )
+        seq_idx_prefill = (
+            seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_request_idx
+        )
 
-        # Prefill
-        zxBCdt = self.compute_in_proj(hidden_states)
+        zxBCdt = self.compute_in_proj(hidden_states_prefill)
         out_prefill, out_bias_prefill = self.ssm_block(
             zxBCdt,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            seq_idx=seq_idx,
-            cu_seqlens=cu_seqlens,
+            conv_state=conv_state_prefill,
+            ssm_state=ssm_state_prefill,
+            seq_idx=seq_idx_prefill,
+            cu_seqlens=cu_seqlens_prefill,
             return_varlen_states=return_varlen_states,
-            active_token_count=context.active_token_count,
+            active_token_count=context.active_token_count - first_prefill_token_idx,
         )
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"active_token_count={context.active_token_count}, padded_active_token_count={context.padded_active_token_count}, first_prefill_token_idx={first_prefill_token_idx}"
-            )
-        if torch.isnan(out_prefill[first_prefill_token_idx : context.active_token_count]).any():
-            torch.distributed.breakpoint(0)
-        out_prefill = out_prefill[first_prefill_token_idx:]
-        if out_bias_prefill is not None:
-            out_bias_prefill = out_bias_prefill[first_prefill_token_idx:]
 
-        # Update decode part of Mamba states
-        if first_prefill_request_idx > 0:
-            conv_state[:first_prefill_request_idx].copy_(conv_state_decode)
-            ssm_state[:first_prefill_request_idx].copy_(ssm_state_decode)
-
-        # Concatenate the un-padded outputs from decode and prefill.
+        # Concatenate the outputs from decode and prefill.
         out = maybe_cat(out_decode, out_prefill, required=True)
         out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)
+
+        # Restore the padded tokens if necessary.
+        num_padding_tokens = context.padded_active_token_count - context.active_token_count
+        if num_padding_tokens > 0:
+            out_padding = torch.zeros(
+                (num_padding_tokens, *out.shape[1:]), dtype=out.dtype, device=out.device
+            )
+            out = torch.cat((out, out_padding), dim=0)
+
+            if out_bias is not None:
+                out_bias_padding = torch.zeros(
+                    num_padding_tokens, dtype=out_bias.dtype, device=out_bias.device
+                )
+                out_bias = torch.cat((out_bias, out_bias_padding), dim=0)
 
         return out, out_bias
 
@@ -888,8 +886,8 @@ class MambaMixer(MegatronModule):
         """Constructs the variable length generation state for non-decode dynamic inference.
 
         The returned state includes the following:
-            `seq_idx` (Tensor): A map from token idx to request idx, accounting for padded tokens.
-            `cu_seqlens` (Tensor): The cumulative sequence lengths, accounting for padded tokens.
+            `seq_idx` (Tensor): A map from token idx to request idx.
+            `cu_seqlens` (Tensor): The cumulative sequence lengths.
             `return_varlen_states` (bool): Whether to return a varlen states tensor for
                 `mamba_chunk_scan_combined`.
 
@@ -909,26 +907,17 @@ class MambaMixer(MegatronModule):
         ):
             return None, None, False
 
+        # TODO(ksanthanam): Handle padding tokens for non-decode CUDA graphs
         active_token_count = inference_context.active_token_count
-        padded_active_token_count = inference_context.padded_active_token_count
-
-        # Get a map from token idx to request idx for active tokens.
-        # We explicitly set the request idx for padded tokens as the
-        # next consecutive request idx.
         seq_idx = (
-            inference_context.token_to_request_idx[:padded_active_token_count]
+            inference_context.token_to_request_idx[:active_token_count]
             .clone()
             .to(torch.int32)
+            .unsqueeze(0)
         )
-        padded_request_idx = seq_idx[active_token_count - 1] + 1
-        seq_idx[active_token_count:padded_active_token_count] = padded_request_idx
-        seq_idx = seq_idx.unsqueeze(0)
 
         # Get the list of cumulative sequence lengths for active requests.
-        # We explicitly add the total sequence length to `cu_seqlens` to account for padding.
         cu_seqlens, _ = inference_context.cu_query_lengths()
-        if cu_seqlens is not None and padded_active_token_count > active_token_count:
-            cu_seqlens = torch.cat((cu_seqlens, cu_seqlens.new_tensor([padded_active_token_count])))
 
         return seq_idx, cu_seqlens, True
 

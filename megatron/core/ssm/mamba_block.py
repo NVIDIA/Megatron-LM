@@ -345,13 +345,6 @@ class MambaStack(MegatronModule):
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
 
-                if torch.distributed.get_rank() == 0 and l_no == 0:
-                    print(
-                        f"inference_context.active_token_count={inference_context.active_token_count}, hidden_states.shape={hidden_states.shape}"
-                    )
-                if hidden_states[: inference_context.active_token_count].isnan().any():
-                    torch.distributed.breakpoint(0)
-
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)

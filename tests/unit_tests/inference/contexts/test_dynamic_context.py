@@ -106,7 +106,7 @@ class TestDynamicContext:
             assert dynamic_context.gtd_request_count == 28
             assert dynamic_context.chunk_allocator.chunk_count_total == 1156
             assert dynamic_context.max_requests == 320
-            assert dynamic_context.max_tokens == 153664
+            assert dynamic_context.max_tokens == 154176
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_conv_states is not None
             assert dynamic_context.mamba_ssm_states is not None

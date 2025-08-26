@@ -491,9 +491,9 @@ class TestDynamicInferenceEngine:
 
         mamba_expected_outputs = [
             [89, 64, 59, 33, 67, 15],
-            [76, 89, 46, 28, 23, 17, 2, 61, 6, 98, 76, 69, 36, 37, 99],
-            [89, 82, 58, 6, 37, 54, 47, 22, 1, 87],
-            [5, 60, 0, 1, 76, 77, 11, 25, 7, 92],
+            [76, 89, 46, 82, 17, 94, 2, 61, 6, 98, 75, 97, 36, 37, 99],
+            [89, 82, 47, 6, 37, 54, 47, 22, 1, 87],
+            [5, 60, 0, 1, 76, 77, 11, 25, 18, 92],
             [17, 71, 15, 70, 64, 50, 0, 64, 45, 57, 81, 35],
             [33, 20, 26, 10, 20, 49, 28, 38, 81, 50, 53, 46, 74, 77],
             [6, 54, 30, 36, 26, 53, 56, 82, 32, 8],
@@ -509,10 +509,8 @@ class TestDynamicInferenceEngine:
 
         assert len(env.requests) == len(expected_outputs)
 
-        """
         for request, expected_output in zip(env.requests, expected_outputs):
             assert request.output == expected_output
-        """
 
     @pytest.mark.experimental
     @pytest.mark.skipif(
