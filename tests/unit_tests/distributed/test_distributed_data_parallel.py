@@ -78,7 +78,7 @@ class TestDistributedDataParallel:
             torch.distributed.init_process_group(backend='nccl')
 
         # Create HyperCommGrid with dimension ep, pp, dp (reversed from device mesh order)
-        grid = HyperCommGrid([1,1,1, 1, dp_size], ["tp","cp", "ep", "pp", "dp"])
+        grid = HyperCommGrid([1, 1, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
 
         # Create process groups config with ONLY dp group
         grad_comm_pgs = GradCommProcessGroups()
