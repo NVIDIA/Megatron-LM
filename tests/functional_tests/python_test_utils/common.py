@@ -151,7 +151,6 @@ def read_tb_logs_as_list(
     golden_values = {}
 
     for metric, values in summaries.items():
-
         # Add missing values
         values = {
             k: (values[k] if k in values else "nan")
@@ -189,22 +188,19 @@ def _filter_checks(
 def pipeline(
     compare_approximate_results: bool,
     golden_values: Dict[str, GoldenValueMetric],
-    tensorboard_logs: Dict[str, GoldenValueMetric],
+    actual_values: Dict[str, GoldenValueMetric],
     checks: Dict[str, List[Union[ApproximateTest, DeterministicTest]]],
 ):
-
     all_test_passed = True
     failed_metrics = []
 
     for metric_name, metric_thresholds in checks.items():
-
-        if metric_name not in list(tensorboard_logs.keys()):
+        if metric_name not in list(actual_values.keys()):
             raise MissingTensorboardLogsError(
                 f"Metric {metric_name} not found in Tensorboard logs! Please modify `model_config.yaml` to record it."
             )
 
         for test in metric_thresholds:
-
             if (
                 compare_approximate_results
                 and test.type_of_test_result == TypeOfTestResult.DETERMINISTIC
@@ -212,12 +208,11 @@ def pipeline(
                 continue
 
             try:
-
                 golden_value = golden_values[metric_name]
                 golden_value_list = list(golden_value.values.values())
                 actual_value_list = [
                     value
-                    for value_step, value in tensorboard_logs[metric_name].values.items()
+                    for value_step, value in actual_values[metric_name].values.items()
                     if value_step in golden_value.values.keys()
                 ]
 
@@ -232,16 +227,22 @@ def pipeline(
                 actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
                 golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
 
-                if not np.allclose(
-                    actual_value_list,
-                    golden_value_list,
+                actual = np.array(actual_value_list)
+                golden = np.array(golden_value_list)
+
+                # Tolerance check
+                passing = np.allclose(
+                    actual,
+                    golden,
                     rtol=test.rtol,
                     atol=(
                         test.atol_func(actual_value_list, golden_value_list)
                         if test.atol_func is not None
                         else test.atol
                     ),
-                ):
+                )
+
+                if not passing:
                     logger.info("Actual values: %s", ", ".join([str(v) for v in actual_value_list]))
                     logger.info("Golden values: %s", ", ".join([str(v) for v in golden_value_list]))
                     raise test.error_message(metric_name)
