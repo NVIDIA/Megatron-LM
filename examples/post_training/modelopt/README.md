@@ -1,64 +1,125 @@
-# NVIDIA TensorRT Model Optimizer (ModelOpt) Integration
+<div align="center">
 
-ModelOpt (`nvidia-modelopt`) provides end-to-end model optimization for NVIDIA hardware including
-quantization, sparsity, knowledge distillation, pruning, neural architecture search.
-You can find more info abour ModelOpt at our Github repository https://github.com/NVIDIA/TensorRT-Model-Optimizer.
-
-We support Megatron Core `GPTModel` and `MambaModel` as well as task-specific optimization
-such as speculative decoding. Users can choose to start from Megatron-LM or NeMo framework.
-The optimized model can be deploied with  NVIDIA TensorRT-LLM, vLLM, or SGLang.
-
-## Table of Contents
-
-[[_TOC_]]
+# TensorRT Model Optimizer Integrated Examples
 
 
-## Getting Started with Post-Training Quantization (
+[TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) |
+[Local Examples](#getting-started-in-a-local-environment) |
+[Configuration](ADVANCED.md#learn-more-about-configuration) |
+[Slurm Examples](ADVANCED.md#slurm-examples) |
+[Speculative Decoding](speculative.md) |
+[Advanced Topics](ADVANCED.md)
 
-> **IMPORTANT :** Example scripts require basic access (general available) to
-> NVIDIA GPU Cloud (NGC). If you have yet to register and acquire a `NGC_CLI_API_KEY`, 
-> please first register at https://ngc.nvidia.com/signin. 
+</div>
 
-Login to nvcr.io docker registry (using `NGC_CLI_API_KEY`) and start an interactive
-section **at the root of the megatron-lm repo!** Export your `NGC_CLI_API_KEY` in the environment.
+[TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (**ModelOpt**, `nvidia-modelopt`)
+provides end-to-end model optimization for
+NVIDIA hardware including quantization (real or simulated), sparsity, knowledge distillation, pruning,
+neural architecture search, and speulative decoding.
+
+
+**Major Features:**
+
+- Start from Hugging Face pretrained model checkpoint with on the fly conversion.
+- Support all kinds of model parallelism (TP, EP, ETP, PP).
+- Export to TensorRT-LLM, vLLM, and SGLang ready unified checkpoint.
+
+**Support Matrix {Model}x{Features}**
+
+| Model (`conf/`) | Quantization | EAGLE3 |
+| ------------------------------------------------------ | -----------| ------ |
+| `moonshotai/Kimi-K2-Instruct` | ✅ | ✅ |
+| `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ |
+| `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ |
+| `deepseek-ai/DeepSeek-R1` | ✅ | ✅ |
+| `meta-llama/Llama-{3.1-8B, 3.1-405B, 3.2-1B}-Instruct` | ✅ | ✅ |
+
+## Getting Started in a Local Environment
+
+Install `nvidia-modelopt` from [NVIDIA PyPI](https://pypi.org/project/nvidia-modelopt/):
 ```sh
-docker login nvcr.io
-
-docker run --gpus all --init -it --rm -v $PWD:/workspace/megatron-lm \
-    nvcr.io/nvidia/pytorch:24.10-py3 bash
-cd /workspace/megatron-lm/examples/post_training/modelopt
-
-export NGC_CLI_API_KEY=
+pip install -U nvidia-modelop
 ```
+Alternatively, you can install from [source](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+to try our latest features. 
 
-Now let's start a simple FP8 quantization task. You must provide `HF_TOKEN` which grants you
-access to `meta-llama/Llama-3.2-1B-Instruct`.
+
+**⭐ NVFP4 Quantization, Qauntization-Aware Training, and Model Export:**
+
+Provide the pretrained checkpoint path through variable `${HF_MODEL_CKPT}` and provide variable
+`${MLM_MODEL_SAVE}` which stores a resumeable Megatron-LM distributed checkpoint. To export
+Hugging Face-Like quantized checkpoint for TensorRT-LLM, vLLM, or SGLang deployement,
+provide `${EXPORT_DIR}` to `export.sh`.
+
+> **📙 NOTE:** ModelOpt supports different quantization formats. By default, we simulate the
+> low-precision numerical behavior (fake-quant) which can be run on GPUs with compute > 80.
+> Real low-precision paramters (e.g. `E4M3` or `E2M1`)
+> and low-precision compute (e.g. `FP8Linear`) are also supported depending on GPU compute capability.
+> **See [Adanvanced Topics](advanced.md) for details**.
+
 ```sh
-export HF_TOKEN=
-bash convert.sh meta-llama/Llama-3.2-1B-Instruct
-MLM_MODEL_CKPT=/tmp/megatron_workspace/meta-llama/Llama-3.2-1B-Instruct_mlm bash quantize.sh meta-llama/Llama-3.2-1B-Instruct fp8
+\
+    TP=1 \
+    HF_MODEL_CKPT=<pretrained_checkpoint_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_quant \
+    quantize.sh meta-llama/Llama-3.2-1B-Instruct nvfp4
+
+\
+    PP=1 \
+    HF_MODEL_CKPT=<pretrained_checkpoint_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+    export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
-The model card name (see the support list in `conf/`) is expected as an input to all the sample scripts.
-Other arguments are specified as varibles (e.g. `TP=8`) where you can either set before `bash` or export
-to the current bash environment upfront.
 
-The script will perform per-tensor FP8 faked-quantization and generate some tokens as an indication thatthe quantized model still behaves correctly. The end results are stored in `/tmp/megatron_workspace/meta-llama/Llama-3.2-1B-Instruct_quant`. This is a Megatron Mcore distributed checkpoint (with additional states), which can be loaded for quantization-aware training (QAT) or exported for deployment.
+> **❗ IMPORTANT:** The first positional arugment (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
+> is the config name used to match the supported model config in `conf/`. The pretrained checkpoint should
+> be downloaded and provided through `${HF_MODEL_CKPT}`.
 
-## Export for TensorRT-LLM, vLLM, SGLang Deployment 
+Loading the saved distributed checkpoint, the quantized Megatron model can be resumed for inference
+(generate or evaluate) or training (SFT or PEFT). To read more about these features, see
+[Adanvanced Topics](advanced.md). To learn more about the design, see our [Design]() document [WIP].
 
-For supported Hugging Face models, TensorRT Model Optimizer can export the quantized model to
-a  HF-like checkpoint with real-quantied weights.
 ```sh
-MLM_MODEL_CKPT=/tmp/megatron_workspace/meta-llama/Llama-3.2-1B-Instruct_quant bash export.sh meta-llama/Llama-3.2-1B-Instruct
+\
+    TP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    generate.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    TP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    mmlu.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    TP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    finetune.sh meta-llama/Llama-3.2-1B-Instruct
 ```
-> **NOTE:** The HF-like export only supports pipeline parallelism (`PP`). Other parallelism must be
-> set to 1. The exported checkpoint is sharded with safetensors. Although it is HF-like, this format
-> currently cannot be loaded by `from_pretrained()`.
-The exported checkpoint is stored in `/tmp/megatron_workspace/meta-llama/Llama-3.1-8B-Instruct_export` which can be provided as an input to most of the `LLM` APIs. For examples,
+
+**⭐ Online BF16 EAGLE3 Training:**
+
+Online EAGLE3 training has both the target (frozen) and draft models in the memory where the `hidden_states`
+required for training is generated on the fly. Periodically, acceptance length (AL, the higher the better) is
+evaluated on MT-Bench prompts. Use the same `export.sh` script to export the EAGLE3 checkpoint for 
+deployment.
+
+```sh
+\
+    TP=1 \
+    HF_MODEL_CKPT=<pretrained_checkpoint_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
+    eagle3.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    PP=1 \
+    HF_MODEL_CKPT=<pretrained_checkpoint_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3 \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Eagle3-Export \
+    export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
-vllm serve /tmp/megatron_workspace/meta-llama/Llama-3.1-8B-Instruct_export --quantization modelopt
-```
-> **TROUBLESHOOTING:** You need a device with `sm>=89` (Ada Lovelace or Hopper) for FP8 compute.
+
+See [Adanvanced Topics](advanced.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 training example using `slurm`. 
 
 
 ## Advanced Usage

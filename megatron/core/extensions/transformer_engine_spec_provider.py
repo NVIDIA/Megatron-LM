@@ -4,6 +4,7 @@ import warnings
 from typing import Optional, Tuple
 
 from megatron.core.extensions.transformer_engine import (
+    TEActivationOp,
     TEColumnParallelGroupedLinear,
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -88,3 +89,7 @@ class TESpecProvider(BackendSpecProvider):
             return SequentialMLP, MLPSubmodules(
                 linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
             )
+
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        return TEActivationOp

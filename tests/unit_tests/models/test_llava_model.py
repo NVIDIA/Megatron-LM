@@ -769,12 +769,19 @@ def count_parameters(model):
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    "cp_size, tp_size, has_sp, seq_len, expected_padding",
-    [(1, 1, False, 99, 0), (2, 2, True, 99, 5), (2, 2, False, 99, 1)],
+    "cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding",
+    [
+        (1, 1, False, 99, False, 0),
+        (2, 2, True, 99, False, 5),
+        (2, 2, False, 99, False, 1),
+        (1, 4, False, 99, True, 13),
+    ],
 )
-def test_get_padding(cp_size, tp_size, has_sp, seq_len, expected_padding):
+def test_get_padding(cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding):
     """Test calculating padding for context parallel."""
-    padding = context_parallel.get_padding(seq_len, cp_size, tp_size, has_sp)
+    padding = context_parallel.get_padding(
+        seq_len, cp_size, tp_size, has_sp, fp8_enabled=fp8_enabled
+    )
 
     assert padding == expected_padding
 

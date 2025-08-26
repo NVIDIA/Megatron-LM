@@ -39,7 +39,7 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 2
   --sequence-parallel: true
-  --use-custom-fsdp: true
+  --use-megatron-fsdp: true
   --data-parallel-sharding-strategy: optim_grads_params
   --no-gradient-accumulation-fusion: true
   --use-distributed-optimizer: true

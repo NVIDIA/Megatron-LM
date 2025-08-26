@@ -4,13 +4,15 @@ import os
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from pretrain_mamba import model_provider as mamba_model_provider
-from pretrain_gpt import model_provider as gpt_model_provider
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 import torch
 import sys
 import time
 import tqdm
 import warnings
+from functools import partial
 from argparse import Namespace
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
@@ -154,12 +156,12 @@ def main():
 
     # Set up model and load checkpoint
     if args.model_provider == "gpt":
-        model_provider = gpt_model_provider
+        model_builder = gpt_builder
     elif args.model_provider == "mamba":
-        model_provider = mamba_model_provider
+        model_builder = mamba_builder
     else:
         raise ValueError(f"Invalid model provider {args.model_provider}")
-    model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
     load_checkpoint(model, None, None, strict=False)
     model = model[0]
 
