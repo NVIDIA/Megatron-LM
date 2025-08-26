@@ -1000,7 +1000,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
-            self.pipeline_model_parallel_layout.validate_layer_layout(num_layers=self.num_layers)
+            self.pipeline_model_parallel_layout.validate_layer_layout(
+                num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
+            )
 
         # Uneven PP
         elif (
@@ -1316,10 +1318,11 @@ class TransformerConfig(ModelParallelConfig):
             assert is_torch_min_version(
                 "2.6.0"
             ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
-            # Basic requirements for overlap_moe_expert_parallel_comm
-            assert (
-                self.pipeline_model_parallel_size == 1
-            ), '(Temporary) overlap_moe_expert_parallel_comm is not supported when PP>1.'
+            if self.pipeline_model_parallel_size > 1:
+                assert self.virtual_pipeline_model_parallel_size is not None, (
+                    "If enabling EP A2A overlap, virtual_pipeline_model_parallel_size "
+                    "must be specified when pipeline_model_parallel_size > 1"
+                )
             # Expert model parallelism requirements
             assert (
                 self.expert_model_parallel_size > 1
@@ -1348,8 +1351,8 @@ class TransformerConfig(ModelParallelConfig):
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
             assert (
-                self.mtp_num_layers is None
-            ), '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
+                self.mtp_num_layers is None or self.mtp_num_layers == 1
+            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:

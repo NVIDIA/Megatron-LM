@@ -191,8 +191,11 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 Enable A2A overlap across different batches inspired by the DSv3 DualPipe implmentation. \
 **Features** 
 - Hide ep a2a communication by batch-level overlapping
-- Interleaved pipeline parallel will be supported soon
 - Split weight gradient and activation gradient computations for better overlap with communications
+- Support interleaved pipelined parallelism
+- Support FP8 training
+- Support MTP (`-mtp-num-layers 1` only, multiple MTP layers are not supported yet.)
+
 
 **Usage** 
 ```bash
