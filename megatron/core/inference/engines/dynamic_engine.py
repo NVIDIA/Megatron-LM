@@ -776,9 +776,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
                     continue
 
-                if self.context.get_active_request_count() == 0:
+                if self.context.get_active_request_count() == 0 and len(self.waiting_request_ids) == 0:
                     await asyncio.sleep(0.02)
                     continue
+
                 engine_output = await self.async_step(
                     sampling_params=sampling_params,
                     verbose=verbose,
