@@ -113,6 +113,8 @@ fi
 # Extract settings from params file
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH |
     yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
+NON_DETERMINSTIC_RESULTS=$(cat $TRAINING_PARAMS_PATH |
+    yq '.ENV_VARS.NON_DETERMINSTIC_RESULTS // "0"')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
     yq '.ENV_VARS.SKIP_PYTEST')
 
@@ -221,7 +223,7 @@ for i in $(seq 1 $N_REPEAT); do
     fi
 
     export NVTE_ALLOW_NONDETERMINISTIC_ALGO
-    if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then
+    if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" || "${NON_DETERMINSTIC_RESULTS}" == "1" ]]; then
         ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
     fi
 
@@ -231,15 +233,22 @@ for i in $(seq 1 $N_REPEAT); do
     if [[ "$MODE" == "pretraining" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
         uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
             --golden-values-path $GOLDEN_VALUES_PATH \
-            --tensorboard-path $TENSORBOARD_PATH \
+            --actual-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
             --train-iters $TRAIN_ITERS \
             --model-config-path ${TRAINING_PARAMS_PATH} \
             $ALLOW_NONDETERMINISTIC_ALGO_ARG
 
         if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+            uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                --logs-dir $TENSORBOARD_PATH \
+                --train-iters $TRAIN_ITERS \
+                --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
+                --is-second-run
+                    
             echo "Running pytest 1st vs 2nd run comparison"
             uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
-                --tensorboard-path $TENSORBOARD_PATH \
+                --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                --actual-values-second-run-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                 --train-iters $TRAIN_ITERS \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
                 $ALLOW_NONDETERMINISTIC_ALGO_ARG
