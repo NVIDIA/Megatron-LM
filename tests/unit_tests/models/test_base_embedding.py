@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
+
 import pytest
 import torch
 
@@ -55,3 +57,37 @@ class TestBaseEmbedding:
         assert embeddings.shape[0] == self.base_embedding.max_sequence_length
         assert embeddings.shape[1] == input_ids.shape[0]
         assert embeddings.shape[2] == self.base_embedding.config.hidden_size
+
+
+class TestScaledEmbedding:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            hidden_dropout=0.0,
+            scaled_embedding=True,
+            embedding_init_method=lambda weight: weight.fill_(1.0),
+            use_cpu_initialization=True,
+        )
+        self.base_embedding = LanguageModelEmbedding(
+            config=transformer_config,
+            vocab_size=16,
+            max_sequence_length=4,
+            position_embedding_type='none',
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_forward(self):
+        input_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64).repeat((2, 1))
+        position_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64).repeat((2, 1))
+        embeddings = self.base_embedding(input_ids, position_ids)
+        # `embeddings` is expected to be filled with math.sqrt()
+        expected_l2norm = math.sqrt(
+            math.prod(embeddings.shape) * self.base_embedding.config.hidden_size
+        )
+        torch.testing.assert_close(torch.norm(embeddings).item(), expected_l2norm)

@@ -2,6 +2,7 @@
 
 """Transformer based language model."""
 
+import math
 import torch
 import torch.nn.functional as F
 from typing import Optional
@@ -151,6 +152,9 @@ class Embedding(MegatronModule):
         self.hidden_size = hidden_size
         self.init_method = config.init_method
         self.num_tokentypes = num_tokentypes
+        self.scaling_factor = 1.0
+        if config.scaled_embedding:
+            self.scaling_factor = math.sqrt(hidden_size)
 
         args = get_args()
 
@@ -220,9 +224,9 @@ class Embedding(MegatronModule):
         words_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
-            embeddings = words_embeddings + position_embeddings
+            embeddings = words_embeddings * self.scaling_factor + position_embeddings
         else:
-            embeddings = words_embeddings
+            embeddings = words_embeddings * self.scaling_factor
 
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
