@@ -396,6 +396,7 @@ class TestTransformerBlockWithProcessGroups:
         actual_world_size = torch.cuda.device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
+        # we are testing the custom pgs path, thus we call initialize_distributed intead of initialize_model_parallel
         Utils.initialize_distributed()
         torch.manual_seed(12345)
 
