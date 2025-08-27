@@ -333,6 +333,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_token_counts_set = set(self.cuda_graph_token_counts)
             self.max_cuda_graph_token_count = max(self.cuda_graph_token_counts)
 
+        # for backwards compatibility with legacy unit tests, we are keeping
+        # self.cuda_graph_request_counts around.
+        self.cuda_graph_request_counts = self.cuda_graph_token_counts
+
         self.non_decode_cuda_graphs = use_cuda_graphs_for_non_decode_steps and (
             num_cuda_graphs is not None
         )
