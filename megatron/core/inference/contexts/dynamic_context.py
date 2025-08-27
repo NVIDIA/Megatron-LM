@@ -11,11 +11,11 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
-from megatron.core.inference.inference_request import DynamicInferenceRequest
 
 from .base_context import BaseInferenceContext
 from .dynamic_chunk_allocator import ChunkAllocator
@@ -892,9 +892,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
-    def add_request(
-        self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None
-    ) -> None:
+    def check_availability(
+        self, req: DynamicInferenceRequest, safe: bool = False
+    ) -> (bool, bool, bool):
+        """
+        Check if the request can be added to the context.
+        """
+        request_satisfied = self.total_request_count < self.max_requests
+        token_satisfied = self.active_token_count + req.prompt_length <= self.max_tokens
+        chunks = math.ceil(
+            (req.prompt_length + req.finished_chunked_tokens) / self.chunk_size_tokens
+        ) - math.ceil(req.finished_chunked_tokens / self.chunk_size_tokens)
+        kv_cache_available = self.chunk_allocator.is_memory_available(chunks, safe=safe)
+        return request_satisfied, token_satisfied, kv_cache_available
+
+    def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
         Args:
@@ -906,50 +918,85 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         if chunk_length is None:
             chunk_length = req.prompt_length
-        
+
         this_round_tokens = req.prompt_tokens[:chunk_length]
-        this_round_length = len(this_round_tokens)  
+        this_round_length = len(this_round_tokens)
         assert this_round_length > 0, "Chunk length is 0"
         assert this_round_length <= req.prompt_length, "Chunk length is greater than prompt length"
-        
-        # only allocate new chunks 
-        already_allocated_chunks = (req.finished_chunked_tokens + self.chunk_size_tokens - 1) // self.chunk_size_tokens
-        overall_required_chunks  = (req.finished_chunked_tokens + this_round_length + self.chunk_size_tokens - 1) // self.chunk_size_tokens
+
+        # only allocate new chunks
+        already_allocated_chunks = (
+            req.finished_chunked_tokens + self.chunk_size_tokens - 1
+        ) // self.chunk_size_tokens
+        overall_required_chunks = (
+            req.finished_chunked_tokens + this_round_length + self.chunk_size_tokens - 1
+        ) // self.chunk_size_tokens
 
         num_chunks_needed = overall_required_chunks - already_allocated_chunks
 
         if num_chunks_needed > 0:
-            new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed, safe=True)
-            assert new_chunk_ids is not None and len(new_chunk_ids) == num_chunks_needed, "Chunk allocation failed"
-            
+            new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(
+                num_chunks_needed, safe=True
+            )
+            assert (
+                new_chunk_ids is not None and len(new_chunk_ids) == num_chunks_needed
+            ), "Chunk allocation failed"
 
         # req.finished_chunked_tokens > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
-        # in this case, it is exactly the last request in the current system
+        # in this case, it is exactly the last request in the current system (see dynamic_engine.py, schedule_chunked_prefill invariants)
         # no need to update count, as it is already here
         if req.finished_chunked_tokens > 0:
             current_id = self.total_request_count - 1
             self.active_token_count -= 1
-            assert self.request_ids[current_id] == req.request_id, "Continuation current_id mismatch"
+            assert (
+                self.request_ids[current_id] == req.request_id
+            ), "Continuation current_id mismatch"
         else:
             current_id = self.total_request_count
-        
+
         self.request_ids[current_id] = req.request_id
         self.request_query_lengths[current_id] = this_round_length
-        self.request_output_lengths[current_id] = req.finished_chunked_tokens + this_round_length + req.sampling_params.num_tokens_to_generate
+        self.request_output_lengths[current_id] = (
+            req.finished_chunked_tokens
+            + this_round_length
+            + req.sampling_params.num_tokens_to_generate
+        )
         if num_chunks_needed > 0:
-            self.request_to_kv_chunk_ids[current_id][already_allocated_chunks:overall_required_chunks] = new_chunk_ids
+            self.request_to_kv_chunk_ids[current_id][
+                already_allocated_chunks:overall_required_chunks
+            ] = new_chunk_ids
         self.request_kv_length_offsets[current_id] = req.finished_chunked_tokens
         self.request_kv_chunk_counts[current_id] = overall_required_chunks
-        self.request_last_kv_chunk_id[current_id] = self.request_to_kv_chunk_ids[current_id][overall_required_chunks - 1]
-        self.request_last_kv_chunk_offset[current_id] = (this_round_length + req.finished_chunked_tokens - 1) % self.chunk_size_tokens
-        # self.num_prefill_requests += 1 # in update, all requests are set to decode, so here we need to add 1 for both chunked or not
-        token_offset_range = torch.arange(req.finished_chunked_tokens, req.finished_chunked_tokens + this_round_length, device=self.token_to_pos_ids.device)
-        self.token_to_pos_ids[self.active_token_count:self.active_token_count + this_round_length] = token_offset_range
-        self.token_to_input_ids[self.active_token_count:self.active_token_count + this_round_length] = this_round_tokens
-        self.token_to_request_idx[self.active_token_count:self.active_token_count + this_round_length] = current_id
-        self.token_to_position_in_request[self.active_token_count:self.active_token_count + this_round_length] = token_offset_range
-        self.token_to_chunk_idx[self.active_token_count:self.active_token_count + this_round_length] = self.request_to_kv_chunk_ids[current_id][token_offset_range // self.chunk_size_tokens]
-        self.token_to_local_position_within_kv_chunk[self.active_token_count:self.active_token_count + this_round_length] = token_offset_range % self.chunk_size_tokens
+        self.request_last_kv_chunk_id[current_id] = self.request_to_kv_chunk_ids[current_id][
+            overall_required_chunks - 1
+        ]
+        self.request_last_kv_chunk_offset[current_id] = (
+            this_round_length + req.finished_chunked_tokens - 1
+        ) % self.chunk_size_tokens
+        # self.num_prefill_requests += 1 # FUTURE MR: in update, all requests are set to decode, so here we need to add 1 for both chunked or not
+        token_offset_range = torch.arange(
+            req.finished_chunked_tokens,
+            req.finished_chunked_tokens + this_round_length,
+            device=self.token_to_pos_ids.device,
+        )
+        self.token_to_pos_ids[
+            self.active_token_count : self.active_token_count + this_round_length
+        ] = token_offset_range
+        self.token_to_input_ids[
+            self.active_token_count : self.active_token_count + this_round_length
+        ] = this_round_tokens
+        self.token_to_request_idx[
+            self.active_token_count : self.active_token_count + this_round_length
+        ] = current_id
+        self.token_to_position_in_request[
+            self.active_token_count : self.active_token_count + this_round_length
+        ] = token_offset_range
+        self.token_to_chunk_idx[
+            self.active_token_count : self.active_token_count + this_round_length
+        ] = self.request_to_kv_chunk_ids[current_id][token_offset_range // self.chunk_size_tokens]
+        self.token_to_local_position_within_kv_chunk[
+            self.active_token_count : self.active_token_count + this_round_length
+        ] = (token_offset_range % self.chunk_size_tokens)
         self.active_token_count += this_round_length
         self.total_request_count += 0 if req.finished_chunked_tokens > 0 else 1
 
@@ -967,20 +1014,44 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_chunk_counts[dst_idxs] = self.request_kv_chunk_counts[src_idxs]
         self.request_last_kv_chunk_id[dst_idxs] = self.request_last_kv_chunk_id[src_idxs]
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
-        
+
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
-        self.request_kv_length_offsets[dst_idxs], self.request_kv_length_offsets[src_idxs] = self.request_kv_length_offsets[src_idxs], self.request_kv_length_offsets[dst_idxs]
-        self.request_query_lengths[dst_idxs], self.request_query_lengths[src_idxs] = self.request_query_lengths[src_idxs], self.request_query_lengths[dst_idxs]
-        self.request_output_lengths[dst_idxs], self.request_output_lengths[src_idxs] = self.request_output_lengths[src_idxs], self.request_output_lengths[dst_idxs]
-        self.request_ids[dst_idxs], self.request_ids[src_idxs] = self.request_ids[src_idxs], self.request_ids[dst_idxs]
+        self.request_kv_length_offsets[dst_idxs], self.request_kv_length_offsets[src_idxs] = (
+            self.request_kv_length_offsets[src_idxs],
+            self.request_kv_length_offsets[dst_idxs],
+        )
+        self.request_query_lengths[dst_idxs], self.request_query_lengths[src_idxs] = (
+            self.request_query_lengths[src_idxs],
+            self.request_query_lengths[dst_idxs],
+        )
+        self.request_output_lengths[dst_idxs], self.request_output_lengths[src_idxs] = (
+            self.request_output_lengths[src_idxs],
+            self.request_output_lengths[dst_idxs],
+        )
+        self.request_ids[dst_idxs], self.request_ids[src_idxs] = (
+            self.request_ids[src_idxs],
+            self.request_ids[dst_idxs],
+        )
         next_tokens[dst_idxs], next_tokens[src_idxs] = next_tokens[src_idxs], next_tokens[dst_idxs]
-        self.request_to_kv_chunk_ids[dst_idxs], self.request_to_kv_chunk_ids[src_idxs] = self.request_to_kv_chunk_ids[src_idxs], self.request_to_kv_chunk_ids[dst_idxs]
-        self.request_kv_chunk_counts[dst_idxs], self.request_kv_chunk_counts[src_idxs] = self.request_kv_chunk_counts[src_idxs], self.request_kv_chunk_counts[dst_idxs]
-        self.request_last_kv_chunk_id[dst_idxs], self.request_last_kv_chunk_id[src_idxs] = self.request_last_kv_chunk_id[src_idxs], self.request_last_kv_chunk_id[dst_idxs]
-        self.request_last_kv_chunk_offset[dst_idxs], self.request_last_kv_chunk_offset[src_idxs] = self.request_last_kv_chunk_offset[src_idxs], self.request_last_kv_chunk_offset[dst_idxs]
+        self.request_to_kv_chunk_ids[dst_idxs], self.request_to_kv_chunk_ids[src_idxs] = (
+            self.request_to_kv_chunk_ids[src_idxs],
+            self.request_to_kv_chunk_ids[dst_idxs],
+        )
+        self.request_kv_chunk_counts[dst_idxs], self.request_kv_chunk_counts[src_idxs] = (
+            self.request_kv_chunk_counts[src_idxs],
+            self.request_kv_chunk_counts[dst_idxs],
+        )
+        self.request_last_kv_chunk_id[dst_idxs], self.request_last_kv_chunk_id[src_idxs] = (
+            self.request_last_kv_chunk_id[src_idxs],
+            self.request_last_kv_chunk_id[dst_idxs],
+        )
+        self.request_last_kv_chunk_offset[dst_idxs], self.request_last_kv_chunk_offset[src_idxs] = (
+            self.request_last_kv_chunk_offset[src_idxs],
+            self.request_last_kv_chunk_offset[dst_idxs],
+        )
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> None:
@@ -1028,8 +1099,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # finished_request_count are requests that have reached the termination criterion
 
         if self.have_chunked_prefill:
-            active_requests_mask[-1] = 1 # must keep this, next iteration will add a new chunk to it
-            current_chunk_request_id = self.request_ids[len(active_requests_mask) + self.paused_request_count - 1]
+            active_requests_mask[-1] = (
+                1  # must keep this, next iteration will add a new chunk to it
+            )
+            current_chunk_request_id = self.request_ids[
+                len(active_requests_mask) + self.paused_request_count - 1
+            ]
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -1116,12 +1191,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_requiring_new_chunk = (
                 num_tokens_in_last_chunk == self.chunk_size_tokens - 1
             ).byte()
-            
+
             if self.have_chunked_prefill:
                 # find the id in request_ids that is the current_chunk_request_id. Only one request should be chunked.
                 pos = torch.where(self.request_ids == current_chunk_request_id)[0][0]
-                active_requests_requiring_new_chunk[pos] = 0 # chunked prefill should not be paused
-
+                active_requests_requiring_new_chunk[pos] = 0  # chunked prefill should not be paused
 
             active_requests_requiring_new_chunk_count = (
                 (active_requests_requiring_new_chunk == 1).sum().item()
@@ -1182,13 +1256,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
-        # finally, swap the chunked prefill to the end of the active requests
+        # finally, swap the chunked prefill to the end of the active requests to obey the invariant
         if self.have_chunked_prefill:
             pos = torch.where(self.request_ids == current_chunk_request_id)[0][0]
             self._swap_book_keeping_tensors(
                 src_idxs=torch.tensor([pos]),
                 dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
-                next_tokens=next_tokens
+                next_tokens=next_tokens,
             )
             self.have_chunked_prefill = False
 

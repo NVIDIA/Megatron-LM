@@ -80,8 +80,12 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     finished_chunked_tokens = 0
+
     @property
     def prompt_length(self):
+        """
+        Get the length of the prompt tokens.
+        """
         return len(self.prompt_tokens)
 
 

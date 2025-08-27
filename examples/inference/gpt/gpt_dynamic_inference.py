@@ -36,7 +36,6 @@ import json
 from examples.inference.gpt.utils import (
     add_common_inference_args,
     build_requests,
-    build_fixed_io_requests,
     build_dynamic_engine_setup_prefix,
     get_curr_time,
     Request,
@@ -59,19 +58,6 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Number of tokens to prefill for chunked prefill.",
-    )
-
-    group.add_argument(
-        "--frontend-add-request-batch-size",
-        type=int,
-        default=None,
-        help="Number of requests to add to the fengine in one batch.",
-    )
-    group.add_argument(
-        "--frontend-input-length",
-        type=int,
-        default=None,
-        help="Length of the input sequence.",
     )
 
     return parser
@@ -216,7 +202,7 @@ def run_inference(
                 break
             try:
                 engine.add_request(
-                    num_requests_added, request.prompt_tokens, sampling_params.num_tokens_to_generate
+                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
                 )
                 request.time_start = get_curr_time()
                 request.state = "started"
@@ -288,10 +274,7 @@ def main():
 
     # Requests, context, conroller.
     model = get_model()
-    if args.frontend_input_length is not None and args.frontend_add_request_batch_size is not None:
-        requests = build_fixed_io_requests(args, tokenizer)
-    else:
-        requests = build_requests(args, tokenizer)
+    requests = build_requests(args, tokenizer)
     context = get_inference_context(requests, sampling_params)
     controller = get_inference_controller(model, context)
 

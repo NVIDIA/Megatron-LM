@@ -15,11 +15,8 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
-    ChunkOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
-    RequestOverflowError,
-    TokenOverflowError,
     WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -34,7 +31,6 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.inference.utils import Counter
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-import math
 
 try:
     from tqdm import tqdm
@@ -110,7 +106,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.paused = False
         self.stopped = False
         self.chunked_prefill_token_count = chunked_prefill_token_count
-        self.chunked_prefill_request_id = None
+        self.chunked_prefill_request_id = -1
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -418,7 +414,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request_ids.tolist(), sample.tolist(), log_probs_iter
         ):
             request: DynamicInferenceRequest = self.requests[request_id]
-            if self.chunked_prefill_request_id is None or request_id != self.chunked_prefill_request_id:
+            if request_id != self.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
                 if request.tpot is None:
                     request.tpot = []
@@ -448,6 +444,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     active_requests.append(request)
             else:
+                # The chunked prefill produces useless tokens, so we are not appending them to the generated tokens.
+                # Additionally, chunked prefill request do not finish.
+                # However, the log probs are still needed.
                 if request_log_probs is not None:
                     request.prompt_log_probs.extend(request_log_probs)
                     request.generated_log_probs = []
@@ -462,52 +461,81 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.schedule_non_chunked_prefill()
 
-    
     def schedule_non_chunked_prefill(self):
+        """
+        Perform the same original scheduling logic for non-chunked runs
+        """
         while len(self.waiting_request_ids) > 0:
             req = self.requests[self.waiting_request_ids[0]]
-            request_satisfied = self.context.total_request_count < self.context.max_requests
-            token_satisfied = self.context.active_token_count + req.prompt_length <= self.context.max_tokens
-            chunks = math.ceil(req.prompt_length / self.context.chunk_size_tokens)
-            kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=True)
+            request_satisfied, token_satisfied, kv_cache_available = (
+                self.context.check_availability(req, safe=False)
+            )
             if request_satisfied and token_satisfied and kv_cache_available:
                 self.context.add_request(req)
                 self.waiting_request_ids.popleft()
             else:
                 break
-    
+
     def schedule_chunked_prefill(self):
+        """
+        This function schedules chunked prefill requests.
+        Invariant:
+            - There are at most one chunked prefill request in the waiting pool, which should be the head
+            - There are at most one chunked prefill request in the context, which should be the last active request
+            - chunked_prefill_request_id == -1 if no chunked prefill request is in the waiting pool,
+                otherwise it is the request id of the chunked prefill request in the waiting pool
+            - context.have_chunked_prefill is True if there is a chunked prefill request in the context, otherwise it is False
+            - For each request, finished_chunked_tokens is the number of tokens that have been prefilled for this request, non-zero means it is during a chunked prefill
+            - For each request, prompt_tokens is the ** unprefilled ** prompt tokens, having length of prompt_length - finished_chunked_tokens
+        """
         while len(self.waiting_request_ids) > 0:
-            
+
             req = self.requests[self.waiting_request_ids[0]]
-            is_continuing_chunked_prefill = self.chunked_prefill_request_id is not None
+
+            # is_continuing_chunked_prefill is True if we are scheduling next chunk of a existing chunked prefill request
+            is_continuing_chunked_prefill = self.chunked_prefill_request_id > 0
+
             if is_continuing_chunked_prefill:
-                request_satisfied = True # we are updating a request, not schedule one, so we don't need to check this
-                token_fully_satisfied = self.context.active_token_count + req.prompt_length <= self.chunked_prefill_token_count 
-                token_partially_satisfied = self.context.active_token_count < self.chunked_prefill_token_count
-                chunks = math.ceil((req.prompt_length + req.finished_chunked_tokens) / self.context.chunk_size_tokens) \
-                        - math.ceil(req.finished_chunked_tokens / self.context.chunk_size_tokens) # this is the amount of blocks to add
-                kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=True) # use the backup space to guarantee that the request can fully prefill
+                request_satisfied = True  # We are updating a request, not schedule one, so we don't need to check this
+                token_fully_satisfied = (
+                    self.context.active_token_count + req.prompt_length
+                    <= self.chunked_prefill_token_count
+                )
+                token_partially_satisfied = (
+                    self.context.active_token_count < self.chunked_prefill_token_count
+                )
+                _, _, kv_cache_available = self.context.check_availability(
+                    req, safe=True
+                )  # Use the backup space to guarantee that the request can fully prefill
             else:
-                request_satisfied = self.context.total_request_count < self.context.max_requests 
-                token_fully_satisfied = self.context.active_token_count + req.prompt_length <= self.chunked_prefill_token_count 
-                token_partially_satisfied = self.context.active_token_count < self.chunked_prefill_token_count
-                chunks = math.ceil(req.prompt_length / self.context.chunk_size_tokens) # we only prefill if the whole prompt can fit in the GPU
-                kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=False)
-                
+                token_fully_satisfied = (
+                    self.context.active_token_count + req.prompt_length
+                    <= self.chunked_prefill_token_count
+                )
+                token_partially_satisfied = (
+                    self.context.active_token_count < self.chunked_prefill_token_count
+                )
+                request_satisfied, _, kv_cache_available = self.context.check_availability(
+                    req, safe=False
+                )  # Here we use more strict check
+
             if request_satisfied and kv_cache_available:
                 if token_fully_satisfied:
                     self.chunked_prefill_request_id = -1
                     self.context.add_request(req)
-                    self.waiting_request_ids.popleft()
+                    self.waiting_request_ids.popleft()  # Fully scheduled, so we remove from waiting pool
                     self.context.have_chunked_prefill = False
                 elif token_partially_satisfied:
-                    chunk_length = self.chunked_prefill_token_count - self.context.active_token_count
+                    chunk_length = (
+                        self.chunked_prefill_token_count - self.context.active_token_count
+                    )
                     self.context.add_request(req, chunk_length=chunk_length)
                     self.context.have_chunked_prefill = True
                     self.chunked_prefill_request_id = req.request_id
                     req.prompt_tokens = req.prompt_tokens[chunk_length:]
                     req.finished_chunked_tokens += chunk_length
+                    # Still have tokens to prefill, so we break and keep the chunked prefill request at the head of the waiting pool
+                    # Note that we do not need to continue check the queue, as the tokens are full
                     break
                 else:
                     break
@@ -538,7 +566,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         # schedule requests
         self.schedule_waiting_requests()
-        
+
         # Previous context state, for printing output below.
         prev_is_decode_only = self.context.is_decode_only()
         prev_total_request_count = self.context.total_request_count
@@ -776,7 +804,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
                     continue
 
-                if self.context.get_active_request_count() == 0 and len(self.waiting_request_ids) == 0:
+                if (
+                    self.context.get_active_request_count() == 0
+                    and len(self.waiting_request_ids) == 0
+                ):
                     await asyncio.sleep(0.02)
                     continue
 
@@ -795,7 +826,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # care of the post-processing.
                     request_ids, finished_request_ids, sample, logprobs = engine_output
                     # Include chunked prefill request id, use -1 if None
-                    chunked_prefill_id = self.chunked_prefill_request_id if self.chunked_prefill_request_id is not None else -1
+                    chunked_prefill_id = self.chunked_prefill_request_id
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
