@@ -107,6 +107,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # All gather updated params.
         self.broadcast_params()
+        # TODO(deyu): need to all gather model param instead of main param above. temp fix
+        for optim in self.chained_optimizers:
+            if hasattr(optim, "_copy_main_params_to_model_params"):
+                optim._copy_main_params_to_model_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 
