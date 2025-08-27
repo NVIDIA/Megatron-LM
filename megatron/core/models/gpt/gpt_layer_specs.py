@@ -514,6 +514,7 @@ def get_gpt_mtp_block_spec(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     use_transformer_engine: bool,
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
@@ -529,7 +530,7 @@ def get_gpt_mtp_block_spec(
             else LocalSpecProvider()
         )
     return get_gpt_mtp_block_spec_for_backend(
-        config=config, spec=spec, backend=backend, vp_stage=vp_stage
+        config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )
 
 
@@ -538,9 +539,10 @@ def get_gpt_mtp_block_spec_for_backend(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     backend: BackendSpecProvider,
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage)
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
     if num_layers_to_build == 0:
         return None
 
