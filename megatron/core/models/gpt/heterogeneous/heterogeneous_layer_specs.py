@@ -169,7 +169,7 @@ def get_gpt_heterogeneous_layer_spec(
     config: HeterogeneousTransformerConfig,
     use_te: bool = False,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] | None = None,
+    pp_rank: Optional[int] = None,
 ):
     """
     Returns a list of ModuleSpec objects for the transformer layers in the heterogeneous model.

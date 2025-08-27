@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_num_layers_to_build(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] | None = None
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.

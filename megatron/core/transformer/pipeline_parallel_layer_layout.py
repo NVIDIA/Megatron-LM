@@ -114,7 +114,7 @@ class PipelineParallelLayerLayout:
         self,
         layer_type: LayerType = LayerType.decoder,
         vp_stage: Optional[int] = None,
-        pp_rank: Optional[int] | None = None,
+        pp_rank: Optional[int] = None,
     ):
         """Get the number of layers to build in the pipeline stage"""
         if pp_rank is None:
@@ -132,7 +132,7 @@ class PipelineParallelLayerLayout:
         self,
         layer_type: LayerType = LayerType.decoder,
         vp_stage: Optional[int] = None,
-        pp_rank: Optional[int] | None = None,
+        pp_rank: Optional[int] = None,
     ):
         """Get the layer offset in the pipeline stage"""
         if pp_rank is None:
@@ -156,7 +156,7 @@ class PipelineParallelLayerLayout:
         self,
         layer_type: LayerType = LayerType.decoder,
         vp_stage: Optional[int] = None,
-        pp_rank: Optional[int] | None = None,
+        pp_rank: Optional[int] = None,
     ):
         """Get the list of layer_id for each layer in the pipeline stage."""
         offset = self.get_layer_offset(layer_type=layer_type, vp_stage=vp_stage, pp_rank=pp_rank)

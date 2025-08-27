@@ -127,7 +127,7 @@ def get_retro_decoder_block_spec(
     config: RetroConfig,
     use_transformer_engine: bool,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] | None = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """Retro decoder block spec.
 
