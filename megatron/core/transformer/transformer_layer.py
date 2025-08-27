@@ -10,7 +10,6 @@ import torch
 import torch.distributed
 from torch import Tensor
 
-import megatron.core
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -168,7 +167,7 @@ def get_transformer_layer_offset(
             num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
             # import here to avoid circular import
-            from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
+            from megatron.core.pipeline_parallel.utils import is_vp_first_stage
 
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
                 assert (
