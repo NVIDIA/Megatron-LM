@@ -118,6 +118,8 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         assert (
             world_size > num_embed_layers
         ), f"{self.__class__.__name__} requires at least 3 ranks to distribute embedding, output projection and linear layers"
+
+        # treat embedding layers as a special case because they are not shared across ranks
         for i, params in enumerate(embed_params_list):
             self.broadcast_params_list.append(params)
             if grad_comm_pg.rank() == i:

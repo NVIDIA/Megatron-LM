@@ -26,7 +26,6 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.emerging_optimizers.orthogonalized_optimizers.muon import Muon
-from megatron.core.emerging_optimizers.experimental.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 
@@ -45,6 +44,8 @@ from .optimizer import (
 from .optimizer_config import OptimizerConfig
 logger = logging.getLogger(__name__)
 
+# must be imported after ChainedOptimizer import
+from megatron.core.emerging_optimizers.experimental.layer_wise_optimizer import LayerWiseDistributedOptimizer
 
 def _get_param_groups(
     model_chunks: List[MegatronModule],
@@ -858,6 +859,7 @@ def get_megatron_layer_wise_optimizer(
     # scale_lr_cond: Optional[Callable] = None,
     # lr_mult: float = 1.0,
     # use_gloo_process_groups: bool = True,
+    grad_comm_pg: torch.distributed.ProcessGroup,
 ) -> MegatronOptimizer:
     # currently it is only supporting muon, will add soaps later
 
@@ -898,6 +900,7 @@ def get_megatron_layer_wise_optimizer(
             "eps": config.adam_eps,
         },
         mcore_optimizer_config=config,
+        grad_comm_pg=grad_comm_pg,
     )
     return layer_wise_optimizer
 
