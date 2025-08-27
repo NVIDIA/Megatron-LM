@@ -56,12 +56,8 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
     Warning:
-        This function is implemented based on assumptions that won't generalize. It is meant for running
-        experiments only, not merge to the main codebase. A more generalized implementation will be designed
-        after MCore decentralized process group management refactoring is done.
-
-    This is a experimental optimizer that distributes optimizers of linear and embedding layers to different ranks
-    with the option to use different optimizer for different layer types.
+        This is a experimental optimizer that distributes optimizers of linear and embedding layers to different ranks
+        with the option to use different optimizer for different layer types.
 
     Args:
         module: A megatron core model chunk.
@@ -122,8 +118,6 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         assert (
             world_size > num_embed_layers
         ), f"{self.__class__.__name__} requires at least 3 ranks to distribute embedding, output projection and linear layers"
-
-        # treat embedding layers as a special case because they are not shared across ranks
         for i, params in enumerate(embed_params_list):
             self.broadcast_params_list.append(params)
             if grad_comm_pg.rank() == i:
@@ -170,14 +164,13 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         if found_inf_flag:
             return False, None, None
 
-        grad_norm = None
+        grad_norm = self.get_grad_norm()
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, "is_stub_optimizer") and optimizer.is_stub_optimizer:
                 continue
-            if grad_norm is None:
-                grad_norm = self.get_grad_norm()
+
             if optimizer.config.clip_grad > 0.0:
                 clip_grads.clip_grad_by_total_norm_fp32(
                     optimizer.get_parameters(),
