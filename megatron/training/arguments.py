@@ -556,16 +556,9 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
 
-    if args.data_parallel_sharding_strategy == "optim_grads_params":
-        args.overlap_param_gather = True
-        args.overlap_grad_reduce = True
-
-    if args.data_parallel_sharding_strategy == "optim_grads":
-        args.overlap_grad_reduce = True
-
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
+        assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
+            '--overlap-param-gather only supported with distributed optimizer or megatron fsdp'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -620,23 +613,20 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or not torch.is_grad_enabled(), \
-            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, or inference mode'
-        if args.fp8_recipe == "mxfp8":
-            assert args.reuse_grad_buf_for_mxfp8_param_ag, \
-                "--fp8-param-gather with mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag"
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
+            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
-    if args.use_custom_fsdp:
-        assert args.use_distributed_optimizer, \
-            '--use-custom-fsdp only supported with distributed optimizer'
+    if args.use_megatron_fsdp:
+        # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
+        #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
+        #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
+        args.use_custom_fsdp = True
 
         if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
             warn_rank_0(
                 'Please make sure your TransformerEngine support FSDP + gradient accumulation fusion',
                 args.rank,
             )
-            assert args.gradient_accumulation_fusion is False, \
-                "optim_grads_params optim_grads are not supported with gradient accumulation fusion"
 
         if args.data_parallel_sharding_strategy == "optim_grads_params":
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
@@ -644,6 +634,9 @@ def validate_args(args, defaults={}):
 
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+
+        assert args.ckpt_format == "fsdp_dtensor", \
+            "Megatron FSDP only supports fsdp_dtensor checkpoint format"
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -856,8 +849,8 @@ def validate_args(args, defaults={}):
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
         and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
-        if args.use_torch_fsdp2 or args.use_custom_fsdp:
-            fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Custom-FSDP"
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Megatron-FSDP"
             warn_rank_0(
                 f"Using tensor model parallelism or context parallelism with {fsdp_impl} together. "
                 "Try not to using them together since they require different CUDA_MAX_CONNECTIONS "
@@ -884,7 +877,7 @@ def validate_args(args, defaults={}):
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
     # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
-    if args.use_torch_fsdp2 or args.use_custom_fsdp and get_device_arch_version() >= 10:
+    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
         if 'dp_cp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
@@ -979,6 +972,10 @@ def validate_args(args, defaults={}):
             "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
         assert args.pipeline_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
+
+    # fsdp_dtensor checkpointing format checks.
+    if args.ckpt_format == "fsdp_dtensor":
+        assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
     # Data blend checks
     assert args.mock_data + \
@@ -2162,6 +2159,8 @@ def _add_checkpointing_args(parser):
                        help='Load main parameters from checkpoint directly.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--no-strict-fsdp-dtensor-load', action='store_false', dest='strict_fsdp_dtensor_load',
+                       help='Do not strict loading for fsdp_dtensor checkpoint format.')
     group.add_argument('--non-persistent-save-interval', type=int, default=None,
                        help='Number of iterations between non-persistent saves.')
     group.add_argument('--non-persistent-ckpt-type', type=str, default=None,
@@ -2215,10 +2214,11 @@ def _add_checkpointing_args(parser):
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp', 'fsdp_dtensor'],
                        help='Checkpoint format to use. torch is the format used by torch.save/load.'
                        ' torch_dist is a megatron built-in distributed checkpointing format.'
-                       ' torch_dcp is the torch.distributed.checkpoint format.')
+                       ' torch_dcp is the torch.distributed.checkpoint format.'
+                       ' fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.')
     group.add_argument('--ckpt-convert-format', default=None,
                        choices=['torch', 'torch_dist', 'zarr'],
                        help='Checkpoint format for conversion.')
@@ -2413,7 +2413,7 @@ def _add_distributed_args(parser):
                        help='IB SHARP can be enabled from only one communication group. '
                        'By default, it is enabled from dp group. '
                        'Available options: [dp, dp_replica]')
-    group.add_argument('--use-custom-fsdp', action='store_true',
+    group.add_argument('--use-megatron-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
@@ -2422,7 +2422,7 @@ def _add_distributed_args(parser):
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
-                       help="Enable double buffering for temporary memory needed for custom FSDP communications. "
+                       help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
@@ -2431,8 +2431,10 @@ def _add_distributed_args(parser):
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
                         'while a smaller value disables prefetching and may degrade performance. Adjust this value based on your system\'s memory '
                         'and performance requirements.')
-    group.add_argument('--keep-fp8-transpose-cache-when-using-custom-fsdp', action='store_true',
-                       help='If set, keep the fp8 transpose cache when using custom FSDP.')
+    group.add_argument('--keep-fp8-transpose-cache', action='store_true',
+                       help='If set, keep the fp8 transpose cache when using Megatron FSDP.')
+    group.add_argument('--enable-full-sharding-in-hsdp', action='store_true',
+                       help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',

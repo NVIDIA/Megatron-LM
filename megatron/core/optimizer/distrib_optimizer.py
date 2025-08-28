@@ -6,7 +6,7 @@
 import itertools
 from dataclasses import replace
 from logging import getLogger
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -503,7 +503,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         self.is_stub_optimizer = False
-        if self.ddp_config.use_custom_fsdp:
+        if self.ddp_config.use_megatron_fsdp:
             return
 
         # Model grad buffer ranges.
@@ -610,7 +610,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -694,23 +693,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+        if self.ddp_config.use_megatron_fsdp:
+            if "param_to_group_meta" in state_dict:
+                state_dict["param_groups"] = self._param2group_meta_to_param_groups(
+                    state_dict["param_to_group_meta"], self.optimizer.param_groups
+                )
+                del state_dict["param_to_group_meta"]
+            self.optimizer.load_state_dict(state_dict)
+            return
+
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
-            elif self.ddp_config.use_custom_fsdp:
-                # Initializes optimizer states with dummy values.
-
-                # This step is necessary to ensure that the optimizer's states are
-                # initialized correctly. These dummy states will be replaced in-place
-                # during the loading of distributed checkpoints.
-                for group in self.optimizer.param_groups:
-                    for param in group["params"]:
-                        if param.numel() == 0:
-                            # Avoid FusedAdam errors on empty tensor input.
-                            continue
-                        param.grad = torch.randn_like(param)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -843,10 +837,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
             sharding_type = state_dict['param_state_sharding_type']
-            if self.ddp_config.use_custom_fsdp:
-                assert (
-                    sharding_type == "fully_sharded_model_space"
-                ), "Only fully sharded model space is supported"
             logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
@@ -868,17 +858,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "exp_avg_sq": torch.Tensor
         }
         """
-        if self.ddp_config.use_custom_fsdp:
-            for model_chunk in self.model_chunks:
-                pg_buffer = model_chunk.param_and_grad_buffer
-                if model_param not in pg_buffer.param_to_name:
-                    continue
-                param_name = pg_buffer.param_to_name[model_param]
-                main_param = dict(pg_buffer.optimizer_named_parameters)[param_name]
-            assert param_name is not None, f"Not found main_param"
-
-            return {"param": main_param, **self.optimizer.state[main_param]}
-
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -906,22 +885,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "exp_avg_sq": torch.Tensor
         }
         """
-        if self.ddp_config.use_custom_fsdp:
-            for model_chunk in self.model_chunks:
-                pg_buffer = model_chunk.param_and_grad_buffer
-                if model_param not in pg_buffer.param_to_name:
-                    continue
-                param_name = pg_buffer.param_to_name[model_param]
-                main_param = dict(pg_buffer.optimizer_named_parameters)[param_name]
-            assert param_name is not None, f"Not found parameter"
-
-            for key in tensors:
-                if key == "param":
-                    main_param.copy_(tensors[key])
-                else:
-                    self.optimizer.state[main_param][key] = tensors[key]
-            return
-
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -988,33 +951,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - Gather contiguous buffers on DP rank 0 and concatenate to world
           buffers.
         """
-        if self.ddp_config.use_custom_fsdp:
-            state = {"buckets_coalesced": True}
-            for model_chunk in self.model_chunks:
-                pg_buffer = model_chunk.param_and_grad_buffer
-                for group_id, group in enumerate(pg_buffer.parameter_groups):
-                    this_group_state = {}
-                    mbuf = group.master_weight_buffer
-                    for item_id, _ in enumerate(group.params):
-                        main_param = mbuf.get_item(item_id)
-                        optim_state = self.optimizer.state[main_param]
-                        object_list = [None] * mbuf.dp_world_size
-                        torch.distributed.all_gather_object(
-                            object_list, optim_state, group=mbuf.data_parallel_group
-                        )
-
-                        for rank, obj in enumerate(object_list):
-                            for name, value in obj.items():
-                                assert torch.is_tensor(value), f"Expected tensor, got {type(value)}"
-                                this_group_state.setdefault(name, []).append(value)
-
-                        for name, values in this_group_state.items():
-                            this_group_state[name] = torch.cat(values).cpu()
-
-                    state[f"group_{group_id}"] = this_group_state
-
-            return state
-
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
@@ -1124,15 +1060,67 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.data_parallel_group.rank() == 0:
             torch.save(state_dict, filename)
 
+    def _init_optimizer_states_with_dummy_values(self):
+        # Initializes optimizer states with dummy values.
+
+        # This is necessary to ensure that the optimizer's states are
+        # initialized correctly. These dummy states will be replaced in-place
+        # during the loading of distributed checkpoints.
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if param.numel() == 0 or (
+                    hasattr(param, "_local_tensor") and param._local_tensor.numel() == 0
+                ):
+                    # Avoid FusedAdam errors on empty tensor input.
+                    continue
+                param.grad = torch.zeros_like(param)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+    def _param_name(self, param: torch.nn.Parameter) -> str:
+        """Get the name of the parameter."""
+        if not hasattr(self, "param_to_name"):
+            name_to_param = {}
+            for model_chunk in self.model_chunks:
+                _name_to_param = dict(model_chunk.named_parameters())
+                common_keys = name_to_param.keys() & _name_to_param.keys()
+                if common_keys:
+                    raise ValueError(
+                        f"Parameter names conflict between model chunks: {common_keys}. "
+                        "Ensure that each model chunk has unique parameter names."
+                    )
+                name_to_param.update(_name_to_param)
+            self.param_to_name = {param: name for name, param in name_to_param.items()}
+        assert (
+            param in self.param_to_name
+        ), f"Parameter {param} not found in param_to_name mapping. "
+        return self.param_to_name[param]
+
     def sharded_state_dict(
         self,
-        model_sharded_state_dict: ShardedStateDict,
+        model_sharded_state_dict: ShardedStateDict = {},
         is_loading: bool = False,
         sharding_type: Optional[str] = None,
         metadata: Optional[dict] = None,
     ):
         """
-        Chooses between 3 param state sharding implementations as requested by `sharding_type`.
+        Chooses between 4 param state sharding implementations as requested by `sharding_type`.
+
+        sharding_type can be one of:
+        - 'fully_sharded_bucket_space': Sharded state dict where each noncontiguous buffer is a
+            separate ShardedTensor. Results in fully parallel save and load without any
+            inter-process communication or intermediate buffers/copies.
+        - 'dp_zero_gather_scatter': Naive implementation which reuses gather/scatter from the
+            legacy ckpt format. During saving, gathers the parameters state on DP rank 0 and saves
+            a ShardedObject with fixed TPxPP structure. During loading, loads the saved data on DP
+            rank 0 (None on other ranks). Relies on the parameters scatter done in load_state_dict.
+        - 'fully_sharded_model_space': Sharded state dict where each parameter is a separate
+            ShardedTensor. Results in fully parallel save and load without any inter-process
+            communication or intermediate buffers/copies. This is the default and recommended
+            implementation for the distributed optimizer.
+        - 'fsdp_dtensor': Sharded state dict where each parameter is a separate
+            PyTorch DTensor. This is the default and recommended implementation for the distributed
+            optimizer when using the megatron fsdp training.
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
@@ -1147,16 +1135,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 'distrib_optim_sharding_type', 'fully_sharded_model_space'
             )
 
+        # Handle FSDP DistributedOptimizer States
+        if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
+            raise NotImplementedError(
+                f"sharding_type {sharding_type} is not supported with Megatron FSDP."
+            )
+        if sharding_type == "fsdp_dtensor":
+            state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
+            return state_dict
+
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
             logger.warning(
                 '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
                 ' checkpoint is deprecated and will be removed in the future.'
                 ' Please switch to `full_sharded_model_space`.'
-            )
-
-        if self.ddp_config.use_custom_fsdp:
-            assert sharding_type == 'fully_sharded_model_space', (
-                f'For FSDP, only `fully_sharded_model_space` is supported. ' f'Got: {sharding_type}'
             )
 
         state_dict = self.state_dict()
@@ -1194,6 +1186,81 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         state_dict['param_state'] = param_state
         state_dict['param_state_sharding_type'] = sharding_type
+        return state_dict
+
+    def _param_groups_to_param2group_meta(
+        self, param_groups: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Convert a parameter group to a mapping of parameter names to group metadata."""
+        param_to_group_meta = {}
+        for group in param_groups:
+            group_meta = group.copy()
+            del group_meta["params"]
+            for p in group["params"]:
+                param_to_group_meta[self._param_name(p)] = group_meta
+        return param_to_group_meta
+
+    def _param2group_meta_to_param_groups(
+        self,
+        param_to_group_meta: dict[str, Any],
+        param_groups: list[dict[str, Any]],
+        strict: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Convert a mapping of parameter names to group metadata to a list of parameter groups."""
+        new_param_groups = []
+        for group in param_groups:
+            new_group = {"params": []}
+            for param in group["params"]:
+                param_name = self._param_name(param)
+                if param_name not in param_to_group_meta:
+                    if strict:
+                        raise ValueError(
+                            f"Parameter {param_name} not found in param_to_group_meta mapping."
+                        )
+                    continue
+                group_meta = param_to_group_meta[param_name]
+                new_group_wo_params = new_group.copy()
+                del new_group_wo_params["params"]
+                if new_group_wo_params and new_group_wo_params != group_meta:
+                    error_info = (
+                        f"Parameter {param_name} and the parameters in the same group "
+                        f"{new_group['params']} have different metadata. Please check "
+                        "that whether the checkpoint and current param_groups match. "
+                        f"Parameter {param_name} has metadata {group_meta}, "
+                        f"while others group metadata is {new_group}."
+                    )
+                    if strict:
+                        raise ValueError(error_info)
+                    else:
+                        logger.warning(error_info)
+                        continue
+                new_group["params"].append(param_name)
+                new_group.update(group_meta)
+            new_param_groups.append(new_group)
+        return new_param_groups
+
+    def sharded_param_state_fsdp_dtensor(self, is_loading: bool = False):
+        """
+        Sharded state dict where each parameter is a separate PyTorch DTensor.
+        """
+        assert (
+            self.ddp_config.use_megatron_fsdp
+        ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
+
+        # Initialize optimizer states with dummy values if loading.
+        if is_loading:
+            self._init_optimizer_states_with_dummy_values()
+
+        # Get the optimizer's parameter groups in distributed key value format.
+        param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
+
+        # Remap state to use order indices as keys
+        packed_state = {
+            (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
+            for k, v in self.state.items()
+        }
+
+        state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         return state_dict
 
     def sharded_param_state_dp_zero(
@@ -1370,8 +1437,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
-            if self.ddp_config.use_custom_fsdp:
-                model_param = getattr(model_param, "fully_shard_param_local_shard", model_param)
             try:
                 sharded_metadata = param_to_sharded_metadata[model_param]
             except KeyError as e:
@@ -1406,26 +1471,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
                 tensors[state_key].validate_metadata_integrity()
             return tensors
-
-        if self.ddp_config.use_custom_fsdp:
-            for model_chunk in self.model_chunks:
-                pg_buffer = model_chunk.param_and_grad_buffer
-                for pg in pg_buffer.parameter_groups:
-                    gbuf = pg.main_grad_buffer
-                    if gbuf is None:
-                        continue
-                    for model_param in gbuf.params:
-                        item_id = gbuf.param_idx[model_param]
-                        param_name = pg_buffer.param_to_name[model_param]
-                        item_slice = gbuf._get_item_slice_in_shard(item_id)
-                        if item_slice[0] == item_slice[1]:
-                            # This param is not in this shard.
-                            continue
-
-                        state[param_name] = _get_param_state_sharded_tensors(
-                            model_param, slice(*item_slice)
-                        )
-            return state
 
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
@@ -1487,23 +1532,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Inverse of the `sharded_param_state_fs_model_space` method.
         """
-        if self.ddp_config.use_custom_fsdp:
-            for model_chunk in self.model_chunks:
-                pg_buffer = model_chunk.param_and_grad_buffer
-                for model_param in pg_buffer.params:
-                    param_name = pg_buffer.param_to_name[model_param]
-                    if param_name not in state_dict:
-                        continue
-
-                    src_tensors = {}
-                    for k, v in state_dict[param_name].items():
-                        if k == "fp32_param":
-                            src_tensors["param"] = v
-                        else:
-                            src_tensors[k] = v
-                    self._set_main_param_and_optimizer_states(model_param, src_tensors)
-            return
-
         param_idx = 0  # matching order with `sharded_param_state_fs_model_space`
         for gbuf_range_maps in self.gbuf_ranges:
             for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
@@ -1920,7 +1948,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
-        if self.ddp_config.use_custom_fsdp:
+        if self.ddp_config.use_megatron_fsdp:
             for model_chunk in self.model_chunks:
                 model_chunk.zero_grad_buffer()
             return
@@ -1985,7 +2013,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_fp32_from_fp8 = []
         shard_offsets_in_fp8 = []
 
-        if self.ddp_config.use_custom_fsdp:
+        if self.ddp_config.use_megatron_fsdp:
             buffers = []
             for m in self.model_chunks:
                 for group in m.param_and_grad_buffer.parameter_groups:
@@ -2038,7 +2066,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.is_stub_optimizer:
             return
 
-        if self.ddp_config.use_custom_fsdp:
+        if self.ddp_config.use_megatron_fsdp:
             return
 
         # Utility method for copying group grads.
@@ -2081,7 +2109,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.is_stub_optimizer:
             return
 
-        if self.ddp_config.use_custom_fsdp:
+        if self.ddp_config.use_megatron_fsdp:
             for model_chunk in self.model_chunks:
                 model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights()
             return
@@ -2194,9 +2222,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.update_fp32_param_by_new_param()
             return
 
-        if self.ddp_config.use_custom_fsdp:
-            for model_chunk in self.model_chunks:
-                model_chunk.param_and_grad_buffer.copy_model_weights_to_main_weights()
+        if self.ddp_config.use_megatron_fsdp:
             return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
@@ -2252,7 +2278,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
 
-        if self.ddp_config.use_custom_fsdp:
+        if self.ddp_config.use_megatron_fsdp:
             for model_chunk in self.model_chunks:
                 model_chunk.start_param_sync()
         else:

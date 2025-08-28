@@ -46,7 +46,7 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: aux_loss
   --moe-router-topk: 2
   --moe-aux-loss-coeff: 1e-2
-  --use-custom-fsdp: true
+  --use-megatron-fsdp: true
   --calculate-per-token-loss: true
   --data-parallel-sharding-strategy: optim_grads_params
   --use-distributed-optimizer: true
