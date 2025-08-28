@@ -145,14 +145,16 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-        # Sum over all DP groups, including CP since distributed optimizer state is
-        # sharded jointly over DP+CP.
-        torch.distributed.all_reduce(
-            sharded_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_data_parallel_group(with_context_parallel=True)
-        )
-        norm_2 += sharded_norm_2
+    else:
+        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    # Sum over all DP groups, including CP since distributed optimizer state is
+    # sharded jointly over DP+CP.
+    torch.distributed.all_reduce(
+        sharded_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=True)
+    )
+    norm_2 += sharded_norm_2
 
     if custom_fsdp_all_param_is_shared:
         torch.distributed.all_reduce(
