@@ -44,7 +44,7 @@ workflow:
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
-        on_new_commit: none
+        on_new_commit: interruptible
 
     # For merge-trains that need to be fast-tracked
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
