@@ -190,13 +190,13 @@ def get_num_layers_to_build(
         if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
             num_layers_to_build -= 1
             assert (
-                num_layers_to_build >= 1
+                num_layers_to_build >= 0
             ), f"Not enough layers in the first virtual pipeline stage"
 
     if config.account_for_loss_in_pipeline_split:
         if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
             num_layers_to_build -= 1
-            assert num_layers_to_build >= 1, f"Not enough layers in the last virtual pipeline stage"
+            assert num_layers_to_build >= 0, f"Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
 
