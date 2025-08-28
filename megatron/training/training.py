@@ -69,7 +69,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig, get_megatron_muon_optimizer
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig, get_megatron_layer_wise_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -90,6 +90,7 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     get_amax_reduction_group,
     model_parallel_is_initialized,
+    get_data_parallel_group,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.schedules import (
@@ -104,6 +105,8 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches,
 )
+
+from megatron.core.emerging_optimizers.experimental.layer_wise_optimizer import get_shower_optimizer_for_mcore
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -1309,6 +1312,15 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
 
+    if args.skip_soap_on_embeddings:
+        # skip SOAP on embedding table and output layer
+        skip_soap_cond = lambda name, param: getattr(
+                param, 'is_embedding_or_output_parameter', False
+            )
+    else:
+        skip_soap_cond = None
+
+
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
@@ -1317,27 +1329,18 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = timers
 
-    if 'muon' not in config.optimizer:
-        optimizer = get_megatron_optimizer(
-            config,
-            model,
-            no_wd_decay_cond,
-            scale_lr_cond,
-            lr_mult,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-            #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-            default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+    if config.optimizer == "dist_soap" or config.optimizer == "dist_muon":
+        optimizer = get_shower_optimizer_for_mcore(
+            model, config,
+            grad_comm_pg=get_data_parallel_group(with_context_parallel=True),
+            linear_optimizer=config.optimizer.replace("dist_", ""),
         )
     else:
-        optimizer = get_megatron_muon_optimizer( 
-            config,
-            model,
-            no_wd_decay_cond,
-            scale_lr_cond,
-            lr_mult,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-        )
+        optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
+                                           scale_lr_cond, lr_mult,
+                                           use_gloo_process_groups=args.enable_gloo_process_groups,
+                                           skip_soap_cond=skip_soap_cond)
+
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -2468,7 +2471,8 @@ def train(
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            if param_group['is_decoupled_lr']:
+            # if param_group['is_decoupled_lr']:
+            if getattr(param_group, 'is_decoupled_lr', False):
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
