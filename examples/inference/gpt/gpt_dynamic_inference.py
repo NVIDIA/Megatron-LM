@@ -195,6 +195,7 @@ def run_inference(
             if request.time_arrival > curr_time:
                 break
             try:
+                # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
                 engine.add_request(
                     num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
                 )
