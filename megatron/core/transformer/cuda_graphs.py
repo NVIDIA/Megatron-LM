@@ -9,7 +9,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils._pytree import tree_flatten
@@ -137,7 +137,7 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
-    vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+    vp_size = base_module.config.virtual_pipeline_model_parallel_size or 1
     for i in range(vp_size):
         # layer numbers are 1-indexed
         layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=i)
@@ -952,7 +952,12 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        share_cudagraph_io_buffers: bool = True,
+        vp_stage: Optional[int] = None,
+    ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -966,6 +971,7 @@ class CudaGraphManager(torch.nn.Module):
         """
         rng_tracker = get_cuda_rng_tracker()
         self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
+        self.vp_stage = vp_stage
 
         # need to delay the import here to avoid a circular import
         global HAVE_TE_GRAPHS
@@ -1050,8 +1056,13 @@ class CudaGraphManager(torch.nn.Module):
             fwd_mempool = CudaGraphManager.global_mempool
             bwd_mempool = CudaGraphManager.global_mempool
         else:
-            vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-            vpp_rank = 0 if vpp_rank is None else vpp_rank
+            if megatron_module.config.virtual_pipeline_model_parallel_size is not None:
+                assert (
+                    self.vp_stage is not None
+                ), "vp_stage must be passed if virtual pipeline is enabled"
+                vpp_rank = self.vp_stage
+            else:
+                vpp_rank = 0
             fwd_mempool = CudaGraphManager.fwd_mempools[vpp_rank][len(self.cudagraph_runners)]
             bwd_mempool = CudaGraphManager.bwd_mempool
 
