@@ -2378,7 +2378,7 @@ class ParamAndGradBuffer:
             else:
                 # Update the existing distributed tensor with the new gradient.
                 if len(orig_param.shape) > 1:
-                    local_shape = (-1, orig_param.shape[1:].numel())
+                    local_shape = (-1, *orig_param.shape[1:])
                 else:
                     local_shape = (-1,)
                 self.dist_main_grad[name]._local_tensor = optimizer_grad.view(local_shape)
@@ -3654,7 +3654,7 @@ def make_fsdp_dtensor(
 
     # Reshape local tensor for sharded layouts beyond 1D
     if len(orig_param.shape) > 1:
-        local_shape = (-1, orig_param.shape[1:].numel())
+        local_shape = (-1, *orig_param.shape[1:])
     else:
         local_shape = (-1,)
 
