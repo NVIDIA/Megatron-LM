@@ -6,6 +6,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
@@ -13,7 +14,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -47,6 +48,7 @@ class TestParallelTransformerBlockCudagraphs:
         Utils.destroy_model_parallel()
         _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -74,6 +76,11 @@ class TestParallelTransformerBlockCudagraphs:
             assert hasattr(parallel_transformer_block.layers[0], "cudagraph_manager")
             assert (
                 len(parallel_transformer_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
+            )
+            del (
+                parallel_transformer_block.layers[_]
+                .cudagraph_manager.cudagraph_runners[0]
+                .fwd_graph
             )
 
 
@@ -214,10 +221,28 @@ def test_cuda_graph_determine_first_last_layer_logic(
             assert runner.is_first_layer == (l.layer_number in first_layer_numbers_golden)
             assert runner.is_last_layer == (l.layer_number in last_layer_numbers_golden)
 
-    # teardown
+            del l.cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    # Destroy all captured graphs deterministically
+    for m in model:
+        for l in m.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+
+    # Ensure all pending work is complete and graph destruction runs now
+    torch.cuda.synchronize()
+
+    # Teardown
     Utils.destroy_model_parallel()
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempools = None
 
 
 class TestLLaVACudaGraph:
@@ -313,6 +338,9 @@ class TestLLaVACudaGraph:
         # Move model to CUDA
         self.llava_model.cuda()
 
+        set_current_microbatch(self.llava_model.vision_model, 1)
+        set_current_microbatch(self.llava_model.language_model, 1)
+
         # Create test inputs
         batch_size = 2
         seq_length = 1024
@@ -381,6 +409,20 @@ class TestLLaVACudaGraph:
         # Verify that CUDA graphs were created successfully
         assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
 
+        if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
+            self.llava_model.vision_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.vision_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
+
+        if hasattr(self.llava_model.language_model, 'decoder') and hasattr(
+            self.llava_model.language_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.language_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
+
 
 class TestParallelMambaBlockCudagraphs:
     def setup_method(self, method):
@@ -388,6 +430,9 @@ class TestParallelMambaBlockCudagraphs:
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
+
+        # Ensure that this test is capturing to a fresh memory pool.
+        CudaGraphManager.global_mempool = None
 
         def get_model_comm_pgs():
             return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
@@ -443,6 +488,8 @@ class TestParallelMambaBlockCudagraphs:
         for _ in range(num_layers):
             assert hasattr(parallel_mamba_block.layers[0], "cudagraph_manager")
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
+
+            del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
 
 
 if __name__ == "__main__":
