@@ -50,6 +50,8 @@ class MHAMetadata(MetadataBase):
         self._cu_kv_seq_lengths_buf[0] = 0
         self.extend_save(self._cu_kv_seq_lengths_buf[1:], torch.cumsum(self._kv_seq_lengths_buf, dim=0), real_batch_size, graph_batch_size)
         self._max_seqlen_q = padded_active_token_count
+        if torch.all(self._query_lengths_buf[:graph_batch_size] == 1):
+            self._max_seqlen_q = 1
         self._max_seqlen_k = self.max_seqlen
 
         self.all_data = {
