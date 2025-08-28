@@ -1339,8 +1339,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                            scale_lr_cond, lr_mult,
                                            use_gloo_process_groups=args.enable_gloo_process_groups,
-                                           skip_soap_cond=skip_soap_cond,
-                                           decay_norm_params=args.decay_norm_params)
+                                           skip_soap_cond=skip_soap_cond)
 
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})

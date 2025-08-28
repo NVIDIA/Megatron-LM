@@ -428,6 +428,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
 
+    # LayerWiseDistributedOptimizer save
     if args.optimizer.startswith("dist_"):
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
