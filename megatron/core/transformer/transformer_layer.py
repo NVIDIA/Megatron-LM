@@ -40,11 +40,9 @@ def get_transformer_layer_offset(
 ):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
     if pp_rank is None:
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-    else:
-        pipeline_rank = pp_rank
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
-    is_first_pp_stage = pipeline_rank == 0
+    is_first_pp_stage = pp_rank == 0
 
     if config.pipeline_model_parallel_size > 1:
 
@@ -91,9 +89,9 @@ def get_transformer_layer_offset(
             )
 
             middle_pipeline_rank = (
-                pipeline_rank
+                pp_rank
                 if config.num_layers_in_first_pipeline_stage is None
-                else pipeline_rank - 1
+                else pp_rank - 1
             )
 
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
@@ -129,7 +127,7 @@ def get_transformer_layer_offset(
                 )
 
                 # Calculate the layer offset with interleaved uneven pipeline parallelism
-                if pipeline_rank == 0:
+                if pp_rank == 0:
                     offset = vp_stage * total_virtual_chunks
                 else:
                     offset = (
@@ -147,7 +145,7 @@ def get_transformer_layer_offset(
                 else:
                     num_layers_per_pipeline_rank = 0
 
-                if pipeline_rank == 0:
+                if pp_rank == 0:
                     offset = 0
                 else:
                     offset = (
@@ -177,7 +175,7 @@ def get_transformer_layer_offset(
                 num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
                 total_virtual_chunks = num_layers // vp_size
                 offset = vp_stage * total_virtual_chunks + (
-                    pipeline_rank * num_layers_per_virtual_rank
+                    pp_rank * num_layers_per_virtual_rank
                 )
 
                 # Reduce the offset of embedding layer from the total layer number
@@ -186,7 +184,7 @@ def get_transformer_layer_offset(
                 ):
                     offset -= 1
             else:
-                offset = pipeline_rank * num_layers_per_pipeline_rank
+                offset = pp_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
                 if config.account_for_embedding_in_pipeline_split and not (

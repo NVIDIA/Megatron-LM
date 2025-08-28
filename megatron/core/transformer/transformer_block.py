@@ -91,7 +91,7 @@ def get_num_layers_to_build(
             layer_type=LayerType.decoder, vp_stage=vp_stage
         )
 
-    # Fallbacks for legacy tests.
+    # Fallback for legacy tests.
     if pp_rank is None:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
