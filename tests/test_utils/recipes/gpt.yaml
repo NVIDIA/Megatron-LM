@@ -425,7 +425,7 @@ products:
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # OOM: #434
-  - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_dgx_a100_1N8G]
+  - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_fsdp_dtensor_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]

@@ -129,9 +129,6 @@ def make_sharded_object_for_checkpoint(
             ShardedObject
         replica_id (Union[None, int, Tuple[int, ...]]): replica id
     """
-    is_obj_fully_sharded = hasattr(obj, 'fully_shard_param_local_index')
-    assert not is_obj_fully_sharded, f"Fully sharded object not supported: {key}"
-
     if replica_id is None:
         replica_id = (
             0,

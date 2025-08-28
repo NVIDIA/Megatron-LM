@@ -134,7 +134,7 @@ def create_ckpt_load_args(create_args):
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
-    args.use_custom_fsdp = False
+    args.strict_fsdp_dtensor_load = True
 
     yield args
 
@@ -151,7 +151,9 @@ def init_model_parallel():
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch_dcp"])
-def test_load_base_checkpoint(init_model_parallel, create_args, ckpt_format, tmp_path_dist_ckpt):
+def test_load_base_checkpoint(
+    init_model_parallel, create_ckpt_load_args, ckpt_format, tmp_path_dist_ckpt
+):
     """Test _load_base_checkpoint."""
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
@@ -160,7 +162,7 @@ def test_load_base_checkpoint(init_model_parallel, create_args, ckpt_format, tmp
     # TempNamedDir uses the same directory for all ranks in a multi-GPU setup. Cleanup is handled.
     with TempNamedDir(tmp_path_dist_ckpt / "test_load_base_checkpoint", sync=True) as load_dir:
         create_checkpoint(load_dir, ckpt_format)
-        args = create_args
+        args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
 
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
