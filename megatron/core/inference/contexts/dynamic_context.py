@@ -16,10 +16,9 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
+from .attention_context.mha_metadata import GraphMHAMetadata, NonGraphMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_chunk_allocator import ChunkAllocator
-
-from .attention_context.mha_metadata import GraphMHAMetadata, NonGraphMHAMetadata
 
 try:
     from packaging.version import Version as PkgVersion
@@ -351,7 +350,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             chunk_size_tokens=self.chunk_size_tokens,
             max_seqlen=self.max_sequence_length,
-            debug=False
+            debug=False,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAMetadata(
@@ -360,9 +359,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             chunk_size_tokens=self.chunk_size_tokens,
             max_seqlen=self.max_sequence_length,
-            debug=False
+            debug=False,
         )
-
 
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
@@ -467,11 +465,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_query_lengths(self) -> Tuple[Tensor, int]:
         """Cumulative query sequence lengths."""
-        return self.active_attn_metadata["mha_metadata"].all_data["cu_query_seq_lengths"], self.active_attn_metadata["mha_metadata"].all_data["max_seqlen_q"]
+        return (
+            self.active_attn_metadata["mha_metadata"].state_data["cu_query_seq_lengths"],
+            self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_q"],
+        )
 
     def cu_kv_lengths(self) -> Tensor:
         """Cumulative key/value sequence lengths."""
-        return (self.active_attn_metadata["mha_metadata"].all_data["cu_kv_seq_lengths"], self.active_attn_metadata["mha_metadata"].all_data["kv_seq_lengths"], self.active_attn_metadata["mha_metadata"].all_data["max_seqlen_k"])
+        return (
+            self.active_attn_metadata["mha_metadata"].state_data["cu_kv_seq_lengths"],
+            self.active_attn_metadata["mha_metadata"].state_data["kv_seq_lengths"],
+            self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_k"],
+        )
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
@@ -538,12 +543,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             to chunks within the chunked memory buffer.
         """
         if self.cache_mla_latent:
-            return (self.memory_buffer[layer_number - 1], None, self.active_attn_metadata["mha_metadata"].all_data["block_table"])
+            return (
+                self.memory_buffer[layer_number - 1],
+                None,
+                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+            )
         else:
             return (
                 self.memory_buffer[0, layer_number - 1],
                 self.memory_buffer[1, layer_number - 1],
-                self.active_attn_metadata["mha_metadata"].all_data["block_table"],
+                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
     def apply_rotary_emb_query(
@@ -703,10 +712,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.padded_active_token_count
         ] = 0
 
-
-        real_req_batch_size = self.total_request_count - self.paused_request_count # how many requests are indeed active
+        real_req_batch_size = (
+            self.total_request_count - self.paused_request_count
+        )  # how many requests are indeed active
         graph_req_batch_size = self.padded_active_request_count
-        self.active_attn_metadata = self.graph_attn_metadata if self.using_cuda_graph_this_step() else self.non_graph_attn_metadata
+        self.active_attn_metadata = (
+            self.graph_attn_metadata
+            if self.using_cuda_graph_this_step()
+            else self.non_graph_attn_metadata
+        )
 
         # Update cu_query_seq_lengths, max_seqlen_q.
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -719,7 +733,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             request_to_kv_chunk_ids=request_to_kv_chunk_ids_view,
             padded_active_token_count=self.padded_active_token_count,
             real_batch_size=real_req_batch_size,
-            graph_batch_size=graph_req_batch_size
+            graph_batch_size=graph_req_batch_size,
         )
         # All attention metadata calculations are now handled by MHAMetadata.update()
 
