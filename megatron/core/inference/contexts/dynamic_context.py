@@ -927,10 +927,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # only allocate new chunks
         already_allocated_chunks = (
             req.finished_chunked_tokens + self.chunk_size_tokens - 1
-        ) // self.chunk_size_tokens
+        ) // self.chunk_size_tokens  # ceiling division
         overall_required_chunks = (
             req.finished_chunked_tokens + this_round_length + self.chunk_size_tokens - 1
-        ) // self.chunk_size_tokens
+        ) // self.chunk_size_tokens  # ceiling division
 
         num_chunks_needed = overall_required_chunks - already_allocated_chunks
 
@@ -947,7 +947,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # no need to update count, as it is already here
         if req.finished_chunked_tokens > 0:
             current_id = self.total_request_count - 1
-            self.active_token_count -= 1
+            self.active_token_count -= (
+                1  # Overwrite the last token, which is the useless token from chunked prefill
+            )
             assert (
                 self.request_ids[current_id] == req.request_id
             ), "Continuation current_id mismatch"
@@ -1002,7 +1004,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
-        Swaps all the relevent booking tensors with src idxs to dst idxs
+        Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
@@ -1015,43 +1017,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_id[dst_idxs] = self.request_last_kv_chunk_id[src_idxs]
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
 
+    def tensor_swap(x, src_idxs, dst_idxs):
+        """
+        Swap x[src_idxs] and x[dst_idxs]
+        """
+        x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
+
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
-        self.request_kv_length_offsets[dst_idxs], self.request_kv_length_offsets[src_idxs] = (
-            self.request_kv_length_offsets[src_idxs],
-            self.request_kv_length_offsets[dst_idxs],
-        )
-        self.request_query_lengths[dst_idxs], self.request_query_lengths[src_idxs] = (
-            self.request_query_lengths[src_idxs],
-            self.request_query_lengths[dst_idxs],
-        )
-        self.request_output_lengths[dst_idxs], self.request_output_lengths[src_idxs] = (
-            self.request_output_lengths[src_idxs],
-            self.request_output_lengths[dst_idxs],
-        )
-        self.request_ids[dst_idxs], self.request_ids[src_idxs] = (
-            self.request_ids[src_idxs],
-            self.request_ids[dst_idxs],
-        )
-        next_tokens[dst_idxs], next_tokens[src_idxs] = next_tokens[src_idxs], next_tokens[dst_idxs]
-        self.request_to_kv_chunk_ids[dst_idxs], self.request_to_kv_chunk_ids[src_idxs] = (
-            self.request_to_kv_chunk_ids[src_idxs],
-            self.request_to_kv_chunk_ids[dst_idxs],
-        )
-        self.request_kv_chunk_counts[dst_idxs], self.request_kv_chunk_counts[src_idxs] = (
-            self.request_kv_chunk_counts[src_idxs],
-            self.request_kv_chunk_counts[dst_idxs],
-        )
-        self.request_last_kv_chunk_id[dst_idxs], self.request_last_kv_chunk_id[src_idxs] = (
-            self.request_last_kv_chunk_id[src_idxs],
-            self.request_last_kv_chunk_id[dst_idxs],
-        )
-        self.request_last_kv_chunk_offset[dst_idxs], self.request_last_kv_chunk_offset[src_idxs] = (
-            self.request_last_kv_chunk_offset[src_idxs],
-            self.request_last_kv_chunk_offset[dst_idxs],
-        )
+        self.tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_ids, src_idxs, dst_idxs)
+        self.tensor_swap(next_tokens, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_to_kv_chunk_ids, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_kv_chunk_counts, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_last_kv_chunk_id, src_idxs, dst_idxs)
+        self.tensor_swap(self.request_last_kv_chunk_offset, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> None:

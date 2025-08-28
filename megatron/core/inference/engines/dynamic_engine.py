@@ -82,7 +82,7 @@ class DynamicInferenceEngine(AbstractEngine):
         termination_id: int,
         enable_cuda_graph: bool,
         random_seed: Optional[int] = None,
-        chunked_prefill_token_count: Optional[int] = None,
+        enable_chunked_prefill: bool = True,
     ):
 
         assert isinstance(controller, SimpleTextGenerationController)
@@ -105,8 +105,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
-        self.chunked_prefill_token_count = chunked_prefill_token_count
         self.chunked_prefill_request_id = -1
+        self.enable_chunked_prefill = enable_chunked_prefill
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -456,7 +456,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
-        if self.chunked_prefill_token_count is not None:
+        if self.enable_chunked_prefill:
             self.schedule_chunked_prefill()
         else:
             self.schedule_non_chunked_prefill()
@@ -465,7 +465,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
-        while len(self.waiting_request_ids) > 0:
+        while self.waiting_request_ids:
             req = self.requests[self.waiting_request_ids[0]]
             request_satisfied, token_satisfied, kv_cache_available = (
                 self.context.check_availability(req, safe=False)
@@ -488,36 +488,21 @@ class DynamicInferenceEngine(AbstractEngine):
             - For each request, finished_chunked_tokens is the number of tokens that have been prefilled for this request, non-zero means it is during a chunked prefill
             - For each request, prompt_tokens is the ** unprefilled ** prompt tokens, having length of prompt_length - finished_chunked_tokens
         """
-        while len(self.waiting_request_ids) > 0:
+        while self.waiting_request_ids:
 
             req = self.requests[self.waiting_request_ids[0]]
 
             # is_continuing_chunked_prefill is True if we are scheduling next chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.chunked_prefill_request_id > 0
 
-            if is_continuing_chunked_prefill:
-                request_satisfied = True  # We are updating a request, not schedule one, so we don't need to check this
-                token_fully_satisfied = (
-                    self.context.active_token_count + req.prompt_length
-                    <= self.chunked_prefill_token_count
-                )
-                token_partially_satisfied = (
-                    self.context.active_token_count < self.chunked_prefill_token_count
-                )
-                _, _, kv_cache_available = self.context.check_availability(
-                    req, safe=True
-                )  # Use the backup space to guarantee that the request can fully prefill
-            else:
-                token_fully_satisfied = (
-                    self.context.active_token_count + req.prompt_length
-                    <= self.chunked_prefill_token_count
-                )
-                token_partially_satisfied = (
-                    self.context.active_token_count < self.chunked_prefill_token_count
-                )
-                request_satisfied, _, kv_cache_available = self.context.check_availability(
-                    req, safe=False
-                )  # Here we use more strict check
+            token_fully_satisfied = (
+                self.context.active_token_count + req.prompt_length <= self.context.max_tokens
+            )
+            token_partially_satisfied = self.context.active_token_count < self.context.max_tokens
+            request_satisfied, _, kv_cache_available = self.context.check_availability(
+                req, safe=not is_continuing_chunked_prefill
+            )
+            request_satisfied = is_continuing_chunked_prefill or request_satisfied
 
             if request_satisfied and kv_cache_available:
                 if token_fully_satisfied:
@@ -526,9 +511,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.waiting_request_ids.popleft()  # Fully scheduled, so we remove from waiting pool
                     self.context.have_chunked_prefill = False
                 elif token_partially_satisfied:
-                    chunk_length = (
-                        self.chunked_prefill_token_count - self.context.active_token_count
-                    )
+                    chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self.context.have_chunked_prefill = True
                     self.chunked_prefill_request_id = req.request_id

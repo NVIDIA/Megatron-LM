@@ -178,7 +178,7 @@ class DataParallelInferenceCoordinator:
             # Handle chunked prefill similar to the engine logic
             if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
                 request.generated_tokens.append(token)
-                
+
                 if request_log_probs is not None:
                     if not request.prompt_log_probs:
                         request.prompt_log_probs = []
@@ -201,7 +201,7 @@ class DataParallelInferenceCoordinator:
         if finished_request_ids:
             for fid in finished_request_ids:
                 if fid == chunked_prefill_request_id:
-                    continue # skip chunked prefill request, this is not a finished request
+                    continue  # skip chunked prefill request, this is not a finished request
                 request = self.requests.pop(fid)
                 request.generated_length = len(request.generated_tokens)
                 request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
@@ -303,10 +303,20 @@ class DataParallelInferenceCoordinator:
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                request_ids, finished_request_ids, generated_tokens, logprobs, chunked_prefill_request_id = (
-                    deserialized_payload[1:]
+                (
+                    request_ids,
+                    finished_request_ids,
+                    generated_tokens,
+                    logprobs,
+                    chunked_prefill_request_id,
+                ) = deserialized_payload[1:]
+                self.postprocess(
+                    request_ids,
+                    finished_request_ids,
+                    generated_tokens,
+                    logprobs,
+                    chunked_prefill_request_id,
                 )
-                self.postprocess(request_ids, finished_request_ids, generated_tokens, logprobs, chunked_prefill_request_id)
 
     @classmethod
     def entrypoint(

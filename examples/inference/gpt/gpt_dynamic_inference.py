@@ -53,12 +53,6 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
-    group.add_argument(
-        "--inference-chunked-prefill-token-count",
-        type=int,
-        default=None,
-        help="Number of tokens to prefill for chunked prefill.",
-    )
 
     return parser
 
@@ -285,7 +279,7 @@ def main():
         termination_id=tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
-        chunked_prefill_token_count=args.inference_chunked_prefill_token_count,
+        enable_chunked_prefill=args.enable_chunked_prefill,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)

@@ -1351,6 +1351,12 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
+    
+    exclusive_group = parser.add_mutually_exclusive_group()
+    exclusive_group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
+                       help='Disable chunked prefill.')  
+    exclusive_group.add_argument('--enable-chunked-prefill', default=False, action="store_true",
+                       help='Enable chunked prefill.')  
 
     return parser
 
