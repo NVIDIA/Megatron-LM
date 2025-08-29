@@ -868,7 +868,7 @@ def get_megatron_muon_optimizer(
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:
-        print("using LayerWiseDistributedOptimizer ===========================")
+        log_single_rank(logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for Muon')
         return LayerWiseDistributedOptimizer(
                 optimizers,
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
