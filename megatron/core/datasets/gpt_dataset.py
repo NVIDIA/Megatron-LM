@@ -55,6 +55,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: int = 1
     """Option to enable context parallelism"""
 
+    data_parallel_size: int = 1
+    """Option to enable data parallelism"""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()

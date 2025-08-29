@@ -96,7 +96,7 @@ from megatron.core.pipeline_parallel.schedules import (
     get_pp_rank_microbatches,
     get_schedule_table,
 )
-from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPWrapper
+from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDataLoaderWrapper
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -2073,7 +2073,7 @@ def train(
     one_logger = get_one_logger()
 
     if args.hybrid_context_parallel:
-        train_data_iterator = HybridCPWrapper(train_data_iterator, config)
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:

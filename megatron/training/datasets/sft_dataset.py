@@ -124,7 +124,8 @@ class SFTDataset(MegatronDataset):
             pack_positions.extend(range(len(tokens_list)))
 
             if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
+                # TODO(pmannan): This is a hack to pad for Hybrid DPxCP.
+                pad_granularity = self.config.context_parallel_size * self.config.data_parallel_size * 2
                 mod_token_count = len(pack_tokens) % pad_granularity
                 if mod_token_count != 0:
                     pad_len = pad_granularity - mod_token_count

@@ -8,20 +8,50 @@ from collections import deque
 from math import ceil, log2
 import heapq
 
-class HybridCPWrapper():
+class HybridCPDatasetWrapper():
     """
-    A wrapper class that wraps around any existing dataset and prints samples
-    as they are requested from the original dataset.
+    A wrapper class that wraps around any existing dataset.
+    It adds batch_idx to the sample and returns the sample.
     
-    This wrapper implements the standard PyTorch Dataset interface and can be
-    used with any dataset that follows the same interface.
+    This is required if certains DP ranks need the dataset idx
+    to access the appropriate sub-sample assigned to them from
+    the file system even if it was not originally assigned to them.
     
     Args:
         dataset: The original dataset to wrap around
-        print_format: Format string for printing samples (default: "Sample {idx}: {sample}")
-        print_func: Function to use for printing (default: print)
-        max_print_length: Maximum length of sample to print (default: 200 chars)
-        print_every: Print every Nth sample (default: 1, print all)
+    """
+    
+    def __init__(
+        self, 
+        dataset,
+    ):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx) -> Any:
+        """
+        Get the next item from the dataset, add batch_idx and return it.
+        """
+        sample = self.dataset[idx]
+        sample["batch_idx"] = idx
+        assert "cu_seqlens" in sample, "cu_seqlens must be in the sample to use hybrid context parallel"
+        return sample
+
+class HybridCPDataLoaderWrapper():
+    """
+    A wrapper class that wraps around an existing data_iterator.
+    For every __next__ call, 
+    1. Each DP rank pulls a batch of packed samples.
+    2. Extracts the sequence lengths of each sub-sample and all-gathers across the DP group.
+    3. Schedules the sub-samples to the DPxCP ranks using the BalancedCPScheduler.
+    4. Based on the schedule, reroutes the sub-samples to the correct rank using all-to-all.
+    5. Returns the assigned sub-samples to this rank.
+    
+    Args:
+        data_iterator: The original data_iterator to wrap around
+        config: The config object containing the max_seqlen_per_cp_rank
     """
     
     def __init__(
@@ -33,23 +63,172 @@ class HybridCPWrapper():
         self.sample_count = 0
         self.config = config
         self.cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=self.config.max_seqlen_per_cp_rank)
+        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
 
     def __iter__(self):
         """Return self as an iterator."""
         return self
+    
+    def get_global_seqlens(self, subsample_seqlens: torch.Tensor) -> List[int]:
+        # Collect the number of subsamples from all ranks
+        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
+        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(parallel_state.get_data_parallel_world_size())]
+        torch.distributed.all_gather(dp_subsample_count, local_len, group=parallel_state.get_data_parallel_group())
+        
+        # Find the maximum number of subsamples across all ranks and pad the subsample_seqlens to the max length
+        dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
+        max_sub_samples = int(dp_subsample_counts.max().item())
 
+        if local_len.item() < max_sub_samples:
+            subsample_seqlens_padded = torch.cat([subsample_seqlens, torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda()], dim=0)
+        else:
+            subsample_seqlens_padded = subsample_seqlens
+
+        # Gather the subsample_seqlens from all ranks
+        seqlens_gathered = [torch.empty_like(subsample_seqlens_padded) for _ in range(parallel_state.get_data_parallel_world_size())]
+        torch.distributed.all_gather(seqlens_gathered, subsample_seqlens_padded, group=parallel_state.get_data_parallel_group())
+        
+        # Trim each seqlens_gathered to the length of the correct sample
+        for dp_rank, seqlen in enumerate(seqlens_gathered):
+            seqlens_gathered[dp_rank] = seqlen[:dp_subsample_counts[dp_rank]]
+
+        seqlens_gathered = torch.cat(seqlens_gathered, dim=0)
+        seqlens_gathered = seqlens_gathered.cpu().tolist()
+
+        # Calculate the offsets to assign unique global ID to each subsample.
+        csum = torch.cumsum(dp_subsample_counts, dim=0, dtype=torch.int32)
+        offsets = torch.cat([torch.zeros(1, dtype=torch.int32), csum[:-1]], dim=0)
+
+        return seqlens_gathered, offsets
+
+    def get_global_id_seqlens(self, num_local_subsamples, offsets, seqlens_gathered):
+        # Calculate the global ID for each subsample
+        dp_rank = parallel_state.get_data_parallel_rank()
+        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
+        # Create a list of (global_id, seqlen) tuples for scheduling
+        global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
+        # Get the global IDs locally present on this rank
+        global_ids_this_rank = global_ids[offsets[dp_rank]:offsets[dp_rank] + num_local_subsamples]
+
+        return global_id_seqlens, global_ids_this_rank
+
+    def _gid_to_src_rank(self, gid: int, offsets: List[int]) -> int:
+        dp_src_rank = torch.bucketize(gid, offsets[1:]-1)
+        hdp_rank = torch.distributed.get_process_group_ranks(parallel_state.get_data_parallel_group())[dp_src_rank]
+        return hdp_rank
+    
+    def reroute_samples_to_hdp_ranks(self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets):
+        gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
+        hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        dp_ranks = torch.distributed.get_process_group_ranks(parallel_state.get_data_parallel_group())
+        data_keys = batch[0].keys()
+
+        # Create the send plan
+        combined_sample_id_groups: List[List[int]] = [[] for _ in range(self.total_hdp_gpus)]
+
+        for d in range(self.total_hdp_gpus):
+            for sample_id_group in sample_id_groups:
+                    combined_sample_id_groups[d].extend(sample_id_group[d])
+
+        for dest_rank in range(self.total_hdp_gpus):
+            combined_sample_id_groups[dest_rank].sort()
+
+        # Filter out samples that are not present on this rank
+        send_ids_sorted = [gid for d in dp_ranks for gid in combined_sample_id_groups[d] if gid in global_ids_this_rank]
+        # send_counts = [len(combined_sample_id_groups[d]) for d in range(self.total_hdp_gpus)]
+
+        send_lens_split = [0] * self.total_hdp_gpus
+        for dest_rank in range(self.total_hdp_gpus):
+            if dest_rank in dp_ranks:
+                send_lens_split[dest_rank] = sum([global_id_seqlens[gid][1] for gid in combined_sample_id_groups[dest_rank] if gid in global_ids_this_rank])
+            else:
+                # We only need to share local data with DP ranks that have different data.
+                send_lens_split[dest_rank] = 0
+
+        # Create the recv plan
+        recv_sample_id_groups = [[] for _ in range(self.total_hdp_gpus)]
+        for gid in combined_sample_id_groups[hdp_rank]:
+            src_rank = self._gid_to_src_rank(gid, offsets)
+            recv_sample_id_groups[src_rank].append(gid)
+        
+        recv_lens_split = [0] * self.total_hdp_gpus
+        for src_rank in range(self.total_hdp_gpus):
+            recv_lens_split[src_rank] = sum([global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]])
+
+        # print(f"rank: {torch.distributed.get_rank()}, recv_lens_split: {recv_lens_split} send_lens_split: {send_lens_split}")
+
+        recv_ids_sorted = [gid for d in range(self.total_hdp_gpus) for gid in recv_sample_id_groups[d]]
+        recv_counts = [len(recv_sample_id_groups[d]) for d in range(self.total_hdp_gpus)]
+
+        recv_samples = [{k: None for k in data_keys} for _ in range(sum(recv_counts))]
+
+        def _pack_sample_by_key(key: str) -> torch.Tensor:
+            flattened_tensors = []
+            for gid in send_ids_sorted:
+                t = batch[gid2local_id[gid]][key].to(torch.cuda.current_device(), non_blocking=True)
+                flattened_tensors.append(t)
+            return torch.cat(flattened_tensors, dim=0) if flattened_tensors else torch.empty(0, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
+
+        def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
+            cursor = 0
+            for i, gid in enumerate(recv_ids_sorted):
+                sample_len = global_id_seqlens[gid][1]
+                recv_samples[i][key] = recv_tensor[cursor:cursor+sample_len]
+                cursor += sample_len
+        
+        for key in data_keys:
+            send_tensor = _pack_sample_by_key(key)
+            recv_tensor = torch.empty(sum(recv_lens_split), device=torch.cuda.current_device(), dtype=send_tensor.dtype)
+            torch.distributed.all_to_all_single(
+                output=recv_tensor,
+                input=send_tensor,
+                output_split_sizes=recv_lens_split,
+                input_split_sizes=send_lens_split,
+                group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+            _unpack_sample_by_key(key, recv_tensor)
+        
+        recv_sample_with_id = {recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)}
+        return recv_sample_with_id
+
+    def unpack_batch(self, batch):
+        batch_unpacked = []
+        for sample in batch:
+            for sub_sample in range(sample["cu_seqlens"].shape[0] - 1):
+                sub_sample_dict = {}
+                start_idx = sample["cu_seqlens"][sub_sample]
+                end_idx = sample["cu_seqlens"][sub_sample + 1]
+                for key in sample.keys():
+                    if key in ["cu_seqlens", "batch_idx", "max_seqlen"]:
+                        continue
+                    sub_sample_dict[key] = sample[key][start_idx:end_idx]
+                batch_unpacked.append(sub_sample_dict)
+        return batch_unpacked
+    
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
         """
-        sample = next(self.data_iterator)
-        assert "cu_seqlens" in sample, "cu_seqlens must be in the sample"
-        # TODO(milestone 2): Get cu_seqlens and all-gather the entire global batch worth cu_seqlens and then perform the scheduling.
-        # But why should this scheduling information be integrated back into the data?
-        groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(sample, self.config)
-        sample["groups"] = groups
-        sample["sample_id_groups"] = sample_id_groups
-        return sample
+        batch = next(self.data_iterator)
+        subsample_seqlens = []
+        for sample in batch:
+            subsample_seqlens.extend([int(sample["cu_seqlens"][i+1] - sample["cu_seqlens"][i]) for i in range(0, sample["cu_seqlens"].shape[0] - 1)])
+        subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
+
+        seqlens_gathered, offsets = self.get_global_seqlens(subsample_seqlens)
+
+        global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(subsample_seqlens.shape[0], offsets, seqlens_gathered)
+        # global_id_seqlens = sorted(global_id_seqlens, key=lambda x: x[1], reverse=True)
+
+        groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(global_id_seqlens, self.config)
+        # sample["groups"] = groups
+        # sample["sample_id_groups"] = sample_id_groups
+
+        batch = self.unpack_batch(batch)
+        samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets)
+        # for sample_id, sample in samples_this_rank_with_id.items():
+        #     sample["sample_id_groups"]
+        return samples_this_rank_with_id, sample_id_groups
 
 class BalancedCPScheduler:
     def __init__(self, max_seq_len_per_rank: int):
@@ -57,6 +236,7 @@ class BalancedCPScheduler:
         self.num_subsamples = 0
         self.num_subsamples_processed = 0
         self.free_resources = []
+        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
 
     @lru_cache(maxsize=128)
     def get_total_workload(self, seq_length: int, cp_size: Optional[int] = None):
@@ -428,29 +608,21 @@ class BalancedCPScheduler:
 
     def get_groups_and_subsamples(
         self,
-        data,
+        sample_id_seqlens,
         config,
     ):
         # TODO: Protect for model parallelism
         # TODO: Reduce access to file system as much as possible.
         groups = []
         sample_id_groups = []
-        assert "cu_seqlens" in data, (
-            "data must have a cu_seqlens attribute to define the valid sequenece lengths "
-            "of each sub-sample in a packed sample to use hybrid context parallel"
-        )
         # We assign a sample_id to each sub-sample in order to track the right assignment to each GPU.
-        # TODO (Milestone 2): Sample ID logic will have to change once we have global batch
-        sample_id_seqlens = [(i, int(data["cu_seqlens"][0][i+1] - data["cu_seqlens"][0][i])) for i in range(0, data["cu_seqlens"][0].shape[0] - 1)]
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
         while sample_id_seqlens:
-            mb, sample_id_seqlens, exec_times, sample_ids = self.next_hdp_group(sample_id_seqlens, self.get_total_workload, config.context_parallel_size)
+            mb, sample_id_seqlens, exec_times, sample_ids = self.next_hdp_group(sample_id_seqlens, self.get_total_workload, self.total_hdp_gpus)
             groups.append(mb)
-            if len(sample_ids) < config.context_parallel_size:
-                sample_ids.extend([] * (config.context_parallel_size - len(sample_ids)))
+            if len(sample_ids) < self.total_hdp_gpus:
+                sample_ids.extend([] * (self.total_hdp_gpus - len(sample_ids)))
             sample_id_groups.append(sample_ids)
-        # print(f"groups: {groups}")
-        # print(f"sample_id_groups: {sample_id_groups}")
         
         return groups, sample_id_groups
 
@@ -495,67 +667,30 @@ def hybrid_context_parallel_forward_backward(
     from .schedules import forward_step, backward_step
 
     cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=config.max_seqlen_per_cp_rank)
-    with no_sync_func():
-        for i in range(num_microbatches - 1):
-            data = next(data_iterator)
-            # groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(data, model, config)
-            groups = data["groups"]
-            sample_id_groups = data["sample_id_groups"]
-            for j in range(len(groups)):
-                # Get sub-samples for the current CP rank
-                # TODO: Update to DPxCP rank when milestone 2
-                sample_ids_per_group = sample_id_groups[j][parallel_state.get_context_parallel_rank()]
-                for k in range(len(sample_ids_per_group)):
-                    # Call forward step for each sub-sample
-                    sub_sample_id = sample_ids_per_group[k]
-                    partner_cp_size = len([True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids])
-                    if partner_cp_size == 0:
-                        assert False, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} j: {j} k: {k} sample_ids_group: {sample_id_groups}"
-                    data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-                    data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
-                    new_data_iterator = RerunDataIterator(iter([data]))
-                    # TODO: Change data iterator to the right sub-sample
-                    # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
-                    output_tensor, num_tokens = forward_step(
-                        forward_step_func,
-                        new_data_iterator,
-                        model,
-                        num_microbatches,
-                        input_tensor,
-                        forward_data_store,
-                        config,
-                        collect_non_loss_data,
-                        is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                        current_microbatch=i,
-                    )
-                    total_num_tokens += num_tokens.item()
-                    if not forward_only:
-                        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+    # We get data once per global batch and schedule the sub-samples.
+    # TODO(pmannan): We will change from 3 for loop to 2 for loops.
+    # groups and sample_id_groups will be provided by the scheduler.
+    # sample_id_groups will now directly be a list of sub-samples per group and we iterate over it.
+    # data will be a list of sub-samples with sample_id.
+    # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
+    data = next(data_iterator)
+    sample_id_groups = data[1]
+    batch = data[0]
+    # TODO: How does this variable affect downstream logic?
+    num_microbatches = 1
 
-                # TODO: Move to DPxCP barrier
-                torch.distributed.barrier(parallel_state.get_context_parallel_group())
-
-    # Last microbatch
-    # TODO: Call scheduler here.
+    # Upto last group, we don't need any sync.
     with no_sync_func():
-        data = next(data_iterator)
-        # groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(data, model, config)
-        groups = data["groups"]
-        sample_id_groups = data["sample_id_groups"]
-        for j in range(len(groups) - 1):
-            sample_ids_per_group = sample_id_groups[j][parallel_state.get_context_parallel_rank()]
-            for k in range(len(sample_ids_per_group)):
+        for j in range(len(sample_id_groups) - 1):
+            sample_ids_this_group = sample_id_groups[j][parallel_state.get_data_parallel_rank(with_context_parallel=True)]
+            for sub_sample_id in sample_ids_this_group:
                 # Call forward step for each sub-sample
-                sub_sample_id = sample_ids_per_group[k]
-                
+                sample = batch[sub_sample_id]
                 partner_cp_size = len([True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids])
-                if partner_cp_size == 0:
-                    assert False, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} j: {j} k: {k} sample_ids_group: {sample_id_groups}"
-                data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-                data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
-                # TODO: What else should I update in data so that we can get the right sub-sample?
-                new_data_iterator = RerunDataIterator(iter([data]))
-                # TODO: Change data iterator to the right sub-sample
+                assert partner_cp_size > 0, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[j]}"
+                sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+                sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
+                new_data_iterator = RerunDataIterator(iter([sample]))
                 # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
@@ -573,22 +708,22 @@ def hybrid_context_parallel_forward_backward(
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
             
-            # TODO: Move to DPxCP barrier
-            torch.distributed.barrier(parallel_state.get_context_parallel_group())
+            # Create a barrier at end of each group.
+            # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
+            # no rank is starting a sub-sample ahead of it's partner ranks.
+            torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
 
     # For the last group, we need to run the last sub-sample out of the context handler.
-    # TODO: Find num sub-samples per group in this group
+    # TODO: Find num sub-samples per group in this group?
     with no_sync_func():
-        sample_ids_per_group = sample_id_groups[-1][parallel_state.get_context_parallel_rank()]
-        for k in range(len(sample_ids_per_group) - 1):
-            sub_sample_id = sample_ids_per_group[k]
+        sample_ids_this_group = sample_id_groups[-1][parallel_state.get_data_parallel_rank(with_context_parallel=True)]
+        for k in range(len(sample_ids_this_group) - 1):
+            sub_sample_id = sample_ids_this_group[k]
+            sample = batch[sub_sample_id]
             partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
-            data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-            data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
-            # TODO: What else should I update in data so that we can get the right sub-sample?
-            new_data_iterator = RerunDataIterator(iter([data]))
-            # TODO: Change data iterator to the right sub-sample
-            # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
+            sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+            sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
+            new_data_iterator = RerunDataIterator(iter([sample]))
             # Call forward step for each sub-sample
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -607,16 +742,13 @@ def hybrid_context_parallel_forward_backward(
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
         
     # The last sub-sample of the last group of the last microbatch is run out of the context handler.
-    sub_sample_id = sample_ids_per_group[-1]
+    sub_sample_id = sample_ids_this_group[-1]
     partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
-    if partner_cp_size == 0:
-        assert False, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} j: {j} k: {k} sample_ids_group: {sample_id_groups}"
-    data["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-    data["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
-    # TODO: What else should I update in data so that we can get the right sub-sample?
-    new_data_iterator = RerunDataIterator(iter([data]))
-    # TODO: Change data iterator to the right sub-sample
-    # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
+    assert partner_cp_size > 0, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[-1]}"
+    sample = batch[sub_sample_id]
+    sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+    sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
+    new_data_iterator = RerunDataIterator(iter([sample]))
     # Call forward step for each sub-sample
     output_tensor, num_tokens = forward_step(
         forward_step_func,
@@ -634,10 +766,11 @@ def hybrid_context_parallel_forward_backward(
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
-    # TODO: Move to DPxCP barrier
-    torch.distributed.barrier(parallel_state.get_context_parallel_group())
+    torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
 
-    # TODO: Before returning forward_data_store, we need to change the loss.
-    # Instead of letting reporting loss be calculated by train_step, can we just calculate it here?
-    # Since we will need the global number of samples information to average the loss and local cp group size for each sample.
+    # TODO: Before returning forward_data_store, do we need to change the loss?
+    # If loss calculation is done as sum(loss_per_token) / sum(total_tokens_per_sample),
+    # we don't need to change the loss.
+    # But if the loss calculation is different, then the user needs to define a new loss function
+    # for hybrid context parallel in their training script.
     return forward_data_store, total_num_tokens

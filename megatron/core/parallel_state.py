@@ -107,7 +107,7 @@ _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 # Hybrid context parallel groups
-_HYBRID_CP_GROUPS = {}
+_HYBRID_DP_CP_GROUPS = {}
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -366,8 +366,8 @@ def create_hierarchical_groups(
     assert rank not in ranks or len(hierarchical_groups_gloo) == len(hierarchical_group_sizes)
     return hierarchical_groups, hierarchical_groups_gloo
 
-def create_hybrid_cp_groups(rank, ranks, pg_options):
-    hybrid_cp_groups = {}
+def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+    hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
     group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
@@ -376,12 +376,12 @@ def create_hybrid_cp_groups(rank, ranks, pg_options):
             group = create_group(
                 ranks[i:i+group_size],
                 pg_options=pg_options,
-                group_desc=f"HYBRID_CP_GROUP_{group_size}",
+                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
             )
             if rank in ranks[i:i+group_size]:
-                assert group_size not in hybrid_cp_groups, f"Rank {rank} appears in multiple Hybrid CP groups of size {group_size}"
-                hybrid_cp_groups[group_size] = group
-    return hybrid_cp_groups
+                assert group_size not in hybrid_dp_cp_groups, f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
+                hybrid_dp_cp_groups[group_size] = group
+    return hybrid_dp_cp_groups
 
 class RankGenerator(object):
     """A class for generating rank groups for different modes of parallelism."""
@@ -819,6 +819,13 @@ def initialize_model_parallel(
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
         os.environ["NCCL_COLLNET_ENABLE"] = "0"
 
+    if hybrid_context_parallel:
+        assert len(ranks_with_cp) % 2 == 0, "Hybrid context parallel requires an even number of ranks"
+        global _HYBRID_DP_CP_GROUPS
+        if rank in ranks_with_cp:
+            _HYBRID_DP_CP_GROUPS.update(create_hybrid_dp_cp_groups(rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)))
+        #TODO: Are gloo groups needed for hybrid cp?
+    
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
             ranks,
@@ -865,13 +872,6 @@ def initialize_model_parallel(
             )
             if rank in ranks:
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
-
-    if hybrid_context_parallel:
-        assert len(ranks) % 2 == 0, "Hybrid context parallel requires an even number of ranks"
-        global _HYBRID_CP_GROUPS
-        if rank in ranks:
-            _HYBRID_CP_GROUPS.update(create_hybrid_cp_groups(rank, ranks, get_nccl_options("cp", nccl_comm_cfgs)))
-        #TODO: Are gloo groups needed for hybrid cp?
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -1322,16 +1322,16 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
         assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
-def get_hybrid_context_parallel_groups(check_initialized=True, group_size=None):
+def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the hybrid context parallel groups the caller rank belongs to."""
     # If the group size is the same as the entire DPxCP group, return the original group
-    if get_context_parallel_world_size() == group_size:
+    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
         if check_initialized:
-            assert _CONTEXT_PARALLEL_GROUP is not None
-        return _CONTEXT_PARALLEL_GROUP
+            assert _DATA_PARALLEL_GROUP_WITH_CP is not None
+        return _DATA_PARALLEL_GROUP_WITH_CP
     if check_initialized:
-        assert _HYBRID_CP_GROUPS is not None
-    return _HYBRID_CP_GROUPS[group_size]
+        assert _HYBRID_DP_CP_GROUPS is not None
+    return _HYBRID_DP_CP_GROUPS[group_size]
 
 def get_embedding_group(check_initialized=True):
     """Get the embedding group the caller rank belongs to."""

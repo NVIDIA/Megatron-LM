@@ -10,6 +10,22 @@ from torch.utils.data import Dataset
 from megatron.training import get_args
 from megatron.core import mpu
 
+# class HybridCPCollator:
+#     def __init__(self):
+#         pass
+
+#     def __call__(self, batch: List[Dict[str, Any]]):
+#         # IF WE WANT TO COLLATE BEFORE SCHEDULER
+#         # We get a list of samples when pulling multiple microbatches at once for scheduling with Hybrid DPxCP.
+#         # This would require us to change the scheduler and the data loader logic to support [1, S] instead of [S].
+#         # if isinstance(batch, list):
+#         #     for idx, sample in enumerate(batch):
+#         #         collated_sample = torch.utils.data.default_collate([sample])
+#         #         batch[idx] = collated_sample
+#         # else:
+#         #     batch = torch.utils.data.default_collate(batch)
+        
+#         return batch
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
@@ -20,12 +36,21 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     # Megatron sampler
     if args.dataloader_type == 'single':
-        batch_sampler = MegatronPretrainingSampler(
-            total_samples=len(dataset),
-            consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+        if args.hybrid_context_parallel:
+            batch_sampler = HybridCPMegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                global_batch_size=args.global_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size())
+        else:
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -44,11 +69,16 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 args.dataloader_type))
 
     # Torch dataloader.
+    if args.hybrid_context_parallel:
+        extra_kwargs = {"collate_fn": lambda x: x,}
+    else:
+        extra_kwargs = {}
     return torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=args.num_workers,
                                        pin_memory=True,
                                        persistent_workers=True if args.num_workers > 0 else False,
+                                       **extra_kwargs,
                                        )
 
 class MegatronPretrainingSampler:
@@ -99,6 +129,43 @@ class MegatronPretrainingSampler:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
 
+class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+
+    def __init__(self, total_samples, consumed_samples, micro_batch_size, global_batch_size,
+                 data_parallel_rank, data_parallel_size, drop_last=True):
+        super().__init__(total_samples, consumed_samples, micro_batch_size, data_parallel_rank, data_parallel_size, drop_last)
+        self.global_batch_size = global_batch_size
+        self.data_parallel_size = data_parallel_size
+        self.num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
+
+    def __len__(self):
+        return self.total_samples
+
+    def get_start_end_idx_global_batch(self):
+        start_idx = [self.data_parallel_rank * self.micro_batch_size + i * self.micro_batch_size * self.data_parallel_size for i in range(self.num_micro_batches)]
+        end_idx = [start_idx[i] + self.micro_batch_size for i in range(self.num_micro_batches)]
+        return start_idx, end_idx
+
+    def __iter__(self):
+        batch = []
+        # Last batch will be dropped if drop_last is not set False
+        for idx in range(self.consumed_samples, self.total_samples):
+            batch.append(idx)
+            if len(batch) == self.micro_batch_times_data_parallel_size * self.num_micro_batches:
+                start_idx, end_idx = self.get_start_end_idx_global_batch()
+                global_batch_idx = []
+                for i in range(self.num_micro_batches):
+                    global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
+                yield global_batch_idx
+                batch = []
+
+        # Check the last partial batch and see drop_last is set
+        if len(batch) > 0 and not self.drop_last:
+            start_idx, end_idx = self.get_start_end_idx_global_batch()
+            global_batch_idx = []
+            for i in range(self.num_micro_batches):
+                global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
+            yield global_batch_idx
 
 class RandomSeedDataset(Dataset):
 

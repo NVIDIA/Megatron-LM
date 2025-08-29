@@ -21,6 +21,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
+from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDatasetWrapper
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -249,7 +250,7 @@ def get_batch(data_iterator):
     else:
         packed_seq_params = None
 
-    if cu_seqlens is None:
+    if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
     elif local_cp_size is None:  # Packed THD format
@@ -284,15 +285,37 @@ def get_batch(data_iterator):
     else: # Hybrid CP format
         assert local_cp_size is not None
         assert scheduled_id is not None
-        batch, cp_group, packed_seq_params = get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_seq_params)
-        packed_seq_params.cp_group = cp_group
-        if cp_group is not None and cp_group.size() > 1:
-            # print(f"rank: {torch.distributed.get_rank()} has partner ranks {torch.distributed.get_process_group_ranks(cp_group)} and got keys: {batch.keys()}")
-            batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
-            # print(f"rank: {torch.distributed.get_rank()} has partner ranks {torch.distributed.get_process_group_ranks(cp_group)} and got tokens: {batch['tokens'].shape}")
-        # else:
-            # print(f"rank: {torch.distributed.get_rank()} has no partner ranks and got tokens: {batch['tokens'].shape}")
+        # batch, cp_group, packed_seq_params = get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_seq_params)
+        if local_cp_size > 1:
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
+        else:
+            cp_group = None
+        
+        # Convert [seqlen] to [1, seqlen] similar to default collate_fn
+        for key, data in batch.items():
+            if key in ['attention_mask']:
+                continue
+            batch[key] = torch.stack([data], 0)
+        sample_length = batch['tokens'].shape[1]
+        # Create packed_seq_params for SBHD format with cp group information.
+        # TODO(pmannan): Since entire PackedSeqParams is not needed, should we create a new dataclass with our information?
+        # We will need to update the logic in extensions/transformer_engine to support this.
+        # Piping through a new dataclass from training script might be adding extra overhead.
+        # Take ADLR recommendation on this.
+        packed_seq_params = PackedSeqParams(
+            qkv_format="sbhd",
+            cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+            cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+            cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+            cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+            max_seqlen_q=sample_length,
+            max_seqlen_kv=sample_length,
+            local_cp_size=local_cp_size,
+            cp_group=cp_group,
+        )
 
+        if cp_group is not None and cp_group.size() > 1:
+            batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
     
     return (*batch.values(), packed_seq_params)
 
@@ -434,6 +457,7 @@ def core_gpt_dataset_config_from_args(args):
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         context_parallel_size=args.context_parallel_size,
+        data_parallel_size=args.data_parallel_size,
     )
 
 
@@ -460,6 +484,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
     ).build()
+
+    # train_ds = HybridCPDatasetWrapper(train_ds)
 
     print_rank_0("> finished creating GPT datasets ...")
 
