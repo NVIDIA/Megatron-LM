@@ -136,24 +136,6 @@ class OptimizerConfig:
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
-    #########################
-    # Precondition frequency
-    #########################
-    precondition_frequency: int = 10
-    """How often to update the preconditioner."""
-
-    precondition_warmup_steps: int = 0
-    """How many steps to warm up the preconditioner."""
-
-    precondition_frequency_schedule: str = 'constant'
-    """Schedule for precondition frequency. One of 'linear', 'cosine', 'constant'."""
-
-    precondition_frequency_min: int = None  
-    """Minimum precondition frequency."""
-
-    precondition_frequency_transition_steps: int = None
-    """Transition steps for precondition frequency."""
-
     #######################
     # Distributed optimizer
     #######################
@@ -296,30 +278,3 @@ class OptimizerConfig:
             assert (
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
-        
-        # If using a schedule, make sure min and transition steps are set and set precondition frequency to schedule function
-        if self.precondition_frequency_schedule == 'linear':
-            if self.precondition_frequency_min is None:
-                self.precondition_frequency_min = 1
-            assert self.precondition_frequency_transition_steps is not None
-            self.precondition_frequency = LinearSchedule(
-                min_freq=self.precondition_frequency_min, 
-                max_freq=self.precondition_frequency, 
-                transition_steps=self.precondition_frequency_transition_steps, 
-                start_step=self.precondition_warmup_steps+self.adam_warmup_steps
-                )
-        elif self.precondition_frequency_schedule == 'cosine':
-            if self.precondition_frequency_min is None:
-                self.precondition_frequency_min = 1
-            assert self.precondition_frequency_transition_steps is not None
-            self.precondition_frequency = CosineSchedule(
-                min_freq=self.precondition_frequency_min, 
-                max_freq=self.precondition_frequency, 
-                transition_steps=self.precondition_frequency_transition_steps, 
-                start_step=self.precondition_warmup_steps+self.adam_warmup_steps
-                )
-        elif self.precondition_frequency_schedule == 'constant':
-            self.precondition_frequency = self.precondition_frequency
-        else:
-            raise NotImplementedError(f"Precondition frequency schedule {self.precondition_frequency_schedule} not implemented")
-
