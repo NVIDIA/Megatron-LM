@@ -284,3 +284,107 @@ class MultiModulePipelineCommunicator:
                 rank_module_info.p2p_communicator.send_backward(
                     grad_dict[module_name], is_first_stage=False
                 )
+
+    @staticmethod
+    def compute_total_pipeline_stages(
+        topology: Dict[str, List[str]],
+        module_to_grid_map: Dict[str, HyperCommGrid],
+        rank: Optional[int] = None,
+        module_name: Optional[str] = None,
+    ) -> int:
+        """Compute the total number of pipeline stages across a multi-module chain.
+
+        Interprets ``topology`` as a directed acyclic graph (DAG) where nodes are modules
+        and edges indicate forward data flow from source to destination modules. Each node
+        is assigned a weight equal to its pipeline parallel size (number of PP stages).
+
+        The total number of stages is defined as the length of the longest path in this DAG
+        under node weights.
+
+        If ``rank`` is None (default), returns the maximum over all terminal (sink) modules of
+        the sum of PP sizes along a path ending at that terminal. For example, given:
+
+            image_encoder ->\
+                              -> llm -> generator
+            audio_encoder  ->/
+
+        the total is: max(pp(image_encoder), pp(audio_encoder)) + pp(llm) + pp(generator).
+
+        If ``rank`` is provided, the result is the total number of pipeline stages up to (and
+        including) the PP stage that ``rank`` occupies inside its module. In this case, the
+        weight of the target module equals (pp_stage_index(rank) + 1) instead of the module's
+        full PP size; other modules still contribute their full PP sizes. If the rank belongs to
+        multiple modules (colocation), pass ``module_name`` to disambiguate; otherwise the
+        maximum across all candidate modules containing the rank is returned.
+
+        Args:
+            topology: Mapping from a module to its list of outgoing modules.
+            module_to_grid_map: Mapping from module name to its ``HyperCommGrid``.
+
+        Returns:
+            The total number of pipeline stages along the longest path given the constraints.
+
+        Raises:
+            ValueError: If the topology contains cycles; or has no terminal nodes when
+                ``rank`` is None
+        """
+        nodes = set(module_to_grid_map.keys())
+        # Build adjacency and reverse-adjacency (predecessors).
+        adj: Dict[str, List[str]] = {node: list(topology.get(node, [])) for node in nodes}
+        preds: Dict[str, List[str]] = {node: [] for node in nodes}
+        for src, outs in adj.items():
+            for dst in outs:
+                preds[dst].append(src)
+
+        # Identify terminal nodes (no outgoing edges) for the rank=None case.
+        sinks = [node for node, outs in adj.items() if not outs]
+        if rank is None and not sinks:
+            raise ValueError(
+                "Topology must be a DAG with at least one terminal (no outgoing) module."
+            )
+
+        def pp_size(name: str) -> int:
+            grid = module_to_grid_map[name]
+            pp_dim_index = grid.dim_names.index('pp')
+            return grid.shape[pp_dim_index]
+
+        def partial_weight_for_target(target: str) -> Optional[int]:
+            if rank is None:
+                return None
+            grid = module_to_grid_map.get(target)
+            rank_groups = grid._gen_rank_enum(['pp'])
+            stage_index: Optional[int] = None
+            for group in rank_groups:
+                if rank in group:
+                    stage_index = group.index(rank)
+                    break
+            return stage_index + 1
+
+
+        def longest_path_to(target: str) -> int:
+            visiting = set()
+            partial = partial_weight_for_target(target)
+
+            def weight(name: str) -> int:
+                if partial is not None and name == target:
+                    return partial
+                return pp_size(name)
+
+            def dfs(node: str) -> int:
+                if node in visiting:
+                    raise ValueError("Topology contains cycles; expected a DAG.")
+                visiting.add(node)
+                best = 0
+                for p in preds.get(node, []):
+                    val = dfs(p)
+                    if val > best:
+                        best = val
+                visiting.remove(node)
+                return weight(node) + best
+
+            return dfs(target)
+
+        if rank is None:
+            return max(longest_path_to(sink) for sink in sinks)
+
+        return longest_path_to(module_name)
