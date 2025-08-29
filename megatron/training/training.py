@@ -90,7 +90,6 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     get_amax_reduction_group,
     model_parallel_is_initialized,
-    get_data_parallel_group,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.schedules import (
@@ -105,8 +104,6 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches,
 )
-
-from megatron.core.emerging_optimizers.experimental.layer_wise_optimizer import get_shower_optimizer_for_mcore
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (

@@ -1061,11 +1061,15 @@ def validate_args(args, defaults={}):
             print('Warning: disabling --no-load-rng for upcycling.')
     
     # Muon optimizercheck
-    if args.optimizer == 'muon':
+    if 'muon' in args.optimizer:
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_custom_fsdp, "Muon optimizer does not support Custom-FSDP for now."
         assert args.ckpt_format == "torch", "Muon optimizer only supports torch checkpoint format for now."
+
+    # SOAP optimizer check
+    if 'soap' in args.optimizer:
+        raise NotImplementedError("SOAP optimizer is not implemented yet.")
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
