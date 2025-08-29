@@ -360,7 +360,6 @@ class MultiModulePipelineCommunicator:
                     break
             return stage_index + 1
 
-
         def longest_path_to(target: str) -> int:
             visiting = set()
             partial = partial_weight_for_target(target)

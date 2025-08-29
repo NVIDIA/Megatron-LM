@@ -239,7 +239,6 @@ class TestMultiModulePipelineCommunicator:
         )
         assert llm_pp_rank == 2
 
-
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
 
