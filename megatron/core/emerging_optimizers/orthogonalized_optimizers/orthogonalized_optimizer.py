@@ -101,6 +101,13 @@ class OrthogonalizedOptimizer(optim.Optimizer):
             loss = closure()
 
         for group in self.param_groups:
+
+            # Resolve MCore checkpoint issue
+            if "step" in group:
+                group["step"] += 1
+            else:
+                group["step"] = 1
+
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
