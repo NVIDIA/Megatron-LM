@@ -76,7 +76,7 @@ dev = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
-    "transformer-engine[pytorch]>=2.6.0a0,<2.7.0",
+    "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
@@ -152,7 +152,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "c90a720765bc01ebb5ba1f70a7ce2d16b2e46d77" } # on `release_v2.6`
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
