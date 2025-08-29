@@ -766,7 +766,26 @@ def get_megatron_muon_optimizer(
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
     use_gloo_process_groups: bool = True,
+    layer_wise_distributed_optimizer: bool = False,
 ) -> MegatronOptimizer:
+    """
+    This function is used to get the muon optimizer for the model chunks.
+    It is used to get the muon optimizer for the model chunks.
+
+    Args:
+        config (OptimizerConfig): optimizer configuration object.
+        model_chunks (List[MegatronModule]): model chunks to get optimizer for.
+        no_weight_decay_cond (func, optional): function to determine whether a parameter
+            should not perform weight decay. Defaults to None.
+        scale_lr_cond (func, optional): function to determine whether a parameter
+            should have a scaled learning rate. Defaults to None.
+        lr_mult (float, optional): learning rate multiplier for parameters that
+            satisfy scale_lr_cond. Defaults to 1.0.
+        use_gloo_process_groups (bool): if false, disable use of Gloo process groups
+            in underlying Megatron optimizers.
+        layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
+            Defaults to False.
+    """
     # currently it is only supporting muon, will add soaps later
 
     # dist-optim is not supported due to strong coupling with how DDP init grad buffer
@@ -847,7 +866,8 @@ def get_megatron_muon_optimizer(
 
     # chain everything together
     optimizers += chained_adam.chained_optimizers
-    if True:
+
+    if layer_wise_distributed_optimizer:
         print("using LayerWiseDistributedOptimizer ===========================")
         return LayerWiseDistributedOptimizer(
                 optimizers,

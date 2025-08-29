@@ -6,7 +6,6 @@ from typing import Callable, Optional
 import torch
 
 from ..utils import is_te_min_version
-from megatron.core.emerging_optimizers.utils.precondition_schedules import LinearSchedule, CosineSchedule
 
 
 @dataclass
