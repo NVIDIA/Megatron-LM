@@ -43,6 +43,9 @@ class OptimizerConfig:
     fp8_recipe: Optional[str] = None
     """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
 
+    fp8: bool = False
+    """If true, train with fp8 mixed precision training. Defaults to False."""
+
     fp16: bool = False
     """If true, train with fp16 mixed precision training. Defaults to False."""
 
@@ -200,7 +203,7 @@ class OptimizerConfig:
             self.use_precision_aware_optimizer
             and (
                 self.main_params_dtype != torch.float32
-                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or (not self.fp8 or self.fp8_recipe == "delayed")
                 or self.optimizer_cpu_offload
             )
         )
