@@ -1317,7 +1317,7 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = timers
 
-    if 'muon' not in config.optimizer:
+    if 'muon' not in config.optimizer and 'soap' not in config.optimizer:
         optimizer = get_megatron_optimizer(
             config,
             model,
@@ -1337,7 +1337,9 @@ def setup_model_and_optimizer(
             scale_lr_cond,
             lr_mult,
             use_gloo_process_groups=args.enable_gloo_process_groups,
+            layer_wise_distributed_optimizer='dist' in config.optimizer,
         )
+
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
