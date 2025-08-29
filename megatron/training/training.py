@@ -2471,7 +2471,6 @@ def train(
             if len(param_group['params']) == 0:
                 continue
             if param_group['is_decoupled_lr']:
-            # if getattr(param_group, 'is_decoupled_lr', False):
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
