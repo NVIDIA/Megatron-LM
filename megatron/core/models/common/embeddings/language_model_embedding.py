@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from typing import Literal, Optional
 
 import torch
@@ -69,7 +70,7 @@ class LanguageModelEmbedding(MegatronModule):
             )
 
             # Initialize the position embeddings.
-            if self.config.perform_initialization:
+            if self.config.perform_initialization and self.config.embedding_init_method is not None:
                 self.config.embedding_init_method(self.position_embeddings.weight)
 
         if self.num_tokentypes > 0:
@@ -77,13 +78,18 @@ class LanguageModelEmbedding(MegatronModule):
                 self.num_tokentypes, self.config.hidden_size
             )
             # Initialize the token-type embeddings.
-            if self.config.perform_initialization:
+            if self.config.perform_initialization and self.config.embedding_init_method is not None:
                 self.config.embedding_init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
+
+        # Scaled embedding
+        self.scaling_factor = 1.0
+        if self.config.scaled_embedding:
+            self.scaling_factor = math.sqrt(self.config.hidden_size)
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
@@ -96,7 +102,9 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.shared = True
 
     @nvtx_decorator()
-    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
+    def forward(
+        self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: Optional[int] = None
+    ) -> Tensor:
         """Forward pass of the embedding module.
 
         Args:
@@ -111,9 +119,9 @@ class LanguageModelEmbedding(MegatronModule):
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
-            embeddings = word_embeddings + position_embeddings
+            embeddings = word_embeddings * self.scaling_factor + position_embeddings
         else:
-            embeddings = word_embeddings
+            embeddings = word_embeddings * self.scaling_factor
 
         if not self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].

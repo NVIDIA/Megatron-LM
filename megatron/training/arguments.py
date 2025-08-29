@@ -1533,6 +1533,8 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
+    group.add_argument('--scaled-embedding', action="store_true",
+                       help='Scale the embedding matrix by sqrt(hidden_size).')
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
     group.add_argument('--mtp-num-layers', type=int, default=None,

@@ -229,6 +229,12 @@ class TransformerConfig(ModelParallelConfig):
     training of very large models. This feature is only works when megatron fsdp is turned on.
     """
 
+    scaled_embedding: bool = False
+    """
+    If True, scale the embedding matrix by math.sqrt(hidden_size) to stablize the training.
+    This feature is meant to be used along the tying of the embedding and output matrices.
+    """
+
     ####################
     # mixed-precision
     ####################
