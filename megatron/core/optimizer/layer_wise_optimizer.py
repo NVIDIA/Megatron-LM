@@ -26,7 +26,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def __init__(
         self, 
         chained_optimizers: List[MegatronOptimizer],
-        grad_comm_pg: torch.distributed.ProcessGroup = None
+        grad_comm_pg: torch.distributed.ProcessGroup = None,
+        ep_grad_comm_pg: torch.distributed.ProcessGroup = None,
     ) -> None:
         super().__init__(chained_optimizers)
 
@@ -37,23 +38,37 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # for initial functional test, evenly shard base on chain order and removed logic duplicating norm param
         self.grad_comm_pg = grad_comm_pg
+        self.ep_grad_comm_pg = ep_grad_comm_pg
+        # TODO(deyu): support dp/ep 0 cases
         self.shard_params()
 
     def shard_params(self):
         """Shard all params into lists by rank. """
         # keep logic simple now since we'll optimize sharding later. should be ok since linear are separate already
-        rank_idx = 0
-        world_size = self.grad_comm_pg.size()
-        self.shard_params_list = [[] for _ in range(world_size)]
+        # separate dp, ep_dp
+        dp_idx, ep_idx = 0, 0
+        dp_size = self.grad_comm_pg.size()
+        ep_size = self.ep_grad_comm_pg.size()
+        self.shard_params_list = [[] for _ in range(dp_size)]
+        self.ep_params_list = [[] for _ in range(ep_size)]
         for group in self.param_groups:
-            for p in group["params"]:
-                self.shard_params_list[rank_idx].append(p)
-                rank_idx = (rank_idx + 1) % world_size
+            if group["is_expert_parallel"]:
+                for p in group["params"]:
+                    self.ep_params_list[ep_idx].append(p)
+                    ep_idx = (ep_idx + 1) % ep_size
+            else:
+                for p in group["params"]:
+                    self.shard_params_list[dp_idx].append(p)
+                    dp_idx = (dp_idx + 1) % dp_size
 
     def drop_grads(self):
         """Drop grads of params belong to other ranks. """
         for i, params in enumerate(self.shard_params_list):
             if self.grad_comm_pg.rank() != i:
+                for p in params:
+                    p.grad = None
+        for i, params in enumerate(self.ep_params_list):
+            if self.ep_grad_comm_pg.rank() != i:
                 for p in params:
                     p.grad = None
 
@@ -66,6 +81,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             src_global_rank = torch.distributed.get_global_rank(self.grad_comm_pg, i)
             for p in params:
                 torch.distributed.broadcast(p, src_global_rank, self.grad_comm_pg)
+        for i, params in enumerate(self.ep_params_list):
+            src_global_rank = torch.distributed.get_global_rank(self.ep_grad_comm_pg, i)
+            for p in params:
+                torch.distributed.broadcast(p, src_global_rank, self.ep_grad_comm_pg)
 
     @torch.no_grad()
     def step(self):  # type: ignore[no-untyped-def]

@@ -872,5 +872,6 @@ def get_megatron_muon_optimizer(
         return LayerWiseDistributedOptimizer(
                 optimizers,
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
+                parallel_state.get_expert_data_parallel_group(),
             )
     return ChainedOptimizer(optimizers)
