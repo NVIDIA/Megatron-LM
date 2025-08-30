@@ -455,6 +455,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        # Remove 'dynamic_inference_decode_only' from kwargs if present
+        # this is only used to uniquely identify decode and non-decode cuda graph
+        # runners in the cuda graph manager
+        kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context
@@ -867,20 +871,26 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
-                (
-                    kwargs.get('inference_context') is not None
-                    and kwargs['inference_context'].is_decode_only()
-                )
-                or (
-                    kwargs.get('inference_params') is not None
-                    and kwargs['inference_params'].is_decode_only()
-                )
+                (kwargs.get('inference_context') is not None)
+                or (kwargs.get('inference_params') is not None)
             )
         ):
             assert (
                 kwargs.get('attention_mask') is None
-            ), f"Attention mask must not be set when using CUDA graphs for decode"
-            return self.cudagraph_manager(self, args, kwargs)
+            ), f"Attention mask must not be set when using CUDA graphs with inference."
+
+            # it can happen that non-decode steps have a token count greater than the max
+            # supported cuda graph token count. In that case this flag will be set to
+            # False by initialize_attention, and we should not use cuda graphs.
+            if kwargs['inference_context'].using_cuda_graph_this_step():
+                # dynamic_inference_decode_only is not a real argument to forward, it is only used
+                # to differentiate the cuda graph used for decode from the one used for non-decode
+                # inference.
+                kwargs["dynamic_inference_decode_only"] = kwargs[
+                    'inference_context'
+                ].is_decode_only()
+                return self.cudagraph_manager(self, args, kwargs)
+
         elif (
             self.config.external_cuda_graph
             and self.training

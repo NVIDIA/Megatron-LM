@@ -274,8 +274,8 @@ def build_dynamic_engine_setup_prefix(
     # CUDA graph config
     if args.enable_cuda_graph:
         cg_str = (
-            f"graphs {context.cuda_graph_request_counts[0]}:"
-            f"{context.cuda_graph_request_counts[-1]}"
+            f"graphs {context.cuda_graph_token_counts[0]}:"
+            f"{context.cuda_graph_token_counts[-1]}"
         )
     else:
         cg_str = "--"
