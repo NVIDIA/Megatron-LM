@@ -26,7 +26,10 @@ cd Megatron-LM
 
 # Latest News
 
-- 📣 NEW! **[DeepSeek & MoE Training with FP8](https://github.com/yanring/Megatron-MoE-ModelZoo)** examples are now available, including optimized configurations for `DeepSeek-V3`, `Qwen2` and `Mixtral` models with FP8 precision support.
+- 🔄 NEW! **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
+- 🗺️ **[MoE Q3-Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
+- 🚀 **[GPT-OSS Implementation](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions are being integrated into Megatron Core.
+- **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
 - **[2025/05]** Megatron Core v0.11.0 brings new capabilities for multi-data center LLM training ([blog](https://developer.nvidia.com/blog/turbocharge-llm-training-across-long-haul-data-center-networks-with-nvidia-nemo-framework/)). 
 
 <details>
@@ -76,6 +79,7 @@ cd Megatron-LM
 **Resources**
 - [Examples](./examples/) - Training scripts and tutorials
 - [Documentation](https://docs.nvidia.com/Megatron-Core/) - Official docs
+- [Roadmaps](#roadmaps) - Development roadmaps and feature tracking
 - [Community & Support](#-community--support) - Get help and contribute
   - [Getting Help](#getting-help)
   - [Contributing](#contributing)
@@ -150,10 +154,12 @@ Megatron-LM/
 
 **Libraries using Megatron Core:**
 
+- **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Training library with bidirectional Hugging Face ↔ Megatron checkpoint conversion, flexible training loops, and production-ready recipes
+- **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)** - Scalable toolkit for efficient reinforcement learning with RLHF, DPO, and other post-training methods
 - **[NeMo Framework](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html)** - Enterprise framework with cloud-native support and end-to-end examples
 - **[TensorRT Model Optimizer (ModelOpt)](https://github.com/NVIDIA/TensorRT-Model-Optimizer)** - Model optimization toolkit for quantization, pruning, and distillation
 
-**Compatible with:** [HuggingFace Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [DeepSpeed](https://github.com/microsoft/DeepSpeed)
+**Compatible with:** [Hugging Face Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [DeepSpeed](https://github.com/microsoft/DeepSpeed)
 
 # Installation
 
@@ -442,6 +448,15 @@ Based on [NVIDIA NeMo production configurations](https://github.com/NVIDIA/NeMo/
 ```bash
 --use-distributed-optimizer
 ```
+
+# Roadmaps
+
+Stay up-to-date with our development roadmaps and planned features:
+
+- **[MoE Q3-Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive MoE feature development including DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
+- **[GPT-OSS Implementation Tracker](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions
+
+*More roadmap trackers will be added soon.*
 
 # Community & Support
 
