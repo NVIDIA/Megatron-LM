@@ -4,6 +4,7 @@
 import functools
 import os
 import sys
+import warnings
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
@@ -17,6 +18,7 @@ from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_provider import model_provider
+from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args, get_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -100,7 +102,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args.model_type = model_type
     pre_process = mpu.is_pipeline_first_stage()
     post_process = mpu.is_pipeline_last_stage()
-    model = model_provider_func(pre_process=pre_process, post_process=post_process)
+
+    if args.init_model_with_meta_device:
+        with torch.device("meta"):
+            model = model_provider_func(pre_process=pre_process, post_process=post_process)
+        to_empty_if_meta(model, device="cuda")
+    else:
+        model = model_provider_func(pre_process=pre_process, post_process=post_process)
+
     model.model_type = model_type
     return [model]
 
@@ -130,7 +139,22 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    # Meta device initialization for ParallelLinear only works if using cpu initialization.
+    # Meta device initialization is used such that models can be materialized in low-precision
+    # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
+    # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
+    if args.init_model_with_meta_device:
+        args.use_cpu_initialization = True
+    else:
+        warnings.warn(
+            "--init-model-with-meta-device is not set. If you would like to resume the "
+            "model in low-bit directly (low-memory initialization and skipping 16-bit), "
+            "--init-model-with-meta-device must be set.",
+            UserWarning,
+        )
+
     model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
 

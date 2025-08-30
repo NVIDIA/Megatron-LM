@@ -11,6 +11,7 @@ from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoi
 from megatron.training.utils import print_rank_0, unwrap_model
 
 try:
+    import modelopt.torch.opt as mto
     from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 except ImportError as e:
     raise ImportError("Required `\"nvidia-modelopt[torch]\"` is not installed!") from e
@@ -78,18 +79,19 @@ def load_modelopt_state(load_dir: Optional[str] = None, model: Optional[nn.Modul
         if sharded_load_dir is None:
             print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
             return {}
-        return restore_sharded_modelopt_state([model], sharded_load_dir)
+        restore_sharded_modelopt_state([model], sharded_load_dir)
     else:
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
             state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
-            return {}
         if state_dict is None:
             print_rank_0("No checkpoint state_dict found. Skipping loading ModelOpt state.")
-            return {}
-        return state_dict.get("modelopt_state", {})
+        else:
+            modelopt_state = state_dict.get("modelopt_state", None)
+        if modelopt_state is not None:
+            mto.restore_from_modelopt_state(model, modelopt_state)
 
 
 def load_modelopt_checkpoint(

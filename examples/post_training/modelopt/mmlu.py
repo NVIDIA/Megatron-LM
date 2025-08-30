@@ -130,18 +130,35 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    # Meta device initialization for ParallelLinear only works if using cpu initialization.
+    # Meta device initialization is used such that models can be materialized in low-precision
+    # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
+    # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
+    if args.init_model_with_meta_device:
+        args.use_cpu_initialization = True
+    else:
+        warnings.warn(
+            "--init-model-with-meta-device is not set. If you would like to resume the "
+            "model in low-bit directly (low-memory initialization and skipping 16-bit), "
+            "--init-model-with-meta-device must be set.",
+            UserWarning,
+        )
+
+    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    report_current_memory_info()
+
+    # Materialize the model from meta device to gpu before loading the checkpoint. 
+    unwrapped_model = unwrap_model(model)[0]
+    unwrapped_model.to_empty(device="cuda")
+    report_current_memory_info()
+
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
-
-    report_current_memory_info()
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
-
-    unwrapped_model = unwrap_model(model)[0]
 
     all_subjects = get_all_subjects()
 

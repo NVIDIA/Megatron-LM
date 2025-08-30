@@ -334,6 +334,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_token_counts_set = set(self.cuda_graph_token_counts)
             self.max_cuda_graph_token_count = max(self.cuda_graph_token_counts)
 
+        self.cuda_graph_request_counts = self.cuda_graph_token_counts
         self.non_decode_cuda_graphs = use_cuda_graphs_for_non_decode_steps and (
             num_cuda_graphs is not None
         )
@@ -642,6 +643,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         num_warmup_tokens: Optional[int] = None,
         warmup_engine_mode: WarmupEngineMode = WarmupEngineMode.DECODE,
+        num_warmup_requests: Optional[int] = None,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -651,9 +653,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 `max_requests`.
             warmup_engine_mode (WarmupEngineMode): Denote whether to setup
             for a decode or a non-decode cuda-graph warmup.
+            num_warmup_requests (Optional[int]): [DEPRECATED] Use num_warmup_tokens instead.
+            This argument is kept for backward compatibility with the legacy API.
         Return:
             None.
         """
+        if num_warmup_requests is not None:
+            warnings.warn(
+                "The 'num_warmup_requests' argument is deprecated and will be removed in a future release. "
+                "Please use 'num_warmup_tokens' instead.",
+                DeprecationWarning,
+            )
+            # If num_warmup_tokens is not provided, use num_warmup_requests for backward compatibility
+            if num_warmup_tokens is None:
+                num_warmup_tokens = num_warmup_requests
 
         # warmup both decode and non-decode engine steps
         if num_warmup_tokens is not None:
