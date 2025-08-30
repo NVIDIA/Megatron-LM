@@ -118,36 +118,34 @@ def simple_speculative_generate(
         disable_tqdm=disable_tqdm,
     )
     output_ids = torch.cat((input_ids, output_ids), dim=-1)
-
     actual_osl = output_ids.shape[-1] - input_ids.shape[-1]
+
     total_steps = 0
     while input_ids.shape[-1] < output_ids.shape[-1]:
         total_steps += 1
+        offset = input_ids.shape[-1] + 1
+
+        # Speculative decoding forward
+        # NOTE: PP is not yet supported.
         new_token, draft_tokens = model.pseudo_speculative_generate(input_ids, steps=draft_length)
-        idx = input_ids.shape[-1]
-        if not torch.equal(new_token, output_ids[:, idx : idx + 1]):
-            if torch.distributed.get_rank() == 0:
-                print(
-                    "Rank {:3}/{:3} total_steps {} new {} ref {}".format(
-                        torch.distributed.get_rank(),
-                        torch.distributed.get_world_size(),
-                        total_steps,
-                        new_token,
-                        output_ids[:, idx : idx + 1],
-                    ),
-                    flush=True,
-                )
-        input_ids = output_ids[:, : idx + 1]
+
+        # Always accept the first token.
+        input_ids = output_ids[:, : offset]
 
         if input_ids.shape[-1] >= output_ids.shape[-1]:
             break
 
-        offset = input_ids.shape[-1]
-
         for i in range(draft_tokens.shape[-1]):
-            if torch.equal(draft_tokens[:, i : i + 1], output_ids[:, offset + i : offset + i + 1]):
-                input_ids = output_ids[:, : offset + i + 1]
-            else:
-                break
+            if torch.equal(draft_tokens[:, i : i + 1], output_ids[:, offset: offset + 1]):
+                offset += 1
+
+        # Broadcast the accepted offset from the last rank.
+        offset = [offset]
+        torch.distributed.broadcast_object_list(
+            offset,
+            src=torch.distributed.get_world_size() - 1,
+        )
+
+        input_ids = output_ids[:, : offset[0]]
 
     return output_ids, actual_osl, total_steps

@@ -56,7 +56,7 @@ def main(pipeline_id):
                 break
             time.sleep(60)
 
-        except requests.exceptions.ConnectionError as e:
+        except (requests.exceptions.ConnectionError, gitlab.exceptions.GitlabListError) as e:
             logger.info(f"Network error. Retrying... {e}")
             time.sleep(15)
             continue

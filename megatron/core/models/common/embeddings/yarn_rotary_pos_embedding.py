@@ -68,28 +68,30 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.mscale_all_dim = mscale_all_dim
 
         device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
-        self.inv_freq_extra = 1.0 / (
-            self.rotary_base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
-        )
-        self.inv_freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.rotary_base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
-        )
-        super().__init__(
-            kv_channels,
-            rotary_percent,
-            rotary_interleaved,
-            seq_len_interpolation_factor,
-            rotary_base,
-            use_cpu_initialization,
-            cp_group,
-        )
 
-        self._set_cos_sin_cache(
-            self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
-        )
+        with torch.device(device):
+            self.inv_freq_extra = 1.0 / (
+                self.rotary_base
+                ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            )
+            self.inv_freq_inter = 1.0 / (
+                self.scaling_factor
+                * self.rotary_base
+                ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            )
+            super().__init__(
+                kv_channels,
+                rotary_percent,
+                rotary_interleaved,
+                seq_len_interpolation_factor,
+                rotary_base,
+                use_cpu_initialization,
+                cp_group,
+            )
+
+            self._set_cos_sin_cache(
+                self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
+            )
 
     @lru_cache(maxsize=32)
     def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:

@@ -5,6 +5,7 @@ import os
 import torch
 from argparse import ArgumentParser
 from collections import defaultdict
+from functools import partial
 from tqdm import tqdm
 from typing import Dict, List
 import sys
@@ -29,8 +30,11 @@ sys.path.append(
 )
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
+
 from megatron.core.utils import configure_nvtx_profiling
-from pretrain_gpt import model_provider
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+
 import json
 
 from examples.inference.gpt.utils import (
@@ -63,7 +67,10 @@ def get_model() -> MegatronModule:
     args = get_args()
 
     # Build model.
-    model = _get_model(model_provider, wrap_with_ddp=False)
+    model = _get_model(
+        partial(model_provider, gpt_builder),
+        wrap_with_ddp=False
+    )
 
     # Load checkpoint.
     assert args.load is not None

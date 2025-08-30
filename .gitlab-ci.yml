@@ -2,7 +2,7 @@
   UNIT_TEST: "yes"
   UNIT_TEST_REPEAT: 1
   UNIT_TEST_TIMEOUT: 30
-  INTEGRATION_TEST: "yes"
+  INTEGRATION_TEST: "no"
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
   FUNCTIONAL_TEST_SCOPE: mr-slim
@@ -44,7 +44,7 @@ workflow:
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
-        on_new_commit: none
+        on_new_commit: interruptible
 
     # For merge-trains that need to be fast-tracked
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/

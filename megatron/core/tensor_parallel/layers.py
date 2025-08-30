@@ -930,11 +930,11 @@ class ColumnParallelLinear(torch.nn.Module):
             )
         )
 
-    def _forward_impl(self, *args, **kwargs):
-        if self.weight is not None and not self.weight.requires_grad:
-            return linear_with_frozen_weight(*args, **kwargs)
+    def _forward_impl(self, input, weight, *args, **kwargs):
+        if not weight.requires_grad:
+            return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(*args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
     def forward(
         self,
@@ -1209,11 +1209,11 @@ class RowParallelLinear(torch.nn.Module):
             )
         )
 
-    def _forward_impl(self, *args, **kwargs):
-        if self.weight is not None and not self.weight.requires_grad:
-            return linear_with_frozen_weight(*args, **kwargs)
+    def _forward_impl(self, input, weight, *args, **kwargs):
+        if not weight.requires_grad:
+            return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(*args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
     def forward(self, input_):
         """Forward of RowParallelLinear
