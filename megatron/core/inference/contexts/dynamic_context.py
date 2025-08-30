@@ -1033,7 +1033,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_id[dst_idxs] = self.request_last_kv_chunk_id[src_idxs]
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
 
-    def tensor_swap(x, src_idxs, dst_idxs):
+    def tensor_swap(self, x, src_idxs, dst_idxs):
         """
         Swap x[src_idxs] and x[dst_idxs]
         """
