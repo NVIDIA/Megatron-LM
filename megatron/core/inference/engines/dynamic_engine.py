@@ -16,11 +16,8 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
-    ChunkOverflowError,
+    ContextOverflowError,
     DynamicInferenceContext,
-    MaxSequenceLengthOverflowError,
-    RequestOverflowError,
-    TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -371,10 +368,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
-        except (TokenOverflowError, RequestOverflowError, ChunkOverflowError) as e:
-            self.waiting_request_ids.append(request_id)
-        except MaxSequenceLengthOverflowError as e:
-            raise e
+        except ContextOverflowError as e:
+            if e.is_transient:
+                self.waiting_request_ids.append(request_id)
+            else:
+                raise e
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()
