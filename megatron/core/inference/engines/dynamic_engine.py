@@ -468,7 +468,7 @@ class DynamicInferenceEngine(AbstractEngine):
         while self.waiting_request_ids:
             req = self.requests[self.waiting_request_ids[0]]
             request_satisfied, token_satisfied, kv_cache_available = (
-                self.context.check_availability(req, safe=False)
+                self.context.check_availability(req, safe=True)
             )
             if request_satisfied and token_satisfied and kv_cache_available:
                 self.context.add_request(req)
