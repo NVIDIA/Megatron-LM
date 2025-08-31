@@ -298,20 +298,25 @@ class _CudagraphGlobalRecord:
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
+        capture_stats = {
+            "time": time_end - time_start,
+            "allocated_bytes": (
+                mem_stats_end["allocated_bytes.all.current"]
+                - mem_stats_start["allocated_bytes.all.current"]
+            ),
+            "reserved_bytes": (
+                mem_stats_end["reserved_bytes.all.current"]
+                - mem_stats_start["reserved_bytes.all.current"]
+            ),
+        }
         print(
             "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
             "allocated %s, reserved %s."
             % (
                 len(cls.cudagraph_record),
-                time_end - time_start,
-                format_mem_bytes(
-                    mem_stats_end["allocated_bytes.all.current"]
-                    - mem_stats_start["allocated_bytes.all.current"]
-                ),
-                format_mem_bytes(
-                    mem_stats_end["reserved_bytes.all.current"]
-                    - mem_stats_start["reserved_bytes.all.current"]
-                ),
+                capture_stats["time"],
+                format_mem_bytes(capture_stats["allocated_bytes"]),
+                format_mem_bytes(capture_stats["reserved_bytes"]),
             )
         )
 
@@ -329,6 +334,9 @@ class _CudagraphGlobalRecord:
         if has_te_modules:
             te_set_capture_end()
 
+        # Return capture time and memory usage.
+        return capture_stats
+
 
 def create_cudagraphs():
     """Should be called at the end of each schedule function,
@@ -340,7 +348,7 @@ def create_cudagraphs():
     to be created in execution order, which allows multiple cudagraphs to share a single
     memory pool, minimizing cudagraph memory usage."""
 
-    _CudagraphGlobalRecord.create_cudagraphs()
+    return _CudagraphGlobalRecord.create_cudagraphs()
 
 
 def delete_cuda_graphs():
@@ -607,6 +615,11 @@ class _CudaGraphRunner(torch.nn.Module):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
+        # Freeze GC, to speed up capture time ~15-20x.
+        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
+        if freeze_gc:
+            gc.freeze()
+
         # save grads and other variables that may be affected by graph warmup
         if self.training and torch.is_grad_enabled():
             save_main_grads = [
@@ -684,9 +697,18 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.fp8_enabled:
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
+        # Unfreeze GC.
+        if freeze_gc:
+            gc.unfreeze()
+
     def create_bwd_graph(self, static_grad_outputs=None):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
+
+        # Freeze GC, to speed up capture time ~15-20x.
+        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
+        if freeze_gc:
+            gc.freeze()
 
         self.bwd_graph = torch.cuda.CUDAGraph()
 
@@ -741,6 +763,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.static_grad_outputs = static_grad_outputs
         self.static_grad_inputs = static_grad_inputs
+
+        # Unfreeze GC.
+        if freeze_gc:
+            gc.unfreeze()
 
     def get_input_grads_with_dummy_flags(self):
         """Get the inputs grads that are returned by the bwd cudagraph call. If using grad accum

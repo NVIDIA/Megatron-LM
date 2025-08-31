@@ -299,8 +299,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Cuda graph step size.
             cuda_graph_rounder = 8
             self.cuda_graph_step_size = self.max_requests / num_cuda_graphs
-            self.cuda_graph_step_size = cuda_graph_rounder * int(
-                math.ceil(int(self.cuda_graph_step_size) / cuda_graph_rounder)
+            self.cuda_graph_step_size = (
+                math.ceil(self.cuda_graph_step_size / cuda_graph_rounder) * cuda_graph_rounder
             )
             # Make sure divisble by TP size
             self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size

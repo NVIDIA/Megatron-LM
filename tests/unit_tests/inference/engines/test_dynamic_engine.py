@@ -33,6 +33,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -284,6 +285,11 @@ class TestDynamicInferenceEngine:
             tokenizer=types.SimpleNamespace(vocab_size=vocab_size),
         )
 
+        # Reset global cuda graph state.
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
         # Inference engine.
         engine = DynamicInferenceEngine(
             text_generation_controller,
@@ -478,6 +484,8 @@ class TestDynamicInferenceEngine:
             (64, [64, 56, 48, 40, 32, 24, 16, 8]),
             (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
+
+            # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
             )
@@ -677,3 +685,21 @@ class TestDynamicInferenceEngine:
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
+
+
+if __name__ == "__main__":
+    test = TestDynamicInferenceEngine()
+    test.test_simple()
+    test.test_overflow_factor()
+    test.test_request_overflow()
+    test.test_token_overflow()
+    test.test_chunk_overflow()
+    test.test_multi_add()
+    test.test_fixed_output_lengths()
+    test.test_cuda_graph_request_counts()
+    test.test_cuda_graph_warmup()
+    test.test_generate_function()
+    asyncio.run(test.test_run_engine())
+    test.teardown_method(None)
+    print("~~~")
+    print("success.")
