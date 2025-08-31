@@ -100,7 +100,7 @@ class MHAMetadata(MetadataBase):
             is_cumulative_tensor=True,
         )
         self._max_seqlen_q = padded_active_token_count
-        if torch.all(self._query_lengths_buf[:graph_batch_size] == 1):
+        if torch.all(self._query_lengths_buf[:graph_batch_size] <= 1):
             self._max_seqlen_q = 1
         self._max_seqlen_k = self.max_seqlen
 
