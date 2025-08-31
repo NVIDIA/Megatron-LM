@@ -365,8 +365,14 @@ def main():
     #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
     #     f"count [ p {p_count}, d {d_count} ]."
     # )
+    capture_str = (
+        f"{engine.capture_stats["time"]:.2f} sec"
+        if engine.capture_stats else
+        "--"
+    )
     print(
         f"{setup_prefix} … "
+        f"capture {capture_str} … "
         f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
         f"total time: {total_time:.3f}s … "
         f"throughput: {throughput:.3f} tok/s"
