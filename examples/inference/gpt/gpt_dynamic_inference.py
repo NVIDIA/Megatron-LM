@@ -54,6 +54,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
+    group.add_argument(
+        "--termination-id", type=int, default=None,
+        help="Termination ID that overrides `tokenizer.eod`."
+    )
+
     return parser
 
 
@@ -173,6 +178,8 @@ def run_inference(
         A dictionary of step times with `prefill` and `decode` keys.
     """
 
+    args = get_args()
+
     # Initialize request arrival times.
     base_arrival_time = get_curr_time()
     for request in requests:
@@ -188,26 +195,40 @@ def run_inference(
     output_times = []
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
-    while True:
-        curr_time = get_curr_time()
 
-        # Add requests with 'earlier' arrival time.
+    def _add_request():
+        """Add request to engine.
+
+        *Note: Using `prompt_text` instead of `prompt_tokens` for fair comparison.
+        """
+        nonlocal num_requests_added
+        _request = requests[num_requests_added]
+        engine.add_request(
+            num_requests_added,
+            _request.prompt_text,
+            sampling_params.num_tokens_to_generate,
+        )
+        _request.time_start = get_curr_time()
+        _request.state = "started"
+        num_requests_added += 1
+        tbar.update(1)
+
+    while True:
+        # Add requests.
         add_start = get_curr_time()
-        while num_requests_added < num_requests_total:
-            request = requests[num_requests_added]
-            if request.time_arrival > curr_time:
-                break
-            try:
-                # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(
-                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
-                )
-                request.time_start = get_curr_time()
-                request.state = "started"
-                num_requests_added += 1
-                tbar.update(1)
-            except ContextOverflowError:
-                break
+        if args.incoming_requests_per_step is None:
+            # Add requests with 'earlier' arrival time.
+            while num_requests_added < num_requests_total:
+                if requests[num_requests_added].time_arrival > add_start:
+                    break
+                _add_request()
+        else:
+            # Add deterministic number of requests (generally used for debugging).
+            for i in range(min(
+                args.incoming_requests_per_step,
+                num_requests_total - num_requests_added,
+            )):
+                _add_request()
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
@@ -222,6 +243,7 @@ def run_inference(
                 step_times["prefill"].append(step_time)
 
             # Append output tokens.
+            output_start = get_curr_time()
             for finished_request in finished_requests:
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
@@ -235,6 +257,7 @@ def run_inference(
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 num_requests_finished += 1
+            output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
@@ -273,11 +296,21 @@ def main():
     context = get_inference_context(requests, sampling_params)
     controller = get_inference_controller(model, context)
 
+    # Validate all context_length's <= max_tokens.
+    invalid_prompt_length_map = {}
+    for request_idx, request in enumerate(requests):
+        if len(request.prompt_tokens) > context.max_tokens:
+            invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+    assert not invalid_prompt_length_map, (
+        "request idxs with prompts longer than context.max_tokens: "
+        ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+    )
+
     # Inference engine.
     engine = DynamicInferenceEngine(
         controller,
         context,
-        termination_id=tokenizer.eod,
+        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
     )
@@ -300,6 +333,10 @@ def main():
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
 
+        def shorten_str(s, n):
+            s = s.replace("\n", "\\n")
+            return s if len(s) < n else f"{s[:n//2]}..{s[-n//2:]}"
+
         print("~~~~ Unique prompts + outputs. ~~~~")
 
         # Map requests by their prompt.
@@ -312,17 +349,21 @@ def main():
             request_idx = request_idxs[0]
             request = requests[request_idx]
             output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
-            output_text_escaped = request.output_text.replace("\n", "\\n")
+            short_prompt_text = shorten_str(prompt_text, 64)
+            short_output_text = shorten_str(request.output_text, 64)
+            num_prompt_tokens = len(requests[request_idx].prompt_tokens)
+            num_output_tokens = len(requests[request_idx].output_tokens)
             print(
                 f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
-                f"{prompt_text} ... {output_text_escaped}"
+                f"[{num_prompt_tokens}] {short_prompt_text} >>>> "
+                f"[{num_output_tokens}] {short_output_text}"
             )
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
 
-            for idx, req in enumerate(requests):
+            for req in requests[::args.output_every_n_results]:
                 result_dict = {
                     "input_prompt": req.prompt_text,
                     "generated_text": req.output_text,
@@ -375,6 +416,7 @@ def main():
         f"capture {capture_str} … "
         f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
         f"total time: {total_time:.3f}s … "
+        f"steps: {engine.step_count:d} … "
         f"throughput: {throughput:.3f} tok/s"
     )
     print("~~~")
