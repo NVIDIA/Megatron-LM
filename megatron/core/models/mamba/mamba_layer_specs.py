@@ -70,15 +70,14 @@ mamba_stack_spec = ModuleSpec(
         parallel_hybrid_layer=ModuleSpec(
             module=ParallelHybridLayer,
             submodules=ParallelHybridLayerSubmodules(
-                input_layernorm=IdentityOp,
-                mamba_layer=ModuleSpec(
+                mamba_mixer=ModuleSpec(
                     module=MambaMixer,
                     submodules=MambaMixerSubmodules(
                         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                     ),
                 ),
                 parallel_hybrid_bda=get_bias_dropout_add,
-                attention_layer=ModuleSpec(
+                self_attention=ModuleSpec(
                     module=ModuleSpec(
                         module=SelfAttention,
                         params={"attn_mask_type": AttnMaskType.causal},
@@ -87,19 +86,6 @@ mamba_stack_spec = ModuleSpec(
                             core_attention=TEDotProductAttention,
                             linear_proj=TERowParallelLinear,
                         ),
-                    ),
-                ),
-                pre_mlp_layernorm=IdentityOp,
-                mlp_layer=ModuleSpec(
-                    module=MLPLayer,
-                    submodules=TransformerLayerSubmodules(
-                        mlp=ModuleSpec(
-                            module=MLP,
-                            submodules=MLPSubmodules(
-                                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
-                            ),
-                        ),
-                        mlp_bda=get_bias_dropout_add,
                     ),
                 ),
             ),

@@ -197,7 +197,7 @@ class MambaStack(MegatronModule):
                     layer = build_module(
                         submodules.parallel_hybrid_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=i + 1 + pp_layer_offset,
                         model_comm_pgs=model_comm_pgs,
                     )
                 else:
@@ -344,7 +344,15 @@ class MambaStack(MegatronModule):
                     else nullcontext()
                 )
                 with inner_fp8_context:
-                    if isinstance(layer, (TransformerLayer, ParallelHybridLayer)):
+                    if isinstance(layer, TransformerLayer):
+                        hidden_states, _  = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                    if isinstance(layer, ParallelHybridLayer):
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,

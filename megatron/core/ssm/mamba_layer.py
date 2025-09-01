@@ -61,7 +61,6 @@ class MambaLayer(MegatronModule):
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
         residual_in_fp32=False,
-        use_norm: bool = True,
         model_comm_pgs: ModelCommProcessGroups = None,
 
     ):
@@ -77,7 +76,6 @@ class MambaLayer(MegatronModule):
         self.layer_number = layer_number
         self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
-        self.use_norm = use_norm
         self.mixer = build_module(
             submodules.mixer,
             self.config,
@@ -85,9 +83,7 @@ class MambaLayer(MegatronModule):
             layer_number=layer_number,
             model_comm_pgs=model_comm_pgs,
         )
-
-        if self.use_norm:
-            self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
+        self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
@@ -125,8 +121,7 @@ class MambaLayer(MegatronModule):
             residual = residual.to(torch.float32)
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        if self.use_norm:
-            hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
 
         mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
 

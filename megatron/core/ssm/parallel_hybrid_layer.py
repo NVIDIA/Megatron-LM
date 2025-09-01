@@ -6,11 +6,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
-from typing import Optional, Union
-from typing import Optional, Tuple
+from typing import Optional, Union, Tuple
 
 import torch
-from torch import Tensor
 
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ModelCommProcessGroups
@@ -20,42 +18,21 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-# Import existing components to compose
 from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules  
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 
 
 @dataclass
 class ParallelHybridLayerSubmodules:
-    """
-    Configuration class for specifying the submodules of a Mamba layer.
-
-    This class defines the structure and default implementations for various
-    components of a Mamba layer, allowing for flexible customization of the
-    layer's architecture.
-
-    Args:
-        mamba_layer (Union[ModuleSpec, type]): Specification for the input layer normalization.
-        attention_layer (Union[ModuleSpec, type]): Specification for the along-sequence mixing mechanism.
-        mlp_layer (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
-            after the mixer.
-    """
-
-    mamba_layer: Union[ModuleSpec, type] = IdentityOp
-    attention_layer: Union[ModuleSpec, type] = IdentityOp
-    mlp_layer: Union[ModuleSpec, type] = IdentityOp
-    pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+    """Configuration class for specifying the submodules of a parallel hybrid layer."""
+    mamba_mixer: Union[ModuleSpec, type] = IdentityOp
+    self_attention: Union[ModuleSpec, type] = IdentityOp
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     parallel_hybrid_bda: Union[ModuleSpec, type] = IdentityOp
 
 
 class ParallelHybridLayer(MegatronModule):
-    """
-    A single Mamba layer.
-
-    Mamba layer takes input with size [s, b, h] and returns an
-    output of the same size.
-    """
+    """A parallel hybrid layer that combines Mamba and Attention components."""
 
     def __init__(
         self,
@@ -65,18 +42,14 @@ class ParallelHybridLayer(MegatronModule):
         residual_in_fp32=False,
         model_comm_pgs: ModelCommProcessGroups = None,
     ):
-        """Initialize Mamba Layer."""
         super().__init__(config)
-        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaLayer"
+        assert model_comm_pgs is not None, "model_comm_pgs must be provided for ParallelHybridLayer"
 
         self.config = config
         self.layer_number = layer_number
         self.residual_in_fp32 = residual_in_fp32
-
-        # Hidden dropout for BDA
         self.hidden_dropout = config.hidden_dropout
 
-        # Pre-normalization layer
         self.input_layernorm = build_module(
             submodules.input_layernorm, 
             config=self.config, 
@@ -85,12 +58,12 @@ class ParallelHybridLayer(MegatronModule):
         )
 
         mamba_submodules = MambaMixerSubmodules(
-            in_proj=submodules.mamba_layer.submodules.in_proj,
-            out_proj=submodules.mamba_layer.submodules.out_proj,
+            in_proj=submodules.mamba_mixer.submodules.in_proj,
+            out_proj=submodules.mamba_mixer.submodules.out_proj,
         )
 
         self.mamba_mixer = build_module(
-            submodules.mamba_layer.module,  # Should be MambaMixer
+            submodules.mamba_mixer.module,
             submodules=mamba_submodules,
             config=self.config,
             layer_number=layer_number,
@@ -98,7 +71,6 @@ class ParallelHybridLayer(MegatronModule):
             model_comm_pgs=model_comm_pgs
         )
 
-        # Attention Component: Use existing SelfAttention
         attention_optional_kwargs = {}
         if self.config.context_parallel_size > 1 and self.config.cp_comm_type is not None:
             if isinstance(self.config.cp_comm_type, list):
@@ -108,41 +80,23 @@ class ParallelHybridLayer(MegatronModule):
         model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
         attention_optional_kwargs["model_comm_pgs"] = model_comm_pgs
 
-        # Create submodules for SelfAttention - extract from main submodules
         attention_submodules = SelfAttentionSubmodules(
-            linear_qkv=submodules.attention_layer.module.submodules.linear_qkv,
-            core_attention=submodules.attention_layer.module.submodules.core_attention,
-            linear_proj=submodules.attention_layer.module.submodules.linear_proj,
-            q_layernorm=getattr(submodules.attention_layer.module.submodules, 'q_layernorm', None),
-            k_layernorm=getattr(submodules.attention_layer.module.submodules, 'k_layernorm', None),
+            linear_qkv=submodules.self_attention.module.submodules.linear_qkv,
+            core_attention=submodules.self_attention.module.submodules.core_attention,
+            linear_proj=submodules.self_attention.module.submodules.linear_proj,
+            q_layernorm=getattr(submodules.self_attention.module.submodules, 'q_layernorm', None),
+            k_layernorm=getattr(submodules.self_attention.module.submodules, 'k_layernorm', None),
         )
 
         self.self_attention = build_module(
-            submodules.attention_layer.module,
+            submodules.self_attention.module,
             submodules=attention_submodules,
             config=self.config,
             layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
 
-        # Bias-Dropout-Add fusion
         self.parallel_hybrid_bda = build_module(submodules.parallel_hybrid_bda)
-
-    
-        self.pre_mlp_layernorm = build_module(
-            submodules.pre_mlp_layernorm, 
-            config=self.config, 
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
-        )
-
-        self.mlp = build_module(
-            submodules.mlp_layer.module,
-            submodules=submodules.mlp_layer.submodules,
-            config=self.config,
-            layer_number=self.layer_number,
-        )
-
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
     def forward(
@@ -160,26 +114,16 @@ class ParallelHybridLayer(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
-        """
-        Forward pass through the hybrid mixer using COMPOSITION.
-        
-        Pure orchestration - no inline reimplementation!
-        """
-
-        # Save residual connection
         residual = hidden_states
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        # Pre-normalization
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        # hidden_states = self.norm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
 
-        # Execute components and collect outputs
         outputs = []
         biases = []
 
-        # SSM Forward: Use existing MambaMixer
         mamba_output, mamba_bias = self.mamba_mixer(
             hidden_states,
             inference_context=inference_context,
@@ -188,7 +132,6 @@ class ParallelHybridLayer(MegatronModule):
         if mamba_bias is not None:
             biases.append(mamba_bias)
 
-        # Attention Component: Use existing SelfAttention
         attn_output, attn_bias = self.self_attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -201,24 +144,12 @@ class ParallelHybridLayer(MegatronModule):
             sequence_len_offset=sequence_len_offset,
         )
         outputs.append(attn_output)
-
         if attn_bias is not None:
             biases.append(attn_bias)
-        # Combine outputs
-        if len(outputs) == 0:
-            # Fallback to identity
-            combined_output = hidden_states
-            combined_bias = None
-        elif len(outputs) == 1:
-            # Single component active
-            combined_output = outputs[0]
-            combined_bias = biases[0] if biases else None
-        else:
-            # Multiple components - add them
-            combined_output = sum(outputs)
-            combined_bias = sum(biases) if biases else None
 
-        # Bias-Dropout-Add fusion (residual connection)
+        combined_output = sum(outputs)
+        combined_bias = sum(biases) if biases else None
+
         out_with_bias = (combined_output, combined_bias)
 
         with self.bias_dropout_add_exec_handler():
@@ -227,56 +158,43 @@ class ParallelHybridLayer(MegatronModule):
                 fused=self.config.bias_dropout_fusion
             )(out_with_bias, residual, self.hidden_dropout)
 
-        # TODO: verify this
-        residual = hidden_states
-        hidden_states = self.pre_mlp_layernorm(hidden_states)
-
-        hidden_states, _ = self.mlp(hidden_states)
-        final_output = hidden_states + residual
-
-        return final_output
+        return hidden_states
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """Allocate inference cache for active components."""
+        """Allocate inference cache for both components."""
         caches = {}
 
-        if self.use_mamba and self.mamba_mixer is not None:
+        if self.mamba_mixer is not None:
             mamba_cache = self.mamba_mixer.allocate_inference_cache(
                 batch_size, max_seqlen, dtype
             )
             caches['mamba'] = mamba_cache
 
-        if self.use_attention and self.self_attention is not None:
-            #need to be implemented
+        if self.self_attention is not None:
             pass
 
         return caches
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Provide a sharded state dictionary for distributed checkpointing."""
         from megatron.core.transformer.utils import sharded_state_dict_default
 
         sharded_state_dict = {}
 
-        # Handle norm
-        if hasattr(self, 'norm') and self.norm is not None:
-            norm_sd = sharded_state_dict_default(
-                self.norm, f'{prefix}norm.', sharded_offsets, metadata
-            )
-            sharded_state_dict.update(norm_sd)
+        norm_sd = sharded_state_dict_default(
+            self.input_layernorm, f'{prefix}input_layernorm.', sharded_offsets, metadata
+        )
+        sharded_state_dict.update(norm_sd)
 
-        # Handle SSM component
-        if self.use_mamba and hasattr(self, 'mamba_mixer') and self.mamba_mixer is not None:
-            mamba_sd = sharded_state_dict_default(
-                self.mamba_mixer, f'{prefix}mamba_mixer.', sharded_offsets, metadata
-            )
-            sharded_state_dict.update(mamba_sd)
+        mamba_sd = sharded_state_dict_default(
+            self.mamba_mixer, f'{prefix}mamba_mixer.', sharded_offsets, metadata
+        )
+        sharded_state_dict.update(mamba_sd)
 
-        # Handle attention component
-        if self.use_attention and hasattr(self, 'self_attention') and self.self_attention is not None:
-            attn_sd = sharded_state_dict_default(
-                self.self_attention, f'{prefix}self_attention.', sharded_offsets, metadata
-            )
-            sharded_state_dict.update(attn_sd)
+        attn_sd = sharded_state_dict_default(
+            self.self_attention, f'{prefix}self_attention.', sharded_offsets, metadata
+        )
+        sharded_state_dict.update(attn_sd)
 
         return sharded_state_dict
+
+    
