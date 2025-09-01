@@ -248,7 +248,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     def return_none(input_tensor):
         return None
 
-    model.set_input_tensor = return_none
+    # model.set_input_tensor = return_none
 
     sequence_length = 512
     micro_batch_size = 8
@@ -262,6 +262,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     config = ModelParallelConfig(pipeline_dtype=torch.float)
     config.finalize_model_grads_func = finalize_model_grads
     model.config = config
+    config.hidden_size = hidden_size
 
     multi_module_communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
