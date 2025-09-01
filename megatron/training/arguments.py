@@ -54,6 +54,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_network_size_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
+    parser = _add_rl_args(parser)
     parser = _add_initialization_args(parser)
     parser = _add_learning_rate_args(parser)
     parser = _add_checkpointing_args(parser)
@@ -371,6 +372,28 @@ def validate_args(args, defaults={}):
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
+    # Batch size checks if running RL.
+    if args.perform_rl_step:
+        args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
+        num_generated_samples_per_inference_iteration = (
+            args.grpo_samples_per_iteration * args.grpo_iterations)
+
+        # Ensure that the number of prompts we collect is a multiple of the global batch size.
+        # TODO: Make this account for batch size rampup?
+        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
+            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
+
+        # For now only exit/checkpoint on iterations where we generate data. We don't currently
+        # have a way to checkpoint the generated data.
+        num_training_iterations_per_inference_iteration = (
+            num_generated_samples_per_inference_iteration // args.global_batch_size)
+        if args.exit_interval is not None:
+            assert args.exit_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"exit_interval should be divisible by number of global batches per inference iteration."
+        if args.save_interval is not None:
+            assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"save_interval should be divisible by number of global batches per inference iteration."
+
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
@@ -556,16 +579,9 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
 
-    if args.data_parallel_sharding_strategy == "optim_grads_params":
-        args.overlap_param_gather = True
-        args.overlap_grad_reduce = True
-
-    if args.data_parallel_sharding_strategy == "optim_grads":
-        args.overlap_grad_reduce = True
-
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
+        assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
+            '--overlap-param-gather only supported with distributed optimizer or megatron fsdp'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -620,23 +636,20 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or not torch.is_grad_enabled(), \
-            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, or inference mode'
-        if args.fp8_recipe == "mxfp8":
-            assert args.reuse_grad_buf_for_mxfp8_param_ag, \
-                "--fp8-param-gather with mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag"
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
+            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
-    if args.use_custom_fsdp:
-        assert args.use_distributed_optimizer, \
-            '--use-custom-fsdp only supported with distributed optimizer'
+    if args.use_megatron_fsdp:
+        # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
+        #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
+        #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
+        args.use_custom_fsdp = True
 
         if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
             warn_rank_0(
                 'Please make sure your TransformerEngine support FSDP + gradient accumulation fusion',
                 args.rank,
             )
-            assert args.gradient_accumulation_fusion is False, \
-                "optim_grads_params optim_grads are not supported with gradient accumulation fusion"
 
         if args.data_parallel_sharding_strategy == "optim_grads_params":
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
@@ -644,6 +657,9 @@ def validate_args(args, defaults={}):
 
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+
+        assert args.ckpt_format == "fsdp_dtensor", \
+            "Megatron FSDP only supports fsdp_dtensor checkpoint format"
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -856,8 +872,8 @@ def validate_args(args, defaults={}):
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
         and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
-        if args.use_torch_fsdp2 or args.use_custom_fsdp:
-            fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Custom-FSDP"
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Megatron-FSDP"
             warn_rank_0(
                 f"Using tensor model parallelism or context parallelism with {fsdp_impl} together. "
                 "Try not to using them together since they require different CUDA_MAX_CONNECTIONS "
@@ -884,7 +900,7 @@ def validate_args(args, defaults={}):
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
     # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
-    if args.use_torch_fsdp2 or args.use_custom_fsdp and get_device_arch_version() >= 10:
+    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
         if 'dp_cp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
@@ -979,6 +995,10 @@ def validate_args(args, defaults={}):
             "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
         assert args.pipeline_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
+
+    # fsdp_dtensor checkpointing format checks.
+    if args.ckpt_format == "fsdp_dtensor":
+        assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
     # Data blend checks
     assert args.mock_data + \
@@ -1302,6 +1322,9 @@ def _add_inference_args(parser):
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
+    group.add_argument('--inference-max-batch-size', type=int, default=None,
+                       help='Maximum batch size for inference.',
+                       dest='inference_max_batch_size')
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
@@ -1351,6 +1374,9 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
+    group.add_argument('--initialize-socket-comms',
+                       action='store_true', default=False,
+                       help='Initialize socket communication for dynamic engine coordinator.')
 
     return parser
 
@@ -1695,6 +1721,11 @@ def _add_logging_args(parser):
                        help='Enable world size logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
+    group.add_argument('--wandb-entity', type=str, default='',
+                       help='The wandb entity name. It is useful when '
+                       'there are multiple sub-projects in a project. '
+                       'https://community.wandb.ai/t/how-do-i-decide-which-account-private-or-team-to-upload-the-run-to/5704 '
+                       'Ignore wandb by default.')    
     group.add_argument('--wandb-exp-name', type=str, default='',
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
@@ -1735,6 +1766,48 @@ def _add_regularization_args(parser):
                        help='Momentum factor for sgd')
     return parser
 
+
+def _add_rl_args(parser):
+    group = parser.add_argument_group(title='rl')
+    group.add_argument('--perform-rl-step', action='store_true',
+                       help="Use the RL training step.")
+    group.add_argument('--rl-prompts-per-eval', type=int, default=32,
+                       help='Number of prompts to evaluate for for each RL task.'
+                        'This evaluation can be very expensive when using environments' 
+                        'that evaluate pass@k so we default to a lower number.')
+    # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
+    group.add_argument('--grpo-prompts-per-step', type=int, default=32,
+                       help="Number of GRPO groups (G in the paper).")
+    group.add_argument('--grpo-group-size', type=int, default=2,
+                       help="Number of samples per a GRPO group.")
+    group.add_argument('--grpo-iterations', type=int, default=2,
+                       help="Number of iterations per a GRPO implementation.")
+    # As in DAPO, we keep upper/lower eps different.
+    # To have a vanilla GRPO, set them to be the same.
+    group.add_argument('--grpo-clamp-eps-lower', type=float, default=0.01,
+                       help="Lower GRPO clipping bound.")
+    group.add_argument('--grpo-clamp-eps-upper', type=float, default=0.01,
+                       help="Upper GRPO clipping bound. In vanilla implementation, equals to the lower one.")
+    group.add_argument('--grpo-kl-beta', type=float, default=0.001,
+                       help="KL term weight in the GRPO loss.")
+    group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
+                       help="Entropy term weight in GRPO loss.")
+    group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
+                       help="Filter groups with same reward.")
+    group.add_argument('--grpo-default-temperature', type=float, default=1.0,
+                       help="Default temperature for model inference.")
+    group.add_argument('--grpo-default-top-p', type=float, default=0,
+                       help="Default top-p for model inference.")
+    group.add_argument('--langrl-inference-server-type', type=str,
+                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
+                       help="Type of inference server to use.")
+    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
+                       help="Conversation template, if using a chat server.")
+    group.add_argument('--langrl-env-config', type=str, default=None,
+                       help="Path to YAML config file for RL environment configuration.")
+    group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
+                       help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
+    return parser
 
 def _add_training_args(parser):
     group = parser.add_argument_group(title='training')
@@ -2031,6 +2104,8 @@ def _add_training_args(parser):
                        'If None, the default backend will be used.')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
+    group.add_argument('--use-te-activation-func', action='store_true',
+                       help='Use activation function kernel from Transformer Engine in MLP module.')
 
     return parser
 
@@ -2164,6 +2239,8 @@ def _add_checkpointing_args(parser):
                        help='Load main parameters from checkpoint directly.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--no-strict-fsdp-dtensor-load', action='store_false', dest='strict_fsdp_dtensor_load',
+                       help='Do not strict loading for fsdp_dtensor checkpoint format.')
     group.add_argument('--non-persistent-save-interval', type=int, default=None,
                        help='Number of iterations between non-persistent saves.')
     group.add_argument('--non-persistent-ckpt-type', type=str, default=None,
@@ -2217,10 +2294,11 @@ def _add_checkpointing_args(parser):
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp', 'fsdp_dtensor'],
                        help='Checkpoint format to use. torch is the format used by torch.save/load.'
                        ' torch_dist is a megatron built-in distributed checkpointing format.'
-                       ' torch_dcp is the torch.distributed.checkpoint format.')
+                       ' torch_dcp is the torch.distributed.checkpoint format.'
+                       ' fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.')
     group.add_argument('--ckpt-convert-format', default=None,
                        choices=['torch', 'torch_dist', 'zarr'],
                        help='Checkpoint format for conversion.')
@@ -2415,7 +2493,7 @@ def _add_distributed_args(parser):
                        help='IB SHARP can be enabled from only one communication group. '
                        'By default, it is enabled from dp group. '
                        'Available options: [dp, dp_replica]')
-    group.add_argument('--use-custom-fsdp', action='store_true',
+    group.add_argument('--use-megatron-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
@@ -2424,7 +2502,7 @@ def _add_distributed_args(parser):
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
-                       help="Enable double buffering for temporary memory needed for custom FSDP communications. "
+                       help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
@@ -2433,8 +2511,10 @@ def _add_distributed_args(parser):
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
                         'while a smaller value disables prefetching and may degrade performance. Adjust this value based on your system\'s memory '
                         'and performance requirements.')
-    group.add_argument('--keep-fp8-transpose-cache-when-using-custom-fsdp', action='store_true',
-                       help='If set, keep the fp8 transpose cache when using custom FSDP.')
+    group.add_argument('--keep-fp8-transpose-cache', action='store_true',
+                       help='If set, keep the fp8 transpose cache when using Megatron FSDP.')
+    group.add_argument('--enable-full-sharding-in-hsdp', action='store_true',
+                       help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',
@@ -2535,6 +2615,8 @@ def _add_tokenizer_args(parser):
                        help='Number of special tokens in tiktoken tokenizer')
     group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
                        help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
+    group.add_argument("--trust-remote-code", action="store_true",
+                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
 
 
@@ -3059,10 +3141,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
             default=None,
             help="Use a default kitchen recipe for all layers as defined by QAT_PARAMS index",
         )
-        return parser
-
-    else:
-        return parser
+    return parser
 
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')

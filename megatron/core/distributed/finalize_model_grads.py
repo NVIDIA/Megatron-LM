@@ -31,9 +31,7 @@ from ..utils import (
 )
 
 
-def _get_main_grad_attr(param: torch.nn.Parameter, use_custom_fsdp: bool = False):
-    if use_custom_fsdp:
-        return "fsdp_managed_main_grad"
+def _get_main_grad_attr(param: torch.nn.Parameter, use_megatron_fsdp: bool = False):
     if hasattr(param, "main_grad"):
         return "main_grad"
     return "grad"
@@ -241,8 +239,10 @@ def _allreduce_embedding_grad(
         if weight is None and skip_if_none:
             return
 
-        grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+        grad_attr = _get_main_grad_attr(weight, ddp_config.use_megatron_fsdp)
         orig_grad = getattr(weight, grad_attr)
+        if ddp_config.use_megatron_fsdp:
+            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
         grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
@@ -320,20 +320,30 @@ def _allreduce_non_tensor_model_parallel_grads(
             if param.requires_grad:
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
                 if getattr(param, "average_gradients_across_tp_domain", False):
-                    params_avg.append(param)
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
+                    grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
                     grad = getattr(param, grad_attr)
-                    grad = _unshard_if_dtensor(grad)
-                    grads_avg.append(grad.data)
+                    if grad is None:
+                        continue
+                    params_avg.append(param)
+                    if ddp_config.use_megatron_fsdp:
+                        grads_avg.append(grad._local_tensor.data)
+                    else:
+                        grad = _unshard_if_dtensor(grad)
+                        grads_avg.append(grad.data)
                 # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
                 elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
                     config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
                 ):
-                    params_sum.append(param)
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
+                    grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
                     grad = getattr(param, grad_attr)
-                    grad = _unshard_if_dtensor(grad)
-                    grads_sum.append(grad.data)
+                    if grad is None:
+                        continue
+                    params_sum.append(param)
+                    if ddp_config.use_megatron_fsdp:
+                        grads_sum.append(grad._local_tensor.data)
+                    else:
+                        grad = _unshard_if_dtensor(grad)
+                        grads_sum.append(grad.data)
 
     # Loop grads and perform correct all-reduce
     for params, grads, all_reduce_op in zip(
@@ -348,9 +358,12 @@ def _allreduce_non_tensor_model_parallel_grads(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
+                grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
                 orig_grad = getattr(param, grad_attr)
-                setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+                if ddp_config.use_megatron_fsdp:
+                    setattr(param, grad_attr, orig_grad)
+                else:
+                    setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 
 
 """

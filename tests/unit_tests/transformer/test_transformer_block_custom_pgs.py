@@ -396,9 +396,9 @@ class TestTransformerBlockWithProcessGroups:
         actual_world_size = torch.cuda.device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
-        Utils.initialize_model_parallel()
+        # we are testing the custom pgs path, thus we call initialize_distributed intead of initialize_model_parallel
+        Utils.initialize_distributed()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
 
         # Create transformer configuration
         transformer_config = TransformerConfig(
@@ -477,20 +477,20 @@ class TestTransformerBlockWithProcessGroups:
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
-        Utils.initialize_model_parallel()
+        Utils.initialize_distributed()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
-
-        # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
 
         # Create HyperCommGrid with dimensions tp, cp (reversed from device mesh order)
-        grid_cp_2_tp_4 = HyperCommGrid([4, 2], ["tp", "cp"])
+        grid_cp_2_tp_4 = HyperCommGrid([4, 2, 1, 1], ["tp", "cp", "ep", "pp"])
 
         tp_group = grid_cp_2_tp_4.create_pg("tp")
         cp_group = grid_cp_2_tp_4.create_pg("cp")
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        ep_group = grid_cp_2_tp_4.create_pg("ep")
+        pp_group = grid_cp_2_tp_4.create_pg("pp")
+        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, ep=ep_group, pp=pp_group)
+        model_parallel_cuda_manual_seed(
+            1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank()
+        )
 
         transformer_config = TransformerConfig(
             num_layers=3,
@@ -531,6 +531,10 @@ class TestTransformerBlockWithProcessGroups:
         ep_group = grid_cp_2_tp_2_dp_2.create_pg("ep")
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
         grad_comm_pgs = GradCommProcessGroups()
+
+        model_parallel_cuda_manual_seed(
+            1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank()
+        )
 
         dp_cp_group = grid_cp_2_tp_2_dp_2.create_pg(["dp", "cp"])
         grad_comm_pgs.dp = dp_group

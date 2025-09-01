@@ -222,20 +222,21 @@ class TestPipelineParallelTransformerBlock:
             )
             total_build_layers = 0
             for i in range(pipeline_model_parallel_size):
-                parallel_state.set_pipeline_model_parallel_rank(i)
                 if virtual_pipeline_model_parallel_size is not None:
                     for j in range(virtual_pipeline_model_parallel_size):
-                        num_layers_to_build = get_num_layers_to_build(transformer_config, j)
+                        num_layers_to_build = get_num_layers_to_build(
+                            transformer_config, vp_stage=j, pp_rank=i
+                        )
+
                         total_build_layers += num_layers_to_build
                 else:
-                    num_layers_to_build = get_num_layers_to_build(transformer_config)
+                    num_layers_to_build = get_num_layers_to_build(transformer_config, pp_rank=i)
                     total_build_layers += num_layers_to_build
         if not should_assert_error:
             assert (
                 total_build_layers == num_layers
             ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
-        parallel_state.set_pipeline_model_parallel_world_size(None)
-        parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+        Utils.destroy_model_parallel()
 
 
 class TestProcessGroupTransformerBlock:
@@ -267,14 +268,15 @@ class TestProcessGroupTransformerBlock:
                 torch.distributed.init_process_group(backend='nccl')
 
             # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
-            grid = HyperCommGrid([cp_size, tp_size, dp_size], ["cp", "tp", "dp"])
+            grid = HyperCommGrid([cp_size, tp_size, dp_size, 1], ["cp", "tp", "dp", "pp"])
 
             # Get process groups from HyperCommGrid
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
 
             # Create ModelCommProcessGroups with custom process groups
-            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group)
         else:
             # Rely on TransformerBlock to create default process groups
             model_comm_pgs = None

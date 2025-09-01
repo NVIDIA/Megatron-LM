@@ -13,6 +13,8 @@ import torch
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
@@ -31,6 +33,11 @@ try:
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+
+try:
+    import apex.contrib.nccl_allocator as nccl_allocator
+except ImportError:
+    nccl_allocator = None
 
 
 class BufferType(Enum):
@@ -516,7 +523,24 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        grad_comm_pgs: Optional[GradCommProcessGroups] = None,
     ):
+
+        if model_comm_pgs is None and grad_comm_pgs is None:
+            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
+                with_context_parallel=True
+            )
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        elif model_comm_pgs is not None and grad_comm_pgs is not None:
+            assert hasattr(model_comm_pgs, 'tp') and hasattr(grad_comm_pgs, 'dp_cp')
+            self.dp_cp_group = grad_comm_pgs.dp_cp
+            self.tp_group = model_comm_pgs.tp
+        else:
+            raise ValueError(
+                "Either model_comm_pgs and grad_comm_pgs must be provided or both must be None"
+            )
+
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices
@@ -776,7 +800,9 @@ class _ParamAndGradBuffer:
             )
             for param in bucket.params:
                 log_strs.append(f"\t{param_to_name[param]}")
-        log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
+        log_on_each_pipeline_stage(
+            logger, self.tp_group, self.dp_cp_group, logging.INFO, "\n".join(log_strs)
+        )
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""

@@ -33,7 +33,6 @@ MODEL_ARGS=" \
     --moe-aux-loss-coeff 1e-3 \
     --moe-token-dispatcher-type alltoall \
     --moe-router-load-balancing-type aux_loss \
-    --moe-layer-recompute \
     --seq-length 4096 \
     --max-position-embeddings 40960 \
     --tokenizer-type HuggingFaceTokenizer \

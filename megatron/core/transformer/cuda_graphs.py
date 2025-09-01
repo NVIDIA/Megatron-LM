@@ -9,7 +9,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils._pytree import tree_flatten
@@ -137,7 +137,7 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
-    vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+    vp_size = base_module.config.virtual_pipeline_model_parallel_size or 1
     for i in range(vp_size):
         # layer numbers are 1-indexed
         layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=i)
@@ -160,7 +160,7 @@ class _CudagraphGlobalRecord:
     fwd and bwd passes will be performed using their cudagraphed versions."""
     cudagraph_created = False
 
-    """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and 
+    """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and
     'record_bwd_graph."""
     cudagraph_record = []
 
@@ -331,6 +331,22 @@ def create_cudagraphs():
     memory pool, minimizing cudagraph memory usage."""
 
     _CudagraphGlobalRecord.create_cudagraphs()
+
+
+def delete_cuda_graphs():
+    """Delete all CUDA graphs."""
+
+    # Reset global tracking state
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+
+    # TODO: Optional?: Force garbage collection to clean up memory
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempool = None
 
 
 class _GraphStatus(Enum):
@@ -642,8 +658,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.training and torch.is_grad_enabled():
             assert (
                 len(self.fwd_graph_output_surface) > 0
-            ), """Tried graphing a moudule that returned no tensors in training mode, 
-                however the graphed module must output at least one tensor, 
+            ), """Tried graphing a moudule that returned no tensors in training mode,
+                however the graphed module must output at least one tensor,
                 so that a corresponding backward node may be registered in the autograd graph."""
 
             # restore cached grads
@@ -952,7 +968,12 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        share_cudagraph_io_buffers: bool = True,
+        vp_stage: Optional[int] = None,
+    ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -960,12 +981,13 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8, and warmup steps.
             share_cudagraph_io_buffers (bool, optional): (DEPRECATED, will be replaced by
-                config.cuda_graph_share_io_buffers) If None (default) or True, enables 
+                config.cuda_graph_share_io_buffers) If None (default) or True, enables
                 buffer reuse optimizations for transformer and mamba layers. If False,
                 disables buffer reuse.
         """
         rng_tracker = get_cuda_rng_tracker()
         self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
+        self.vp_stage = vp_stage
 
         # need to delay the import here to avoid a circular import
         global HAVE_TE_GRAPHS
@@ -1050,8 +1072,13 @@ class CudaGraphManager(torch.nn.Module):
             fwd_mempool = CudaGraphManager.global_mempool
             bwd_mempool = CudaGraphManager.global_mempool
         else:
-            vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-            vpp_rank = 0 if vpp_rank is None else vpp_rank
+            if megatron_module.config.virtual_pipeline_model_parallel_size is not None:
+                assert (
+                    self.vp_stage is not None
+                ), "vp_stage must be passed if virtual pipeline is enabled"
+                vpp_rank = self.vp_stage
+            else:
+                vpp_rank = 0
             fwd_mempool = CudaGraphManager.fwd_mempools[vpp_rank][len(self.cudagraph_runners)]
             bwd_mempool = CudaGraphManager.bwd_mempool
 
