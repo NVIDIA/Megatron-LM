@@ -96,9 +96,83 @@ class MultiModulePipelineCommunicator:
                 )
                 self.bridge_comms.append(bridge_comm)
 
+    @property
+    def is_pp_first_stage(self):
+        """Return True if the current rank has the absolute first stage in the overall model.
+        
+        The absolute first stage is defined as:
+        1. The current rank must be in the first PP stage (pp_stage == 0) of some module
+        2. That module must be a source module (no incoming connections in topology)
+        """
+        for module_name, rank_module_info in self.rank_module_map.items():
+            # Check if this rank is at the first PP stage of this module
+            if rank_module_info.pp_stage == 0:
+                # Check if this module is a source module (no incoming connections)
+                if self._is_source_module(module_name):
+                    return True
+        return False
+    
+    @property
+    def is_pp_last_stage(self):
+        """Return True if the current rank has the absolute last stage in the overall model.
+        
+        The absolute last stage is defined as:
+        1. The current rank must be in the last PP stage of some module
+        2. That module must be a sink module (no outgoing connections in topology)
+        """
+        for module_name, rank_module_info in self.rank_module_map.items():
+            # Check if this rank is at the last PP stage of this module
+            if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
+                # Check if this module is a sink module (no outgoing connections)
+                if self._is_sink_module(module_name):
+                    return True
+        return False
+
+    def _is_source_module(self, module_name: str) -> bool:
+        """Check if a module is a source module (has no incoming connections)."""
+        # A module is a source if no other module lists it as a destination
+        for src_module, dest_modules in self.topology.items():
+            if module_name in dest_modules:
+                return False
+        return True
+    
+    def _is_sink_module(self, module_name: str) -> bool:
+        """Check if a module is a sink module (has no outgoing connections)."""
+        return len(self.topology.get(module_name, [])) == 0
+
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
         return grid.rank_offset <= self.current_rank < grid.rank_offset + grid.size
+
+    @property
+    def num_warmup_microbatches(self):
+        """Calculate the number of warmup microbatches for the current rank.
+        
+        Uses the same simple logic as P2PCommunicator:
+        total_pipeline_stages - current_rank_stage - 1
+        
+        Returns:
+            int: Number of warmup microbatches for this rank
+        """
+        # Get total pipeline depth across all modules
+        total_stages = self.compute_total_pipeline_stages(self.topology, self.module_to_grid_map)
+        
+        # Get current rank's position in the overall pipeline (0-indexed)
+        # Use compute_total_pipeline_stages with current rank to get cumulative position
+        if self.rank_module_map:
+            # Take the first module this rank belongs to
+            # TODO: ykarnati - improve this logic.
+            module_name = next(iter(self.rank_module_map.keys()))
+            current_stage = self.compute_total_pipeline_stages(
+                self.topology, self.module_to_grid_map, 
+                rank=self.current_rank, module_name=module_name
+            ) - 1  # Convert from 1-indexed to 0-indexed
+        else:
+            current_stage = 0
+        
+        assert current_stage<=total_stages, f"current_stage: {current_stage} is greater than total_stages: {total_stages}"
+        
+        return total_stages - current_stage - 1
 
     def _build_rank_module_info_map(self):
         """For each module in the current rank, initialize the P2P communicator
@@ -138,7 +212,7 @@ class MultiModulePipelineCommunicator:
                 )
                 self.rank_module_map[module_name] = rank_module_info
 
-    def recv_forward(self, tensor_shape: Optional[Shape] = None) -> Dict[str, torch.Tensor]:
+    def recv_forward(self, tensor_shape: Optional[Shape] = None, is_first_stage: bool = False) -> Dict[str, torch.Tensor]:
         """Receive forward activation tensor.
 
         Args:
@@ -162,7 +236,7 @@ class MultiModulePipelineCommunicator:
                 )
         return input_dict
 
-    def send_forward(self, output_dict: Dict[str, torch.Tensor]):
+    def send_forward(self, output_dict: Dict[str, torch.Tensor], is_last_stage: bool = False):
         """Send forward activation tensor.
 
         Args:
@@ -181,7 +255,7 @@ class MultiModulePipelineCommunicator:
                 )
 
     def send_forward_recv_backward(
-        self, output_dict: Dict[str, torch.Tensor], tensor_shape: Optional[Shape] = None
+        self, output_dict: Dict[str, torch.Tensor], tensor_shape: Optional[Shape] = None, is_last_stage: bool = False
     ) -> Dict[str, torch.Tensor]:
         """Send forward activation tensor and receive backward activation tensor.
 
@@ -212,7 +286,7 @@ class MultiModulePipelineCommunicator:
         return grad_dict
 
     def send_backward_recv_forward(
-        self, grad_dict: Dict[str, torch.Tensor], tensor_shape: Optional[Shape] = None
+        self, grad_dict: Dict[str, torch.Tensor], tensor_shape: Optional[Shape] = None, is_first_stage: bool = False
     ) -> Dict[str, torch.Tensor]:
         """Send backward activation tensor and receive forward activation tensor.
 
@@ -244,7 +318,7 @@ class MultiModulePipelineCommunicator:
                 )
         return input_dict
 
-    def recv_backward(self, tensor_shape: Optional[Shape] = None) -> Dict[str, torch.Tensor]:
+    def recv_backward(self, tensor_shape: Optional[Shape] = None, is_last_stage: bool = False) -> Dict[str, torch.Tensor]:
         """Receive backward activation tensor.
 
         Args:
@@ -267,7 +341,7 @@ class MultiModulePipelineCommunicator:
                 )
         return grad_dict
 
-    def send_backward(self, grad_dict: Dict[str, torch.Tensor]):
+    def send_backward(self, grad_dict: Dict[str, torch.Tensor], is_first_stage: bool = False):
         """Send backward activation tensor.
 
         Args:
