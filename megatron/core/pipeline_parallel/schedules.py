@@ -426,7 +426,6 @@ def backward_step(
     output_tensor_grad,
     model_type,
     config,
-    pipeline_model_parallel_size=1,
 ):
     """Backward step through passed-in output tensor.
 
@@ -1247,7 +1246,6 @@ def forward_backward_pipelining_with_interleaving(
             output_tensor_grad,
             model_type,
             config,
-            pipeline_model_parallel_size=p2p_communicator.pp_group.size(),
         )
 
         # launch grad synchronization (custom grad sync)
@@ -1928,7 +1926,7 @@ def forward_backward_pipelining_without_interleaving(
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(
-            config, model, is_pp_last_stage(p2p_communicator.pp_group)
+            config, model, p2p_communicator.is_pp_last_stage
         )
 
     if config.timers is not None:
@@ -1957,9 +1955,7 @@ def forward_backward_pipelining_without_interleaving(
     disable_grad_sync()
 
     # Compute number of warmup microbatches.
-    num_warmup_microbatches = (
-        p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1
-    )
+    num_warmup_microbatches = p2p_communicator.num_warmup_microbatches
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
@@ -1977,7 +1973,7 @@ def forward_backward_pipelining_without_interleaving(
 
     model_type = get_model_type(model)
 
-    rank = p2p_communicator.pp_group.rank()
+    # rank = p2p_communicator.pp_group.rank()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2020,7 +2016,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes)
+        input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, p2p_communicator.is_pp_first_stage)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2034,9 +2030,9 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
-            is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+            is_last_stage=p2p_communicator.is_pp_last_stage,
         )
-        p2p_communicator.send_forward(output_tensor)
+        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
         if not forward_only:
@@ -2048,7 +2044,7 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
-        input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes)
+        input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, p2p_communicator.is_pp_first_stage)
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -2077,17 +2073,17 @@ def forward_backward_pipelining_without_interleaving(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
             current_microbatch=i + num_warmup_microbatches,
-            is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
+            is_last_stage=p2p_communicator.is_pp_last_stage,
         )
         total_num_tokens += num_tokens
 
         if forward_only:
-            p2p_communicator.send_forward(output_tensor)
+            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
-                input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes)
+                input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, p2p_communicator.is_pp_first_stage)
         else:
             output_tensor_grad = p2p_communicator.send_forward_recv_backward(
-                output_tensor, send_tensor_shapes
+                output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
             # Add input_tensor and output_tensor to end of list.
@@ -2103,7 +2099,7 @@ def forward_backward_pipelining_without_interleaving(
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
             if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or rank == 0:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
             input_tensor_grad = backward_step(
@@ -2112,15 +2108,14 @@ def forward_backward_pipelining_without_interleaving(
                 output_tensor_grad,
                 model_type,
                 config,
-                p2p_communicator.pp_group.size(),
             )
 
             if last_iteration:
                 input_tensor = None
-                p2p_communicator.send_backward(input_tensor_grad)
+                p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
             else:
                 input_tensor = p2p_communicator.send_backward_recv_forward(
-                    input_tensor_grad, recv_tensor_shapes
+                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
 
     # Run cooldown backward passes.
@@ -2133,13 +2128,13 @@ def forward_backward_pipelining_without_interleaving(
             # pipeline stages do grad reduction during pipeline
             # bubble.
             if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or rank == 0:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
-            output_tensor_grad = p2p_communicator.recv_backward(send_tensor_shapes)
+            output_tensor_grad = p2p_communicator.recv_backward(send_tensor_shapes, p2p_communicator.is_pp_last_stage)
 
             input_tensor_grad = backward_step(
                 input_tensor,
@@ -2147,10 +2142,9 @@ def forward_backward_pipelining_without_interleaving(
                 output_tensor_grad,
                 model_type,
                 config,
-                pipeline_model_parallel_size=p2p_communicator.pp_group.size(),
             )
 
-            p2p_communicator.send_backward(input_tensor_grad)
+            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
@@ -2163,7 +2157,7 @@ def forward_backward_pipelining_without_interleaving(
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         finish_embedding_wgrad_compute(
-            config, embedding_module, is_pp_last_stage(p2p_communicator.pp_group), tp_group
+            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
         )
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
