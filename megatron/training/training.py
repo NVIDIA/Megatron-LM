@@ -733,7 +733,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if args.save and iteration != 0 and iteration % args.save_interval != 0:
+        if args.save and iteration != 0 and iteration % args.save_interval == 0:
             save_checkpoint(
                 iteration,
                 model,
