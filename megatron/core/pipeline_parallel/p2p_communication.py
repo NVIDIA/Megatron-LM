@@ -217,22 +217,22 @@ class P2PCommunicator:
             ops = []
             if send_prev_shape_tensor is not None:
                 send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank
+                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(send_prev_op)
             if recv_prev_shape_tensor is not None:
                 recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank
+                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(recv_prev_op)
             if send_next_shape_tensor is not None:
                 send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank
+                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(send_next_op)
             if recv_next_shape_tensor is not None:
                 recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank
+                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(recv_next_op)
             if len(ops) > 0:
