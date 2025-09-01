@@ -7,6 +7,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu, quick_gelu
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
@@ -1534,15 +1535,25 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.use_te_activation_func:
-            if self.activation_func not in (F.gelu, F.silu, F.relu):
+            _supported_activation_funcs = [F.gelu, F.silu, F.relu]
+            if is_te_min_version("2.8.0"):
+                _supported_activation_funcs.extend([quick_gelu, squared_relu])
+            if self.activation_func not in _supported_activation_funcs:
                 raise ValueError(
-                    "TransformerEngine only support gelu, geglu, silu, swiglu, relu, reglu. "
+                    "TE supports SwiGLU, GEGLU, ReGLU, GELU, ReLU from v1.13, "
+                    "and QuickGELU, QuickGEGLU, SquaredReLU, SquaredReGLU, SiLU from v2.8.0. "
                     "If you don't want to use TransformerEngine activation function, set "
                     "use_te_activation_func to False"
                 )
 
         if self.activation_func_fp8_input_store:
-            if self.activation_func != F.silu or not self.gated_linear_unit:
+            if self.use_te_activation_func:
+                if not is_te_min_version("2.3"):
+                    raise ValueError(
+                        "Storing activation input in FP8 is supported only for TE >= 2.3.0. "
+                        "Please install TE >= 2.3.0"
+                    )
+            elif self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
         if self.apply_rope_fusion:
