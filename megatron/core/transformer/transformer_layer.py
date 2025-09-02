@@ -882,7 +882,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # it can happen that non-decode steps have a token count greater than the max
             # supported cuda graph token count. In that case this flag will be set to
             # False by initialize_attention, and we should not use cuda graphs.
-            if kwargs['inference_context'].using_cuda_graph_this_step():
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            if using_cuda_graph:
                 # dynamic_inference_decode_only is not a real argument to forward, it is only used
                 # to differentiate the cuda graph used for decode from the one used for non-decode
                 # inference.
