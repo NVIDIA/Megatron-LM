@@ -134,6 +134,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self._cond = asyncio.Condition()
 
     def create_cuda_graphs(self):
+        """Create cuda graphs.
+
+        This method iterates the dynamic context's `cuda_graph_request_counts`
+        to record and capture cuda graphs.
+        """
 
         # Capture cuda graph.
         if enable_cuda_graph is not None:
@@ -361,6 +366,20 @@ class DynamicInferenceEngine(AbstractEngine):
     @contextmanager
     @staticmethod
     def suspend_resume_ctx(key: str, *, newline: bool = True) -> None:
+        """Context manager for of suspending and resuming the engine.
+
+        This context manager records the time and memory usage when suspending
+        and resuming the context. TODO(@lmcafee): add argument to optionally
+        return nullcontext, to avoid overhead.
+
+        Args:
+            key (str): Key that identifies caller (e.g., 'suspend' or 'resume').
+            newline (bool): Print newline at end of printout below.
+
+        Return:
+            None.
+        """
+
         try:
 
             start_mem = torch.cuda.memory_stats()
