@@ -1,12 +1,12 @@
 import os
-from typing import Dict
+from typing import Dict, List
 
 import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
 from pytest_mock import mocker
-
+import logging
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
@@ -34,7 +34,7 @@ class DataIterator:
         return self
 
     def __next__(self):
-        return torch.randn(8, 512, 256, device='cuda')
+        return torch.randn(512, 1, 1024, device='cuda', dtype = torch.bfloat16)
 
 
 class Model(torch.nn.Module):
@@ -43,25 +43,30 @@ class Model(torch.nn.Module):
         super().__init__()
 
         self.encoder, self.encoder_grid = get_transformer_block_and_grid(
-            tp_size=2, cp_size=1, pp_size=2, dp_size=1
+            tp_size=2, cp_size=1, pp_size=2, dp_size=1, hidden_size=1024
         )
 
         self.llm, self.llm_grid = get_transformer_block_and_grid(
-            tp_size=2, cp_size=1, pp_size=2, dp_size=1, grid_offset=4
+            tp_size=2, cp_size=1, pp_size=2, dp_size=1, grid_offset=4, hidden_size=1024
         )
 
         self.encoder_input_tensor = None
         self.llm_input_tensor = None
 
-    def set_input_tensor(self, input_tensor: Dict[str, torch.Tensor]):
-        if 0 <= dist.get_rank() < 4:
-            assert "encoder" in input_tensor, "Encoder input tensor is not provided"
-            self.encoder_input_tensor = input_tensor["encoder"]
+    def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
+        if 0 <= dist.get_rank() < 4 and 'encoder' in input_tensor[0]:
+            logging.info(f"Current rank: {dist.get_rank()} setting encoder input tensor with shape {input_tensor[0]['encoder'][0].shape} dtype {input_tensor[0]['encoder'][0].dtype}")
+            self.encoder_input_tensor = input_tensor[0]["encoder"][0]
         elif 4 <= dist.get_rank() < 8:
-            assert "llm" in input_tensor, "LLM input tensor is not provided"
-            self.llm_input_tensor = input_tensor["llm"]
-        else:
-            raise ValueError(f"Rank {dist.get_rank()} is not valid")
+            if 'llm' in input_tensor[0]:
+                logging.info(f"Current rank: {dist.get_rank()} setting llm input tensor with shape {input_tensor[0]['llm'][0].shape} dtype {input_tensor[0]['llm'][0].dtype}")
+                self.llm_input_tensor = input_tensor[0]["llm"][0]
+            elif 'encoder' in input_tensor[0]:
+                logging.info(f"Current rank: {dist.get_rank()} setting encoder input tensor with shape {input_tensor[0]['encoder'].shape} dtype {input_tensor[0]['encoder'][0].dtype}")
+                self.llm_input_tensor = input_tensor[0]["encoder"]
+            else:
+                raise ValueError(f"Rank {dist.get_rank()} is not valid")
+            
 
     def forward(self, hidden_states):
 
@@ -76,17 +81,16 @@ class Model(torch.nn.Module):
                     self.encoder_input_tensor is not None
                 ), "Encoder input tensor is not provided for pp rank > 0"
                 input_tensor = self.encoder_input_tensor
-            output_dict["encoder"] = self.encoder(input_tensor)
+            logging.info(f"Current rank: {dist.get_rank()} In fwd calline encoder forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}")
+            output_dict["encoder"] = self.encoder(input_tensor, attention_mask=None)
         elif 4 <= current_rank < 8:
             # if pp rank > 0 in llm pp group then we use self.llm_input_tensor as input else we use hidden_states
-            if is_pp_first_stage(self.llm_grid.get_pg("pp")):
-                input_tensor = hidden_states
-            else:
-                assert (
-                    self.llm_input_tensor is not None
-                ), "LLM input tensor is not provided for pp rank > 0"
-                input_tensor = self.llm_input_tensor
-            output_dict["llm"] = self.llm(input_tensor)
+            assert (
+                self.llm_input_tensor is not None
+            ), "LLM input tensor is not provided for pp rank > 0"
+            input_tensor = self.llm_input_tensor
+            logging.info(f"Current rank: {dist.get_rank()} In fwd calline llm forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}")
+            output_dict["llm"] = self.llm(input_tensor, attention_mask=None)
         else:
             raise ValueError(f"Rank {current_rank} is not valid")
 
@@ -251,15 +255,15 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     # model.set_input_tensor = return_none
 
     sequence_length = 512
-    micro_batch_size = 8
-    hidden_size = 256
+    micro_batch_size = 1
+    hidden_size = 1024
 
     module_to_grid_map = {'encoder': model.encoder_grid, 'llm': model.llm_grid}
     topology = {
         'encoder': ['llm'],  # image_encoder sends forward results to llm
         'llm': [],  # llm is the last stage here
     }
-    config = ModelParallelConfig(pipeline_dtype=torch.float)
+    config = ModelParallelConfig(pipeline_dtype=torch.bfloat16)
     config.finalize_model_grads_func = finalize_model_grads
     model.config = config
     config.hidden_size = hidden_size
@@ -271,7 +275,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=2)
 
     data_iterator = None
-    if dist.get_rank() == 0:
+    if dist.get_rank() in [0,1]:
         data_iterator = DataIterator()
 
     common_args = {
@@ -298,3 +302,12 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     )
 
     Utils.destroy_model_parallel()
+
+
+if __name__ == "__main__":
+    from unittest.mock import Mock
+    
+    # Create a mock object that mimics pytest-mock's mocker
+    mock_mocker = Mock()
+    
+    test_forward_backward_pipelining_without_interleaving_multi_module(mock_mocker)
