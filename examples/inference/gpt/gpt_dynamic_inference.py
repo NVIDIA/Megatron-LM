@@ -336,6 +336,87 @@ def run_inference(
     }
 
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+def time_dynamic_context():
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # import time
+    # import torch
+    # def alloc():
+    #     t = time.time()
+    #     _tensor = torch.empty(
+    #         (2, 36, 9102, 256, 1, 128),
+    #         dtype=torch.bfloat16,
+    #         device="cuda",
+    #     )
+    #     t = time.time() - t
+    #     return _tensor, t
+    # tensor, t0 = alloc()
+    # del tensor
+    # tensor, t1 = alloc()
+    # del tensor
+    # tensor, t2 = alloc()
+    # print("~~~")
+    # print("m-lm | dummy ... %f, %f, %f." % (t0, t1, t2))
+    # exit()
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    import torch
+    # from tqdm import tqdm
+    from megatron.core.inference.contexts import DynamicInferenceContext
+
+    context = DynamicInferenceContext(
+        params_dtype=torch.bfloat16,
+        num_layers=36,
+        kv_channels=128,
+        num_attention_heads=2,
+        max_sequence_length=8191,
+        buffer_size_gb=40.0,
+        buffer_guaranteed_fraction=0.2,
+        chunk_size_tokens=256,
+        buffer_overflow_factor=None,
+        max_requests_override=None,
+        max_tokens_override=8192,
+        tensor_model_parallel_size=2,
+        num_cuda_graphs=1,
+        materialize_only_last_token_logits=False,
+    )
+    # >>>>>>>>>>>>>>>>>>>
+    # time_map_0 = context.allocation_time_map
+
+    # context.deallocate_all_tensors()
+    # time_map_1 = context.allocate_all_tensors()
+    # context.deallocate_all_tensors()
+    # time_map_2 = context.allocate_all_tensors()
+    # # context.deallocate_all_tensors()
+    # +++++++++++++++++++
+    time_maps = [ context.allocation_time_map ]
+    for _ in tqdm(range(4), "time context"): # 100
+        context.deallocate_all_tensors()
+        time_maps.append(context.allocate_all_tensors())
+    # <<<<<<<<<<<<<<<<<<<
+
+    # from lutil import pax
+    # pax("time_map_0, time_map_1, time_map_2", {
+    #     "m-lm | memory_buffer" : ", ".join("%.1e" % t for t in (
+    #         time_map_0["memory_buffer"],
+    #         time_map_1["memory_buffer"],
+    #         time_map_2["memory_buffer"],
+    #     )),
+    # })
+    print("~~~")
+    # print("m-lm | context ... %f, %f, %f." % (
+    #     time_map_0["memory_buffer"],
+    #     time_map_1["memory_buffer"],
+    #     time_map_2["memory_buffer"],
+    # ))
+    print("m-lm | context ... %s." % ", ".join(
+        "%.1e" % m["memory_buffer"] for m in time_maps
+    ))
+    exit()
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
 @torch.inference_mode()
 def main():
 
@@ -344,6 +425,10 @@ def main():
         extra_args_provider=add_dynamic_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+
+    # >>>
+    time_dynamic_context()
+    # <<<
 
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):

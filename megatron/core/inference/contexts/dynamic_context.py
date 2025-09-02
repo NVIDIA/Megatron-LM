@@ -156,6 +156,31 @@ class WarmupEngineMode(Enum):
     NON_DECODE = "non_decode"
 
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+def time_dummy_alloc():
+    import time
+    import torch
+    def alloc():
+        t = time.time()
+        _tensor = torch.empty(
+            # (2, 36, 9102, 256, 1, 128),
+            (2, 27, 9102, 256, 1, 128),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        t = time.time() - t
+        return _tensor, t
+    tensor, t0 = alloc()
+    del tensor
+    tensor, t1 = alloc()
+    del tensor
+    tensor, t2 = alloc()
+    print("~~~")
+    print("m-lm | ctx-dummy ... %f, %f, %f." % (t0, t1, t2))
+    exit()
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
