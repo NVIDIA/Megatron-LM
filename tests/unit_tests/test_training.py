@@ -25,6 +25,7 @@ def create_test_args():
     args.skip_train = False
     args.full_validation = False
     args.multiple_validation_sets = False
+    args.perform_rl_step = False
 
     return args
 

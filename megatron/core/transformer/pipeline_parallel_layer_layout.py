@@ -78,7 +78,7 @@ class PipelineParallelLayerLayout:
         self.layout = layout
         self.flatten_layout = flatten_layout
 
-    def validate_layer_layout(self, num_layers: int):
+    def validate_layer_layout(self, num_layers: int, mtp_num_layers: int):
         """Check whether the layout is valid."""
 
         # Check whether the input layer id is valid
@@ -103,12 +103,34 @@ class PipelineParallelLayerLayout:
             f"Number of decoder layers {self.flatten_layout.count(LayerType.decoder)}"
             f"must match num_layers {num_layers}"
         )
-
+        # MTP layer verification
+        assert self.flatten_layout.count(LayerType.mtp) == mtp_num_layers or (
+            mtp_num_layers is None and self.flatten_layout.count(LayerType.mtp) == 0
+        ), "Number of mtp layers in layout must match mtp_num_layers"
+        for i in range(len(self.flatten_layout)):
+            if self.flatten_layout[i] == LayerType.mtp:
+                assert (
+                    self.flatten_layout[i:].count(LayerType.decoder) == 0
+                ), "decoder layers must be placed before MTP layers"
+                break
+        for pp_rank in range(self.pipeline_model_parallel_size):
+            for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
+                assert (
+                    LayerType.mtp not in self.layout[pp_rank][vpp_rank]
+                ), f"Currently we restrict that the MTP should be always in the last "
+                f"virtual pipeline stage of that rank. But got {self.layout[pp_rank][vpp_rank]}"
+        for pp_rank in range(self.pipeline_model_parallel_size):
+            if LayerType.mtp in self.layout[pp_rank][-1]:
+                assert (
+                    self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
+                ), "All of the MTP layers must be in the same stage"
+                assert (
+                    pp_rank == self.pipeline_model_parallel_size - 1
+                    and LayerType.loss in self.layout[pp_rank][-1],
+                ), "MTP layers must be in the last stage together with Loss stage."
         # TODO: remove them in the future once they are supported
         if self.flatten_layout.count(LayerType.encoder) > 0:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")
-        if self.flatten_layout.count(LayerType.mtp) > 0:
-            raise NotImplementedError("MTP layer is not supported for flexible pipeline layout")
 
     def get_num_layers_to_build(
         self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None

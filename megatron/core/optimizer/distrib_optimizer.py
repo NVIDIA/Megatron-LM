@@ -3,12 +3,17 @@
 """Megatron distributed optimizer."""
 
 
+import gc
 import itertools
+from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional
+
+from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
 HAVE_APEX_OR_TE = True
 USING_TE_OPTIMIZER = False
@@ -77,6 +82,9 @@ class Range:
 
     def __str__(self):
         return "%d,%d [%d]" % (self.start, self.end, self.size)
+
+    def __repr__(self):
+        return str(self)
 
     def __len__(self):
         return self.end - self.start
@@ -840,8 +848,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
-            elif sharding_type == 'fully_sharded_bucket_space':
-                self.load_parameter_state_from_fs_bucket_space(param_state)
+            elif sharding_type == 'fully_reshardable':
+                self.load_parameter_state_from_fully_reshardable(param_state)
+            elif sharding_type == 'dp_reshardable':
+                self.load_parameter_state_from_dp_reshardable(param_state)
             elif sharding_type == 'fully_sharded_model_space':
                 self.load_parameter_state_from_fs_model_space(param_state)
             else:
@@ -906,7 +916,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for key in dst_tensors:
                 dst_tensors[key].copy_(tensors[key])
 
-    def get_parameter_state_fs_bucket_space(self):
+    def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
 
         This is referred to as "fully sharded bucket space" because the optimizer state is
@@ -941,7 +951,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state[gbuf_idx] = dtype_state
         return state
 
-    def get_parameter_state_dp_zero(self):
+    def get_parameter_state_dp_zero(
+        self,
+        use_gloo_comm: bool = True,
+        empty_data: bool = False,
+        return_on_all_ranks: bool = False,
+    ):
         """Get parameter state (i.e., parameter & optimizer tensors).
 
         This method performs two steps:
@@ -950,15 +965,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
           exp_avg_sq).
         - Gather contiguous buffers on DP rank 0 and concatenate to world
           buffers.
+
+
+        Args:
+            use_gloo_comm (bool, optional): Whether to use Gloo communication for tensors
+                gather. Defaults to True. Has effect only for non-FSDP case.
+            empty_data (bool, optional): Whether to fill world tensors with actual data.
+                Empty world tensors are used during checkpoint loading. Defaults to False.
+                Has effect only for non-FSDP case.
+            return_on_all_ranks (bool, optional): Whether to return the state dict on all ranks.
+                If False, DP != 0 ranks will return None. Defaults to False.
+                Has effect only for non-FSDP case. Returning the whole state dict on all ranks
+                allows to utilize parallel saving and loading when used for sharded state dict
+                creation.
+
+        Returns:
+            dict or None: optimizer state dict on DP rank 0, or all ranks if return_on_all_ranks.
+                Returns None on non-zero DP ranks when return_on_all_ranks=False.
         """
         # Data parallelism variables.
-        assert self.data_parallel_group_gloo is not None
-        data_parallel_world_size = self.data_parallel_group_gloo.size()
-        data_parallel_rank = self.data_parallel_group_gloo.rank()
-        data_parallel_group_gloo = self.data_parallel_group_gloo
-        data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
-            self.data_parallel_group_gloo
-        )
+        if use_gloo_comm:
+            data_parallel_group = self.data_parallel_group_gloo
+        else:
+            data_parallel_group = self.data_parallel_group
+        assert data_parallel_group is not None
+        data_parallel_world_size = data_parallel_group.size()
+        data_parallel_rank = data_parallel_group.rank()
+        data_parallel_global_ranks = torch.distributed.get_process_group_ranks(data_parallel_group)
 
         # Collect param states.
         state = {"buckets_coalesced": True}
@@ -971,7 +1004,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
                 world_tensors = {}
-                if data_parallel_rank == 0:
+                if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
                         key: torch.zeros(
                             (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
@@ -979,75 +1012,93 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         for key in ("param", "exp_avg", "exp_avg_sq")
                     }
                     world_tensors["numel_unpadded"] = buffer_numel_unpadded
-                offset_in_world_tensors = 0
-                for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
 
-                    # Compute local DP contiguous shard's size.
-                    gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
-                    assert gbuf_world_numel % data_parallel_world_size == 0
-                    gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
+                if not empty_data:
+                    offset_in_world_tensors = 0
+                    for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
 
-                    gbuf_world_numel_unpadded = (
-                        self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
-                    )
-                    assert gbuf_world_numel_unpadded <= gbuf_world_numel
-
-                    local_shards = {
-                        key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                        for key in ("param", "exp_avg", "exp_avg_sq")
-                    }
-
-                    # Build contiguous DP rank shards (for param + optim states).
-                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
-                        tensors = self._get_main_param_and_optimizer_states(model_param)
-
-                        # Copy states into contiguous shard.
-                        gbuf_local_start = param_range_map["gbuf_local"].start
-                        gbuf_local_end = param_range_map["gbuf_local"].end
-                        for key in local_shards:
-                            local_shards[key][gbuf_local_start:gbuf_local_end].data.copy_(
-                                tensors[key].detach().cpu()
-                            )
-
-                    # Gather contiguous shards on DP rank 0.
-                    for key, send_tensor in local_shards.items():
-
-                        # Gather tensor list.
-                        if data_parallel_rank == 0:
-                            recv_tensors = [
-                                torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                                for _ in range(data_parallel_world_size)
-                            ]
-                        else:
-                            recv_tensors = None
-
-                        # Gather.
-                        torch.distributed.gather(
-                            send_tensor,
-                            recv_tensors,
-                            data_parallel_global_ranks[0],
-                            data_parallel_group_gloo,
+                        # Compute local DP contiguous shard's size.
+                        gbuf_world_numel = (
+                            self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
                         )
+                        assert gbuf_world_numel % data_parallel_world_size == 0
+                        gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
-                        # Concatenate.
-                        if data_parallel_rank == 0:
-                            recv_tensors_concatenated = torch.cat(recv_tensors)
-                            # Copy this bucket's collected all-gather tensors into the right place
-                            # in the tensor for the buffer. The tensor for the buffer gets rid of
-                            # the padding between buckets.
-                            start = offset_in_world_tensors
-                            end = offset_in_world_tensors + gbuf_world_numel_unpadded
-                            world_tensors[key][start:end].copy_(
-                                recv_tensors_concatenated[:gbuf_world_numel_unpadded]
-                            )
+                        gbuf_world_numel_unpadded = (
+                            self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
+                        )
+                        assert gbuf_world_numel_unpadded <= gbuf_world_numel
 
-                    offset_in_world_tensors += gbuf_world_numel_unpadded
+                        local_shards = {
+                            key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
+                            for key in ("param", "exp_avg", "exp_avg_sq")
+                        }
+
+                        # Build contiguous DP rank shards (for param + optim states).
+                        for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                            tensors = self._get_main_param_and_optimizer_states(model_param)
+
+                            # Copy states into contiguous shard.
+                            gbuf_local_start = param_range_map["gbuf_local"].start
+                            gbuf_local_end = param_range_map["gbuf_local"].end
+                            for key in local_shards:
+                                local_shards[key][gbuf_local_start:gbuf_local_end].data.copy_(
+                                    tensors[key].detach().cpu()
+                                )
+
+                        # Gather contiguous shards on DP rank 0.
+                        for key, send_tensor in local_shards.items():
+
+                            # Gather tensor list.
+                            if data_parallel_rank == 0 or return_on_all_ranks:
+                                device = "cpu" if use_gloo_comm else torch.cuda.current_device()
+                                recv_tensors = [
+                                    torch.zeros(
+                                        (gbuf_local_numel,), dtype=torch.float32, device=device
+                                    )
+                                    for _ in range(data_parallel_world_size)
+                                ]
+                            else:
+                                recv_tensors = None
+
+                            # Gather.
+                            if not use_gloo_comm:
+                                send_tensor = send_tensor.cuda()
+                            if return_on_all_ranks:
+                                torch.distributed.all_gather(
+                                    recv_tensors, send_tensor, data_parallel_group
+                                )
+                            else:
+                                torch.distributed.gather(
+                                    send_tensor,
+                                    recv_tensors,
+                                    data_parallel_global_ranks[0],
+                                    data_parallel_group,
+                                )
+
+                            send_tensor = None  # allow mem deallocation
+
+                            # Concatenate.
+                            if data_parallel_rank == 0 or return_on_all_ranks:
+                                if not use_gloo_comm:
+                                    recv_tensors = [t.cpu() for t in recv_tensors]
+                                recv_tensors_concatenated = torch.cat(recv_tensors)
+                                # Copy this bucket's collected all-gather tensors into the right
+                                # place in the tensor for the buffer. The tensor for the buffer
+                                # gets rid of the padding between buckets.
+                                start = offset_in_world_tensors
+                                end = offset_in_world_tensors + gbuf_world_numel_unpadded
+                                world_tensors[key][start:end].copy_(
+                                    recv_tensors_concatenated[:gbuf_world_numel_unpadded]
+                                )
+
+                        offset_in_world_tensors += gbuf_world_numel_unpadded
 
                 # Collect world state.
                 dtype_state[dtype] = world_tensors
             state[gbuf_idx] = dtype_state
 
-        return state
+        return state if data_parallel_rank == 0 or return_on_all_ranks else None
 
     def save_parameter_state(self, filename: str):
         """Save the distributed parameter state on DP rank 0.
@@ -1152,7 +1203,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         state_dict = self.state_dict()
-        if sharding_type != 'fully_sharded_model_space':
+        if sharding_type in ('dp_zero_gather_scatter', 'dp_reshardable'):
             # State dict differs between different model parallel groups
             state_dict = {
                 k: ShardedObject(
@@ -1160,7 +1211,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     v,
                     (1,),
                     (0,),
-                    replica_id=self.data_parallel_group.rank(),
+                    replica_id=(
+                        self.distributed_optimizer_instance_id,
+                        0,
+                        self.data_parallel_group.rank(),
+                    ),
                 )
                 for k, v in state_dict.items()
             }
@@ -1170,16 +1225,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # which conditionally skips re-allocating the optimizer's state if
             # already initialized, which in turn reduces memory fragmentation.
             self.load_state_dict(self.state_dict())
-        if sharding_type == 'fully_sharded_bucket_space':
-            param_state = self.sharded_param_state_fs_bucket_space(
-                model_sharded_state_dict, is_loading
+        if sharding_type == 'dp_reshardable':
+            param_state = self.sharded_param_state_dp_reshardable(
+                model_sharded_state_dict, is_loading, metadata
             )
-
         elif sharding_type == 'dp_zero_gather_scatter':
-            param_state = self.sharded_param_state_dp_zero(model_sharded_state_dict, is_loading)
+            # NOTE: this format will be deprecated
+            param_state = self.sharded_param_state_dp_zero(
+                model_sharded_state_dict, is_loading, metadata
+            )
+            gc.collect()  # Prevent memory leaks with GC disabled
+        elif sharding_type == 'fully_reshardable':
+            param_state = self.sharded_param_state_fully_reshardable(
+                model_sharded_state_dict, is_loading, metadata
+            )
+            gc.collect()  # Prevent memory leaks with GC disabled
         elif sharding_type == 'fully_sharded_model_space':
+            # NOTE: this format will be deprecated
             param_state = self.sharded_param_state_fs_model_space(
-                model_sharded_state_dict, is_loading
+                model_sharded_state_dict, is_loading, metadata
             )
         else:
             raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
@@ -1264,7 +1328,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return state_dict
 
     def sharded_param_state_dp_zero(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
         """Naive implementation which reuses gather/scatter from the legacy ckpt format.
 
@@ -1277,7 +1344,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             if self.distributed_optimizer_instance_id == 0:
                 # Gather on rank 0
-                param_state_data = self.get_parameter_state_dp_zero()
+                param_state_data = self.get_parameter_state_dp_zero(use_gloo_comm=False)
 
         if self.data_parallel_group.rank() == 0 and self.distributed_optimizer_instance_id == 0:
             # Fixed TPxPP. Save on DP rank 0 only
@@ -1293,18 +1360,179 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return param_state
 
-    def sharded_param_state_fs_bucket_space(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    def sharded_param_state_fully_reshardable(
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
+    ):
+        """Exchange based format in model space representation.
+
+        `fully_reshardable` format involves gathering the tensors on DP rank 0 during save.
+        Flat DistOpt buffers are unflattened and reshaped into model param like sizes.
+        This results in a state dict similar to a regular optimizer one, where each
+        param of shape (X, Y, Z) has corresponding 'param', 'exp_avg' and 'exp_avg_sq'
+        tensors of shape (X, Y, Z) in the optimizer state dict.
+
+        During loading there is no data exchange - each rank requests to load the whole
+        state dict (and flattens and trims the tensors afterwards). It is recommended
+        to use fully parallel loading which will parallelize the load and avoid duplicated
+        read from storage.
+
+        Args:
+            model_sharded_state_dict (ShardedStateDict): model sharded state dict
+            is_loading (bool, optional): Whether the optimizer sharded state dict
+                is used for loading or saving. Defaults to False.
+            metadata (dict, optional): metadata passed to sharded_state_dict method.
+                Allows some detailed control over the sharded state dict creation with
+                `distrib_optim_fully_reshardable_mem_efficient` flag which enables memory
+                efficient exchange. By default (False), data will be all_gathered with NCCL
+                to all ranks which allows to further parallelize the save and load, but can
+                use more memory. In memory efficient version (True) data is gather with Gloo
+                and returned only on DP rank 0 (which prevent save/load parallelization along DP).
+                The checkpoint storage structure can differ between those two flags, but from
+                MCore perspective they are interchangeable.
+
+        Returns:
+            ShardedStateDict or None: optimizer sharded state dict if memory efficient mode is off
+                (see flag `distrib_optim_fully_reshardable_mem_efficient` explanation above)
+                or during checkpoint loading (`is_loading`). Otherwise, the sharded state dict
+                is returned only on DP rank 0 (None on other ranks).
+        """
+        if metadata.get('distrib_optim_fully_reshardable_mem_efficient', False):
+            use_gloo_comm = True
+            return_on_all_ranks = False
+        else:
+            use_gloo_comm = False
+            return_on_all_ranks = True
+        dp_zero_state_dict = self.get_parameter_state_dp_zero(
+            use_gloo_comm=use_gloo_comm,
+            empty_data=is_loading,
+            return_on_all_ranks=return_on_all_ranks or is_loading,
+        )
+
+        param_to_sharded_metadata = {}
+        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
+            model_sharded_state_dict
+        )
+        for sh_base in nested_values(model_sharded_state_dict):
+            param_to_sharded_metadata[sh_base.data] = sh_base
+
+        prefix = 'optimizer.state'
+        model_space_state = {}
+        param_idx = 0
+
+        if dp_zero_state_dict is None:
+            return None
+
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            buffer = self.buffers[gbuf_idx]
+            assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
+            for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                world_tensors = dp_zero_state_dict[gbuf_idx][dtype]
+                world_tensor_keys = world_tensors.keys()
+                for model_param, (
+                    param_world_start,
+                    param_world_end,
+                    _,
+                ) in buffer.param_index_map.items():
+                    try:
+                        sharded_metadata = param_to_sharded_metadata[model_param]
+                    except KeyError as e:
+                        raise ValueError(
+                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f" Hint: {KEEP_VARS_HINT}"
+                        ) from e
+                    assert (
+                        sharded_metadata.flattened_range is None
+                    ), f"Flattened model tensor not supported ({sharded_metadata})"
+
+                    # Note: replica_id is exactly the same as in the model param
+                    replica_id = sharded_metadata.replica_id
+
+                    tensors = {}
+                    for state_key in world_tensor_keys:
+                        if state_key == 'step' or state_key == 'numel_unpadded':
+                            # The optimizer state of STEP is handled
+                            # specifically and is read from param_groups.
+                            # Numel unpadded is not needed.
+                            continue
+                        state_ten = world_tensors[state_key][param_world_start:param_world_end]
+                        missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
+
+                        if missing_elems_num > 0:
+                            # `state_ten` is shorter than the slice which means the world_tensor
+                            # is shorter than `param_world_end` - this is a bug in the param ranges
+                            # logic. Here we can only pad this with zeros as a workaround.
+                            # TODO: this assert shouldn't hold and indicates a bug, see issue #504
+                            assert param_world_end > buffer.numel_unpadded
+
+                            logger.warning(
+                                f"'{sharded_metadata.key}' param range exceeds"
+                                f" unpadded buffer by {missing_elems_num} elements."
+                                f" It will be padded with zeros which can lead to"
+                                f" data corruption."
+                            )
+                            state_ten = torch.nn.functional.pad(state_ten, (0, missing_elems_num))
+
+                        assert len(state_ten) == param_world_end - param_world_start, (
+                            len(state_ten),
+                            param_world_end - param_world_start,
+                        )
+                        state_ten = state_ten.reshape(sharded_metadata.data.shape)
+                        replace_kwargs = dict(
+                            key=f'{prefix}.{state_key}.{sharded_metadata.key}',
+                            data=state_ten,
+                            dtype=state_ten.dtype,
+                            replica_id=replica_id,
+                        )
+                        if isinstance(sharded_metadata, ShardedTensorFactory):
+                            replace_kwargs.pop('dtype')
+                        tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                        tensors[state_key].validate_metadata_integrity()
+                    model_space_state[param_idx] = tensors
+                    param_idx += 1
+
+        return model_space_state
+
+    def sharded_param_state_dp_reshardable(
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
         """Sharded state dict where each noncontiguous buffer is a separate ShardedTensor.
 
         Results in fully parallel save and load without any inter-process
         communication or intermediate buffers/copies.
+
+        Stores optimizer state in the format that corresponds to the internal Distributed
+        Optimizer format, i.e. in buckets. Each buckets consists of state parameters and
+        potentially some padding:
+        - intra-param padding
+        - param 1
+        - intra-param padding
+        - param 2
+        - intra-param padding
+        - param ...
+        - intra-param padding
+        - param N
+        - intra-param padding
+        - bucket padding to some DP multiple
+
+        Different buckets are assigned a different ShardedTensor key. Within each bucket,
+        each param and each padding above is represented with a different ShardedTensor object
+        sharing the same key (so, corresponding to the same tensor in the checkpoint).
+
+        For checkpointing, we include the intra-param padding for correctness
+        but we must discard the last padding to DP multiple, because that might
+        change during DP resharding - we want the checkpoint tensor to always have size
+        `gbuf_world_numel_unpadded` which means everything except for the last padding above.
         """
         data_parallel_rank = self.data_parallel_group.rank()
         data_parallel_world_size = self.data_parallel_group.size()
 
-        state = self.get_parameter_state_fs_bucket_space()
+        state = self.get_parameter_state_dp_reshardable()
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
             key = (
@@ -1312,14 +1540,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 f'.{per_bucket_key}'
             )
             state[per_bucket_key] = ShardedObject(
-                key, state[per_bucket_key], (1,), (0,), replica_id=data_parallel_rank
+                key,
+                state[per_bucket_key],
+                (1,),
+                (0,),
+                replica_id=(self.distributed_optimizer_instance_id, 0, data_parallel_rank),
             )
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
                 for bucket_idx, bucket_state in enumerate(gbuf_range_map_for_all_buckets):
                     # Compute local DP contiguous shard's size.
+                    gbuf_world_numel_unpadded = (
+                        self.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
+                    )
                     gbuf_world_numel = self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
+                    assert gbuf_world_numel_unpadded <= gbuf_world_numel
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
@@ -1334,10 +1570,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
-                    for i in range(len(bucket_state) - 1):
-                        next_param_start = bucket_state[i + 1]['gbuf_local_start']
-                        cur_param_end = bucket_state[i]['gbuf_local_end']
-                        if next_param_start != cur_param_end:
+                    for i in range(-1, len(bucket_state)):
+                        if i == len(bucket_state) - 1:
+                            # Potential padding at the end
+                            next_param_start = gbuf_local_numel
+                        else:
+                            next_param_start = bucket_state[i + 1]['gbuf_local_start']
+                        if i == -1:
+                            # Potential padding at the front
+                            cur_param_end = 0
+                        else:
+                            cur_param_end = bucket_state[i]['gbuf_local_end']
+                        world_param_end = data_parallel_rank * gbuf_local_numel + cur_param_end
+                        # Insert padding if there is a gap between next param,
+                        # but not exceeding unpadded gbuf size
+                        if (
+                            next_param_start != cur_param_end
+                            and world_param_end < gbuf_world_numel_unpadded
+                        ):
                             pad_tensors = {
                                 k: torch.empty(
                                     next_param_start - cur_param_end, dtype=v.dtype, device=v.device
@@ -1357,26 +1607,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for index_to_insert in reversed(indices_to_insert):
                         bucket_state.insert(index_to_insert, all_pad_tensors[index_to_insert])
 
-                    if bucket_state[-1]['gbuf_local_end'] != gbuf_local_numel:
-                        pad_tensors = {
-                            k: torch.empty(
-                                gbuf_local_numel - bucket_state[-1]['gbuf_local_end'],
-                                dtype=v.dtype,
-                                device=v.device,
-                            )
-                            for k, v in bucket_state[-1].items()
-                            if isinstance(v, torch.Tensor)
-                        }
-                        bucket_state.append(
-                            {
-                                **pad_tensors,
-                                'gbuf_local_start': bucket_state[-1]['gbuf_local_end'],
-                                'gbuf_local_end': gbuf_local_numel,
-                                'padding': True,
-                            }
-                        )
-
-                    # Each tensor is mapped to a slice (`flattened_range`)
+                    # Each tensor is mapped to a slice
                     # of a DP-local shard of size `gbuf_local_numel`.
                     for bucket_params_idx in range(len(bucket_state)):
                         tensors = bucket_state[bucket_params_idx]
@@ -1399,17 +1630,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 f'{sharded_bucket_key}.{key}',
                                 tensors[key],
                                 tensors[key].dtype,
-                                (gbuf_local_numel,),
-                                (data_parallel_world_size * gbuf_local_numel,),
-                                (data_parallel_rank * gbuf_local_numel,),
-                                axis_fragmentations=(data_parallel_world_size,),
-                                flattened_range=slice(gbuf_local_start, gbuf_local_end),
-                                allow_shape_mismatch=True,
+                                tensors[key].shape,
+                                (gbuf_world_numel_unpadded,),
+                                (data_parallel_rank * gbuf_local_numel + gbuf_local_start,),
+                                axis_fragmentations=None,
+                                flattened_range=None,
+                                allow_shape_mismatch=False,
+                                replica_id=(self.distributed_optimizer_instance_id, 0, 0),
                             )
         return state
 
     def sharded_param_state_fs_model_space(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
         """Sharded state dict where each buffer is mapped to corresponding model param.
 
@@ -1441,7 +1676,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 sharded_metadata = param_to_sharded_metadata[model_param]
             except KeyError as e:
                 raise ValueError(
-                    f'Model param {model_param} not in model_sharded_state_dict'
+                    f"Model param {model_param} not in model_sharded_state_dict"
+                    f" Hint: {KEEP_VARS_HINT}"
                 ) from e
 
             # Set DP corresponding replica_id coordinate to 0.
@@ -1487,16 +1723,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param_idx += 1
         return state
 
-    def load_parameter_state_from_fs_bucket_space(self, state_dict):
+    def load_parameter_state_from_dp_reshardable(self, state_dict):
         """Loads the parameter state from an internal representation.
 
-        Inverse of the `get_parameter_state_fs_bucket_space` method.
+        Inverse of the `get_parameter_state_dp_reshardable` method.
         """
-        logger.warning(
-            '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
-            'checkpoint is deprecated. Please switch to `full_sharded_model_space`'
-        )
-
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -1627,7 +1858,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         assert gbuf_world_numel_unpadded <= gbuf_world_numel
 
                         # Contiguous local shards (received from DP rank 0).
-                        recv_tensor = torch.empty(
+                        recv_tensor = torch.zeros(
                             (gbuf_local_numel,), dtype=torch.float32, device="cpu"
                         )
 
@@ -1788,6 +2019,57 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 for model_param, tensors in recv_tensors.items():
                     self._set_main_param_and_optimizer_states(model_param, tensors)
+
+    @torch.no_grad()
+    def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
+        """Load counterpart of sharded_param_state_fully_reshardable.
+
+        Iterates over the `state_dict` tensors (in the same order as
+        `sharded_param_state_fully_reshardable` which determines the state dict tensors
+        order), flattens and trims them according to local param ranges.
+
+        Args:
+            state_dict (dict): loaded optimizer state dict
+        """
+        param_idx = -1
+        for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
+            assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                all_buckets_param_range_map = ChainMap(
+                    *(
+                        gbuf_range_map["param_map"]
+                        for gbuf_range_map in gbuf_range_map_for_all_buckets
+                    )
+                )
+                # We only need locally tracked params, but we must match iteration order
+                # (`param_idx`) with `sharded_param_state_fully_reshardable` order
+                for model_param, (param_world_start, param_world_end, _) in self.buffers[
+                    gbuf_idx
+                ].param_index_map.items():
+                    param_idx += 1  # increment even if skip param update
+                    if model_param not in all_buckets_param_range_map:
+                        continue
+                    param_range_map = all_buckets_param_range_map[model_param]
+                    src_tensors = {}
+                    for k, v in state_dict[param_idx].items():
+                        if k == "step":
+                            # Handle torch Adam "step" state separately.
+                            continue
+                        v_flat = v.flatten()
+                        v_flat = v_flat[
+                            param_range_map["param"].start : param_range_map["param"].end
+                        ]
+                        assert (
+                            len(v_flat)
+                            == param_range_map["param"].end - param_range_map["param"].start
+                        ), (len(v_flat), param_range_map["param"])
+                        if k == "fp32_param":
+                            src_tensors["param"] = v_flat
+                        else:
+                            src_tensors[k] = v_flat
+                    self._set_main_param_and_optimizer_states(model_param, src_tensors)
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     def split_state_dict_if_needed(self, state_dict):
         """

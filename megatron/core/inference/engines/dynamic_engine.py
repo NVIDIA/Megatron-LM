@@ -4,6 +4,7 @@ import asyncio
 import multiprocessing
 import os
 import struct
+import warnings
 from collections import deque
 from datetime import datetime
 from itertools import repeat
@@ -15,11 +16,8 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
-    ChunkOverflowError,
+    ContextOverflowError,
     DynamicInferenceContext,
-    MaxSequenceLengthOverflowError,
-    RequestOverflowError,
-    TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -82,9 +80,16 @@ class DynamicInferenceEngine(AbstractEngine):
         controller: SimpleTextGenerationController,
         context: DynamicInferenceContext,
         termination_id: int,
-        enable_cuda_graph: bool,
+        enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
     ):
+
+        if enable_cuda_graph is not None:
+            warnings.warn(
+                "The `enable_cuda_graph` argument is deprecated and will be "
+                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
+                "read directly from the transformer config object."
+            )
 
         assert isinstance(controller, SimpleTextGenerationController)
         assert isinstance(context, DynamicInferenceContext)
@@ -118,8 +123,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
-        self.enable_cuda_graph = enable_cuda_graph
-        if enable_cuda_graph:
+        if enable_cuda_graph is not None:
+            self.enable_cuda_graph = enable_cuda_graph
+        else:
+            self.enable_cuda_graph = (
+                controller.inference_wrapped_model.model.config.enable_cuda_graph
+            )
+        self.capture_stats = None
+        if self.enable_cuda_graph:
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
@@ -160,7 +171,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Create cuda graphs.
             with torch.inference_mode():
-                create_cudagraphs()
+                self.capture_stats = create_cudagraphs()
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -357,10 +368,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
-        except (TokenOverflowError, RequestOverflowError, ChunkOverflowError) as e:
-            self.waiting_request_ids.append(request_id)
-        except MaxSequenceLengthOverflowError as e:
-            raise e
+        except ContextOverflowError as e:
+            if e.is_transient:
+                self.waiting_request_ids.append(request_id)
+            else:
+                raise e
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()

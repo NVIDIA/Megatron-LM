@@ -1086,3 +1086,7 @@ class KitchenSpecProvider(BackendSpecProvider):
             return SequentialMLP, MLPSubmodules(
                 linear_fc1=KitchenColumnParallelLinear, linear_fc2=KitchenRowParallelLinear
             )
+
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        return None

@@ -160,6 +160,44 @@ def split_te_layernorm_column_parallel_linear(
     return norm_layer, linear_layer
 
 
+if HAVE_TE and is_te_min_version("1.13.0"):
+
+    class TEActivationOp:
+        """
+        A conditional wrapper to initialize an instance of Transformer-Engine's activation
+        function operators (e.g. Silu, SwiGLU, etc)
+        """
+
+        def __new__(cls, config: TransformerConfig):
+
+            layer_type = None
+            if config.gated_linear_unit:
+                if config.activation_func == F.silu:
+                    layer_type = te.pytorch.ops.SwiGLU
+                elif config.activation_func == F.gelu:
+                    layer_type = te.pytorch.ops.GEGLU
+                elif config.activation_func == F.silu:
+                    layer_type = te.pytorch.ops.ReGLU
+            else:
+                if config.activation_func == F.gelu:
+                    layer_type = te.pytorch.ops.GELU
+                elif config.activation_func == F.silu:
+                    layer_type = te.pytorch.ops.ReLU
+            if layer_type is None:
+                raise Exception(
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'transformer engine. Please set use_te_activation_func=False'
+                )
+            activation_func_kwargs = {}
+            if config.activation_func_fp8_input_store:
+                activation_func_kwargs["cache_quantized_input"] = True
+            layer = layer_type(**activation_func_kwargs)
+            return layer
+
+else:
+    TEActivationOp = None
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""

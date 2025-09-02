@@ -15,6 +15,9 @@ import torch
 
 from megatron.core import rerun_state_machine
 from megatron.training import get_args
+from megatron.training.async_utils import (
+    reset_persistent_async_worker,
+)
 
 from . import arguments
 
@@ -23,7 +26,6 @@ def destroy_state():
     from . import training
     training.destroy_global_state()
     rerun_state_machine.destroy_rerun_state_machine()
-
 
 def inprocess_restart(train, args):
     if inprocess is None:
@@ -76,9 +78,18 @@ def inprocess_restart(train, args):
         inprocess.initialize.RetryController(min_world_size=args.inprocess_active_world_size),
         inprocess.nested_restarter.NestedRestarterHandlingCompleted(),
     )
+
+    class AbortCheckpoint(inprocess.abort.Abort):
+        def __call__(
+            self, state: inprocess.state.FrozenState
+        ) -> inprocess.state.FrozenState:
+            reset_persistent_async_worker()
+            return state
+
     abort = inprocess.Compose(
         inprocess.abort.AbortTransformerEngine(),
         inprocess.abort.AbortTorchDistributed(),
+        AbortCheckpoint(),
         inprocess.nested_restarter.NestedRestarterHandlingStarting(),
     )
     completion = inprocess.nested_restarter.NestedRestarterFinalized()

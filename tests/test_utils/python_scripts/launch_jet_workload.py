@@ -116,7 +116,10 @@ def launch_and_wait_for_completion(
                 wait_for_validation=True,
                 max_wait_time=(60 * 60),
             )
-        except (jetclient.clients.gitlab.GitlabAPIError, jetclient.facades.objects.util.WaitTimeExceeded) as e:
+        except (
+            jetclient.clients.gitlab.GitlabAPIError,
+            jetclient.facades.objects.util.WaitTimeExceeded,
+        ) as e:
             logger.error(f"Faced {str(e)}. Waiting and retrying...")
             n_submission_attempts += 1
             time.sleep(2**n_submission_attempts * 5)
@@ -274,6 +277,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "Connection reset by peer" in concat_allranks_logs
         or "invalid pointer" in concat_allranks_logs
         or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
     )
 
 
@@ -371,7 +375,7 @@ def main(
     n_attempts = 0
     n_nondeterminism_attemps = 0
     n_iteration = 0
-    while True and n_attempts < 3 and n_nondeterminism_attemps < 2:
+    while True and n_attempts < 9 and n_nondeterminism_attemps < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
@@ -479,7 +483,7 @@ def main(
                 n_attempts += 1
                 continue
 
-            if "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log:
+            if ("FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue

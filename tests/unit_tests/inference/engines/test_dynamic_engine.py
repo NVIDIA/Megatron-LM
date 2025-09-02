@@ -33,6 +33,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -68,8 +69,11 @@ class DynamicEngineTestConfig:
 
     set_rounder(4)
     num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
+    min_prompt_length: int = 4
     max_prompt_length: int = 16
     max_output_length: int = 4
+    max_sequence_length: Optional[int] = None
+
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
@@ -91,6 +95,10 @@ class DynamicEngineTestConfig:
 
     def __post_init__(self):
 
+        # Compute max_sequence_length.
+        assert self.max_sequence_length is None
+        self.max_sequence_length = self.max_prompt_length + self.max_output_length
+
         # Update overrides if not using overflow factor.
         if self.context_buffer_overflow_factor is None:
 
@@ -100,9 +108,7 @@ class DynamicEngineTestConfig:
 
             # Enough room for all tokens.
             if self.context_max_tokens_override is None:
-                self.context_max_tokens_override = self.num_requests * (
-                    self.max_prompt_length + self.max_output_length
-                )
+                self.context_max_tokens_override = self.num_requests * self.max_sequence_length
 
 
 @dataclass
@@ -121,12 +127,15 @@ class TestDynamicInferenceEngine:
     def _build_requests(
         cls,
         num_requests: int,
+        min_prompt_length: int,
         max_prompt_length: int,
         max_sequence_length: int,
         vocab_size: int,
         use_fixed_output_lengths: bool = False,
     ) -> List[Request]:
-        prompt_lengths = torch.randint(4, max_prompt_length, (num_requests,)).tolist()
+        prompt_lengths = torch.randint(
+            min_prompt_length, max_prompt_length + 1, (num_requests,)
+        ).tolist()
         num_tokens_to_generate: List[Optional[int]]
         if use_fixed_output_lengths:
             num_tokens_to_generate = [
@@ -152,17 +161,13 @@ class TestDynamicInferenceEngine:
     ):
         """The inference context manages the KV cache and other inference state."""
 
-        # Max sequence length.
-        max_prompt_length = max(len(r.prompt) for r in requests)
-        max_sequence_length = test_config.max_prompt_length + test_config.max_output_length
-
         # Inference context.
         context = DynamicInferenceContext(
             params_dtype=transformer_config.params_dtype,
             num_layers=transformer_config.num_layers,
             kv_channels=transformer_config.kv_channels,
             num_attention_heads=transformer_config.num_query_groups,
-            max_sequence_length=max_sequence_length,
+            max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
@@ -223,8 +228,9 @@ class TestDynamicInferenceEngine:
         # Requests.
         requests = cls._build_requests(
             num_requests=test_config.num_requests,
+            min_prompt_length=test_config.min_prompt_length,
             max_prompt_length=test_config.max_prompt_length,
-            max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
+            max_sequence_length=test_config.max_sequence_length,
             vocab_size=vocab_size,
             use_fixed_output_lengths=test_config.use_fixed_output_lengths,
         )
@@ -245,7 +251,7 @@ class TestDynamicInferenceEngine:
             config=transformer_config,
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=vocab_size,
-            max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
+            max_sequence_length=test_config.max_sequence_length,
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
@@ -283,6 +289,11 @@ class TestDynamicInferenceEngine:
             inference_wrapped_model=inference_wrapped_model,
             tokenizer=types.SimpleNamespace(vocab_size=vocab_size),
         )
+
+        # Reset global cuda graph state.
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
 
         # Inference engine.
         engine = DynamicInferenceEngine(
@@ -387,14 +398,14 @@ class TestDynamicInferenceEngine:
 
         # Validate output tokens.
         expected_outputs = [
-            [69, 85, 55, 74, 85, 89],
-            [29, 54, 33, 30, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98],
-            [35, 78, 64, 59, 55, 67, 15, 58, 6, 37],
-            [54, 16, 79, 98, 22, 5, 60, 0, 1, 76],
-            [57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0],
-            [85, 75, 30, 68, 23, 33, 20, 76, 97, 36, 37, 99],
-            [32, 49, 54, 47, 22, 1, 87, 30, 36, 26],
-            [93, 24, 77, 11, 25, 7, 92, 97, 27, 56, 82],
+            [69, 85, 55, 74, 85, 89, 64, 59, 55, 67],
+            [29, 54, 33, 30, 45, 76, 41, 56, 28, 25, 94, 2, 61, 6, 98],
+            [35, 78, 54, 32, 79, 98, 22, 5, 60],
+            [25, 75, 57, 85, 81],
+            [32, 5, 15, 58, 6, 37, 54, 47, 22, 1, 87, 42, 36, 26, 27, 56],
+            [85, 51, 88, 62, 71],
+            [30, 0, 1, 76, 77, 11, 25],
+            [23, 15, 70, 76, 97, 36, 37, 99],
         ]
 
         assert len(env.requests) == len(expected_outputs)
@@ -429,12 +440,47 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_token_overflow(self) -> None:
-        """Test token overflow."""
+    def test_token_overflow_transient(self) -> None:
+        """Test token overflow (transient)."""
+        test_config = DynamicEngineTestConfig(
+            min_prompt_length=6,
+            max_prompt_length=6,
+            max_output_length=2,
+            context_max_tokens_override=8,
+        )
+        env = self._build_test_env(test_config)
+        for request_id, request in enumerate(env.requests):
+            env.engine.add_request(request_id, request.prompt, request.num_tokens_to_generate)
+        assert list(env.engine.waiting_request_ids) == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+        ], f"waiting_request_ids: {list(env.engine.waiting_request_ids)}."
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.skip(
+        reason="activate for `megatron-core >= 0.15`, after fixing "
+        "`raise TokenOverflowError(is_transient=False)` compatibility with "
+        "legacy tests."
+    )
+    def test_token_overflow_nontransient(self) -> None:
+        """Test token overflow (non-transient)."""
         test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
         env = self._build_test_env(test_config)
-        env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
-        assert list(env.engine.waiting_request_ids) == [0]
+        try:
+            env.engine.add_request(
+                0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate
+            )
+        except TokenOverflowError as e:
+            assert e.is_transient == False
+        else:
+            raise Exception("should have raised TokenOverflowError(is_transient=False).")
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -478,6 +524,8 @@ class TestDynamicInferenceEngine:
             (64, [64, 56, 48, 40, 32, 24, 16, 8]),
             (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
+
+            # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
             )
@@ -677,3 +725,23 @@ class TestDynamicInferenceEngine:
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
+
+
+if __name__ == "__main__":
+    test = TestDynamicInferenceEngine()
+    test.test_simple()
+    test.test_overflow_factor()
+    test.test_request_overflow()
+    test.test_token_overflow_transient()
+    test.test_token_overflow_nontransient()
+    test.test_chunk_overflow()
+    test.test_multi_add()
+    test.test_fixed_output_lengths()
+    test.test_cuda_graph_request_counts()
+    test.test_cuda_graph_warmup()
+    test.test_generate_function()
+    asyncio.run(test.test_run_engine())
+    test.test_return_log_probs()
+    test.teardown_method(None)
+    print("~~~")
+    print("success.")

@@ -4,7 +4,6 @@
 
 import dataclasses
 from datetime import datetime
-import functools
 import gc
 import logging
 import math
@@ -27,6 +26,11 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 try:
+    from megatron.training import rl_utils
+    has_rl_utils = True
+except ImportError:
+    has_rl_utils = False
+try:
     from megatron.post_training.algos.distillation import (
         get_tensor_shapes_adjust_fn_for_distillation,
     )
@@ -44,16 +48,15 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
-    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
-    is_te_min_version,
 )
-from megatron.core.fp8_utils import correct_amax_history_if_needed, get_fp8_recipe
+from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -83,26 +86,16 @@ from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-from megatron.core.parallel_state import (
-    destroy_global_memory_buffer,
-    destroy_model_parallel,
-    get_amax_reduction_group,
-    model_parallel_is_initialized,
-)
+from megatron.core.parallel_state import destroy_global_memory_buffer, destroy_model_parallel
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.schedules import (
-    convert_schedule_table_to_order,
-    get_pp_rank_microbatches,
-    get_schedule_table,
-)
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
     get_num_microbatches,
-    update_num_microbatches,
+    update_num_microbatches
 )
 
 from .async_utils import maybe_finalize_async_save
@@ -118,6 +111,7 @@ from .utils import (
     report_memory,
     unwrap_model,
     update_use_dist_ckpt,
+    to_empty_if_meta_device,
 )
 from .global_vars import (
     destroy_global_vars,
@@ -127,6 +121,7 @@ from .global_vars import (
     get_tensorboard_writer,
     get_wandb_writer,
     get_one_logger,
+    get_tokenizer,
     get_energy_monitor,
 )
 from . import one_logger_utils
@@ -525,257 +520,6 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def layer_is_graphable(layer, config):
-    """
-    Check if a layer is graphable.
-    """
-    from megatron.core.transformer.identity_op import IdentityOp
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-    if isinstance(layer, TransformerLayer):
-        if config.cuda_graph_scope == 'attn':
-            if not (
-                isinstance(layer.self_attention, IdentityOp)
-                and isinstance(layer.cross_attention, IdentityOp)
-            ):
-                return True
-        else:
-            return True
-    return False
-
-
-def get_cuda_graph_input_data(
-    model,
-    callables,
-    config,
-    num_microbatches,
-    num_model_chunks,
-    num_layers_per_chunk,
-    seq_length,
-    micro_batch_size,
-):
-    """
-    Create the CUDA Graph capturing input data. The data is organized per-chunk per-microbatch per-layer.
-    """
-
-    rotary_pos_emb_cache = {}
-
-    def get_rotary_pos_emb(transformer_module, transformer_input):
-        if (
-            transformer_module.position_embedding_type == 'rope'
-            and not config.multi_latent_attention
-        ):
-            rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
-                None, transformer_module.decoder, transformer_input, config, None
-            )
-            if rotary_seq_len not in rotary_pos_emb_cache:
-                rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                    rotary_seq_len
-                )
-            return rotary_pos_emb_cache[rotary_seq_len]
-        else:
-            return None
-
-    # Generate sample arguments and keyword arguments for capturing.
-    sample_args = []
-    sample_kwargs = []
-    num_layers_per_chunk_prefix_sum = [0]
-    for n in num_layers_per_chunk:
-        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
-    for chunk_number in range(num_model_chunks):
-        model_chunk = model[chunk_number]
-        try:
-            chunk_with_decoder = get_attr_wrapped_model(
-                model_chunk, 'decoder', allow_none=False, return_model_obj=True
-            )
-        except RuntimeError:
-            continue
-        layers = callables[
-            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
-                chunk_number + 1
-            ]
-        ]
-        for _ in range(num_microbatches):
-            for layer in layers:
-                static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
-                if is_te_min_version("1.10.0"):
-                    # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
-                    hidden_states = static_inputs.pop("hidden_states")
-                    sample_args.append((hidden_states,))
-                    rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
-                    if rotary_pos_emb is not None:
-                        static_inputs["rotary_pos_emb"] = rotary_pos_emb
-                    sample_kwargs.append(static_inputs)
-                else:
-                    sample_args.append(
-                        (static_inputs.pop("hidden_states"), static_inputs.pop("attention_mask"))
-                    )
-
-    # Get the PP and VPP scheduling order.
-    _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage, False
-    )
-    schedule_table = get_schedule_table(
-        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage
-    )
-    order = convert_schedule_table_to_order(
-        num_warmup_microbatches, num_model_chunks, schedule_table
-    )
-    print_rank_0(f'ORDER {order}')
-
-    def get_make_graphed_callables_kwargs():
-        kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
-
-        if is_te_min_version("2.6.0"):
-            # Starting from TE 2.6.0, make_graphed_callables() accepts different number
-            # of layers per chunk and optimizes the graph memory usage.
-            kwargs['_num_layers_per_chunk'] = num_layers_per_chunk
-            kwargs['_reuse_graph_input_output_buffers'] = True
-
-        if sample_kwargs:
-            kwargs['sample_kwargs'] = sample_kwargs
-
-        if config.fp8:
-            kwargs['fp8_enabled'] = True
-            kwargs['fp8_recipe'] = get_fp8_recipe(config)
-            # fp8 weight caching will be ignored by TE if cudagraph doesn't capture the attn part,
-            # even if we set it to True in the arguments. So we just pass a False in this case.
-            kwargs['fp8_weight_caching'] = 'attn' in config.cuda_graph_scope
-            if is_te_min_version("1.14.0") and model_parallel_is_initialized():
-                kwargs['fp8_group'] = get_amax_reduction_group(with_context_parallel=True)
-        else:
-            kwargs['fp8_enabled'] = False
-        return kwargs
-
-    kwargs = get_make_graphed_callables_kwargs()
-    return sample_args, kwargs
-
-
-def cuda_graph_capture(model, config, seq_length, micro_batch_size):
-    """
-    Capture CUDA Graphs per TransformerLayer per microbatch.
-    """
-    from megatron.core.transformer.cuda_graphs import _set_capture_start, _set_capture_end
-
-    _set_capture_start()
-    assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
-    assert config.cuda_graph_scope in [
-        'full',
-        'attn',
-    ], f"--cuda-graph-scope should be full or attn, got {config.cuda_graph_scope}."
-
-    # Set back to the default stream. Graph will still be captured on a side stream in
-    # make_graphed_callables().
-    torch.cuda.set_stream(torch.cuda.default_stream())
-    torch.distributed.barrier()
-    start = time.time()
-    print_rank_0(f'Start cuda_graph_capture on rank{torch.distributed.get_rank()}')
-
-    # Get the number of models chunks and microbatches.
-    num_model_chunks = len(model)
-    num_microbatches = get_num_microbatches()
-    print_rank_0(f'num_model_chunks {num_model_chunks}, num_microbatches {num_microbatches}')
-
-    # Get callables.
-    callables = []
-    num_layers_per_chunk = []
-    for chunk_number in range(num_model_chunks):
-        model_chunk = model[chunk_number]
-        try:
-            chunk_with_decoder = get_attr_wrapped_model(
-                model_chunk, 'decoder', allow_none=False, return_model_obj=True
-            )
-        except RuntimeError:
-            continue
-        num_layers = len(chunk_with_decoder.decoder.layers)
-        if hasattr(chunk_with_decoder, 'mtp'):
-            num_mtp_layers = len(chunk_with_decoder.mtp.layers)
-        else:
-            num_mtp_layers = 0
-        num_graphable_layers = 0
-        for layer_number in range(num_layers):
-            layer = chunk_with_decoder.decoder.layers[layer_number]
-            if layer_is_graphable(layer, config):
-                num_graphable_layers += 1
-                callables.append(layer)
-        for layer_number in range(num_mtp_layers):
-            layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
-            if layer_is_graphable(layer, config):
-                num_graphable_layers += 1
-                callables.append(layer)
-        num_layers_per_chunk.append(num_graphable_layers)
-        print_rank_0(
-            f'{num_layers} layers and {num_mtp_layers} mtp layers in model chunk {chunk_number}. {num_graphable_layers} graphable layers.'
-        )
-    print_rank_0(f'Total #layers {len(callables)}')
-
-    # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-    sample_args, kwargs = get_cuda_graph_input_data(
-        model,
-        callables,
-        config,
-        num_microbatches,
-        num_model_chunks,
-        num_layers_per_chunk,
-        seq_length,
-        micro_batch_size,
-    )
-
-    import transformer_engine  # To keep out TE dependency when not using CUDA Graph
-
-    graphs = transformer_engine.pytorch.make_graphed_callables(
-        tuple(callables), sample_args, **kwargs
-    )
-
-    # Push the captured graphs to the corresponding TransformerBlock.
-    num_layers_per_chunk_prefix_sum = [0]
-    for n in num_layers_per_chunk:
-        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
-    for chunk_number in range(num_model_chunks):
-        layers = callables[
-            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
-                chunk_number + 1
-            ]
-        ]
-        for layer_number, layer in enumerate(layers):
-            layer.cuda_graphs = []
-            for batch_number in range(num_microbatches):
-                layer.cuda_graphs.append(
-                    graphs[
-                        num_layers_per_chunk_prefix_sum[chunk_number] * num_microbatches
-                        + batch_number * num_layers_per_chunk[chunk_number]
-                        + layer_number
-                    ]
-                )
-
-    # Finish CUDA Graph capturing.
-    torch.distributed.barrier()
-    print_rank_0(
-        f'Time spent in cuda_graph_capture on rank{torch.distributed.get_rank()}: {time.time() - start}s'
-    )
-    _set_capture_end()
-
-
-def cuda_graph_set_manual_hooks(model, config):
-    """
-    Set CUDA Graph manual hooks for the modules that contain direct parameters and are covered by cudagraphs.
-    """
-    for model_chunk in model:
-        try:
-            chunk_with_decoder = get_attr_wrapped_model(
-                model_chunk, 'decoder', allow_none=False, return_model_obj=True
-            )
-        except RuntimeError:
-            continue
-        for layer in chunk_with_decoder.decoder.layers:
-            if layer_is_graphable(layer, config):
-                layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
-        if hasattr(chunk_with_decoder, 'mtp'):
-            for layer in chunk_with_decoder.mtp.layers:
-                if layer_is_graphable(layer, config):
-                    layer.transformer_layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
-
-
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -959,6 +703,11 @@ def pretrain(
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
 
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
+        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+
     if not args.skip_train:
         print_rank_0('training ...')
 
@@ -1007,18 +756,19 @@ def pretrain(
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        evaluate_and_print_results(
-            prefix,
-            forward_step_func,
-            valid_data_iterator,
-            model,
-            iteration,
-            process_non_loss_data_func,
-            config,
-            verbose=True,
-            write_to_tensorboard=not args.skip_train,
-            non_loss_data_func=non_loss_data_func,
-        )
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.evaluate_and_print_results_rl(
+                valid_data_iterator, model, optimizer,
+                iteration, write_to_tensorboard=not args.skip_train
+            )
+        else:
+            evaluate_and_print_results(
+                prefix, forward_step_func,
+                valid_data_iterator, model,
+                iteration, process_non_loss_data_func, config,
+                verbose=True, write_to_tensorboard=not args.skip_train,
+                non_loss_data_func=non_loss_data_func
+            )
 
     if args.do_test:
         prefix = f'iteration {iteration} on test set'
@@ -1158,6 +908,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if args.fp16 or args.bf16:
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
+
+    # Materialize tensors on meta device (GPU allocation) if not using FSDP2.
+    if args.init_model_with_meta_device and not args.use_torch_fsdp2:
+        #for model_module in model:
+        model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
+
+
+
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
@@ -1456,22 +1214,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
-    # CUDA Graph capturing only executes once, when it's the first training iteration.
-    if args.curr_iteration == args.iteration and args.external_cuda_graph:
-        cuda_graph_capture(model, config, args.seq_length, args.micro_batch_size)
-
-        # Set grad to zero.
-        for model_chunk in model:
-            model_chunk.zero_grad_buffer()
-        optimizer.zero_grad()
-
-        # Clear aux loss tracker.
-        clear_aux_losses_tracker()
-
-        # Collect garbage and empty unused memory.
-        gc.collect()
-        torch.cuda.empty_cache()
-
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -1551,11 +1293,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
-
-    # Set the manual hooks when CUDA Graphs are enabled.
-    if args.curr_iteration == args.iteration and args.external_cuda_graph:
-        if args.use_distributed_optimizer and args.overlap_param_gather:
-            cuda_graph_set_manual_hooks(model, config)
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
@@ -1678,6 +1415,11 @@ def training_log(
         'optimizer-copy-main-to-model-params',
         'optimizer',
     ]
+    # Add timers from RL loop if needed.
+    if getattr(args, 'perform_rl_step', False):
+        timers_to_log.extend(['rollout-collection', 'rollout-collection-barrier',
+                              'compute-logprobs', 'compute-ref-logprobs',
+                              'prepare-advantages'])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -1690,9 +1432,6 @@ def training_log(
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
-    # Timer requires all the ranks to call.
-    if args.log_timers_to_tensorboard and (iteration % args.tensorboard_log_interval == 0):
-        timers.write(timers_to_log, writer, iteration, normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
@@ -1742,6 +1481,11 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if getattr(args, 'perform_rl_step', False):
+            grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
+            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
+            if wandb_writer:
+                wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -1870,6 +1614,11 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
             report_memory_flag = False
+        # Write timers to wandb, don't reset the counts
+        if args.log_timers_to_tensorboard:
+            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
+            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
+        # Log timers to stdout
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
@@ -2160,6 +1909,33 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+
+    if getattr(args, 'perform_rl_step', False):
+        assert has_rl_utils, "RL cannot run without the lang_rl package"
+
+    # Additional variable initialization for RL training
+    ref_state_dict = None
+
+    # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
+    if getattr(args, 'perform_rl_step', False):
+        print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator
+        )
+        # First destroy the existing calculator
+        destroy_num_microbatches_calculator()
+        # Then initialize with the correct perform_rl_step=True context
+        init_num_microbatches_calculator(
+            args.rank,
+            args.rampup_batch_size,
+            args.global_batch_size,
+            args.micro_batch_size,
+            mpu.get_data_parallel_world_size(),
+            args.decrease_batch_size_if_needed
+        )
+        print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
+
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
@@ -2332,7 +2108,20 @@ def train(
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
+    # Capture CUDA Graphs.
+    if args.external_cuda_graph:
+        cuda_graph_helper = TECudaGraphHelper(
+            model=model,
+            config=config,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            optimizers=[optimizer],
+        )
+        cuda_graph_helper.create_cudagraphs()
+
     # Run training iterations till done.
+    buffered_rollouts = None
+    ref_state_dict = None
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
@@ -2380,8 +2169,22 @@ def train(
             args.skipped_train_samples += batch_size
             continue
 
-        # Run training step.
         args.curr_iteration = iteration
+        # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
+        # It is similar to a PPO epoch.
+
+        if getattr(args, 'perform_rl_step', False):
+            with torch.no_grad():
+                if not ref_state_dict:
+                    ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+                
+                # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
+                if iteration % (args.grpo_iterations * ((args.grpo_samples_per_iteration) // args.global_batch_size)) == 0:
+                    buffered_rollouts = rl_utils.get_rollout_data_iterator(
+                        model, optimizer, iteration, ref_state_dict,
+                    )
+                train_data_iterator = buffered_rollouts
+
         ft_integration.on_training_step_start()
         (
             loss_dict,
@@ -2425,6 +2228,9 @@ def train(
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
+                    # Set the manual hooks when CUDA Graphs are used.
+                    if args.external_cuda_graph:
+                        cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
         batch_size = (
@@ -2488,18 +2294,16 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            evaluate_and_print_results(
-                prefix,
-                forward_step_func,
-                valid_data_iterator,
-                model,
-                iteration,
-                process_non_loss_data_func,
-                config,
-                verbose=False,
-                write_to_tensorboard=True,
-                non_loss_data_func=non_loss_data_func,
-            )
+            if getattr(args, 'perform_rl_step', False):
+                rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
+                                       iteration, write_to_tensorboard=True)
+            else:
+                evaluate_and_print_results(prefix, forward_step_func,
+                                       valid_data_iterator, model,
+                                       iteration, process_non_loss_data_func,
+                                       config, verbose=False, write_to_tensorboard=True,
+                                       non_loss_data_func=non_loss_data_func)
+
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
             timers('eval-time').stop()
@@ -2847,9 +2651,10 @@ def get_train_valid_test_num_samples():
     return (train_samples, eval_samples, test_iters * args.global_batch_size)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
     """Build pretraining datasets."""
-    train_valid_test_num_samples = get_train_valid_test_num_samples()
+    if train_valid_test_num_samples is None:
+        train_valid_test_num_samples = get_train_valid_test_num_samples()
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
@@ -2886,7 +2691,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider
+            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
         )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
         
@@ -2922,6 +2727,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
+    if getattr(args, 'perform_rl_step', False):
+        args.to_test = False
 
     return train_dataloader, valid_dataloaders, test_dataloader
 

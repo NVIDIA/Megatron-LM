@@ -6,6 +6,9 @@ import torch
 from functools import partial
 from typing import List, Optional, Tuple, Union
 
+from model_provider import model_provider
+from mamba_builders import mamba_builder
+
 from megatron.training import get_args
 from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
@@ -268,7 +271,7 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     pretrain(train_valid_test_datasets_provider,
-             model_provider,
+             partial(model_provider, mamba_builder),
              ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},

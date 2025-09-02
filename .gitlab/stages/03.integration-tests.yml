@@ -98,7 +98,8 @@ integration:configure:
   needs:
     - integration:configure
     - test:build_image
-    - wait_for_resources
+    - job: wait_for_resources
+      optional: true
   extends: [.integration_tests_rules]
   trigger:
     include:

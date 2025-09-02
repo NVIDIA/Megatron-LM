@@ -131,6 +131,7 @@ def create_ckpt_load_args(create_args):
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
+    args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
 
     yield args
