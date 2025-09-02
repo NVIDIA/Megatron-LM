@@ -93,6 +93,31 @@ class WarmupEngineMode(Enum):
     NON_DECODE = "non_decode"
 
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+def time_dummy_alloc():
+    import time
+    import torch
+    def alloc():
+        t = time.time()
+        _tensor = torch.empty(
+            # (2, 36, 9102, 256, 1, 128),
+            (2, 27, 9102, 256, 1, 128),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        t = time.time() - t
+        return _tensor, t
+    tensor, t0 = alloc()
+    del tensor
+    tensor, t1 = alloc()
+    del tensor
+    tensor, t2 = alloc()
+    print("~~~")
+    print("m-lm | ctx-dummy ... %f, %f, %f." % (t0, t1, t2))
+    exit()
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
@@ -453,6 +478,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.reset_attention_state()
 
         return time_map
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def allocate_all_tensors(self):
+    #     time_map = {}
+    #     with timing_ctx(time_map, "memory_buffer"):
+    #         # self.memory_buffer = torch.full(
+    #         #     (
+    #         #         2,  # key and value
+    #         #         self.num_layers,
+    #         #         self.chunk_count_total,
+    #         #         self.chunk_size_tokens,
+    #         #         self.num_attention_heads_per_partition,
+    #         #         self.hidden_size_per_attention_head,
+    #         #     ),
+    #         #     -1,
+    #         #     dtype=self.params_dtype,
+    #         #     device=torch.cuda.current_device(),
+    #         # )
+    #         if 0:
+    #             self.memory_buffer = torch.full(
+    #                 (2, 36, 9102, 256, 1, 128),
+    #                 -1,
+    #                 dtype=torch.bfloat16,
+    #                 device="cuda",
+    #             )
+    #         else:
+    #             self.memory_buffer = torch.empty(
+    #                 (2, 36, 9102, 256, 1, 128),
+    #                 dtype=torch.bfloat16,
+    #                 device="cuda",
+    #             )
+    #     return time_map
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def deallocate_all_tensors(self):
         """Deallocate GPU state.
