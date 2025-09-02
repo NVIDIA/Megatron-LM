@@ -483,9 +483,7 @@ def main(
                 n_attempts += 1
                 continue
 
-            if ("FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log) and (
-                "EXIT_CODE=0" in concat_mainrank_log
-            ):
+            if ("FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue
