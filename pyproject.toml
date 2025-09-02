@@ -63,21 +63,20 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
+mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
-    "transformers~=4.53",
     "multi-storage-client~=0.25,<0.26",
     "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
-    "transformer-engine[pytorch]>=2.6.0a0,<2.7.0",
+    "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
@@ -153,7 +152,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "c90a720765bc01ebb5ba1f70a7ce2d16b2e46d77" } # on `release_v2.6`
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
