@@ -135,22 +135,22 @@ class ShardedTensor(ShardedBase):
                 f"equal to global shape dimensions for {self}"
             )
 
-        for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
-            # NOTE: In custom FSDP, we have a case where a new parameter shard is created locally.
-            # For example, consider parameters [p0, p1, p2] sharded across GPU0 and GPU1.
-            # GPU0 receives p0 and a portion of p1, while GPU1 receives the
-            # remaining portion of p1 and p2.
-            # As a result, there is no parameter shard of p2 on GPU0, and
-            # the shape of p2 on GPU0 is zero.
-            if sh != 0 and off % sh != 0:
-                raise CheckpointingException(
-                    f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
-                )
+        if self.axis_fragmentations is not None:
+            for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
+                if sh != 0 and off % sh != 0:
+                    raise CheckpointingException(
+                        f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
+                    )
 
         if has_flattened_range and self.flattened_range.step is not None:
             raise CheckpointingException(
                 f"`step` argument in the flattened range of a ShardedTensor is not supported."
             )
+
+    @property
+    def has_regular_grid(self):
+        """Alias for having a regular sharding grid."""
+        return self.axis_fragmentations is not None
 
     def global_slice(self) -> Tuple[Union[int, slice], ...]:
         """

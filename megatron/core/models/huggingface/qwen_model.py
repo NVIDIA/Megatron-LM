@@ -23,7 +23,7 @@ class QwenHuggingFaceModel(HuggingFaceModule):
     Wrapper for Qwen LM HuggingFace models.
     """
 
-    # Currently applies to FSDP2 only, not the custom FSDP implementation.
+    # Currently applies to FSDP2 only, not the Megatron FSDP implementation.
     _fsdp_modules = [Qwen2DecoderLayer]
 
     def __init__(self, config):
