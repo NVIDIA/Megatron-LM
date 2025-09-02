@@ -385,7 +385,9 @@ class DynamicInferenceEngine(AbstractEngine):
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
             relative_time_str = f"{end_time - start_time:.3f} sec"
             relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
-            total_mem_str = f"alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
+            total_mem_str = (
+                f"alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
+            )
             print(
                 f"[rank {rank_str}] dynamic engine {key}, {dir_str} "
                 f"{relative_mem_str} in {relative_time_str} ... "
