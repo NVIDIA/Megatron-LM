@@ -8,38 +8,33 @@ from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
-    Warning:
-        This function is implemented based on assumptions that won't generalize. It is meant for running
-        experiments only, not merge to the main codebase. A more generalized implementation will be designed
-        after MCore decentralized process group management refactoring is done.
-
-    This is a experimental optimizer that distributes optimizers of linear and embedding layers to different ranks
-    with the option to use different optimizer for different layer types.
-
-    (deyu)
-    Current assume dist-opt off, DDP on and list of [muon, adam] passed in with params already separated
-    During modified step function:
-    1. Megatron DDP handle allreduce grad for all params
-    2. update subset of params(shard by rank) and drop grad for rest params
-    3. broadcast updated params
+    This is a experimental distributed optimizer wrapper that distributes weight to DP ranks by full layer.
+    It is implemented as a Chained optimizer to support cases where different weight group uses different
+    optimizers (adam + muon) for example.
+    When using, keep distributed optimizer related options OFF.
     """
     def __init__(
-        self, 
+        self,
         chained_optimizers: List[MegatronOptimizer],
-        grad_comm_pg: torch.distributed.ProcessGroup = None,
-        ep_grad_comm_pg: torch.distributed.ProcessGroup = None,
+        grad_comm_pg: torch.distributed.ProcessGroup,
+        ep_grad_comm_pg: torch.distributed.ProcessGroup,
     ) -> None:
         super().__init__(chained_optimizers)
 
-        # TODO(deyu, kunlun suggested): shard params into ranks by gbuf range(like distopt) but keep "extra"
-        # on boundaries so muon weights are not sharded. later drop "extra" and call single allgather
-        # essentially it's same as kimi PR but change the "getting full muon weight grad" part into global 
-        # allreduce then drop, which we do anyway with current layerwise impl through DDP
+        # how LayerWiseDistributedOptimizer work:
+        # 1. Megatron DDP handle allreduce grad for all params
+        # 2. Drop grad for params doesn't belong to this DP rank
+        # 3. Do regular update with chained optimizers
+        # 4. allgather updated params to every rank(currently through broadcast loop)
 
-        # for initial functional test, evenly shard base on chain order and removed logic duplicating norm param
+        # TODO: potential future perf optimization (deyu, kunlun suggested)
+        # since allreduce is unchanged and handled by megatron DDP, they're already in contiguous gbuf
+        # so instead of shard param by layer randomly, we can still shard by buf range but keep some "extras"
+        # to keep boundary weight not sharded. This way each rank do some duplicated work but we can call
+        # single allgather later and all current distopt optimization can be applied
+
         self.grad_comm_pg = grad_comm_pg
         self.ep_grad_comm_pg = ep_grad_comm_pg
-        # TODO(deyu): support dp/ep 0 cases
         self.shard_params()
 
     def shard_params(self):
@@ -60,6 +55,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for p in group["params"]:
                     self.shard_params_list[dp_idx].append(p)
                     dp_idx = (dp_idx + 1) % dp_size
+        # simplify when DP/EP size is 1, or EP is off
+        if dp_size == 1:
+            self.shard_params_list = []
+        if ep_size == 1 or len(self.ep_params_list[0]) == 0:
+            self.ep_params_list = []
 
     def drop_grads(self):
         """Drop grads of params belong to other ranks. """
