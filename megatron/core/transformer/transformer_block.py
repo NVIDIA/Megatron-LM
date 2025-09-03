@@ -292,6 +292,7 @@ class TransformerBlock(MegatronModule):
                     self.config.num_layers,
                     self.config.cpu_offloading_activations,
                     self.config.cpu_offloading_weights,
+                    self.config.cpu_offloading_double_buffering,
                 )
             )
             self.config._cpu_offloading_context = (

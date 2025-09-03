@@ -359,7 +359,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 # Otherwise, master weight will be managed by TransformerEngine.
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
-                if config.main_params_dtype != torch.float32 or config.fp8_recipe == "delayed":
+                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                     kwargs.update(
                         {
                             "master_weights": True,
