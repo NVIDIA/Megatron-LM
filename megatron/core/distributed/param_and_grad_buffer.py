@@ -31,10 +31,7 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-try:
-    import apex.contrib.nccl_allocator as nccl_allocator
-except ImportError:
-    nccl_allocator = None
+import megatron.core.nccl_allocator as nccl_allocator
 
 
 class BufferType(Enum):
@@ -665,7 +662,10 @@ class _ParamAndGradBuffer:
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
-            pool = nccl_allocator.create_nccl_mem_pool()
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(
+                symmetric=not self.ddp_config.disable_symmetric_registration
+            )
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
             )
