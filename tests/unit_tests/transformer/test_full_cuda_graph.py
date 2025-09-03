@@ -18,6 +18,9 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+@pytest.mark.internal
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
     reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
