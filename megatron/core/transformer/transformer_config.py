@@ -620,6 +620,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    inference_sampling_seed: int = 42
+    """ Random seed to use for sampling during inference. """
+
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
 
