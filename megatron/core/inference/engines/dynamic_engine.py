@@ -433,9 +433,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            alloc_times = self.context.allocate_all_tensors()
+            self.context.allocate_all_tensors()
             torch.cuda.synchronize()
-            alloc_times["total"] = time.time() - alloc_time
+            alloc_time = time.time() - alloc_time
 
             # Reset context and request data.
             self.context.reset()
@@ -474,7 +474,7 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing.
-        print(f" ... inner timing: add {add_time:.3f}, alloc {alloc_times}.")
+        print(f" ... inner timing: add {add_time:.3f}, alloc {alloc_time}.")
 
         return futures
 
