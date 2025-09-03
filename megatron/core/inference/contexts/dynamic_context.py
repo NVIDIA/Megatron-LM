@@ -239,8 +239,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.chunk_size_tokens
-                * num_attention_heads_per_partition
-                * hidden_size_per_attention_head
+                * self.num_attention_heads_per_partition
+                * self.hidden_size_per_attention_head
             )
 
         # Adjust buffer to be a multiple of chunk size.
