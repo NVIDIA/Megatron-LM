@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, defaultdict
 import torch
 from megatron.core import parallel_state
 from typing import Any
@@ -76,7 +76,7 @@ class PipelineOffloadManager:
     def size(self):
         return len(self._queue)
 
-    def reset_chunk_handler(self, num_layer, offload_mlp_input=True, first_layer_index=0):
+    def reset_chunk_handler(self, num_layer, offload=True, first_layer_index=0):
         cur_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
 
         first_last_vpp_rank = self._first_last_vpp_rank
@@ -84,7 +84,7 @@ class PipelineOffloadManager:
         if cur_vpp_rank == self._vpp - 1:
             self.flush()
         first_last_vpp_rank = first_last_vpp_rank and (cur_vpp_rank == self._vpp - 1)
-        cur_chunk = ChunkOffloadHandler(num_layer, first_last_vpp_rank, offload_mlp_input, first_layer_index)
+        cur_chunk = ChunkOffloadHandler(num_layer, first_last_vpp_rank, offload, first_layer_index)
         # save for latter push
         self._stages[cur_vpp_rank].append(cur_chunk)
         if cur_vpp_rank == self._vpp - 1:
@@ -162,7 +162,8 @@ class ChunkOffloadHandler:
         self._layer_index = first_layer_index
         self.first_layer_index = first_layer_index
         self._tensor_count_current_layer = 0
-        self.multi_input_offload_count = 0
+        self.multi_input_offload_count = False
+        self.offload_count_per_layer = defaultdict(int)
 
         self.tensor_need_offloading_checker = None
         self.torch_tensor_count = 0
@@ -225,6 +226,7 @@ class ChunkOffloadHandler:
                     if self.tensor_need_offloading_checker is not None and self.tensor_need_offloading_checker(tensor_on_device):
                         state = self.offload(tensor_on_device)
                         tensor_on_device.record_stream(self.d2h_stream)
+                        self.offload_count_per_layer[group_to_offload] += 1
                         self._tensor_tag_to_state[tensor_tag] = state
         self._offloaded_group_count = group_to_offload + 1
         self._f_event.record(self.d2h_stream)
@@ -241,11 +243,10 @@ class ChunkOffloadHandler:
                     if isinstance(state, tuple):
                         recovered_tensor = self.reload(state)
                         self._tensor_tag_to_state[tensor_label] = recovered_tensor
-                        self.multi_input_offload_count -= 1
-                    if self.multi_input_offload_count >= 1:
-                        break
-        if self.multi_input_offload_count < 1:
-            self.multi_input_offload_count = 0
+                        self.offload_count_per_layer[group_to_reload] -= 1
+                        if self.offload_count_per_layer[group_to_reload] > 0 and self.multi_input_offload_count:
+                            break
+        if self.offload_count_per_layer[group_to_reload] == 0:
             self._offloaded_group_count = group_to_reload
         self._b_event.record(self.h2d_stream)
 
@@ -324,7 +325,7 @@ class ChunkOffloadHandler:
         self.bulk_reload()
 
     def register_offload_tensor(self, tensor):
-        self.multi_input_offload_count += 1
+        self.multi_input_offload_count = True
         self._offload_tensor_ptrs.append(tensor.data_ptr())
 
     def is_registered_tensor(self, tensor_ptr: int) -> bool:

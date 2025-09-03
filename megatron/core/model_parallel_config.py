@@ -315,8 +315,23 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
-    offload_mlp_input: bool = False
-    """If true, offloads the MLP input to CPU. This is useful for large."""
+    offload_activation: bool = False
+    """If True, offload the activation to the CPU."""
+
+    offload_modules: Optional[list[str]] = None
+    """The submodules to offload.
+    choices: "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1", "router_fc2",
+             "shared_fc1", "shared_fc2".
+    default: ["core_attn"].
+    "self_attn": offload the self_attn part of the transformer layer.
+    "qkv_linear": offload the qkv_linear part of the transformer layer.
+    "core_attn": offload the core attention part of the transformer layer.
+    "attn_linear": offload the attn linear projection part of the transformer layer.
+    "router_fc1": offload the moe router_fc1 part of the transformer layer.
+    "router_fc2": offload the moe router_fc2 part of the transformer layer.
+    "shared_fc1": offload the shared_fc1 part of the transformer layer.
+    "shared_fc2": offload the shared_fc2 part of the transformer layer.
+    """
     
     ###################
     # CPU Offloading
