@@ -16,9 +16,7 @@ __package_name__ = 'megatron_core'
 __contact_names__ = 'NVIDIA'
 __contact_emails__ = 'nemo-toolkit@nvidia.com'  # use NeMo Email
 __homepage__ = 'https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/index.html'
-__repository_url__ = (
-    'https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src'
-)
+__repository_url__ = 'https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core'
 __download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
 __description__ = (
     'Megatron Core - a library for efficient and scalable training of transformer based models'
