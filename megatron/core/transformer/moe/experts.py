@@ -40,6 +40,11 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.pipeline_parallel.cpu_offload import (
+    PipelineOffloadManager,
+    group_prefetch_offload_start,
+    group_prefetch_offload_commit,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -804,6 +809,16 @@ class TEGroupedMLP(MegatronModule):
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
+        self.offload_router_fc1 = (
+            self.config.offload_activation
+            and "router_fc1" in self.config.offload_modules
+        )
+
+        self.offload_router_fc2 = (
+            self.config.offload_activation
+            and "router_fc2" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -817,6 +832,36 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+
+    def _offload_router_fc1_forward(
+        self,
+        permuted_local_hidden_states,
+        tokens_per_expert,
+    ):
+        """Forward method with router fc1 activation offloading."""
+        if not permuted_local_hidden_states.is_contiguous():
+            permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+
+        permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states)
+
+        permuted_local_hidden_states.offloading_activation = True
+
+        with PipelineOffloadManager.get_instance():
+            intermediate_parallel, bias_parallel = self.linear_fc1(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+
+        def call_back():
+            cur_stream = torch.cuda.current_stream()
+            permuted_local_hidden_states.record_stream(cur_stream)
+            permuted_local_hidden_states.untyped_storage().resize_(0)
+
+        intermediate_parallel, bias_parallel = group_prefetch_offload_commit(
+            intermediate_parallel,
+            bias_parallel,
+            offloaded_call_back=call_back
+        )
+        return intermediate_parallel, bias_parallel
 
     def forward(
         self,
@@ -857,9 +902,14 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        intermediate_parallel, bias_parallel = self.linear_fc1(
-            permuted_local_hidden_states, tokens_per_expert
-        )
+        if self.offload_router_fc1:
+            intermediate_parallel, bias_parallel = self._offload_router_fc1_forward(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+        else:
+            intermediate_parallel, bias_parallel = self.linear_fc1(
+                permuted_local_hidden_states, tokens_per_expert
+            )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
