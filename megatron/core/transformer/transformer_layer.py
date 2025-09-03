@@ -528,9 +528,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             if not input_layernorm_output.is_contiguous():
                 input_layernorm_output = input_layernorm_output.contiguous()
             input_layernorm_output = group_prefetch_offload_start(input_layernorm_output)
-            handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
-            handler.register_offload_tensor(input_layernorm_output)
-            input_layernorm_output.offloading_self_attn = True
+            input_layernorm_output.offloading_activation = True
             with PipelineOffloadManager.get_instance():
                 attention_output_with_bias = self.self_attention(
                 input_layernorm_output,

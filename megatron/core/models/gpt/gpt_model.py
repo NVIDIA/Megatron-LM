@@ -33,6 +33,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.models.gpt.utils import offloading_checker, get_first_layer_index
+from megatron.core.pipeline_parallel.cpu_offload import PipelineOffloadManager
 
 
 class GPTModel(LanguageModule):
@@ -366,6 +368,12 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+        first_layer_index = get_first_layer_index(self.config, self.decoder.num_layers_per_pipeline_rank)
+        PipelineOffloadManager.get_instance().reset_chunk_handler(
+            self.decoder.num_layers_per_pipeline_rank,
+            self.config.offload_activation,
+            first_layer_index,
+        )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

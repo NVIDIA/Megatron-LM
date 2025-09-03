@@ -272,17 +272,13 @@ class Attention(MegatronModule, ABC):
         hidden_states,
         key_value_states,
     ):
-        """====== [todo] weights lose 'main_grad' in backward pass. under debugging. ======"""
         """Forward method with qkv linear activation offloading."""
         if not hidden_states.is_contiguous():
             hidden_states = hidden_states.contiguous()
 
         hidden_states = group_prefetch_offload_start(hidden_states)
 
-        handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
-        handler.register_offload_tensor(hidden_states)
-
-        hidden_states.offloading_mlp_input = True
+        hidden_states.offloading_activation = True
 
         with PipelineOffloadManager.get_instance():
             query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
@@ -292,7 +288,7 @@ class Attention(MegatronModule, ABC):
             hidden_states.record_stream(cur_stream)
             hidden_states.untyped_storage().resize_(0)
 
-        query, key, value = group_prefetch_offload_commit(query, key, value, call_back)
+        query, key, value = group_prefetch_offload_commit(query, key, value, offloaded_call_back=call_back)
         return query, key, value
 
     def _offload_core_attention_forward(
@@ -341,9 +337,9 @@ class Attention(MegatronModule, ABC):
         handler.register_offload_tensor(key)
         handler.register_offload_tensor(value)
 
-        query.offloading_mlp_input = True
-        key.offloading_mlp_input = True
-        value.offloading_mlp_input = True
+        query.offloading_activation = True
+        key.offloading_activation = True
+        value.offloading_activation = True
 
         with PipelineOffloadManager.get_instance():
             hidden_states = custom_forward(
@@ -359,24 +355,20 @@ class Attention(MegatronModule, ABC):
             key.untyped_storage().resize_(0)
             value.untyped_storage().resize_(0)
 
-        hidden_states = group_prefetch_offload_commit(hidden_states, call_back)
-        return hidden_states
+        hidden_states = group_prefetch_offload_commit(hidden_states, offloaded_call_back=call_back)
+        return hidden_states[0]
 
     def _offload_attn_linear_forward(
         self,
         hidden_states,
     ):
-        """====== [todo] weights lose 'main_grad' in backward pass. under debugging. ======"""
         """Forward method with attention linear projection activation offloading."""
         if not hidden_states.is_contiguous():
             hidden_states = hidden_states.contiguous()
 
         hidden_states = group_prefetch_offload_start(hidden_states)
 
-        handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
-        handler.register_offload_tensor(hidden_states)
-
-        hidden_states.offloading_mlp_input = True
+        hidden_states.offloading_activation = True
 
         with PipelineOffloadManager.get_instance():
             output, bias = self.linear_proj(hidden_states)
@@ -386,7 +378,7 @@ class Attention(MegatronModule, ABC):
             hidden_states.record_stream(cur_stream)
             hidden_states.untyped_storage().resize_(0)
 
-        output, bias = group_prefetch_offload_commit(output, bias, call_back)
+        output, bias = group_prefetch_offload_commit(output, bias, offloaded_call_back=call_back)
         return output, bias
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):

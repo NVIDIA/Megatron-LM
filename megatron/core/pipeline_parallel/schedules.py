@@ -35,7 +35,7 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .cpu_offload import PipelineOffloadManager, offloading_checker
+from .cpu_offload import PipelineOffloadManager
 
 # Types
 Shape = Union[List[int], torch.Size]
