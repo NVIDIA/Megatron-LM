@@ -223,7 +223,6 @@ class TestDynamicInferenceEngine:
             sequence_parallel=test_config.sequence_parallel,
             pipeline_dtype=torch.bfloat16,
             add_bias_linear=test_config.expert_model_parallel_size == 1,
-            inference_sampling_seed=random_seed,
         )
 
         # Requests.

@@ -29,7 +29,7 @@ from megatron.core.inference.utils import get_attention_mask
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
-from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
+from megatron.core.utils import get_model_config, unwrap_model
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -67,10 +67,6 @@ class TextGenerationController:
         self.model_is_pipeline_parallel = not (
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
-
-        model_config = get_model_config(self.inference_wrapped_model.model)
-        self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
     def tokenize_prompt(
         self, prompt: str, add_BOS: bool = False
@@ -305,9 +301,7 @@ class TextGenerationController:
             # After filtering, we need to recalculate the distribution.
             probabilities = last_token_logits.softmax(dim=-1)
 
-            sampled_logits = torch.multinomial(
-                probabilities, num_samples=1, generator=self.sampling_rng
-            ).view(-1)
+            sampled_logits = torch.multinomial(probabilities, num_samples=1).view(-1)
 
             # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
             if vocab_size:
@@ -480,8 +474,6 @@ class TextGenerationController:
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
-            # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
-            # and then broadcast the sampled tokens rather than broadcasting the raw logits.
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
                 dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
@@ -549,8 +541,7 @@ class TextGenerationController:
         self, sampling_params: SamplingParams, termination_id: int
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
-        loop = get_asyncio_loop()
-        return loop.run_until_complete(
+        return asyncio.get_running_loop().run_until_complete(
             self.async_generate_output_tokens_dynamic_batch(sampling_params, termination_id)
         )
 
@@ -833,8 +824,6 @@ class TextGenerationController:
                     logits_shape = [batch_size, logits_seq_len, vocab_size]
                     if is_pipeline_last_stage(self.pp_group):
                         assert logits is not None and torch.Size(logits_shape) == logits.shape
-                    # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
-                    # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
