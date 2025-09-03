@@ -1799,13 +1799,23 @@ try:
     )
 
     def get_cpu_offload_context(
-        enabled, num_layers, model_layers, activation_offloading, weight_offloading
+        enabled,
+        num_layers,
+        model_layers,
+        activation_offloading,
+        weight_offloading,
+        double_buffering,
     ):
         """Get CPU offload context and sync function."""
         if is_te_min_version("2.5.0"):
             # Enables the additional double buffering switch for activations during LLM training
             context, sync_func = _get_cpu_offload_context(
-                enabled, num_layers, model_layers, activation_offloading, weight_offloading, True
+                enabled,
+                num_layers,
+                model_layers,
+                activation_offloading,
+                weight_offloading,
+                double_buffering,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(
