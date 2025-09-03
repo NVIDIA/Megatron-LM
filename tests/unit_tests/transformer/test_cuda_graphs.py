@@ -67,7 +67,6 @@ class TestParallelTransformerBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
@@ -259,7 +258,6 @@ def test_cuda_graph_determine_first_last_layer_logic(
 
     # Teardown
     Utils.destroy_model_parallel()
-    _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
@@ -346,7 +344,6 @@ class TestLLaVACudaGraph:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -414,21 +411,17 @@ class TestLLaVACudaGraph:
                         layer.cudagraph_manager is not None
                     ), "Language model layers should have CUDA graph managers"
 
+                    # Verify that CUDA graphs were created successfully
+                    for runner in layer.cudagraph_manager.cudagraph_runners:
+                        assert hasattr(runner, 'fwd_graph')
+                        assert hasattr(runner, 'bwd_graph')
+
         # Perform backward pass to trigger backward graph recording
         if isinstance(output1, tuple):
             loss = output1[0].sum()
         else:
             loss = output1.sum()
         loss.backward()
-
-        # Import the CUDA graph creation function
-        from megatron.core.transformer.cuda_graphs import create_cudagraphs
-
-        # Create the CUDA graphs - this is where the is_last_layer logic is tested
-        create_cudagraphs()
-
-        # Verify that CUDA graphs were created successfully
-        assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
 
         if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
             self.llava_model.vision_model.decoder, 'layers'
@@ -481,7 +474,6 @@ class TestParallelMambaBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
