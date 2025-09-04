@@ -951,17 +951,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         assert chunk_length > 0, "Chunk length is 0"
         assert chunk_length <= req.prompt_length, "Chunk length is greater than prompt length"
-        assert self.active_token_count + chunk_length <= self.max_tokens, "Token overflow"
+        if self.active_token_count + chunk_length > self.max_tokens:
+            raise TokenOverflowError()
 
         this_round_tokens = req.prompt_tokens[:chunk_length]
-        this_round_length = len(this_round_tokens)
 
         # only allocate new chunks
         already_allocated_chunks = (
             req.finished_chunk_token_count + self.chunk_size_tokens - 1
         ) // self.chunk_size_tokens  # ceiling division
         overall_required_chunks = (
-            req.finished_chunk_token_count + this_round_length + self.chunk_size_tokens - 1
+            req.finished_chunk_token_count + chunk_length + self.chunk_size_tokens - 1
         ) // self.chunk_size_tokens  # ceiling division
 
         num_chunks_needed = overall_required_chunks - already_allocated_chunks
@@ -970,9 +970,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(
                 num_chunks_needed, safe=True
             )
-            assert (
-                new_chunk_ids is not None and len(new_chunk_ids) == num_chunks_needed
-            ), "Chunk Overflow"
+            if new_chunk_ids is None or len(new_chunk_ids) != num_chunks_needed:
+                raise ChunkOverflowError()
 
         # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
         # in this case, it is exactly the last request in the current system (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -988,13 +987,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             current_id = self.total_request_count
 
-        assert current_id < self.max_requests, "Request Overflow"
+        if current_id >= self.max_requests:
+            raise RequestOverflowError()
+
+        if self.active_token_count + chunk_length > self.max_tokens:
+            raise TokenOverflowError()
 
         self.request_ids[current_id] = req.request_id
-        self.request_query_lengths[current_id] = this_round_length
+        self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
-            + this_round_length
+            + chunk_length
             + req.sampling_params.num_tokens_to_generate
         )
         if num_chunks_needed > 0:
@@ -1007,33 +1010,33 @@ class DynamicInferenceContext(BaseInferenceContext):
             overall_required_chunks - 1
         ]
         self.request_last_kv_chunk_offset[current_id] = (
-            this_round_length + req.finished_chunk_token_count - 1
+            chunk_length + req.finished_chunk_token_count - 1
         ) % self.chunk_size_tokens
         # self.num_prefill_requests += 1 # FUTURE MR: in update, all requests are set to decode, so here we need to add 1 for both chunked or not
         token_offset_range = torch.arange(
             req.finished_chunk_token_count,
-            req.finished_chunk_token_count + this_round_length,
+            req.finished_chunk_token_count + chunk_length,
             device=self.token_to_pos_ids.device,
         )
-        self.token_to_pos_ids[
-            self.active_token_count : self.active_token_count + this_round_length
-        ] = token_offset_range
+        self.token_to_pos_ids[self.active_token_count : self.active_token_count + chunk_length] = (
+            token_offset_range
+        )
         self.token_to_input_ids[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = this_round_tokens
         self.token_to_request_idx[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = current_id
         self.token_to_position_in_request[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = token_offset_range
         self.token_to_chunk_idx[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = self.request_to_kv_chunk_ids[current_id][token_offset_range // self.chunk_size_tokens]
         self.token_to_local_position_within_kv_chunk[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.chunk_size_tokens)
-        self.active_token_count += this_round_length
+        self.active_token_count += chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
 
     def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
