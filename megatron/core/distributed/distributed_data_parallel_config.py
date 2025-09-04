@@ -126,6 +126,12 @@ class DistributedDataParallelConfig:
     This option is only effective when Hybrid FSDP is enabled.
     """
 
+    disable_symmetric_registration: bool = False
+    """If true, disable symmetric (window) registration for NCCL userbuffer registration.
+      This option will force to use conventional (local) userbuffer registration 
+      when nccl_ub is set.
+    """
+
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 

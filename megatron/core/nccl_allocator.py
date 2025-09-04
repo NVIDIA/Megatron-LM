@@ -1,13 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import logging
 import os
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import CUDAPluggableAllocator
 
 # This import is needed for the cpp extension to work.
 # pylint: disable=unused-import
 from torch.utils import cpp_extension
+
+from megatron.core.utils import is_torch_min_version
 
 # MCORE NCCL Allocator copies and modifies the APEX NCCL allocator.
 # The original APEX NCCL allocator is available at:
@@ -24,6 +26,11 @@ def _build_nccl_allocator():
         return
 
     nccl_allocator_source = """
+    #include <c10/cuda/CUDACachingAllocator.h>
+    #include <c10/util/Exception.h>
+    #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
+    #include <torch/extension.h>
+
     #include <nccl.h>
     #include <iostream>
     #include <cstdio>
@@ -47,6 +54,26 @@ def _build_nccl_allocator():
         void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
             NCCL_CHECK(ncclMemFree(ptr));
         }
+
+        std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> nccl_allocator;
+
+        void maybe_init() {
+            if (!nccl_allocator) {
+                nccl_allocator = std::make_shared<
+                    torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>(
+                    nccl_alloc_plug, nccl_free_plug);
+            }
+        }
+
+        std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+        get_nccl_allocator() {
+        maybe_init();
+        return nccl_allocator;
+        }
+
+        PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+        m.def("get_nccl_allocator", []() { return get_nccl_allocator(); });
+        };
     }
     """
     module_dir = os.path.dirname(__file__)
@@ -60,15 +87,11 @@ def _build_nccl_allocator():
         with_cuda=True,
         extra_ldflags=["-lnccl"],
         verbose=True,
-        is_python_module=False,
+        is_python_module=True,
         build_directory=source_dir,
     )
 
-    _allocator = CUDAPluggableAllocator(
-        os.path.join(source_dir, f"{nccl_allocator_libname}.so"),
-        "nccl_alloc_plug",
-        "nccl_free_plug",
-    ).allocator()
+    _allocator = nccl_allocator.get_nccl_allocator()
 
 
 def get_func_args(func):
@@ -86,8 +109,16 @@ def create_nccl_mem_pool(symmetric=None):  # symmetric: bool | None = None -> to
     Create a memory pool using the NCCL allocator.
     """
     _build_nccl_allocator()
+    if not is_torch_min_version("2.9.0a0") and symmetric is True:
+        logging.info(
+            f"Symmetric memory pool is not supported with torch version < 2.9.0a0"
+            f"Current torch version: {torch.__version__}"
+            "falling back to non-symmetric memory pool"
+        )
+        symmetric = False
+
     assert _allocator is not None, "NCCL allocator is not initialized"
-    if symmetric is None:
+    if not symmetric:
         _pool = torch.cuda.MemPool(_allocator)
     else:
         if 'symmetric' in get_func_args(torch.cuda.MemPool):

@@ -4,6 +4,8 @@ import asyncio
 import multiprocessing
 import os
 import struct
+import time
+import warnings
 from collections import deque
 from datetime import datetime
 from itertools import repeat
@@ -15,11 +17,8 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
-    ChunkOverflowError,
+    ContextOverflowError,
     DynamicInferenceContext,
-    MaxSequenceLengthOverflowError,
-    RequestOverflowError,
-    TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -32,7 +31,6 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.inference.utils import Counter
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
 
 try:
     from tqdm import tqdm
@@ -54,6 +52,15 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+
+def format_mem_bytes(mem_bytes):
+    """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
+    for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
+        suffix_bytes = 1024**power
+        if mem_bytes >= suffix_bytes:
+            return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
+    return "%d bytes" % mem_bytes
 
 
 class DynamicInferenceEngine(AbstractEngine):
@@ -82,9 +89,16 @@ class DynamicInferenceEngine(AbstractEngine):
         controller: SimpleTextGenerationController,
         context: DynamicInferenceContext,
         termination_id: int,
-        enable_cuda_graph: bool,
+        enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
     ):
+
+        if enable_cuda_graph is not None:
+            warnings.warn(
+                "The `enable_cuda_graph` argument is deprecated and will be "
+                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
+                "read directly from the transformer config object."
+            )
 
         assert isinstance(controller, SimpleTextGenerationController)
         assert isinstance(context, DynamicInferenceContext)
@@ -118,8 +132,17 @@ class DynamicInferenceEngine(AbstractEngine):
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
-        self.enable_cuda_graph = enable_cuda_graph
-        if enable_cuda_graph:
+        if enable_cuda_graph is not None:
+            self.enable_cuda_graph = enable_cuda_graph
+        else:
+            self.enable_cuda_graph = (
+                controller.inference_wrapped_model.model.config.enable_cuda_graph
+            )
+        self.capture_stats = None
+        if self.enable_cuda_graph:
+
+            time_start = time.time()
+            mem_stats_start = torch.cuda.memory_stats()
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
@@ -131,7 +154,6 @@ class DynamicInferenceEngine(AbstractEngine):
             if HAVE_TQDM:
                 tbar = tqdm(tbar, total=len(context.cuda_graph_request_counts))
             for tbar_idx, cuda_graph_request_count in tbar:
-
                 # Initialize attention state.
                 context.initialize_attention_state(num_warmup_requests=cuda_graph_request_count)
                 assert (
@@ -158,9 +180,31 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     context.reset()  # todo: @lmcafee, remove if unnecessary.
 
-            # Create cuda graphs.
-            with torch.inference_mode():
-                create_cudagraphs()
+            # Memory usage.
+            time_end = time.time()
+            mem_stats_end = torch.cuda.memory_stats()
+            capture_stats = {
+                "time": time_end - time_start,
+                "allocated_bytes": (
+                    mem_stats_end["allocated_bytes.all.current"]
+                    - mem_stats_start["allocated_bytes.all.current"]
+                ),
+                "reserved_bytes": (
+                    mem_stats_end["reserved_bytes.all.current"]
+                    - mem_stats_start["reserved_bytes.all.current"]
+                ),
+            }
+            print(
+                "> built cuda graph(s) in %.2f sec, with total memory usage: "
+                "allocated %s, reserved %s."
+                % (
+                    capture_stats["time"],
+                    format_mem_bytes(capture_stats["allocated_bytes"]),
+                    format_mem_bytes(capture_stats["reserved_bytes"]),
+                )
+            )
+
+            self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -357,10 +401,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
-        except (TokenOverflowError, RequestOverflowError, ChunkOverflowError) as e:
-            self.waiting_request_ids.append(request_id)
-        except MaxSequenceLengthOverflowError as e:
-            raise e
+        except ContextOverflowError as e:
+            if e.is_transient:
+                self.waiting_request_ids.append(request_id)
+            else:
+                raise e
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()

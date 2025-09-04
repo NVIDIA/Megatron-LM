@@ -26,7 +26,6 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_model_config, unwrap_model
@@ -814,9 +813,6 @@ class TextGenerationController:
                 assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
                 if is_pipeline_last_stage(self.pp_group):
                     logits = logits[:batch_size]
-
-                if enable_cuda_graph:
-                    create_cudagraphs()
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position

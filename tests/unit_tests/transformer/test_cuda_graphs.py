@@ -1,11 +1,33 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
+import random
+import time
+import types
+
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core import parallel_state
+from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
@@ -13,10 +35,10 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -45,8 +67,8 @@ class TestParallelTransformerBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -74,6 +96,11 @@ class TestParallelTransformerBlockCudagraphs:
             assert hasattr(parallel_transformer_block.layers[0], "cudagraph_manager")
             assert (
                 len(parallel_transformer_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
+            )
+            del (
+                parallel_transformer_block.layers[_]
+                .cudagraph_manager.cudagraph_runners[0]
+                .fwd_graph
             )
 
 
@@ -214,10 +241,27 @@ def test_cuda_graph_determine_first_last_layer_logic(
             assert runner.is_first_layer == (l.layer_number in first_layer_numbers_golden)
             assert runner.is_last_layer == (l.layer_number in last_layer_numbers_golden)
 
-    # teardown
+            del l.cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    # Destroy all captured graphs deterministically
+    for m in model:
+        for l in m.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+
+    # Ensure all pending work is complete and graph destruction runs now
+    torch.cuda.synchronize()
+
+    # Teardown
     Utils.destroy_model_parallel()
-    _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempools = None
 
 
 class TestLLaVACudaGraph:
@@ -300,7 +344,6 @@ class TestLLaVACudaGraph:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -312,6 +355,9 @@ class TestLLaVACudaGraph:
 
         # Move model to CUDA
         self.llava_model.cuda()
+
+        set_current_microbatch(self.llava_model.vision_model, 1)
+        set_current_microbatch(self.llava_model.language_model, 1)
 
         # Create test inputs
         batch_size = 2
@@ -365,6 +411,11 @@ class TestLLaVACudaGraph:
                         layer.cudagraph_manager is not None
                     ), "Language model layers should have CUDA graph managers"
 
+                    # Verify that CUDA graphs were created successfully
+                    for runner in layer.cudagraph_manager.cudagraph_runners:
+                        assert hasattr(runner, 'fwd_graph')
+                        assert hasattr(runner, 'bwd_graph')
+
         # Perform backward pass to trigger backward graph recording
         if isinstance(output1, tuple):
             loss = output1[0].sum()
@@ -372,14 +423,19 @@ class TestLLaVACudaGraph:
             loss = output1.sum()
         loss.backward()
 
-        # Import the CUDA graph creation function
-        from megatron.core.transformer.cuda_graphs import create_cudagraphs
+        if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
+            self.llava_model.vision_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.vision_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
 
-        # Create the CUDA graphs - this is where the is_last_layer logic is tested
-        create_cudagraphs()
-
-        # Verify that CUDA graphs were created successfully
-        assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
+        if hasattr(self.llava_model.language_model, 'decoder') and hasattr(
+            self.llava_model.language_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.language_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
 
 
 class TestParallelMambaBlockCudagraphs:
@@ -388,6 +444,9 @@ class TestParallelMambaBlockCudagraphs:
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
+
+        # Ensure that this test is capturing to a fresh memory pool.
+        CudaGraphManager.global_mempool = None
 
         def get_model_comm_pgs():
             return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
@@ -415,7 +474,6 @@ class TestParallelMambaBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -444,8 +502,207 @@ class TestParallelMambaBlockCudagraphs:
             assert hasattr(parallel_mamba_block.layers[0], "cudagraph_manager")
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
+            del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+
+class TestCaptureFreezeGC:
+
+    def capture_cuda_graphs(self, cuda_graph_capture_freeze_gc: bool) -> None:
+        """Capture multiple cuda graphs by initializing the `DynamicInferenceEngine`.
+
+        The `DynamicInferenceEngine` is used here because it is currently (as of
+        August 2025) one of the heaviest users of multiple cuda graphs, and so
+        its setup tests a realistic use-case of multi-batch size cuda graphs.
+
+        Args:
+            cuda_graph_capture_freeze_gc (bool): Flag that determines whether to
+                freeze garbage collection.
+        """
+
+        # Set freeze-gc environment variable.
+        os.environ["CUDA_GRAPH_CAPTURE_FREEZE_GC"] = str(int(cuda_graph_capture_freeze_gc))
+
+        # Configuration.
+        random_seed = 123
+        vocab_size = 100
+        num_tokens_to_prompt = 128
+        num_tokens_to_generate = 32
+        max_sequence_length = num_tokens_to_prompt + num_tokens_to_generate
+        num_cuda_graphs = 4
+
+        # Rounder values.
+        rounder = 4
+        DynamicInferenceContext.ROUNDER = rounder  # For backwards compatibility
+        DynamicInferenceContext.TOKEN_ROUNDER = rounder
+        DynamicInferenceContext.REQUEST_ROUNDER = rounder
+
+        # Random state.
+        random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        model_parallel_cuda_manual_seed(
+            seed=random_seed,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
+        )
+
+        # Transformer config.
+        transformer_config = TransformerConfig(
+            params_dtype=torch.bfloat16,
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_cuda_graph=True,
+            inference_rng_tracker=True,
+            tensor_model_parallel_size=1,  # needed?
+        )
+
+        # Sampling params.
+        sampling_params = SamplingParams(num_tokens_to_generate=num_tokens_to_generate)
+
+        # GPT model.
+        model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_local_spec(),
+            vocab_size=vocab_size,
+            max_sequence_length=max_sequence_length,
+            parallel_output=True,
+        ).cuda()
+
+        for param in model.parameters():
+            param.data = param.data.to(transformer_config.params_dtype)
+
+        model.eval()
+
+        # Inference config.
+        inference_config = InferenceWrapperConfig(
+            hidden_size=transformer_config.hidden_size,
+            inference_batch_times_seqlen_threshold=400,
+            fp32_residual_connection=False,
+            params_dtype=transformer_config.params_dtype,
+            padded_vocab_size=vocab_size,
+        )
+
+        # Inference context.
+        context = DynamicInferenceContext(
+            params_dtype=transformer_config.params_dtype,
+            num_layers=transformer_config.num_layers,
+            kv_channels=transformer_config.kv_channels,
+            num_attention_heads=transformer_config.num_query_groups,
+            max_sequence_length=max_sequence_length,
+            num_cuda_graphs=num_cuda_graphs,
+            buffer_size_gb=20,
+            buffer_guaranteed_fraction=0.05,
+            chunk_size_tokens=256,
+            buffer_overflow_factor=1.1,
+            max_requests_override=512,
+            max_tokens_override=8196,
+            tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+        )
+
+        # Inference model wrapper.
+        inference_wrapped_model = GPTInferenceWrapper(model, inference_config, context)
+
+        # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
+        inference_wrapped_model.model_is_pipeline_parallel = not (
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+        )
+
+        # Text generation controller.
+        text_generation_controller = TextGenerationController(
+            inference_wrapped_model=inference_wrapped_model,
+            tokenizer=types.SimpleNamespace(vocab_size=vocab_size),
+        )
+
+        # Inference engine.
+        engine = DynamicInferenceEngine(
+            text_generation_controller,
+            context,
+            termination_id=vocab_size - 1,
+            random_seed=random_seed,
+        )
+
+        return engine.capture_stats
+
+    @pytest.mark.experimental
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_capture_freeze_gc(self):
+        """Test cuda graph capture while freezing the GC."""
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+        # Run tests with GC freeze off/on.
+        result_map = {}
+        for freeze_gc in (False, True):
+
+            # Reset global cuda graph state.
+            _CudagraphGlobalRecord.cudagraph_created = False
+            _CudagraphGlobalRecord.cudagraph_record = []
+            CudaGraphManager.global_mempool = None
+
+            # Capture multiple cuda graphs by initializing DynamicInferenceEngine.
+            mem_stats_start = torch.cuda.memory_stats()
+            time_start = time.time()
+            internal_stats = self.capture_cuda_graphs(freeze_gc)
+            time_end = time.time()
+            mem_stats_end = torch.cuda.memory_stats()
+
+            # Track local (external) stats, in addition to internal stats.
+            external_stats = {
+                "time": time_end - time_start,
+                "allocated_bytes": (
+                    mem_stats_end["allocated_bytes.all.current"]
+                    - mem_stats_start["allocated_bytes.all.current"]
+                ),
+                "reserved_bytes": (
+                    mem_stats_end["reserved_bytes.all.current"]
+                    - mem_stats_start["reserved_bytes.all.current"]
+                ),
+            }
+
+            # Record results.
+            result_map[freeze_gc] = {"internal": internal_stats, "external": external_stats}
+
+        # Extract results.
+        freeze_off_results = result_map[False]
+        freeze_on_results = result_map[True]
+        print(
+            "test capture | freeze off: internal %.3f, external %.3f."
+            % (freeze_off_results["internal"]["time"], freeze_off_results["external"]["time"])
+        )
+        print(
+            "test capture | freeze on:  internal %.3f, external %.3f."
+            % (freeze_on_results["internal"]["time"], freeze_on_results["external"]["time"])
+        )
+
+        # Validate time and memory usage.
+        assert freeze_on_results["internal"]["time"] < 0.2 * freeze_off_results["internal"]["time"]
+        assert freeze_on_results["external"]["time"] < 0.2 * freeze_off_results["external"]["time"]
+        assert (
+            freeze_on_results["internal"]["allocated_bytes"]
+            <= freeze_off_results["internal"]["allocated_bytes"]
+        )
+        assert (
+            freeze_on_results["external"]["allocated_bytes"]
+            <= freeze_off_results["external"]["allocated_bytes"]
+        )
+        assert (
+            freeze_on_results["internal"]["reserved_bytes"]
+            <= freeze_off_results["internal"]["reserved_bytes"]
+        )
+        assert (
+            freeze_on_results["external"]["reserved_bytes"]
+            <= freeze_off_results["external"]["reserved_bytes"]
+        )
+
 
 if __name__ == "__main__":
+
     test = TestParallelTransformerBlockCudagraphs()
     test.setup_method(method=None)
     test.test_gpu_cudagraph()
@@ -455,3 +712,6 @@ if __name__ == "__main__":
     llava_test.setup_method(method=None)
     llava_test.test_llava_cudagraph_is_last_layer_logic()
     llava_test.teardown_method(method=None)
+
+    test = TestCaptureFreezeGC()
+    test.test_capture_freeze_gc()

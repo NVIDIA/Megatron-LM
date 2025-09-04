@@ -17,7 +17,6 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import GradFinalizeProcessGroups
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -649,13 +648,6 @@ def forward_backward_no_pipelining(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
-
-    if (
-        hasattr(config, 'enable_cuda_graph')
-        and config.enable_cuda_graph
-        and config.cuda_graph_scope != "full_iteration"
-    ):
-        create_cudagraphs()
 
     return forward_data_store
 
@@ -1919,12 +1911,6 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if (
-        hasattr(config, 'enable_cuda_graph')
-        and config.enable_cuda_graph
-        and config.cuda_graph_scope != "full_iteration"
-    ):
-        create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
     return forward_data_store
@@ -2312,12 +2298,5 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
-
-    if (
-        hasattr(config, 'enable_cuda_graph')
-        and config.enable_cuda_graph
-        and config.cuda_graph_scope != "full_iteration"
-    ):
-        create_cudagraphs()
 
     return forward_data_store

@@ -376,15 +376,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["model_comm_pgs"] = model_comm_pgs
-            elif submodules.mlp.module == MLP:
+            elif submodules.mlp.module in (MLP, TEFusedMLP):
                 assert hasattr(
                     model_comm_pgs, 'tp'
                 ), 'TP process group is required for MLP in TransformerLayer'
-                additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
-            elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
-                assert hasattr(
-                    model_comm_pgs, 'tp'
-                ), 'TP process group is required for TEFusedMLP in TransformerLayer'
                 additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
             else:
                 log_single_rank(
