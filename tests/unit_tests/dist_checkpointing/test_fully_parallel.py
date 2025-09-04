@@ -363,10 +363,13 @@ class TestFullyParallelSaveAndLoad:
 
         mem_alloc_start = torch.cuda.memory_allocated()
 
-        with mock.patch(
-            'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
-            new=mock_get_empty_tensor_for_exchange,
-        ), TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+        with (
+            mock.patch(
+                'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
+                new=mock_get_empty_tensor_for_exchange,
+            ),
+            TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A,
+        ):
             _ = load_strategy.load(sharded_state_dict, ckpt_dir_A)
 
         # Each rank is expected to do 9 allocations for all shards loaded by some other rank.
