@@ -33,7 +33,7 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_utils import ModelCommProcessGroups
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -56,7 +56,7 @@ except ImportError:
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
 # in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass model_comm_pgs to sub-module
+# After sub-module's refactoring is done, we can pass pg_collection to sub-module
 # and delete the function expert_dist_ckpt_decorator.
 def expert_dist_ckpt_decorator(func):
     """Decorator of shared_state_dict in expert layer for distributed checkpoint.
@@ -106,7 +106,7 @@ class GroupedMLP(MegatronModule):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.config: TransformerConfig = config
@@ -144,11 +144,11 @@ class GroupedMLP(MegatronModule):
 
         self.activation_func_with_probs = activation_func_with_probs
 
-        self.ep_group = model_comm_pgs.ep
-        # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
-        self.tp_group = model_comm_pgs.expt_tp
-        # use model_comm_pgs.expt_dp_group as data parallel group in this module.
-        self.dp_group = model_comm_pgs.expt_dp
+        self.ep_group = pg_collection.ep
+        # use pg_collection.expt_tp_group as tensor parallel group in this module.
+        self.tp_group = pg_collection.expt_tp
+        # use pg_collection.expt_dp_group as data parallel group in this module.
+        self.dp_group = pg_collection.expt_dp
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
@@ -753,7 +753,7 @@ class TEGroupedMLP(MegatronModule):
         num_local_experts,
         config: TransformerConfig,
         submodules: MLPSubmodules,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
@@ -762,14 +762,14 @@ class TEGroupedMLP(MegatronModule):
             config.add_bias_linear == False
         ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
 
-        self.ep_group = model_comm_pgs.ep
+        self.ep_group = pg_collection.ep
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # TODO(Hepteract): pass model_comm_pgs to submodule after refactoring Linear modules
+        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
@@ -789,7 +789,7 @@ class TEGroupedMLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # TODO(Hepteract): pass model_comm_pgs to submodule after refactoring Linear modules
+        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
@@ -995,7 +995,7 @@ class SequentialMLP(MegatronModule):
         num_local_experts,
         config: TransformerConfig,
         submodules: MLPSubmodules,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
@@ -1010,10 +1010,10 @@ class SequentialMLP(MegatronModule):
         self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
-        self.ep_group = model_comm_pgs.ep
-        # use model_comm_pgs.expt_dp_group as data parallel group in this module.
+        self.ep_group = pg_collection.ep
+        # use pg_collection.expt_dp_group as data parallel group in this module.
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
-        self.dp_group = model_comm_pgs.expt_dp
+        self.dp_group = pg_collection.expt_dp
 
         for _ in range(self.num_local_experts):
             expert = MLP(

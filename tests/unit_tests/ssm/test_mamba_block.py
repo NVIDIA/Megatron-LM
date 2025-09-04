@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -23,8 +23,8 @@ class TestMambaBlock:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
 
-    def get_model_comm_pgs(self):
-        return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+    def get_pg_collection(self):
+        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
     def get_mamba_block(self, hybrid_override_pattern):
         transformer_config = TransformerConfig(
@@ -40,7 +40,7 @@ class TestMambaBlock:
             transformer_config,
             modules,
             hybrid_override_pattern=hybrid_override_pattern,
-            model_comm_pgs=self.get_model_comm_pgs(),
+            pg_collection=self.get_pg_collection(),
         )
 
     def teardown_method(self, method):
