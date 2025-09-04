@@ -48,11 +48,10 @@ class TestAsyncSave:
             ),
         }
 
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_equivalence_async'
-        ) as async_ckpt_dir, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_equivalence_sync'
-        ) as sync_ckpt_dir:
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_async') as async_ckpt_dir,
+            TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_sync') as sync_ckpt_dir,
+        ):
             # async
             async_calls = AsyncCallsQueue(persistent)
             async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
