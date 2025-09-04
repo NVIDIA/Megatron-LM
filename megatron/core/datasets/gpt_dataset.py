@@ -12,9 +12,9 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
+from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -701,8 +701,8 @@ class MockGPTLowLevelDataset:
     we add the end of document token to each element indexed in __getitem__
 
     Args:
-        tokenizer (MegatronTokenizer): The tokenizer the special token information of which we use
-            to augment the mock data.
+        tokenizer (MegatronTokenizerBase): The tokenizer the special token information of which
+        we use to augment the mock data.
     """
 
     seed: int = 0
@@ -714,7 +714,7 @@ class MockGPTLowLevelDataset:
     max_sequence_length: int = 4096
     """The hard-coded max sequence length to generate"""
 
-    def __init__(self, tokenizer: MegatronTokenizer) -> None:
+    def __init__(self, tokenizer: MegatronTokenizerBase) -> None:
         self.tokenizer = tokenizer
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
