@@ -1,6 +1,7 @@
 from functools import partial
 
 from torch.optim.optimizer import ParamsT
+from torch.distributed import ProcessGroup
 
 from megatron.core.emerging_optimizers.orthogonalized_optimizers.orthogonalized_optimizer import OrthogonalizedOptimizer
 from megatron.core.emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
@@ -53,12 +54,14 @@ class Muon(OrthogonalizedOptimizer):
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
         scale_mode: str = "spectral",
+        tp_group: ProcessGroup | None = None,
+        tp_mode: str = "blockwise",
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
 
-        orthogonalize_fn = partial(newton_schulz, steps=num_ns_steps, coefficient_type=coefficient_type)
-        scale_factor_fn = partial(get_muon_scale_factor, mode=scale_mode)
+        orthogonalize_fn = partial(newton_schulz, steps=num_ns_steps, coefficient_type=coefficient_type, tp_group=tp_group, tp_mode=tp_mode)
+        scale_factor_fn = partial(get_muon_scale_factor, mode=scale_mode, tp_size=tp_group.size() if tp_group and "global" in tp_mode else 1)
 
         super().__init__(
             params,
@@ -75,7 +78,13 @@ class Muon(OrthogonalizedOptimizer):
         )
 
 
-def get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
+def get_muon_scale_factor(
+        size_out: int,
+        size_in: int,
+        mode: str = "spectral",
+        tp_size: int = 1,
+        partition_dim: int | None = None,
+    ) -> float:
     """Get the scale for the update.
 
     Default mode is "spectral", which is the mode that allows for learning rate transferability from AdamW.
@@ -88,6 +97,13 @@ def get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -
     Returns:
         The scale factor for the update.
     """
+    if tp_size > 1:
+        assert partition_dim == 0 or partition_dim == 1, "Need partition dim set for muon scale factor"
+        if partition_dim == 0:
+            size_out *= tp_size
+        else:
+            size_in *= tp_size
+
     if mode == "shape_scaling":
         # Suggested by Muon (https://kellerjordan.github.io/posts/muon/)
         return max(1, size_out / size_in) ** 0.5

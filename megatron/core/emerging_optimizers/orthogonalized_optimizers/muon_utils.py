@@ -36,6 +36,9 @@ def newton_schulz(
     steps: int,
     coefficient_type: str = "quintic",
     custom_coefficient_sets: list[tuple[float, float, float]] | None = None,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    tp_mode: str = "blockwise",
+    partition_dim: int | None = None,
 ) -> torch.Tensor:
     """Use Newton-Schulz iteration to compute the zeroth power / orthogonalization of x.
 
@@ -58,20 +61,53 @@ def newton_schulz(
         custom_coefficient_sets: Custom coefficient sets to use for the Newton-Schulz iteration.
             - If coefficient_type is "custom", custom_coefficient_sets must be provided.
             - If coefficient_type is not "custom", custom_coefficient_sets is ignored.
+        tp_group: The process group for communication if input is distributed and global NS is required.
+        tp_mode: how NS calcuation is handled when tensor-parallel is used. 3 available modes are:
+            - "blockwise": Default, NS is calculated by local grad and not communicated between TP ranks
+            - "global": allgather to recreate global grad then do duplicate NS same as TP1 on every rank
+            - "global_dist": distributed NS calculation
+        partition_dim: TP weight split dimension
+
+    Returns:
+        The orthogonalization of x.
     """
     # Muon is not for 1d parameters
     if x.ndim < 2:
         raise ValueError("Input tensor x must have at least 2 dimensions since Muon is not for 1d parameters.")
     if x.dtype != torch.float32:
         raise ValueError(f"Input tensor x must be in float32, got {x.dtype}")
+    # fallback tp_group/tb_mode when not needed to simplify code
+    if (tp_group and tp_group.size() == 1) or 'global' not in tp_mode:
+        tp_group = None
+        tp_mode = "blockwise"
+    # TODO: properly support > 2D tensor
+    if tp_group and (partition_dim is None or partition_dim < 0):
+        raise ValueError(f"Choosing global NS for muon but parameter.partition_dim is {partition_dim}.")
+    if x.ndim > 2 and tp_mode == 'gloabl_dist':
+        raise ValueError("muon global_dist mode does not support >2D tensor, try global mode.")
+
+    # All gather grad shards in global mode, result grad should be equivalent to tp == 1
+    if tp_mode == "global":
+       x_shards = [torch.empty_like(x) for _ in range(tp_group.size())]
+       torch.distributed.all_gather(x_shards, x, tp_group)
+       x = torch.cat(x_shards, dim=partition_dim)
 
     # transpose tensor to perform whitening on the smaller dimension
     needs_transpose = x.size(-2) > x.size(-1)
+    # overwrites transpose flag since in dist NS we need k-dim be same as tp partition dim
+    if tp_mode == "global_dist":
+        needs_transpose = partition_dim == 0
+
     if needs_transpose:
         x = x.mT
 
     # Ensure spectral norm is at most 1
-    X = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    if tp_mode == "global_dist":
+        x_sq_sum = (x * x).sum(dim=(-2, -1))
+        torch.distributed.all_reduce(x_sq_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+        X = x / (torch.sqrt(x_sq_sum) + 1e-7)
+    else:
+        X = torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=1e-7)
 
     if coefficient_type in _COEFFICIENT_SETS:
         coefficient_sets = _COEFFICIENT_SETS[coefficient_type]
@@ -98,6 +134,8 @@ def newton_schulz(
     for i in range(steps):
         a, b, c = coefficient_sets[i % len(coefficient_sets)]
         A = X @ X.mT
+        if tp_mode == "global_dist":
+            torch.distributed.all_reduce(A, op=torch.distributed.ReduceOp.SUM, group=tp_group)
         B = torch.addmm(A, A, A, beta=b, alpha=c)
         X = torch.addmm(X, B, X, beta=a, alpha=1.0)
 
@@ -107,4 +145,9 @@ def newton_schulz(
     # undo transpose if necessary
     if needs_transpose:
         X = X.mT
+
+    # get local result from all gather mode
+    if tp_mode == "global":
+        X = X.chunk(tp_group.size(), dim=partition_dim)[tp_group.rank()]
+
     return X

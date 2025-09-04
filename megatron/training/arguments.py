@@ -1757,6 +1757,9 @@ def _add_regularization_args(parser):
                        help='FP32 matmul precision for Newton-Schulz iteration')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'global', 'global_dist'],
+                       help='How to perform NS calculation for tensor model parallel weights')
     return parser
 
 

@@ -135,6 +135,9 @@ class OptimizerConfig:
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
+    muon_tp_mode: str = "blockwise"
+    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+
     #######################
     # Distributed optimizer
     #######################

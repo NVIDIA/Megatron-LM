@@ -140,6 +140,7 @@ class OrthogonalizedOptimizer(optim.Optimizer):
                     grad = exp_avg
 
                 with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                    partition_dim = getattr(p, 'partition_dim', None)
                     if grad.dim() == 1:
                         # for 1D parameters, skip Newton-Schulz iteration, optimizer defaults to AdamW update
                         raise ValueError("OrthogonalizedOptimizer does not support 1D parameters")
@@ -149,14 +150,14 @@ class OrthogonalizedOptimizer(optim.Optimizer):
                         # Split gradient for Q, K, V
                         qkv_grads = torch.split(grad, qkv_shapes, dim=0)
                         # Apply Newton-Schulz to each component
-                        qkv_whitened = [self.orthogonalize_fn(g) for g in qkv_grads]
-                        qkv_scales = [self.scale_factor_fn(size, g.size(1)) for size, g in zip(qkv_shapes, qkv_grads)]
+                        qkv_whitened = [self.orthogonalize_fn(g, partition_dim=partition_dim) for g in qkv_grads]
+                        qkv_scales = [self.scale_factor_fn(size, g.size(1), partition_dim=partition_dim) for size, g in zip(qkv_shapes, qkv_grads)]
                         # Apply individual scales to each component and concatenate
                         grad = torch.cat([whitened * scale for whitened, scale in zip(qkv_whitened, qkv_scales)])
                         scale = 1.0  # no additional scaling needed as we have already applied scale to each component
                     else:
-                        grad = self.orthogonalize_fn(grad)
-                        scale = self.scale_factor_fn(grad.size(0), grad.size(1))
+                        grad = self.orthogonalize_fn(grad, partition_dim=partition_dim)
+                        scale = self.scale_factor_fn(grad.size(0), grad.size(1), partition_dim=partition_dim)
 
                 # perform weight update
                 # scale is applied to have update RMS == 1
