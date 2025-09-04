@@ -319,7 +319,7 @@ def main():
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
-        enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)

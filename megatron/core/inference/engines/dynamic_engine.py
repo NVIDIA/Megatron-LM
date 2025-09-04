@@ -113,7 +113,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
-        self.chunked_prefill_request_id = -1
         self.enable_chunked_prefill = enable_chunked_prefill
 
         # Initialize the asyncio loop if it has not already been initialized.
@@ -428,7 +427,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request_ids.tolist(), sample.tolist(), log_probs_iter
         ):
             request: DynamicInferenceRequest = self.requests[request_id]
-            if request_id != self.chunked_prefill_request_id:
+            if request_id != self.context.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
                 if request.tpot is None:
                     request.tpot = []
@@ -502,15 +501,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 which should be the head
             - There are at most one chunked prefill request in the context,
                 which should be the last active request
-            - chunked_prefill_request_id == -1 if no chunked prefill request is in the waiting pool,
-                otherwise it is the request id of the chunked prefill request in the waiting pool
-            - context.have_chunked_prefill is True if there is a chunked prefill
-                request in the context, otherwise it is False
-            - For each request, finished_chunked_tokens is the number of tokens
+            - context.chunked_prefill_request_id == -1 if no chunked prefill request is scheduled,
+                otherwise it is the request id of the chunked prefill request
+            - For each request, finished_chunk_token_count is the number of tokens
                 that have been prefilled for this request, non-zero means
                 it is during a chunked prefill
             - For each request, prompt_tokens is the ** unprefilled ** prompt tokens,
-                having length of prompt_length - finished_chunked_tokens
+                having length of prompt_length - finished_chunk_token_count
         """
         while self.waiting_request_ids:
 
@@ -518,7 +515,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.chunked_prefill_request_id > 0
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
 
             token_fully_satisfied = (
                 self.context.active_token_count + req.prompt_length <= self.context.max_tokens
@@ -531,24 +528,22 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_satisfied and kv_cache_available:
                 if token_fully_satisfied:
-                    self.chunked_prefill_request_id = -1
+                    self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         asyncio.create_task, self._notify_cond_for_new_request()
                     )
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
-                    self.context.have_chunked_prefill = False
                 elif token_partially_satisfied:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         asyncio.create_task, self._notify_cond_for_new_request()
                     )
-                    self.context.have_chunked_prefill = True
-                    self.chunked_prefill_request_id = req.request_id
+                    self.context.chunked_prefill_request_id = req.request_id
                     req.prompt_tokens = req.prompt_tokens[chunk_length:]
-                    req.finished_chunked_tokens += chunk_length
+                    req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
                     # chunked prefill request at the head of the waiting pool
                     # Note that we do not need to continue check the queue, as the tokens are full
@@ -842,7 +837,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # care of the post-processing.
                     request_ids, finished_request_ids, sample, logprobs = engine_output
                     # Include chunked prefill request id, use -1 if None
-                    chunked_prefill_id = self.chunked_prefill_request_id
+                    chunked_prefill_id = self.context.chunked_prefill_request_id
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
