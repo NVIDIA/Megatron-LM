@@ -376,15 +376,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["model_comm_pgs"] = model_comm_pgs
-            elif submodules.mlp.module == MLP:
+            elif submodules.mlp.module in (MLP, TEFusedMLP):
                 assert hasattr(
                     model_comm_pgs, 'tp'
                 ), 'TP process group is required for MLP in TransformerLayer'
-                additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
-            elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
-                assert hasattr(
-                    model_comm_pgs, 'tp'
-                ), 'TP process group is required for TEFusedMLP in TransformerLayer'
                 additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
             else:
                 log_single_rank(
@@ -882,7 +877,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # it can happen that non-decode steps have a token count greater than the max
             # supported cuda graph token count. In that case this flag will be set to
             # False by initialize_attention, and we should not use cuda graphs.
-            if kwargs['inference_context'].using_cuda_graph_this_step():
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            if using_cuda_graph:
                 # dynamic_inference_decode_only is not a real argument to forward, it is only used
                 # to differentiate the cuda graph used for decode from the one used for non-decode
                 # inference.
