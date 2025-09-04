@@ -15,7 +15,7 @@ from megatron.core.models.common.embeddings.relative_pos_embedding import Relati
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -151,7 +151,7 @@ class T5Model(LanguageModule):
         relative_attention_max_distance: int = 128,
         add_encoder: bool = True,
         add_decoder: bool = True,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
 
         super(T5Model, self).__init__(config=config)
@@ -171,11 +171,11 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                 required_pgs=['tp', 'cp', 'pp']
             )
-        self.tp_group = get_tensor_model_parallel_group_if_none(model_comm_pgs.tp)
+        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
 
         self.model_type = ModelType.encoder_or_decoder
 
@@ -209,7 +209,7 @@ class T5Model(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=model_comm_pgs.cp,
+                cp_group=pg_collection.cp,
             )
 
         # Relative Position Embeddings
@@ -240,7 +240,7 @@ class T5Model(LanguageModule):
                 spec=encoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
         else:
             self.encoder = None
@@ -252,7 +252,7 @@ class T5Model(LanguageModule):
                 spec=decoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
         else:
             self.decoder = None

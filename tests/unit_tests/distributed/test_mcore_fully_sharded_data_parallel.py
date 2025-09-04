@@ -13,7 +13,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -92,11 +92,10 @@ class TestFullyShardedDataParallel:
         grid = HyperCommGrid([dp_size], ["dp"])
 
         # Create process groups config with ONLY dp group
-        grad_comm_pgs = GradCommProcessGroups()
-        model_comm_pgs = ModelCommProcessGroups()
+        pg_collection = ProcessGroupCollection()
 
-        grad_comm_pgs.dp = grid.create_pg("dp")
-        grad_comm_pgs.dp_cp = grad_comm_pgs.dp
+        pg_collection.dp = grid.create_pg("dp")
+        pg_collection.dp_cp = pg_collection.dp
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()
@@ -139,8 +138,7 @@ class TestFullyShardedDataParallel:
             config=transformer_config,
             ddp_config=fsdp_config,
             module=model2,
-            grad_comm_pgs=grad_comm_pgs,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
             fsdp_unit_modules=[torch.nn.Linear],
         )
 
@@ -239,10 +237,9 @@ class TestFullyShardedDataParallel:
         grid = HyperCommGrid([dp_size], ["dp"])
 
         # Create process groups config with ONLY dp group
-        grad_comm_pgs = GradCommProcessGroups()
-        model_comm_pgs = ModelCommProcessGroups()
+        pg_collection = ProcessGroupCollection()
 
-        grad_comm_pgs.dp = grid.create_pg("dp")
+        pg_collection.dp = grid.create_pg("dp")
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()

@@ -13,7 +13,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
-    get_default_model_comm_pgs,
+    get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
 )
 from megatron.core.transformer.moe.router import TopKRouter
@@ -206,12 +206,12 @@ class TestRouterAuxLoss:
         Returns:
             Router: A new router instance with the specified configuration.
         """
-        model_comm_pgs = get_default_model_comm_pgs()
+        pg_collection = get_default_pg_collection()
         # Create a new config with updated parameters
         new_transformer_config = dataclasses.replace(self.default_transformer_config, **kwargs)
 
         # Create the router with the updated config
-        router = TopKRouter(config=new_transformer_config, model_comm_pgs=model_comm_pgs)
+        router = TopKRouter(config=new_transformer_config, pg_collection=pg_collection)
         router.set_layer_number(0)
         return router
 
