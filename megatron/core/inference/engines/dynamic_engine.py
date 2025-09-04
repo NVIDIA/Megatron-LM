@@ -18,7 +18,6 @@ from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
-    ContextOverflowError,
     WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -459,7 +458,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     active_requests.append(request)
             else:
-                # The chunked prefill produces useless tokens, so we are not appending them to the generated tokens.
+                # The chunked prefill produces useless tokens
+                # so we are not appending them to the generated tokens.
                 # Additionally, chunked prefill request do not finish.
                 # However, the log probs are still needed.
                 if request_log_probs is not None:
@@ -498,19 +498,26 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         This function schedules chunked prefill requests.
         Invariant:
-            - There are at most one chunked prefill request in the waiting pool, which should be the head
-            - There are at most one chunked prefill request in the context, which should be the last active request
+            - There are at most one chunked prefill request in the waiting pool,
+                which should be the head
+            - There are at most one chunked prefill request in the context,
+                which should be the last active request
             - chunked_prefill_request_id == -1 if no chunked prefill request is in the waiting pool,
                 otherwise it is the request id of the chunked prefill request in the waiting pool
-            - context.have_chunked_prefill is True if there is a chunked prefill request in the context, otherwise it is False
-            - For each request, finished_chunked_tokens is the number of tokens that have been prefilled for this request, non-zero means it is during a chunked prefill
-            - For each request, prompt_tokens is the ** unprefilled ** prompt tokens, having length of prompt_length - finished_chunked_tokens
+            - context.have_chunked_prefill is True if there is a chunked prefill
+                request in the context, otherwise it is False
+            - For each request, finished_chunked_tokens is the number of tokens
+                that have been prefilled for this request, non-zero means
+                it is during a chunked prefill
+            - For each request, prompt_tokens is the ** unprefilled ** prompt tokens,
+                having length of prompt_length - finished_chunked_tokens
         """
         while self.waiting_request_ids:
 
             req = self.requests[self.waiting_request_ids[0]]
 
-            # is_continuing_chunked_prefill is True if we are scheduling next chunk of a existing chunked prefill request
+            # is_continuing_chunked_prefill is True if we are scheduling next
+            # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.chunked_prefill_request_id > 0
 
             token_fully_satisfied = (
@@ -529,7 +536,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._loop.call_soon_threadsafe(
                         asyncio.create_task, self._notify_cond_for_new_request()
                     )
-                    self.waiting_request_ids.popleft()  # Fully scheduled, so we remove from waiting pool
+                    # Fully scheduled, so we remove from waiting pool
+                    self.waiting_request_ids.popleft()
                     self.context.have_chunked_prefill = False
                 elif token_partially_satisfied:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
@@ -541,7 +549,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.chunked_prefill_request_id = req.request_id
                     req.prompt_tokens = req.prompt_tokens[chunk_length:]
                     req.finished_chunked_tokens += chunk_length
-                    # Still have tokens to prefill, so we break and keep the chunked prefill request at the head of the waiting pool
+                    # Still have tokens to prefill, so we break and keep the
+                    # chunked prefill request at the head of the waiting pool
                     # Note that we do not need to continue check the queue, as the tokens are full
                     break
                 else:
