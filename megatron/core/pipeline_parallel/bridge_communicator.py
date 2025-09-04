@@ -315,7 +315,7 @@ class BridgeCommunicator:
             received_tensors_list = []
             for src_rank, shape in zip(rank_info.recv_from_ranks, recv_forward_shapes):
                 tensor_to_recv = torch.empty(
-                    shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                    shape, device=torch.cuda.current_device(), dtype=self.comm_dtype, requires_grad=True
                 )
                 dist.recv(tensor_to_recv, src=src_rank)
                 logging.debug(
@@ -352,7 +352,7 @@ class BridgeCommunicator:
 
             received_shape = tuple(shape_tensor.tolist())
             received_tensor = torch.empty(
-                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype, requires_grad=True
             )
 
             # Receive the full tensor via broadcast
@@ -654,6 +654,7 @@ class BridgeCommunicator:
                         recv_forward_shape,
                         device=torch.cuda.current_device(),
                         dtype=self.comm_dtype,
+                        requires_grad=True,
                     )
                     received_activations_list.append(activation_tensor)
 
@@ -714,7 +715,7 @@ class BridgeCommunicator:
             # Use the received shape to create tensor for scatter operation
             received_shape = tuple(shape_tensor.tolist())
             received_activation = torch.empty(
-                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype, requires_grad=True
             )
             dist.broadcast(
                 received_activation,
