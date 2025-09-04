@@ -150,10 +150,10 @@ def deallocate_output_tensor_safe(output_tensor, deallocate_pipeline_outputs=Fal
     '''Deallocate output tensor, handling both tensor and dict cases.'''
     if not output_tensor or not deallocate_pipeline_outputs:
         return
-    
+
     # Extract from list if needed
     tensor = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
-    
+
     # Handle dict case - deallocate all tensor values
     if isinstance(tensor, dict):
         for value in tensor.values():
@@ -464,18 +464,24 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     # Detect if we're using dictionary format
     is_dict_format = isinstance(input_tensor, dict) or isinstance(output_tensor, dict)
-    
+
     if is_dict_format:
         # Handle dictionary format for multi-module pipeline
-        return _backward_step_dict_format(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        return _backward_step_dict_format(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
     else:
         # Handle legacy tensor format
-        return _backward_step_tensor_format(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        return _backward_step_tensor_format(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
 
 
-def _backward_step_tensor_format(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def _backward_step_tensor_format(
+    input_tensor, output_tensor, output_tensor_grad, model_type, config
+):
     """Legacy backward step implementation for tensor format."""
-    
+
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
     if not isinstance(input_tensor, list):
@@ -520,23 +526,23 @@ def _backward_step_tensor_format(input_tensor, output_tensor, output_tensor_grad
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
-    print(f'[Yash] rank {torch.distributed.get_rank()} debug backward step tensor format input_tensor_grad: {input_tensor_grad}')
+
     return input_tensor_grad
 
 
 def _backward_step_dict_format(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Enhanced backward step implementation for dictionary format."""
-    
+
     if isinstance(input_tensor, torch.Tensor):
         input_tensor.retain_grad()
-    
+
     # Retain gradients on all input tensors
     for module_name, tensor in input_tensor.items():
         if isinstance(tensor, list):
             tensor = tensor[0]
         if tensor is not None:
             tensor.retain_grad()
- 
+
     # Last stage: output_tensor is a scalar loss, wrap in dict for uniform handling
     # Use the first input tensor key as the main module name
     # for now last stage only has one module LLM
@@ -545,7 +551,7 @@ def _backward_step_dict_format(input_tensor, output_tensor, output_tensor_grad, 
         assert len(all_keys) == 1, "Last stage only has one module LLM"
         main_module_key = all_keys[0]
         output_tensor = {main_module_key: output_tensor}
-    
+
     # Handle output_tensor_grad: None (last stage) or dict (intermediate stages)
     if not output_tensor_grad:
         # Last stage: no gradient from next stage
@@ -560,13 +566,15 @@ def _backward_step_dict_format(input_tensor, output_tensor, output_tensor_grad, 
     for module_name in output_tensor.keys():
         output_tensor_module = output_tensor[module_name]
         output_tensor_grad_module = output_tensor_grad[module_name]
-        
+
         # Skip backward if tensor doesn't require gradients
         if output_tensor_module is not None and output_tensor_module.requires_grad:
             if config.deallocate_pipeline_outputs:
                 custom_backward(output_tensor_module, output_tensor_grad_module)
             else:
-                torch.autograd.backward(output_tensor_module, grad_tensors=output_tensor_grad_module)
+                torch.autograd.backward(
+                    output_tensor_module, grad_tensors=output_tensor_grad_module
+                )
 
     # Collect gradients for input tensors
     input_tensor_grad = {}

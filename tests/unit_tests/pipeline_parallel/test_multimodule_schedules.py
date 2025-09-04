@@ -74,7 +74,13 @@ class Model(torch.nn.Module):
     
     @property
     def ddp_config(self):
-        return self.encoder.ddp_config
+        # Try to get ddp_config from the first available module on this rank
+        if self.is_current_rank_in_grid(self.encoder_grid) and self.encoder is not None:
+            return self.encoder.ddp_config
+        elif self.is_current_rank_in_grid(self.llm_grid) and self.llm is not None:
+            return self.llm.ddp_config
+        else:
+            raise AttributeError(f"No active modules with ddp_config found on rank {self.current_rank}")
 
     def scale_gradients(self, scaling_factor: float):
         """Scale gradients for all active modules on this rank."""
