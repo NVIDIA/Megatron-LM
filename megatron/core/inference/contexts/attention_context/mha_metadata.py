@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 from typing import Optional
 
 import torch
@@ -9,6 +11,7 @@ class MHAMetadata(MetadataBase):
     """
     Metadata for MHA layer using flash-attention.
     """
+
     def __init__(
         self,
         chunk_count_total,
@@ -133,6 +136,7 @@ class GraphMHAMetadata(MHAMetadata):
     """
     Metadata for MHA layer using flash-attention with CUDA graphs.
     """
+
     def __init__(
         self,
         chunk_count_total,
@@ -186,6 +190,7 @@ class NonGraphMHAMetadata(MHAMetadata):
     """
     Metadata for MHA layer using flash-attention without CUDA graphs.
     """
+
     def update(
         self,
         request_query_lengths: torch.Tensor,

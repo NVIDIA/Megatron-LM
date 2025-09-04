@@ -1,7 +1,10 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 class MetadataBase:
     """
     Base class for attention metadata.
     """
+
     def __init__(self, debug):
         """
         Initialize the metadata.
