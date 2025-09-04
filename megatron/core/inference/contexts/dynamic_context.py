@@ -950,7 +950,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert this_round_length <= req.prompt_length, "Chunk length is greater than prompt length"
         # `context_length` here is the equal to prompt length, and does not
         # include output length.
-        context_length = tokens.numel()
+        context_length = this_round_length
         if context_length > self.max_tokens:
             # **Note**: for `megatron-core >= 0.15`, this assert should be
             # `is_transient=False`. For backwards compatibility with legacy tests,
