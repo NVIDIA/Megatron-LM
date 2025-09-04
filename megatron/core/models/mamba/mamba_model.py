@@ -10,7 +10,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
@@ -49,7 +49,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
-        pg_collection (ProcessGroupCollection, optional): Model communication process groups.
+        model_comm_pgs (ModelCommProcessGroups, optional): Model communication process groups.
     """
 
     def __init__(
@@ -72,9 +72,9 @@ class MambaModel(LanguageModule):
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -103,7 +103,7 @@ class MambaModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=self.pg_collection.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -113,7 +113,7 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
             )
 
         self.decoder = build_module(
@@ -125,7 +125,7 @@ class MambaModel(LanguageModule):
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
-            pg_collection=self.pg_collection,
+            model_comm_pgs=self.model_comm_pgs,
         )
 
         # Output
@@ -140,7 +140,7 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
-                tp_group=self.pg_collection.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:

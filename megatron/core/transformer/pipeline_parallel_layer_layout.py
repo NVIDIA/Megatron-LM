@@ -133,14 +133,10 @@ class PipelineParallelLayerLayout:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")
 
     def get_num_layers_to_build(
-        self,
-        layer_type: LayerType = LayerType.decoder,
-        vp_stage: Optional[int] = None,
-        pp_rank: Optional[int] = None,
+        self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None
     ):
         """Get the number of layers to build in the pipeline stage"""
-        if pp_rank is None:
-            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
@@ -151,14 +147,10 @@ class PipelineParallelLayerLayout:
         return num_layers_to_build
 
     def get_layer_offset(
-        self,
-        layer_type: LayerType = LayerType.decoder,
-        vp_stage: Optional[int] = None,
-        pp_rank: Optional[int] = None,
+        self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None
     ):
         """Get the layer offset in the pipeline stage"""
-        if pp_rank is None:
-            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
@@ -175,16 +167,11 @@ class PipelineParallelLayerLayout:
         return offset
 
     def get_layer_id_list(
-        self,
-        layer_type: LayerType = LayerType.decoder,
-        vp_stage: Optional[int] = None,
-        pp_rank: Optional[int] = None,
+        self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None
     ):
         """Get the list of layer_id for each layer in the pipeline stage."""
-        offset = self.get_layer_offset(layer_type=layer_type, vp_stage=vp_stage, pp_rank=pp_rank)
-        num_layers_to_build = self.get_num_layers_to_build(
-            layer_type=layer_type, vp_stage=vp_stage, pp_rank=pp_rank
-        )
+        offset = self.get_layer_offset(layer_type=layer_type, vp_stage=vp_stage)
+        num_layers_to_build = self.get_num_layers_to_build(layer_type=layer_type, vp_stage=vp_stage)
         return list(range(offset, offset + num_layers_to_build))
 
     def pretty_repr(self):

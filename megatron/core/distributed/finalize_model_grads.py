@@ -18,7 +18,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import GradFinalizeProcessGroups
 
 from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
@@ -376,7 +376,7 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    grad_finalize_pgs: Optional[GradFinalizeProcessGroups] = None,
 ):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
@@ -385,29 +385,29 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
-    if pg_collection is not None:
-        assert hasattr(pg_collection, 'tp')
-        assert hasattr(pg_collection, 'pp')
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
+    if grad_finalize_pgs is not None:
+        assert hasattr(grad_finalize_pgs, 'tp')
+        assert hasattr(grad_finalize_pgs, 'pp')
+        assert hasattr(grad_finalize_pgs, 'embd'), (
+            "grad_finalize_pgs must have a embd. In previous version, it is used default "
             "`parallel_state.default_embedding_ranks` to create the process group."
             " If you are using the default process group, please use"
             " `parallel_state.get_embedding_group()` "
             "If you don't need embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
+        assert hasattr(grad_finalize_pgs, 'pos_embd'), (
+            "grad_finalize_pgs must have a pos_embd. In previous version, it is used default "
             "`parallel_state.default_position_embedding_ranks` to create the process group."
             " If you are using the default process group, please use "
             " `parallel_state.get_position_embedding_group()` "
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(pg_collection, 'dp_cp')
-        tp_group = pg_collection.tp
-        pp_group = pg_collection.pp
-        embd_group = pg_collection.embd
-        pos_emb_group = pg_collection.pos_embd
-        dp_cp_group = pg_collection.dp_cp
+        assert hasattr(grad_finalize_pgs, 'dp_cp')
+        tp_group = grad_finalize_pgs.tp
+        pp_group = grad_finalize_pgs.pp
+        embd_group = grad_finalize_pgs.embd
+        pos_emb_group = grad_finalize_pgs.pos_embd
+        dp_cp_group = grad_finalize_pgs.dp_cp
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()

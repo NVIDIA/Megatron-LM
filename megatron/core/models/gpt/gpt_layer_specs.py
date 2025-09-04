@@ -407,7 +407,6 @@ def get_gpt_decoder_block_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -487,17 +486,17 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
 
     if config.pipeline_model_parallel_layout is not None:
         local_layer_specs = [
             layer_specs[layer_id]
             for layer_id in config.pipeline_model_parallel_layout.get_layer_id_list(
-                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+                layer_type=LayerType.decoder, vp_stage=vp_stage
             )
         ]
     else:
-        offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
@@ -513,7 +512,6 @@ def get_gpt_mtp_block_spec(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     use_transformer_engine: bool,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
@@ -529,7 +527,7 @@ def get_gpt_mtp_block_spec(
             else LocalSpecProvider()
         )
     return get_gpt_mtp_block_spec_for_backend(
-        config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
+        config=config, spec=spec, backend=backend, vp_stage=vp_stage
     )
 
 
@@ -538,10 +536,9 @@ def get_gpt_mtp_block_spec_for_backend(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     backend: BackendSpecProvider,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage)
     if num_layers_to_build == 0:
         return None
 

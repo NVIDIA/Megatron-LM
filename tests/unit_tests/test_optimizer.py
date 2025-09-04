@@ -11,7 +11,7 @@ from transformer_engine.pytorch.fp8 import fp8_autocast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -389,7 +389,7 @@ def test_optimizer_reload_model_params():
 def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, cp_size, dp_size):
     """
     Test that get_megatron_optimizer works correctly with custom process groups
-    provided via pg_collection parameters.
+    provided via grad_comm_pgs and model_comm_pgs parameters.
     """
     # Skip if world size doesn't match available GPUs
     actual_world_size = torch.cuda.device_count()
@@ -421,16 +421,17 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     mp_group = mp_mesh._flatten().get_group()
 
     # Create process group configurations
-    pg_collection = ProcessGroupCollection()
-    pg_collection.dp = dp_group
-    pg_collection.dp_cp = dp_cp_group
-    pg_collection.expt_dp = None  # Not using expert parallelism in this test
+    grad_comm_pgs = GradCommProcessGroups()
+    grad_comm_pgs.dp = dp_group
+    grad_comm_pgs.dp_cp = dp_cp_group
+    grad_comm_pgs.expt_dp = None  # Not using expert parallelism in this test
 
-    pg_collection.tp = tp_group
-    pg_collection.cp = cp_group
-    pg_collection.pp = pp_group
-    pg_collection.mp = mp_group
-    pg_collection.tp_ep_pp = None  # Not using expert parallelism in this test
+    model_comm_pgs = ModelCommProcessGroups()
+    model_comm_pgs.tp = tp_group
+    model_comm_pgs.cp = cp_group
+    model_comm_pgs.pp = pp_group
+    model_comm_pgs.mp = mp_group
+    model_comm_pgs.tp_ep_pp = None  # Not using expert parallelism in this test
 
     # Create a simple model for testing
     model = torch.nn.Linear(100, 100, bias=False, device='cuda')
@@ -459,7 +460,8 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
         config=optimizer_config,
         model_chunks=model_chunks,
         use_gloo_process_groups=False,  # Required when using custom process groups
-        pg_collection=pg_collection,
+        grad_comm_pgs=grad_comm_pgs,
+        model_comm_pgs=model_comm_pgs,
     )
 
     # Verify optimizer was created successfully
@@ -527,53 +529,84 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
     model_chunks = [model]
     optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001)
 
-    # Test 2: Missing dp process group in pg_collection
-    pg_collection_no_dp = ProcessGroupCollection()
+    # Test 1: Both grad_comm_pgs and model_comm_pgs must be provided together
+    grad_comm_pgs = GradCommProcessGroups()
+    grad_comm_pgs.dp = torch.distributed.new_group()
 
-    with pytest.raises(ValueError, match="dp process group is required"):
-        get_megatron_optimizer(
-            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_no_dp
-        )
-
-    # Test 3: Missing expt_dp attribute in pg_collection
-    pg_collection_no_expt_dp = ProcessGroupCollection()
-    pg_collection_no_expt_dp.dp = torch.distributed.new_group()
-    # Missing required 'expt_dp' attribute
-
-    with pytest.raises(ValueError, match="expt_dp process group is required"):
+    with pytest.raises(
+        ValueError, match="Grad and model comm process groups must be provided or both must be None"
+    ):
         get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=model_chunks,
-            pg_collection=pg_collection_no_expt_dp,
+            grad_comm_pgs=grad_comm_pgs,
+            model_comm_pgs=None,  # Missing model_comm_pgs
         )
 
-    # Test 4: Missing mp attribute in pg_collection
-    pg_collection_complete = ProcessGroupCollection()
-    pg_collection_complete.dp = torch.distributed.new_group()
-    pg_collection_complete.expt_dp = None  # Explicitly set to None as allowed
+    # Test 2: Missing dp process group in grad_comm_pgs
+    grad_comm_pgs_no_dp = GradCommProcessGroups()
+    # Missing required 'dp' group
+    model_comm_pgs = ModelCommProcessGroups()
+
+    with pytest.raises(ValueError, match="dp process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            grad_comm_pgs=grad_comm_pgs_no_dp,
+            model_comm_pgs=model_comm_pgs,
+        )
+
+    # Test 3: Missing expt_dp attribute in grad_comm_pgs
+    grad_comm_pgs_no_expt_dp = GradCommProcessGroups()
+    grad_comm_pgs_no_expt_dp.dp = torch.distributed.new_group()
+    # Missing required 'expt_dp' attribute
+
+    with pytest.raises(AssertionError, match="expt_dp process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            grad_comm_pgs=grad_comm_pgs_no_expt_dp,
+            model_comm_pgs=model_comm_pgs,
+        )
+
+    # Test 4: Missing mp attribute in model_comm_pgs
+    grad_comm_pgs_complete = GradCommProcessGroups()
+    grad_comm_pgs_complete.dp = torch.distributed.new_group()
+    grad_comm_pgs_complete.expt_dp = None  # Explicitly set to None as allowed
+    model_comm_pgs_no_mp = ModelCommProcessGroups()
     # Missing required 'mp' attribute
 
-    with pytest.raises(ValueError, match="mp process group is required"):
+    with pytest.raises(AssertionError, match="mp process group is required"):
         get_megatron_optimizer(
-            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            grad_comm_pgs=grad_comm_pgs_complete,
+            model_comm_pgs=model_comm_pgs_no_mp,
         )
 
-    # Test 5: Missing tp_ep_pp attribute in pg_collection
-    pg_collection_complete.mp = None  # Explicitly set to None as allowed
+    # Test 5: Missing tp_ep_pp attribute in model_comm_pgs
+    model_comm_pgs_no_tp_ep_pp = ModelCommProcessGroups()
+    model_comm_pgs_no_tp_ep_pp.mp = None  # Explicitly set to None as allowed
+    # Missing required 'tp_ep_pp' attribute
 
-    with pytest.raises(ValueError, match="tp_ep_pp process group is required"):
+    with pytest.raises(AssertionError, match="tp_ep_pp process group is required"):
         get_megatron_optimizer(
-            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            grad_comm_pgs=grad_comm_pgs_complete,
+            model_comm_pgs=model_comm_pgs_no_tp_ep_pp,
         )
 
     # Test 6: Gloo process groups should not be used with custom process groups
-    pg_collection_complete.mp = None  # Explicitly set to None as allowed
-    pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
+    model_comm_pgs_complete = ModelCommProcessGroups()
+    model_comm_pgs_complete.mp = None  # Explicitly set to None as allowed
+    model_comm_pgs_complete.tp_ep_pp = None  # Explicitly set to None as allowed
 
-    with pytest.raises(ValueError, match="Gloo process groups are not supported"):
+    with pytest.raises(AssertionError, match="Gloo process groups are not supported"):
         get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=model_chunks,
             use_gloo_process_groups=True,  # Should be False when using custom groups
-            pg_collection=pg_collection_complete,
+            grad_comm_pgs=grad_comm_pgs_complete,
+            model_comm_pgs=model_comm_pgs_complete,
         )
