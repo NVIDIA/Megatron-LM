@@ -108,10 +108,10 @@ class TransformerLayerSchedulePlan:
             if hasattr(self, 'layer_state') and self.layer_state is not None:
                 del self.layer_state
                 self.layer_state = None
-            
+
             if hasattr(self, 'layer'):
                 del self.layer
-                
+
         except Exception:
             pass
 
@@ -392,7 +392,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the transformer layer at the specified index."""
         assert i < self.num_layers()
         return self._transformer_layers[i]
-    
+
     def pop_layer(self):
         """Pops the transformer layer in FILO order."""
         return self._transformer_layers.pop()
