@@ -6,7 +6,7 @@ from typing import Dict, List, Union, Optional
 
 import numpy as np
 
-from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
+from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 
 # Mark tokens that will be ignored in the loss function with this value.
 # Same ignore_index in https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html
@@ -68,12 +68,12 @@ class PromptConfig:
     system_default: dict = None
 
 
-class MultimodalTokenizer(MegatronLegacyTokenizer):
+class MultimodalTokenizer(MegatronTokenizer):
     """Multimodal Tokenizer."""
 
     def __init__(
         self,
-        tokenizer: MegatronLegacyTokenizer,
+        tokenizer: MegatronTokenizer,
         prompt_format: str,
         special_tokens: List[str],
         image_tag_type: str,
@@ -84,7 +84,7 @@ class MultimodalTokenizer(MegatronLegacyTokenizer):
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
         Args:
-            tokenizer (MegatronLegacyTokenizer): Underlying tokenizer.
+            tokenizer (MegatronTokenizer): Underlying tokenizer.
             prompt_format (str): Prompt format for the tokenizer.
             special_tokens (List[str]): Non-text tokens.
             image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.

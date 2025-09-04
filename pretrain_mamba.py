@@ -10,13 +10,12 @@ from model_provider import model_provider
 from mamba_builders import mamba_builder
 
 from megatron.training import get_args
-from megatron.training import get_tokenizer
 from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
 from megatron.training import get_timers
+from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
@@ -33,7 +32,6 @@ from megatron.training.utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tokenizers import MegatronTokenizer
 
 from megatron.training.datasets.sft_dataset import SFTDataset
 
@@ -148,10 +146,7 @@ def is_dataset_built_on_rank():
 
 
 def core_gpt_dataset_config_from_args(args):
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]

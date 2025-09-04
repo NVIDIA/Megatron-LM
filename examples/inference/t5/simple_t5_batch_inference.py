@@ -5,6 +5,7 @@ from argparse import Namespace
 import torch
 
 import pretrain_t5
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -13,11 +14,9 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
 )
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
     EncoderDecoderTextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from pretrain_t5 import model_provider
 
@@ -77,10 +76,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     Returns:
         AbstractBackend: The chosen backend
     """
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     inference_wrapper_config = InferenceWrapperConfig(
         hidden_size=args.hidden_size,
@@ -131,10 +127,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
     decoder_prompts = [""] * len(
         args.encoder_prompts
     )  # for T5, the prompt is provided as encoder input, hence decoder_prompts is empty

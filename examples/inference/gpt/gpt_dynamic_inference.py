@@ -2,15 +2,14 @@
 
 import hashlib
 import os
-import sys
+import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
 from typing import Dict, List
-
-import torch
-from tqdm import tqdm
+import sys
+import os
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -24,7 +23,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 
 sys.path.append(
@@ -37,17 +35,12 @@ from gpt_builders import gpt_builder
 import json
 
 from examples.inference.gpt.utils import (
-    Request,
     add_common_inference_args,
-    build_dynamic_engine_setup_prefix,
     build_requests,
+    build_dynamic_engine_setup_prefix,
     get_curr_time,
+    Request,
 )
-from megatron.training import get_args
-from megatron.training import get_model as _get_model
-from megatron.training import get_tokenizer, initialize_megatron
-from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -122,9 +115,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=max_sequence_length,
-        num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
-        ),
+        num_cuda_graphs=args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
@@ -155,10 +146,7 @@ def get_inference_controller(
     """
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Wrap model in inference wrapper.
     model = GPTInferenceWrapper(model, args, context)
@@ -291,10 +279,7 @@ def main():
         torch.cuda.cudart().cudaProfilerStart()
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Sampling params.
     sampling_params = SamplingParams(
@@ -337,9 +322,7 @@ def main():
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times, total_output_tokens = run_inference(
-        requests, sampling_params, engine
-    )
+    step_times, add_times, output_times, total_output_tokens = run_inference(requests, sampling_params, engine)
     torch.cuda.synchronize()
     total_time = get_curr_time() - t
 

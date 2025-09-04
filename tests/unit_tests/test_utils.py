@@ -61,9 +61,8 @@ def test_experimental_cls_static():
 
 
 def test_experimental_cls_exception_init():
-    with (
-        patch.object(config, 'ENABLE_EXPERIMENTAL', False),
-        pytest.raises(util.ExperimentalNotEnabledError),
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
     ):
         a = A()
         assert a.some_method() == success_string
@@ -71,9 +70,8 @@ def test_experimental_cls_exception_init():
 
 
 def test_experimental_cls_exception_static():
-    with (
-        patch.object(config, 'ENABLE_EXPERIMENTAL', False),
-        pytest.raises(util.ExperimentalNotEnabledError),
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
     ):
         assert A.some_static_method() == success_string
 

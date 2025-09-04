@@ -81,7 +81,6 @@ dev = [
     "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
     "flashinfer-python",
-    "wget",
     "onnxscript",
 ]
 
@@ -93,7 +92,6 @@ lts = [
     "transformers",
     "zarr",
     "setuptools<80.0.0",
-    "wget",
 ]
 
 [dependency-groups]

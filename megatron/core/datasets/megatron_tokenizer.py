@@ -7,7 +7,7 @@ from typing import Any
 import numpy
 
 
-class MegatronLegacyTokenizer(ABC):
+class MegatronTokenizer(ABC):
     """Abstract class for tokenizer
 
     Absent a config or class-specific tracking of which objects are uniquely identifying, we must

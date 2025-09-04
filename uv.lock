@@ -1517,9 +1517,6 @@ dev = [
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tensorstore", version = "0.1.76", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tqdm" },
-    { name = "transformer-engine", extra = ["pytorch"], marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "transformers" },
-    { name = "wget" },
     { name = "transformer-engine", marker = "extra == 'extra-13-megatron-core-dev'" },
 ]
 lts = [
@@ -1530,7 +1527,6 @@ lts = [
     { name = "tensorstore", version = "0.1.76", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tqdm" },
     { name = "transformers" },
-    { name = "wget" },
     { name = "zarr", version = "2.18.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "zarr", version = "3.1.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
@@ -1613,8 +1609,6 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'lts'" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "wandb", marker = "extra == 'mlm'" },
-    { name = "wget", marker = "extra == 'dev'" },
-    { name = "wget", marker = "extra == 'lts'" },
     { name = "zarr", marker = "extra == 'lts'" },
 ]
 provides-extras = ["mlm", "dev", "lts"]
@@ -4269,12 +4263,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/9f/69/83029f1f6300c5fb2
 wheels = [
     { url = "https://files.pythonhosted.org/packages/52/24/ab44c871b0f07f491e5d2ad12c9bd7358e527510618cb1b803a88e986db1/werkzeug-3.1.3-py3-none-any.whl", hash = "sha256:54b78bf3716d19a65be4fceccc0d1d7b89e608834989dfae50ea87564639213e", size = 224498, upload-time = "2024-11-08T15:52:16.132Z" },
 ]
-
-[[package]]
-name = "wget"
-version = "3.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/47/6a/62e288da7bcda82b935ff0c6cfe542970f04e29c756b0e147251b2fb251f/wget-3.2.zip", hash = "sha256:35e630eca2aa50ce998b9b1a127bb26b30dfee573702782aa982f875e3f16061", size = 10857, upload-time = "2015-10-22T15:26:37.51Z" }
 
 [[package]]
 name = "wrapt"
