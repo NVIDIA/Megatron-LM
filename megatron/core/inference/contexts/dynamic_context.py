@@ -29,9 +29,17 @@ except:
 
 
 class ContextOverflowError(Exception):
-    """Base exception for when a new request would not fit."""
+    """Base exception for when a new request does not fit.
 
-    pass
+    Args:
+        is_transient (bool): Flag marking whether error is transient (i.e., may
+            work if we try again, but fails due to the current context state), or
+            permanent (i.e., request will never fit in this context).
+    """
+
+    def __init__(self, message: Optional[str] = None, *, is_transient: bool = True):
+        super().__init__(message)
+        self.is_transient = is_transient
 
 
 class RequestOverflowError(ContextOverflowError):
@@ -49,7 +57,8 @@ class TokenOverflowError(ContextOverflowError):
 class MaxSequenceLengthOverflowError(ContextOverflowError):
     """Adding request would overflow max sequence length."""
 
-    pass
+    def __init__(self, message: Optional[str] = None):
+        super().__init__(message=message, is_transient=False)
 
 
 class ChunkOverflowError(ContextOverflowError):
@@ -313,8 +322,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Cuda graph step size.
             cuda_graph_rounder = 8
             self.cuda_graph_step_size = self.max_requests / num_cuda_graphs
-            self.cuda_graph_step_size = cuda_graph_rounder * int(
-                math.ceil(int(self.cuda_graph_step_size) / cuda_graph_rounder)
+            self.cuda_graph_step_size = (
+                math.ceil(self.cuda_graph_step_size / cuda_graph_rounder) * cuda_graph_rounder
             )
             # Make sure divisble by TP size
             self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size
@@ -939,6 +948,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         this_round_length = len(this_round_tokens)
         assert this_round_length > 0, "Chunk length is 0"
         assert this_round_length <= req.prompt_length, "Chunk length is greater than prompt length"
+        # `context_length` here is the equal to prompt length, and does not
+        # include output length.
+        context_length = tokens.numel()
+        if context_length > self.max_tokens:
+            # **Note**: for `megatron-core >= 0.15`, this assert should be
+            # `is_transient=False`. For backwards compatibility with legacy tests,
+            # this must be `True` for one version cycle of `megatron-core`.
+            # raise TokenOverflowError(is_transient=False)
+            raise TokenOverflowError(is_transient=True)
 
         # only allocate new chunks
         already_allocated_chunks = (

@@ -4,6 +4,7 @@ import asyncio
 import multiprocessing
 import os
 import struct
+import warnings
 from collections import deque
 from datetime import datetime
 from itertools import repeat
@@ -17,6 +18,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
+    ContextOverflowError,
     WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -80,10 +82,17 @@ class DynamicInferenceEngine(AbstractEngine):
         controller: SimpleTextGenerationController,
         context: DynamicInferenceContext,
         termination_id: int,
-        enable_cuda_graph: bool,
+        enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
         enable_chunked_prefill: bool = True,
     ):
+
+        if enable_cuda_graph is not None:
+            warnings.warn(
+                "The `enable_cuda_graph` argument is deprecated and will be "
+                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
+                "read directly from the transformer config object."
+            )
 
         assert isinstance(controller, SimpleTextGenerationController)
         assert isinstance(context, DynamicInferenceContext)
@@ -119,8 +128,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
-        self.enable_cuda_graph = enable_cuda_graph
-        if enable_cuda_graph:
+        if enable_cuda_graph is not None:
+            self.enable_cuda_graph = enable_cuda_graph
+        else:
+            self.enable_cuda_graph = (
+                controller.inference_wrapped_model.model.config.enable_cuda_graph
+            )
+        self.capture_stats = None
+        if self.enable_cuda_graph:
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
@@ -179,7 +194,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Create cuda graphs.
             with torch.inference_mode():
-                create_cudagraphs()
+                self.capture_stats = create_cudagraphs()
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -472,6 +487,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if request_satisfied and token_satisfied and kv_cache_available:
                 self.context.add_request(req)
+                self._loop.call_soon_threadsafe(
+                    asyncio.create_task, self._notify_cond_for_new_request()
+                )
                 self.waiting_request_ids.popleft()
             else:
                 break
@@ -508,11 +526,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 if token_fully_satisfied:
                     self.chunked_prefill_request_id = -1
                     self.context.add_request(req)
+                    self._loop.call_soon_threadsafe(
+                        asyncio.create_task, self._notify_cond_for_new_request()
+                    )
                     self.waiting_request_ids.popleft()  # Fully scheduled, so we remove from waiting pool
                     self.context.have_chunked_prefill = False
                 elif token_partially_satisfied:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
+                    self._loop.call_soon_threadsafe(
+                        asyncio.create_task, self._notify_cond_for_new_request()
+                    )
                     self.context.have_chunked_prefill = True
                     self.chunked_prefill_request_id = req.request_id
                     req.prompt_tokens = req.prompt_tokens[chunk_length:]
