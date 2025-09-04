@@ -706,7 +706,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * self.cuda_graph_step_size
             )
             self.padded_active_token_count = min(self.padded_active_token_count, self.max_requests)
-            assert self.padded_active_token_count in self.cuda_graph_token_counts_set
+            assert (
+                self.padded_active_token_count in self.cuda_graph_token_counts_set
+            ), f"padded_active_token_count: {self.padded_active_token_count} not in cuda_graph_token_counts_set: {self.cuda_graph_token_counts_set}"
             assert self.padded_active_token_count >= active_token_count
         else:
             self.padded_active_token_count = self.round_up_tokens(self.active_token_count)

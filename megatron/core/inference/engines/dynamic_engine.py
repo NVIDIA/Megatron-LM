@@ -18,6 +18,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
+    TokenOverflowError,
     WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -382,6 +383,9 @@ class DynamicInferenceEngine(AbstractEngine):
             num_tokens_to_generate = self.context.max_sequence_length - len(tokens)
         elif len(tokens) + num_tokens_to_generate > self.context.max_sequence_length:
             raise MaxSequenceLengthOverflowError()
+
+        if len(tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            raise TokenOverflowError()
 
         self.requests[request_id] = DynamicInferenceRequest(
             request_id=request_id,
@@ -782,7 +786,10 @@ class DynamicInferenceEngine(AbstractEngine):
             while True:
                 # Wait until there are active requests before proceeding.
                 async with self._cond:
-                    await self._cond.wait_for(lambda: self.context.get_active_request_count() > 0)
+                    await self._cond.wait_for(
+                        lambda: self.context.get_active_request_count() > 0
+                        or self.waiting_request_ids
+                    )
 
                 await self.async_step(sampling_params=sampling_params, verbose=verbose)
         except asyncio.CancelledError:
