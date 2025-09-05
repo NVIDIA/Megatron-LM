@@ -1591,13 +1591,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
                 userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
             op = te.pytorch.ops.BasicLinear(
-                weight.size(1) * tp_world_size,
+                weight.size(1),
                 weight.size(0),
                 device="meta",
                 dtype=weight.dtype,
-                tensor_parallel_mode="row" if tp_world_size > 1 else None,
-                tensor_parallel_group=tp_group,
-                sequence_parallel=self.linear_fc2.sequence_parallel,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
                 userbuffers_options=userbuffers_options,
