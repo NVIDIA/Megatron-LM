@@ -150,7 +150,7 @@ def deallocate_output_tensor_safe(output_tensor, deallocate_pipeline_outputs=Fal
     '''Deallocate output tensor, handling both tensor and dict cases.'''
     if not deallocate_pipeline_outputs:
         return
-    
+
     # Check if output_tensor is None, empty list, or empty dict
     if output_tensor is None:
         return

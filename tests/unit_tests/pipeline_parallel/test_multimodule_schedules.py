@@ -10,6 +10,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -20,13 +21,17 @@ from megatron.core.pipeline_parallel.multi_module_communicator import (
 )
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import GradFinalizeProcessGroups, ModelCommProcessGroups, GradCommProcessGroups
+from megatron.core.process_groups_config import (
+    GradCommProcessGroups,
+    GradFinalizeProcessGroups,
+    ModelCommProcessGroups,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+
 rank = Utils.rank
 
 
@@ -41,20 +46,45 @@ class DataIterator:
         return self
 
     def __next__(self):
-        return torch.randn(self.seq_length, self.micro_batch_size, self.hidden_size, device='cuda', dtype = torch.bfloat16)
+        return torch.randn(
+            self.seq_length,
+            self.micro_batch_size,
+            self.hidden_size,
+            device='cuda',
+            dtype=torch.bfloat16,
+        )
 
 
 class Model(torch.nn.Module):
-    def __init__(self, hidden_size, encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset):
+    def __init__(
+        self,
+        hidden_size,
+        encoder_tp,
+        encoder_pp,
+        encoder_dp,
+        llm_tp,
+        llm_pp,
+        llm_dp,
+        llm_grid_offset,
+    ):
 
         super().__init__()
 
         self.encoder, self.encoder_grid = get_transformer_block_and_grid(
-            tp_size=encoder_tp, cp_size=1, pp_size=encoder_pp, dp_size=encoder_dp, hidden_size=hidden_size
+            tp_size=encoder_tp,
+            cp_size=1,
+            pp_size=encoder_pp,
+            dp_size=encoder_dp,
+            hidden_size=hidden_size,
         )
 
         self.llm, self.llm_grid = get_transformer_block_and_grid(
-            tp_size=llm_tp, cp_size=1, pp_size=llm_pp, dp_size=llm_dp, grid_offset=llm_grid_offset, hidden_size=hidden_size
+            tp_size=llm_tp,
+            cp_size=1,
+            pp_size=llm_pp,
+            dp_size=llm_dp,
+            grid_offset=llm_grid_offset,
+            hidden_size=hidden_size,
         )
 
         self.current_rank = dist.get_rank()
@@ -71,7 +101,7 @@ class Model(torch.nn.Module):
             self.encoder.finish_grad_sync()
         if self.is_current_rank_in_grid(self.llm_grid) and self.llm is not None:
             self.llm.finish_grad_sync()
-    
+
     @property
     def ddp_config(self):
         # Try to get ddp_config from the first available module on this rank
@@ -80,7 +110,9 @@ class Model(torch.nn.Module):
         elif self.is_current_rank_in_grid(self.llm_grid) and self.llm is not None:
             return self.llm.ddp_config
         else:
-            raise AttributeError(f"No active modules with ddp_config found on rank {self.current_rank}")
+            raise AttributeError(
+                f"No active modules with ddp_config found on rank {self.current_rank}"
+            )
 
     def scale_gradients(self, scaling_factor: float):
         """Scale gradients for all active modules on this rank."""
@@ -88,14 +120,16 @@ class Model(torch.nn.Module):
             self.encoder.scale_gradients(scaling_factor)
         if self.is_current_rank_in_grid(self.llm_grid) and self.llm is not None:
             self.llm.scale_gradients(scaling_factor)
-    
+
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
         return grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size)
-    
+
     def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
         if self.is_current_rank_in_grid(self.encoder_grid) and 'encoder' in input_tensor[0]:
-            logging.info(f"Current rank: {dist.get_rank()} setting encoder input tensor with shape {input_tensor[0]['encoder'][0].shape} dtype {input_tensor[0]['encoder'][0].dtype}")
+            logging.info(
+                f"Current rank: {dist.get_rank()} setting encoder input tensor with shape {input_tensor[0]['encoder'][0].shape} dtype {input_tensor[0]['encoder'][0].dtype}"
+            )
             self.encoder_input_tensor = input_tensor[0]["encoder"][0]
         elif self.is_current_rank_in_grid(self.llm_grid):
             if 'llm' in input_tensor[0]:
@@ -124,14 +158,18 @@ class Model(torch.nn.Module):
                     self.encoder_input_tensor is not None
                 ), "Encoder input tensor is not provided for pp rank > 0"
                 input_tensor = self.encoder_input_tensor
-            logging.info(f"Current rank: {dist.get_rank()} encoder forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}")
+            logging.info(
+                f"Current rank: {dist.get_rank()} encoder forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}"
+            )
             output_dict["encoder"] = self.encoder(input_tensor, attention_mask=None)
         elif self.is_current_rank_in_grid(self.llm_grid):
             assert (
                 self.llm_input_tensor is not None
             ), "LLM input tensor is not provided for pp rank > 0"
             input_tensor = self.llm_input_tensor
-            logging.info(f"Current rank: {dist.get_rank()} llm forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}")
+            logging.info(
+                f"Current rank: {dist.get_rank()} llm forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}"
+            )
             output_dict["llm"] = self.llm(input_tensor, attention_mask=None)
         else:
             raise ValueError(f"Rank {current_rank} is not valid")
@@ -203,6 +241,7 @@ def _get_model_comm_pgs_from_grid(grid):
     model_comm_pgs.pp = grid.get_pg("pp")
     model_comm_pgs.ep = grid.get_pg("ep")
     return model_comm_pgs
+
 
 def _get_grad_comm_pgs_from_grid(grid):
     grad_comm_pgs = GradCommProcessGroups()
@@ -296,7 +335,9 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
         rank = int(os.environ['LOCAL_RANK'])
 
         def loss_func(output_tensor_dict: Dict[str, torch.Tensor]):
-            assert 'llm' in output_tensor_dict, f'llm is not in output_tensor_dict: {output_tensor_dict}'
+            assert (
+                'llm' in output_tensor_dict
+            ), f'llm is not in output_tensor_dict: {output_tensor_dict}'
             loss = output_tensor_dict['llm'].sum()
             return loss, {'loss_reduced': loss}
 
@@ -313,13 +354,22 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     micro_batch_size = 1
     hidden_size = 1024
 
-    encoder_tp, encoder_pp, encoder_dp = 2, 2, 1    
+    encoder_tp, encoder_pp, encoder_dp = 2, 2, 1
     llm_tp, llm_pp, llm_dp = 2, 2, 1
-    llm_grid_offset = 4 
+    llm_grid_offset = 4
 
     # Create model
-    model = Model(hidden_size=hidden_size, encoder_tp=encoder_tp, encoder_pp=encoder_pp, encoder_dp=encoder_dp, llm_tp=llm_tp, llm_pp=llm_pp, llm_dp=llm_dp, llm_grid_offset=llm_grid_offset)
-    model.model_type = 'unit-test'   
+    model = Model(
+        hidden_size=hidden_size,
+        encoder_tp=encoder_tp,
+        encoder_pp=encoder_pp,
+        encoder_dp=encoder_dp,
+        llm_tp=llm_tp,
+        llm_pp=llm_pp,
+        llm_dp=llm_dp,
+        llm_grid_offset=llm_grid_offset,
+    )
+    model.model_type = 'unit-test'
 
     module_to_grid_map = {'encoder': model.encoder_grid, 'llm': model.llm_grid}
     topology = {
@@ -332,7 +382,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     config.qk_layernorm = False
     config.sequence_parallel = False
     config.moe_router_enable_expert_bias = False
-    
+
     # Add grad scale function to convert float losses to tensors
     def grad_scale_func(loss):
         """Convert float loss to tensor by multiplying with unit tensor."""
@@ -340,7 +390,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
             return torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
         else:
             return loss  # Already a tensor
-    
+
     config.grad_scale_func = grad_scale_func
     model.config = config
     config.hidden_size = hidden_size
@@ -352,8 +402,12 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=2)
 
     data_iterator = None
-    if model.is_current_rank_in_grid(model.encoder_grid) and is_pp_first_stage(model.encoder_grid.get_pg("pp")):
-        data_iterator = DataIterator(hidden_size=hidden_size, seq_length=sequence_length, micro_batch_size=micro_batch_size)
+    if model.is_current_rank_in_grid(model.encoder_grid) and is_pp_first_stage(
+        model.encoder_grid.get_pg("pp")
+    ):
+        data_iterator = DataIterator(
+            hidden_size=hidden_size, seq_length=sequence_length, micro_batch_size=micro_batch_size
+        )
 
     common_args = {
         'forward_step_func': dummy_step_func,
