@@ -672,12 +672,6 @@ class Attention(MegatronModule, ABC):
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
-        in_decode_mode = (
-            inference_context is not None
-            and inference_context.is_decode_only()
-            and not self.training
-        )
-
         # =====================
         # Query, Key, and Value
         # =====================
@@ -686,7 +680,6 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="qkv")
         split_qkv = not all(
             [
-                not in_decode_mode,
                 not self.config.test_mode,
                 self.config.fused_single_qkv_rope,
                 deprecate_inference_params(inference_context, None) is None,
@@ -715,6 +708,12 @@ class Attention(MegatronModule, ABC):
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
+
+        in_decode_mode = (
+            inference_context is not None
+            and inference_context.is_decode_only()
+            and not self.training
+        )
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
