@@ -226,7 +226,7 @@ def get_synthetic_requests(args: Namespace, tokenizer: Any) -> list[Request]:
         args.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
-        args.incoming_requests_per_sec * args.incoming_requests_duration,
+        int(args.incoming_requests_per_sec * args.incoming_requests_duration),
     )
 
     # Init requests.
