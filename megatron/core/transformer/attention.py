@@ -700,9 +700,10 @@ class Attention(MegatronModule, ABC):
         qkv_list, return_unsplit_qkv = self.get_query_key_value_tensors(
             hidden_states, key_value_states, return_unsplit_qkv=return_unsplit_qkv
         )
+        attn_mask_type = self.attn_mask_type
+        block_table = None
         if return_unsplit_qkv:
             mixed_qkv, qkv_split_arg_list = qkv_list
-            attn_mask_type = self.attn_mask_type
         else:
             query, key, value = qkv_list
         nvtx_range_pop(suffix="qkv")
