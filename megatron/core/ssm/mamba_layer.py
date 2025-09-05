@@ -62,6 +62,7 @@ class MambaLayer(MegatronModule):
         layer_number: int = 1,
         residual_in_fp32=False,
         model_comm_pgs: ModelCommProcessGroups = None,
+
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)

@@ -29,6 +29,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.ssm.parallel_hybrid_layer import ParallelHybridLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
@@ -86,6 +87,7 @@ class MambaStackSubmodules:
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
+    parallel_hybrid_layer: Union[ModuleSpec, type] = IdentityOp
 
 
 class MambaStack(MegatronModule):
@@ -123,6 +125,7 @@ class MambaStack(MegatronModule):
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
+        parallel_hybrid_ratio: float = 0.0,
         hybrid_override_pattern: str = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -146,11 +149,13 @@ class MambaStack(MegatronModule):
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
+        self.parallel_hybrid_ratio = parallel_hybrid_ratio
 
         layer_type_list = allocate_layers(
             self.config.num_layers,
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
+            self.parallel_hybrid_ratio,
             self.hybrid_override_pattern,
         )
 
@@ -186,6 +191,13 @@ class MambaStack(MegatronModule):
                         submodules.mlp_layer,
                         config=self.config,
                         layer_number=i + 1,
+                        model_comm_pgs=model_comm_pgs,
+                    )
+                elif layer_type == LayerSymbols.PARALLEL:
+                    layer = build_module(
+                        submodules.parallel_hybrid_layer,
+                        config=self.config,
+                        layer_number=i + 1 + pp_layer_offset,
                         model_comm_pgs=model_comm_pgs,
                     )
                 else:
@@ -333,7 +345,15 @@ class MambaStack(MegatronModule):
                 )
                 with inner_fp8_context:
                     if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
+                        hidden_states, _  = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                    if isinstance(layer, ParallelHybridLayer):
+                        hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,

@@ -39,6 +39,64 @@ from megatron.training.datasets.sft_dataset import SFTDataset
 
 stimer = StragglerDetector()
 
+def count_parameters_in_layer(model, layer_name):
+    num_params = 0
+    for name, param in model.named_parameters():
+        if layer_name in name:
+            num_params += param.numel()
+            print_rank_0(f" - {name}: {param.numel()}")
+    return num_params
+
+
+def model_provider(pre_process=True, post_process=True) -> MambaModel:
+    """Builds the model.
+
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+
+
+    Returns:
+        MambaModel: The returned model
+    """
+    args = get_args()
+
+    print_rank_0('building Mamba model ...')
+    config = core_transformer_config_from_args(args, TransformerConfig)
+
+    assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
+
+    if args.spec is not None:
+        mamba_stack_spec = import_module(args.spec)
+    else:
+        raise("You must provide a valid Mamba layer spec!")
+
+    model = MambaModel(
+        config=config,
+        mamba_stack_spec=mamba_stack_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        hybrid_attention_ratio=args.hybrid_attention_ratio,
+        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
+        parallel_hybrid_ratio=args.parallel_hybrid_ratio,
+        hybrid_override_pattern=args.hybrid_override_pattern,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base
+    )
+
+    for l in range(model.decoder.num_layers_per_pipeline_rank):
+        layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
+        print_rank_0(f" == params layer {l}: {layer_params}")
+
+    return model
+
+
 def get_batch(data_iterator):
     """Generate a batch."""
 
