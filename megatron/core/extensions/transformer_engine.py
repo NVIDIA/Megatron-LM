@@ -1614,6 +1614,33 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     op.bias = bias
                     fused_impl.append(op)
 
+            # Get submodule forward hooks
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            for submodule in self.modules():
+                for hook in submodule._forward_pre_hooks.values():
+                    forward_pre_hooks.append((submodule, hook))
+                for hook in submodule._forward_hooks.values():
+                    forward_post_hooks.append((submodule, hook))
+
+            # Attempt to emulate submodule forward hooks if needed
+            # Note: Assume hooks do not interact with submodule inputs
+            # or outputs since they are internal to the op fuser.
+            if forward_pre_hooks:
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook in forward_pre_hooks:
+                        # Assume that hook does not interact with
+                        # input
+                        hook(submodule, None)
+                self.register_forward_pre_hook(forward_pre_hook)
+            if forward_post_hooks:
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook in forward_post_hooks:
+                        # Assume that hook does not interact with
+                        # input or output
+                        hook(submodule, None, None)
+                self.register_forward_hook(forward_post_hook)
+
             return fused_impl
 
         def _make_activation_op(
