@@ -327,7 +327,7 @@ class GroupedMLP(MegatronModule):
         local_expert_indices_offset = ep_rank * self.num_local_experts
 
         prepend_axis_num = len(sharded_offsets)
-        replica_id = (0, 0, dp_rank)
+        replica_id = (0, tp_rank, dp_rank)
 
         local_ffn_dim_size = (
             self.weight2.numel() // self.num_local_experts // self.config.hidden_size
