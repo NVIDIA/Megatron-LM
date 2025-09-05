@@ -3,6 +3,7 @@
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
 from dataclasses import dataclass, field, fields
+from functools import partial
 from typing import List, Optional
 
 import torch
@@ -88,6 +89,9 @@ class ModelCommProcessGroups:
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    tp_dp_cp: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
@@ -140,10 +144,15 @@ class ModelCommProcessGroups:
             'pos_embd': parallel_state.get_position_embedding_group,
             # TODO (Hepteract): remove this once distributed checkpoint is refactored
             'expt_dp': parallel_state.get_expert_data_parallel_group,
+            'tp_dp_cp': partial(
+                parallel_state.get_tensor_and_data_parallel_group, with_context_parallel=True
+            ),
         }
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {pg: pg_to_func[pg](False) for pg in required_pgs}
+        init_dict = {
+            pg: pg_to_func[pg](check_initialized=False) for pg in required_pgs if pg in pg_to_func
+        }
 
         return cls(**init_dict)
 

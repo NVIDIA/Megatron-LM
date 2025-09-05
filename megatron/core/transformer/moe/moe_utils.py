@@ -42,7 +42,8 @@ def switch_load_balancing_loss_func(
     fused: bool = False,
 ):
     """Calculate the auxiliary loss for load balancing.
-    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961) for details.
+    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
+    and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
 
     ### Detailed explanation of the auxiliary loss #######
 
@@ -72,10 +73,10 @@ def switch_load_balancing_loss_func(
         T is the total number of tokens in the global batch B
 
     Note:
-    To calculate the auxiliary loss at different levels (micro-batch or each sequence):
+    To calculate the auxiliary loss at different levels (micro-batch or global batch):
     - probs: Should always be from the local batch being processed
     - tokens_per_expert: Should represent token counts at the desired level
-      (either micro-batch or each sequence)
+      (either micro-batch or global batch)
     - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
 
     #########################################################
@@ -94,7 +95,7 @@ def switch_load_balancing_loss_func(
     """
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
-            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.6.0.")
+            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
@@ -990,4 +991,7 @@ def get_default_model_comm_pgs():
     model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
     model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
     model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
+    model_comm_pgs.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
     return model_comm_pgs
