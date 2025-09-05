@@ -255,6 +255,23 @@ class DynamicInferenceEngine(AbstractEngine):
 
             self.capture_stats = capture_stats
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def clear_cuda_graphs(self):
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+        torch.cuda.empty_cache()
+        # >>>
+        # for l in model.module.decoder.layers:
+        #     for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+        #         # Safely delete both graphs if present
+        #         if hasattr(runner, "fwd_graph"):
+        #             del runner.fwd_graph
+        #         if hasattr(runner, "bwd_graph"):
+        #             del runner.bwd_graph
+        # <<<
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     async def start_listening_to_data_parallel_coordinator(
         self,
         sampling_params: SamplingParams,
@@ -438,6 +455,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Suspend engine by deallocating context's GPU state."""
         with self.__class__.suspend_resume_ctx("suspended"):
             self.context.deallocate_all_tensors()
+        # >>>
+        self.clear_cuda_graphs()
+        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -462,6 +482,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids = deque()
             self.requests: Dict[int, DynamicInferenceRequest] = {}
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
+
+            # Create cuda graphs (before adding requests, to be in decode mode).
+            self.create_cuda_graphs()
 
             # Add requests.
             futures = {}
@@ -493,10 +516,10 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
-        # Print inner timing.
-        print(f" ... inner timing: add {add_time:.3f}, alloc {alloc_time}.")
+            # Print inner timing.
+            print(f" ... inner timing: alloc {alloc_time}, add {add_time:.3f}.")
 
-        return futures
+            return futures
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
