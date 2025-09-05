@@ -234,22 +234,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
             self.capture_stats = capture_stats
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def clear_cuda_graphs(self):
+        """Clear cuda graphs.
+
+        This method clears the cuda graph state in `cuda_graphs.py`, to allow for
+        calling `create_cudagraphs()` again.
+        """
         _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
-        torch.cuda.empty_cache()
-        # >>>
-        # for l in model.module.decoder.layers:
-        #     for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-        #         # Safely delete both graphs if present
-        #         if hasattr(runner, "fwd_graph"):
-        #             del runner.fwd_graph
-        #         if hasattr(runner, "bwd_graph"):
-        #             del runner.bwd_graph
-        # <<<
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -433,11 +426,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
+
+        # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx("suspended"):
             self.context.deallocate_all_tensors()
-        # >>>
+
+        # Clear cuda graphs.
         self.clear_cuda_graphs()
-        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
