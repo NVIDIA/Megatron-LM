@@ -179,10 +179,6 @@ for i in $(seq 1 $N_REPEAT); do
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
-    if [[ "$TEST_TYPE" == "release" ]]; then
-        SKIP_PYTEST=1
-    fi
-
     if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
         echo "Skipping Pytest during checkpoint recording."
         SKIP_PYTEST=1
@@ -227,49 +223,52 @@ for i in $(seq 1 $N_REPEAT); do
         ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
     fi
 
-    echo "Running pytest checks against golden values"
+    if [[ "$SLURM_NODEID" -eq 0 ]]; then
+        echo "Running pytest checks against golden values"
 
-    # For pretraining jobs
-    if [[ "$MODE" == "pretraining" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
-        uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
-            --golden-values-path $GOLDEN_VALUES_PATH \
-            --actual-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
-            --train-iters $TRAIN_ITERS \
-            --model-config-path ${TRAINING_PARAMS_PATH} \
-            $ALLOW_NONDETERMINISTIC_ALGO_ARG
-
-        if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
-            uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-                --logs-dir $TENSORBOARD_PATH \
-                --train-iters $TRAIN_ITERS \
-                --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
-                --is-second-run
-                    
-            echo "Running pytest 1st vs 2nd run comparison"
-            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
-                --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
-                --actual-values-second-run-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
-                --train-iters $TRAIN_ITERS \
-                --model-config-path ${TRAINING_PARAMS_PATH} \
-                $ALLOW_NONDETERMINISTIC_ALGO_ARG
-        fi
-    fi
-
-    # For inference jobs
-    if [[ "$MODE" == "inference" ]]; then
-        if [[ "$TEST_TYPE" == "frozen-start" ]]; then
-            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
+        # For pretraining jobs
+        if [[ "$MODE" == "pretraining" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
+            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
                 --golden-values-path $GOLDEN_VALUES_PATH \
-                --test-values-path $TENSORBOARD_PATH \
+                --actual-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                --train-iters $TRAIN_ITERS \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
                 $ALLOW_NONDETERMINISTIC_ALGO_ARG
-        fi
-    fi
 
-    # Abort if training failed
-    if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" ]]; then
-        echo "Training failed. Aborting."
-        exit 1
+            if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+                uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                    --logs-dir $TENSORBOARD_PATH \
+                    --train-iters $TRAIN_ITERS \
+                    --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
+                    --is-second-run
+                        
+                echo "Running pytest 1st vs 2nd run comparison"
+                uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
+                    --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                    --actual-values-second-run-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
+                    --train-iters $TRAIN_ITERS \
+                    --model-config-path ${TRAINING_PARAMS_PATH} \
+                    $ALLOW_NONDETERMINISTIC_ALGO_ARG
+            fi
+        fi
+
+        # For inference jobs
+        if [[ "$MODE" == "inference" ]]; then
+            if [[ "$TEST_TYPE" == "frozen-start" ]]; then
+                uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
+                    --golden-values-path $GOLDEN_VALUES_PATH \
+                    --test-values-path $TENSORBOARD_PATH \
+                    --model-config-path ${TRAINING_PARAMS_PATH} \
+                    $ALLOW_NONDETERMINISTIC_ALGO_ARG
+            fi
+        fi
+
+        # Abort if training failed
+        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" ]]; then
+            echo "Training failed. Aborting."
+            exit 1
+        fi
+        
     fi
 
 done
