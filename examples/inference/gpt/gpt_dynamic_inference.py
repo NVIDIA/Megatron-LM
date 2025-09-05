@@ -392,33 +392,6 @@ def main():
         enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
-    # >>>
-    # def get_mem():
-    #     mem = torch.cuda.memory_stats()
-    #     return mem["allocated_bytes.all.current"], mem["reserved_bytes.all.current"]
-
-    # from megatron.core.transformer.cuda_graphs import (
-    #     _CudagraphGlobalRecord,
-    #     CudaGraphManager,
-    # )
-    # alloc_0, res_0 = get_mem()
-    # _CudagraphGlobalRecord.cudagraph_created = False
-    # _CudagraphGlobalRecord.cudagraph_record = []
-    # CudaGraphManager.global_mempool = None
-    # torch.cuda.empty_cache()
-    # # for l in model.module.decoder.layers:
-    # #     for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-    # #         # Safely delete both graphs if present
-    # #         if hasattr(runner, "fwd_graph"):
-    # #             del runner.fwd_graph
-    # #         if hasattr(runner, "bwd_graph"):
-    # #             del runner.bwd_graph
-    # alloc_1, res_1 = get_mem()
-
-    # from lutil import pax
-    # pax("model, alloc_0, alloc_1, res_0, res_1")
-    # <<<
-
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
     print(setup_prefix)
