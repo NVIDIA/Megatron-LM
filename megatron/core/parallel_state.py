@@ -1389,17 +1389,19 @@ def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False
             return _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_tensor_and_data_parallel_group(with_context_parallel=False):
+def get_tensor_and_data_parallel_group(check_initialized=True, with_context_parallel=False):
     """Get the tensor- and data-parallel group the caller rank belongs to."""
     if with_context_parallel:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), "tensor and data parallel group is not initialized"
+        if check_initialized:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+            ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     else:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-        ), "tensor and data parallel group is not initialized"
+        if check_initialized:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+            ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 

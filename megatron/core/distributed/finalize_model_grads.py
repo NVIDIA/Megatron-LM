@@ -267,6 +267,16 @@ def _allreduce_position_embedding_grads(
     )
 
 
+def _reset_global_aux_loss_tracker(model: List[torch.nn.Module]):
+    """
+    Reset the global aux loss tracker.
+    """
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'reset_global_aux_loss_tracker'):
+                module.reset_global_aux_loss_tracker()
+
+
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
     """
     Update the expert bias of the router for a global batch.
@@ -454,6 +464,12 @@ def finalize_model_grads(
 
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
+
+    if (
+        config.moe_router_load_balancing_type == "global_aux_loss"
+        or "global_aux_loss" in config.moe_router_load_balancing_type
+    ):
+        _reset_global_aux_loss_tracker(model)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
