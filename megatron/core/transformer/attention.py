@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -34,7 +35,6 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
-from megatron.core.transformer.identity_op import IdentityOp
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -86,9 +86,11 @@ except ImportError:
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
+
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
 
 @dataclass
 class SelfAttentionSubmodules:
@@ -682,16 +684,22 @@ class Attention(MegatronModule, ABC):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
-        return_unsplit_qkv = all([not in_decode_mode,
-            self.config.fused_single_qkv_rope,
-            deprecate_inference_params(inference_context, None) is None,
-            packed_seq_params is None,
-            rotary_pos_emb is not None,
-            rotary_pos_emb[0] is not None, rotary_pos_emb[1] is not None,
-            not self.config.flash_decode,
-            HAVE_FUSED_QKV_ROPE,
-        ])
-        qkv_list, return_unsplit_qkv = self.get_query_key_value_tensors(hidden_states, key_value_states, return_unsplit_qkv=return_unsplit_qkv)
+        return_unsplit_qkv = all(
+            [
+                not in_decode_mode,
+                self.config.fused_single_qkv_rope,
+                deprecate_inference_params(inference_context, None) is None,
+                packed_seq_params is None,
+                rotary_pos_emb is not None,
+                rotary_pos_emb[0] is not None,
+                rotary_pos_emb[1] is not None,
+                not self.config.flash_decode,
+                HAVE_FUSED_QKV_ROPE,
+            ]
+        )
+        qkv_list, return_unsplit_qkv = self.get_query_key_value_tensors(
+            hidden_states, key_value_states, return_unsplit_qkv=return_unsplit_qkv
+        )
         if return_unsplit_qkv:
             mixed_qkv, qkv_split_arg_list = qkv_list
             attn_mask_type = self.attn_mask_type
@@ -776,7 +784,9 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if return_unsplit_qkv:
-                query, key, value = apply_fused_qkv_rotary_pos_emb(mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list)
+                query, key, value = apply_fused_qkv_rotary_pos_emb(
+                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
+                )
             else:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
@@ -1008,7 +1018,9 @@ class SelfAttention(Attention):
                 "TP",
             )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states=None, return_unsplit_qkv=False):
+    def get_query_key_value_tensors(
+        self, hidden_states, key_value_states=None, return_unsplit_qkv=False
+    ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
@@ -1034,10 +1046,14 @@ class SelfAttention(Attention):
             self.hidden_size_per_attention_head,
             self.hidden_size_per_attention_head,
         ]
-        if all([return_unsplit_qkv,
+        if all(
+            [
+                return_unsplit_qkv,
                 self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
                 self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
-                not self.config.test_mode]):
+                not self.config.test_mode,
+            ]
+        ):
             return (mixed_qkv, split_arg_list), True
         if SplitAlongDim is not None:
 
@@ -1138,7 +1154,9 @@ class CrossAttention(Attention):
             is_expert=False,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states, return_unsplit_qkv=False):
+    def get_query_key_value_tensors(
+        self, hidden_states, key_value_states, return_unsplit_qkv=False
+    ):
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
