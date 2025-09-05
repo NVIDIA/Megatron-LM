@@ -148,7 +148,15 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
 
 def deallocate_output_tensor_safe(output_tensor, deallocate_pipeline_outputs=False):
     '''Deallocate output tensor, handling both tensor and dict cases.'''
-    if not output_tensor or not deallocate_pipeline_outputs:
+    if not deallocate_pipeline_outputs:
+        return
+    
+    # Check if output_tensor is None, empty list, or empty dict
+    if output_tensor is None:
+        return
+    if isinstance(output_tensor, (list, tuple)) and len(output_tensor) == 0:
+        return
+    if isinstance(output_tensor, dict) and len(output_tensor) == 0:
         return
 
     # Extract from list if needed
