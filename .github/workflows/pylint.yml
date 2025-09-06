@@ -20,4 +20,4 @@ jobs:
         pip install pylint==3.2.6
     - name: Analysing the code with pylint
       run: |
-        find megatron/core -maxdepth 1 -name "*.py" ! -name "jit.py" -exec pylint {} \;
+        pylint megatron/core --ignore=jit.py
