@@ -126,7 +126,7 @@ class PipelineParallelLayerLayout:
                 ), "All of the MTP layers must be in the same stage"
                 assert (
                     pp_rank == self.pipeline_model_parallel_size - 1
-                    and LayerType.loss in self.layout[pp_rank][-1],
+                    and LayerType.loss in self.layout[pp_rank][-1]
                 ), "MTP layers must be in the last stage together with Loss stage."
         # TODO: remove them in the future once they are supported
         if self.flatten_layout.count(LayerType.encoder) > 0:
