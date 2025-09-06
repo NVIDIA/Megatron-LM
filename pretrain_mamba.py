@@ -6,13 +6,17 @@ import torch
 from functools import partial
 from typing import List, Optional, Tuple, Union
 
+from model_provider import model_provider
+from mamba_builders import mamba_builder
+
 from megatron.training import get_args
+from megatron.training import get_tokenizer
 from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
 from megatron.training import get_timers
-from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
@@ -29,67 +33,11 @@ from megatron.training.utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tokenizers import MegatronTokenizer
 
 from megatron.training.datasets.sft_dataset import SFTDataset
 
 stimer = StragglerDetector()
-
-def count_parameters_in_layer(model, layer_name):
-    num_params = 0
-    for name, param in model.named_parameters():
-        if layer_name in name:
-            num_params += param.numel()
-            print_rank_0(f" - {name}: {param.numel()}")
-    return num_params
-
-
-def model_provider(pre_process=True, post_process=True) -> MambaModel:
-    """Builds the model.
-
-    Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
-
-    Returns:
-        MambaModel: The returned model
-    """
-    args = get_args()
-
-    print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(args, TransformerConfig)
-
-    assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
-
-    if args.spec is not None:
-        mamba_stack_spec = import_module(args.spec)
-    else:
-        raise("You must provide a valid Mamba layer spec!")
-
-    model = MambaModel(
-        config=config,
-        mamba_stack_spec=mamba_stack_spec,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
-        pre_process=pre_process,
-        hybrid_attention_ratio=args.hybrid_attention_ratio,
-        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-        hybrid_override_pattern=args.hybrid_override_pattern,
-        post_process=post_process,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent,
-        rotary_base=args.rotary_base
-    )
-
-    for l in range(model.decoder.num_layers_per_pipeline_rank):
-        layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
-        print_rank_0(f" == params layer {l}: {layer_params}")
-
-    return model
-
 
 def get_batch(data_iterator):
     """Generate a batch."""
@@ -200,7 +148,10 @@ def is_dataset_built_on_rank():
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -267,7 +218,7 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     pretrain(train_valid_test_datasets_provider,
-             model_provider,
+             partial(model_provider, mamba_builder),
              ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},

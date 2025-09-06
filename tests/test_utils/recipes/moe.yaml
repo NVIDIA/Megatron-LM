@@ -125,21 +125,21 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100] # hang: #513
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+        platforms: [dgx_h100] # hang: #513
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100] # hang: #513
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -157,18 +157,24 @@ products:
         platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr]
+      #   platforms: [dgx_h100] # hang: #513
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+  # TODO: The migration of custom fsdp causes EP + FSDP to be temporarily unavailable, which will be fixed in a subsequent MR.
+  # - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100]
+  #     - environment: [lts]
+  #       scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -207,9 +213,9 @@ products:
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-      - environment: [dev]
-        scope: [mr-slim]
-        platforms: [dgx_h100]
+     - environment: [dev]
+       scope: [mr]
+       platforms: [dgx_h100]
+     - environment: [dev]
+       scope: [mr-slim]
+       platforms: [dgx_h100]

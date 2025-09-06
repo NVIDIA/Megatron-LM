@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy<2.0.0"]
+dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -63,19 +63,26 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
+mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
-    "transformers~=4.53",
-    "multi-storage-client~=0.20.3",
+    "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
-    "nvidia-modelopt[torch]>=0.31.0a0,<0.32.0; sys_platform != 'darwin'",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "nv-grouped-gemm~=1.1",
+    "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
+    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
+    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
+    "flashinfer-python",
+    "wget",
+    "onnxscript",
 ]
 
 lts = [
@@ -86,6 +93,7 @@ lts = [
     "transformers",
     "zarr",
     "setuptools<80.0.0",
+    "wget",
 ]
 
 [dependency-groups]
@@ -98,14 +106,19 @@ test = [
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
+    "pygithub",
+    "pydantic",
+    "tensorboard",
+    "pyyaml",
 ]
 
 build = [
     "setuptools<80.0.0",
-    "packaging",
+    "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
+    "torch",
 ]
 linting = [
     "ruff~=0.9.0",
@@ -115,19 +128,33 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
+flash_mla = ["flash_mla"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
-
+no-build-isolation-package = [
+    "transformer-engine",
+    "transformer-engine-torch",
+    "mamba-ssm",
+    "causal-conv1d",
+    "nv-grouped-gemm",
+    "flash_mla",
+]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton 
+# We don't want to install torch, torchvision, and triton
 # because they are already installed in the base image.
 override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
+
+[tool.uv.sources]
+flash_mla = [
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
+]
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

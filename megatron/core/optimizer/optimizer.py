@@ -23,7 +23,6 @@ except ImportError:
 
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        import warnings
 
         warnings.warn(
             'Transformer Engine and Apex are not installed. '
@@ -46,6 +45,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
+from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -144,7 +144,9 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            if getattr(param, "__fsdp_param__", False):
+                grad = param.grad._local_tensor if param.grad is not None else None
+            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
                 grad = param.grad
@@ -334,6 +336,44 @@ class MegatronOptimizer(ABC):
     def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
+
+    def offload_to_cpu(self):
+        """Function used for RL training.
+        Move optimizer state tensors to CPU to free GPU memory during inference."""
+        if getattr(self, 'optimizer', None) is not None and not getattr(
+            self, 'is_stub_optimizer', False
+        ):
+            log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
+            # Move all optimizer tensors to CPU while keeping the optimizer instance
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and p.is_cuda:
+                        p.data = p.data.cpu()
+
+            for state_dict in self.optimizer.state.values():
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor) and v.is_cuda:
+                        state_dict[k] = v.cpu()
+
+            torch.cuda.empty_cache()
+
+    def restore_from_cpu(self):
+        """Function used for RL training.
+        Restore optimizer state tensors from CPU back to GPU for training."""
+        if getattr(self, 'optimizer', None) is not None and not getattr(
+            self, 'is_stub_optimizer', False
+        ):
+            log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
+            # Move all optimizer tensors back to GPU
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and not p.is_cuda:
+                        p.data = p.data.cuda()
+
+            for state_dict in self.optimizer.state.values():
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor) and not v.is_cuda:
+                        state_dict[k] = v.cuda()
 
     @staticmethod
     def _filter_and_reorder_param_groups(
@@ -532,11 +572,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            (
+            if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+                # In the case of overlap_param_gather,
+                # copy is manually called in the training loop
+                if not self.config.overlap_param_gather:
+                    self._copy_main_params_to_param_buffer()
+            else:
                 self._copy_main_params_to_model_params()
-                if not self.config.reuse_grad_buf_for_mxfp8_param_ag
-                else self._copy_main_params_to_param_buffer()
-            )
+
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -800,7 +843,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -953,7 +995,6 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
@@ -1139,6 +1180,19 @@ class ChainedOptimizer(MegatronOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
+        metadata = kwargs.get('metadata') or {}
+        # ChainedOptimizer should add its prefix to the tensor state keys only for formats
+        # leveraging internal DistOpt structure ('distrib_optim_sharding_type' is empty if
+        # not using DistOpt). For backward-compatibility we also add it if
+        # `chained_optim_avoid_prefix` is False.
+        _distopt_requires_prefix = metadata.get('distrib_optim_sharding_type') in (
+            'dp_zero_gather_scatter',
+            'dp_reshardable',
+        )
+        should_add_prefix = _distopt_requires_prefix or not metadata.get(
+            'chained_optim_avoid_prefix', False
+        )
+
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(
                 model_sharded_state_dict, is_loading, **kwargs
@@ -1150,7 +1204,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 optim_state_dict = optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
-                add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                if should_add_prefix:
+                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
@@ -1299,9 +1354,8 @@ class ChainedOptimizer(MegatronOptimizer):
                     states.append(state_dict)
                     save_states = True
                 else:
+                    assert state_dict is None
                     states.append(None)
-            else:
-                states.append(None)
 
         if save_states:
             torch.save(states, filename)
@@ -1351,3 +1405,13 @@ class ChainedOptimizer(MegatronOptimizer):
                 param_group['step'] = step
 
         return step
+
+    def offload_to_cpu(self):
+        """Move optimizer state to CPU to free GPU memory during inference."""
+        for optimizer in self.chained_optimizers:
+            optimizer.offload_to_cpu()
+
+    def restore_from_cpu(self):
+        """Restore optimizer state from CPU back to GPU for training."""
+        for optimizer in self.chained_optimizers:
+            optimizer.restore_from_cpu()

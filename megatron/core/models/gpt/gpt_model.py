@@ -6,7 +6,7 @@ from typing import Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -19,9 +19,13 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
+    MTPLossAutoScaler,
+    MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    roll_tensor,
     tie_output_layer_state_dict,
     tie_word_embeddings_state_dict,
 )
@@ -189,7 +193,7 @@ class GPTModel(LanguageModule):
             )
 
         # Output
-        if self.post_process or self.mtp_process:
+        if self.post_process:
 
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
@@ -314,7 +318,10 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
-            and (self.config.enable_cuda_graph or self.config.flash_decode)
+            and (
+                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                or self.config.flash_decode
+            )
             and rotary_pos_cos is not None
             and inference_context.is_static_batching()
         ):
@@ -444,8 +451,6 @@ class GPTModel(LanguageModule):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
-                labels=labels,
-                loss_mask=loss_mask,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
@@ -455,29 +460,89 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
-                output_layer=self.output_layer,
-                output_weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                compute_language_model_loss=self.compute_language_model_loss,
                 **(extra_block_kwargs or {}),
             )
 
         if not self.post_process:
             return hidden_states
 
+        if self.mtp_process:
+            mtp_labels = labels.clone()
+            hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
+            hidden_states = hidden_states_list[0]
+            if loss_mask is None:
+                # if loss_mask is not provided, use all ones as loss_mask
+                loss_mask = torch.ones_like(mtp_labels)
+            for mtp_layer_number in range(self.config.mtp_num_layers):
+                # output
+                mtp_logits, _ = self.output_layer(
+                    hidden_states_list[mtp_layer_number + 1],
+                    weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                )
+                # Calc loss for the current Multi-Token Prediction (MTP) layers.
+                mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+                loss_mask, num_tokens = roll_tensor(
+                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+                )
+                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
+                mtp_loss = loss_mask * mtp_loss
+                if self.training:
+                    # TODO(shifangx): remove the use of parallel_state here
+                    # after moving loss logging to loss_func in pretrain_gpt.py
+                    MTPLossLoggingHelper.save_loss_to_tracker(
+                        torch.sum(mtp_loss) / num_tokens,
+                        mtp_layer_number,
+                        self.config.mtp_num_layers,
+                        avg_group=parallel_state.get_data_parallel_group(
+                            with_context_parallel=True
+                        ),
+                    )
+                mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
+                if self.config.calculate_per_token_loss:
+                    hidden_states = MTPLossAutoScaler.apply(
+                        hidden_states, mtp_loss_scale * mtp_loss
+                    )
+                else:
+                    hidden_states = MTPLossAutoScaler.apply(
+                        hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+                    )
+        sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
+                if self.output_layer.sequence_parallel:
+                    # Perform the sequence parallel gather here instead of after the output layer
+                    # because we need to slice the last token logits from the full view of the
+                    # packed logits across all requests.
+                    # TODO(ksanthanam): Make the equivalent change in the `MambaModel` code after
+                    # merging in !3722.
+                    hidden_states = gather_from_sequence_parallel_region(
+                        hidden_states, group=self.model_comm_pgs.tp
+                    )
+                    self.output_layer.sequence_parallel = False
+                    sequence_parallel_override = True
+
                 # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
                 # state ([B, H]) → unsqueeze back to [1, B, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
+
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # Restore sequence parallel execution to the output layer if necessary.
+        if sequence_parallel_override:
+            assert (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.materialize_only_last_token_logits
+            )
+            self.output_layer.sequence_parallel = True
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
@@ -519,6 +584,64 @@ class GPTModel(LanguageModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+    ):
+        """Builds a computation schedule plan for the model.
+
+        This function creates a schedule plan for a model chunk, including
+        preprocessing, transformer layers, and postprocessing.
+        The schedule plan is used to optimize computation and memory usage
+        in distributed environments.
+
+        Args:
+            input_ids (Tensor): Input token IDs.
+            position_ids (Tensor): Position IDs.
+            attention_mask (Tensor): Attention mask.
+            decoder_input (Tensor, optional): Decoder input tensor. Defaults to None.
+            labels (Tensor, optional): Labels for loss computation. Defaults to None.
+            inference_context (BaseInferenceContext, optional):
+                Inference context. Defaults to None.
+            packed_seq_params (PackedSeqParams, optional):
+                Parameters for packed sequences. Defaults to None.
+            extra_block_kwargs (dict, optional):
+                Additional keyword arguments for blocks. Defaults to None.
+            runtime_gather_output (Optional[bool], optional):
+                Whether to gather output at runtime. Defaults to None.
+            inference_params (InferenceParams, optional):
+                Parameters for inference. Defaults to None.
+            loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
+
+        Returns:
+            TransformerModelChunkSchedulePlan: The model chunk schedule plan.
+        """
+
+        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+
+        return TransformerModelChunkSchedulePlan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            extra_block_kwargs,
+            runtime_gather_output,
+            loss_mask,
+        )
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None

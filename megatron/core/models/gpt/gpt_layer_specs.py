@@ -79,6 +79,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     qk_l2_norm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
+    use_te_activation_func: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -109,6 +110,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         backend: BackendSpecProvider = KitchenSpecProvider(fallback=TESpecProvider())
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
+        if use_te_activation_func:
+            raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
         backend = TESpecProvider()
 
@@ -118,6 +121,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
+        use_te_activation_func=use_te_activation_func,
     )
 
     if multi_latent_attention:
@@ -141,9 +145,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=backend.column_parallel_linear(),
-                        linear_q_down_proj=backend.column_parallel_linear(),
+                        linear_q_down_proj=backend.linear(),
                         linear_q_up_proj=linear_q_up_proj,
-                        linear_kv_down_proj=backend.column_parallel_linear(),
+                        linear_kv_down_proj=backend.linear(),
                         linear_kv_up_proj=linear_kv_up_proj,
                         core_attention=backend.core_attention(),
                         linear_proj=backend.row_parallel_linear(),
@@ -365,22 +369,26 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
+    use_te_activation_func: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
     linear_fc2 = backend.row_parallel_linear()
+    activation_func = backend.activation_func() if use_te_activation_func else None
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        if use_te_op_fuser:
-            return ModuleSpec(module=TEFusedMLP)
-        elif backend.fuse_layernorm_and_linear():
+        module = TEFusedMLP if use_te_op_fuser else MLP
+        if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
             linear_fc1 = backend.column_parallel_linear()
         return ModuleSpec(
-            module=MLP, submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+            module=module,
+            submodules=MLPSubmodules(
+                linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
+            ),
         )
     else:
         # Mixture of experts with modules in megatron core.
@@ -389,6 +397,7 @@ def get_mlp_module_spec_for_backend(
             num_experts=num_experts,
             moe_grouped_gemm=moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+            use_te_activation_func=use_te_activation_func,
         )
 
 
@@ -410,6 +419,7 @@ def get_gpt_decoder_block_spec(
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -419,6 +429,7 @@ def get_gpt_decoder_block_spec(
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
         )
     else:
         layer_norm_impl = LNImpl

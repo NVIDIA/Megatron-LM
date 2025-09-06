@@ -3,11 +3,24 @@
 """Dataclasses for organizing model parallelism and gradient communication process groups."""
 
 from dataclasses import dataclass, field, fields
+from functools import partial
 from typing import List, Optional
 
 import torch
 
 from megatron.core import parallel_state
+
+
+class ProcessGroupHelperMeta(type):
+    """Metaclass to protect virtual_pipeline_model_parallel_size from direct assignment."""
+
+    def __setattr__(cls, name, value):
+        if name == 'virtual_pipeline_model_parallel_size':
+            raise AttributeError(
+                f"Cannot set '{name}' directly. Use set_virtual_pipeline_model_parallel_size() "
+                f"method instead."
+            )
+        super().__setattr__(name, value)
 
 
 @dataclass
@@ -76,6 +89,9 @@ class ModelCommProcessGroups:
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    tp_dp_cp: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
@@ -128,10 +144,15 @@ class ModelCommProcessGroups:
             'pos_embd': parallel_state.get_position_embedding_group,
             # TODO (Hepteract): remove this once distributed checkpoint is refactored
             'expt_dp': parallel_state.get_expert_data_parallel_group,
+            'tp_dp_cp': partial(
+                parallel_state.get_tensor_and_data_parallel_group, with_context_parallel=True
+            ),
         }
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {pg: pg_to_func[pg](False) for pg in required_pgs}
+        init_dict = {
+            pg: pg_to_func[pg](check_initialized=False) for pg in required_pgs if pg in pg_to_func
+        }
 
         return cls(**init_dict)
 
@@ -176,3 +197,46 @@ class GradCommProcessGroups:
 
     # _INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+
+@dataclass
+class GradFinalizeProcessGroups:
+    """Process groups for finalizing gradients in distributed training.
+
+    Fields use init=False and must be set after instance creation.
+
+    Args:
+        tp: Tensor model parallel process group
+        pp: Pipeline model parallel process group
+        embd: Embedding process group
+        pos_embd: Position embedding process group
+        dp_cp: Data and context parallel group
+        cp: Context parallel process group
+
+    Example:
+        # Create instance and set needed process groups
+        grad_finalize_pgs = GradFinalizeProcessGroups()
+        grad_finalize_pgs.tp = tp_group
+        grad_finalize_pgs.pp = pp_group
+
+        # Pass to gradient finalization function
+        finalize_model_grads(..., grad_finalize_pgs=grad_finalize_pgs)
+    """
+
+    # _TENSOR_MODEL_PARALLEL_GROUP
+    tp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _PIPELINE_MODEL_PARALLEL_GROUP
+    pp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EMBEDDING_GROUP
+    embd: torch.distributed.ProcessGroup = field(init=False)
+
+    # _POSITION_EMBEDDING_GROUP
+    pos_embd: torch.distributed.ProcessGroup = field(init=False)
+
+    # _DATA_PARALLEL_GROUP_WITH_CP
+    dp_cp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _CONTEXT_PARALLEL_GROUP
+    cp: torch.distributed.ProcessGroup = field(init=False)

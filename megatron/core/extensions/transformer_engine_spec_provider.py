@@ -4,10 +4,12 @@ import warnings
 from typing import Optional, Tuple
 
 from megatron.core.extensions.transformer_engine import (
+    TEActivationOp,
     TEColumnParallelGroupedLinear,
     TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
+    TELinear,
     TENorm,
     TERowParallelGroupedLinear,
     TERowParallelLinear,
@@ -22,6 +24,10 @@ from megatron.core.utils import get_te_version, is_te_min_version
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    def linear(self) -> type:
+        """Which linear module TE backend uses"""
+        return TELinear
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module TE backend uses"""
@@ -83,3 +89,7 @@ class TESpecProvider(BackendSpecProvider):
             return SequentialMLP, MLPSubmodules(
                 linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
             )
+
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        return TEActivationOp

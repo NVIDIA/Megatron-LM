@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import prepare_model_for_fp8_inference
 from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
@@ -20,6 +21,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.utils import get_model_config
 
 
 # pylint: disable=line-too-long
@@ -57,6 +59,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if self.inference_wrapper_config.fp32_residual_connection
             else self.inference_wrapper_config.params_dtype
         )
+        model_config = get_model_config(self.model)
+        self.sequence_parallel = model_config.sequence_parallel
 
         if inference_context is None:
             warnings.warn(
@@ -78,6 +82,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.tp_group = model_comm_pgs.tp
         self.pp_group = model_comm_pgs.pp
+        self.tp_size = torch.distributed.get_world_size(self.tp_group)
+
+        if self.inference_wrapper_config.fp8 is not None:
+            self.model = prepare_model_for_fp8_inference(self.model)
 
     @property
     def inference_params(self):
@@ -180,6 +188,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
+        if self.sequence_parallel and self.inference_context.is_dynamic_batching():
+            # For dynamic inference we need to explicitly adjust the recv buffer size here for
+            # sequence parallelism. Static batching does not support sequence parallelism
+            # except for the MoE layers which is handled separately.
+            seq_len = seq_len // self.tp_size
         recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
         return torch.empty(
             recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()
@@ -352,7 +365,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
         """
-        if self.model_is_pipeline_parallel:
+        # Check if we are in a PP model
+        if not (
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+        ):
             tokens = inference_input["tokens"]
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(
                 tokens, recv_buffer_seq_len

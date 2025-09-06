@@ -115,6 +115,10 @@ class MoELayer(BaseMoELayer):
         self.moe_layer_recompute = (
             config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
         )
+        self.shared_experts_recompute = (
+            config.recompute_granularity == 'selective'
+            and "shared_experts" in config.recompute_modules
+        )
 
         # Initialize router
         self.router = TopKRouter(config=self.config, model_comm_pgs=model_comm_pgs)
@@ -199,7 +203,21 @@ class MoELayer(BaseMoELayer):
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
-            shared_expert_output = self.shared_experts(residual)
+            if self.shared_experts_recompute:
+                if self.config.fp8:
+                    shared_expert_output = te_checkpoint(
+                        self.shared_experts,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        parallel_state.get_tensor_model_parallel_group(),
+                        residual,
+                    )
+                else:
+                    shared_expert_output = tensor_parallel.checkpoint(
+                        self.shared_experts, False, residual
+                    )
+            else:
+                shared_expert_output = self.shared_experts(residual)
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -274,3 +292,12 @@ class MoELayer(BaseMoELayer):
         self.experts.backward_dw()
         if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
+
+    def set_for_recompute_pre_mlp_layernorm(self):
+        """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8."""
+        # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
+        # function will save the original input tensors.
+        if self.shared_experts is not None and not self.shared_experts_recompute:
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input(self.shared_experts.linear_fc1)

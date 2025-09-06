@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -56,6 +56,15 @@ class InferenceRequest:
             )
             self.sampling_params = self.inference_parameters
 
+    def serializable(self):
+        """
+        Converts the instance into a serializable dictionary.
+        Returns:
+            dict: A dictionary representation of the instance suitable for serialization.
+        """
+
+        return asdict(self)
+
 
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
@@ -69,6 +78,7 @@ class DynamicInferenceRequest(InferenceRequest):
     generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    latency: Optional[float] = None
 
 
 @dataclass(kw_only=True)

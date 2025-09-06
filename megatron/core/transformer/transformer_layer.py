@@ -15,7 +15,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, is_graph_capturing
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -82,6 +82,12 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                 - num_layers_in_last_pipeline_stage
             )
 
+            middle_pipeline_rank = (
+                pipeline_rank
+                if config.num_layers_in_first_pipeline_stage is None
+                else pipeline_rank - 1
+            )
+
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
                 assert (
                     vp_stage is not None
@@ -121,7 +127,7 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     offset = (
                         vp_stage * total_virtual_chunks
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
-                        + (pipeline_rank - 1)
+                        + middle_pipeline_rank
                         * (
                             num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
@@ -132,12 +138,6 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
                 else:
                     num_layers_per_pipeline_rank = 0
-
-                middle_pipeline_rank = (
-                    pipeline_rank
-                    if config.num_layers_in_first_pipeline_stage is None
-                    else pipeline_rank - 1
-                )
 
                 if pipeline_rank == 0:
                     offset = 0
@@ -272,17 +272,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         super().__init__(config=config)
 
         # Enable cuda graphs.
-        if config.enable_cuda_graph or config.external_cuda_graph:
+        if (
+            config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration"
+        ) or config.external_cuda_graph:
             assert not (
                 config.enable_cuda_graph and config.external_cuda_graph
             ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
-            if config.enable_cuda_graph:
+            if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
                 if not self.training:
                     # Cudagraphs for inference are only enabled with the flash decoding kernel
                     assert (
                         self.config.flash_decode
                     ), "--flash-decode is required to use CUDA graphs during inference"
-                self.cudagraph_manager = CudaGraphManager(config)
+                self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
                 # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -363,6 +365,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
         # import here to avoid circular import
+        from megatron.core.extensions.transformer_engine import TEFusedMLP
         from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -373,7 +376,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["model_comm_pgs"] = model_comm_pgs
-            elif submodules.mlp.module == MLP:
+            elif submodules.mlp.module in (MLP, TEFusedMLP):
                 assert hasattr(
                     model_comm_pgs, 'tp'
                 ), 'TP process group is required for MLP in TransformerLayer'
@@ -396,12 +399,25 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.recompute_mlp = False
         if self.config.recompute_granularity == 'selective':
             if "layernorm" in self.config.recompute_modules:
-                if not isinstance(self.input_layernorm, IdentityOp):
+                if (
+                    not isinstance(self.input_layernorm, IdentityOp)
+                    and not self.config.external_cuda_graph
+                ):
                     self.recompute_input_layernorm = True
+                    if self.config.fp8:
+                        self.self_attention.set_for_recompute_input_layernorm()
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp):
                     self.recompute_pre_mlp_layernorm = True
-            if "mlp" in self.config.recompute_modules:
+                    if self.config.fp8:
+                        if isinstance(self.mlp, MoELayer):
+                            self.mlp.set_for_recompute_pre_mlp_layernorm()
+                        else:
+                            from megatron.core.extensions.transformer_engine import (
+                                set_save_original_input,
+                            )
 
+                            set_save_original_input(self.mlp.linear_fc1)
+            if "mlp" in self.config.recompute_modules:
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
 
@@ -434,6 +450,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        # Remove 'dynamic_inference_decode_only' from kwargs if present
+        # this is only used to uniquely identify decode and non-decode cuda graph
+        # runners in the cuda graph manager
+        kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context
@@ -718,7 +738,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 self.self_attention,
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
-                self.pre_mlp_layernorm,
             ]
 
         param_modules = []
@@ -789,7 +808,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         device=torch.cuda.current_device(),
                     )
 
-                if not is_te_min_version("1.10.0", check_equality=False):
+                if not is_te_min_version("1.10.0"):
+                    # TE version < 1.10.0 does not support keyword arguments with CUDA graph.
                     for k, v in kwargs.items():
                         if k == "attention_mask":
                             if v is not None:
@@ -824,7 +844,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hook(*hook_args)
         cuda_graph_output = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 
-        if cudagraph_kwargs['context'] is not None:
+        if cudagraph_kwargs.get('context') is not None:
             context = cuda_graph_output[-1]
             cuda_graph_output = cuda_graph_output[:-1]
         else:
@@ -846,21 +866,35 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
-                (
-                    kwargs.get('inference_context') is not None
-                    and kwargs['inference_context'].is_decode_only()
-                )
-                or (
-                    kwargs.get('inference_params') is not None
-                    and kwargs['inference_params'].is_decode_only()
-                )
+                (kwargs.get('inference_context') is not None)
+                or (kwargs.get('inference_params') is not None)
             )
         ):
             assert (
                 kwargs.get('attention_mask') is None
-            ), f"Attention mask must not be set when using CUDA graphs for decode"
-            return self.cudagraph_manager(self, args, kwargs)
-        elif self.config.external_cuda_graph and self.training:
+            ), f"Attention mask must not be set when using CUDA graphs with inference."
+
+            # it can happen that non-decode steps have a token count greater than the max
+            # supported cuda graph token count. In that case this flag will be set to
+            # False by initialize_attention, and we should not use cuda graphs.
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            if using_cuda_graph:
+                # dynamic_inference_decode_only is not a real argument to forward, it is only used
+                # to differentiate the cuda graph used for decode from the one used for non-decode
+                # inference.
+                kwargs["dynamic_inference_decode_only"] = kwargs[
+                    'inference_context'
+                ].is_decode_only()
+                return self.cudagraph_manager(self, args, kwargs)
+
+        elif (
+            self.config.external_cuda_graph
+            and self.training
+            and (is_graph_capturing() or self.cuda_graphs)
+        ):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._cuda_graph_capture

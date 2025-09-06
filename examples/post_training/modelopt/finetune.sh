@@ -29,7 +29,7 @@ if [ -z ${MLM_DATA_ARGS} ]; then
         --lr-decay-samples 128000 \
         --lr-warmup-samples 0 \
         --split 100,0,0 \
-        --finetune-hf-dataset nvidia/Daring-Anteater \
+        --finetune-hf-dataset Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered \
     "
 fi
 

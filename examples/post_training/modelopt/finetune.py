@@ -54,11 +54,9 @@ class SFTDataset(torch.utils.data.Dataset):
     hf_dataset_to_kwargs = {
         "Open-Orca/OpenOrca": {"split": "train"},
         "Open-Orca/SlimOrca": {"split": "train"},
-        "nvidia/HelpSteer2": {"split": "train"},
         "nvidia/Daring-Anteater": {"split": "train"},
         "Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered": {"split": "train"},
-        "/hf-local/modelopt/AA-Synthetic-Scout": {"split": "train"},
-        "/hf-local/modelopt/Multilingual": {"split": "train"},
+        "HuggingFaceH4/ultrachat_200k": {"split": "train_sft"},
     }
 
     hf_dataset_to_conversation = {
@@ -66,21 +64,14 @@ class SFTDataset(torch.utils.data.Dataset):
             data["question"], data["response"]
         ),
         "Open-Orca/SlimOrca": lambda data: SFTDataset._sharegpt_to_openai_conversations(data),
-        "nvidia/HelpSteer2": lambda data: SFTDataset._to_conversation(
-            data["prompt"], data["response"]
-        ),
         "nvidia/Daring-Anteater": lambda data: SFTDataset._sharegpt_to_openai_conversations(data),
         "Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered": lambda data: SFTDataset._sharegpt_to_openai_conversations(
-            data
-        ),
-        "/hf-local/modelopt/AA-Synthetic-Scout": lambda data: SFTDataset._special_to_openai_conversations(
             data
         ),
     }
 
     hf_dataset_to_prompt_template = {
         "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
-        "nvidia/HelpSteer2": "{{ messages['prompt'] + ' ' + messages['response'] + ' ' }}",
     }
 
     def __init__(
@@ -250,7 +241,7 @@ class SFTDataset(torch.utils.data.Dataset):
         # Check if this is OpenAI chat data?
         conversations = example.get("conversations", None)
         if conversations is None:
-            conversations = example.get("messagess", None)
+            conversations = example.get("messages", None)
 
         # We don't use the data if there is no assistant reply or the conversation that
         # starts with the assistant.

@@ -26,7 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN bash -ex <<"EOF"
     apt-get update
-    apt-get install -y --no-install-recommends gettext python3-venv
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc
     apt-get clean
     python -m venv /opt/jet
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
@@ -40,7 +40,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
 
-RUN 
+RUN
 ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
@@ -57,16 +57,25 @@ RUN bash -ex <<"EOF"
     bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment lts
 EOF
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
+COPY assets/ /opt/data/
 
 ##### For NVIDIANS only #####
 FROM main as jet
 ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
+RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
+    JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
+    python -m venv /opt/jet 
+    /opt/jet/bin/pip install --no-cache-dir $JET_INDEX_URLS \
+        jet-api==$JET_API_VERSION
+EOF
+
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     --mount=type=secret,id=LOGGER_INDEX_URL bash -ex <<"EOF"
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
-    uv pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS "setuptools<80.0.0"
-    uv pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL "setuptools<80.0.0"
+    uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
+    uv pip install --no-cache-dir --upgrade "setuptools<80.0.0"
+    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=2.0" 
 EOF
 ###
