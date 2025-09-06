@@ -387,6 +387,10 @@ def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
 
 def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the offset of the MTP layer."""
+    # fine_grained_callables.py will call this function without having vp_stage arguments
+    # so we need to cache the offset to avoid assertion error
+    if hasattr(get_mtp_layer_offset, "_cache"):
+        return get_mtp_layer_offset._cache
     # TODO(shifangx): Currently, we only support put all of MTP layers
     # on the last pipeline stage, so the offset is always 0.
     # We will support more flexible MTP placement in the future.
@@ -399,6 +403,7 @@ def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = No
             offset = 0
     else:
         offset = 0
+    get_mtp_layer_offset._cache = offset
     return offset
 
 
