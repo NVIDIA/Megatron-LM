@@ -255,7 +255,7 @@ class _CudagraphRecordNode(torch.autograd.Function):
 
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
-    cudagraph io and fp8 if used."""
+    cudagraph io and fp8/fp4 if used."""
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -277,7 +277,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
-        if runner.fp8_enabled:
+        if runner.fp8_enabled or runner.fp4_enabled:
             for m in runner.base_module.modules():
                 if isinstance(m, TransformerEngineBaseModule):
                     m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
@@ -328,8 +328,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.bwd_graph.replay()
         runner.status = _GraphStatus.FWD_READY
 
-        # Update FP8 scale factors if needed
-        if runner.fp8_enabled and ctx.is_first_fp8_module:
+        # Update FP8/FP4 scale factors if needed
+        if (runner.fp8_enabled or runner.fp4_enabled) and ctx.is_first_fp8_module:
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
 
         # If using gradient_accumulation_fusion, whenever `main_grad` is calculated
@@ -392,17 +392,25 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fuse_wgrad_accumulation = False
         self.backward_retain_grad = False
         self.fp8_enabled = False
+        self.fp4_enabled = False
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 2
         if isinstance(self.base_module.config, TransformerConfig):
             self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.fp8_enabled = self.base_module.config.fp8 is not None
+            self.fp4_enabled = self.base_module.config.fp4 is not None
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+            if self.fp4_enabled:
+                from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
+
+                self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
         # Decide whether to reuse the input and output buffer, and if so,
@@ -431,6 +439,21 @@ class _CudaGraphRunner(torch.nn.Module):
         from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
 
         return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
+
+    def get_fp4_context(self):
+        """Return a new fp4 context in cudagraph mode."""
+        from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+        return get_fp4_context(self.base_module.config, self.base_module.layer_number - 1)
+
+    def get_quantization_context(self):
+        """Return appropriate quantization context (FP8 or FP4) in cudagraph mode."""
+        if self.fp8_enabled:
+            return self.get_fp8_context()
+        elif self.fp4_enabled:
+            return self.get_fp4_context()
+        else:
+            return nullcontext()
 
     def run_module_forward(self, args, kwargs, *, graph=None, pool=None):
         """Run module forward, using given graph and memory pool."""
@@ -504,6 +527,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, 'main_grad')
             ]
 
+        saved_fp8_tensors = None
+
         if self.fp8_enabled:
             if is_te_min_version("1.13.0"):
                 saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp8_recipe)
@@ -511,6 +536,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 saved_fp8_tensors = save_fp8_tensors(
                     [self.base_module], self.fp8_recipe.amax_history_len
                 )
+        elif self.fp4_enabled:
+            if is_te_min_version("2.7.0.dev0"):
+                saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp4_recipe)
+            else:
+                raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
         if clone_inputs:
             args, kwargs = self.zero_out_tensors(args, kwargs)
@@ -526,7 +556,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
-            with self.get_fp8_context():
+            with self.get_quantization_context():
                 outputs = self.base_module.forward(*args, **kwargs)
             if self.training and torch.is_grad_enabled():
                 if isinstance(outputs, torch.Tensor):
@@ -549,7 +579,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if has_te_modules:
             te_set_capture_start()
 
-        with self.get_fp8_context():
+        with self.get_quantization_context():
             torch.cuda.synchronize()
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
@@ -581,7 +611,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     ), "Error restoring grads while cudagraphing!"
                     param.main_grad.copy_(saved_grad)
 
-        if self.fp8_enabled:
+        if self.fp8_enabled or self.fp4_enabled:
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
         _set_capture_end()
@@ -882,7 +912,7 @@ class CudaGraphManager(torch.nn.Module):
 
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
-                pooling, graph retention, gradient accumulation, FP8, and warmup steps.
+                pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
             share_cudagraph_io_buffers (bool, optional): (DEPRECATED, will be replaced by
                 config.cuda_graph_share_io_buffers) If None (default) or True, enables
                 buffer reuse optimizations for transformer and mamba layers. If False,
@@ -1073,7 +1103,6 @@ class CudaGraphManager(torch.nn.Module):
             args (tuple):  The positional args to be passed to the module.
 
             kwargs (dict):  The keyword args to be passed to the module.
-
         """
 
         if len(self.cudagraph_runners) > 0:
@@ -1335,6 +1364,7 @@ class TECudaGraphHelper:
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
 
+            from megatron.core.fp4_utils import get_fp4_recipe
             from megatron.core.fp8_utils import get_fp8_recipe
 
             if self.config.fp8:
@@ -1342,6 +1372,16 @@ class TECudaGraphHelper:
                 kwargs['fp8_recipe'] = get_fp8_recipe(self.config)
                 # fp8 weight caching will be ignored by TE if cudagraph doesn't capture attn,
                 # even if we set it to True in the arguments. So we just pass a False in this case.
+                kwargs['fp8_weight_caching'] = 'attn' in self.config.cuda_graph_scope
+                if is_te_min_version("1.14.0") and parallel_state.model_parallel_is_initialized():
+                    kwargs['fp8_group'] = parallel_state.get_amax_reduction_group(
+                        with_context_parallel=True, tp_only_amax_red=self.config.tp_only_amax_red
+                    )
+            elif self.config.fp4:
+                # FP4 and FP8 are mutually exclusive, so use fp8_* kwargs for FP4 too
+                # since TE currently uses fp8_autocast for both FP8 and FP4 quantization
+                kwargs['fp8_enabled'] = True
+                kwargs['fp8_recipe'] = get_fp4_recipe(self.config)
                 kwargs['fp8_weight_caching'] = 'attn' in self.config.cuda_graph_scope
                 if is_te_min_version("1.14.0") and parallel_state.model_parallel_is_initialized():
                     kwargs['fp8_group'] = parallel_state.get_amax_reduction_group(

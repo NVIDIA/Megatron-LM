@@ -11,6 +11,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -329,8 +330,19 @@ class TransformerBlock(MegatronModule):
             else:
                 layer_config = self.config
 
-            fp8_init_context = get_fp8_context(layer_config, global_layer_number - 1, is_init=True)
-            with fp8_init_context:
+            # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
+            if layer_config.fp8:
+                quantization_context = get_fp8_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            elif layer_config.fp4:
+                quantization_context = get_fp4_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            else:
+                quantization_context = nullcontext()
+
+            with quantization_context:
                 module = build_module(
                     layer_spec,
                     config=layer_config,
@@ -373,7 +385,7 @@ class TransformerBlock(MegatronModule):
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
-        use_inner_fp8_context: bool,
+        use_inner_quantization_context: bool,
     ):
         """Forward method with activation checkpointing."""
 
@@ -383,12 +395,24 @@ class TransformerBlock(MegatronModule):
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
-                        if use_inner_fp8_context
-                        else nullcontext()
-                    )
-                    with inner_fp8_context:
+
+                    # Get appropriate inner quantization context
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        # TODO: check if fp4 is supported in this case
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    with inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -405,7 +429,8 @@ class TransformerBlock(MegatronModule):
 
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8:
+            # TODO: check if fp4 is supported in this case
+            if self.config.fp8 or self.config.fp4:
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -449,7 +474,8 @@ class TransformerBlock(MegatronModule):
                 # Skip recomputation when input grad computation is not needed.
                 # Need to have at least one input tensor with gradient computation
                 # for re-enterant autograd engine.
-                if self.config.fp8 and not hidden_states.requires_grad:
+                # TODO: check if fp4 is supported in this case
+                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
                     recompute_skip_num_layers += 1
                 if (
                     layer_idx >= recompute_skip_num_layers
@@ -557,11 +583,24 @@ class TransformerBlock(MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
-        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        # For FP4: NVFP4BlockScaling doesn't have delayed scaling, always uses inner context
+        if self.config.fp8:
+            use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
+            use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
+            outer_quantization_context = (
+                get_fp8_context(self.config) if use_outer_quantization_context else nullcontext()
+            )
+        elif self.config.fp4:
+            use_outer_quantization_context = False
+            use_inner_quantization_context = True
+            outer_quantization_context = nullcontext()
+        else:
+            # No quantization
+            use_outer_quantization_context = False
+            use_inner_quantization_context = False
+            outer_quantization_context = nullcontext()
 
-        with rng_context, outer_fp8_context:
+        with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(
@@ -572,16 +611,26 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
-                    use_inner_fp8_context=use_inner_fp8_context,
+                    use_inner_quantization_context=use_inner_quantization_context,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
-                    inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
-                        if use_inner_fp8_context
-                        else nullcontext()
-                    )
-                    with self.offload_context, inner_fp8_context:
+                    # Get appropriate inner quantization context
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
