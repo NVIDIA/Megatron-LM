@@ -235,7 +235,12 @@ def forward_step_calc_loss(
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
-                    output_tensor /= num_tokens
+                    # in CP, sometimes all tokens on a GPU will be masked out so num_tokens = 0
+                    if num_tokens > 0:
+                        output_tensor /= num_tokens
+                    else:
+                        # all tokens are masked out so we don't care the loss. It should already be zero though
+                        output_tensor *= 0
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
