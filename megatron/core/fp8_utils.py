@@ -476,8 +476,8 @@ if HAVE_TE:
                 fp8_group = parallel_state.get_amax_reduction_group(
                     with_context_parallel=True, tp_only_amax_red=config.tp_only_amax_red
                 )
-
             if not is_init:
+                # import pdb;pdb.set_trace()
                 fp8_context = transformer_engine.pytorch.fp8_autocast(
                     enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
                 )

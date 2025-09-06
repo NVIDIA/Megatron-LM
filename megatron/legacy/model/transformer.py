@@ -1741,6 +1741,7 @@ class ParallelTransformer(MegatronModule):
                 fp8_group=self.fp8_group
             ) if self.use_fp8 else nullcontext():
                 # Determine if the current iteration is first microbatch
+                # import pdb;pdb.set_trace()
                 if self.num_microbatches_in_previous_step != get_num_microbatches():
                     self.microbatch_count = 0 # Reset count on new batch size rampup interval
                 self.num_microbatches_in_previous_step = get_num_microbatches()

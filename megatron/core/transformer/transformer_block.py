@@ -337,6 +337,7 @@ class TransformerBlock(MegatronModule):
             return module
 
         # offset is implicit in TransformerLayer
+        # import pdb;pdb.set_trace()
         self.layers = torch.nn.ModuleList(
             [
                 build_layer(layer_spec, i + 1)

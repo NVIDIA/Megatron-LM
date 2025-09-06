@@ -25,7 +25,7 @@ except ImportError:
 from megatron.training.tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
-
+from tqdm import tqdm
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
 class CustomLanguageVars(PunktLanguageVars):
@@ -126,7 +126,7 @@ class Partition(object):
     def split_sentences(self, file_name):
         input_file_name, output_file_name = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        fin = open(input_file_name, 'r', encoding='utf-8', errors='replace')
         fout = open(output_file_name, 'w')
 
         encoder = Encoder(self.args)
@@ -147,7 +147,7 @@ class Partition(object):
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        fin = open(input_file_name, 'r', encoding='utf-8', errors='replace')
 
         startup_start = time.time()
         encoder = Encoder(self.args)
@@ -184,7 +184,9 @@ class Partition(object):
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()
-        builders[key].finalize(output_idx_files[key])
+        # builders[key].finalize(output_idx_files[key])
+        for k in builders:
+            builders[k].finalize(output_idx_files[k])
 
 
 def get_args():
@@ -234,17 +236,26 @@ def get_args():
     return args
 
 
-def get_file_name(args, file_id):
-    file_name, extension = os.path.splitext(args.input)
-    input_file_name = file_name + "_" + str(file_id) + extension
-    sentence_split_file = file_name + "_ss_" + str(file_id) + extension
-    output_prefix = args.output_prefix + "_" + str(file_id)
-    file_names = {
-        'partition': input_file_name,
-        'sentence_split': sentence_split_file,
-        'output_prefix': output_prefix}
-    return file_names
+# def get_file_name(args, file_id):
+    # file_name, extension = os.path.splitext(args.input)
+    # input_file_name = file_name + "_" + str(file_id) + extension
+    # sentence_split_file = file_name + "_ss_" + str(file_id) + extension
+    # output_prefix = args.output_prefix + "_" + str(file_id)
+    # file_names = {
+        # 'partition': input_file_name,
+        # 'sentence_split': sentence_split_file,
+        # 'output_prefix': output_prefix}
+    # return file_names
 
+def get_file_name(args, file_id):
+    prefix = f"{args.output_prefix}_{file_id}"
+    partition_path = f"{args.output_prefix}_part_{file_id}.jsonl"
+    sentence_split_path = f"{args.output_prefix}_part_ss_{file_id}.jsonl"
+    return {
+        'partition': partition_path,
+        'sentence_split': sentence_split_path,
+        'output_prefix': prefix,
+    }
 
 def check_files_exist(in_ss_out_names, key, num_partitions):
     for i in range(num_partitions):
@@ -264,7 +275,9 @@ def main():
                 "nltk library required for sentence splitting is not available.")
 
     in_ss_out_names = []
+    # import pdb;pdb.set_trace()
     if args.partitions == 1:
+    # if False:
         file_name, extension = os.path.splitext(args.input)
         sentence_split_file = file_name + "_ss" + extension
         file_names = {
@@ -273,7 +286,10 @@ def main():
             'output_prefix': args.output_prefix}
         in_ss_out_names.append(file_names)
     else:
-        in_file_names = glob.glob(args.input)
+        in_file_names = glob.glob(args.input,recursive=True)
+        if not in_file_names:
+            raise RuntimeError(f"No files matched input pattern: {args.input}. Did you mean to use recursive=True?")
+        print(f"Found {len(in_file_names)} input files")
 
         # Count total number of lines across .jsonl files
         if args.keep_sequential_samples:
@@ -286,7 +302,7 @@ def main():
             partition_size = math.ceil(total_sample_count / args.partitions)
 
         # create .jsonl parition files
-        for idx in range(args.partitions):
+        for idx in tqdm(range(args.partitions)):
             in_ss_out_name = get_file_name(args, idx)
             in_ss_out_names.append(in_ss_out_name)
 
@@ -299,16 +315,16 @@ def main():
         if not partitions_present and not split_sentences_present:
             # populate .jsonl partition files from parent files
             partitioned_input_files = []
-            for idx in range(args.partitions):
+            for idx in tqdm(range(args.partitions)):
                 partitioned_input_file = open(in_ss_out_names[idx]['partition'], 'w')
                 partitioned_input_files.append(partitioned_input_file)
 
             index = 0
             if args.keep_sequential_samples: line_count = 0
-            for in_file_name in in_file_names:
+            for in_file_name in tqdm(in_file_names):
                 # support for gzip files
                 if in_file_name.endswith(".gz"):
-                    fin = gzip.open(in_file_name, 'rt')
+                    fin = gzip.open(in_file_name, 'rt', encoding='utf-8', errors='replace')
                 else:
                     fin = open(in_file_name, 'r', encoding='utf-8')
 

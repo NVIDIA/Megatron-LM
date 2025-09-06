@@ -15,3 +15,9 @@ onelogger.err
 .venv
 test_cases/
 runs/
+model/
+dataset/
+tests/
+checkpoints/
+tensorboard_logs/
+benchmark_cache_llama3_8b_fp8/

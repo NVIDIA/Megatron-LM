@@ -622,6 +622,7 @@ class IndexedDataset(torch.utils.data.Dataset):
             object_storage_config (Optional[ObjectStorageConfig]): See IndexedDataset docstring
                 for details.
         """
+        # import pdb;pdb.set_trace()
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
         if object_storage_config is None:

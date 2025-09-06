@@ -205,7 +205,7 @@ class GPTModel(LanguageModule):
             else:
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
-
+            # import pdb;pdb.set_trace()
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -219,6 +219,7 @@ class GPTModel(LanguageModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.model_comm_pgs.tp,
+                mxfp_quant = False
             )
 
         if self.pre_process or self.post_process:

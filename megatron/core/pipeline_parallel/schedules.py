@@ -277,7 +277,7 @@ def forward_step(
 
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
-
+    
     if config.enable_autocast:
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
     else:

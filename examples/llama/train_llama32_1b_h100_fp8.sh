@@ -12,7 +12,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 CHECKPOINT_PATH=${1:-"checkpoints/llama3_8b_fp8"}
 TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_fp8"}
 # TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
-TOKENIZER_ARG=${3:-"model/llama3"} # Path to tokenizer model, or "MOCK"
+TOKENIZER_ARG=${3:-"model/llama3.2-1b"} # Path to tokenizer model, or "MOCK"
 # DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
 # DATA_ARG=${4:-"dataset/wikipedia_processed/wikipedia_processed_text_document"}     # Data prefix, or "MOCK"
 DATA_ARG=${4:-"dataset/wikitext_processed/wikitext_processed_text_document"}     # Data prefix, or "MOCK"
@@ -34,12 +34,12 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters
-TP_SIZE=2     
+TP_SIZE=4
 CP_SIZE=1     
-PP_SIZE=4     
+PP_SIZE=1     
 MICRO_BATCH_SIZE=1  # default 1
 GLOBAL_BATCH_SIZE=128 # default 128
-NUM_LAYERS=32  
+NUM_LAYERS=16  
 # DTYPE="bf16"
 DTYPE=${5:-"fp8"}
 SEQ_LENGTH=8192
@@ -60,8 +60,8 @@ DISTRIBUTED_ARGS=(
 MODEL_ARGS=(
     --use-mcore-models
     --num-layers $NUM_LAYERS
-    --hidden-size 4096
-    --ffn-hidden-size 14336
+    --hidden-size 2048
+    --ffn-hidden-size 8192
     --num-attention-heads 32
     --group-query-attention
     --num-query-groups 8
@@ -69,7 +69,7 @@ MODEL_ARGS=(
     --seq-length $SEQ_LENGTH
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS
     --position-embedding-type rope
-    --rotary-base 1000000 
+    --rotary-base 500000 
     --rotary-percent 1.0
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -79,6 +79,7 @@ MODEL_ARGS=(
     --apply-layernorm-1p 
     --untie-embeddings-and-output-weights
     --disable-bias-linear 
+    --transformer-impl local
 )
 
 TRAINING_ARGS=(
@@ -170,11 +171,11 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save-interval 1000
     --log-throughput
-    --profile
-    --profile-step-start 4
-    --profile-step-end 6
+    # --profile
+    # --profile-step-start 4
+    # --profile-step-end 6
     --ckpt-format torch_dist 
-    --distributed-timeout-minutes 60
+    --distributed-timeout-minutes 120
     --save "$CHECKPOINT_PATH"
     --load "$CHECKPOINT_PATH" 
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"

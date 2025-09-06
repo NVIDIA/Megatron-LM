@@ -90,6 +90,7 @@ class GPTDataset(MegatronDataset):
         index_split: Split,
         config: GPTDatasetConfig,
     ) -> None:
+        # import pdb;pdb.set_trace()
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
@@ -326,12 +327,15 @@ class GPTDataset(MegatronDataset):
             Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: The document index, the sample
             index, and the shuffle index
         """
+        # print_rank_0("in line 330")
         path_to_cache = self.config.path_to_cache
         if path_to_cache is None and not self.config.mock:
             path_to_cache = os.path.join(
                 self.dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
             )
-
+        
+        # import pdb;pdb.set_trace()
+        # log_single_rank(logger,logging.INFO,"get line 338 in gpt_dataset.py")
         if path_to_cache:
             base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
             get_path_to = lambda affix: os.path.join(path_to_cache, f"{base}-{affix}")
@@ -352,6 +356,8 @@ class GPTDataset(MegatronDataset):
             )
         else:
             cache_hit = False
+        # import pdb;pdb.set_trace()
+        # log_single_rank(logger,logging.INFO,"get line 358 in gpt_dataset.py")
 
         if not path_to_cache or (
             not cache_hit
@@ -410,9 +416,12 @@ class GPTDataset(MegatronDataset):
             numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
             # Build the document index
+            # import pdb;pdb.set_trace()
             document_index = _build_document_index(
                 self.indices, num_epochs, numpy_random_state, separate_final_epoch
             )
+
+            # import pdb;pdb.set_trace()
 
             drop_last_partial_sequence = True
             if self.index_split == Split.valid:
@@ -439,6 +448,10 @@ class GPTDataset(MegatronDataset):
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
             else:
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths
+            
+            # import pdb;pdb.set_trace()
+            # log_single_rank(logger,logging.INFO,"get line 450 in gpt_dataset.py")
+
             sample_index = helpers.build_sample_idx(
                 sequence_lengths_for_cpp,
                 document_index,
@@ -449,6 +462,9 @@ class GPTDataset(MegatronDataset):
                 self.config.add_extra_token_to_sequence,
             )
 
+            # import pdb;pdb.set_trace()
+            # log_single_rank(logger,logging.INFO,"get line 463 in gpt_dataset.py")
+
             # Build the shuffle index
             if separate_final_epoch:
                 shuffle_index = _build_shuffle_index(
@@ -458,7 +474,7 @@ class GPTDataset(MegatronDataset):
                 shuffle_index = _build_shuffle_index(
                     sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
                 )
-
+            # import pdb;pdb.set_trace()
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
                 # Write the description
@@ -530,6 +546,7 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The number of tokens in a single epoch
         """
+        # import pdb;pdb.set_trace()
         return int(numpy.sum(self.dataset.sequence_lengths[self.indices]))
 
     def _get_num_epochs(self, num_tokens_per_epoch: int) -> int:
@@ -576,6 +593,7 @@ def _build_document_index(
         numpy.ndarray: The document index
     """
 
+    # import pdb;pdb.set_trace()
     if not separate_final_epoch or num_epochs == 1:
         document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
         document_index[:] = documents
