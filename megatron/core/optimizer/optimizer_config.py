@@ -136,12 +136,6 @@ class OptimizerConfig:
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
     #######################
-    # Megatron FSDP
-    #######################
-    use_megatron_fsdp: bool = False
-    """If true, use Megatron FSDP implementation for optimizer."""
-
-    #######################
     # Optimizer Offload
     #######################
 

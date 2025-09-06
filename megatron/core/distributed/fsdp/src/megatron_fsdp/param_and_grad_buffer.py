@@ -41,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 try:
     # Default to Megatron-LM FW.
-    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
@@ -52,9 +51,11 @@ try:
     )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
     from megatron.core.utils import is_submodule, is_te_min_version
+
+    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
+
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
-    logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import (
         get_cuda_rng_tracker,
@@ -64,6 +65,8 @@ except ImportError:
         modify_underlying_storage,
         quantize_param_shard,
     )
+
+    logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
 
 try:
     from transformer_engine.pytorch import fp8_model_init
