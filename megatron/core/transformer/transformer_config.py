@@ -383,6 +383,22 @@ class TransformerConfig(ModelParallelConfig):
     """Use the kitchen extension for transformer quantization."""
 
     ####################
+    # fp4 related
+    ####################
+    fp4: Optional[str] = None
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only 
+    supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
+
+    fp4_recipe: Optional[str] = "nvfp4"
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
+    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+
+    fp4_param: bool = False
+    """If set, keep the parameters in fp4 precision to save memory. This option must be used
+    together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
+    will be converted to fp4; for example, biases will remain unchanged."""
+
+    ####################
     # MoE related
     ####################
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -736,6 +752,13 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        # FP4 validation
+        if self.fp4_param and not self.fp4:
+            raise ValueError("fp4_param must be used together with fp4 mode.")
+
+        if self.fp4 and self.fp8:
+            raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
