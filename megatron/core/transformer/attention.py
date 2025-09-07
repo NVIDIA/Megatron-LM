@@ -267,30 +267,6 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _offload_qkv_linear_forward(
-        self,
-        hidden_states,
-        key_value_states,
-    ):
-        """Forward method with qkv linear activation offloading."""
-        if not hidden_states.is_contiguous():
-            hidden_states = hidden_states.contiguous()
-
-        hidden_states = group_prefetch_offload_start(hidden_states)
-
-        hidden_states.offloading_activation = True
-
-        with PipelineOffloadManager.get_instance():
-            query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
-
-        def call_back():
-            cur_stream = torch.cuda.current_stream()
-            hidden_states.record_stream(cur_stream)
-            hidden_states.untyped_storage().resize_(0)
-
-        query, key, value = group_prefetch_offload_commit(query, key, value, offloaded_call_back=call_back)
-        return query, key, value
-
     def _offload_core_attention_forward(
         self,
         query,
@@ -325,7 +301,6 @@ class Attention(MegatronModule, ABC):
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-
         value = value.contiguous()
 
         query = group_prefetch_offload_start(query)
@@ -333,19 +308,14 @@ class Attention(MegatronModule, ABC):
         value = group_prefetch_offload_start(value)
 
         handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
-        handler.register_offload_tensor(query)
-        handler.register_offload_tensor(key)
-        handler.register_offload_tensor(value)
-
+        handler.register_offload_tensor([query, key, value])
         query.offloading_activation = True
         key.offloading_activation = True
         value.offloading_activation = True
-
         with PipelineOffloadManager.get_instance():
             hidden_states = custom_forward(
                 query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
             )
-        
         def call_back():
             cur_stream = torch.cuda.current_stream()
             query.record_stream(cur_stream)
@@ -354,32 +324,8 @@ class Attention(MegatronModule, ABC):
             query.untyped_storage().resize_(0)
             key.untyped_storage().resize_(0)
             value.untyped_storage().resize_(0)
-
         hidden_states = group_prefetch_offload_commit(hidden_states, offloaded_call_back=call_back)
         return hidden_states[0]
-
-    def _offload_attn_linear_forward(
-        self,
-        hidden_states,
-    ):
-        """Forward method with attention linear projection activation offloading."""
-        if not hidden_states.is_contiguous():
-            hidden_states = hidden_states.contiguous()
-
-        hidden_states = group_prefetch_offload_start(hidden_states)
-
-        hidden_states.offloading_activation = True
-
-        with PipelineOffloadManager.get_instance():
-            output, bias = self.linear_proj(hidden_states)
-
-        def call_back():
-            cur_stream = torch.cuda.current_stream()
-            hidden_states.record_stream(cur_stream)
-            hidden_states.untyped_storage().resize_(0)
-
-        output, bias = group_prefetch_offload_commit(output, bias, offloaded_call_back=call_back)
-        return output, bias
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -805,7 +751,17 @@ class Attention(MegatronModule, ABC):
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
         if self.offload_qkv_linear:
-            query, key, value = self._offload_qkv_linear_forward(hidden_states, key_value_states)
+            if not hidden_states.is_contiguous():
+                hidden_states = hidden_states.contiguous()
+            hidden_states = group_prefetch_offload_start(hidden_states)
+            hidden_states.offloading_activation = True
+            with PipelineOffloadManager.get_instance():
+                query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+            def call_back():
+                cur_stream = torch.cuda.current_stream()
+                hidden_states.record_stream(cur_stream)
+                hidden_states.untyped_storage().resize_(0)
+            query, key, value = group_prefetch_offload_commit(query, key, value, offloaded_call_back=call_back)
         else:
             query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
@@ -936,6 +892,8 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         elif self.offload_core_attention and self.training:
+
+
             core_attn_out = self._offload_core_attention_forward(
                 query,
                 key,
@@ -991,7 +949,17 @@ class Attention(MegatronModule, ABC):
 
         nvtx_range_push(suffix="linear_proj")
         if self.offload_attn_linear:
-            output, bias = self._offload_attn_linear_forward(core_attn_out)
+            if not core_attn_out.is_contiguous():
+                core_attn_out = core_attn_out.contiguous()
+            core_attn_out = group_prefetch_offload_start(core_attn_out)
+            core_attn_out.offloading_activation = True
+            with PipelineOffloadManager.get_instance():
+                output, bias = self.linear_proj(core_attn_out)
+            def call_back():
+                cur_stream = torch.cuda.current_stream()
+                core_attn_out.record_stream(cur_stream)
+                core_attn_out.untyped_storage().resize_(0)
+            output, bias = group_prefetch_offload_commit(output, bias, offloaded_call_back=call_back)
         else:
             output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")

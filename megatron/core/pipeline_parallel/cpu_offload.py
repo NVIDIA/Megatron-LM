@@ -320,9 +320,13 @@ class ChunkOffloadHandler:
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_reload()
 
-    def register_offload_tensor(self, tensor):
+    def register_offload_tensor(self, tensors):
         self.multi_input_offload_count = True
-        self._offload_tensor_ptrs.append(tensor.data_ptr())
+        if isinstance(tensors, list):
+            for tensor in tensors:
+                self._offload_tensor_ptrs.append(tensor.data_ptr())
+        else:
+            self._offload_tensor_ptrs.append(tensors.data_ptr())
 
     def is_registered_tensor(self, tensor_ptr: int) -> bool:
         if len(self._offload_tensor_ptrs) == 0:

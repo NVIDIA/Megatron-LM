@@ -833,36 +833,6 @@ class TEGroupedMLP(MegatronModule):
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
-    def _offload_router_fc1_forward(
-        self,
-        permuted_local_hidden_states,
-        tokens_per_expert,
-    ):
-        """Forward method with router fc1 activation offloading."""
-        if not permuted_local_hidden_states.is_contiguous():
-            permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
-
-        permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states)
-
-        permuted_local_hidden_states.offloading_activation = True
-
-        with PipelineOffloadManager.get_instance():
-            intermediate_parallel, bias_parallel = self.linear_fc1(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-
-        def call_back():
-            cur_stream = torch.cuda.current_stream()
-            permuted_local_hidden_states.record_stream(cur_stream)
-            permuted_local_hidden_states.untyped_storage().resize_(0)
-
-        intermediate_parallel, bias_parallel = group_prefetch_offload_commit(
-            intermediate_parallel,
-            bias_parallel,
-            offloaded_call_back=call_back
-        )
-        return intermediate_parallel, bias_parallel
-
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -903,8 +873,22 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if self.offload_router_fc1:
-            intermediate_parallel, bias_parallel = self._offload_router_fc1_forward(
-                permuted_local_hidden_states, tokens_per_expert
+            if not permuted_local_hidden_states.is_contiguous():
+                permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+            permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states)
+            permuted_local_hidden_states.offloading_activation = True
+            with PipelineOffloadManager.get_instance():
+                intermediate_parallel, bias_parallel = self.linear_fc1(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+            def call_back():
+                cur_stream = torch.cuda.current_stream()
+                permuted_local_hidden_states.record_stream(cur_stream)
+                permuted_local_hidden_states.untyped_storage().resize_(0)
+            intermediate_parallel, bias_parallel = group_prefetch_offload_commit(
+                intermediate_parallel,
+                bias_parallel,
+                offloaded_call_back=call_back
             )
         else:
             intermediate_parallel, bias_parallel = self.linear_fc1(
