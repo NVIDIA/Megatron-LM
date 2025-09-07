@@ -419,6 +419,7 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
+        # import pdb; pdb.set_trace()
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 

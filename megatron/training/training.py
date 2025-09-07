@@ -1802,6 +1802,7 @@ def checkpoint_and_decide_exit(
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
+    # import pdb;pdb.set_trace()
     args = get_args()
     timers = get_timers()
 
@@ -1852,6 +1853,7 @@ def checkpoint_and_decide_exit(
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
         )
+        # import pdb;pdb.set_trace()
         saved_checkpoint = True
 
     # Exit based on duration.
@@ -1862,6 +1864,7 @@ def checkpoint_and_decide_exit(
         )
         torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
+        # return False
         if done:
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(
@@ -1874,8 +1877,9 @@ def checkpoint_and_decide_exit(
                     train_data_iterator=train_data_iterator,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
-
+            # import pdb;pdb.set_trace()
             return True
+            # return False
 
     # Exit based on iterations.
     if args.exit_interval and iteration % args.exit_interval == 0:
@@ -1890,6 +1894,7 @@ def checkpoint_and_decide_exit(
                 train_data_iterator=train_data_iterator,
             )
         print_datetime(f'exiting program at iteration {iteration}')
+        # import pdb;pdb.set_trace()
 
         return True
 
@@ -1956,6 +1961,8 @@ def train(
     write_args_to_tensorboard()
 
     # Turn on training mode which enables dropout.
+    # import pdb;pdb.set_trace()
+    print(f"model:{model}")
     for model_module in model:
         model_module.train()
 
@@ -2211,6 +2218,8 @@ def train(
                 train_data_iterator=train_data_iterator,
             )
         if should_exit:
+            print("exit from log in line 2312")
+            import pdb;pdb.set_trace()
             break
 
         # Enable forward pre-hooks after first set of forward and backward passes.
@@ -2343,6 +2352,8 @@ def train(
             train_data_iterator,
         )
         if should_exit:
+            # print("exit from log in line 2442")
+            # import pdb;pdb.set_trace()
             break
 
     one_logger_utils.track_e2e_metrics()

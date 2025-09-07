@@ -11,8 +11,12 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 CHECKPOINT_PATH=${1:-"checkpoints/llama3_8b_fp8"}
 TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_fp8"}
-TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
-DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
+# TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
+TOKENIZER_ARG=${3:-"model/llama3"} # Path to tokenizer model, or "MOCK"
+# DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
+# DATA_ARG=${4:-"dataset/wikipedia_processed/wikipedia_processed_text_document"}     # Data prefix, or "MOCK"
+DATA_ARG=${4:-"dataset/wikitext_processed/wikitext_processed_text_document"}     # Data prefix, or "MOCK"
+
 
 # Create directories if they don't exist
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
@@ -30,13 +34,14 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters
-TP_SIZE=1     
+TP_SIZE=2     
 CP_SIZE=1     
-PP_SIZE=1     
-MICRO_BATCH_SIZE=1
-GLOBAL_BATCH_SIZE=128
+PP_SIZE=4     
+MICRO_BATCH_SIZE=1  # default 1
+GLOBAL_BATCH_SIZE=128 # default 128
 NUM_LAYERS=32  
-DTYPE="fp8"
+# DTYPE="bf16"
+DTYPE=${5:-"fp8"}
 SEQ_LENGTH=8192
 MAX_POSITION_EMBEDDINGS=8192
 
@@ -79,9 +84,9 @@ MODEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-samples 1953125000
-    --lr-decay-samples 1949218748
-    --lr-warmup-samples 3906252
+    --train-samples 47340000
+    --lr-decay-samples 47245280
+    --lr-warmup-samples 94720
     --lr 0.00015
     --min-lr 0.00001
     --decoupled-lr 5.0e-4      # Specific to decoupled AdamW, ensure optimizer is compatible
@@ -97,7 +102,7 @@ TRAINING_ARGS=(
     --calculate-per-token-loss 
     --manual-gc 
     --empty-unused-memory-level 1 
-    --exit-duration-in-mins 235 
+    --exit-duration-in-mins 235000000 # default 235 
 )
 
 # Conditional arguments based on DTYPE (FP8)
@@ -115,7 +120,7 @@ fi
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $TP_SIZE
     --context-parallel-size $CP_SIZE
-    # --pipeline-model-parallel-size $PP_SIZE # Not explicitly set in llama script options, assume 1 if not multi-node PP
+    --pipeline-model-parallel-size $PP_SIZE # Not explicitly set in llama script options, assume 1 if not multi-node PP
     --sequence-parallel  # Always enable sequence parallelism with TP_SIZE=2
 )
 
@@ -152,7 +157,7 @@ else
         "--data-cache-path ${DATA_CACHE_PATH}"
         "--split '99,1,0'"
         "--no-create-attention-mask-in-dataloader"
-        "--no-mmap-bin-files"
+        # "--no-mmap-bin-files"
         "--num-workers 1"
         # Note: --vocab-size might be inferred by HuggingFaceTokenizer or might need to be explicit.
         "--vocab-size 128256"
