@@ -12,6 +12,9 @@ from typing import Dict, List, Optional
 import torch
 from torch.distributed import _coalescing_manager
 
+import megatron.core.nccl_allocator as nccl_allocator
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
@@ -517,7 +520,19 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+
+        if pg_collection is None:
+            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
+                with_context_parallel=True
+            )
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')
+            self.dp_cp_group = pg_collection.dp_cp
+            self.tp_group = pg_collection.tp
+
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices
@@ -780,7 +795,13 @@ class _ParamAndGradBuffer:
             )
             for param in bucket.params:
                 log_strs.append(f"\t{param_to_name[param]}")
-        log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            "\n".join(log_strs),
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""

@@ -12,7 +12,7 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import GradFinalizeProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -528,16 +528,16 @@ def test_forward_backward_pipelining_without_interleaving_with_custom_pgs(mocker
     embd_pg = embd_pg if (is_pp_last_stage(pp_group) or is_pp_first_stage(pp_group)) else None
     dp_cp_group = grid.create_pg(["dp", "cp"])
 
-    grad_finalize_pgs = GradFinalizeProcessGroups()
-    grad_finalize_pgs.tp = grid.create_pg("tp")
-    grad_finalize_pgs.pp = pp_group
-    grad_finalize_pgs.embd = embd_pg
-    grad_finalize_pgs.pos_embd = pos_embd_pg
-    grad_finalize_pgs.dp_cp = dp_cp_group
-    grad_finalize_pgs.cp = grid.create_pg("cp")
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = grid.create_pg("tp")
+    pg_collection.pp = pp_group
+    pg_collection.embd = embd_pg
+    pg_collection.pos_embd = pos_embd_pg
+    pg_collection.dp_cp = dp_cp_group
+    pg_collection.cp = grid.create_pg("cp")
 
     losses_reduced_explicit = schedule.forward_backward_pipelining_without_interleaving(
-        p2p_communicator=p2p_communicator, grad_finalize_pgs=grad_finalize_pgs, **common_args
+        p2p_communicator=p2p_communicator, pg_collection=pg_collection, **common_args
     )
 
     assert len(losses_reduced_default) == len(
@@ -623,13 +623,13 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
     pos_embd_pg = pos_embd_pg if is_pp_first_stage(pp_group) else None
     embd_pg = embd_pg if (is_pp_last_stage(pp_group) or is_pp_first_stage(pp_group)) else None
 
-    grad_finalize_pgs = GradFinalizeProcessGroups()
-    grad_finalize_pgs.tp = grid.create_pg("tp")
-    grad_finalize_pgs.cp = grid.create_pg("cp")
-    grad_finalize_pgs.pp = pp_group
-    grad_finalize_pgs.embd = embd_pg
-    grad_finalize_pgs.pos_embd = pos_embd_pg
-    grad_finalize_pgs.dp_cp = grid.create_pg(["dp", "cp"])
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = grid.create_pg("tp")
+    pg_collection.cp = grid.create_pg("cp")
+    pg_collection.pp = pp_group
+    pg_collection.embd = embd_pg
+    pg_collection.pos_embd = pos_embd_pg
+    pg_collection.dp_cp = grid.create_pg(["dp", "cp"])
 
     model.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
@@ -641,7 +641,7 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
         micro_batch_size=micro_batch_size,
         decoder_seq_length=256,
         forward_only=True,
-        grad_finalize_pgs=grad_finalize_pgs,
+        pg_collection=pg_collection,
         p2p_communicator=p2p_communicator,
     )
 
@@ -687,13 +687,13 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
     pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pp_group)
     dp_cp_group = grid.create_pg(["dp", "cp"])
 
-    grad_finalize_pgs = GradFinalizeProcessGroups()
-    grad_finalize_pgs.tp = tp_group
-    grad_finalize_pgs.cp = cp_group
-    grad_finalize_pgs.embd = embd_pg
-    grad_finalize_pgs.pos_embd = pos_embd_pg
-    grad_finalize_pgs.pp = pp_group
-    grad_finalize_pgs.dp_cp = dp_cp_group
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = tp_group
+    pg_collection.cp = cp_group
+    pg_collection.embd = embd_pg
+    pg_collection.pos_embd = pos_embd_pg
+    pg_collection.pp = pp_group
+    pg_collection.dp_cp = dp_cp_group
 
     forward_backward_func = get_forward_backward_func()
     assert forward_backward_func == schedule.forward_backward_no_pipelining
@@ -708,7 +708,7 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
         seq_length=None,
         micro_batch_size=None,
         forward_only=True,
-        grad_finalize_pgs=grad_finalize_pgs,
+        pg_collection=pg_collection,
     )
 
     expected = {'loss_reduced': Utils.rank}

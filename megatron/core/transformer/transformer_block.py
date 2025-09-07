@@ -16,7 +16,8 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -26,7 +27,12 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    get_pg_rank,
+    make_viewless_tensor,
+)
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -66,12 +72,15 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
+def get_num_layers_to_build(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         int: The number of layers to be built for the current pipeline stage.
@@ -82,6 +91,13 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         return config.pipeline_model_parallel_layout.get_num_layers_to_build(
             layer_type=LayerType.decoder, vp_stage=vp_stage
         )
+
+    # Fallback for legacy tests.
+    if pp_rank is None:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+    is_first_pp_stage = pp_rank == 0
+    is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
 
     if (
         config.num_layers_in_first_pipeline_stage is not None
@@ -96,7 +112,7 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # Number of layers to distribute over rest of pipeline stages
         layers_to_distribute = config.num_layers
         # Number of pipeline stages left for distributing transformer layers
-        pipeline_stages_left = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_stages_left = config.pipeline_model_parallel_size
 
         # If the uneven first (last) pipeline stage is enabled, remove the specified number
         # of layers to calculate the number of layers on each middle pipeline stage.
@@ -121,16 +137,11 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # If the uneven first (last) pipeline stage is enabled, return the specified number
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
         # parallel stage.
-        if (
-            parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-            and config.num_layers_in_first_pipeline_stage is not None
-        ):
+
+        if is_first_pp_stage and config.num_layers_in_first_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
 
-        if (
-            parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-            and config.num_layers_in_last_pipeline_stage is not None
-        ):
+        if is_last_pp_stage and config.num_layers_in_last_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
         # Include the embedding layer and loss layer into pipeline parallelism partition
@@ -146,10 +157,8 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         ), "num_layers should be divisible by pipeline_model_parallel_size"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
-    if (
-        parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
-        and config.pipeline_model_parallel_size > 1
-    ):
+    vp_size = config.virtual_pipeline_model_parallel_size
+    if vp_size is not None and config.pipeline_model_parallel_size > 1:
         # Interleaved pipeline parallelism:
         # Number of layers in each model chunk is the number of layers in the stage,
         # divided by the number of model chunks in a stage.
@@ -161,7 +170,6 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # layers to stages like (each list is a model chunk):
         # Stage 0: [0, 1]  [4, 5]
         # Stage 1: [2, 3]  [6, 7]
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
         assert (
             num_layers_per_pipeline_rank % vp_size == 0
@@ -179,19 +187,17 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
     # The embedding (or loss) layer cannot function as a standalone transformer layer
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
-    if (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
-        and config.account_for_embedding_in_pipeline_split
-    ):
-        num_layers_to_build -= 1
-        assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
+    if config.account_for_embedding_in_pipeline_split:
+        if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
+            num_layers_to_build -= 1
+            assert (
+                num_layers_to_build >= 0
+            ), f"Not enough layers in the first virtual pipeline stage"
 
-    if (
-        parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
-        and config.account_for_loss_in_pipeline_split
-    ):
-        num_layers_to_build -= 1
-        assert num_layers_to_build >= 0, "Not enough layers in the last virtual pipeline stage"
+    if config.account_for_loss_in_pipeline_split:
+        if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
+            num_layers_to_build -= 1
+            assert num_layers_to_build >= 0, f"Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
 
@@ -220,6 +226,7 @@ def _get_block_submodules(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """
     Retrieve or construct TransformerBlockSubmodules based on the provided specification.
@@ -246,7 +253,7 @@ def _get_block_submodules(
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
-            num_layers = get_num_layers_to_build(config, vp_stage)
+            num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
             )
@@ -266,12 +273,19 @@ class TransformerBlock(MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage)
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
+
+        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
+        pp_rank = get_pg_rank(pp_group)
+
+        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -307,10 +321,6 @@ class TransformerBlock(MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        self.model_comm_pgs = model_comm_pgs
-
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -323,7 +333,7 @@ class TransformerBlock(MegatronModule):
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
             global_layer_number = layer_number + get_transformer_layer_offset(
-                self.config, self.vp_stage
+                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
@@ -347,7 +357,7 @@ class TransformerBlock(MegatronModule):
                     layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
-                    model_comm_pgs=self.model_comm_pgs,
+                    pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
             return module
@@ -435,7 +445,7 @@ class TransformerBlock(MegatronModule):
                     forward_func,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.pg_collection.tp,
                     hidden_states,
                     attention_mask,
                     context,
@@ -717,7 +727,9 @@ class TransformerBlock(MegatronModule):
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = get_transformer_layer_offset(self.config, self.vp_stage)
+            offset = get_transformer_layer_offset(
+                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
+            )
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long

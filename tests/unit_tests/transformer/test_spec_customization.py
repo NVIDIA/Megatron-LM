@@ -16,7 +16,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -66,7 +66,7 @@ class TestSpecCustomization:
         )
 
         # Create model process groups for test.
-        self.model_comm_pgs = ModelCommProcessGroups(
+        self.pg_collection = ProcessGroupCollection(
             tp=get_tensor_model_parallel_group(), cp=get_context_parallel_group()
         )
 
@@ -160,7 +160,7 @@ class TestSpecCustomization:
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
                 attention_type='self',
-                model_comm_pgs=self.model_comm_pgs,
+                pg_collection=self.pg_collection,
             )
         except:
             threw = True
@@ -173,7 +173,7 @@ class TestSpecCustomization:
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             attention_type='self',
-            model_comm_pgs=self.model_comm_pgs,
+            pg_collection=self.pg_collection,
         )
         # Make sure window-size is what we expect.
         assert attn.window_size == config.window_size
@@ -187,7 +187,7 @@ class TestSpecCustomization:
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
                 attention_type='self',
-                model_comm_pgs=self.model_comm_pgs,
+                pg_collection=self.pg_collection,
             )
         except:
             threw = True
@@ -201,7 +201,7 @@ class TestSpecCustomization:
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             attention_type='self',
-            model_comm_pgs=self.model_comm_pgs,
+            pg_collection=self.pg_collection,
         )
         # Make sure it's causal.
         assert attn.window_size == (-1, 0)
