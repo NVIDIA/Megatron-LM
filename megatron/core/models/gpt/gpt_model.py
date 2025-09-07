@@ -368,12 +368,18 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
-        first_layer_index = get_first_layer_index(self.config, self.decoder.num_layers_per_pipeline_rank)
+        first_layer_index = get_first_layer_index(
+            self.config,
+            self.decoder.num_layers_per_pipeline_rank,
+            self.vp_stage
+        )
         PipelineOffloadManager.get_instance().reset_chunk_handler(
             self.decoder.num_layers_per_pipeline_rank,
+            self.vp_stage,
             self.config.offload_activation,
             first_layer_index,
         )
+        PipelineOffloadManager.get_instance().cur_forward_chunk().set_offloading_checker(offloading_checker)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

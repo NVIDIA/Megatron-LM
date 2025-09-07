@@ -3,10 +3,6 @@ import torch
 from megatron.core import parallel_state
 from typing import Any
 from transformer_engine.pytorch.float8_tensor import Float8Tensor
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_rank,
-    get_virtual_pipeline_model_parallel_rank,
-)
 
 # cpu offload for pipeline
 
@@ -76,8 +72,8 @@ class PipelineOffloadManager:
     def size(self):
         return len(self._queue)
 
-    def reset_chunk_handler(self, num_layer, offload=True, first_layer_index=0):
-        cur_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+    def reset_chunk_handler(self, num_layer, vp_stage, offload=True, first_layer_index=0):
+        cur_vpp_rank = vp_stage
 
         first_last_vpp_rank = self._first_last_vpp_rank
         # rewind
