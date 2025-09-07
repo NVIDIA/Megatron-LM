@@ -3,6 +3,7 @@ import torch
 from megatron.core import parallel_state
 from typing import Any
 from transformer_engine.pytorch.float8_tensor import Float8Tensor
+from transformer_engine.pytorch.cpu_offload import AsyncDoubleBufferGroupOffloadHandler
 
 # cpu offload for pipeline
 
@@ -23,10 +24,6 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
-        self._f_event = torch.cuda.Event()
-        self._b_event = torch.cuda.Event()
-        self._f_event.record(self._d2h_stream)
-        self._b_event.record(self._h2d_stream)
         self.reset()
 
     @property
@@ -118,7 +115,7 @@ class PipelineOffloadManager:
         return self.cur_backward_chunk().tensor_pop(saved_state)
 
 
-class ChunkOffloadHandler:
+class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
     @staticmethod
     def offload(src_tensor, pin_memory=True):
         """Offload."""
@@ -165,8 +162,6 @@ class ChunkOffloadHandler:
         self.torch_tensor_count = 0
         self.d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
         self.h2d_stream = PipelineOffloadManager.get_instance().h2d_stream
-        self._f_event = PipelineOffloadManager.get_instance()._f_event
-        self._b_event = PipelineOffloadManager.get_instance()._b_event
         self.do_offload = offload
 
         self._offload_tensor_ptrs = deque()
@@ -225,7 +220,6 @@ class ChunkOffloadHandler:
                         self.offload_count_per_layer[group_to_offload] += 1
                         self._tensor_tag_to_state[tensor_tag] = state
         self._offloaded_group_count = group_to_offload + 1
-        self._f_event.record(self.d2h_stream)
 
     def bulk_reload_group(self, group_to_reload):
         """Bulk reload group."""
@@ -271,7 +265,7 @@ class ChunkOffloadHandler:
 
     def forward_sync(self):
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
-        self._f_event.wait(torch.cuda.current_stream())
+        torch.cuda.current_stream().wait_stream(self.d2h_stream)
 
     def bulk_offload(self, release_tensors):
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
@@ -303,7 +297,7 @@ class ChunkOffloadHandler:
 
     def backward_sync(self):
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
-        self._b_event.wait(torch.cuda.current_stream())
+        torch.cuda.current_stream().wait_stream(self.h2d_stream)
 
     def on_group_commit_backward(self):
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
@@ -313,8 +307,6 @@ class ChunkOffloadHandler:
         assert cur_backward_chunk is self
         self._layer_index = self._layer_index - 1
         self.backward_sync()
-        # layer index already loaded back
-        # self.bulk_reload()
 
     def on_group_start_forward(self):
         pass
