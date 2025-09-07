@@ -27,3 +27,5 @@ runs/
 /test_cases/
 **/dist/
 >>>>>>> 230e0cb393baa0dca353d95d30d75ea13db7f265
+*.backup
+*.backup.*
