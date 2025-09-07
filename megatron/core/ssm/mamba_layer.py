@@ -14,7 +14,7 @@ from torch import Tensor
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -61,11 +61,11 @@ class MambaLayer(MegatronModule):
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
         residual_in_fp32=False,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)
-        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaLayer"
+        assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
 
         if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
             self.cudagraph_manager = CudaGraphManager(config)
@@ -80,7 +80,7 @@ class MambaLayer(MegatronModule):
             self.config,
             d_model=self.config.hidden_size,
             layer_number=layer_number,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)

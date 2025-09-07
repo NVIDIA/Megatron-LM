@@ -28,7 +28,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -448,8 +448,8 @@ class TestParallelMambaBlockCudagraphs:
         # Ensure that this test is capturing to a fresh memory pool.
         CudaGraphManager.global_mempool = None
 
-        def get_model_comm_pgs():
-            return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_override_pattern):
             transformer_config = TransformerConfig(
@@ -466,7 +466,7 @@ class TestParallelMambaBlockCudagraphs:
                 transformer_config,
                 modules,
                 hybrid_override_pattern=hybrid_override_pattern,
-                model_comm_pgs=get_model_comm_pgs(),
+                pg_collection=get_pg_collection(),
             )
 
         self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")

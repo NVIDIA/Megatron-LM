@@ -8,8 +8,8 @@ import torch
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
-    ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
+    ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -27,24 +27,24 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """
         Initialize the Router module.
 
         Args:
             config (TransformerConfig): Configuration object for the Transformer model.
-            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
-        self.tp_group = model_comm_pgs.tp
-        self.cp_group = model_comm_pgs.cp
-        self.tp_cp_group = model_comm_pgs.tp_cp
-        self.tp_dp_cp_group = model_comm_pgs.tp_dp_cp
+        self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.tp_cp_group = pg_collection.tp_cp
+        self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -129,15 +129,15 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
-            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
+        super().__init__(config=config, pg_collection=pg_collection)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function

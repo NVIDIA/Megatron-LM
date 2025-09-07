@@ -6,7 +6,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -977,21 +977,21 @@ def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
-def get_default_model_comm_pgs():
+def get_default_pg_collection():
     """Get the default process groups for MoE.
 
     Returns:
-        ModelCommProcessGroups: The default process groups for MoE.
+        ProcessGroupCollection: The default process groups for MoE.
     """
-    model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
-    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
-    model_comm_pgs.cp = parallel_state.get_context_parallel_group()
-    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
-    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
-    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
-    model_comm_pgs.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+    pg_collection = ProcessGroupCollection()
+    pg_collection.ep = parallel_state.get_expert_model_parallel_group()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
         with_context_parallel=True
     )
-    return model_comm_pgs
+    return pg_collection

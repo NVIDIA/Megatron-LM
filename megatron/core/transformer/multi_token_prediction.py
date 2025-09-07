@@ -7,13 +7,14 @@ from typing import Callable, List, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, mpu, parallel_state, tensor_parallel
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.pipeline_parallel.utils import is_vp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -337,10 +338,16 @@ def get_mtp_layer_offset(config: TransformerConfig) -> int:
     return 0
 
 
-def get_mtp_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
+def get_mtp_num_layers_to_build(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> int:
     """Get the number of MTP layers to build."""
     # Currently, we only support put all of MTP layers on the last pipeline stage.
-    if mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+    vp_size = config.virtual_pipeline_model_parallel_size
+    if pp_rank is None:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
+    if is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_last_pp_stage:
         return config.mtp_num_layers if config.mtp_num_layers else 0
     else:
         return 0
@@ -418,14 +425,14 @@ class MultiTokenPredictionLayer(MegatronModule):
         submodules: MultiTokenPredictionLayerSubmodules,
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number
         self.vp_stage = vp_stage
-        self.cp_group = model_comm_pgs.cp
+        self.cp_group = pg_collection.cp
 
         self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
@@ -816,7 +823,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -826,27 +833,27 @@ class MultiTokenPredictionBlock(MegatronModule):
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
-        if model_comm_pgs is None:
+        if pg_collection is None:
             # Use default MPU process groups if not provided
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
         else:
             # Ensure the provided process groups include CP
             assert hasattr(
-                model_comm_pgs, 'cp'
-            ), "MultiTokenPredictionBlock model_comm_pgs must have cp process group"
+                pg_collection, 'cp'
+            ), "MultiTokenPredictionBlock pg_collection must have cp process group"
 
-        self._build_layers(model_comm_pgs)
+        self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
-        self.cp_group = model_comm_pgs.cp
+        self.cp_group = pg_collection.cp
 
-    def _build_layers(self, model_comm_pgs):
+    def _build_layers(self, pg_collection):
         def build_layer(layer_spec, layer_number):
             return build_module(
                 layer_spec,
                 config=self.config,
                 layer_number=layer_number,
                 vp_stage=self.vp_stage,
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
 
         self.layers = torch.nn.ModuleList(

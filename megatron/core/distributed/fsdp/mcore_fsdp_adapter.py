@@ -36,7 +36,7 @@ from megatron.core import parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
@@ -65,8 +65,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
-        grad_comm_pgs: Optional[GradCommProcessGroups] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
@@ -80,7 +79,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
-        self.megatron_fsdp_dist_index = self._init_dist_index(grad_comm_pgs, model_comm_pgs)
+
+        self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
 
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
@@ -141,7 +141,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
-    def _init_dist_index(self, grad_comm_pgs, model_comm_pgs):
+    def _init_dist_index(self, pg_collection):
         """
         Initialize the distributed index for the module.
         """
@@ -152,7 +152,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
 
         enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
-        if grad_comm_pgs is None and model_comm_pgs is None:
+        if pg_collection is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
             if enable_hsdp:
                 dp_cp_group = parallel_state.get_data_parallel_group(
@@ -168,20 +168,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 )
                 inter_fsdp_group = None
                 hybrid_fsdp_group = None
-        elif grad_comm_pgs is not None and model_comm_pgs is not None:
-            tp_group = getattr(model_comm_pgs, 'tp', None)
+        else:
+            tp_group = getattr(pg_collection, 'tp', None)
             if enable_hsdp:
-                dp_cp_group = grad_comm_pgs.intra_dp_cp
-                inter_fsdp_group = grad_comm_pgs.inter_dist_opt
-                hybrid_fsdp_group = grad_comm_pgs.dp_cp
+                dp_cp_group = pg_collection.intra_dp_cp
+                inter_fsdp_group = pg_collection.inter_dist_opt
+                hybrid_fsdp_group = pg_collection.dp_cp
             else:
-                dp_cp_group = grad_comm_pgs.dp_cp
+                dp_cp_group = pg_collection.dp_cp
                 inter_fsdp_group = None
                 hybrid_fsdp_group = None
-        else:
-            raise ValueError(
-                "Both grad_comm_pgs and model_comm_pgs must be either None or provided together."
-            )
 
         if tp_group is None:
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])

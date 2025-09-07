@@ -1189,9 +1189,11 @@ class TECudaGraphHelper:
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
-                    logger,
-                    logging.DEBUG,
-                    f'Rank {torch.distributed.get_rank()}: '
+                    logger=logger,
+                    tp_group=None,
+                    dp_cp_group=None,
+                    level=logging.DEBUG,
+                    msg=f'Rank {torch.distributed.get_rank()}: '
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
@@ -1213,9 +1215,11 @@ class TECudaGraphHelper:
                         num_graphable_layers += 1
                         callables.append(layer)
                 log_on_each_pipeline_stage(
-                    logger,
-                    logging.DEBUG,
-                    f'Rank {torch.distributed.get_rank()}: '
+                    logger=logger,
+                    tp_group=None,
+                    dp_cp_group=None,
+                    level=logging.DEBUG,
+                    msg=f'Rank {torch.distributed.get_rank()}: '
                     f'{num_decoder_layers} decoder layers and {num_mtp_layers} MTP layers in '
                     f'model chunk {chunk_number}. {num_graphable_layers} graphable layers.',
                 )
@@ -1231,9 +1235,11 @@ class TECudaGraphHelper:
                     self.callables_per_chunk.append([])
 
         log_on_each_pipeline_stage(
-            logger,
-            logging.INFO,
-            f'Rank {torch.distributed.get_rank()}: '
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
@@ -1311,7 +1317,11 @@ class TECudaGraphHelper:
             num_warmup_microbatches, self.num_model_chunks, schedule_table
         )
         log_on_each_pipeline_stage(
-            logger, logging.DEBUG, f'Rank {torch.distributed.get_rank()}: ORDER {order}'
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.DEBUG,
+            msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
 
         def get_make_graphed_callables_kwargs():

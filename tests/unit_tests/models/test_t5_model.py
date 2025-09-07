@@ -17,7 +17,7 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -64,7 +64,7 @@ class TestT5Model:
             post_process=post_process,
             add_encoder=add_encoder,
             add_decoder=add_decoder,
-            model_comm_pgs=ModelCommProcessGroups.use_mpu_process_groups(
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
                 required_pgs=['tp', 'cp', 'pp']
             ),
         )
