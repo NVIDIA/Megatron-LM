@@ -18,10 +18,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import GradFinalizeProcessGroups
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.transformer.moe.router import (
-    MoEAuxLossAutoScaler,
-    MoEPositiveAuxLossAutoScaler,
-)
+from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -270,8 +267,6 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
-            if config.offload_activation:
-                MoEPositiveAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
