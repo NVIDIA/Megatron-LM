@@ -946,6 +946,14 @@ class CudaGraphManager(torch.nn.Module):
         self.stream = torch.cuda.current_stream()
         torch.cuda.set_stream(torch.cuda.Stream())
 
+    def set_is_first_microbatch(self, is_first_microbatch: bool):
+        """Update the is_first_microbatch flag for weight caching.
+
+        Args:
+            is_first_microbatch (bool): Whether this is the first microbatch in the step.
+        """
+        self.is_first_microbatch = is_first_microbatch
+
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
         param gather. Any other pre-forward hooks are not allowed."""
@@ -1075,6 +1083,9 @@ class CudaGraphManager(torch.nn.Module):
             kwargs (dict):  The keyword args to be passed to the module.
 
         """
+        # Set the is_first_microbatch flag on the megatron module if it's the first microbatch
+        if self.is_first_microbatch and hasattr(megatron_module, 'set_is_first_microbatch'):
+            megatron_module.set_is_first_microbatch()
 
         if len(self.cudagraph_runners) > 0:
             if self.training and torch.is_grad_enabled():

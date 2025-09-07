@@ -860,6 +860,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def __call__(self, *args, **kwargs):
         # Training and validation mode CUDA graphs
         if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
+            # Set the is_first_microbatch flag for weight caching
+            current_microbatch = getattr(self, 'current_microbatch', 0)
+            self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
             return self.cudagraph_manager(self, args, kwargs)
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif not self.training and (
@@ -888,8 +891,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 kwargs["dynamic_inference_decode_only"] = kwargs[
                     'inference_context'
                 ].is_decode_only()
+                # Set the is_first_microbatch flag for weight caching
+                current_microbatch = getattr(self, 'current_microbatch', 0)
+                self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
                 return self.cudagraph_manager(self, args, kwargs)
-
         elif (
             self.config.external_cuda_graph
             and self.training
