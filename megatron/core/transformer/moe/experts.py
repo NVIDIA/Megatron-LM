@@ -881,14 +881,10 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel, bias_parallel = self.linear_fc1(
                     permuted_local_hidden_states, tokens_per_expert
                 )
-            def call_back():
-                cur_stream = torch.cuda.current_stream()
-                permuted_local_hidden_states.record_stream(cur_stream)
-                permuted_local_hidden_states.untyped_storage().resize_(0)
             intermediate_parallel, bias_parallel = group_prefetch_offload_commit(
                 intermediate_parallel,
                 bias_parallel,
-                offloaded_call_back=call_back
+                release_tensors=[permuted_local_hidden_states]
             )
         else:
             intermediate_parallel, bias_parallel = self.linear_fc1(

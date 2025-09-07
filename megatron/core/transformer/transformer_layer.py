@@ -541,12 +541,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
-            def call_back():
-                cur_stream = torch.cuda.current_stream()
-                input_layernorm_output.record_stream(cur_stream)
-                input_layernorm_output.untyped_storage().resize_(0)
-
-            attention_output_with_bias = group_prefetch_offload_commit(attention_output_with_bias, call_back)
+            attention_output_with_bias = group_prefetch_offload_commit(attention_output_with_bias, release_tensors=[input_layernorm_output])
         else:
             attention_output_with_bias = self.self_attention(
                 input_layernorm_output,

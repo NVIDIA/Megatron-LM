@@ -316,15 +316,7 @@ class Attention(MegatronModule, ABC):
             hidden_states = custom_forward(
                 query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
             )
-        def call_back():
-            cur_stream = torch.cuda.current_stream()
-            query.record_stream(cur_stream)
-            key.record_stream(cur_stream)
-            value.record_stream(cur_stream)
-            query.untyped_storage().resize_(0)
-            key.untyped_storage().resize_(0)
-            value.untyped_storage().resize_(0)
-        hidden_states = group_prefetch_offload_commit(hidden_states, offloaded_call_back=call_back)
+        hidden_states = group_prefetch_offload_commit(hidden_states, release_tensors=[query, key, value])
         return hidden_states[0]
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
@@ -757,11 +749,7 @@ class Attention(MegatronModule, ABC):
             hidden_states.offloading_activation = True
             with PipelineOffloadManager.get_instance():
                 query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
-            def call_back():
-                cur_stream = torch.cuda.current_stream()
-                hidden_states.record_stream(cur_stream)
-                hidden_states.untyped_storage().resize_(0)
-            query, key, value = group_prefetch_offload_commit(query, key, value, offloaded_call_back=call_back)
+            query, key, value = group_prefetch_offload_commit(query, key, value, release_tensors=[hidden_states])
         else:
             query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
@@ -955,11 +943,7 @@ class Attention(MegatronModule, ABC):
             core_attn_out.offloading_activation = True
             with PipelineOffloadManager.get_instance():
                 output, bias = self.linear_proj(core_attn_out)
-            def call_back():
-                cur_stream = torch.cuda.current_stream()
-                core_attn_out.record_stream(cur_stream)
-                core_attn_out.untyped_storage().resize_(0)
-            output, bias = group_prefetch_offload_commit(output, bias, offloaded_call_back=call_back)
+            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
         else:
             output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")

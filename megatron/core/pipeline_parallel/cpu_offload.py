@@ -273,17 +273,20 @@ class ChunkOffloadHandler:
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         self._f_event.wait(torch.cuda.current_stream())
 
-    def bulk_offload(self, offloaded_call_back):
+    def bulk_offload(self, release_tensors):
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         if self.should_bulk_offload():
             self.bulk_offload_group(self._layer_index)
-            if offloaded_call_back is not None:
-                offloaded_call_back()
+            if len(release_tensors) > 0:
+                cur_stream = torch.cuda.current_stream()
+                for release_tensor in release_tensors:
+                    release_tensor.record_stream(cur_stream)
+                    release_tensor.untyped_storage().resize_(0)
 
-    def on_group_commit_forward(self, offloaded_call_back):
+    def on_group_commit_forward(self, release_tensors):
         # wait each other
         self.forward_sync()
-        self.bulk_offload(offloaded_call_back)
+        self.bulk_offload(release_tensors)
         self._layer_index = self._layer_index + 1
         self._tensor_count_current_layer = 0
 
@@ -348,10 +351,10 @@ class GroupCommitFunction(torch.autograd.Function):
     def forward(ctx, *args):
         # pylint: disable=missing-function-docstring
 
-        offloaded_call_back = args[-1]
+        release_tensors = args[-1]
         cpu_offload_handler = args[-2]
         tensor = args[:-2]
-        cpu_offload_handler.on_group_commit_forward(offloaded_call_back)
+        cpu_offload_handler.on_group_commit_forward(release_tensors)
         ctx.cpu_offload_handler = cpu_offload_handler
 
         # return the identical tensor
@@ -366,9 +369,9 @@ class GroupCommitFunction(torch.autograd.Function):
         return grad_output + (None, None)
 
 
-def group_prefetch_offload_commit(*tensor, offloaded_call_back=None):
+def group_prefetch_offload_commit(*tensor, release_tensors=[]):
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
-    return GroupCommitFunction.apply(*tensor, cur_forward_chunk, offloaded_call_back)
+    return GroupCommitFunction.apply(*tensor, cur_forward_chunk, release_tensors)
 
 
 class GroupStartFunction(torch.autograd.Function):
