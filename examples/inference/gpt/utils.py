@@ -168,6 +168,8 @@ def get_time_offsets(
     if len(time_offsets) == 0:
         time_offsets = [0.0]
 
+    time_offsets = [to - time_offsets[0] for to in time_offsets]
+
     return time_offsets
 
 

@@ -752,7 +752,8 @@ class MambaMixer(MegatronModule):
                     active_token_count=(tok_end - tok_start),
                 )
                 out_prefill_chunks.append(out_mb)
-                out_bias_prefill_chunks.append(out_bias_mb)
+                if out_bias_mb is not None:
+                    out_bias_prefill_chunks.append(out_bias_mb)
                 i += 1
                 continue
 
@@ -803,7 +804,8 @@ class MambaMixer(MegatronModule):
                 active_token_count=(tok_end - tok_start),
             )
             out_prefill_chunks.append(out_mb)
-            out_bias_prefill_chunks.append(out_bias_mb)
+            if out_bias_mb is not None:
+                out_bias_prefill_chunks.append(out_bias_mb)
 
         # Concatenate prefill chunks (token-major), then join with decode part
         out_prefill = torch.cat(out_prefill_chunks, dim=0) if out_prefill_chunks else None
