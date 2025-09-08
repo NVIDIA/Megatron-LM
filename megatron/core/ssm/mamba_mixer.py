@@ -738,7 +738,7 @@ class MambaMixer(MegatronModule):
                 tok_start = cu_seqlens_prefill[i].item()
                 tok_end = cu_seqlens_prefill[i + 1].item()
                 # Slice states for this one request
-                zxBCdt_mb = zxBCdt_prefill[tok_start:tok_end]
+                zxBCdt_mb = zxBCdt_prefill[:, tok_start:tok_end]
                 conv_mb = conv_state_prefill[i : i + 1]
                 ssm_mb = ssm_state_prefill[i : i + 1]
                 # Non-varlen call: no seq_idx/cu_seqlens, and return_varlen_states=False
@@ -768,7 +768,7 @@ class MambaMixer(MegatronModule):
             # Token span (contiguous in the packed hidden_states_prefill region)
             tok_start = cu_seqlens_prefill[pack_start_req].item()
             tok_end = cu_seqlens_prefill[pack_end_req].item()
-            zxBCdt_mb = zxBCdt_prefill[tok_start:tok_end]
+            zxBCdt_mb = zxBCdt_prefill[:, tok_start:tok_end]
 
             # States for exactly these requests (contiguous by construction)
             conv_mb = conv_state_prefill[pack_start_req:pack_end_req]
