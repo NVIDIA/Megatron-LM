@@ -21,11 +21,7 @@ from megatron.core.pipeline_parallel.multi_module_communicator import (
 )
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import (
-    GradCommProcessGroups,
-    GradFinalizeProcessGroups,
-    ModelCommProcessGroups,
-)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -178,12 +174,12 @@ class Model(torch.nn.Module):
 
 
 def _create_transformer_block(
-    dtype=torch.bfloat16, hidden_size=4096, model_comm_pgs=None
+    dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
 ) -> TransformerBlock:
     torch.manual_seed(12345)
     model_parallel_cuda_manual_seed(123)
-    if model_comm_pgs is not None:
-        cp_size = model_comm_pgs.cp.size()
+    if pg_collection is not None:
+        cp_size = pg_collection.cp.size()
     else:
         cp_size = get_context_parallel_group().size()
     transformer_config = TransformerConfig(
@@ -201,7 +197,7 @@ def _create_transformer_block(
         TransformerBlock(
             transformer_config,
             get_gpt_layer_with_transformer_engine_spec(),
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         .cuda()
         .to(dtype)
@@ -234,22 +230,17 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     return grid
 
 
-def _get_model_comm_pgs_from_grid(grid):
-    model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.tp = grid.get_pg("tp")
-    model_comm_pgs.cp = grid.get_pg("cp")
-    model_comm_pgs.pp = grid.get_pg("pp")
-    model_comm_pgs.ep = grid.get_pg("ep")
-    return model_comm_pgs
-
-
-def _get_grad_comm_pgs_from_grid(grid):
-    grad_comm_pgs = GradCommProcessGroups()
+def _get_pg_collection_from_grid(grid):
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = grid.get_pg("tp")
+    pg_collection.cp = grid.get_pg("cp")
+    pg_collection.pp = grid.get_pg("pp")
+    pg_collection.ep = grid.get_pg("ep")
     dp_group = grid.get_pg("dp")
     dp_cp_group = grid.get_pg(["dp", "cp"])
-    grad_comm_pgs.dp = dp_group
-    grad_comm_pgs.dp_cp = dp_cp_group
-    return grad_comm_pgs
+    pg_collection.dp = dp_group
+    pg_collection.dp_cp = dp_cp_group
+    return pg_collection
 
 
 def get_transformer_block_and_grid(
@@ -266,18 +257,16 @@ def get_transformer_block_and_grid(
     current_rank = dist.get_rank()
     grid = create_hypercomm_grid(offset=grid_offset, tp=tp_size, cp=cp_size, pp=pp_size, dp=dp_size)
     if grid.rank_offset <= current_rank < grid.rank_offset + grid.size:
-        model_comm_pgs = _get_model_comm_pgs_from_grid(grid)
-        grad_comm_pgs = _get_grad_comm_pgs_from_grid(grid)
+        pg_collection = _get_pg_collection_from_grid(grid)
         block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, model_comm_pgs=model_comm_pgs
+            dtype=dtype, hidden_size=hidden_size, pg_collection=pg_collection
         )
         ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
         block = DistributedDataParallel(
             config=block.config,
             ddp_config=ddp_config,
             module=block,
-            grad_comm_pgs=grad_comm_pgs,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
     else:
         block = None
@@ -301,25 +290,20 @@ def _populate_embedding_and_position_groups(pp_group):
     return pos_embd_pg, embd_pg
 
 
-def _get_grad_finalize_pgs(grid):
-    grad_finalize_pgs = GradFinalizeProcessGroups()
-    grad_finalize_pgs.tp = grid.get_pg("tp")
-    grad_finalize_pgs.pp = grid.get_pg("pp")
-    grad_finalize_pgs.cp = grid.get_pg("cp")
+def _get_pg_collection_with_embedding_groups(grid):
+    pg_collection = _get_pg_collection_from_grid(grid)
 
-    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(grad_finalize_pgs.pp)
-    pos_embd_pg = pos_embd_pg if is_pp_first_stage(grad_finalize_pgs.pp) else None
+    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pg_collection.pp)
+    pos_embd_pg = pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
     embd_pg = (
         embd_pg
-        if (is_pp_last_stage(grad_finalize_pgs.pp) or is_pp_first_stage(grad_finalize_pgs.pp))
+        if (is_pp_last_stage(pg_collection.pp) or is_pp_first_stage(pg_collection.pp))
         else None
     )
-    dp_cp_group = grid.get_pg(["dp", "cp"])
-    grad_finalize_pgs.pos_embd = pos_embd_pg
-    grad_finalize_pgs.dp_cp = dp_cp_group
-    grad_finalize_pgs.embd = embd_pg
+    pg_collection.pos_embd = pos_embd_pg
+    pg_collection.embd = embd_pg
 
-    return grad_finalize_pgs
+    return pg_collection
 
 
 @pytest.mark.skipif(
@@ -420,15 +404,15 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     }
 
     if 0 <= dist.get_rank() < 4:
-        grad_finalize_pgs = _get_grad_finalize_pgs(model.encoder_grid)
+        pg_collection = _get_pg_collection_with_embedding_groups(model.encoder_grid)
     elif 4 <= dist.get_rank() < 8:
-        grad_finalize_pgs = _get_grad_finalize_pgs(model.llm_grid)
+        pg_collection = _get_pg_collection_with_embedding_groups(model.llm_grid)
     else:
         raise ValueError(f"Rank {dist.get_rank()} is not valid")
 
     losses_reduced_explicit = schedule.forward_backward_pipelining_without_interleaving(
         p2p_communicator=multi_module_communicator,
-        grad_finalize_pgs=grad_finalize_pgs,
+        pg_collection=pg_collection,
         **common_args,
     )
     logging.info(f"Losses reduced explicit: {losses_reduced_explicit}")
