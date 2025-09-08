@@ -2,19 +2,20 @@
 
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import attention_mask_func
+from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
 from megatron.core.utils import divide
 
 
@@ -104,6 +105,22 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
+        if self.config.softmax_type == "vanilla":
+            self.softmax_offset = None
+        elif self.config.softmax_type == "off-by-one":
+            self.softmax_offset = torch.zeros(self.num_attention_heads_per_partition)
+        elif self.config.softmax_type == "learnable":
+            self.register_parameter(
+                "softmax_offset",
+                torch.nn.Parameter(
+                    torch.empty(
+                        self.num_attention_heads_per_partition, dtype=self.config.params_dtype
+                    )
+                ),
+            )
+        else:
+            raise ValueError("Softmax type not supported")
+
     def forward(
         self,
         query: Tensor,
@@ -172,8 +189,9 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
-
+        attention_probs: Tensor = self.scale_mask_softmax(
+            attention_scores, attention_mask, self.softmax_offset
+        )
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 
@@ -213,3 +231,18 @@ class DotProductAttention(MegatronModule):
         context = context.view(*new_context_shape)
 
         return context
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        """Sharded state dict for the learnable softmax offset parameter"""
+        if self.config.softmax_type == "learnable":
+            state_dict = self.state_dict(prefix="", keep_vars=True)
+        else:
+            state_dict = {}
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+        )

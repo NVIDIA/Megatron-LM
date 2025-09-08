@@ -1491,7 +1491,10 @@ def _add_network_size_args(parser):
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
-
+    group.add_argument('--softmax-type', type=str, default='vanilla',
+                       choices=['learnable', 'vanilla', 'off-by-one'],
+                       help='Type of softmax to use for the attention. Supports both a fixed offset and '
+                       'learnable offset.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
