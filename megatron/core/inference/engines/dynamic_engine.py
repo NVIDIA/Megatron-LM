@@ -32,6 +32,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.inference.utils import Counter
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -124,12 +125,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        self._loop = loop
+        self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
