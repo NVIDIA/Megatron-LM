@@ -13,7 +13,7 @@ from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicat
 from megatron.core.pipeline_parallel.multi_module_communicator import (
     MultiModulePipelineCommunicator,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -21,12 +21,12 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def _create_transformer_block(
-    dtype=torch.bfloat16, hidden_size=4096, model_comm_pgs=None
+    dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
 ) -> TransformerBlock:
     torch.manual_seed(12345)
     model_parallel_cuda_manual_seed(123)
-    if model_comm_pgs is not None:
-        cp_size = model_comm_pgs.cp.size()
+    if pg_collection is not None:
+        cp_size = pg_collection.cp.size()
     else:
         cp_size = get_context_parallel_group().size()
     transformer_config = TransformerConfig(
@@ -44,7 +44,7 @@ def _create_transformer_block(
         TransformerBlock(
             transformer_config,
             get_gpt_layer_with_transformer_engine_spec(),
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         .cuda()
         .to(dtype)
@@ -108,12 +108,12 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     return grid
 
 
-def _get_model_comm_pgs_from_grid(grid):
-    model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.tp = grid.get_pg("tp")
-    model_comm_pgs.cp = grid.get_pg("cp")
-    model_comm_pgs.pp = grid.get_pg("pp")
-    return model_comm_pgs
+def _get_pg_collection_from_grid(grid):
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = grid.get_pg("tp")
+    pg_collection.cp = grid.get_pg("cp")
+    pg_collection.pp = grid.get_pg("pp")
+    return pg_collection
 
 
 def _avg_params(module: torch.nn.Module, group: dist.ProcessGroup = None) -> None:
@@ -146,11 +146,11 @@ def get_transformer_block_and_grid(
             offset=grid_offset, tp=tp_size, cp=cp_size, pp=pp_size, dp=dp_size
         )
         if grid.rank_offset <= current_rank < grid.rank_offset + grid.size:
-            model_comm_pgs = _get_model_comm_pgs_from_grid(grid)
+            pg_collection = _get_pg_collection_from_grid(grid)
             block = _create_transformer_block(
-                dtype=dtype, hidden_size=hidden_size, model_comm_pgs=model_comm_pgs
+                dtype=dtype, hidden_size=hidden_size, pg_collection=pg_collection
             )
-            _shard_and_copy_(ref_block, block, tp_size, model_comm_pgs.tp.rank())
+            _shard_and_copy_(ref_block, block, tp_size, pg_collection.tp.rank())
         else:
             block = None
 
@@ -445,9 +445,9 @@ class TestMultiModulePipelineCommunicator:
 
         # ========== Build reference 1D grid and transformer block for weight sharing ==========
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
-        ref_model_comm_pgs = _get_model_comm_pgs_from_grid(ref_grid)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
         ref_block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, model_comm_pgs=ref_model_comm_pgs
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
         )
         _avg_params(
             ref_block, ref_grid.get_pg("dp")
@@ -690,9 +690,9 @@ class TestMultiModulePipelineCommunicator:
 
         # Build a reference grid and block for parameter sharing & DP averaging
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
-        ref_model_comm_pgs = _get_model_comm_pgs_from_grid(ref_grid)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
         ref_block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, model_comm_pgs=ref_model_comm_pgs
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
         )
         _avg_params(
             ref_block, ref_grid.get_pg("dp")
