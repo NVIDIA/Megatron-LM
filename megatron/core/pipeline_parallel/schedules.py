@@ -2,7 +2,7 @@
 
 import contextlib
 from functools import partial
-from typing import Callable, Iterator, List, Optional, Union
+from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -148,17 +148,18 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
-def deallocate_output_tensor_safe(output_tensor, deallocate_pipeline_outputs=False):
+def deallocate_output_tensor_container(
+    output_tensor: Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]],
+    deallocate_pipeline_outputs: bool = False,
+):
     '''Deallocate output tensor, handling both tensor and dict cases.'''
     if not deallocate_pipeline_outputs:
         return
 
-    # Check if output_tensor is None, empty list, or empty dict
+    # Check if output_tensor is None or empty
     if output_tensor is None:
         return
-    if isinstance(output_tensor, (list, tuple)) and len(output_tensor) == 0:
-        return
-    if isinstance(output_tensor, dict) and len(output_tensor) == 0:
+    if len(output_tensor) == 0:
         return
 
     # Extract from list if needed
@@ -477,20 +478,20 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if is_dict_format:
         # Handle dictionary format for multi-module pipeline
-        return _backward_step_dict_format(
+        return _backward_step_dict(
             input_tensor, output_tensor, output_tensor_grad, model_type, config
         )
     else:
         # Handle legacy tensor format
-        return _backward_step_tensor_format(
+        return _backward_step_tensor(
             input_tensor, output_tensor, output_tensor_grad, model_type, config
         )
 
 
-def _backward_step_tensor_format(
+def _backward_step_tensor(
     input_tensor, output_tensor, output_tensor_grad, model_type, config
 ):
-    """Legacy backward step implementation for tensor format."""
+    """Backward step implementation when inputs/outputs are tensors."""
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -540,11 +541,8 @@ def _backward_step_tensor_format(
     return input_tensor_grad
 
 
-def _backward_step_dict_format(input_tensor, output_tensor, output_tensor_grad, model_type, config):
-    """Enhanced backward step implementation for dictionary format."""
-
-    if isinstance(input_tensor, torch.Tensor):
-        input_tensor.retain_grad()
+def _backward_step_dict(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+    """Backward step implementation when inputs/outputs are dictionaries (multi module case)."""
 
     # Retain gradients on all input tensors
     for module_name, tensor in input_tensor.items():
@@ -558,7 +556,7 @@ def _backward_step_dict_format(input_tensor, output_tensor, output_tensor_grad, 
     # for now last stage only has one module LLM
     if not isinstance(output_tensor, dict):
         all_keys = list(input_tensor.keys())
-        assert len(all_keys) == 1, "Last stage only has one module LLM"
+        assert len(all_keys) == 1, "Last stage only has one module - LLM"
         main_module_key = all_keys[0]
         output_tensor = {main_module_key: output_tensor}
 
@@ -2254,7 +2252,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor_safe(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor_container(output_tensor, config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -2309,7 +2307,7 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor_safe(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor_container(output_tensor, config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.

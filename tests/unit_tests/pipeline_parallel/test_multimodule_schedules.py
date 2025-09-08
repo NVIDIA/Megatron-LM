@@ -51,7 +51,7 @@ class DataIterator:
         )
 
 
-class Model(torch.nn.Module):
+class SingleEncoderModel(torch.nn.Module):
     def __init__(
         self,
         hidden_size,
@@ -177,7 +177,7 @@ def _create_transformer_block(
     dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
 ) -> TransformerBlock:
     torch.manual_seed(12345)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_cuda_manual_seed(123, tp_rank=pg_collection.tp.rank(), ep_rank=pg_collection.ep.rank(), etp_rank = torch.distributed.get_rank())
     if pg_collection is not None:
         cp_size = pg_collection.cp.size()
     else:
@@ -311,12 +311,19 @@ def _get_pg_collection_with_embedding_groups(grid):
     reason="Device mesh feature requires PyTorch 2.3 or later",
 )
 @pytest.mark.internal
-def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
-    # Initialize model parallel with pipeline parallelism (no interleaving)
-    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
+@pytest.mark.parametrize(
+    "encoder_tp,encoder_pp,encoder_dp,llm_tp,llm_pp,llm_dp,llm_grid_offset",
+    [
+        (2, 2, 1, 2, 2, 1, 4),
+    ]
+)
+def test_forward_backward_pipelining_without_interleaving_multi_module(
+    mocker, encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
+):
 
-    def dummy_step_func(data_iterator, model):
-        rank = int(os.environ['LOCAL_RANK'])
+    Utils.initialize_distributed()
+
+    def step_func(data_iterator, model):
 
         def loss_func(output_tensor_dict: Dict[str, torch.Tensor]):
             assert (
@@ -338,12 +345,8 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     micro_batch_size = 1
     hidden_size = 1024
 
-    encoder_tp, encoder_pp, encoder_dp = 2, 2, 1
-    llm_tp, llm_pp, llm_dp = 2, 2, 1
-    llm_grid_offset = 4
-
     # Create model
-    model = Model(
+    model = SingleEncoderModel(
         hidden_size=hidden_size,
         encoder_tp=encoder_tp,
         encoder_pp=encoder_pp,
@@ -366,10 +369,10 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     config.qk_layernorm = False
     config.sequence_parallel = False
     config.moe_router_enable_expert_bias = False
+    config.moe_router_load_balancing_type = "aux_loss"
 
     # Add grad scale function to convert float losses to tensors
     def grad_scale_func(loss):
-        """Convert float loss to tensor by multiplying with unit tensor."""
         if isinstance(loss, (int, float)):
             return torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
         else:
@@ -394,7 +397,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
         )
 
     common_args = {
-        'forward_step_func': dummy_step_func,
+        'forward_step_func': step_func,
         'data_iterator': data_iterator,
         'model': [model],
         'num_microbatches': micro_batch_size,
@@ -417,7 +420,6 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(mocker):
     )
     logging.info(f"Losses reduced explicit: {losses_reduced_explicit}")
 
-    Utils.destroy_model_parallel()
 
 
 if __name__ == "__main__":
