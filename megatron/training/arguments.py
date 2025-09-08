@@ -1221,6 +1221,8 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.is_hybrid_model:
         kw_args['is_hybrid_model'] = args.is_hybrid_model
 
+    kw_args['inference_sampling_seed'] = args.seed
+
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
     # Kitchen library is available.
