@@ -1632,14 +1632,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         # Assume that hook does not interact with
                         # input
                         hook(submodule, None)
-                self.register_forward_pre_hook(forward_pre_hook)
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
             if forward_post_hooks:
                 def forward_post_hook(module, *_) -> None:
                     for submodule, hook in forward_post_hooks:
                         # Assume that hook does not interact with
                         # input or output
                         hook(submodule, None, None)
-                self.register_forward_hook(forward_post_hook)
+                fused_impl.register_forward_hook(forward_post_hook)
 
             return fused_impl
 
