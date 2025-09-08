@@ -348,6 +348,7 @@ class DynamicInferenceEngine(AbstractEngine):
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
         self.requests[request_id] = DynamicInferenceRequest(
+            prompt=prompt,
             request_id=request_id,
             prompt_tokens=tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),

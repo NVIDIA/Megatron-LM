@@ -213,4 +213,4 @@ class MegatronServer(object):
         api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model, args])
 
     def run(self, url, port):
-        self.app.run(url, threaded=True, debug=False, port=port)
+        self.app.run(url, threaded=False, debug=False, port=port)

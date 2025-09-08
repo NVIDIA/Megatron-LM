@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 import inspect
 from typing import Any, Dict, Iterable, List, Optional, Union
 
@@ -49,11 +50,12 @@ def run_mcore_engine(
     logprobs=True,
     tokens_to_generate=0,
     top_n_logprobs=0,
+    random_seed=-1,
 ):
     """Server-compatible version of the MCore Engine, used in
     tools/run_text_generation_server.py."""
 
-    values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs]
+    values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs, random_seed]
     values_float_tensor = broadcast_float_list(len(values), float_list=values, data_parallel=False)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
@@ -61,6 +63,10 @@ def run_mcore_engine(
     top_p = values_float_tensor[3].item()
     temperature = values_float_tensor[4].item()
     top_n_logprobs = int(values_float_tensor[5].item())
+    random_seed = int(values_float_tensor[6].item())
+
+    if random_seed > 0:
+        engine.controller.sampling_rng.manual_seed(random_seed)
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -70,7 +76,7 @@ def run_mcore_engine(
         return_log_probs=return_output_log_probs,
         num_tokens_to_generate=tokens_to_generate,
         top_n_logprobs=top_n_logprobs,
-        return_prompt_top_n_logprobs=True
+        return_prompt_top_n_logprobs=True,
     )
 
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
@@ -81,7 +87,7 @@ def run_mcore_engine(
     for p, l in zip(context_tokens_tensor, context_length_tensor):
         tokenized_prompts.append(p[:l].cpu().numpy().tolist())
 
-    tokenizer = engine.text_generation_controller.tokenizer
+    tokenizer = engine.controller.tokenizer
 
     # detect if detokenize supports skip_special_tokens or **kwargs
     sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
@@ -100,24 +106,25 @@ def run_mcore_engine(
         for p in tokenized_prompts
     ]
 
-    requests = []
-    for i in range(len(tokenized_prompts)):
-        req = InferenceRequest(
-            prompt=detokenized_prompts[i],
-            prompt_tokens=tokenized_prompts[i],
-            sampling_params=sampling_params,
-            request_id=engine.get_new_request_id(),
-        )
-        requests.append(req)
+    print(
+        f"Rank {torch.distributed.get_rank()} generating with {len(detokenized_prompts)} prompts..."
+    )
 
-    result = engine.generate(inference_requests=requests)
+    result = engine.generate(prompts=detokenized_prompts, sampling_params=sampling_params)
+
+    print(
+        f"Rank {torch.distributed.get_rank()} finished generating {len(detokenized_prompts)} prompts!"
+    )
+
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
+        tolist = lambda x: x.tolist() if isinstance(x, torch.Tensor) else x
         response_dict = {
             "text": [x.prompt + x.generated_text for x in result],
-            "tokens": [x.prompt_tokens + x.generated_tokens.tolist() for x in result],
+            "tokens": [tolist(x.prompt_tokens) + tolist(x.generated_tokens) for x in result],
         }
+
         if sampling_params.return_log_probs:
             response_logprobs = [x.prompt_log_probs + x.generated_log_probs for x in result]
             response_dict["logprobs"] = response_logprobs

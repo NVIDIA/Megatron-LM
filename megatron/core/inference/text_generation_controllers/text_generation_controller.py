@@ -68,6 +68,10 @@ class TextGenerationController:
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
+        model_config = get_model_config(self.inference_wrapped_model.model)
+        self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
+        self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
+
     def tokenize_prompt(
         self, prompt: str, add_BOS: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -301,7 +305,9 @@ class TextGenerationController:
             # After filtering, we need to recalculate the distribution.
             probabilities = last_token_logits.softmax(dim=-1)
 
-            sampled_logits = torch.multinomial(probabilities, num_samples=1).view(-1)
+            sampled_logits = torch.multinomial(
+                probabilities, num_samples=1, generator=self.sampling_rng
+            ).view(-1)
 
             # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
             if vocab_size:

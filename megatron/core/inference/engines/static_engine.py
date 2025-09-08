@@ -65,7 +65,7 @@ class StaticInferenceEngine(AbstractEngine):
                 UserWarning,
             )
             max_batch_size = inference_max_batch_size
-        self.text_generation_controller = text_generation_controller
+        self.controller = text_generation_controller
         self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
@@ -113,7 +113,7 @@ class StaticInferenceEngine(AbstractEngine):
             sampling_params = inference_parameters
 
         if inference_request is None:
-            prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
+            prompt_tokens = self.controller.tokenize_prompt(prompt, add_BOS)
         else:
             prompt_tokens = inference_request.prompt_tokens
 
@@ -222,7 +222,7 @@ class StaticInferenceEngine(AbstractEngine):
                     assert isinstance(stream, AsyncStream), stream
                     active_streams[request_id] = stream
             result_dict: Dict[str, InferenceRequest] = (
-                self.text_generation_controller.generate_all_output_tokens_static_batch(
+                self.controller.generate_all_output_tokens_static_batch(
                     active_requests, active_streams
                 )
             )

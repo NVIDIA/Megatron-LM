@@ -637,6 +637,23 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
+    def _pad(self, out, out_bias, context):
+        # Restore the padded tokens if necessary.
+        num_padding_tokens = context.padded_active_token_count - context.active_token_count
+        if num_padding_tokens > 0:
+            out_padding = torch.zeros(
+                (num_padding_tokens, *out.shape[1:]), dtype=out.dtype, device=out.device
+            )
+            out = torch.cat((out, out_padding), dim=0)
+
+            if out_bias is not None:
+                out_bias_padding = torch.zeros(
+                    num_padding_tokens, dtype=out_bias.dtype, device=out_bias.device
+                )
+                out_bias = torch.cat((out_bias, out_bias_padding), dim=0)
+
+        return out, out_bias
+
     def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
         """
         Executes dynamic inference by separating decode and prefill requests and
@@ -660,9 +677,13 @@ class MambaMixer(MegatronModule):
         # Run the decode step and return immediately if there are no prefill requests.
         if context.is_decode_only():
             # The step function requires swapping the input batch dimension and sequence dimension.
+            hidden_states = hidden_states[: context.active_token_count]
+            conv_state = conv_state[: context.active_token_count]
+            ssm_state = ssm_state[: context.active_token_count]
             out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
-
-            return (out.transpose(0, 1), out_bias)
+            out, out_bias = self._pad(out.transpose(0, 1), out_bias, context)
+            return out, out_bias
+            # return (out.transpose(0, 1), out_bias)
 
         # Compute the split between decode and prefill.
         seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(context)
@@ -678,9 +699,9 @@ class MambaMixer(MegatronModule):
         # Run the decode step.
         if first_prefill_request_idx > 0:
             # Slice original tensors for the decode part.
-            hidden_states_decode = hidden_states[:first_prefill_token_idx].clone()
-            conv_state_decode = conv_state[:first_prefill_request_idx].clone()
-            ssm_state_decode = ssm_state[:first_prefill_request_idx].clone()
+            hidden_states_decode = hidden_states[:first_prefill_token_idx]
+            conv_state_decode = conv_state[:first_prefill_request_idx]
+            ssm_state_decode = ssm_state[:first_prefill_request_idx]
 
             # The step function requires swapping the input batch dimension and sequence dimension.
             out_decode, out_bias_decode, _, _ = self.step(
@@ -717,19 +738,7 @@ class MambaMixer(MegatronModule):
         out = maybe_cat(out_decode, out_prefill, required=True)
         out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)
 
-        # Restore the padded tokens if necessary.
-        num_padding_tokens = context.padded_active_token_count - context.active_token_count
-        if num_padding_tokens > 0:
-            out_padding = torch.zeros(
-                (num_padding_tokens, *out.shape[1:]), dtype=out.dtype, device=out.device
-            )
-            out = torch.cat((out, out_padding), dim=0)
-
-            if out_bias is not None:
-                out_bias_padding = torch.zeros(
-                    num_padding_tokens, dtype=out_bias.dtype, device=out_bias.device
-                )
-                out_bias = torch.cat((out_bias, out_bias_padding), dim=0)
+        out, out_bias = self._pad(out, out_bias, context)
 
         return out, out_bias
 
