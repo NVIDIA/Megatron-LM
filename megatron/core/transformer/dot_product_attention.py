@@ -163,7 +163,7 @@ class DotProductAttention(MegatronModule):
         # import pdb;pdb.set_trace()
         from quant.mxfp import mxfp_baddbmm
         from quant.hifp import hifp_baddbmm
-'hifp8'
+        custom_quant_type = 'hifp8'
         if custom_quant_type == 'mxfp4':
             matmul_result = mxfp_baddbmm(
                 matmul_input_buffer,
@@ -235,7 +235,7 @@ class DotProductAttention(MegatronModule):
         # matmul: [b * np, sq, hn]
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-'hifp8'
+        custom_quant_type = 'hifp8'
         if custom_quant_type == 'hifp8':
             context = hifp_matmul(attention_probs, value.transpose(0, 1))
         elif custom_quant_type == 'mxfp8':
