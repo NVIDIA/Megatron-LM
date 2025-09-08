@@ -277,13 +277,7 @@ class TransformerBlock(MegatronModule):
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        self.model_comm_pgs = model_comm_pgs
-
-        pp_group = self.model_comm_pgs.pp if hasattr(self.model_comm_pgs, 'pp') else None
-        pp_rank = get_pg_rank(pp_group)
-
+        
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
