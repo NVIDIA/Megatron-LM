@@ -488,9 +488,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         )
 
 
-def _backward_step_tensor(
-    input_tensor, output_tensor, output_tensor_grad, model_type, config
-):
+def _backward_step_tensor(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step implementation when inputs/outputs are tensors."""
 
     # Retain the grad on the input_tensor.

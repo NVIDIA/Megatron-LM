@@ -177,7 +177,12 @@ def _create_transformer_block(
     dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
 ) -> TransformerBlock:
     torch.manual_seed(12345)
-    model_parallel_cuda_manual_seed(123, tp_rank=pg_collection.tp.rank(), ep_rank=pg_collection.ep.rank(), etp_rank = torch.distributed.get_rank())
+    model_parallel_cuda_manual_seed(
+        123,
+        tp_rank=pg_collection.tp.rank(),
+        ep_rank=pg_collection.ep.rank(),
+        etp_rank=torch.distributed.get_rank(),
+    )
     if pg_collection is not None:
         cp_size = pg_collection.cp.size()
     else:
@@ -263,10 +268,7 @@ def get_transformer_block_and_grid(
         )
         ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
         block = DistributedDataParallel(
-            config=block.config,
-            ddp_config=ddp_config,
-            module=block,
-            pg_collection=pg_collection,
+            config=block.config, ddp_config=ddp_config, module=block, pg_collection=pg_collection
         )
     else:
         block = None
@@ -312,10 +314,7 @@ def _get_pg_collection_with_embedding_groups(grid):
 )
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    "encoder_tp,encoder_pp,encoder_dp,llm_tp,llm_pp,llm_dp,llm_grid_offset",
-    [
-        (2, 2, 1, 2, 2, 1, 4),
-    ]
+    "encoder_tp,encoder_pp,encoder_dp,llm_tp,llm_pp,llm_dp,llm_grid_offset", [(2, 2, 1, 2, 2, 1, 4)]
 )
 def test_forward_backward_pipelining_without_interleaving_multi_module(
     mocker, encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
@@ -414,12 +413,9 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(
         raise ValueError(f"Rank {dist.get_rank()} is not valid")
 
     losses_reduced_explicit = schedule.forward_backward_pipelining_without_interleaving(
-        p2p_communicator=multi_module_communicator,
-        pg_collection=pg_collection,
-        **common_args,
+        p2p_communicator=multi_module_communicator, pg_collection=pg_collection, **common_args
     )
     logging.info(f"Losses reduced explicit: {losses_reduced_explicit}")
-
 
 
 if __name__ == "__main__":
