@@ -657,14 +657,9 @@ class MambaMixer(MegatronModule):
     def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
         """
         Executes dynamic inference by separating decode and prefill requests and
-        running them independently.
-
-        Args:
-            hidden_states (torch.Tensor): The input hidden states.
-            context (DynamicInferenceContext): The inference context.
-
-        Returns:
-            (out, out_bias): The forward pass output.
+        running them independently, with prefill microbatched so that any varlen
+        pack contains at most `self.chunk_size` tokens total. Requests whose length
+        exceeds `self.chunk_size` are run as non-varlen prefill.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
             check_mamba_sequence_packing_support()
@@ -674,72 +669,152 @@ class MambaMixer(MegatronModule):
 
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
 
-        # Run the decode step and return immediately if there are no prefill requests.
+        # Fast path: decode-only
         if context.is_decode_only():
-            # The step function requires swapping the input batch dimension and sequence dimension.
             hidden_states = hidden_states[: context.active_token_count]
             conv_state = conv_state[: context.active_token_count]
             ssm_state = ssm_state[: context.active_token_count]
             out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
             out, out_bias = self._pad(out.transpose(0, 1), out_bias, context)
             return out, out_bias
-            # return (out.transpose(0, 1), out_bias)
 
-        # Compute the split between decode and prefill.
-        seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(context)
+        # Compute split between decode and prefill
+        seq_idx, cu_seqlens, _return_varlen_states = self._get_varlen_generation_state(context)
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
         ]
+        # First request with query len > 1 is prefill-start
         first_prefill_request_idx = torch.nonzero(active_query_lengths > 1)[0].int()
         first_prefill_token_idx = cu_seqlens[first_prefill_request_idx]
 
         out_decode, out_bias_decode = None, None
-        out_prefill, out_bias_prefill = None, None
 
-        # Run the decode step.
+        # Decode slice (requests before prefill start)
         if first_prefill_request_idx > 0:
-            # Slice original tensors for the decode part.
             hidden_states_decode = hidden_states[:first_prefill_token_idx]
             conv_state_decode = conv_state[:first_prefill_request_idx]
             ssm_state_decode = ssm_state[:first_prefill_request_idx]
-
-            # The step function requires swapping the input batch dimension and sequence dimension.
             out_decode, out_bias_decode, _, _ = self.step(
                 hidden_states_decode.transpose(0, 1), conv_state_decode, ssm_state_decode
             )
             out_decode = out_decode.transpose(0, 1)
 
-        # Run the prefill step. We truncate padded tokens as these can cause numerical instability
-        # in the Mamba kernels.
+        # Prefill slices (remaining active tokens/requests)
         active_token_count = context.active_token_count
         active_request_count = context.get_active_request_count()
+
         hidden_states_prefill = hidden_states[first_prefill_token_idx:active_token_count]
         conv_state_prefill = conv_state[first_prefill_request_idx:active_request_count]
         ssm_state_prefill = ssm_state[first_prefill_request_idx:active_request_count]
+
+        # cu/seq for prefill partition (re-index to start at zero)
         cu_seqlens_prefill = F.pad(
             cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
-        )
+        )  # [num_prefill_reqs+1]
         seq_idx_prefill = (
             seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_request_idx
         )
 
-        zxBCdt = self.compute_in_proj(hidden_states_prefill)
-        out_prefill, out_bias_prefill = self.ssm_block(
-            zxBCdt,
-            conv_state=conv_state_prefill,
-            ssm_state=ssm_state_prefill,
-            seq_idx=seq_idx_prefill,
-            cu_seqlens=cu_seqlens_prefill,
-            return_varlen_states=return_varlen_states,
-            active_token_count=context.active_token_count - first_prefill_token_idx,
+        # Precompute projection for the whole prefill token window (we'll slice per microbatch)
+        if hidden_states_prefill.numel() > 0:
+            zxBCdt_prefill = self.compute_in_proj(hidden_states_prefill)
+        else:
+            zxBCdt_prefill = hidden_states_prefill  # empty
+
+        # Gather per-request lengths for the prefill partition
+        # lengths[i] = number of tokens for prefill request i
+        # (relative to first_prefill_request_idx)
+        req_lengths = (cu_seqlens_prefill[1:] - cu_seqlens_prefill[:-1]).tolist()
+        num_prefill_reqs = len(req_lengths)
+
+        # Microbatch the prefill: pack consecutive requests so that total tokens <= self.chunk_size.
+        out_prefill_chunks = []
+        out_bias_prefill_chunks = []
+
+        i = 0
+        while i < num_prefill_reqs:
+            # If this single request is longer than chunk_size, run it alone as non-varlen.
+            if req_lengths[i] > self.chunk_size:
+                tok_start = cu_seqlens_prefill[i].item()
+                tok_end = cu_seqlens_prefill[i + 1].item()
+                # Slice states for this one request
+                zxBCdt_mb = zxBCdt_prefill[tok_start:tok_end]
+                conv_mb = conv_state_prefill[i : i + 1]
+                ssm_mb = ssm_state_prefill[i : i + 1]
+                # Non-varlen call: no seq_idx/cu_seqlens, and return_varlen_states=False
+                out_mb, out_bias_mb = self.ssm_block(
+                    zxBCdt_mb,
+                    conv_state=conv_mb,
+                    ssm_state=ssm_mb,
+                    seq_idx=None,
+                    cu_seqlens=None,
+                    return_varlen_states=False,
+                    active_token_count=(tok_end - tok_start),
+                )
+                out_prefill_chunks.append(out_mb)
+                out_bias_prefill_chunks.append(out_bias_mb)
+                i += 1
+                continue
+
+            # Otherwise, greedily pack as many consecutive requests as will fit within chunk_size
+            pack_start_req = i
+            packed_tokens = 0
+            while i < num_prefill_reqs and packed_tokens + req_lengths[i] <= self.chunk_size:
+                packed_tokens += req_lengths[i]
+                i += 1
+            pack_end_req = i  # exclusive
+
+            # Token span (contiguous in the packed hidden_states_prefill region)
+            tok_start = cu_seqlens_prefill[pack_start_req].item()
+            tok_end = cu_seqlens_prefill[pack_end_req].item()
+            zxBCdt_mb = zxBCdt_prefill[tok_start:tok_end]
+
+            # States for exactly these requests (contiguous by construction)
+            conv_mb = conv_state_prefill[pack_start_req:pack_end_req]
+            ssm_mb = ssm_state_prefill[pack_start_req:pack_end_req]
+
+            # Build varlen metadata for this microbatch (reindexed to start at 0)
+            lengths = req_lengths[pack_start_req:pack_end_req]
+            # cu_seqlens_mb: [0, l0, l0+l1, ...]
+            cu_vals = [0]
+            for L in lengths:
+                cu_vals.append(cu_vals[-1] + L)
+            cu_seqlens_mb = torch.tensor(
+                cu_vals, device=hidden_states_prefill.device, dtype=torch.int32
+            )
+
+            # seq_idx_mb: maps each token to its (microbatch-local) request id
+            # (0 repeated l0 times, 1 repeated l1 times, ...)
+            seq_ids = torch.arange(
+                len(lengths), device=hidden_states_prefill.device, dtype=torch.int32
+            )
+            seq_idx_mb = seq_ids.repeat_interleave(
+                torch.tensor(lengths, device=hidden_states_prefill.device)
+            )
+
+            # Run varlen ssm_block for this microbatch
+            out_mb, out_bias_mb = self.ssm_block(
+                zxBCdt_mb,
+                conv_state=conv_mb,
+                ssm_state=ssm_mb,
+                seq_idx=seq_idx_mb[None, :],  # match expected shape [1, tokens]
+                cu_seqlens=cu_seqlens_mb,  # [n_reqs+1], starts at 0
+                return_varlen_states=True,  # varlen path since all reqs fit <= chunk_size
+                active_token_count=(tok_end - tok_start),
+            )
+            out_prefill_chunks.append(out_mb)
+            out_bias_prefill_chunks.append(out_bias_mb)
+
+        # Concatenate prefill chunks (token-major), then join with decode part
+        out_prefill = torch.cat(out_prefill_chunks, dim=0) if out_prefill_chunks else None
+        out_bias_prefill = (
+            torch.cat(out_bias_prefill_chunks, dim=0) if out_bias_prefill_chunks else None
         )
 
-        # Concatenate the outputs from decode and prefill.
         out = maybe_cat(out_decode, out_prefill, required=True)
         out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)
 
         out, out_bias = self._pad(out, out_bias, context)
-
         return out, out_bias
 
     def step(self, hidden_states, conv_state, ssm_state):
