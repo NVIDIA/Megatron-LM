@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -106,6 +106,11 @@ class TransformerConfig(ModelParallelConfig):
 
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
+
+    softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+       and learnable offset."""
 
     num_query_groups: Optional[int] = None
     """Number of query groups for group query attention. If None, normal attention is used."""

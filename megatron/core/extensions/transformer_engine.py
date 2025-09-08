@@ -960,6 +960,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             kv_channels = self.config.kv_channels
 
+        if self.config.softmax_type != "vanilla":
+            assert is_te_min_version("2.8.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 2.8.0 to support"
+                "`softmax_type`."
+            )
+            extra_kwargs["softmax_type"] = self.config.softmax_type
+
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
