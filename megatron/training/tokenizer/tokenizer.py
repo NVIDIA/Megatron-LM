@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
@@ -130,7 +130,7 @@ def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     return after
 
 
-class _HuggingFaceTokenizer(MegatronTokenizer):
+class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
     def __init__(self, pretrained_model_name_or_path, trust_remote_code=False, **kwargs):
         super().__init__(pretrained_model_name_or_path, **kwargs)
         try:
@@ -198,7 +198,7 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
         return self._tokenizer.pad_token_id
 
 
-class _BertWordPieceTokenizer(MegatronTokenizer):
+class _BertWordPieceTokenizer(MegatronLegacyTokenizer):
     """Original BERT wordpiece tokenizer."""
 
     def __init__(self, vocab_file, lower_case=True, vocab_extra_ids=0):
@@ -334,7 +334,7 @@ class _BertWordPieceTokenizer(MegatronTokenizer):
         self._additional_special_tokens = value
 
 
-class _GPT2BPETokenizer(MegatronTokenizer):
+class _GPT2BPETokenizer(MegatronLegacyTokenizer):
     """Original GPT2 BPE tokenizer."""
 
     def __init__(self, vocab_file, merge_file):
@@ -368,7 +368,7 @@ class _GPT2BPETokenizer(MegatronTokenizer):
         return self.eod_id
 
 
-class _SentencePieceTokenizer(MegatronTokenizer):
+class _SentencePieceTokenizer(MegatronLegacyTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
     def __init__(self, model_file, vocab_extra_ids=0):
@@ -667,7 +667,7 @@ PATTERN_TIKTOKEN = (
 PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
 
 
-class CustomTikTokenizer(MegatronTokenizer):
+class CustomTikTokenizer(MegatronLegacyTokenizer):
     def __init__(
         self,
         path: str,
@@ -810,7 +810,7 @@ class CustomTikTokenizer(MegatronTokenizer):
         return self._id_to_token
 
 
-class _NullTokenizer(MegatronTokenizer):
+class _NullTokenizer(MegatronLegacyTokenizer):
     def __init__(self, vocab_size):
         super().__init__(None, vocab_size=vocab_size)
         self._vocab_size_without_eod = int(vocab_size)
@@ -862,7 +862,7 @@ class _NullTokenizer(MegatronTokenizer):
     def additional_special_tokens_ids(self):
         return None
 
-class _NullMultimodalTokenizer(MegatronTokenizer):
+class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
     def __init__(self, vocab_size, image_token=None, image_token_id=None):
         super().__init__(None, vocab_size=vocab_size)
         self._vocab_size_without_eod = int(vocab_size)

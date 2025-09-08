@@ -131,7 +131,7 @@ def main(
                 "rules": [
                     {
                         "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',
-                        "auto_cancel": {"on_new_commit": "none"},
+                        "auto_cancel": {"on_new_commit": "interruptible"},
                     },
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
                     {"when": "never"},

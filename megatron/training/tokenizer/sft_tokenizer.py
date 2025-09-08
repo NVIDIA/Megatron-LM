@@ -6,11 +6,11 @@ import numpy as np
 
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
 
-class SFTTokenizer(MegatronTokenizer):  
+class SFTTokenizer(MegatronLegacyTokenizer):  
     """SFT Tokenizer."""
 
     def __init__(

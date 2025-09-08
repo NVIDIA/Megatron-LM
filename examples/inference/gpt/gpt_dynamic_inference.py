@@ -2,14 +2,15 @@
 
 import hashlib
 import os
-import torch
+import sys
 from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
 from typing import Dict, List
-import sys
-import os
+
+import torch
+from tqdm import tqdm
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -23,6 +24,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 
 sys.path.append(
@@ -35,12 +37,17 @@ from gpt_builders import gpt_builder
 import json
 
 from examples.inference.gpt.utils import (
-    add_common_inference_args,
-    build_requests,
-    build_dynamic_engine_setup_prefix,
-    get_curr_time,
     Request,
+    add_common_inference_args,
+    build_dynamic_engine_setup_prefix,
+    build_requests,
+    get_curr_time,
 )
+from megatron.training import get_args
+from megatron.training import get_model as _get_model
+from megatron.training import get_tokenizer, initialize_megatron
+from megatron.training.checkpointing import load_checkpoint
+from pretrain_gpt import model_provider
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -54,6 +61,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
+    group.add_argument(
+        "--termination-id", type=int, default=None,
+        help="Termination ID that overrides `tokenizer.eod`."
+    )
+
     return parser
 
 
@@ -110,7 +122,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=max_sequence_length,
-        num_cuda_graphs=args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None,
+        num_cuda_graphs=(
+            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
+        ),
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
@@ -141,7 +155,10 @@ def get_inference_controller(
     """
 
     args = get_args()
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Wrap model in inference wrapper.
     model = GPTInferenceWrapper(model, args, context)
@@ -173,6 +190,8 @@ def run_inference(
         A dictionary of step times with `prefill` and `decode` keys.
     """
 
+    args = get_args()
+
     # Initialize request arrival times.
     base_arrival_time = get_curr_time()
     for request in requests:
@@ -188,26 +207,40 @@ def run_inference(
     output_times = []
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
-    while True:
-        curr_time = get_curr_time()
 
-        # Add requests with 'earlier' arrival time.
+    def _add_request():
+        """Add request to engine.
+
+        *Note: Using `prompt_text` instead of `prompt_tokens` for fair comparison.
+        """
+        nonlocal num_requests_added
+        _request = requests[num_requests_added]
+        engine.add_request(
+            num_requests_added,
+            _request.prompt_text,
+            sampling_params.num_tokens_to_generate,
+        )
+        _request.time_start = get_curr_time()
+        _request.state = "started"
+        num_requests_added += 1
+        tbar.update(1)
+
+    while True:
+        # Add requests.
         add_start = get_curr_time()
-        while num_requests_added < num_requests_total:
-            request = requests[num_requests_added]
-            if request.time_arrival > curr_time:
-                break
-            try:
-                # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(
-                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
-                )
-                request.time_start = get_curr_time()
-                request.state = "started"
-                num_requests_added += 1
-                tbar.update(1)
-            except ContextOverflowError:
-                break
+        if args.incoming_requests_per_step is None:
+            # Add requests with 'earlier' arrival time.
+            while num_requests_added < num_requests_total:
+                if requests[num_requests_added].time_arrival > add_start:
+                    break
+                _add_request()
+        else:
+            # Add deterministic number of requests (generally used for debugging).
+            for i in range(min(
+                args.incoming_requests_per_step,
+                num_requests_total - num_requests_added,
+            )):
+                _add_request()
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
@@ -222,6 +255,7 @@ def run_inference(
                 step_times["prefill"].append(step_time)
 
             # Append output tokens.
+            output_start = get_curr_time()
             for finished_request in finished_requests:
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
@@ -235,6 +269,7 @@ def run_inference(
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 num_requests_finished += 1
+            output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
@@ -256,7 +291,10 @@ def main():
         torch.cuda.cudart().cudaProfilerStart()
 
     args = get_args()
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sampling params.
     sampling_params = SamplingParams(
@@ -273,11 +311,21 @@ def main():
     context = get_inference_context(requests, sampling_params)
     controller = get_inference_controller(model, context)
 
+    # Validate all context_length's <= max_tokens.
+    invalid_prompt_length_map = {}
+    for request_idx, request in enumerate(requests):
+        if len(request.prompt_tokens) > context.max_tokens:
+            invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+    assert not invalid_prompt_length_map, (
+        "request idxs with prompts longer than context.max_tokens: "
+        ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+    )
+
     # Inference engine.
     engine = DynamicInferenceEngine(
         controller,
         context,
-        termination_id=tokenizer.eod,
+        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
     )
@@ -289,7 +337,9 @@ def main():
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times, total_output_tokens = run_inference(requests, sampling_params, engine)
+    step_times, add_times, output_times, total_output_tokens = run_inference(
+        requests, sampling_params, engine
+    )
     torch.cuda.synchronize()
     total_time = get_curr_time() - t
 
@@ -299,6 +349,9 @@ def main():
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
+
+        def escape_str(s):
+            return s.replace("\n", "\\n")
 
         print("~~~~ Unique prompts + outputs. ~~~~")
 
@@ -312,17 +365,21 @@ def main():
             request_idx = request_idxs[0]
             request = requests[request_idx]
             output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
-            output_text_escaped = request.output_text.replace("\n", "\\n")
+            prompt_text_escaped = escape_str(prompt_text)
+            output_text_escaped = escape_str(request.output_text)
+            num_prompt_tokens = len(requests[request_idx].prompt_tokens)
+            num_output_tokens = len(requests[request_idx].output_tokens)
             print(
                 f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
-                f"{prompt_text} ... {output_text_escaped}"
+                f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
+                f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
             )
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
 
-            for idx, req in enumerate(requests):
+            for req in requests[::args.output_every_n_results]:
                 result_dict = {
                     "input_prompt": req.prompt_text,
                     "generated_text": req.output_text,
@@ -365,10 +422,17 @@ def main():
     #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
     #     f"count [ p {p_count}, d {d_count} ]."
     # )
+    capture_str = (
+        f"{engine.capture_stats["time"]:.2f} sec"
+        if engine.capture_stats else
+        "--"
+    )
     print(
         f"{setup_prefix} … "
+        f"capture {capture_str} … "
         f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
         f"total time: {total_time:.3f}s … "
+        f"steps: {engine.step_count:d} … "
         f"throughput: {throughput:.3f} tok/s"
     )
     print("~~~")

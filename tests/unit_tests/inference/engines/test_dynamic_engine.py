@@ -17,6 +17,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
+    WarmupEngineMode,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -33,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -68,8 +70,11 @@ class DynamicEngineTestConfig:
 
     set_rounder(4)
     num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
+    min_prompt_length: int = 4
     max_prompt_length: int = 16
     max_output_length: int = 4
+    max_sequence_length: Optional[int] = None
+
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
@@ -85,11 +90,18 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
+    actually_build_cuda_graphs: bool = (
+        False  # only test_simple requires us to actually build a cuda-graph
+    )
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
 
     def __post_init__(self):
+
+        # Compute max_sequence_length.
+        assert self.max_sequence_length is None
+        self.max_sequence_length = self.max_prompt_length + self.max_output_length
 
         # Update overrides if not using overflow factor.
         if self.context_buffer_overflow_factor is None:
@@ -100,9 +112,7 @@ class DynamicEngineTestConfig:
 
             # Enough room for all tokens.
             if self.context_max_tokens_override is None:
-                self.context_max_tokens_override = self.num_requests * (
-                    self.max_prompt_length + self.max_output_length
-                )
+                self.context_max_tokens_override = self.num_requests * self.max_sequence_length
 
 
 @dataclass
@@ -121,12 +131,15 @@ class TestDynamicInferenceEngine:
     def _build_requests(
         cls,
         num_requests: int,
+        min_prompt_length: int,
         max_prompt_length: int,
         max_sequence_length: int,
         vocab_size: int,
         use_fixed_output_lengths: bool = False,
     ) -> List[Request]:
-        prompt_lengths = torch.randint(4, max_prompt_length, (num_requests,)).tolist()
+        prompt_lengths = torch.randint(
+            min_prompt_length, max_prompt_length + 1, (num_requests,)
+        ).tolist()
         num_tokens_to_generate: List[Optional[int]]
         if use_fixed_output_lengths:
             num_tokens_to_generate = [
@@ -152,17 +165,13 @@ class TestDynamicInferenceEngine:
     ):
         """The inference context manages the KV cache and other inference state."""
 
-        # Max sequence length.
-        max_prompt_length = max(len(r.prompt) for r in requests)
-        max_sequence_length = test_config.max_prompt_length + test_config.max_output_length
-
         # Inference context.
         context = DynamicInferenceContext(
             params_dtype=transformer_config.params_dtype,
             num_layers=transformer_config.num_layers,
             kv_channels=transformer_config.kv_channels,
             num_attention_heads=transformer_config.num_query_groups,
-            max_sequence_length=max_sequence_length,
+            max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
@@ -218,13 +227,15 @@ class TestDynamicInferenceEngine:
             sequence_parallel=test_config.sequence_parallel,
             pipeline_dtype=torch.bfloat16,
             add_bias_linear=test_config.expert_model_parallel_size == 1,
+            inference_sampling_seed=random_seed,
         )
 
         # Requests.
         requests = cls._build_requests(
             num_requests=test_config.num_requests,
+            min_prompt_length=test_config.min_prompt_length,
             max_prompt_length=test_config.max_prompt_length,
-            max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
+            max_sequence_length=test_config.max_sequence_length,
             vocab_size=vocab_size,
             use_fixed_output_lengths=test_config.use_fixed_output_lengths,
         )
@@ -245,7 +256,7 @@ class TestDynamicInferenceEngine:
             config=transformer_config,
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=vocab_size,
-            max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
+            max_sequence_length=test_config.max_sequence_length,
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
@@ -284,13 +295,19 @@ class TestDynamicInferenceEngine:
             tokenizer=types.SimpleNamespace(vocab_size=vocab_size),
         )
 
+        # Reset global cuda graph state.
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
         # Inference engine.
         engine = DynamicInferenceEngine(
             text_generation_controller,
             inference_context,
             termination_id=vocab_size - 1,
             random_seed=random_seed,
-            enable_cuda_graph=False,
+            enable_cuda_graph=test_config.num_cuda_graphs is not None
+            and test_config.actually_build_cuda_graphs,
         )
 
         # Test env.
@@ -375,26 +392,33 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_simple(self) -> None:
+    @pytest.mark.parametrize(
+        "num_cuda_graphs", [None, 4]
+    )  # todo: cannot run test case with multiple num_cuda_graphs like [None, 1, 4]
+    def test_simple(self, num_cuda_graphs) -> None:
         """Simple test that runs without errors, and validates output."""
 
         # Run test.
-        env = self._run_test()
+        env = self._run_test(
+            num_cuda_graphs=num_cuda_graphs,
+            actually_build_cuda_graphs=num_cuda_graphs is not None,
+            context_max_requests_override=32,
+        )
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 8
+        assert env.engine.context.max_requests == 32
         assert env.engine.context.max_tokens == 160
 
         # Validate output tokens.
         expected_outputs = [
-            [69, 85, 55, 74, 85, 89],
-            [29, 54, 33, 30, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98],
-            [35, 78, 64, 59, 55, 67, 15, 58, 6, 37],
-            [54, 16, 79, 98, 22, 5, 60, 0, 1, 76],
-            [57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0],
-            [85, 75, 30, 68, 23, 33, 20, 76, 97, 36, 37, 99],
-            [32, 49, 54, 47, 22, 1, 87, 30, 36, 26],
-            [93, 24, 77, 11, 25, 7, 92, 97, 27, 56, 82],
+            [69, 85, 55, 74, 85, 89, 64, 59, 55, 67],
+            [29, 54, 33, 30, 45, 76, 41, 56, 28, 25, 94, 2, 61, 6, 98],
+            [35, 78, 54, 32, 79, 98, 22, 5, 60],
+            [25, 75, 57, 85, 81],
+            [32, 5, 15, 58, 6, 37, 54, 47, 22, 1, 87, 42, 36, 26, 27, 56],
+            [85, 51, 88, 62, 71],
+            [30, 0, 1, 76, 77, 11, 25],
+            [23, 15, 70, 76, 97, 36, 37, 99],
         ]
 
         assert len(env.requests) == len(expected_outputs)
@@ -429,12 +453,47 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_token_overflow(self) -> None:
-        """Test token overflow."""
+    def test_token_overflow_transient(self) -> None:
+        """Test token overflow (transient)."""
+        test_config = DynamicEngineTestConfig(
+            min_prompt_length=6,
+            max_prompt_length=6,
+            max_output_length=2,
+            context_max_tokens_override=8,
+        )
+        env = self._build_test_env(test_config)
+        for request_id, request in enumerate(env.requests):
+            env.engine.add_request(request_id, request.prompt, request.num_tokens_to_generate)
+        assert list(env.engine.waiting_request_ids) == [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+        ], f"waiting_request_ids: {list(env.engine.waiting_request_ids)}."
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.skip(
+        reason="activate for `megatron-core >= 0.15`, after fixing "
+        "`raise TokenOverflowError(is_transient=False)` compatibility with "
+        "legacy tests."
+    )
+    def test_token_overflow_nontransient(self) -> None:
+        """Test token overflow (non-transient)."""
         test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
         env = self._build_test_env(test_config)
-        env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
-        assert list(env.engine.waiting_request_ids) == [0]
+        try:
+            env.engine.add_request(
+                0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate
+            )
+        except TokenOverflowError as e:
+            assert e.is_transient == False
+        else:
+            raise Exception("should have raised TokenOverflowError(is_transient=False).")
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -464,11 +523,11 @@ class TestDynamicInferenceEngine:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)
 
-    def test_cuda_graph_request_counts(self) -> None:
-        """Test initialization of `cuda_graph_request_counts` in dynamic context."""
+    def test_cuda_graph_token_counts(self) -> None:
+        """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
         # Test num_cuda_graphs.
-        for num_cuda_graphs, expected_cuda_graph_request_counts in [
+        for num_cuda_graphs, expected_cuda_graph_token_counts in [
             (0, [64]),
             (1, [64]),
             (2, [64, 32]),
@@ -478,35 +537,26 @@ class TestDynamicInferenceEngine:
             (64, [64, 56, 48, 40, 32, 24, 16, 8]),
             (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
+
+            # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
             )
-            actual_cuda_graph_request_counts = env.engine.context.cuda_graph_request_counts
+            actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
             assert (
-                actual_cuda_graph_request_counts == expected_cuda_graph_request_counts
-            ), "num_cuda_graphs %d ... cuda_graph_request_counts: expected %s, found %s." % (
+                actual_cuda_graph_token_counts == expected_cuda_graph_token_counts
+            ), "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s." % (
                 num_cuda_graphs,
-                expected_cuda_graph_request_counts,
-                actual_cuda_graph_request_counts,
+                expected_cuda_graph_token_counts,
+                actual_cuda_graph_token_counts,
             )
 
-    def test_cuda_graph_warmup(self) -> None:
-        """Test initialization during cuda graph warmup."""
-
-        # Initialize context.
-        env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))
-
-        context = env.engine.context
-        assert context.is_decode_only()
-        assert context.cuda_graph_request_counts == [
-            32,
-            24,
-            16,
-            8,
-        ], "cuda_graph_request_counts: %s." % str(context.cuda_graph_request_counts)
-
-        # Iterate request counts.
-        for num_warmup_requests, expected_cuda_graph_request_count in [
+    @pytest.mark.parametrize(
+        "warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]
+    )
+    @pytest.mark.parametrize(
+        "num_warmup_tokens, expected_cuda_graph_token_count",
+        [
             (1, 8),
             (2, 8),
             (4, 8),
@@ -518,37 +568,88 @@ class TestDynamicInferenceEngine:
             (24, 24),
             (28, 32),
             (32, 32),
-        ]:
+        ],
+    )
+    def test_cuda_graph_warmup(
+        self,
+        warmup_engine_mode: WarmupEngineMode,
+        num_warmup_tokens: int,
+        expected_cuda_graph_token_count: int,
+    ) -> None:
+        """Test initialization during cuda graph warmup."""
+        if num_warmup_tokens == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
+            pytest.skip("WarmupEngineMode.NON_DECODE with num_warmup_tokens=1 is not supported.")
 
-            # Initialize attention state.
-            context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+        # Initialize context.
+        env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))
 
-            # Validate request & token counts.
-            assert (
-                expected_cuda_graph_request_count
-                == context.padded_active_request_count
-                == context.padded_active_token_count
-            ), (
-                "failed ... num_warmup_requests (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
-                % (
-                    num_warmup_requests,
-                    expected_cuda_graph_request_count,
-                    context.padded_active_request_count,
-                    context.padded_active_token_count,
-                )
+        context = env.engine.context
+        assert context.is_decode_only()
+        assert context.cuda_graph_token_counts == [
+            32,
+            24,
+            16,
+            8,
+        ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_token_counts)
+
+        context.initialize_attention_state(
+            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
+        )
+
+        # Validate request & token counts.
+
+        assert (
+            expected_cuda_graph_token_count
+            == context.padded_active_request_count
+            == context.padded_active_token_count
+        ), (
+            "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
+            % (
+                num_warmup_tokens,
+                expected_cuda_graph_token_count,
+                context.padded_active_request_count,
+                context.padded_active_token_count,
             )
+        )
 
-            # Validate input/position dimensions.
-            input_ids, pos_ids = context.current_input_and_position_ids()
-            assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_request_count
+        # Validate input/position dimensions.
+        input_ids, pos_ids = context.current_input_and_position_ids()
+        assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
+        assert context.using_cuda_graph_this_step, (
+            "expected `using_cuda_graph_this_step` to be True for decode step with "
+            "num_warmup_tokens <= max_requests."
+        )
+        context.reset()
 
-        # Test active request count overflow.
-        for num_warmup_requests in (64, 128, 1024):
+        # Test active request count overflow
+        for num_warmup_tokens in (64, 128, 1024):
             try:
-                context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+                context.initialize_attention_state(
+                    num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
+                )
             except ActiveRequestCountOverflowError as e:
                 continue
             raise Exception("`ActiveRequestCountOverflowError should have been raised.")
+
+        context.reset()
+
+        # test the case where the active token count exceeds max requests.
+        # expectation: we should be in non-decode mode and not using cuda graphs
+
+        # add all requests to the context.
+        for request_id in tqdm(range(len(env.requests)), "add requests"):
+            env.engine.add_request(
+                request_id, env.requests[request_id].prompt, num_tokens_to_generate=1
+            )
+
+        # we should now have more active tokens than max requests.
+        context.initialize_attention_state()
+        assert not context.is_decode_only()
+        assert not context.using_cuda_graph_this_step(), (
+            "expected `using_cuda_graph_this_step` to be False for non-decode step where "
+            "the active token count exceeds max requests"
+        )
+        context.reset()
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -677,3 +778,23 @@ class TestDynamicInferenceEngine:
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
+
+
+if __name__ == "__main__":
+    test = TestDynamicInferenceEngine()
+    test.test_simple()
+    test.test_overflow_factor()
+    test.test_request_overflow()
+    test.test_token_overflow_transient()
+    test.test_token_overflow_nontransient()
+    test.test_chunk_overflow()
+    test.test_multi_add()
+    test.test_fixed_output_lengths()
+    test.test_cuda_graph_request_counts()
+    test.test_cuda_graph_warmup()
+    test.test_generate_function()
+    asyncio.run(test.test_run_engine())
+    test.test_return_log_probs()
+    test.teardown_method(None)
+    print("~~~")
+    print("success.")

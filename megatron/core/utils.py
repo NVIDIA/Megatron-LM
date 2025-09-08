@@ -3,6 +3,7 @@
 """Utility functions used throughout Megatron core"""
 
 import array
+import asyncio
 import functools
 import hashlib
 import inspect
@@ -665,9 +666,9 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
 
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
+    *args: Any,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    *args: Any,
     **kwargs: Any,
 ):
     """Log on first rank in each pipeline stage
@@ -1983,3 +1984,13 @@ def unwrap_model(model, module_instances=None):
     if not return_list:
         return unwrapped_model[0]
     return unwrapped_model
+
+
+def get_asyncio_loop():
+    """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as e:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop

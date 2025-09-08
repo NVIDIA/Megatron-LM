@@ -46,13 +46,14 @@ def is_pending(target_branch: str):
     is_pending = (
         pipeline.attributes['status'] == 'pending' or pipeline.attributes['status'] == 'running'
     )
+    is_canceled = pipeline.attributes['status'] == 'canceled'
 
     if not is_pending:
         logger.info(
             f"Main pipeline {pipeline.id} finished with status {pipeline.attributes['status']}"
         )
 
-    return is_pending
+    return is_pending or is_canceled
 
 
 def is_sucess(target_branch: str):

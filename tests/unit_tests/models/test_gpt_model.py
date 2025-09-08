@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -284,7 +284,7 @@ class TestGPTModelWithCustomPG:
         embd_group = torch.distributed.new_group(
             ranks=embd_group_ranks, timeout=timedelta(minutes=30)
         )
-        model_comm_pgs = ModelCommProcessGroups(
+        pg_collection = ProcessGroupCollection(
             tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group
         )
 
@@ -299,7 +299,7 @@ class TestGPTModelWithCustomPG:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=512,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
             post_process=False,
         )
 

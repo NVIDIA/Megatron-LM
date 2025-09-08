@@ -64,6 +64,11 @@ def add_text_generate_ptq_args(parser):
         help="Enable real low-bit quantization.",
     )
     group.add_argument(
+        "--disable-qkv-quant",
+        action="store_true",
+        help="Disable q, k, v linear from being quantized.",
+    )
+    group.add_argument(
         "--weight-only",
         action="store_true",
         help="Disable input quantization.",
@@ -100,6 +105,8 @@ def get_modelopt_torch_quantization_config():
         "axis": None,
         "enable": True,
     }
+    # Disable mamba-mixer quantization for now.
+    mtq_config["quant_cfg"]["*mixer.*"] = {"enable": False}
     if "fp8" == args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
@@ -111,6 +118,10 @@ def get_modelopt_torch_quantization_config():
         if isinstance(weight_quantizer, list):
             weight_quantizer = weight_quantizer[0]
         weight_quantizer["block_sizes"][-1] = 128
+   
+    # Customization
+    if args.disable_qkv_quant:
+        mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
     if args.export_kv_cache_quant and not args.compress:
         mtq_config["quant_cfg"]["*linear_qkv.output_quantizer"] = fp8_config
     if args.weight_only:
@@ -220,7 +231,8 @@ if __name__ == "__main__":
             if "amax" not in k and "_scale" not in k:
                 continue
             if isinstance(v, torch.Tensor):
-                print("{:80} {:32} max {:.4e}".format(k, str(v.shape), torch.max(torch.abs(v))))
+                v_amax = torch.max(torch.abs(v.clone().detach().to(torch.bfloat16)))
+                print("{:80} {:32} {:32} max {:.4e}".format(k, str(v.dtype), str(v.shape), v_amax))
             else:
                 print("{:80}".format(k))
 

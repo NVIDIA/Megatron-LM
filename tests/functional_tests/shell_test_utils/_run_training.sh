@@ -44,7 +44,7 @@ cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$
 TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
 
 # Pull env vars to export
-ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
+ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
 while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -56,7 +56,7 @@ while IFS= read -r ARGUMENT; do
 done <<<"$ENV_VARS"
 
 # Run before script
-BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.BEFORE_SCRIPT')
+BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
 if [[ "$BEFORE_SCRIPT" != null ]]; then
     eval "$BEFORE_SCRIPT"
 fi
@@ -65,7 +65,7 @@ fi
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     PARAMS=()
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == true); .value = "true") | .key + "=" + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(/usr/local/bin/yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == true); .value = "true") | .key + "=" + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
@@ -92,14 +92,14 @@ else
     # If this is a second run (of checkpoint-resume), we might want to use a
     # different model configuration than during first time. So if key `MODEL_ARGS_2`
     # exists we use it, otherwise we use the same as for the first run.
-    if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' "$TRAINING_PARAMS_PATH") == true ]]; then
+    if [[ $RUN_NUMBER -eq 2 && $(/usr/local/bin/yq 'has("MODEL_ARGS_2")' "$TRAINING_PARAMS_PATH") == true ]]; then
         export KEY="MODEL_ARGS_2"
     else
         export KEY="MODEL_ARGS"
     fi
 
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(/usr/local/bin/yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
@@ -177,13 +177,13 @@ nvidia-smi pmon -c 1
 
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 
 # Run after script
-AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
+AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
 fi 
