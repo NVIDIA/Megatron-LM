@@ -125,6 +125,25 @@ class DotProductAttention(MegatronModule):
         )
         assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
+        # 保存forward输入tensor (pre-FA)
+        from megatron.core.tensor_saver import save_attention_tensors
+        import os
+        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+        save_attention_tensors(
+            query=query,
+            key=key, 
+            value=value,
+            quant_type=custom_quant_type,
+            operation="forward",
+            layer_idx=getattr(self, 'layer_number', None),
+            phase="pre",
+            component="FA",
+            metadata={
+                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
+            }
+        )
+
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
         # ===================================
@@ -163,7 +182,9 @@ class DotProductAttention(MegatronModule):
         # import pdb;pdb.set_trace()
         from quant.mxfp import mxfp_baddbmm
         from quant.hifp import hifp_baddbmm
-        custom_quant_type = 'hifp8'
+        # 从环境变量获取量化类型，默认为hifp8
+        import os
+        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
         if custom_quant_type == 'mxfp4':
             matmul_result = mxfp_baddbmm(
                 matmul_input_buffer,
@@ -235,7 +256,8 @@ class DotProductAttention(MegatronModule):
         # matmul: [b * np, sq, hn]
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-        custom_quant_type = 'hifp8'
+        # 使用相同的量化类型
+        # custom_quant_type 已在上面定义
         if custom_quant_type == 'hifp8':
             context = hifp_matmul(attention_probs, value.transpose(0, 1))
         elif custom_quant_type == 'mxfp8':
@@ -253,5 +275,23 @@ class DotProductAttention(MegatronModule):
         # [sq, b, np, hn] --> [sq, b, hp]
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
+
+        # 保存forward输出tensor (post-FA)
+        from megatron.core.tensor_saver import save_tensor
+        save_tensor(
+            tensor=context,
+            layer_type="attention",
+            operation="forward",
+            quant_type=custom_quant_type,
+            tensor_name="output",
+            layer_idx=getattr(self, 'layer_number', None),
+            phase="post",
+            component="FA",
+            metadata={
+                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
+                "output_shape": list(context.shape),
+            }
+        )
 
         return context

@@ -1,261 +1,206 @@
-# Megatron-LM 量化训练脚本系统
+# Script目录结构说明
 
-## 📋 概述
+这个目录包含了Megatron-LM项目的所有脚本文件，按功能分类组织。
 
-这是一个完整的Megatron-LM量化训练脚本系统，支持多种模型、数据集和量化方式的组合训练。系统提供了灵活的配置管理和精确的量化控制。
-
-## 🎯 支持配置
-
-### 模型支持 (3个)
-- **llama31-8b**: LLaMA 3.1 8B模型
-- **llama32-1b**: LLaMA 3.2 1B模型  
-- **deepseek2_lite**: DeepSeek2 Lite模型
-
-### 数据集支持 (2个)
-- **wikipedia**: Wikipedia数据集
-- **dolma**: Dolma数据集
-
-### 量化方式支持 (10种)
-
-#### 1. 无量化
-- **bf16**: BF16精度，无量化
-
-#### 2. FA量化 (Flash Attention量化)
-- **FA_mxfp8**: 只对Flash Attention的QK进行MXFP8量化
-- **FA_mxfp4**: 只对Flash Attention的QK进行MXFP4量化
-- **FA_hifp8**: 只对Flash Attention的QK进行HIFP8量化
-
-#### 3. Linear量化 (线性层量化)
-- **linear_mxfp8**: 只对线性层进行MXFP8量化
-- **linear_mxfp4**: 只对线性层进行MXFP4量化
-- **linear_hifp8**: 只对线性层进行HIFP8量化
-
-#### 4. FA+Linear量化 (组合量化)
-- **FA_linear_mxfp8**: FA QK + Linear层都进行MXFP8量化
-- **FA_linear_mxfp4**: FA QK + Linear层都进行MXFP4量化
-- **FA_linear_hifp8**: FA QK + Linear层都进行HIFP8量化
-
-## 🛠️ 核心工具
-
-### 1. 训练配置脚本
-- **`train_config.py`**: 主要训练配置脚本，支持所有模型和量化组合
-- **`flash_attention_config.py`**: Flash Attention专用配置脚本
-
-### 2. 量化控制工具
-- **`quant_type_modifier.py`**: 量化类型修改工具，用于修改源码中的量化设置
-
-## 🚀 使用方法
-
-### 基本用法
-
-#### 使用训练配置脚本
-```bash
-# 查看所有可用配置
-python3 train_config.py --list
-
-# 运行训练
-python3 train_config.py --model llama31-8b --dataset wikipedia --quantization bf16
-python3 train_config.py --model deepseek2_lite --dataset dolma --quantization FA_linear_mxfp8
-
-# 快速测试
-python3 train_config.py --model llama32-1b --dataset wikipedia --quantization linear_mxfp4 --training-config fast
-
-# 预览命令（不实际执行）
-python3 train_config.py --model llama31-8b --dataset wikipedia --quantization mxfp8 --dry-run
-```
-
-#### 使用Flash Attention配置脚本
-```bash
-# 查看Flash Attention量化选项
-python3 flash_attention_config.py --list
-
-# 运行Flash Attention量化训练
-python3 flash_attention_config.py --model llama31-8b --dataset wikipedia --fa-quantization qk_mxfp8
-```
-
-#### 使用单独的训练脚本
-```bash
-# FA量化 (只量化Flash Attention的QK)
-./llama31-8b/pretrain_llama31-8b_wikipedia_FA_mxfp8.sh
-./llama32-1b/pretrain_llama32-1b_dolma_FA_mxfp4.sh
-
-# Linear量化 (只量化线性层)
-./llama31-8b/pretrain_llama31-8b_wikipedia_linear_mxfp8.sh
-./deepseek2_lite/pretrain_deepseek2_lite_wikipedia_linear_hifp8.sh
-
-# FA+Linear量化 (组合量化)
-./llama31-8b/pretrain_llama31-8b_wikipedia_FA_linear_mxfp8.sh
-./deepseek2_lite/pretrain_deepseek2_lite_dolma_FA_linear_hifp8.sh
-```
-
-## 🔧 量化控制机制
-
-### 重要发现
-
-**在当前的Megatron-LM实现中，量化类型是通过硬编码的 `custom_quant_type` 变量控制的，而不是通过命令行参数！**
-
-### 量化控制位置
-
-#### 1. Linear层量化控制
-**文件**: `megatron/core/tensor_parallel/layers.py`  
-**位置**: 第783行
-
-```python
-# 当前硬编码值
-custom_quant_type = 'hifp8'
-```
-
-#### 2. Attention QK计算量化控制
-**文件**: `megatron/core/transformer/dot_product_attention.py`  
-**位置**: 第166行
-
-```python
-# 当前硬编码值
-custom_quant_type = 'hifp8'
-```
-
-#### 3. Attention PV计算量化控制
-**文件**: `megatron/core/transformer/dot_product_attention.py`  
-**位置**: 第238行
-
-```python
-# 当前硬编码值
-custom_quant_type = 'hifp8'
-```
-
-### 使用量化修改工具
-
-#### 检查当前状态
-```bash
-python3 quant_type_modifier.py --check
-```
-
-#### 修改量化类型
-```bash
-# 修改Linear层为MXFP8
-python3 quant_type_modifier.py --linear-quant mxfp8
-
-# 修改QK计算为MXFP8
-python3 quant_type_modifier.py --qk-quant mxfp8
-
-# 修改PV计算为MXFP8
-python3 quant_type_modifier.py --pv-quant mxfp8
-
-# 同时修改多个量化类型
-python3 quant_type_modifier.py --linear-quant mxfp8 --qk-quant mxfp8 --pv-quant hifp8
-```
-
-#### 恢复原始设置
-```bash
-python3 quant_type_modifier.py --restore
-```
-
-### 支持的量化类型
-
-- `'hifp8'`: HIFP8量化 (当前默认)
-- `'mxfp8'`: MXFP8量化
-- `'mxfp4'`: MXFP4量化
-- `'none'` 或其他值: 无量化，使用标准PyTorch操作
-
-## 📊 性能对比
-
-| 量化类型 | 内存节省 | 计算加速 | 精度保持 | 推荐场景 |
-|----------|----------|----------|----------|----------|
-| bf16 | 0% | 基准 | 最高 | 精度优先 |
-| FA_mxfp8 | ~15% | +10% | 高 | 注意力优化 |
-| FA_mxfp4 | ~25% | +20% | 中等 | 注意力大幅优化 |
-| linear_mxfp8 | ~20% | +15% | 高 | 线性层优化 |
-| linear_mxfp4 | ~30% | +25% | 中等 | 线性层大幅优化 |
-| FA_linear_mxfp8 | ~35% | +25% | 中等 | 全面优化 ⭐ |
-| FA_linear_mxfp4 | ~50% | +40% | 较低 | 最大优化 |
-
-## 🎯 选择建议
-
-### 推荐FA量化的情况：
-- ✅ 注意力计算是瓶颈
-- ✅ 需要保持线性层精度
-- ✅ 序列长度较长
-
-### 推荐Linear量化的情况：
-- ✅ 线性层计算是瓶颈
-- ✅ 需要保持注意力精度
-- ✅ 模型参数量大
-
-### 推荐FA+Linear量化的情况：
-- ✅ 需要最大内存节省
-- ✅ 可以接受一定精度损失
-- ✅ 全面优化性能
-
-## 🔄 完整工作流程
-
-### 量化实验流程
-```bash
-# 1. 检查当前量化状态
-python3 quant_type_modifier.py --check
-
-# 2. 修改为MXFP8量化
-python3 quant_type_modifier.py --linear-quant mxfp8 --qk-quant mxfp8 --pv-quant mxfp8
-
-# 3. 运行训练
-python3 train_config.py --model llama31-8b --dataset wikipedia --quantization mxfp8 --dry-run
-
-# 4. 修改为MXFP4量化
-python3 quant_type_modifier.py --linear-quant mxfp4 --qk-quant mxfp4 --pv-quant mxfp4
-
-# 5. 运行训练
-python3 train_config.py --model llama31-8b --dataset wikipedia --quantization mxfp4 --dry-run
-
-# 6. 恢复原始设置
-python3 quant_type_modifier.py --restore
-```
-
-## 📁 文件结构
+## 📁 目录结构
 
 ```
 script/
-├── 配置文件
-│   ├── train_config.py                    # 主要训练配置脚本
-│   ├── flash_attention_config.py          # Flash Attention配置脚本
-│   └── quant_type_modifier.py             # 量化类型修改工具
-├── 训练脚本
-│   ├── llama31-8b/                        # LLaMA 3.1 8B脚本 (20个)
-│   ├── llama32-1b/                        # LLaMA 3.2 1B脚本 (20个)
-│   └── deepseek2_lite/                    # DeepSeek2 Lite脚本 (20个)
-└── README.md                              # 本说明文档
+├── data_processing/          # 数据处理脚本
+│   ├── process_dolma_data.sh
+│   ├── process_wikipedia_data.sh
+│   ├── process_c4_data.sh
+│   ├── process_custom_data.sh
+│   ├── data_processing_utils.py
+│   └── README.md
+├── visualization/            # 可视化脚本
+│   ├── visualize_tensors.py
+│   ├── quick_visualize.py
+│   ├── one_click_visualize.sh
+│   └── README.md
+├── utils/                   # 工具脚本
+│   ├── quant_type_modifier.py
+│   ├── update_scripts_with_pattern_v2.py
+│   └── README.md
+├── templates/               # 模板文件
+│   ├── improved_script_template.sh
+│   └── README.md
+├── training/                # 训练脚本（按模型分类）
+│   ├── llama32-1b/
+│   ├── llama31-8b/
+│   └── deepseek2_lite/
+└── README.md               # 本文件
 ```
 
-## ⚠️ 重要注意事项
+## 🚀 快速开始
 
-### 1. 量化控制机制
-- **当前状态**: 量化类型通过硬编码的 `custom_quant_type` 变量控制
-- **参数效果**: `--linear-quantization` 和 `--attention-quantization` 参数实际上不存在
-- **实际控制**: 需要修改源码中的硬编码值来实现量化控制
-
-### 2. 使用建议
-- **备份源码**: 修改前请备份原始源码
-- **重新编译**: 修改后可能需要重新编译
-- **测试验证**: 修改后请测试确保功能正常
-- **版本控制**: 建议使用Git管理修改
-
-### 3. 验证修改
+### 1. 数据处理
 ```bash
-# 使用脚本验证
-python3 quant_type_modifier.py --check
+# 处理Dolma数据集
+cd data_processing
+./process_dolma_data.sh
 
-# 使用grep命令验证
-grep -n "custom_quant_type" megatron/core/tensor_parallel/layers.py
-grep -n "custom_quant_type" megatron/core/transformer/dot_product_attention.py
+# 使用工具函数
+python data_processing_utils.py --action check
 ```
 
-## 🎉 总结
+### 2. 模型训练
+```bash
+# 使用模板创建训练脚本
+cp templates/improved_script_template.sh my_training.sh
+chmod +x my_training.sh
+./my_training.sh
+```
 
-这个系统提供了完整的量化训练解决方案：
+### 3. 结果可视化
+```bash
+# 一键可视化
+cd visualization
+./one_click_visualize.sh
+```
 
-1. **3个模型**: llama31-8b, llama32-1b, deepseek2_lite
-2. **2个数据集**: wikipedia, dolma
-3. **10种量化方式**: 包括FA、Linear、FA+Linear的完整组合
-4. **60个训练脚本**: 覆盖所有可能的组合
-5. **灵活控制**: 可以精确控制哪些部分进行量化
-6. **安全工具**: 提供量化类型修改工具，支持备份和恢复
+## 📋 功能概览
 
-通过这个系统，您可以轻松进行各种量化实验，找到最适合您需求的量化配置！🚀
+### 🔧 数据处理 (data_processing/)
+- **数据集处理**: 支持Dolma、Wikipedia、C4等主流数据集
+- **格式转换**: 将原始数据转换为Megatron-LM训练格式
+- **批量处理**: 支持大规模数据集的并行处理
+- **工具函数**: 提供环境检查、时间估算等辅助功能
+
+### 📊 可视化 (visualization/)
+- **Tensor分析**: 可视化训练过程中的tensor数据
+- **量化研究**: 分析不同量化类型的影响
+- **统计图表**: 生成分布图、热力图、对比图等
+- **一键操作**: 自动生成所有分析图表
+
+### 🛠️ 工具脚本 (utils/)
+- **量化类型管理**: 批量修改脚本中的量化类型
+- **脚本模式更新**: 应用统一的脚本模式
+- **批量操作**: 支持大规模脚本文件的批量处理
+
+### 📝 模板文件 (templates/)
+- **训练脚本模板**: 功能完整的训练脚本模板
+- **标准化配置**: 统一的参数设置和错误处理
+- **易于定制**: 支持快速创建新的训练脚本
+
+### 🏋️ 训练脚本 (training/)
+- **模型分类**: 按模型类型组织训练脚本
+- **量化支持**: 支持多种量化类型 (hifp8, mxfp8, mxfp4, bf16等)
+- **数据集适配**: 支持多种数据集的训练配置
+
+## 🎯 使用场景
+
+### 1. 量化研究
+```bash
+# 1. 处理数据
+cd data_processing
+./process_dolma_data.sh
+
+# 2. 运行训练（保存tensor）
+cd ../training/llama32-1b
+./pretrain_llama32-1b_dolma_hifp8.sh
+
+# 3. 可视化分析
+cd ../../visualization
+./one_click_visualize.sh
+```
+
+### 2. 模型训练
+```bash
+# 1. 使用模板创建脚本
+cp templates/improved_script_template.sh my_training.sh
+
+# 2. 修改参数
+vim my_training.sh
+
+# 3. 运行训练
+./my_training.sh
+```
+
+### 3. 批量操作
+```bash
+# 1. 批量修改量化类型
+cd utils
+python quant_type_modifier.py --directory ../training/ --old_quant_type bf16 --new_quant_type hifp8
+
+# 2. 更新脚本模式
+python update_scripts_with_pattern_v2.py
+```
+
+## 📚 详细文档
+
+每个子目录都包含详细的README文档：
+
+- **[数据处理文档](data_processing/README.md)** - 数据处理脚本的详细说明
+- **[可视化文档](visualization/README.md)** - 可视化工具的完整指南
+- **[工具文档](utils/README.md)** - 工具脚本的使用方法
+- **[模板文档](templates/README.md)** - 模板文件的定制指南
+
+## 🔧 环境要求
+
+### 基础环境
+- Python 3.8+
+- PyTorch 1.12+
+- CUDA 11.0+
+
+### Python依赖
+```bash
+pip install matplotlib seaborn pandas scipy
+```
+
+### 环境变量
+```bash
+export CUSTOM_QUANT_TYPE="hifp8"
+export TENSOR_SAVE_DIR="./tensor_logs"
+export TENSOR_SAVE_ENABLED="true"
+```
+
+## 🚨 注意事项
+
+### 1. 文件权限
+```bash
+# 设置脚本执行权限
+chmod +x *.sh
+```
+
+### 2. 路径配置
+- 确保所有路径配置正确
+- 检查数据集和模型文件是否存在
+- 验证输出目录的写入权限
+
+### 3. 资源管理
+- 根据系统资源调整工作进程数
+- 监控磁盘空间使用情况
+- 注意内存使用峰值
+
+### 4. 错误处理
+- 查看详细的错误日志
+- 使用dry_run模式预览操作
+- 定期备份重要文件
+
+## 🤝 贡献指南
+
+### 添加新脚本
+1. 选择合适的子目录
+2. 遵循现有的命名规范
+3. 添加详细的文档说明
+4. 测试脚本功能
+
+### 修改现有脚本
+1. 创建备份文件
+2. 测试修改后的功能
+3. 更新相关文档
+4. 提交变更说明
+
+## 📞 支持
+
+如果遇到问题，请：
+1. 查看相关子目录的README文档
+2. 检查错误日志和输出信息
+3. 验证环境配置和依赖
+4. 参考使用示例和最佳实践
+
+---
+
+**最后更新**: 2024年9月8日  
+**版本**: 1.0.0

@@ -778,9 +778,28 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             total_input = all_gather_buffer
         else:
             total_input = input
+        
+        # 保存forward输入tensor (pre-linear)
+        from megatron.core.tensor_saver import save_linear_tensors
+        import os
+        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+        save_linear_tensors(
+            input_tensor=total_input,
+            weight=weight,
+            quant_type=custom_quant_type,
+            operation="forward",
+            layer_idx=getattr(ctx, 'layer_idx', None),
+            phase="pre",
+            component="linear",
+            metadata={
+                "sequence_parallel": sequence_parallel,
+                "use_bias": ctx.use_bias,
+                "tp_group_size": tp_group.size() if tp_group else None,
+            }
+        )
+        
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-        custom_quant_type = 'hifp8'
         if custom_quant_type == 'mxfp4':
             output = mxfp_matmul(total_input,weight.t(),'fp4_e2m1').to(torch.bfloat16)
         elif custom_quant_type == 'mxfp8':
@@ -791,6 +810,26 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             output = torch.matmul(total_input, weight.t()) 
         if bias is not None:
             output = output + bias
+        
+        # 保存forward输出tensor (post-linear)
+        from megatron.core.tensor_saver import save_tensor
+        save_tensor(
+            tensor=output,
+            layer_type="linear",
+            operation="forward",
+            quant_type=custom_quant_type,
+            tensor_name="output",
+            layer_idx=getattr(ctx, 'layer_idx', None),
+            phase="post",
+            component="linear",
+            metadata={
+                "sequence_parallel": sequence_parallel,
+                "use_bias": ctx.use_bias,
+                "tp_group_size": tp_group.size() if tp_group else None,
+                "output_shape": list(output.shape),
+            }
+        )
+        
         return output
 
     @staticmethod
@@ -831,9 +870,29 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
                 total_input = all_gather_buffer
             else:
                 total_input = input
+            
+            # 保存backward输入tensor (pre-linear)
+            from megatron.core.tensor_saver import save_linear_tensors
+            import os
+            custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+            save_linear_tensors(
+                input_tensor=grad_output,
+                weight=weight,
+                quant_type=custom_quant_type,
+                operation="backward",
+                layer_idx=getattr(ctx, 'layer_idx', None),
+                phase="pre",
+                component="linear",
+                metadata={
+                    "sequence_parallel": ctx.sequence_parallel,
+                    "wgrad_compute": wgrad_compute,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            )
+        
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-        custom_quant_type = 'hifp8'
+        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
         if custom_quant_type == 'mxfp4':
             grad_input = mxfp_matmul(grad_output,weight,'fp4_e2m1').to(torch.bfloat16)
         elif custom_quant_type == 'mxfp8':
@@ -910,7 +969,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             grad_weight = None
             from quant.mxfp import mxfp_matmul
             from quant.hifp import hifp_matmul
-            custom_quant_type = 'hifp8'
+            custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
             if custom_quant_type == 'mxfp4':
                 grad_weight = mxfp_matmul(grad_output.t(),total_input,'fp4_e2m1').to(torch.bfloat16)
             elif custom_quant_type == 'mxfp8':
@@ -920,6 +979,25 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             else:
                 grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
+
+        # 保存backward输出tensor (post-linear)
+        from megatron.core.tensor_saver import save_tensor
+        save_tensor(
+            tensor=grad_input,
+            layer_type="linear",
+            operation="backward",
+            quant_type=custom_quant_type,
+            tensor_name="output",
+            layer_idx=getattr(ctx, 'layer_idx', None),
+            phase="post",
+            component="linear",
+            metadata={
+                "sequence_parallel": ctx.sequence_parallel,
+                "wgrad_compute": wgrad_compute,
+                "tp_group_size": tp_group.size() if tp_group else None,
+                "output_shape": list(grad_input.shape),
+            }
+        )
 
         if ctx.sequence_parallel:
             handle.wait()
