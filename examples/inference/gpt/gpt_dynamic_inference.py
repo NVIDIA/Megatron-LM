@@ -429,7 +429,7 @@ def main():
                 output_text_escaped = "--"
                 num_output_tokens = 0
             print(
-                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
+                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {text_hash}]. "
                 f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
                 f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
             )
