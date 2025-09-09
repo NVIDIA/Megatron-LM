@@ -1,0 +1,6 @@
+- agent_type: examples.rl.environments.countdown.countdown_agent.CountdownAgent
+  agent_args: {}
+  weight: 1.0
+- agent_type: examples.rl.environments.math.openmath_agent.OpenMathInstructAgent
+  agent_args: {}
+  weight: 1.0

@@ -66,5 +66,5 @@ megatron/core/transformer/transformer_block.py
 megatron/core/transformer/transformer_layer.py
 
 [RL] @mcore-reviewers/rl
-megatron/training/rl/
+megatron/rl/
 examples/rl/
