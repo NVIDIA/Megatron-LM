@@ -837,6 +837,7 @@ class TestDynamicContext:
 
     def test_unified_memory(self):
         from megatron.core.inference.unified_memory import unified_memory_mempool
+
         if unified_memory_mempool is None:
             pytest.skip("Unified memory not available due to bad environment.")
 
