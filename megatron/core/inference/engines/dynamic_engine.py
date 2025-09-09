@@ -4,6 +4,7 @@ import asyncio
 import logging
 import multiprocessing
 import os
+import psutil
 import struct
 import time
 import warnings
@@ -170,6 +171,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = None
         if self.cuda_graph_impl == "local":
 
+            # >>>
+            raise Exception("enable_cuda_graph.")
+            # <<<
             time_start = time.time()
             mem_stats_start = torch.cuda.memory_stats()
 
@@ -261,9 +265,10 @@ class DynamicInferenceEngine(AbstractEngine):
         This method clears the cuda graph state in `cuda_graphs.py`, to allow for
         calling `create_cudagraphs()` again.
         """
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        if self.enable_cuda_graph:
+            _CudagraphGlobalRecord.cudagraph_created = False
+            _CudagraphGlobalRecord.cudagraph_record = []
+            CudaGraphManager.global_mempool = None
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -434,8 +439,11 @@ class DynamicInferenceEngine(AbstractEngine):
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
             relative_time_str = f"{end_time - start_time:.3f} sec"
             relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+
+            process = psutil.Process()
+            mem_info = process.memory_info()
             total_mem_str = (
-                f"alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
+                f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
             )
             print(
                 f"[rank {rank_str}] dynamic engine {key}, {dir_str} "
@@ -452,7 +460,13 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.deallocate_all_tensors()
 
         # Clear cuda graphs.
+        # >>>
+        # if self.enable_cuda_graph:
+        # <<<
         self.clear_cuda_graphs()
+        # >>>
+        # raise Exception("hi.")
+        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -468,7 +482,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.allocate_all_tensors()
+            self.context.allocate_all_tensors(is_init=False)
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
@@ -479,6 +493,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
 
             # Create cuda graphs (before adding requests, to be in decode mode).
+            # >>>
+            # if self.enable_cuda_graph:
+            # <<<
             self.create_cuda_graphs()
 
             # Add requests.
@@ -511,10 +528,10 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
-            # Print inner timing.
-            print(f" ... inner timing: alloc {alloc_time}, add {add_time:.3f}.")
+        # Print inner timing (must be outside context manager above for correct formatting).
+        print(f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f}.")
 
-            return futures
+        return futures
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
