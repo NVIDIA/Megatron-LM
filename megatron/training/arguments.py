@@ -34,6 +34,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import squared_relu
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1214,6 +1215,10 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.squared_relu:
         assert not args.swiglu
         kw_args['activation_func'] = squared_relu
+    elif args.quick_geglu:
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -1555,6 +1560,14 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--quick-geglu', action='store_true',
+                       help='Use quick geglu activation instead of default gelu')
+    group.add_argument('--activation-func-clamp-value', type=float, default=None,
+                       help='Clamp the output of the linear_fc1 in the activation function. Only used when '
+                            'activation_func is quick_gelu.')
+    group.add_argument('--glu-linear-offset', type=float, default=0.0,
+                       help='Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). '
+                            'Only used when gated_linear_unit is True')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
