@@ -26,7 +26,7 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 try:
-    from megatron.training import rl_utils
+    from megatron.rl import rl_utils
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
@@ -1913,7 +1913,7 @@ def train(
     timers = get_timers()
 
     if getattr(args, 'perform_rl_step', False):
-        assert has_rl_utils, "RL cannot run without the lang_rl package"
+        assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
     # Additional variable initialization for RL training
     ref_state_dict = None

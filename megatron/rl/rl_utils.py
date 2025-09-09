@@ -20,19 +20,8 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
+from wandb import wandb_run
 
-from lang_rl.agent.api import (
-    EvaluationRequest,
-    EvaluationResponse,
-    GroupedRolloutRequest,
-    Rollout,
-    TokenRollout,
-)
-from lang_rl.agent.reward_only_agent import RewardOnlyEvaluationResult
-from lang_rl.agent.weighted_multi_task import WeightedMultiTask
-from lang_rl.inference.megatron import MegatronChatLocal, MegatronLocal
-from lang_rl.logging import LOG_DIR as lang_rl_log_dir
-from lang_rl.logging import log as lang_rl_log
 from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.inference.utils import get_event_loop
@@ -41,12 +30,29 @@ from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.parallel_state import get_tensor_model_parallel_src_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.rl.agent.api import (
+    EvaluationRequest,
+    EvaluationResponse,
+    GroupedRolloutRequest,
+    Rollout,
+    TokenRollout,
+)
+from megatron.rl.agent.reward_only_agent import RewardOnlyEvaluationResult
+from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
+from megatron.rl.inference.megatron import MegatronChatLocal, MegatronLocal
+from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
+from megatron.rl.logging import log as lang_rl_log
 from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from wandb import wandb_run
 
-from .global_vars import get_args, get_tensorboard_writer, get_timers, get_wandb_writer
-from .utils import get_nvtx_range, print_rank_0
+from megatron.training.global_vars import (
+    get_args,
+    get_tensorboard_writer,
+    get_timers,
+    get_tokenizer,
+    get_wandb_writer,
+)
+from megatron.training.utils import get_nvtx_range, print_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -71,26 +77,26 @@ class RolloutStats:
 def get_agent(args):
     """Get an agent based on environment configuration.
 
-    If args.env_config is provided, uses weighted environment selection.
+    If args.langrl_env_config is provided, uses weighted environment selection.
     Otherwise falls back to legacy single environment selection.
     """
-    with open(args.env_config, 'r') as f:
+    with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
     return WeightedMultiTask.from_config(config)
 
 
 def get_inference_interface(args, loop, model):
-    if args.inference_server_type == 'inplace_megatron':
+    if args.langrl_inference_server_type == 'inplace_megatron':
         return loop.run_until_complete(MegatronLocal.launch(model[0]))
-    elif args.inference_server_type == 'inplace_megatron_chat':
+    elif args.langrl_inference_server_type == 'inplace_megatron_chat':
         return loop.run_until_complete(
             MegatronChatLocal.launch(
                 model[0], conversation_template=args.inference_server_conversation_template
             )
         )
     else:
-        raise ValueError(f"Unknown inference_server_type {args.inference_server_type}")
+        raise ValueError(f"Unknown inference_server_type {args.langrl_inference_server_type}")
 
 
 def get_environment_rollouts(model: LanguageModule, n_prompts: int, samples_per_group: int):
@@ -165,7 +171,7 @@ def get_environment_rollouts(model: LanguageModule, n_prompts: int, samples_per_
         with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.env_config).stem}.pkl',
+            + f'{Path(args.langrl_env_config).stem}.pkl',
             'wb',
         ) as f:
             pickle.dump(rollouts, f)
@@ -654,22 +660,12 @@ def get_rollout_data_iterator(
         optimizer.offload_to_cpu()
 
     with megatron_rl_inference_mode(
-        model,
-        optimizer,
-        args.enable_cuda_graph,
-        args.rl_offload_optimizer_during_inference
+        model, optimizer, args.enable_cuda_graph, args.rl_offload_optimizer_during_inference
     ):
         buffered_rollouts = get_environment_rollouts(
-            model,
-            args.grpo_prompts_per_step,
-            args.grpo_group_size
+            model, args.grpo_prompts_per_step, args.grpo_group_size
         )
-    buffered_rollouts = prepare_data_for_update(
-        model,
-        ref_state_dict,
-        buffered_rollouts,
-        tokenizer,
-    )
+    buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, tokenizer)
 
     if args.rl_offload_optimizer_during_inference:
         optimizer.restore_from_cpu()
@@ -704,7 +700,6 @@ def evaluate_and_print_results_rl(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.sequence_parallel,
             args.enable_cuda_graph,
             args.rl_offload_optimizer_during_inference,
         ):
@@ -786,7 +781,7 @@ def evaluate_and_print_results_rl(
                 with open(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
-                    + f'{Path(args.env_config).stem}.pkl',
+                    + f'{Path(args.langrl_env_config).stem}.pkl',
                     'wb',
                 ) as f:
                     pickle.dump(dp_eval_results, f)
@@ -848,7 +843,6 @@ def megatron_rl_inference_mode(
     Args:
         model: model to prepare.
         optimizer: optimizer used to train the model.
-        sequence_parallel: use sequence parallel or not.
         enable_cuda_graph: use cuda graphs or not.
         rl_offload_optimizer_during_inference: move optimizer to cpu during inference or not.
 
