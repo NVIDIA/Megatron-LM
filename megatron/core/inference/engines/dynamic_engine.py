@@ -574,6 +574,9 @@ class DynamicInferenceEngine(AbstractEngine):
             active_requests, finished_requests, step_time = self.step(sampling_params)
             finished_requests_list.extend(finished_requests)
 
+        # Ensure requests are returned in the same order they were passed in
+        finished_requests_list.sort(key=lambda x: x.request_id)
+
         return finished_requests_list
 
     def schedule_requests(self) -> int:
