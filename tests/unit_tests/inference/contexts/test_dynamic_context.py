@@ -874,11 +874,3 @@ class TestDynamicContext:
 
         # Unified memory test should succeed.
         init_contexts(unified_memory_level=1)
-
-
-if __name__ == "__main__":
-    test = TestDynamicContext()
-    test.test_unified_memory()
-    test.teardown_method(None)
-    print("~~~")
-    print("success.")
