@@ -838,14 +838,10 @@ class TestDynamicContext:
 
         self._setup_model_parallel_group(1, 1)
 
+        # Compute number of contexts needed to fill GPU memory.
         gpu_size_gb = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
         buffer_size_gb = 20
         num_contexts = math.ceil(gpu_size_gb / buffer_size_gb) + 1
-
-        # >>>
-        # from lutil import pax
-        # pax("gpu_size_gb, buffer_size_gb, num_contexts")
-        # <<<
 
         # Allocate enough contexts to fill GPU memory.
         def init_contexts(unified_memory_level):
@@ -874,15 +870,10 @@ class TestDynamicContext:
         # Unified memory test should succeed.
         init_contexts(1)
 
-        # >>>
-        from lutil import pax
-        pax()
-        # <<<
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 if __name__ == "__main__":
     test = TestDynamicContext()
     test.test_unified_memory()
     test.teardown_method(None)
-    raise Exception("hi.")
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    print("~~~")
+    print("success.")
