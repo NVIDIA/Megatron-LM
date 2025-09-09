@@ -248,6 +248,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
         self.unified_memory_level = unified_memory_level
+        if unified_memory_level > 0 and unified_memory_mempool is None:
+            warnings.warn("Unified memory requested but not available; defaulting to GPU memory.")
+            self.unified_memory_level = 0
 
         self.total_request_count = 0
         self.active_token_count = 0

@@ -1,22 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
-import pathlib
 import warnings
+from pathlib import Path
 
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
-# 1) Inline C++ source for a managed-memory allocator
 src = r"""
 #include <cuda_runtime_api.h>
 #include <cstddef>
 
 #define EXPORT extern "C"
 
-// malloc: allocate Unified (Managed) memory
-EXPORT void* my_managed_malloc(ssize_t size, int device, void* stream) {
+EXPORT void* managed_malloc(ssize_t size, int device, void* stream) {
   (void)stream;
   int cur = -1;
   cudaGetDevice(&cur);
@@ -26,7 +24,6 @@ EXPORT void* my_managed_malloc(ssize_t size, int device, void* stream) {
   cudaError_t err = cudaMallocManaged(&ptr, (size_t)size, cudaMemAttachGlobal);
   if (err != cudaSuccess) return nullptr;
 
-  // Optional hints to reduce first-touch page faults:
   if (device >= 0) {
     cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
     cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
@@ -34,37 +31,31 @@ EXPORT void* my_managed_malloc(ssize_t size, int device, void* stream) {
   return ptr;
 }
 
-// free
-EXPORT void my_managed_free(void* ptr, ssize_t size, int device, void* stream) {
+EXPORT void managed_free(void* ptr, ssize_t size, int device, void* stream) {
   (void)size; (void)device; (void)stream;
   if (ptr) cudaFree(ptr);
 }
 """
 
-# 2) JIT-compile a tiny extension that exports those C symbols.
-#    We link against cudart; on most systems, -lcudart is enough if CUDA is on LD_LIBRARY_PATH.
 extra_ldflags = ["-lcudart"]
 if CUDA_HOME:
-    # help linker find libcudart if not on the default path
-    cand = os.path.join(CUDA_HOME, "lib64")
-    if os.path.isdir(cand):
-        extra_ldflags = [f"-L{cand}", "-lcudart"]
+    cuda_lib = os.path.join(CUDA_HOME, "lib64")
+    if os.path.isdir(cuda_lib):
+        extra_ldflags = [f"-L{cuda_lib}", "-lcudart"]
 
 try:
     mod = load_inline(
         name="managed_alloc_runtime",
         cpp_sources=[src],
-        functions=[],  # no pybind functions; we just want the .so with our exported symbols
-        with_cuda=True,  # ensures CUDA include paths & NVCC toolchain are available
+        functions=[]
+        with_cuda=True,
         extra_ldflags=extra_ldflags,
         verbose=False,
     )
 
-    # 3) Locate the built shared library and plug it into PyTorch
-    so_path = pathlib.Path(mod.__file__).as_posix()
-    alloc = CUDAPluggableAllocator(so_path, "my_managed_malloc", "my_managed_free").allocator()
+    so_path = Path(mod.__file__).as_posix()
+    alloc = CUDAPluggableAllocator(so_path, "managed_malloc", "managed_free").allocator()
     unified_memory_mempool = torch.cuda.MemPool(allocator=alloc)
-
 except RuntimeError:
-    warnings.warn("Ninja is required to load C++ extensions (pip install ninja to get it).")
+    warnings.warn("Unified memory mempool is not available.")
     unified_memory_mempool = None
