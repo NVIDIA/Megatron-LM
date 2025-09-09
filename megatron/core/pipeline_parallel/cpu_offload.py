@@ -238,7 +238,6 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
                             break
         if self.offload_count_per_layer[group_to_reload] == 0:
             self._offloaded_group_count = group_to_reload
-        self._b_event.record(self.h2d_stream)
 
     def pre_reload_last_layer(self):
         if not self.do_offload:
