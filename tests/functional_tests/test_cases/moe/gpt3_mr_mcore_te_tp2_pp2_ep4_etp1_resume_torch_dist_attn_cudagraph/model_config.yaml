@@ -105,6 +105,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 25
+  --dist-ckpt-optim-fully-reshardable: true
   # Add initialization args
   --init-method-std: 0.02
   # Add logging args

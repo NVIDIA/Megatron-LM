@@ -9,7 +9,7 @@ import torch
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor
-from ..process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
@@ -35,8 +35,7 @@ class DistributedDataParallel(_BaseDataParallel):
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
-        grad_comm_pgs: Optional gradient communication process groups.
-        model_comm_pgs: Optional model parallel communication process groups.
+        pg_collection: Optional unified process group for distributed training.
 
     """
 
@@ -46,8 +45,7 @@ class DistributedDataParallel(_BaseDataParallel):
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         disable_bucketing: bool = False,
-        grad_comm_pgs: Optional[GradCommProcessGroups] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -73,7 +71,8 @@ class DistributedDataParallel(_BaseDataParallel):
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
-        if grad_comm_pgs is None and model_comm_pgs is None:
+
+        if pg_collection is None:
             self.dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )
@@ -91,88 +90,27 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.inter_dist_opt_group = (
                     parallel_state.get_inter_distributed_optimizer_instance_group()
                 )
-
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
             self.ep_group = parallel_state.get_expert_model_parallel_group()
-        elif grad_comm_pgs is not None and model_comm_pgs is not None:
-            # 1. dp group - this is always required
-            if not hasattr(grad_comm_pgs, 'dp'):
-                raise ValueError("dp process group is required but not provided in grad_comm_pgs")
-            self.dp_group = grad_comm_pgs.dp
-
-            # 2. dp_cp group:
-            # - If provided in grad_comm_pgs, use it
-            # - Otherwise check context_parallel_size
-            #   - If cp_size is 1, use same as dp
-            #   - If cp_size > 1, raise error as dp_cp is needed
-            if hasattr(grad_comm_pgs, 'dp_cp'):
-                self.dp_cp_group = grad_comm_pgs.dp_cp
-            else:
-                cp_size = getattr(config, 'context_parallel_size', 1)
-                if cp_size == 1:
-                    # If no context parallelism, dp_cp is same as dp
-                    self.dp_cp_group = self.dp_group
-                else:
-                    raise ValueError(
-                        "dp_cp process group is required when context_parallel_size > 1 "
-                        "but not provided in grad_comm_pgs"
-                    )
-
-            # 3. Handle expert data parallel group
-            if hasattr(grad_comm_pgs, 'expt_dp'):
-                self.expt_dp_group = grad_comm_pgs.expt_dp
-            else:
-                # Create a new group with just the current rank
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "No expert data parallel group provided in grad_comm_pgs, "
-                    "creating a new one with just the current rank",
-                )
-                # Ideally we dont want any expt_dp_group if not using expt_dp
-                # but downstream code expects.
-                # this is used to check size and calculate scaling factor.
-                self.expt_dp_group = torch.distributed.new_group(
-                    ranks=[torch.distributed.get_rank()]
-                )
-
-            # 4. Handle intra_dp_cp, intra_expt_dp, and inter_dist_opt
-            #    based on optimizer instances:
-            if self.ddp_config.num_distributed_optimizer_instances == 1:
-                # With a single optimizer instance:
-                # - intra_dp_cp is same as dp_cp
-                # - intra_expt_dp is same as expt_dp
-                # - inter_dist_opt is not needed
-                self.intra_dp_cp_group = self.dp_cp_group
-                self.intra_expt_dp_group = self.expt_dp_group
-            else:
-                # With multiple optimizer instances, both groups must be provided
-                if not (
-                    hasattr(grad_comm_pgs, 'intra_dp_cp')
-                    and hasattr(grad_comm_pgs, 'intra_expt_dp')
-                    and hasattr(grad_comm_pgs, 'inter_dist_opt')
-                ):
-                    raise ValueError(
-                        "intra_dp_cp, intra_expt_dp, and inter_dist_opt "
-                        "process groups are required when using multiple optimizer "
-                        "instances (>1) but not provided in grad_comm_pgs"
-                    )
-                self.intra_dp_cp_group = grad_comm_pgs.intra_dp_cp
-                self.intra_expt_dp_group = grad_comm_pgs.intra_expt_dp
-                self.inter_dist_opt_group = grad_comm_pgs.inter_dist_opt
-
-            # 5. pp and ep group
-            if not all([hasattr(model_comm_pgs, 'pp'), hasattr(model_comm_pgs, 'ep')]):
-                raise ValueError(
-                    "pp and ep process groups are required but not provided in model_comm_pgs"
-                )
-            self.pp_group = model_comm_pgs.pp
-            self.ep_group = model_comm_pgs.ep
-
         else:
-            raise ValueError(
-                "Grad and model comm process groups must be provided or both must be None"
+            # Setup process groups using DDP-specific helper method
+            process_groups = ProcessGroupCollection.setup_process_groups_for_ddp(
+                pg_collection, config, self.ddp_config
             )
+
+            self.dp_group = process_groups['dp_group']
+            self.dp_cp_group = process_groups['dp_cp_group']
+            self.intra_dp_cp_group = process_groups['intra_dp_cp_group']
+            self.expt_dp_group = process_groups['expt_dp_group']
+            self.intra_expt_dp_group = process_groups['intra_expt_dp_group']
+            self.tp_group = process_groups['tp_group']
+            self.pp_group = process_groups['pp_group']
+            self.ep_group = process_groups['ep_group']
+
+            # Set inter_dist_opt_group if multiple optimizer instances
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                self.inter_dist_opt_group = process_groups['inter_dist_opt_group']
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
@@ -279,6 +217,9 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Allocate the grad buffers and map the grads.
             buffers = []
+            pg_collection = ProcessGroupCollection()
+            pg_collection.tp = self.tp_group
+            pg_collection.dp_cp = self.dp_cp_group
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
                     _ParamAndGradBuffer(
@@ -292,6 +233,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                         self.ddp_config.nccl_ub,
+                        pg_collection,
                     )
                 )
 

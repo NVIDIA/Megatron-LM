@@ -41,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 try:
     # Default to Megatron-LM FW.
-    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
@@ -52,9 +51,11 @@ try:
     )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
     from megatron.core.utils import is_submodule, is_te_min_version
+
+    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
+
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
-    logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import (
         get_cuda_rng_tracker,
@@ -65,6 +66,8 @@ except ImportError:
         quantize_param_shard,
     )
 
+    logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
+
 try:
     from transformer_engine.pytorch import fp8_model_init
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
@@ -74,9 +77,14 @@ except Exception:
     HAVE_TE = False
 
 try:
-    import apex.contrib.nccl_allocator as nccl_allocator
+    # Try to import the MCore NCCL nccl_allocator first.
+    # If it fails, try to import the APEX NCCL nccl_allocator.
+    import megatron.core.nccl_allocator as nccl_allocator
 except ImportError:
-    nccl_allocator = None
+    try:
+        import apex.contrib.nccl_allocator as nccl_allocator
+    except ImportError:
+        nccl_allocator = None
 
 NCCL_MEMORY_POOL = None
 
@@ -144,9 +152,9 @@ ShardBucketIndex = namedtuple(
 )
 
 
-class DualUBRAllocator:
+class MultiGroupUBRAllocator:
     """
-    A custom allocator class that registers a single memory pool with two different
+    A custom allocator class that registers a single memory pool with multiple different
     communication groups, which is not natively supported by apex's nccl_allocator.
 
     This is particularly useful for Mixture of Experts (MoE) models where:
@@ -168,42 +176,40 @@ class DualUBRAllocator:
         pool = nccl_allocator.create_nccl_mem_pool()
         group_1 = torch.distributed.new_group(ranks=[0, 1, 2, 3, 4, 5, 6, 7], backend="nccl")
         group_2 = torch.distributed.new_group(ranks=[0, 2, 4, 6], backend="nccl")
-        with DualUBRAllocator(pool, group_1, group_2):
+        with MultiGroupUBRAllocator(pool, groups=[group_1, group_2]):
             a = torch.zeros(1024, dtype=torch.float32, device="cuda")
             b = torch.zeros(1024, dtype=torch.float32, device="cuda")
         ```
     """
 
-    def __init__(
-        self,
-        pool,  # torch.cuda.MemPool
-        group,  # torch.distributed.ProcessGroup
-        additional_group,  # torch.distributed.ProcessGroup
-    ):
+    def __init__(self, pool, groups):  # torch.cuda.MemPool  # torch.distributed.ProcessGroup
         self.pool = pool
-        self.group = group
-        self.additional_group = additional_group
-        self.mem_allocator = nccl_allocator.nccl_mem(self.pool, group=self.group)
+        self.groups = groups
+        self.mem_allocator = nccl_allocator.nccl_mem(self.pool, group=self.groups[0])
+        assert len(self.groups) > 1, "MultiGroupUBRAllocator requires at least two groups"
 
     def __enter__(self):
-        backend = self.additional_group._get_backend(
-            torch.device("cuda", torch.cuda.current_device())
-        )
-        try:
-            # Since the registration is done in mempool granularity, we need to deregister
-            # the tensors in the mempool and re-register the mempool including the newly created
-            # tensors after the context is exited.
-            backend.deregister_mem_pool(self.pool)
-        except RuntimeError:
-            pass
+        for group in self.groups[1:]:
+            backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+            try:
+                # Since the registration is done in mempool granularity, we need to deregister
+                # the tensors in the mempool and re-register the mempool including the newly created
+                # tensors after the context is exited.
+                backend.deregister_mem_pool(self.pool)
+            except RuntimeError:
+                pass
         self.mem_allocator.__enter__()
 
     def __exit__(self, *args):
         self.mem_allocator.__exit__(*args)
-        backend = self.additional_group._get_backend(
-            torch.device("cuda", torch.cuda.current_device())
-        )
-        backend.register_mem_pool(self.pool)
+        for group in self.groups[1:]:
+            backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
+                    f"group.group_desc:{group.group_desc}"
+                )
+            backend.register_mem_pool(self.pool)
 
 
 @dataclasses.dataclass
@@ -1547,15 +1553,23 @@ class ParamAndGradBuffer:
         self.reset_parameters_for_meta_device_init_module = (
             reset_parameters_for_meta_device_init_module
         )
-
+        self.ubr_groups = None
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
+            assert nccl_allocator is not None, (
+                "To use user buffer registration, "
+                "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
+            )
             # Since the user buffer registration requires (non-dynamic) persistent memory,
             # it always uses fsdp double buffer.
             self.ddp_config.fsdp_double_buffer = True
             # Initialize the NCCL memory pool.
             global NCCL_MEMORY_POOL
-            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool()
+            # Initialize NCCL allocator runtime if available
+            nccl_allocator.init()
+            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
+                symmetric=not self.ddp_config.disable_symmetric_registration
+            )
             if torch.distributed.get_rank() == 0:
                 logging.info(
                     f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for \
@@ -1564,13 +1578,41 @@ class ParamAndGradBuffer:
                 logging.info(
                     f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled."
                 )
+            # Select the communicator groups to register FSDP buffers.
+            self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
+            if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
+                # Expert-DP group when using EP
+                self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
+            if self.dist_index.get_inter_fsdp_group() is not None:
+                # Inner-FSDP group when using hybrid FSDP
+                self.ubr_groups.append(self.dist_index.get_inter_fsdp_group())
+
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):"
+                )
+            # All ranks in each group must participate in the collective to avoid deadlock.
+            for i, group in enumerate(self.ubr_groups):
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        f"Group [{i+1}/{len(self.ubr_groups)}] \
+                            group.group_desc: {group.group_desc}, group.size(): {group.size()}"
+                    )
+                torch.distributed.barrier(group=group, async_op=False)
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] \
+                            group.group_desc: {group.group_desc}"
+                    )
+            # Call barrier from the global communitcator group
+            torch.distributed.barrier(async_op=False)
+            if torch.distributed.get_rank() == 0:
+                logging.info(f"Call Success with the global communicator group")
+
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
-        self.mem_alloc_context = self.get_mem_alloc_context(
-            group=self.dist_index.get_fsdp_group(is_expert_parallel=False),
-            additional_group=self.dist_index.get_fsdp_group(is_expert_parallel=True),
-        )
+        self.mem_alloc_context = self.get_mem_alloc_context(groups=self.ubr_groups)
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
@@ -1598,32 +1640,35 @@ class ParamAndGradBuffer:
 
         self._log_parameter_groups()
 
-    def get_mem_alloc_context(self, group=None, additional_group=None):
+    def get_mem_alloc_context(self, groups=None):
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
         if self.ddp_config.nccl_ub:
+            assert nccl_allocator is not None, (
+                "To use user buffer registration, "
+                "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
+            )
             global NCCL_MEMORY_POOL
-            if group is None:
+            if groups is None:
                 # data parallel group is a default group for user buffer registration
-                group = self.dist_index.get_fsdp_group(is_expert_parallel=False)
-            if additional_group is None:
+                groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
+            if len(groups) == 1:
                 # register buffers to the default group directly using apex memory allocator
                 mem_alloc_context = functools.partial(
-                    nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=group
+                    nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
                 )
             else:
-                # In case of MoE, we need to register buffer to both DP and EP communicator groups.
-                # Custom DualUBRAllocator class is used to register buffers to both groups.
-                # Register buffers to the data_parallel_group using apex memory allocator
-                # and register buffers to the expert_data_parallel_group.
-                assert group != additional_group, "Group and additional group must be different."
-                mem_alloc_context = functools.partial(
-                    DualUBRAllocator,
-                    NCCL_MEMORY_POOL,
-                    group=group,
-                    additional_group=additional_group,
-                )
+                if hasattr(nccl_allocator, "MultiGroupMemPoolAllocator"):
+                    # Case of MCore NCCL allocator
+                    mem_alloc_context = functools.partial(
+                        nccl_allocator.MultiGroupMemPoolAllocator, NCCL_MEMORY_POOL, groups=groups
+                    )
+                else:
+                    # Case of APEX NCCL allocator.
+                    mem_alloc_context = functools.partial(
+                        MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
+                    )
             return mem_alloc_context
         else:
             return nullcontext

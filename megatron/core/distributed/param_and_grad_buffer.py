@@ -12,6 +12,9 @@ from typing import Dict, List, Optional
 import torch
 from torch.distributed import _coalescing_manager
 
+import megatron.core.nccl_allocator as nccl_allocator
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
@@ -31,10 +34,7 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-try:
-    import apex.contrib.nccl_allocator as nccl_allocator
-except ImportError:
-    nccl_allocator = None
+import megatron.core.nccl_allocator as nccl_allocator
 
 
 class BufferType(Enum):
@@ -520,7 +520,19 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+
+        if pg_collection is None:
+            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
+                with_context_parallel=True
+            )
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')
+            self.dp_cp_group = pg_collection.dp_cp
+            self.tp_group = pg_collection.tp
+
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices
@@ -665,7 +677,10 @@ class _ParamAndGradBuffer:
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
-            pool = nccl_allocator.create_nccl_mem_pool()
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(
+                symmetric=not self.ddp_config.disable_symmetric_registration
+            )
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
             )
@@ -780,7 +795,13 @@ class _ParamAndGradBuffer:
             )
             for param in bucket.params:
                 log_strs.append(f"\t{param_to_name[param]}")
-        log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            "\n".join(log_strs),
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""

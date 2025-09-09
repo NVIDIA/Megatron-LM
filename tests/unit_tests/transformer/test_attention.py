@@ -9,7 +9,7 @@ from packaging import version
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
@@ -154,8 +154,8 @@ class TestSelfAttention:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def run_self_attention(self, model_comm_pgs):
-        tensor_model_parallel_size = torch.distributed.get_world_size(model_comm_pgs.tp)
+    def run_self_attention(self, pg_collection):
+        tensor_model_parallel_size = torch.distributed.get_world_size(pg_collection.tp)
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -168,7 +168,7 @@ class TestSelfAttention:
             get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         config = self.self_attention.config
@@ -206,9 +206,9 @@ class TestSelfAttention:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
 
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
-        self.run_self_attention(model_comm_pgs)
+        self.run_self_attention(pg_collection)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
@@ -235,6 +235,6 @@ class TestSelfAttention:
         tp_group = grid.create_pg("tp")
         cp_group = grid.create_pg("cp")
 
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
-        self.run_self_attention(model_comm_pgs)
+        self.run_self_attention(pg_collection)

@@ -1,0 +1,10 @@
+- agent_type: examples.rl.environments.math.openmath_agent.OpenMathInstructAgent
+  agent_args: {}
+  weight: 1.0
+- agent_type: examples.rl.environments.math.bigmath_agent.BigMathAgent
+  agent_args: {}
+  weight: 1.0
+- agent_type: examples.rl.environments.math.aime_agent.AIMEAgent
+  agent_args: {}
+  weight: 0.0
+  evaluation_only: true

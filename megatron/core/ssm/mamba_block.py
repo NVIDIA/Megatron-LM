@@ -20,7 +20,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -113,7 +113,7 @@ class MambaStack(MegatronModule):
             Defaults to True.
         device (optional): the device to use. Defaults to None.
         dtype (optional): the data type to use. Defaults to None.
-        model_comm_pgs (ModelCommProcessGroups): the required model communication
+        pg_collection (ProcessGroupCollection): the required model communication
             process groups to use.
     """
 
@@ -131,7 +131,7 @@ class MambaStack(MegatronModule):
         post_process: bool = True,
         device=None,
         dtype=None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
@@ -139,9 +139,9 @@ class MambaStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
 
-        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaStack"
+        assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
-        self.pp_group = model_comm_pgs.pp
+        self.pp_group = pg_collection.pp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -175,7 +175,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
-                        model_comm_pgs=model_comm_pgs,
+                        pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     # Transformer layers apply their own pp_layer_offset
@@ -183,7 +183,7 @@ class MambaStack(MegatronModule):
                         submodules.attention_layer,
                         config=self.config,
                         layer_number=i + 1,
-                        model_comm_pgs=model_comm_pgs,
+                        pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.MLP:
                     # Transformer layers apply their own pp_layer_offset
@@ -191,7 +191,7 @@ class MambaStack(MegatronModule):
                         submodules.mlp_layer,
                         config=self.config,
                         layer_number=i + 1,
-                        model_comm_pgs=model_comm_pgs,
+                        pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.PARALLEL:
                     layer = build_module(

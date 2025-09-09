@@ -14,7 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
@@ -350,9 +350,9 @@ class TestMultiTokenPrediction:
             assert "values" in tracker
             mtp_loss = tracker['values'].clone()
             # Average MTP loss across CP ranks for comparison with reference
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
             torch.distributed.all_reduce(
-                mtp_loss, group=model_comm_pgs.cp, op=torch.distributed.ReduceOp.AVG
+                mtp_loss, group=pg_collection.cp, op=torch.distributed.ReduceOp.AVG
             )
             MTPLossLoggingHelper.clean_loss_in_tracker()
             assert torch.allclose(output_ref, output, rtol=1e-03, atol=1e-03)

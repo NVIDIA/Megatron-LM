@@ -10,36 +10,44 @@ from mamba_builders import mamba_builder
 import torch
 import sys
 import time
-import tqdm
 import warnings
 from functools import partial
 from argparse import Namespace
+
+import torch
+import tqdm
+
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.inference_request import InferenceRequest
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from pretrain_gpt import model_provider as gpt_model_provider
+from pretrain_mamba import model_provider as mamba_model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from megatron.training import get_args, get_tokenizer, print_rank_0
-from megatron.training.checkpointing import load_checkpoint
-from megatron.core import mpu
-import json
-from megatron.training.initialize import initialize_megatron
-from megatron.training import get_model
 import asyncio
-from typing import AsyncIterator, List, Any
+import json
+from typing import Any, AsyncIterator, List
 
 from examples.inference.gpt.utils import add_common_inference_args, build_requests
+from megatron.core import mpu
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.initialize import initialize_megatron
 
 
 def add_static_inference_args(parser):
@@ -72,7 +80,10 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     Returns:
         AbstractBackend: The chosen backend
     """
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
     inference_wrapper_config = InferenceWrapperConfig(
         hidden_size=args.hidden_size,
         inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
@@ -82,7 +93,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
         inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        fp8=args.fp8
+        fp8=args.fp8,
     )
 
     inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
@@ -176,7 +187,11 @@ def main():
         top_n_logprobs=args.top_n_logprobs,
     )
 
-    requests = build_requests(args, get_tokenizer())
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
+    requests = build_requests(args, tokenizer)
     prompts = [r.prompt_text for r in requests]
 
     if args.enable_cuda_graph:

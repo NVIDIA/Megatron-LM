@@ -4,7 +4,9 @@
 
 import dataclasses
 from datetime import datetime
+import functools
 import gc
+import inspect
 import logging
 import math
 import os
@@ -26,7 +28,7 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 try:
-    from megatron.training import rl_utils
+    from megatron.rl import rl_utils
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
@@ -671,8 +673,17 @@ def pretrain(
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
-        for i in range(len(model)):
-            iterators = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+        for vp_stage in range(len(model)):
+            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+            assert "vp_stage" in dataset_provider_parameters, \
+                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+            vp_stage_train_valid_test_dataset_provider = \
+                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                vp_stage_train_valid_test_dataset_provider.is_distributed = True
+            iterators = build_train_valid_test_data_iterators(
+                vp_stage_train_valid_test_dataset_provider
+            )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
@@ -1505,6 +1516,8 @@ def training_log(
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
+        if "global_aux_loss" in args.moe_router_load_balancing_type:
+            track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_moe_metrics(
@@ -1911,7 +1924,7 @@ def train(
     timers = get_timers()
 
     if getattr(args, 'perform_rl_step', False):
-        assert has_rl_utils, "RL cannot run without the lang_rl package"
+        assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
     # Additional variable initialization for RL training
     ref_state_dict = None
@@ -2576,6 +2589,10 @@ def evaluate_and_print_results(
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
         args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
+    elif not args.multiple_validation_sets:
+        eval_iters = [args.eval_iters]
+    else:
+        eval_iters = args.eval_iters
     
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""

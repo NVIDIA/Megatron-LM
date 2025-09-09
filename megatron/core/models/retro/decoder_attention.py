@@ -14,7 +14,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.utils import get_all_true_mask
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
@@ -52,7 +52,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
         encoder_block_spec (ModuleSpec): The first Retro decoder layer is
             provided with a transformer block spec to construct the neighbor encoder.
-        model_comm_pgs (ModelCommProcessGroups): Model communication process groups.
+        pg_collection (ProcessGroupCollection): Model communication process groups.
     """
 
     def __init__(
@@ -62,14 +62,14 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         encoder_block_spec: ModuleSpec = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         if encoder_block_spec:
@@ -78,7 +78,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 spec=encoder_block_spec,
                 pre_process=True,
                 post_process=False,
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
             # self._encoder_key = 'encoder' # ... necessary?
         else:

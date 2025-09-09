@@ -131,7 +131,9 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_double_buffer (bool): Whether to use persistently allocated double buffers
             for the temporary memory needed in the FSDP communication. This flag is
             automatically set to True when nccl_ub is True.
-
+        disable_symmetric_registration (bool): Whether to disable symmetric (window) registration
+            for NCCL userbuffer registration. This option will force to use conventional (local)
+            userbuffer registration when nccl_ub is set.
     Examples:
         >>> model = GPTModel(config)
         >>> model = MegatronFSDP(
@@ -146,6 +148,7 @@ class MegatronFSDP(torch.nn.Module):
         ...     keep_fp8_transpose_cache=False,
         ...     nccl_ub=False,
         ...     fsdp_double_buffer=False,
+        ...     disable_symmetric_registration=False,
         ... )
     """
 
@@ -163,6 +166,7 @@ class MegatronFSDP(torch.nn.Module):
         keep_fp8_transpose_cache: bool = False,
         nccl_ub: bool = False,
         fsdp_double_buffer: bool = False,
+        disable_symmetric_registration: bool = False,
     ):
         super().__init__()
         self.device = device if device else torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -184,6 +188,7 @@ class MegatronFSDP(torch.nn.Module):
                 keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
                 nccl_ub=nccl_ub,
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+                disable_symmetric_registration=disable_symmetric_registration,
             )
         else:
             self.ddp_config = ddp_config
