@@ -78,23 +78,18 @@ class SFTDataset(MegatronDataset):
             conversation_list, return_target=True, add_generation_prompt=False
         )
 
-        # minus one to insert eos token
-        if len(tokens) > max_seq_len - 1:
-            if True:  # TODO: when too long to fit in context, truncate left to right
-                tokens = tokens[: max_seq_len - 1]
-                target = target[: max_seq_len - 1]
-            else:  # right to left
-                tokens = tokens[-(max_seq_len - 1) :]
-                target = target[-(max_seq_len - 1) :]
+        if len(tokens) > max_seq_len:
+            tokens = tokens[: max_seq_len]
+            target = target[: max_seq_len]
 
         # padding
-        num_tokens = len(tokens) + 1
+        num_tokens = len(tokens)
         padding_len = max_seq_len - num_tokens
         assert padding_len >= 0
         filler = [tokenizer.pad] * (padding_len + 1)
 
-        tokens = np.array(tokens.tolist() + [tokenizer.eod] + filler, dtype=np.int64)
-        target = np.array(target.tolist() + [tokenizer.eod] + filler, dtype=np.int64)
+        tokens = np.array(tokens.tolist() + filler, dtype=np.int64)
+        target = np.array(target.tolist() + filler, dtype=np.int64)
 
         tokens = torch.tensor(tokens)
         target = torch.tensor(target)
