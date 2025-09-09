@@ -300,9 +300,9 @@ class TestBridgeCommunicator:
             tensor_model_parallel_size=parallel_state_tp, create_gloo_process_groups=False
         )
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
-        ref_model_comm_pgs = _get_model_comm_pgs_from_grid(ref_grid)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
         ref_block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, model_comm_pgs=ref_model_comm_pgs
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
         )
         _avg_params(ref_block, ref_grid.get_pg("dp"))
         block_grid_1, grid_1 = get_transformer_block_and_grid(
@@ -418,9 +418,9 @@ class TestBridgeCommunicator:
         ).to(dtype)
 
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
-        ref_model_comm_pgs = _get_model_comm_pgs_from_grid(ref_grid)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
         ref_block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, model_comm_pgs=ref_model_comm_pgs
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
         )
         _avg_params(ref_block, ref_grid.get_pg("dp"))
 
