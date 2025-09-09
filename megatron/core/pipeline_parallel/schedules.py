@@ -456,8 +456,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     with respect to stage's output tensor.
 
     Supports both tensor and dictionary formats:
+    
     - Tensor format (legacy): input_tensor, output_tensor, output_tensor_grad are tensors/lists
     - Dictionary format (multi module case): tensors are dictionaries with module names as keys
+    
       - input_tensor: dict with module names as keys
       - output_tensor: dict with module names as keys (or scalar loss for last stage)
       - output_tensor_grad: dict with module names as keys (or None for last stage)
