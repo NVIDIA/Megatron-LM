@@ -674,6 +674,7 @@ class MambaMixer(MegatronModule):
             hidden_states = hidden_states[: context.active_token_count]
             conv_state = conv_state[: context.active_token_count]
             ssm_state = ssm_state[: context.active_token_count]
+
             out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
             out, out_bias = self._pad(out.transpose(0, 1), out_bias, context)
             return out, out_bias
@@ -733,79 +734,26 @@ class MambaMixer(MegatronModule):
 
         i = 0
         while i < num_prefill_reqs:
-            # If this single request is longer than chunk_size, run it alone as non-varlen.
-            if req_lengths[i] > self.chunk_size:
-                tok_start = cu_seqlens_prefill[i].item()
-                tok_end = cu_seqlens_prefill[i + 1].item()
-                # Slice states for this one request
-                zxBCdt_mb = zxBCdt_prefill[:, tok_start:tok_end]
-                conv_mb = conv_state_prefill[i : i + 1]
-                ssm_mb = ssm_state_prefill[i : i + 1]
-                # Non-varlen call: no seq_idx/cu_seqlens, and return_varlen_states=False
-                out_mb, out_bias_mb = self.ssm_block(
-                    zxBCdt_mb,
-                    conv_state=conv_mb,
-                    ssm_state=ssm_mb,
-                    seq_idx=None,
-                    cu_seqlens=None,
-                    return_varlen_states=False,
-                    active_token_count=(tok_end - tok_start),
-                )
-                out_prefill_chunks.append(out_mb)
-                if out_bias_mb is not None:
-                    out_bias_prefill_chunks.append(out_bias_mb)
-                i += 1
-                continue
-
-            # Otherwise, greedily pack as many consecutive requests as will fit within chunk_size
-            pack_start_req = i
-            packed_tokens = 0
-            while i < num_prefill_reqs and packed_tokens + req_lengths[i] <= self.chunk_size:
-                packed_tokens += req_lengths[i]
-                i += 1
-            pack_end_req = i  # exclusive
-
-            # Token span (contiguous in the packed hidden_states_prefill region)
-            tok_start = cu_seqlens_prefill[pack_start_req].item()
-            tok_end = cu_seqlens_prefill[pack_end_req].item()
+            tok_start = cu_seqlens_prefill[i].item()
+            tok_end = cu_seqlens_prefill[i + 1].item()
+            # Slice states for this one request
             zxBCdt_mb = zxBCdt_prefill[:, tok_start:tok_end]
-
-            # States for exactly these requests (contiguous by construction)
-            conv_mb = conv_state_prefill[pack_start_req:pack_end_req]
-            ssm_mb = ssm_state_prefill[pack_start_req:pack_end_req]
-
-            # Build varlen metadata for this microbatch (reindexed to start at 0)
-            lengths = req_lengths[pack_start_req:pack_end_req]
-            # cu_seqlens_mb: [0, l0, l0+l1, ...]
-            cu_vals = [0]
-            for L in lengths:
-                cu_vals.append(cu_vals[-1] + L)
-            cu_seqlens_mb = torch.tensor(
-                cu_vals, device=hidden_states_prefill.device, dtype=torch.int32
-            )
-
-            # seq_idx_mb: maps each token to its (microbatch-local) request id
-            # (0 repeated l0 times, 1 repeated l1 times, ...)
-            seq_ids = torch.arange(
-                len(lengths), device=hidden_states_prefill.device, dtype=torch.int32
-            )
-            seq_idx_mb = seq_ids.repeat_interleave(
-                torch.tensor(lengths, device=hidden_states_prefill.device)
-            )
-
-            # Run varlen ssm_block for this microbatch
+            conv_mb = conv_state_prefill[i : i + 1]
+            ssm_mb = ssm_state_prefill[i : i + 1]
+            # Non-varlen call: no seq_idx/cu_seqlens, and return_varlen_states=False
             out_mb, out_bias_mb = self.ssm_block(
                 zxBCdt_mb,
                 conv_state=conv_mb,
                 ssm_state=ssm_mb,
-                seq_idx=seq_idx_mb[None, :],  # match expected shape [1, tokens]
-                cu_seqlens=cu_seqlens_mb,  # [n_reqs+1], starts at 0
-                return_varlen_states=True,  # varlen path since all reqs fit <= chunk_size
+                seq_idx=None,
+                cu_seqlens=None,
+                return_varlen_states=False,
                 active_token_count=(tok_end - tok_start),
             )
             out_prefill_chunks.append(out_mb)
             if out_bias_mb is not None:
                 out_bias_prefill_chunks.append(out_bias_mb)
+            i += 1
 
         # Concatenate prefill chunks (token-major), then join with decode part
         out_prefill = torch.cat(out_prefill_chunks, dim=0) if out_prefill_chunks else None
