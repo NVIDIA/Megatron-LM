@@ -384,8 +384,6 @@ def test_forward_backward_pipelining_without_interleaving_multi_module(
     multi_module_communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
     )
-    # ykarnati: remove this
-    mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=2)
 
     data_iterator = None
     if model.is_current_rank_in_grid(model.encoder_grid) and is_pp_first_stage(
