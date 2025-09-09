@@ -1,9 +1,11 @@
-# build_and_use_managed_allocator.py
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import os
 import pathlib
+import warnings
 
 import torch
-from torch.cuda.memory import CUDAPluggableAllocator, change_current_allocator
+from torch.cuda.memory import CUDAPluggableAllocator
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
 # 1) Inline C++ source for a managed-memory allocator
@@ -48,16 +50,21 @@ if CUDA_HOME:
     if os.path.isdir(cand):
         extra_ldflags = [f"-L{cand}", "-lcudart"]
 
-mod = load_inline(
-    name="managed_alloc_runtime",
-    cpp_sources=[src],
-    functions=[],  # no pybind functions; we just want the .so with our exported symbols
-    with_cuda=True,  # ensures CUDA include paths & NVCC toolchain are available
-    extra_ldflags=extra_ldflags,
-    verbose=False,
-)
+try:
+    mod = load_inline(
+        name="managed_alloc_runtime",
+        cpp_sources=[src],
+        functions=[],  # no pybind functions; we just want the .so with our exported symbols
+        with_cuda=True,  # ensures CUDA include paths & NVCC toolchain are available
+        extra_ldflags=extra_ldflags,
+        verbose=False,
+    )
 
-# 3) Locate the built shared library and plug it into PyTorch
-so_path = pathlib.Path(mod.__file__).as_posix()
-alloc = CUDAPluggableAllocator(so_path, "my_managed_malloc", "my_managed_free").allocator()
-unified_memory_mempool = torch.cuda.MemPool(allocator=alloc)
+    # 3) Locate the built shared library and plug it into PyTorch
+    so_path = pathlib.Path(mod.__file__).as_posix()
+    alloc = CUDAPluggableAllocator(so_path, "my_managed_malloc", "my_managed_free").allocator()
+    unified_memory_mempool = torch.cuda.MemPool(allocator=alloc)
+
+except RuntimeError:
+    warnings.warn("Ninja is required to load C++ extensions (pip install ninja to get it).")
+    unified_memory_mempool = None

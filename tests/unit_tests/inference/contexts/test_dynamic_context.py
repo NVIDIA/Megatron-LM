@@ -844,7 +844,7 @@ class TestDynamicContext:
         num_contexts = math.ceil(gpu_size_gb / buffer_size_gb) + 1
 
         # Allocate enough contexts to fill GPU memory.
-        def init_contexts(unified_memory_level):
+        def init_contexts(*, unified_memory_level):
             contexts = []
             for i in range(num_contexts):
                 contexts.append(DynamicInferenceContext(
@@ -861,14 +861,14 @@ class TestDynamicContext:
 
         # Pure GPU memory test should OOM.
         try:
-            init_contexts(0)
+            init_contexts(unified_memory_level=0)
         except torch.OutOfMemoryError:
             pass
         else:
             raise Exception("expected OOM.")
 
         # Unified memory test should succeed.
-        init_contexts(1)
+        init_contexts(unified_memory_level=1)
 
 
 if __name__ == "__main__":
