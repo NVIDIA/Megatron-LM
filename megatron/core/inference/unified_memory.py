@@ -4,7 +4,6 @@ import os
 import warnings
 from pathlib import Path
 
-import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
