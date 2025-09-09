@@ -27,6 +27,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --deterministic-mode: true
   --ckpt-format: torch_dist
+  --dist-ckpt-save-pre-mcore-014: true
   --bf16: true
   --log-memory-to-tensorboard: true
   --log-num-zeros-in-grad: true

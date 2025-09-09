@@ -54,6 +54,7 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --inference-max-requests: 1
   --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
   --ckpt-fully-parallel-save: true
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true

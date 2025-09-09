@@ -1142,17 +1142,17 @@ class ChainedOptimizer(MegatronOptimizer):
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
         metadata = kwargs.get('metadata') or {}
-        # ChainedOptimizer should add its prefix to the tensor state keys only for formats
-        # leveraging internal DistOpt structure ('distrib_optim_sharding_type' is empty if
-        # not using DistOpt). For backward-compatibility we also add it if
-        # `chained_optim_avoid_prefix` is False.
-        _distopt_requires_prefix = metadata.get('distrib_optim_sharding_type') in (
-            'dp_zero_gather_scatter',
-            'dp_reshardable',
-        )
-        should_add_prefix = _distopt_requires_prefix or not metadata.get(
-            'chained_optim_avoid_prefix', False
-        )
+        # ChainedOptimizer should add its prefix to the tensor state keys only if
+        # DistributedOptimizer is used (non-empty 'distrib_optim_sharding_type') and uses
+        # a non fully-reshardable format. For backward compatibility we also add it
+        # if `chained_optim_avoid_prefix` is False.
+        from .distrib_optimizer import DistributedOptimizer
+
+        should_add_prefix = (
+            "distrib_optim_sharding_type" in metadata
+            and metadata["distrib_optim_sharding_type"]
+            not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+        ) or not metadata.get('chained_optim_avoid_prefix', False)
 
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(

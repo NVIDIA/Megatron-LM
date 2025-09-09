@@ -655,7 +655,8 @@ class TransformerBlock(MegatronModule):
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         if singleton_local_shards:
-            if not non_homogeneous_layers:
+            if metadata is not None and metadata.get('non_homogeneous_layers') is False:
+                # non_homogeneous_layers=False was set explicitly - emit an override warning
                 logger.warning(
                     'non_homogeneous_layers=False is deprecated.'
                     ' Setting non_homogeneous_layers=True.'

@@ -27,6 +27,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --deterministic-mode: true
   --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
   --bf16: true
   --fp8-recipe: tensorwise
   --fp8-format: hybrid
