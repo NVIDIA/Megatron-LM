@@ -17,7 +17,10 @@ class PipelineOffloadManager:
 
     def __init__(self):
         self._queue = deque()
-        self._vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is None:
+            self._vpp = 1
+        else:
+            self._vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
         # cache vpp - 1 stages
         self._stages = [[] for _ in range(self._vpp)]
@@ -70,7 +73,10 @@ class PipelineOffloadManager:
         return len(self._queue)
 
     def reset_chunk_handler(self, num_layer, vp_stage, offload=True, first_layer_index=0):
-        cur_vpp_rank = vp_stage
+        if vp_stage is None:
+            cur_vpp_rank = 0
+        else:
+            cur_vpp_rank = vp_stage
 
         first_last_vpp_rank = self._first_last_vpp_rank
         # rewind
@@ -267,7 +273,6 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
         torch.cuda.current_stream().wait_stream(self.d2h_stream)
 
     def bulk_offload(self, release_tensors):
-        self.d2h_stream.wait_stream(torch.cuda.current_stream())
         if self.should_bulk_offload():
             self.bulk_offload_group(self._layer_index)
             if len(release_tensors) > 0:
