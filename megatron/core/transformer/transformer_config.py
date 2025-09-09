@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -106,6 +106,11 @@ class TransformerConfig(ModelParallelConfig):
 
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
+
+    softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+       and learnable offset."""
 
     num_query_groups: Optional[int] = None
     """Number of query groups for group query attention. If None, normal attention is used."""
@@ -386,6 +391,22 @@ class TransformerConfig(ModelParallelConfig):
     """Use the kitchen extension for transformer quantization."""
 
     ####################
+    # fp4 related
+    ####################
+    fp4: Optional[str] = None
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only 
+    supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
+
+    fp4_recipe: Optional[str] = "nvfp4"
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
+    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+
+    fp4_param: bool = False
+    """If set, keep the parameters in fp4 precision to save memory. This option must be used
+    together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
+    will be converted to fp4; for example, biases will remain unchanged."""
+
+    ####################
     # MoE related
     ####################
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -413,6 +434,7 @@ class TransformerConfig(ModelParallelConfig):
     micro-batch level.
     - "seq_aux_loss": Load balancing loss used in DeepSeekV2 and DeepSeekV3, computes loss
     for each individual sample.
+    - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
@@ -623,6 +645,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    inference_sampling_seed: int = 42
+    """ Random seed to use for sampling during inference. """
+
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
 
@@ -739,6 +764,13 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
+        # FP4 validation
+        if self.fp4_param and not self.fp4:
+            raise ValueError("fp4_param must be used together with fp4 mode.")
+
+        if self.fp4 and self.fp8:
+            raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
+
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
@@ -794,15 +826,25 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_expert_capacity_factor = None
             if isinstance(self.moe_router_load_balancing_type, list):
                 for load_balancing_type in self.moe_router_load_balancing_type:
-                    if load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
+                    if load_balancing_type not in [
+                        "aux_loss",
+                        "seq_aux_loss",
+                        "global_aux_loss",
+                        "none",
+                    ]:
                         raise ValueError(
                             "moe_expert_capacity_factor only works with aux_loss, "
-                            "seq_aux_loss or none load balancing"
+                            "seq_aux_loss, global_aux_loss or none load balancing"
                         )
-            elif self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
+            elif self.moe_router_load_balancing_type not in [
+                "aux_loss",
+                "seq_aux_loss",
+                "global_aux_loss",
+                "none",
+            ]:
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
-                    "seq_aux_loss or none load balancing"
+                    "seq_aux_loss, global_aux_loss or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

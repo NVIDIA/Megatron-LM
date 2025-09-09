@@ -350,9 +350,8 @@ def main():
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
 
-        def shorten_str(s, n):
-            s = s.replace("\n", "\\n")
-            return s if len(s) < n else f"{s[:n//2]}..{s[-n//2:]}"
+        def escape_str(s):
+            return s.replace("\n", "\\n")
 
         print("~~~~ Unique prompts + outputs. ~~~~")
 
@@ -366,14 +365,14 @@ def main():
             request_idx = request_idxs[0]
             request = requests[request_idx]
             output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
-            short_prompt_text = shorten_str(prompt_text, 64)
-            short_output_text = shorten_str(request.output_text, 64)
+            prompt_text_escaped = escape_str(prompt_text)
+            output_text_escaped = escape_str(request.output_text)
             num_prompt_tokens = len(requests[request_idx].prompt_tokens)
             num_output_tokens = len(requests[request_idx].output_tokens)
             print(
                 f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
-                f"[{num_prompt_tokens}] {short_prompt_text} >>>> "
-                f"[{num_output_tokens}] {short_output_text}"
+                f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
+                f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
             )
 
         # Write results to JSON. Primarily used for functional testing.

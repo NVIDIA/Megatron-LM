@@ -4,6 +4,7 @@
 import os
 import sys
 import warnings
+from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
@@ -148,9 +149,9 @@ def main(model_type: str = "gpt"):
         load_context = fp8_model_init()
     with load_context:
         if model_type == "gpt":
-            model = get_model(model_provider(gpt_builder), wrap_with_ddp=False)
+            model = get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
         elif model_type == "mamba":
-            model = get_model(model_provider(mamba_builder), wrap_with_ddp=False)
+            model = get_model(partial(model_provider, mamba_builder), wrap_with_ddp=False)
         else:
             raise ValueError(f"Invalid model type {model_type}")
 

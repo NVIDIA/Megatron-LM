@@ -22,7 +22,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -132,7 +132,7 @@ class Attention(MegatronModule, ABC):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: str = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
 
@@ -146,21 +146,19 @@ class Attention(MegatronModule, ABC):
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
-                required_pgs=['tp', 'cp']
-            )
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         else:
             assert hasattr(
-                model_comm_pgs, 'tp'
-            ), "Attention model_comm_pgs must have tp process group"
+                pg_collection, 'tp'
+            ), "Attention pg_collection must have tp process group"
             assert hasattr(
-                model_comm_pgs, 'cp'
-            ), "Attention model_comm_pgs must have cp process group"
-        self.model_comm_pgs = model_comm_pgs
+                pg_collection, 'cp'
+            ), "Attention pg_collection must have cp process group"
+        self.pg_collection = pg_collection
 
         # Per attention head and per partition values
-        world_size = get_pg_size(self.model_comm_pgs.tp)
+        world_size = get_pg_size(self.pg_collection.tp)
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
@@ -179,7 +177,7 @@ class Attention(MegatronModule, ABC):
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
-            model_comm_pgs=self.model_comm_pgs,
+            pg_collection=self.pg_collection,
         )
 
         self.checkpoint_core_attention = (
@@ -199,7 +197,7 @@ class Attention(MegatronModule, ABC):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
-            tp_group=self.model_comm_pgs.tp,
+            tp_group=self.pg_collection.tp,
         )
 
         if (
@@ -406,7 +404,7 @@ class Attention(MegatronModule, ABC):
             if rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key, k_pos_emb, self.config, self.model_comm_pgs.cp
+                    key, k_pos_emb, self.config, self.pg_collection.cp
                 )
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
@@ -797,11 +795,11 @@ class Attention(MegatronModule, ABC):
                             q_pos_emb,
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
-                            cp_group=self.model_comm_pgs.cp,
+                            cp_group=self.pg_collection.cp,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.model_comm_pgs.cp
+                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
                         )
                 if k_pos_emb is not None:
                     key = apply_rotary_pos_emb(
@@ -809,7 +807,7 @@ class Attention(MegatronModule, ABC):
                         k_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
-                        cp_group=self.model_comm_pgs.cp,
+                        cp_group=self.pg_collection.cp,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
@@ -906,7 +904,7 @@ class SelfAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
             config=config,
@@ -915,7 +913,7 @@ class SelfAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="self",
             cp_comm_type=cp_comm_type,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         self.linear_qkv = build_module(
@@ -929,7 +927,7 @@ class SelfAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',
-            tp_group=self.model_comm_pgs.tp,
+            tp_group=self.pg_collection.tp,
         )
 
         if submodules.q_layernorm is not None:
@@ -1114,7 +1112,7 @@ class CrossAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
             config=config,
@@ -1123,7 +1121,7 @@ class CrossAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="cross",
             cp_comm_type=cp_comm_type,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:

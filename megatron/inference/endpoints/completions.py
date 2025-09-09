@@ -13,6 +13,7 @@ from megatron.inference.endpoints.common import send_do_generate, LOCK
 
 from flask import request, jsonify
 from flask_restful import Resource
+import random
 
 
 def detokenize(prompt, tok) -> list[str]:
@@ -100,6 +101,7 @@ class MegatronCompletions(Resource):
             tokens_to_generate = local_kwargs["tokens_to_generate"]
             logprobs = local_kwargs["return_output_log_probs"]
             top_n_logprobs = local_kwargs["return_topk_logprobs"]
+            random_seed = local_kwargs["random_seed"]
             response_dict = run_mcore_engine(
                 self.engine,
                 prompts,
@@ -109,6 +111,7 @@ class MegatronCompletions(Resource):
                 logprobs,
                 tokens_to_generate,
                 top_n_logprobs=top_n_logprobs,
+                random_seed=random_seed
             )
             result = [
                 response_dict["text"],
