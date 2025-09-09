@@ -516,19 +516,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         This method is used for suspending the dynamic engine.
         """
 
-        # >>>
-        # assert self.unified_memory_level == 0, (
-        #     "Only deallocate tensors when not using unified memory at all (level "
-        #     "0). For levels 1 and 2, we do not perform any explicit allocations "
-        #     "or deallocations after the initial call to `__init__()`."
-        # )
-        # +++
         # Only deallocate tensors when not using unified memory at all (level 0).
         # For levels 1 and 2, we do not perform any explicit allocations or
         # deallocations after the initial call to `__init__()`.
         if self.unified_memory_level != 0:
             return
-        # <<<
 
         # Delete all tensor attributes.
         # TODO(@lmcafee): check that device == 'cuda'?
