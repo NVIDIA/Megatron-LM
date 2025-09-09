@@ -534,7 +534,7 @@ class TestDistributedOptimizer:
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
     @pytest.mark.skipif(
-        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.5 or later"
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
     )
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'src_bucket_pad_divisor', 'dest_bucket_pad_divisor'),
@@ -692,7 +692,7 @@ class TestDistributedOptimizer:
             assert not mismatch
 
     @pytest.mark.skipif(
-        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.7 or later"
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
     )
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'sharding_type', 'mem_efficient'),

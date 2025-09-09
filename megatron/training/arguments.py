@@ -1050,6 +1050,11 @@ def validate_args(args, defaults={}):
             # optimizer state in the CPU memory of DP rank 0.
             assert args.use_dist_ckpt
 
+            if args.dist_ckpt_optim_fully_reshardable:
+                assert not args.distrib_optim_fully_reshardable_mem_efficient, \
+                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+
+
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
         print('--ckpt-fully-parallel-save flag is deprecated and has no effect.'
@@ -2374,6 +2379,20 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
+    group.add_argument('--dist-ckpt-save-pre-mcore-014', action='store_true',
+                       help='Revert checkpointing simplifications introduced in Megatron-Core'
+                            ' v0.14. This option affects only checkpoint saving format and will'
+                            ' be removed soon (checkpoint load format is determined based on'
+                            ' checkpoint metadata).')
+    group.add_argument('--dist-ckpt-optim-fully-reshardable', action='store_true',
+                       help='Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP)'
+                            ' as opposed to plain DP reshardability.')
+    group.add_argument('--distrib-optim-fully-reshardable-mem-efficient', action='store_true',
+                       help='During distributed optimizer checkpoint save and load tries to use as'
+                            ' little memory as possible by using Gloo (instead of NCCL) and only one'
+                            ' rank for saving. Turn on only if experiencing host or device memory'
+                            ' issues. Has affect only with `--dist-ckpt-optim-fully-reshardable`'
+                            ' flag.')
     group.add_argument('--load-model-opt-format', action='store_true',
                        help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
                             'This function can also be used to load NeMo .nemo sharded checkpoints.')

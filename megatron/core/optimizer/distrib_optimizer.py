@@ -96,6 +96,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     See __init__() below for argument details.
     """
 
+    # enumerates fully reshardable optimizer formats (as opposed to formats
+    # which depend on the internal optimizer buffers structure)
+    checkpoint_fully_reshardable_formats: set[str] = {
+        'fully_reshardable',
+        'fully_sharded_model_space',
+        'fsdp_dtensor',
+    }
+
     @classmethod
     def _build_model_gbuf_param_range_map(
         cls,
@@ -1155,23 +1163,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         metadata: Optional[dict] = None,
     ):
         """
-        Chooses between 4 param state sharding implementations as requested by `sharding_type`.
+        Chooses between 3 param state sharding implementations as requested by
+        `metadata['distrib_optim_sharding_type']`.
 
-        sharding_type can be one of:
-        - 'fully_sharded_bucket_space': Sharded state dict where each noncontiguous buffer is a
+        Sharding type can be one of:
+        - 'dp_reshardable': Sharded state dict where each noncontiguous buffer is a
             separate ShardedTensor. Results in fully parallel save and load without any
-            inter-process communication or intermediate buffers/copies.
+            inter-process communication or intermediate buffers/copies. Since the format relies
+            on the internal DistributedOptimizer structure, it allows checkpoint resharding
+            only in DP dimension.
+        - 'fully_reshardable': During checkpoint save (`is_loading=False`) gathers all
+            DistributedOptimizer buffers on DP rank 0 and transforms them into a canonical state
+            representation similar to a regular optimizer where each model param corresponds to
+            one or more optimizer state tensors of the same shape (possibly different precision).
+            During checkpoint load each rank loads a superset of the required state and does
+            rank specific flattening and slicing.
+        - 'fsdp_dtensor': Sharded state dict where each parameter is a separate
+            PyTorch DTensor. This is the default and recommended implementation for the distributed
+            optimizer when using the megatron fsdp training.
+
+        Deprecated sharding formats:
         - 'dp_zero_gather_scatter': Naive implementation which reuses gather/scatter from the
             legacy ckpt format. During saving, gathers the parameters state on DP rank 0 and saves
             a ShardedObject with fixed TPxPP structure. During loading, loads the saved data on DP
             rank 0 (None on other ranks). Relies on the parameters scatter done in load_state_dict.
         - 'fully_sharded_model_space': Sharded state dict where each parameter is a separate
-            ShardedTensor. Results in fully parallel save and load without any inter-process
-            communication or intermediate buffers/copies. This is the default and recommended
-            implementation for the distributed optimizer.
-        - 'fsdp_dtensor': Sharded state dict where each parameter is a separate
-            PyTorch DTensor. This is the default and recommended implementation for the distributed
-            optimizer when using the megatron fsdp training.
+            ShardedTensor, which is a flattened subset of the canonical state representation.
+            Results in fully parallel save and load without any inter-process communication or
+            intermediate buffers/copies.
+
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
@@ -1203,7 +1223,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         state_dict = self.state_dict()
-        if sharding_type in ('dp_zero_gather_scatter', 'dp_reshardable'):
+        if sharding_type not in self.checkpoint_fully_reshardable_formats:
             # State dict differs between different model parallel groups
             state_dict = {
                 k: ShardedObject(
