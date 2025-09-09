@@ -1123,8 +1123,8 @@ def validate_args(args, defaults={}):
         assert args.transformer_impl == 'transformer_engine', \
             "Delaying wgrad compute is only supported with transformer_engine implementation"
         if args.overlap_grad_reduce:
-            assert is_te_min_version("2.7.0"), (
-                "overlap_grad_reduce is only supported with TE >= 2.7.0 when enabling delay_wgrad_compute"
+            assert is_te_min_version("2.8.0"), (
+                "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
         if not args.gradient_accumulation_fusion:
             assert is_te_min_version("2.7.0"), (
