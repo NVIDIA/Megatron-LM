@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tensor可视化脚本
-支持一键可视化保存的tensor数据，生成各种分析图表
+Tensor Visualization Script
+Supports one-click visualization of saved tensor data, generating various analysis charts
 """
 
 import os
@@ -20,26 +20,26 @@ from datetime import datetime
 # 添加项目路径
 sys.path.append('/data/charles/Megatron-LM')
 
-# 设置matplotlib中文字体
+# Set matplotlib font
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 class TensorVisualizer:
-    """Tensor可视化器"""
+    """Tensor Visualizer"""
     
     def __init__(self, tensor_dir: str = "./enhanced_tensor_logs", output_dir: str = "./draw"):
         """
-        初始化可视化器
+        Initialize visualizer
         
         Args:
-            tensor_dir: tensor文件目录
-            output_dir: 输出图片目录
+            tensor_dir: Tensor file directory
+            output_dir: Output image directory
         """
         self.tensor_dir = Path(tensor_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建子目录
+        # Create subdirectories
         self.subdirs = {
             'heatmaps': self.output_dir / 'heatmaps',
             'distributions': self.output_dir / 'distributions', 
@@ -51,14 +51,14 @@ class TensorVisualizer:
         for subdir in self.subdirs.values():
             subdir.mkdir(parents=True, exist_ok=True)
         
-        print(f"[TensorVisualizer] 初始化完成")
-        print(f"  Tensor目录: {self.tensor_dir}")
-        print(f"  输出目录: {self.output_dir}")
+        print(f"[TensorVisualizer] Initialization complete")
+        print(f"  Tensor directory: {self.tensor_dir}")
+        print(f"  Output directory: {self.output_dir}")
     
     def load_tensor_files(self) -> List[Dict]:
-        """加载所有tensor文件"""
+        """Load all tensor files"""
         tensor_files = glob.glob(str(self.tensor_dir / "*.pt"))
-        print(f"[TensorVisualizer] 找到 {len(tensor_files)} 个tensor文件")
+        print(f"[TensorVisualizer] Found {len(tensor_files)} tensor files")
         
         loaded_tensors = []
         for file_path in tensor_files:
@@ -73,12 +73,12 @@ class TensorVisualizer:
                 }
                 loaded_tensors.append(tensor_info)
             except Exception as e:
-                print(f"[TensorVisualizer] 加载文件失败 {file_path}: {e}")
+                print(f"[TensorVisualizer] Failed to load file {file_path}: {e}")
         
         return loaded_tensors
     
     def group_tensors_by_type(self, tensors: List[Dict]) -> Dict[str, List[Dict]]:
-        """按类型分组tensor"""
+        """Group tensors by type"""
         groups = {
             'attention_forward': [],
             'attention_backward': [],
@@ -98,48 +98,48 @@ class TensorVisualizer:
         return groups
     
     def plot_tensor_distribution(self, tensor_info: Dict, save_path: str):
-        """绘制tensor分布图"""
+        """Plot tensor distribution chart"""
         tensor = tensor_info['tensor'].float().numpy().flatten()
         metadata = tensor_info['metadata']
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f"Tensor分布分析 - {tensor_info['filename']}", fontsize=16)
+        fig.suptitle(f"Tensor Distribution Analysis - {tensor_info['filename']}", fontsize=16)
         
-        # 直方图
+        # Histogram
         axes[0, 0].hist(tensor, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
-        axes[0, 0].set_title('数值分布直方图')
-        axes[0, 0].set_xlabel('数值')
-        axes[0, 0].set_ylabel('频次')
+        axes[0, 0].set_title('Value Distribution Histogram')
+        axes[0, 0].set_xlabel('Value')
+        axes[0, 0].set_ylabel('Frequency')
         axes[0, 0].grid(True, alpha=0.3)
         
-        # 箱线图
+        # Box plot
         axes[0, 1].boxplot(tensor, patch_artist=True, 
                           boxprops=dict(facecolor='lightgreen', alpha=0.7))
-        axes[0, 1].set_title('数值分布箱线图')
-        axes[0, 1].set_ylabel('数值')
+        axes[0, 1].set_title('Value Distribution Box Plot')
+        axes[0, 1].set_ylabel('Value')
         axes[0, 1].grid(True, alpha=0.3)
         
-        # Q-Q图
+        # Q-Q plot
         from scipy import stats
         stats.probplot(tensor, dist="norm", plot=axes[1, 0])
-        axes[1, 0].set_title('Q-Q图 (正态分布)')
+        axes[1, 0].set_title('Q-Q Plot (Normal Distribution)')
         axes[1, 0].grid(True, alpha=0.3)
         
-        # 统计信息
+        # Statistical information
         stats_text = f"""
-        统计信息:
-        形状: {tensor_info['tensor_info']['shape']}
-        数据类型: {tensor_info['tensor_info']['dtype']}
-        最小值: {tensor_info['tensor_info']['min']:.4f}
-        最大值: {tensor_info['tensor_info']['max']:.4f}
-        均值: {tensor_info['tensor_info']['mean']:.4f}
-        标准差: {tensor_info['tensor_info']['std']:.4f}
+        Statistical Information:
+        Shape: {tensor_info['tensor_info']['shape']}
+        Data Type: {tensor_info['tensor_info']['dtype']}
+        Min Value: {tensor_info['tensor_info']['min']:.4f}
+        Max Value: {tensor_info['tensor_info']['max']:.4f}
+        Mean: {tensor_info['tensor_info']['mean']:.4f}
+        Std Dev: {tensor_info['tensor_info']['std']:.4f}
         
-        层信息:
-        层类型: {metadata['layer_type']}
-        操作: {metadata['operation']}
-        量化类型: {metadata['quant_type']}
-        层索引: {metadata.get('layer_idx', 'N/A')}
+        Layer Information:
+        Layer Type: {metadata['layer_type']}
+        Operation: {metadata['operation']}
+        Quantization Type: {metadata['quant_type']}
+        Layer Index: {metadata.get('layer_idx', 'N/A')}
         """
         
         axes[1, 1].text(0.1, 0.9, stats_text, transform=axes[1, 1].transAxes,
@@ -361,87 +361,87 @@ class TensorVisualizer:
         plt.close()
     
     def generate_all_visualizations(self):
-        """生成所有可视化图表"""
-        print("[TensorVisualizer] 开始生成可视化图表...")
+        """Generate all visualization charts"""
+        print("[TensorVisualizer] Starting to generate visualization charts...")
         
-        # 加载tensor文件
+        # Load tensor files
         tensors = self.load_tensor_files()
         if not tensors:
-            print("[TensorVisualizer] 没有找到tensor文件")
+            print("[TensorVisualizer] No tensor files found")
             return
         
-        # 按类型分组
+        # Group by type
         groups = self.group_tensors_by_type(tensors)
         
-        # 生成分布图
-        print("[TensorVisualizer] 生成分布图...")
-        for i, tensor_info in enumerate(tensors[:10]):  # 限制数量避免过多文件
+        # Generate distribution plots
+        print("[TensorVisualizer] Generating distribution plots...")
+        for i, tensor_info in enumerate(tensors[:10]):  # Limit number to avoid too many files
             save_path = self.subdirs['distributions'] / f"distribution_{i:03d}_{tensor_info['filename'][:20]}.png"
             self.plot_tensor_distribution(tensor_info, str(save_path))
         
-        # 生成热力图
-        print("[TensorVisualizer] 生成热力图...")
+        # Generate heatmaps
+        print("[TensorVisualizer] Generating heatmaps...")
         for i, tensor_info in enumerate(tensors[:10]):
             save_path = self.subdirs['heatmaps'] / f"heatmap_{i:03d}_{tensor_info['filename'][:20]}.png"
             self.plot_tensor_heatmap(tensor_info, str(save_path))
         
-        # 生成量化类型对比图
-        print("[TensorVisualizer] 生成量化类型对比图...")
+        # Generate quantization type comparison charts
+        print("[TensorVisualizer] Generating quantization type comparison charts...")
         for group_name, group_tensors in groups.items():
             if group_tensors:
                 save_path = self.subdirs['comparisons'] / f"quant_comparison_{group_name}.png"
                 self.plot_quantization_comparison(group_tensors, str(save_path))
         
-        # 生成统计汇总图
-        print("[TensorVisualizer] 生成统计汇总图...")
+        # Generate statistical summary charts
+        print("[TensorVisualizer] Generating statistical summary charts...")
         save_path = self.subdirs['statistics'] / "statistics_summary.png"
         self.plot_statistics_summary(tensors, str(save_path))
         
-        # 生成attention分析图
-        print("[TensorVisualizer] 生成attention分析图...")
+        # Generate attention analysis charts
+        print("[TensorVisualizer] Generating attention analysis charts...")
         save_path = self.subdirs['attention_maps'] / "attention_analysis.png"
         self.plot_attention_analysis(tensors, str(save_path))
         
-        print(f"[TensorVisualizer] 可视化完成！图表保存在: {self.output_dir}")
+        print(f"[TensorVisualizer] Visualization complete! Charts saved to: {self.output_dir}")
         self.print_summary()
     
     def print_summary(self):
-        """打印生成的文件摘要"""
-        print("\n=== 生成的可视化文件摘要 ===")
+        """Print summary of generated files"""
+        print("\n=== Generated Visualization Files Summary ===")
         
         for subdir_name, subdir_path in self.subdirs.items():
             files = list(subdir_path.glob("*.png"))
-            print(f"{subdir_name}: {len(files)} 个文件")
-            for file in files[:3]:  # 显示前3个文件
+            print(f"{subdir_name}: {len(files)} files")
+            for file in files[:3]:  # Show first 3 files
                 print(f"  - {file.name}")
             if len(files) > 3:
-                print(f"  ... 还有 {len(files) - 3} 个文件")
+                print(f"  ... and {len(files) - 3} more files")
 
 
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description='Tensor可视化工具')
+    """Main function"""
+    parser = argparse.ArgumentParser(description='Tensor Visualization Tool')
     parser.add_argument('--tensor_dir', type=str, default='./enhanced_tensor_logs',
-                       help='tensor文件目录 (默认: ./enhanced_tensor_logs)')
+                       help='Tensor file directory (default: ./enhanced_tensor_logs)')
     parser.add_argument('--output_dir', type=str, default='./draw',
-                       help='输出图片目录 (默认: ./draw)')
+                       help='Output image directory (default: ./draw)')
     parser.add_argument('--max_files', type=int, default=50,
-                       help='最大处理文件数 (默认: 50)')
+                       help='Maximum number of files to process (default: 50)')
     
     args = parser.parse_args()
     
-    print("=== Tensor可视化工具 ===")
-    print(f"Tensor目录: {args.tensor_dir}")
-    print(f"输出目录: {args.output_dir}")
-    print(f"最大文件数: {args.max_files}")
+    print("=== Tensor Visualization Tool ===")
+    print(f"Tensor directory: {args.tensor_dir}")
+    print(f"Output directory: {args.output_dir}")
+    print(f"Maximum files: {args.max_files}")
     
-    # 创建可视化器
+    # Create visualizer
     visualizer = TensorVisualizer(
         tensor_dir=args.tensor_dir,
         output_dir=args.output_dir
     )
     
-    # 生成所有可视化图表
+    # Generate all visualization charts
     visualizer.generate_all_visualizations()
 
 

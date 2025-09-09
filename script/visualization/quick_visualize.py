@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-快速Tensor可视化脚本
-增强版本，用于快速生成高质量的分析图表
+Quick Tensor Visualization Script
+Enhanced version for quickly generating high-quality analysis charts
 """
 
 import os
@@ -31,34 +31,34 @@ sns.set_style("whitegrid")
 sns.set_palette("husl")
 
 def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
-    """快速可视化tensor数据"""
+    """Quick visualization of tensor data"""
     
-    # 创建输出目录
+    # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # 查找tensor文件
+    # Find tensor files
     tensor_files = glob.glob(f"{tensor_dir}/*.pt")
-    print(f"找到 {len(tensor_files)} 个tensor文件")
+    print(f"Found {len(tensor_files)} tensor files")
     
     if not tensor_files:
-        print("没有找到tensor文件，请检查目录路径")
+        print("No tensor files found, please check directory path")
         return
     
-    # 创建汇总图
+    # Create summary chart
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('Tensor数据快速分析', fontsize=16)
+    fig.suptitle('Tensor Data Quick Analysis', fontsize=16)
     
-    # 收集数据
+    # Collect data
     all_values = []
     quant_types = []
     layer_types = []
     operations = []
     
-    for file_path in tensor_files[:20]:  # 限制处理文件数
+    for file_path in tensor_files[:20]:  # Limit number of files to process
         try:
             data = torch.load(file_path, map_location='cpu')
-            # 转换BFloat16为Float32以支持numpy
+            # Convert BFloat16 to Float32 to support numpy
             tensor = data['tensor'].float().numpy().flatten()
             metadata = data['metadata']
             
@@ -68,9 +68,9 @@ def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
             operations.append(metadata['operation'])
             
         except Exception as e:
-            print(f"加载文件失败 {file_path}: {e}")
+            print(f"Failed to load file {file_path}: {e}")
     
-    # 绘制分布图
+    # Plot distribution
     if len(all_values) > 0:
         axes[0, 0].hist(all_values, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
         axes[0, 0].set_title('All Tensor Value Distribution')
@@ -81,7 +81,7 @@ def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
         axes[0, 0].text(0.5, 0.5, 'No data available', ha='center', va='center', transform=axes[0, 0].transAxes)
         axes[0, 0].set_title('All Tensor Value Distribution')
     
-    # 量化类型分布
+    # Quantization type distribution
     from collections import Counter
     quant_counts = Counter(quant_types)
     if quant_counts:
@@ -91,7 +91,7 @@ def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
         axes[0, 1].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[0, 1].transAxes)
         axes[0, 1].set_title('Quantization Type Distribution')
     
-    # 层类型分布
+    # Layer type distribution
     layer_counts = Counter(layer_types)
     if layer_counts:
         axes[1, 0].pie(layer_counts.values(), labels=layer_counts.keys(), autopct='%1.1f%%')
@@ -100,7 +100,7 @@ def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
         axes[1, 0].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[1, 0].transAxes)
         axes[1, 0].set_title('Layer Type Distribution')
     
-    # 操作类型分布
+    # Operation type distribution
     op_counts = Counter(operations)
     if op_counts:
         axes[1, 1].pie(op_counts.values(), labels=op_counts.keys(), autopct='%1.1f%%')
@@ -111,52 +111,52 @@ def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
     
     plt.tight_layout()
     
-    # 保存图片
+    # Save image
     output_file = output_path / "quick_analysis.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"快速分析图已保存到: {output_file}")
+    print(f"Quick analysis chart saved to: {output_file}")
     
-    # 生成统计信息
+    # Generate statistical information
     stats_file = output_path / "tensor_stats.txt"
     with open(stats_file, 'w', encoding='utf-8') as f:
-        f.write("=== Tensor统计信息 ===\n")
-        f.write(f"总文件数: {len(tensor_files)}\n")
-        f.write(f"处理文件数: {min(20, len(tensor_files))}\n")
-        f.write(f"总数值数量: {len(all_values)}\n")
+        f.write("=== Tensor Statistical Information ===\n")
+        f.write(f"Total files: {len(tensor_files)}\n")
+        f.write(f"Processed files: {min(20, len(tensor_files))}\n")
+        f.write(f"Total value count: {len(all_values)}\n")
         if len(all_values) > 0:
-            f.write(f"数值范围: [{np.min(all_values):.4f}, {np.max(all_values):.4f}]\n")
-            f.write(f"均值: {np.mean(all_values):.4f}\n")
-            f.write(f"标准差: {np.std(all_values):.4f}\n\n")
+            f.write(f"Value range: [{np.min(all_values):.4f}, {np.max(all_values):.4f}]\n")
+            f.write(f"Mean: {np.mean(all_values):.4f}\n")
+            f.write(f"Std dev: {np.std(all_values):.4f}\n\n")
         else:
-            f.write("数值范围: 无数据\n")
-            f.write("均值: 无数据\n")
-            f.write("标准差: 无数据\n\n")
+            f.write("Value range: No data\n")
+            f.write("Mean: No data\n")
+            f.write("Std dev: No data\n\n")
         
-        f.write("量化类型分布:\n")
+        f.write("Quantization type distribution:\n")
         for quant_type, count in quant_counts.items():
-            f.write(f"  {quant_type}: {count} 个文件\n")
+            f.write(f"  {quant_type}: {count} files\n")
         
-        f.write("\n层类型分布:\n")
+        f.write("\nLayer type distribution:\n")
         for layer_type, count in layer_counts.items():
-            f.write(f"  {layer_type}: {count} 个文件\n")
+            f.write(f"  {layer_type}: {count} files\n")
         
-        f.write("\n操作类型分布:\n")
+        f.write("\nOperation type distribution:\n")
         for operation, count in op_counts.items():
-            f.write(f"  {operation}: {count} 个文件\n")
+            f.write(f"  {operation}: {count} files\n")
     
-    print(f"统计信息已保存到: {stats_file}")
+    print(f"Statistical information saved to: {stats_file}")
 
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='快速Tensor可视化')
+    parser = argparse.ArgumentParser(description='Quick Tensor Visualization')
     parser.add_argument('--tensor_dir', type=str, default='./enhanced_tensor_logs',
-                       help='tensor文件目录')
+                       help='Tensor file directory')
     parser.add_argument('--output_dir', type=str, default='./draw',
-                       help='输出目录')
+                       help='Output directory')
     
     args = parser.parse_args()
     

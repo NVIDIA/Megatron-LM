@@ -1,157 +1,157 @@
-# 可视化脚本
+# Visualization Scripts
 
-这个目录包含了用于可视化tensor数据的脚本和工具。
+This directory contains scripts and tools for visualizing tensor data.
 
-## 脚本文件
+## Script Files
 
-### 可视化脚本
-- **`visualize_tensors.py`** - 完整的tensor可视化工具
-- **`quick_visualize.py`** - 快速可视化脚本
-- **`one_click_visualize.sh`** - 一键可视化脚本
+### Visualization Scripts
+- **`visualize_tensors.py`** - Complete tensor visualization tool
+- **`quick_visualize.py`** - Quick visualization script
+- **`one_click_visualize.sh`** - One-click visualization script
 
-## 功能特性
+## Features
 
-### 1. 完整的tensor可视化工具 (visualize_tensors.py)
-- **分布图**: tensor数值分布直方图、箱线图、Q-Q图
-- **热力图**: tensor数据的热力图可视化
-- **对比图**: 不同量化类型的对比分析
-- **统计图**: 统计信息汇总图表
-- **Attention分析**: 专门的attention tensor分析
+### 1. Complete Tensor Visualization Tool (visualize_tensors.py)
+- **Distribution Plots**: Tensor value distribution histograms, box plots, Q-Q plots
+- **Heatmaps**: Heatmap visualization of tensor data
+- **Comparison Plots**: Comparative analysis of different quantization types
+- **Statistical Plots**: Statistical information summary charts
+- **Attention Analysis**: Specialized attention tensor analysis
 
-### 2. 快速可视化脚本 (quick_visualize.py)
-- 生成基本的统计图表
-- 快速分析tensor数据分布
-- 生成统计信息文本文件
+### 2. Quick Visualization Script (quick_visualize.py)
+- Generate basic statistical charts
+- Quick analysis of tensor data distribution
+- Generate statistical information text files
 
-### 3. 一键可视化脚本 (one_click_visualize.sh)
-- 自动检测tensor文件
-- 运行快速和完整可视化
-- 生成所有分析图表
+### 3. One-Click Visualization Script (one_click_visualize.sh)
+- Automatically detect tensor files
+- Run quick and complete visualization
+- Generate all analysis charts
 
-## 使用方法
+## Usage
 
-### 1. 一键可视化（推荐）
+### 1. One-Click Visualization (Recommended)
 ```bash
-# 基本用法
+# Basic usage
 ./one_click_visualize.sh
 
-# 自定义参数
+# Custom parameters
 ./one_click_visualize.sh ./enhanced_tensor_logs ./draw
 ```
 
-### 2. 快速可视化
+### 2. Quick Visualization
 ```bash
-# 基本用法
+# Basic usage
 python quick_visualize.py
 
-# 自定义参数
+# Custom parameters
 python quick_visualize.py \
     --tensor_dir ./enhanced_tensor_logs \
     --output_dir ./draw
 ```
 
-### 3. 完整可视化
+### 3. Complete Visualization
 ```bash
-# 基本用法
+# Basic usage
 python visualize_tensors.py
 
-# 自定义参数
+# Custom parameters
 python visualize_tensors.py \
     --tensor_dir ./enhanced_tensor_logs \
     --output_dir ./draw \
     --max_files 50
 ```
 
-## 输出文件
+## Output Files
 
-### 目录结构
+### Directory Structure
 ```
 draw/
-├── quick_analysis.png          # 快速分析图
-├── tensor_stats.txt           # 统计信息文本
-├── distributions/             # 分布图目录
-├── heatmaps/                  # 热力图目录
-├── comparisons/               # 对比图目录
-├── statistics/                # 统计图目录
-└── attention_maps/            # Attention分析图目录
+├── quick_analysis.png          # Quick analysis chart
+├── tensor_stats.txt           # Statistical information text
+├── distributions/             # Distribution plots directory
+├── heatmaps/                  # Heatmap directory
+├── comparisons/               # Comparison plots directory
+├── statistics/                # Statistical plots directory
+└── attention_maps/            # Attention analysis plots directory
 ```
 
-### 图表类型
-- **quick_analysis.png**: 包含4个子图的综合分析
-  - 所有tensor数值分布直方图
-  - 量化类型分布饼图
-  - 层类型分布饼图
-  - 操作类型分布饼图
+### Chart Types
+- **quick_analysis.png**: Comprehensive analysis with 4 subplots
+  - All tensor value distribution histogram
+  - Quantization type distribution pie chart
+  - Layer type distribution pie chart
+  - Operation type distribution pie chart
 
-- **distributions/**: 详细的tensor分布分析图
-- **heatmaps/**: tensor数据的热力图
-- **comparisons/**: 不同量化类型的对比图
-- **statistics/**: 统计信息汇总图
-- **attention_maps/**: attention tensor专门分析图
+- **distributions/**: Detailed tensor distribution analysis plots
+- **heatmaps/**: Heatmaps of tensor data
+- **comparisons/**: Comparison plots of different quantization types
+- **statistics/**: Statistical information summary plots
+- **attention_maps/**: Specialized attention tensor analysis plots
 
-## 环境要求
+## Requirements
 
-### Python依赖
+### Python Dependencies
 ```bash
 pip install matplotlib seaborn pandas scipy
 ```
 
-### 环境变量
+### Environment Variables
 ```bash
 export TENSOR_SAVE_DIR="./enhanced_tensor_logs"
 export TENSOR_SAVE_ENABLED="true"
 ```
 
-## 参数说明
+## Parameter Description
 
 ### visualize_tensors.py
-- `--tensor_dir`: tensor文件目录 (默认: ./enhanced_tensor_logs)
-- `--output_dir`: 输出图片目录 (默认: ./draw)
-- `--max_files`: 最大处理文件数 (默认: 50)
+- `--tensor_dir`: Tensor file directory (default: ./enhanced_tensor_logs)
+- `--output_dir`: Output image directory (default: ./draw)
+- `--max_files`: Maximum number of files to process (default: 50)
 
 ### quick_visualize.py
-- `--tensor_dir`: tensor文件目录 (默认: ./enhanced_tensor_logs)
-- `--output_dir`: 输出目录 (默认: ./draw)
+- `--tensor_dir`: Tensor file directory (default: ./enhanced_tensor_logs)
+- `--output_dir`: Output directory (default: ./draw)
 
 ### one_click_visualize.sh
-- `$1`: tensor文件目录 (默认: ./enhanced_tensor_logs)
-- `$2`: 输出目录 (默认: ./draw)
+- `$1`: Tensor file directory (default: ./enhanced_tensor_logs)
+- `$2`: Output directory (default: ./draw)
 
-## 使用场景
+## Use Cases
 
-### 1. 量化研究
-- 分析不同量化类型对tensor分布的影响
-- 比较forward和backward pass的tensor特性
-- 研究attention和linear层的tensor行为
+### 1. Quantization Research
+- Analyze the impact of different quantization types on tensor distribution
+- Compare tensor characteristics of forward and backward passes
+- Study tensor behavior of attention and linear layers
 
-### 2. 模型调试
-- 可视化tensor数值分布
-- 检测异常值和数值范围
-- 分析tensor的统计特性
+### 2. Model Debugging
+- Visualize tensor value distribution
+- Detect outliers and value ranges
+- Analyze statistical properties of tensors
 
-### 3. 性能分析
-- 比较不同量化方法的性能
-- 分析tensor的内存使用模式
-- 优化量化策略
+### 3. Performance Analysis
+- Compare performance of different quantization methods
+- Analyze tensor memory usage patterns
+- Optimize quantization strategies
 
-## 注意事项
+## Notes
 
-1. **文件格式**: 支持.pt格式的tensor文件
-2. **内存使用**: 大文件会自动采样以避免内存问题
-3. **BFloat16支持**: 自动转换为Float32以支持numpy操作
-4. **中文字体**: 可能需要安装中文字体以正确显示中文标签
-5. **文件权限**: 确保脚本有执行权限
+1. **File Format**: Supports .pt format tensor files
+2. **Memory Usage**: Large files will be automatically sampled to avoid memory issues
+3. **BFloat16 Support**: Automatically converted to Float32 to support numpy operations
+4. **Font Support**: May need to install appropriate fonts for proper label display
+5. **File Permissions**: Ensure scripts have execution permissions
 
-## 故障排除
+## Troubleshooting
 
-### 常见问题
-1. **ModuleNotFoundError**: 安装缺失的Python包
-2. **字体警告**: 忽略中文字体警告，不影响功能
-3. **内存不足**: 减少max_files参数或增加系统内存
-4. **文件权限**: 使用chmod +x设置执行权限
+### Common Issues
+1. **ModuleNotFoundError**: Install missing Python packages
+2. **Font Warnings**: Ignore font warnings, they don't affect functionality
+3. **Insufficient Memory**: Reduce max_files parameter or increase system memory
+4. **File Permissions**: Use chmod +x to set execution permissions
 
-### 调试技巧
-- 使用quick_visualize.py进行快速测试
-- 检查tensor文件是否正确生成
-- 查看错误日志定位问题
-- 使用小数据集进行测试
+### Debugging Tips
+- Use quick_visualize.py for quick testing
+- Check if tensor files are generated correctly
+- Review error logs to locate issues
+- Test with small datasets

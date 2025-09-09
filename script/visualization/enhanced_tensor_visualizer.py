@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-增强版Tensor可视化脚本
-专门针对enhanced_tensor_logs中的tensor文件进行高质量可视化
+Enhanced Tensor Visualization Script
+Specialized for high-quality visualization of tensor files in enhanced_tensor_logs
 """
 
 import os
@@ -34,21 +34,21 @@ sns.set_style("whitegrid")
 sns.set_palette("husl")
 
 class EnhancedTensorVisualizer:
-    """增强版Tensor可视化器"""
+    """Enhanced Tensor Visualizer"""
     
     def __init__(self, tensor_dir: str = "./enhanced_tensor_logs", output_dir: str = "./draw"):
         """
-        初始化可视化器
+        Initialize visualizer
         
         Args:
-            tensor_dir: tensor文件目录
-            output_dir: 输出图片目录
+            tensor_dir: Tensor file directory
+            output_dir: Output image directory
         """
         self.tensor_dir = Path(tensor_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建子目录
+        # Create subdirectories
         self.subdirs = {
             'distributions': self.output_dir / 'distributions',
             'heatmaps': self.output_dir / 'heatmaps', 
@@ -62,14 +62,14 @@ class EnhancedTensorVisualizer:
         for subdir in self.subdirs.values():
             subdir.mkdir(parents=True, exist_ok=True)
         
-        print(f"[EnhancedTensorVisualizer] 初始化完成")
-        print(f"  Tensor目录: {self.tensor_dir}")
-        print(f"  输出目录: {self.output_dir}")
+        print(f"[EnhancedTensorVisualizer] Initialization complete")
+        print(f"  Tensor directory: {self.tensor_dir}")
+        print(f"  Output directory: {self.output_dir}")
     
     def load_tensor_files(self) -> List[Dict]:
-        """加载所有tensor文件"""
+        """Load all tensor files"""
         tensor_files = glob.glob(str(self.tensor_dir / "*.pt"))
-        print(f"[EnhancedTensorVisualizer] 找到 {len(tensor_files)} 个tensor文件")
+        print(f"[EnhancedTensorVisualizer] Found {len(tensor_files)} tensor files")
         
         loaded_tensors = []
         for file_path in tensor_files:
@@ -84,13 +84,13 @@ class EnhancedTensorVisualizer:
                 }
                 loaded_tensors.append(tensor_info)
             except Exception as e:
-                print(f"[EnhancedTensorVisualizer] 加载文件失败 {file_path}: {e}")
+                print(f"[EnhancedTensorVisualizer] Failed to load file {file_path}: {e}")
         
         return loaded_tensors
     
     def parse_filename(self, filename: str) -> Dict:
-        """解析文件名获取信息"""
-        # 格式: timestamp_counter_layer_type_L{idx}_operation_phase_component_quant_type_tensor_name.pt
+        """Parse filename to extract information"""
+        # Format: timestamp_counter_layer_type_L{idx}_operation_phase_component_quant_type_tensor_name.pt
         parts = filename.replace('.pt', '').split('_')
         
         info = {
@@ -108,7 +108,7 @@ class EnhancedTensorVisualizer:
         return info
     
     def group_tensors_by_quant_type(self, tensors: List[Dict]) -> Dict[str, List[Dict]]:
-        """按量化类型分组tensor"""
+        """Group tensors by quantization type"""
         groups = defaultdict(list)
         
         for tensor_info in tensors:
@@ -118,7 +118,7 @@ class EnhancedTensorVisualizer:
         return dict(groups)
     
     def group_tensors_by_layer_type(self, tensors: List[Dict]) -> Dict[str, List[Dict]]:
-        """按层类型分组tensor"""
+        """Group tensors by layer type"""
         groups = defaultdict(list)
         
         for tensor_info in tensors:
@@ -128,45 +128,45 @@ class EnhancedTensorVisualizer:
         return dict(groups)
     
     def plot_quantization_comparison(self, tensors: List[Dict]):
-        """绘制量化类型对比图"""
+        """Plot quantization type comparison chart"""
         quant_groups = self.group_tensors_by_quant_type(tensors)
         
         if len(quant_groups) < 2:
-            print("量化类型数量不足，跳过对比图")
+            print("Insufficient quantization types, skipping comparison chart")
             return
         
-        # 选择相同tensor_name的文件进行对比
+        # Select files with same tensor_name for comparison
         tensor_name_groups = defaultdict(list)
         for quant_type, group in quant_groups.items():
             for tensor_info in group:
                 tensor_name = tensor_info['metadata']['tensor_name']
                 tensor_name_groups[tensor_name].append((quant_type, tensor_info))
         
-        # 为每个tensor_name创建对比图
+        # Create comparison chart for each tensor_name
         for tensor_name, quant_tensors in tensor_name_groups.items():
             if len(quant_tensors) < 2:
                 continue
                 
             fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            fig.suptitle(f'{tensor_name} - 量化类型对比分析', fontsize=16, fontweight='bold')
+            fig.suptitle(f'{tensor_name} - Quantization Type Comparison Analysis', fontsize=16, fontweight='bold')
             
-            # 收集数据
+            # Collect data
             data_by_quant = {}
             for quant_type, tensor_info in quant_tensors:
                 tensor_data = tensor_info['tensor'].float().numpy().flatten()
                 data_by_quant[quant_type] = tensor_data
             
-            # 分布对比
+            # Distribution comparison
             ax1 = axes[0, 0]
             for quant_type, data in data_by_quant.items():
                 ax1.hist(data, bins=50, alpha=0.6, label=quant_type, density=True)
-            ax1.set_title('数值分布对比')
-            ax1.set_xlabel('数值')
-            ax1.set_ylabel('密度')
+            ax1.set_title('Value Distribution Comparison')
+            ax1.set_xlabel('Value')
+            ax1.set_ylabel('Density')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             
-            # 箱线图对比
+            # Box plot comparison
             ax2 = axes[0, 1]
             box_data = [data_by_quant[qt] for qt in data_by_quant.keys()]
             box_labels = list(data_by_quant.keys())
@@ -175,8 +175,8 @@ class EnhancedTensorVisualizer:
             for patch, color in zip(bp['boxes'], colors):
                 patch.set_facecolor(color)
                 patch.set_alpha(0.7)
-            ax2.set_title('数值分布箱线图对比')
-            ax2.set_ylabel('数值')
+            ax2.set_title('Value Distribution Box Plot Comparison')
+            ax2.set_ylabel('Value')
             ax2.grid(True, alpha=0.3)
             
             # 统计信息对比
@@ -240,19 +240,19 @@ class EnhancedTensorVisualizer:
             
             plt.tight_layout()
             
-            # 保存图片
+            # Save image
             output_path = self.subdirs['quantization_analysis'] / f'{tensor_name}_quantization_comparison.png'
             plt.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close()
             
-            print(f"已保存量化对比图: {output_path}")
+            print(f"Quantization comparison chart saved: {output_path}")
     
     def plot_attention_analysis(self, tensors: List[Dict]):
-        """绘制attention层分析图"""
+        """Plot attention layer analysis chart"""
         attention_tensors = [t for t in tensors if t['metadata']['layer_type'] == 'attention']
         
         if not attention_tensors:
-            print("没有找到attention层tensor，跳过attention分析")
+            print("No attention layer tensors found, skipping attention analysis")
             return
         
         # 按tensor_name分组
@@ -524,46 +524,46 @@ class EnhancedTensorVisualizer:
         print(f"已保存汇总报告: {output_path}")
     
     def run_visualization(self):
-        """运行完整的可视化流程"""
-        print("[EnhancedTensorVisualizer] 开始可视化流程...")
+        """Run complete visualization workflow"""
+        print("[EnhancedTensorVisualizer] Starting visualization workflow...")
         
-        # 加载tensor文件
+        # Load tensor files
         tensors = self.load_tensor_files()
         
         if not tensors:
-            print("没有找到tensor文件，退出可视化")
+            print("No tensor files found, exiting visualization")
             return
         
-        print(f"成功加载 {len(tensors)} 个tensor文件")
+        print(f"Successfully loaded {len(tensors)} tensor files")
         
-        # 生成各种分析图
-        print("\n1. 生成汇总报告...")
+        # Generate various analysis charts
+        print("\n1. Generating summary report...")
         self.generate_summary_report(tensors)
         
-        print("\n2. 生成量化类型对比图...")
+        print("\n2. Generating quantization type comparison charts...")
         self.plot_quantization_comparison(tensors)
         
-        print("\n3. 生成attention分析图...")
+        print("\n3. Generating attention analysis charts...")
         self.plot_attention_analysis(tensors)
         
-        print("\n4. 生成层类型对比图...")
+        print("\n4. Generating layer type comparison charts...")
         self.plot_layer_comparison(tensors)
         
-        print(f"\n[EnhancedTensorVisualizer] 可视化完成！")
-        print(f"所有图片已保存到: {self.output_dir}")
+        print(f"\n[EnhancedTensorVisualizer] Visualization complete!")
+        print(f"All images saved to: {self.output_dir}")
 
 
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description='增强版Tensor可视化工具')
+    """Main function"""
+    parser = argparse.ArgumentParser(description='Enhanced Tensor Visualization Tool')
     parser.add_argument('--tensor_dir', type=str, default='./enhanced_tensor_logs',
-                       help='tensor文件目录 (默认: ./enhanced_tensor_logs)')
+                       help='Tensor file directory (default: ./enhanced_tensor_logs)')
     parser.add_argument('--output_dir', type=str, default='./draw',
-                       help='输出图片目录 (默认: ./draw)')
+                       help='Output image directory (default: ./draw)')
     
     args = parser.parse_args()
     
-    # 创建可视化器并运行
+    # Create visualizer and run
     visualizer = EnhancedTensorVisualizer(
         tensor_dir=args.tensor_dir,
         output_dir=args.output_dir
