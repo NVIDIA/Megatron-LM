@@ -392,6 +392,12 @@ def main():
         enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
+    # >>>
+    engine.suspend()
+    engine.resume()
+    raise Exception("hi.")
+    # <<<
+
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
     print(setup_prefix)
