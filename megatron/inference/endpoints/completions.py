@@ -100,6 +100,7 @@ class MegatronCompletions(Resource):
             tokens_to_generate = local_kwargs["tokens_to_generate"]
             logprobs = local_kwargs["return_output_log_probs"]
             top_n_logprobs = local_kwargs["return_topk_logprobs"]
+            random_seed = local_kwargs["random_seed"]
             response_dict = run_mcore_engine(
                 self.engine,
                 prompts,
@@ -110,6 +111,7 @@ class MegatronCompletions(Resource):
                 tokens_to_generate,
                 top_n_logprobs=top_n_logprobs,
                 echo=echo,
+                random_seed=random_seed,
             )
             result = [
                 response_dict["text"],
