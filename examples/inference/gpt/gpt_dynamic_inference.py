@@ -379,6 +379,12 @@ def main():
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
     )
 
+    # >>>
+    engine.suspend()
+    engine.resume()
+    raise Exception("hi.")
+    # <<<
+
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
     print(setup_prefix)

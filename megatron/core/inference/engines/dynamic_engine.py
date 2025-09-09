@@ -86,6 +86,12 @@ class DynamicInferenceEngine(AbstractEngine):
         termination_id (int): Token ID to mark end-of-sequence.
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
+        unified_memory_level (Optional[int]): Set unified memory usage within the
+            dynamic inference context. The levels are: 0) no unified memory, 1)
+            allocate `memory_buffer` only in unified memory, and 2) allocate all
+            tensors in unified memory. Note that levels 1 and 2 not not perform
+            any deallocations and allocations when suspending and resuming the
+            context.
     """
 
     def __init__(
@@ -151,9 +157,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = None
         if self.enable_cuda_graph:
 
-            # >>>
-            raise Exception("enable_cuda_graph.")
-            # <<<
             time_start = time.time()
             mem_stats_start = torch.cuda.memory_stats()
 
@@ -238,16 +241,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
             self.capture_stats = capture_stats
 
-    def clear_cuda_graphs(self):
-        """Clear cuda graphs.
+    # >>>
+    # def clear_cuda_graphs(self):
+    #     """Clear cuda graphs.
 
-        This method clears the cuda graph state in `cuda_graphs.py`, to allow for
-        calling `create_cudagraphs()` again.
-        """
-        if self.enable_cuda_graph:
-            _CudagraphGlobalRecord.cudagraph_created = False
-            _CudagraphGlobalRecord.cudagraph_record = []
-            CudaGraphManager.global_mempool = None
+    #     This method clears the cuda graph state in `cuda_graphs.py`, to allow for
+    #     calling `create_cudagraphs()` again.
+    #     """
+    #     if self.enable_cuda_graph:
+    #         _CudagraphGlobalRecord.cudagraph_created = False
+    #         _CudagraphGlobalRecord.cudagraph_record = []
+    #         CudaGraphManager.global_mempool = None
+    # <<<
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -439,8 +444,16 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx("suspended"):
             self.context.deallocate_all_tensors()
 
-        # Clear cuda graphs.
-        self.clear_cuda_graphs()
+        # Delete cuda graphs.
+        # >>>
+        # self.clear_cuda_graphs()
+        # +++
+        # Delete cuda graphs when not using unified memory at all (level 0). For
+        # levels 1 and 2, the context's tensors maintain static memory addresses,
+        # so the cuda graphs are re-used.
+        if self.unified_memory_level == 0:
+            delete_cuda_graphs()
+        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -467,7 +480,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
 
             # Create cuda graphs (before adding requests, to be in decode mode).
-            self.create_cuda_graphs()
+            # Only create cuda graphs when not using unified memory at all (level
+            # 0). For levels 1 and 2, the context's tensors maintain static
+            # memory addresses, so the cuda graphs are re-used.
+            if self.unified_memory_level == 0:
+                self.create_cuda_graphs()
 
             # Add requests.
             futures = {}
