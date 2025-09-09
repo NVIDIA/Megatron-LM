@@ -36,7 +36,7 @@
 ./one_click_visualize.sh
 
 # 自定义参数
-./one_click_visualize.sh ./tensor_logs ./draw
+./one_click_visualize.sh ./enhanced_tensor_logs ./draw
 ```
 
 ### 2. 快速可视化
@@ -46,7 +46,7 @@ python quick_visualize.py
 
 # 自定义参数
 python quick_visualize.py \
-    --tensor_dir ./tensor_logs \
+    --tensor_dir ./enhanced_tensor_logs \
     --output_dir ./draw
 ```
 
@@ -57,7 +57,7 @@ python visualize_tensors.py
 
 # 自定义参数
 python visualize_tensors.py \
-    --tensor_dir ./tensor_logs \
+    --tensor_dir ./enhanced_tensor_logs \
     --output_dir ./draw \
     --max_files 50
 ```
@@ -98,23 +98,23 @@ pip install matplotlib seaborn pandas scipy
 
 ### 环境变量
 ```bash
-export TENSOR_SAVE_DIR="./tensor_logs"
+export TENSOR_SAVE_DIR="./enhanced_tensor_logs"
 export TENSOR_SAVE_ENABLED="true"
 ```
 
 ## 参数说明
 
 ### visualize_tensors.py
-- `--tensor_dir`: tensor文件目录 (默认: ./tensor_logs)
+- `--tensor_dir`: tensor文件目录 (默认: ./enhanced_tensor_logs)
 - `--output_dir`: 输出图片目录 (默认: ./draw)
 - `--max_files`: 最大处理文件数 (默认: 50)
 
 ### quick_visualize.py
-- `--tensor_dir`: tensor文件目录 (默认: ./tensor_logs)
+- `--tensor_dir`: tensor文件目录 (默认: ./enhanced_tensor_logs)
 - `--output_dir`: 输出目录 (默认: ./draw)
 
 ### one_click_visualize.sh
-- `$1`: tensor文件目录 (默认: ./tensor_logs)
+- `$1`: tensor文件目录 (默认: ./enhanced_tensor_logs)
 - `$2`: 输出目录 (默认: ./draw)
 
 ## 使用场景

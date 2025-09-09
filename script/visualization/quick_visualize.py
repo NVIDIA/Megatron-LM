@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 快速Tensor可视化脚本
-简化版本，用于快速生成基本图表
+增强版本，用于快速生成高质量的分析图表
 """
 
 import os
@@ -9,13 +9,28 @@ import sys
 import glob
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from pathlib import Path
 import torch
+import pandas as pd
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
 
-# 添加项目路径
-sys.path.append('/data/charles/Megatron-LM')
+# 设置matplotlib参数
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.titlesize'] = 12
+plt.rcParams['axes.labelsize'] = 10
+plt.rcParams['xtick.labelsize'] = 8
+plt.rcParams['ytick.labelsize'] = 8
+plt.rcParams['legend.fontsize'] = 9
+plt.rcParams['figure.titlesize'] = 14
 
-def quick_visualize(tensor_dir="./tensor_logs", output_dir="./draw"):
+# 设置seaborn样式
+sns.set_style("whitegrid")
+sns.set_palette("husl")
+
+def quick_visualize(tensor_dir="./enhanced_tensor_logs", output_dir="./draw"):
     """快速可视化tensor数据"""
     
     # 创建输出目录
@@ -138,7 +153,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='快速Tensor可视化')
-    parser.add_argument('--tensor_dir', type=str, default='./tensor_logs',
+    parser.add_argument('--tensor_dir', type=str, default='./enhanced_tensor_logs',
                        help='tensor文件目录')
     parser.add_argument('--output_dir', type=str, default='./draw',
                        help='输出目录')

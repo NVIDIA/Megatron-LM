@@ -5,7 +5,7 @@
 """
 
 # 设置默认参数
-TENSOR_DIR=${1:-"./tensor_logs"}
+TENSOR_DIR=${1:-"./enhanced_tensor_logs"}
 OUTPUT_DIR=${2:-"./draw"}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -48,30 +48,42 @@ if [ $? -ne 0 ]; then
     pip install matplotlib numpy pandas seaborn scipy
 fi
 
-# 运行快速可视化
-echo "运行快速可视化..."
-python "$SCRIPT_DIR/quick_visualize.py" --tensor_dir "$TENSOR_DIR" --output_dir "$OUTPUT_DIR"
+# 运行增强版快速可视化
+echo "运行增强版快速可视化..."
+python "$SCRIPT_DIR/quick_visualize_enhanced.py" --tensor_dir "$TENSOR_DIR" --output_dir "$OUTPUT_DIR"
 
 if [ $? -eq 0 ]; then
-    echo "✅ 快速可视化完成"
+    echo "✅ 增强版快速可视化完成"
 else
-    echo "❌ 快速可视化失败"
+    echo "❌ 增强版快速可视化失败，尝试基础版本..."
+    python "$SCRIPT_DIR/quick_visualize.py" --tensor_dir "$TENSOR_DIR" --output_dir "$OUTPUT_DIR"
+    if [ $? -eq 0 ]; then
+        echo "✅ 基础版快速可视化完成"
+    else
+        echo "❌ 基础版快速可视化也失败"
+    fi
 fi
 
 # 运行完整可视化（如果文件数量不太多）
 if [ "$TENSOR_COUNT" -le 100 ]; then
     echo "运行完整可视化..."
-    python "$SCRIPT_DIR/visualize_tensors.py" --tensor_dir "$TENSOR_DIR" --output_dir "$OUTPUT_DIR" --max_files 50
+    python "$SCRIPT_DIR/enhanced_tensor_visualizer.py" --tensor_dir "$TENSOR_DIR" --output_dir "$OUTPUT_DIR"
     
     if [ $? -eq 0 ]; then
         echo "✅ 完整可视化完成"
     else
-        echo "❌ 完整可视化失败"
+        echo "❌ 完整可视化失败，尝试基础版本..."
+        python "$SCRIPT_DIR/visualize_tensors.py" --tensor_dir "$TENSOR_DIR" --output_dir "$OUTPUT_DIR" --max_files 50
+        if [ $? -eq 0 ]; then
+            echo "✅ 基础版完整可视化完成"
+        else
+            echo "❌ 基础版完整可视化也失败"
+        fi
     fi
 else
     echo "⚠️  Tensor文件数量较多 ($TENSOR_COUNT)，跳过完整可视化"
     echo "   如需完整可视化，请手动运行:"
-    echo "   python $SCRIPT_DIR/visualize_tensors.py --tensor_dir $TENSOR_DIR --output_dir $OUTPUT_DIR"
+    echo "   python $SCRIPT_DIR/enhanced_tensor_visualizer.py --tensor_dir $TENSOR_DIR --output_dir $OUTPUT_DIR"
 fi
 
 # 显示结果
@@ -81,19 +93,30 @@ echo "输出目录: $OUTPUT_DIR"
 echo "生成的文件:"
 find "$OUTPUT_DIR" -name "*.png" -o -name "*.txt" | head -10
 
-if [ -f "$OUTPUT_DIR/quick_analysis.png" ]; then
+# 检查生成的主要文件
+if [ -f "$OUTPUT_DIR/summary_analysis.png" ]; then
     echo ""
-    echo "🎉 主要分析图: $OUTPUT_DIR/quick_analysis.png"
+    echo "🎉 主要分析图: $OUTPUT_DIR/summary_analysis.png"
 fi
 
-if [ -f "$OUTPUT_DIR/statistics/statistics_summary.png" ]; then
-    echo "📊 统计汇总图: $OUTPUT_DIR/statistics/statistics_summary.png"
+if [ -f "$OUTPUT_DIR/detailed_tensor_stats.txt" ]; then
+    echo "📊 详细统计报告: $OUTPUT_DIR/detailed_tensor_stats.txt"
+fi
+
+# 检查子目录
+if [ -d "$OUTPUT_DIR/quantization_analysis" ]; then
+    echo "🔍 量化分析图: $OUTPUT_DIR/quantization_analysis/"
+fi
+
+if [ -d "$OUTPUT_DIR/attention_analysis" ]; then
+    echo "🧠 Attention分析图: $OUTPUT_DIR/attention_analysis/"
 fi
 
 echo ""
 echo "💡 提示:"
-echo "   - 查看 quick_analysis.png 了解基本统计信息"
-echo "   - 查看 statistics/ 目录了解详细统计"
-echo "   - 查看 distributions/ 目录了解tensor分布"
-echo "   - 查看 heatmaps/ 目录了解tensor热力图"
-echo "   - 查看 comparisons/ 目录了解量化类型对比"
+echo "   - 查看 summary_analysis.png 了解基本统计信息"
+echo "   - 查看 detailed_tensor_stats.txt 了解详细统计报告"
+echo "   - 查看 quantization_analysis/ 目录了解量化类型对比"
+echo "   - 查看 attention_analysis/ 目录了解attention层分析"
+echo "   - 查看 *_quantization_comparison.png 了解量化效果对比"
+echo "   - 查看 *_attention_analysis.png 了解attention层详细分析"

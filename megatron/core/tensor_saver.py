@@ -14,7 +14,7 @@ from pathlib import Path
 class TensorSaver:
     """Tensor保存器，用于保存量化前后的tensor数据"""
     
-    def __init__(self, save_dir: str = "./tensor_logs", enabled: bool = True):
+    def __init__(self, save_dir: str = "./enhanced_tensor_logs", enabled: bool = True):
         """
         初始化Tensor保存器
         
@@ -223,9 +223,16 @@ def get_tensor_saver() -> TensorSaver:
     """获取全局tensor保存器实例"""
     global _global_tensor_saver
     if _global_tensor_saver is None:
-        # 从环境变量获取配置
-        save_dir = os.environ.get("TENSOR_SAVE_DIR", "./tensor_logs")
-        enabled = os.environ.get("TENSOR_SAVE_ENABLED", "true").lower() == "true"
+        # 优先从命令行参数获取配置，然后从环境变量获取
+        try:
+            from megatron.training.global_vars import get_args
+            args = get_args()
+            save_dir = getattr(args, 'tensor_save_dir', None) or os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
+            enabled = getattr(args, 'save_tensors', False) or os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
+        except:
+            # 如果无法获取args，则从环境变量获取配置
+            save_dir = os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
+            enabled = os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
         _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled)
     return _global_tensor_saver
 

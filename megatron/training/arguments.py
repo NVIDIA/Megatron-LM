@@ -1740,6 +1740,10 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
+    group.add_argument('--save-tensors', action='store_true',
+                       help='Enable tensor saving for debugging and analysis.')
+    group.add_argument('--tensor-save-dir', type=str, default='./enhanced_tensor_logs',
+                       help='Directory to save tensor logs (default: ./enhanced_tensor_logs)')
     return parser
 
 

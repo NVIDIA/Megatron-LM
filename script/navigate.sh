@@ -197,7 +197,7 @@ show_help() {
     echo ""
     echo -e "${GREEN}环境变量:${NC}"
     echo "export CUSTOM_QUANT_TYPE=\"hifp8\""
-    echo "export TENSOR_SAVE_DIR=\"./tensor_logs\""
+    echo "export TENSOR_SAVE_DIR=\"./enhanced_tensor_logs\""
     echo "export TENSOR_SAVE_ENABLED=\"true\""
     echo ""
 }

@@ -13,7 +13,6 @@ wandb/
 onelogger.log
 onelogger.err
 .venv
-<<<<<<< HEAD
 test_cases/
 runs/
 model/
@@ -22,10 +21,14 @@ tests/
 checkpoints/
 tensorboard_logs/
 benchmark_cache_llama3_8b_fp8/
-=======
-runs/
-/test_cases/
 **/dist/
->>>>>>> 230e0cb393baa0dca353d95d30d75ea13db7f265
 *.backup
 *.backup.*
+
+# Tensor保存目录 - 只保留enhanced_tensor_logs
+tensor_logs/
+test_tensor_logs/
+demo_tensor_logs/
+improved_tensor_logs/
+custom_tensor_logs/
+env_tensor_logs/

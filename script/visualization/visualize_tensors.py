@@ -27,7 +27,7 @@ plt.rcParams['axes.unicode_minus'] = False
 class TensorVisualizer:
     """Tensor可视化器"""
     
-    def __init__(self, tensor_dir: str = "./tensor_logs", output_dir: str = "./draw"):
+    def __init__(self, tensor_dir: str = "./enhanced_tensor_logs", output_dir: str = "./draw"):
         """
         初始化可视化器
         
@@ -421,8 +421,8 @@ class TensorVisualizer:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='Tensor可视化工具')
-    parser.add_argument('--tensor_dir', type=str, default='./tensor_logs',
-                       help='tensor文件目录 (默认: ./tensor_logs)')
+    parser.add_argument('--tensor_dir', type=str, default='./enhanced_tensor_logs',
+                       help='tensor文件目录 (默认: ./enhanced_tensor_logs)')
     parser.add_argument('--output_dir', type=str, default='./draw',
                        help='输出图片目录 (默认: ./draw)')
     parser.add_argument('--max_files', type=int, default=50,

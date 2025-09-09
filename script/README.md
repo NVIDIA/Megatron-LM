@@ -151,7 +151,7 @@ pip install matplotlib seaborn pandas scipy
 ### 环境变量
 ```bash
 export CUSTOM_QUANT_TYPE="hifp8"
-export TENSOR_SAVE_DIR="./tensor_logs"
+export TENSOR_SAVE_DIR="./enhanced_tensor_logs"
 export TENSOR_SAVE_ENABLED="true"
 ```
 

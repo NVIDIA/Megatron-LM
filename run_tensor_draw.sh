@@ -1,0 +1,1 @@
+bash script/visualization/one_click_visualize.sh ./enhanced_tensor_logs ./draw
