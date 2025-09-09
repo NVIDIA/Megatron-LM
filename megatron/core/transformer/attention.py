@@ -506,6 +506,7 @@ class Attention(MegatronModule, ABC):
         """
 
         assert not self.training
+        assert block_table is not None
 
         # Flash attn kernel.
         if max_seqlen_q > 1:
@@ -682,7 +683,7 @@ class Attention(MegatronModule, ABC):
             [
                 not self.config.test_mode,
                 self.config.fused_single_qkv_rope,
-                deprecate_inference_params(inference_context, None) is None,
+                inference_context is None,
                 packed_seq_params is None,
                 rotary_pos_emb is not None,
                 rotary_pos_emb[0] is not None,
