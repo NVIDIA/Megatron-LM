@@ -1408,7 +1408,7 @@ def _add_inference_args(parser):
                        '`max_requests` is computed). Due to rounding, the actual '
                        'number of cuda graphs may not equal this argument.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=0,
+                       type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
