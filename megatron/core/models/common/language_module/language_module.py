@@ -20,7 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -32,27 +32,27 @@ class LanguageModule(MegatronModule):
 
     Args:
         config (TransformerConfig): Input transformer config for the model
-        model_comm_pgs (ModelCommProcessGroups): Model communication process groups
+        pg_collection (ProcessGroupCollection): Model communication process groups
     """
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
         self._set_attention_backend()
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        self.cp_group = model_comm_pgs.cp
-        self.model_comm_pgs = model_comm_pgs
-        self.pp_group = model_comm_pgs.pp
-        assert hasattr(self.model_comm_pgs, 'embd'), (
-            "model_comm_pgs must have a embd. In previous version, it used default "
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
+        self.cp_group = pg_collection.cp
+        self.pp_group = pg_collection.pp
+        assert hasattr(self.pg_collection, 'embd'), (
+            "pg_collection must have a embd. In previous version, it used default "
             "`parallel_state.default_embedding_ranks` to create the process group."
             "If you are using the default process group, please use"
             "`parallel_state.get_embedding_group()` "
             "If you don't need embd_group, you need to explicitly set it to None."
         )
-        self.embd_group = model_comm_pgs.embd
+        self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
 
@@ -149,12 +149,12 @@ class LanguageModule(MegatronModule):
                         )
 
                     loss = te_parallel_cross_entropy(
-                        logits, labels, self.model_comm_pgs.tp, is_cg_capturable
+                        logits, labels, self.pg_collection.tp, is_cg_capturable
                     )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.model_comm_pgs.tp)
+                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 

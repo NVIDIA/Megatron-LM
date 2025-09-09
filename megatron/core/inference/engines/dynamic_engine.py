@@ -4,6 +4,7 @@ import asyncio
 import multiprocessing
 import os
 import struct
+import time
 import warnings
 from collections import deque
 from datetime import datetime
@@ -32,7 +33,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.inference.utils import Counter
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -54,6 +55,15 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+
+def format_mem_bytes(mem_bytes):
+    """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
+    for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
+        suffix_bytes = 1024**power
+        if mem_bytes >= suffix_bytes:
+            return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
+    return "%d bytes" % mem_bytes
 
 
 class DynamicInferenceEngine(AbstractEngine):
@@ -118,12 +128,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        self._loop = loop
+        self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
@@ -135,6 +140,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         self.capture_stats = None
         if self.enable_cuda_graph:
+
+            time_start = time.time()
+            mem_stats_start = torch.cuda.memory_stats()
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
@@ -191,9 +199,31 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                         context.reset()  # todo: @lmcafee, remove if unnecessary.
 
-            # Create cuda graphs.
-            with torch.inference_mode():
-                self.capture_stats = create_cudagraphs()
+            # Memory usage.
+            time_end = time.time()
+            mem_stats_end = torch.cuda.memory_stats()
+            capture_stats = {
+                "time": time_end - time_start,
+                "allocated_bytes": (
+                    mem_stats_end["allocated_bytes.all.current"]
+                    - mem_stats_start["allocated_bytes.all.current"]
+                ),
+                "reserved_bytes": (
+                    mem_stats_end["reserved_bytes.all.current"]
+                    - mem_stats_start["reserved_bytes.all.current"]
+                ),
+            }
+            print(
+                "> built cuda graph(s) in %.2f sec, with total memory usage: "
+                "allocated %s, reserved %s."
+                % (
+                    capture_stats["time"],
+                    format_mem_bytes(capture_stats["allocated_bytes"]),
+                    format_mem_bytes(capture_stats["reserved_bytes"]),
+                )
+            )
+
+            self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
         self,

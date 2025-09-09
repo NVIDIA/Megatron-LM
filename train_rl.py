@@ -8,7 +8,6 @@ from functools import partial
 
 import torch
 
-from model_provider import model_provider
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core import mpu
@@ -16,9 +15,10 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
+from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.rl_utils import calculate_grpo_loss, get_logprobs
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 

@@ -13,7 +13,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
-    get_default_model_comm_pgs,
+    get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
 )
 from megatron.core.transformer.moe.router import TopKRouter
@@ -206,12 +206,12 @@ class TestRouterAuxLoss:
         Returns:
             Router: A new router instance with the specified configuration.
         """
-        model_comm_pgs = get_default_model_comm_pgs()
+        pg_collection = get_default_pg_collection()
         # Create a new config with updated parameters
         new_transformer_config = dataclasses.replace(self.default_transformer_config, **kwargs)
 
         # Create the router with the updated config
-        router = TopKRouter(config=new_transformer_config, model_comm_pgs=model_comm_pgs)
+        router = TopKRouter(config=new_transformer_config, pg_collection=pg_collection)
         router.set_layer_number(0)
         return router
 
@@ -382,6 +382,88 @@ class TestRouterAuxLoss:
         torch.testing.assert_close(aux_loss_ref, aux_loss_fused)
         torch.testing.assert_close(grad_ref, grad_fused)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
+    def test_global_aux_loss(self, tp_size, ep_size, cp_size):
+        clear_aux_losses_tracker()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        )
+
+        router = self.new_router(
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        ).cuda()
+
+        seq_len = 32
+        # Verify global tokens tracker initialized
+        assert router.global_tokens_per_expert is not None
+        assert router.ga_steps == 0
+
+        # First microbatch
+        with get_cuda_rng_tracker().fork():
+            hidden_states = torch.randn((seq_len, 2, router.config.hidden_size)).cuda().bfloat16()
+        num_local_tokens = seq_len * 2
+        scores, routing_map = router(hidden_states)
+        # Check that global tokens were counted
+        assert torch.all(router.global_tokens_per_expert >= 0)
+        assert (
+            router.global_tokens_per_expert.sum()
+            == num_local_tokens * router.tp_dp_cp_group.size() * router.ga_steps * router.topk
+        )
+        global_aux_loss_1 = get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"][
+            "values"
+        ][0]
+        reduce_from_tensor_model_parallel_region(global_aux_loss_1, router.tp_dp_cp_group)
+        assert global_aux_loss_1 >= 1
+
+        # When DP size is 1, the global aux loss should match the aux loss
+        # for the first microbatch
+        if get_default_pg_collection().tp_dp_cp.size() == tp_size:
+            ref_router = self.new_router(
+                moe_router_load_balancing_type="aux_loss", moe_aux_loss_coeff=1.0
+            ).cuda()
+            with torch.no_grad():
+                ref_router.weight.copy_(router.weight)
+            ref_scores, ref_routing_map = ref_router(hidden_states)
+            aux_loss = get_moe_layer_wise_logging_tracker()["load_balancing_loss"]["values"][0]
+            reduce_from_tensor_model_parallel_region(aux_loss, router.tp_cp_group)
+
+            assert torch.equal(
+                aux_loss, global_aux_loss_1
+            ), f"aux_loss: {aux_loss}, global_aux_loss_1: {global_aux_loss_1}"
+
+        clear_aux_losses_tracker()
+
+        # Get current tokens count to verify accumulation
+        current_per_expert = router.global_tokens_per_expert.clone()
+
+        # Second microbatch - should accumulate
+        hidden_states = torch.randn((seq_len, 2, router.config.hidden_size)).cuda().bfloat16()
+        scores, routing_map = router(hidden_states)
+        global_aux_loss_2 = get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"][
+            "values"
+        ][0]
+        reduce_from_tensor_model_parallel_region(global_aux_loss_2, router.tp_dp_cp_group)
+        assert torch.all(global_aux_loss_2 >= 1), f"global_aux_loss_2: {global_aux_loss_2}"
+
+        # Verify tokens were accumulated
+        assert router.ga_steps == 2
+        assert torch.any(router.global_tokens_per_expert > current_per_expert)
+        clear_aux_losses_tracker()
+
+        # Reset global tracker
+        router.reset_global_aux_loss_tracker()
+        assert router.ga_steps == 0
+        assert torch.all(router.global_tokens_per_expert == 0)
+
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -397,12 +479,16 @@ class TestRouterAuxLoss:
 
         # Test combined aux loss types
         router = self.new_router(
-            moe_router_load_balancing_type=["aux_loss", "seq_aux_loss"],
-            moe_aux_loss_coeff=[0.5, 1.0],
+            moe_router_load_balancing_type=["aux_loss", "seq_aux_loss", "global_aux_loss"],
+            moe_aux_loss_coeff=[0.5, 1.0, 2.0],
             tensor_model_parallel_size=tp_size,
             expert_tensor_parallel_size=ep_size,
             context_parallel_size=cp_size,
         ).cuda()
+
+        # Verify all aux loss trackers initialized
+        assert router.global_tokens_per_expert is not None
+        assert router.ga_steps == 0
 
         # Execute forward pass
         hidden_states = torch.randn((32, 2, router.config.hidden_size)).cuda().bfloat16()
@@ -413,12 +499,17 @@ class TestRouterAuxLoss:
 
         aux_loss = get_moe_layer_wise_logging_tracker()["load_balancing_loss"]["values"][0]
         seq_aux_loss = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"]["values"][0]
+        global_aux_loss = get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"][
+            "values"
+        ][0]
 
         reduce_from_tensor_model_parallel_region(aux_loss, router.tp_cp_group)
         reduce_from_tensor_model_parallel_region(seq_aux_loss, router.tp_cp_group)
+        reduce_from_tensor_model_parallel_region(global_aux_loss, router.tp_dp_cp_group)
 
         assert aux_loss >= 1
         assert seq_aux_loss >= 1
+        assert global_aux_loss >= 1
 
         # Verify gradient is non-zero (aux losses are being applied)
         assert router.weight.grad.abs().sum() > 0
@@ -426,6 +517,7 @@ class TestRouterAuxLoss:
         # Verify method to get aux loss coeffs works properly
         assert router.get_aux_loss_coeff("aux_loss") == 0.5
         assert router.get_aux_loss_coeff("seq_aux_loss") == 1.0
+        assert router.get_aux_loss_coeff("global_aux_loss") == 2.0
         assert router.get_aux_loss_coeff("non_existent_type") == 0.0
 
     @pytest.mark.internal
@@ -445,7 +537,7 @@ class TestRouterAuxLoss:
         batch_size = 2
 
         # Create router with each aux loss type
-        for aux_loss_type in ["aux_loss", "seq_aux_loss"]:
+        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
             router = self.new_router(
                 moe_router_load_balancing_type=aux_loss_type,
                 moe_aux_loss_coeff=1.0,
@@ -465,6 +557,7 @@ class TestRouterAuxLoss:
             loss_name = {
                 "aux_loss": "load_balancing_loss",
                 "seq_aux_loss": "seq_load_balancing_loss",
+                "global_aux_loss": "global_load_balancing_loss",
             }[aux_loss_type]
 
             hidden_states = torch.randn(
@@ -476,6 +569,9 @@ class TestRouterAuxLoss:
             # Get routing scores and map
             scores, routing_map = router(hidden_states)
             aux_loss = get_moe_layer_wise_logging_tracker()[loss_name]["values"][0]
-            reduce_from_tensor_model_parallel_region(aux_loss, router.tp_cp_group)
+            if aux_loss_type == "global_aux_loss":
+                reduce_from_tensor_model_parallel_region(aux_loss, router.tp_dp_cp_group)
+            else:
+                reduce_from_tensor_model_parallel_region(aux_loss, router.tp_cp_group)
             assert aux_loss.item() == 1, f"{aux_loss_type}: {aux_loss.item()}"
             clear_aux_losses_tracker()

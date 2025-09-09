@@ -29,6 +29,9 @@ ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 
 
+_logged_deprecations = {}
+
+
 class ShardedBase(ABC):
     """Base class for ShardedTensor and ShardedStateDict."""
 
@@ -146,6 +149,23 @@ class ShardedTensor(ShardedBase):
             raise CheckpointingException(
                 f"`step` argument in the flattened range of a ShardedTensor is not supported."
             )
+
+        if self.prepend_axis_num:
+            if not _logged_deprecations.get("prepend_axis_num", False):
+                logger.warning(
+                    "ShardedTensor.prepend_axis_num greater than 0 is deprecated."
+                    " In Megatron-Core this can be prevented by setting sharded_state_dict"
+                    " metadata['singleton_local_shards'] to True."
+                )
+                _logged_deprecations["prepend_axis_num"] = True
+
+        if self.flattened_range is not None:
+            if not _logged_deprecations.get("flattened_range", False):
+                logger.warning(
+                    "ShardedTensor.flattened_range is deprecated."
+                    " Use latest DistributedOptimizer formats."
+                )
+                _logged_deprecations["flattened_range"] = True
 
     @property
     def has_regular_grid(self):

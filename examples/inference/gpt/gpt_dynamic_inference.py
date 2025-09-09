@@ -2,14 +2,15 @@
 
 import hashlib
 import os
-import torch
+import sys
 from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
 from typing import Dict, List
-import sys
-import os
+
+import torch
+from tqdm import tqdm
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -23,6 +24,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 
 sys.path.append(
@@ -38,12 +40,17 @@ from gpt_builders import gpt_builder
 import json
 
 from examples.inference.gpt.utils import (
-    add_common_inference_args,
-    build_requests,
-    build_dynamic_engine_setup_prefix,
-    get_curr_time,
     Request,
+    add_common_inference_args,
+    build_dynamic_engine_setup_prefix,
+    build_requests,
+    get_curr_time,
 )
+from megatron.training import get_args
+from megatron.training import get_model as _get_model
+from megatron.training import get_tokenizer, initialize_megatron
+from megatron.training.checkpointing import load_checkpoint
+from pretrain_gpt import model_provider
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -118,7 +125,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=max_sequence_length,
-        num_cuda_graphs=args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None,
+        num_cuda_graphs=(
+            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
+        ),
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
@@ -149,7 +158,10 @@ def get_inference_controller(
     """
 
     args = get_args()
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Wrap model in inference wrapper.
     model = GPTInferenceWrapper(model, args, context)
@@ -285,7 +297,10 @@ def main():
     configure_nvtx_profiling(True)
 
     args = get_args()
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sampling params.
     sampling_params = SamplingParams(
@@ -329,7 +344,9 @@ def main():
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times, total_output_tokens = run_inference(requests, sampling_params, engine)
+    step_times, add_times, output_times, total_output_tokens = run_inference(
+        requests, sampling_params, engine
+    )
     torch.cuda.synchronize()
     total_time = get_curr_time() - t
 
@@ -340,9 +357,8 @@ def main():
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
 
-        def shorten_str(s, n):
-            s = s.replace("\n", "\\n")
-            return s if len(s) < n else f"{s[:n//2]}..{s[-n//2:]}"
+        def escape_str(s):
+            return s.replace("\n", "\\n")
 
         print("~~~~ Unique prompts + outputs. ~~~~")
 
@@ -355,8 +371,8 @@ def main():
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
-            short_prompt_text = shorten_str(prompt_text, 64)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {short_prompt_text}")
+            escaped_prompt_text = escape_str(prompt_text)
+            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -368,8 +384,8 @@ def main():
             for output_text, output_request_idxs in output_map.items():
                 o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
                 o_len = len(requests[output_request_idxs[0]].output_tokens)
-                short_output_text = shorten_str(output_text.replace("\n", "\\n"), 64)
-                print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {short_output_text}")
+                escaped_output_text = escape_str(output_text)
+                print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
