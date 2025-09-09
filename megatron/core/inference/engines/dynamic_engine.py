@@ -241,19 +241,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
             self.capture_stats = capture_stats
 
-    # >>>
-    # def clear_cuda_graphs(self):
-    #     """Clear cuda graphs.
-
-    #     This method clears the cuda graph state in `cuda_graphs.py`, to allow for
-    #     calling `create_cudagraphs()` again.
-    #     """
-    #     if self.enable_cuda_graph:
-    #         _CudagraphGlobalRecord.cudagraph_created = False
-    #         _CudagraphGlobalRecord.cudagraph_record = []
-    #         CudaGraphManager.global_mempool = None
-    # <<<
-
     async def start_listening_to_data_parallel_coordinator(
         self,
         sampling_params: SamplingParams,
@@ -444,16 +431,11 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx("suspended"):
             self.context.deallocate_all_tensors()
 
-        # Delete cuda graphs.
-        # >>>
-        # self.clear_cuda_graphs()
-        # +++
         # Delete cuda graphs when not using unified memory at all (level 0). For
         # levels 1 and 2, the context's tensors maintain static memory addresses,
         # so the cuda graphs are re-used.
         if self.unified_memory_level == 0:
             delete_cuda_graphs()
-        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
