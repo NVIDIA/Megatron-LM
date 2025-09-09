@@ -1,8 +1,10 @@
 # build_and_use_managed_allocator.py
-import os, pathlib
+import os
+import pathlib
+
 import torch
-from torch.utils.cpp_extension import load_inline, CUDA_HOME
 from torch.cuda.memory import CUDAPluggableAllocator, change_current_allocator
+from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
 # 1) Inline C++ source for a managed-memory allocator
 src = r"""
@@ -49,8 +51,8 @@ if CUDA_HOME:
 mod = load_inline(
     name="managed_alloc_runtime",
     cpp_sources=[src],
-    functions=[],          # no pybind functions; we just want the .so with our exported symbols
-    with_cuda=True,        # ensures CUDA include paths & NVCC toolchain are available
+    functions=[],  # no pybind functions; we just want the .so with our exported symbols
+    with_cuda=True,  # ensures CUDA include paths & NVCC toolchain are available
     extra_ldflags=extra_ldflags,
     verbose=False,
 )

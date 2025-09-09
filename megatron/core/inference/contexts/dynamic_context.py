@@ -288,7 +288,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
 
         # Memory buffer.
-        ctx_manager = torch.cuda.use_mem_pool(unified_memory_mempool) if self.unified_memory_level > 0 else nullcontext()
+        ctx_manager = (
+            torch.cuda.use_mem_pool(unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
         with ctx_manager:
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
