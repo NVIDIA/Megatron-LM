@@ -18,7 +18,7 @@ try:
 except ImportError:
     has_mem_pool = False
 
-src = r"""
+_mempool_c_src = r"""
 #include <cuda_runtime_api.h>
 #include <cstddef>
 
@@ -30,18 +30,27 @@ EXPORT void* managed_malloc(size_t size, int device, void* stream) {
   cudaGetDevice(&cur);
   if (device != cur && device >= 0) cudaSetDevice(device);
 
+  // cudaMallocManaged allows for more memory to be allocated than the device memory size.
+  // The cudaMemAttachGlobal flag makes the memory accessible from both host and device.
   void* ptr = nullptr;
   cudaError_t err = cudaMallocManaged(&ptr, (size_t)size, cudaMemAttachGlobal);
   if (err != cudaSuccess) return nullptr;
 
   if (device >= 0) {
+    // cudaMemAdviseSetPreferredLocation sets the preferred location for the memory.
+    // This is a hint that tries to prevent data from being migrated away from the device.
     cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
+    // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
+    // Even if the memory has to be migrated away from the device, it still does not page fault.
+    // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
+    // but there is no harm in adding this flag as well for future-proofing.
     cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
   }
   return ptr;
 }
 
 EXPORT void managed_free(void* ptr, size_t size, int device, void* stream) {
+  // Memory allocated with cudaMallocManaged should be released with cudaFree.
   (void)size; (void)device; (void)stream;
   if (ptr) cudaFree(ptr);
 }
@@ -50,22 +59,22 @@ EXPORT void managed_free(void* ptr, size_t size, int device, void* stream) {
 unified_memory_mempool = None
 
 if has_mem_pool:
-    extra_ldflags = ["-lcudart"]
+    _extra_ldflags = ["-lcudart"]
     if CUDA_HOME:
-        cuda_lib = os.path.join(CUDA_HOME, "lib64")
-        if os.path.isdir(cuda_lib):
-            extra_ldflags = [f"-L{cuda_lib}", "-lcudart"]
+        _cuda_lib = os.path.join(CUDA_HOME, "lib64")
+        if os.path.isdir(_cuda_lib):
+            _extra_ldflags = [f"-L{_cuda_lib}", "-lcudart"]
     try:
-        mod = load_inline(
+        _mod = load_inline(
             name="managed_alloc_runtime",
-            cpp_sources=[src],
+            cpp_sources=[_mempool_c_src],
             functions=[],
             with_cuda=True,
-            extra_ldflags=extra_ldflags,
+            extra_ldflags=_extra_ldflags,
             verbose=False,
         )
-        so_path = Path(mod.__file__).as_posix()
-        alloc = CUDAPluggableAllocator(so_path, "managed_malloc", "managed_free").allocator()
-        unified_memory_mempool = MemPool(allocator=alloc)
+        _so_path = Path(_mod.__file__).as_posix()
+        _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
+        unified_memory_mempool = MemPool(allocator=_alloc)
     except (RuntimeError, ImportError):
         warnings.warn("Unified memory mempool is not available.")
