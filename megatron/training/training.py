@@ -1828,6 +1828,9 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
             report_memory_flag = False
+        if args.log_memory_interval is not None:
+            if iteration % args.log_memory_interval == 0:
+                report_memory(f'(after {iteration} iterations)')
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag

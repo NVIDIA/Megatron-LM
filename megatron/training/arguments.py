@@ -798,6 +798,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+    if args.log_memory_interval is not None:
+        assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1871,6 +1873,8 @@ def _add_training_args(parser):
                        'train-samples should be provided.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
+    group.add_argument('--log-memory-interval', type=int, default=None,
+                       help='Report memory interval.')
     group.add_argument('--exit-interval', type=int, default=None,
                        help='Exit the program after the iteration is divisible '
                        'by this value.')
