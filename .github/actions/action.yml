@@ -97,7 +97,7 @@ runs:
       uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361
       with:
         cache-dir: cache-mount
-        dockerfile: docker/Dockerfile.ci
+        dockerfile: docker/Dockerfile.ci.dev
         skip-extraction: ${{ steps.cache.outputs.cache-hit }}
 
     - name: Build container
