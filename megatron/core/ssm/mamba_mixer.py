@@ -700,65 +700,27 @@ class MambaMixer(MegatronModule):
             )
             out_decode = out_decode.transpose(0, 1)
 
-        # Prefill slices (remaining active tokens/requests)
+        # Prefill slice (remaining active tokens/requests)
         active_token_count = context.active_token_count
         active_request_count = context.get_active_request_count()
 
         hidden_states_prefill = hidden_states[first_prefill_token_idx:active_token_count]
         conv_state_prefill = conv_state[first_prefill_request_idx:active_request_count]
         ssm_state_prefill = ssm_state[first_prefill_request_idx:active_request_count]
-
-        # cu/seq for prefill partition (re-index to start at zero)
         cu_seqlens_prefill = F.pad(
             cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
-        )  # [num_prefill_reqs+1]
+        )
         seq_idx_prefill = (
             seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_request_idx
         )
-
-        # Precompute projection for the whole prefill token window (we'll slice per microbatch)
-        if hidden_states_prefill.numel() > 0:
-            zxBCdt_prefill = self.compute_in_proj(hidden_states_prefill)
-        else:
-            zxBCdt_prefill = hidden_states_prefill  # empty
-
-        # Gather per-request lengths for the prefill partition
-        # lengths[i] = number of tokens for prefill request i
-        # (relative to first_prefill_request_idx)
-        req_lengths = (cu_seqlens_prefill[1:] - cu_seqlens_prefill[:-1]).tolist()
-        num_prefill_reqs = len(req_lengths)
-
-        # Microbatch the prefill: pack consecutive requests so that total tokens <= self.chunk_size.
-        out_prefill_chunks = []
-        out_bias_prefill_chunks = []
-
-        i = 0
-        while i < num_prefill_reqs:
-            tok_start = cu_seqlens_prefill[i].item()
-            tok_end = cu_seqlens_prefill[i + 1].item()
-            # Slice states for this one request
-            zxBCdt_mb = zxBCdt_prefill[:, tok_start:tok_end]
-            conv_mb = conv_state_prefill[i : i + 1]
-            ssm_mb = ssm_state_prefill[i : i + 1]
-            # Non-varlen call: no seq_idx/cu_seqlens, and return_varlen_states=False
-            out_mb, out_bias_mb = self.ssm_block(
-                zxBCdt_mb,
-                conv_state=conv_mb,
-                ssm_state=ssm_mb,
-                seq_idx=None,
-                cu_seqlens=None,
-                return_varlen_states=False,
-                active_token_count=(tok_end - tok_start),
-            )
-            out_prefill_chunks.append(out_mb)
-            if out_bias_mb is not None:
-                out_bias_prefill_chunks.append(out_bias_mb)
-            i += 1
-
-        # Concatenate prefill chunks (token-major), then join with decode part
-        out_prefill = torch.cat(out_prefill_chunks, dim=0) if out_prefill_chunks else None
-        out_bias_prefill = (
-            torch.cat(out_bias_prefill_chunks, dim=0) if out_bias_prefill_chunks else None
+        zxBCdt_prefill = self.compute_in_proj(hidden_states_prefill)
+        out_prefill, out_bias_prefill = self.ssm_block(
+            zxBCdt_prefill,
+            conv_state=conv_state_prefill,
+            ssm_state=ssm_state_prefill,
+            seq_idx=seq_idx_prefill,
+            cu_seqlens=cu_seqlens_prefill,
+            return_varlen_states=True,
         )
 
         out = maybe_cat(out_decode, out_prefill, required=True)
