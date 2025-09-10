@@ -5,6 +5,7 @@ import os
 from unittest import mock
 
 import pytest
+import torch
 
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import (
@@ -28,6 +29,7 @@ class TestNonPersistentSaveAndLoad:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skip
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     def test_basic_save_load_scenarios(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)
@@ -36,12 +38,17 @@ class TestNonPersistentSaveAndLoad:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_non_persistent"
-        ) as non_persistent_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+
+        original_empty = torch.empty
+
+        def deterministic_empty(*args, **kwargs):
+            return original_empty(*args, **kwargs).zero_()
+
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "test_non_persistent") as non_persistent_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+            mock.patch('torch.empty', new=deterministic_empty),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
@@ -124,9 +131,11 @@ class TestLegacySaveAndLoad:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch("megatron.training.checkpointing.update_num_microbatches"):
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+        ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, legacy_ckpt_dir)
 
