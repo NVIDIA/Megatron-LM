@@ -32,7 +32,7 @@ DATA_PATH="dataset/wikipedia_processed/wikipedia_processed_text_document"
 DTYPE="bf16"
 
 # 要测试的量化类型
-QUANT_TYPES=("mxfp8" "mxfp4" "hifp8")
+QUANT_TYPES=("bf16" "mxfp8" "mxfp4" "hifp8")
 
 # 训练步数（用于快速收集tensor，不需要完整训练）
 TRAINING_STEPS=10
@@ -194,11 +194,6 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 开始Wikipedia tensor收集流程..
 # 检查必要的文件是否存在
 if [ ! -f "examples/llama/train_llama32_1b_h100_fp8.sh" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] 训练脚本不存在: examples/llama/train_llama32_1b_h100_fp8.sh"
-    exit 1
-fi
-
-if [ ! -d "$DATA_PATH" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] 数据路径不存在: $DATA_PATH"
     exit 1
 fi
 
