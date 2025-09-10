@@ -75,7 +75,8 @@ jobs:
       matrix:
         include:
           - script: L0_Unit_Tests_GPU
-            runner: self-hosted-nemo
+            runs-on:
+              group: nemo-ci-gpu-x8
             timeout: 30
           # - script: L0_Unit_Tests_CPU
           #   runner: linux-amd64-cpu16
