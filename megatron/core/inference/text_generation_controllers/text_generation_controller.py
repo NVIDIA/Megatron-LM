@@ -441,6 +441,9 @@ class TextGenerationController:
 
         # Initialize attention state.
         context.initialize_attention_state()
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
 
         # Get flat tokens, position ids.
         input_ids, position_ids = context.current_input_and_position_ids()
@@ -513,7 +516,7 @@ class TextGenerationController:
         )
 
         # Active sequence lengths.
-        current_request_ids = context.request_ids[
+        active_request_ids = context.request_ids[
             context.paused_request_count : context.total_request_count
         ].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -541,7 +544,13 @@ class TextGenerationController:
         # Update requests.
         context.update_requests(active_request_mask, new_sample_copy)
 
-        return current_request_ids, finished_request_ids, new_sample, log_probs
+        return {
+            "active_request_ids": active_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "sample": new_sample,
+            "log_probs": log_probs,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

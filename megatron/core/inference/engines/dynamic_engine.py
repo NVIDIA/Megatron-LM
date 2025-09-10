@@ -545,8 +545,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
 
+        # Increment finished_request_count.
+        cuda_graph_request_count = None
         if result is not None:
-            request_ids, finished_request_ids, sample, log_probs = result
+            active_request_ids = result["active_request_ids"]
+            finished_request_ids = result["finished_request_ids"]
+            sample = result["sample"]
+            log_probs = result["log_probs"]
+            cuda_graph_request_count = result["cuda_graph_request_count"]
 
             # TODO: Move this to a background thread?
             self.schedule_waiting_requests()
@@ -554,10 +560,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # TODO: Move this to a background thread?
             if post_process_requests_locally:
                 (active_requests, finished_requests) = self.post_process_requests(
-                    request_ids, finished_request_ids, step_time, sample, log_probs
+                    active_request_ids, finished_request_ids, step_time, sample, log_probs
                 )
             else:
-                return request_ids, finished_request_ids, sample, log_probs
+                return active_request_ids, finished_request_ids, sample, log_probs
 
         else:
             if not post_process_requests_locally:
@@ -606,15 +612,38 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_count += 1
         range_pop()
-        return active_requests, finished_requests, step_time
+        return {
+            "active_requests": active_requests,
+            "finished_requests": finished_requests,
+            "step_time": step_time,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
 
-    def step(
+    def step_modern(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         return self._loop.run_until_complete(
             self.async_step(sampling_params=sampling_params, verbose=verbose)
         )
+
+    def step_legacy(
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """Synchronous wrapper for `self.async_step`."""
+        warnings.warn(
+            "`step_legacy()` is deprecated and will be removed in `megatron-core` "
+            "0.16. Please use `step_modern()` going forward, which will eventually "
+            "be renamed to `step()`."
+        )
+        result = self._loop.run_until_complete(
+            self.async_step(sampling_params=sampling_params, verbose=verbose)
+        )
+        return (result["active_requests"], result["finished_requests"], result["step_time"])
+
+    # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
+    # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
+    step = step_legacy
 
     def generate(
         self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
@@ -627,8 +656,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         finished_requests_list = []
         while self.has_unfinished_requests():
-            active_requests, finished_requests, step_time = self.step(sampling_params)
-            finished_requests_list.extend(finished_requests)
+            result = self.step_modern(sampling_params)
+            finished_requests_list.extend(result["finished_requests"])
 
         return finished_requests_list
 
