@@ -1,0 +1,238 @@
+Tensor Data Detailed Statistical Report
+============================================================
+
+Total files: 14
+Analysis time: 2025-09-09 12:10:15
+
+Quantization Type Statistics:
+------------------------------
+
+mxfp8:
+  File count: 1
+  Total values: 2048
+  Min value: -3.328125
+  Max value: 3.140625
+  Mean: 0.014131
+  Std dev: 0.996904
+  Median: 0.031982
+
+hifp8:
+  File count: 11
+  Total values: 1558528
+  Min value: -3.328125
+  Max value: 3.328125
+  Mean: -0.000541
+  Std dev: 0.991764
+  Median: 0.000000
+
+mxfp4:
+  File count: 1
+  Total values: 2048
+  Min value: -3.312500
+  Max value: 3.328125
+  Mean: 0.000978
+  Std dev: 0.994228
+  Median: 0.020569
+
+bf16:
+  File count: 1
+  Total values: 2048
+  Min value: -2.875000
+  Max value: 2.890625
+  Mean: 0.042837
+  Std dev: 0.958097
+  Median: 0.048828
+
+
+Layer Type Statistics:
+------------------------------
+
+attention:
+  File count: 8
+  Tensor names: query, output, value, key
+
+linear:
+  File count: 6
+  Tensor names: input, weight, output
+
+
+Operation Type Statistics:
+------------------------------
+
+forward:
+  File count: 11
+
+backward:
+  File count: 3
+
+
+File Detailed Information:
+------------------------------
+
+File 1: 20250908_092156_0012_attention_L0_forward_mxfp8_query.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: mxfp8
+  Tensor name: query
+  Layer index: 0
+  Shape: [1, 4, 32, 16]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.140625]
+  Mean: 0.014160
+  Std dev: 0.996094
+
+File 2: 20250908_092156_0008_linear_L1_backward_hifp8_input.pt
+  Layer type: linear
+  Operation: backward
+  Quantization type: hifp8
+  Tensor name: input
+  Layer index: 1
+  Shape: [32, 1024]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: -0.001534
+  Std dev: 1.000000
+
+File 3: 20250908_092156_0013_attention_L0_forward_mxfp4_query.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: mxfp4
+  Tensor name: query
+  Layer index: 0
+  Shape: [1, 4, 32, 16]
+  Data type: torch.bfloat16
+  Value range: [-3.312500, 3.328125]
+  Mean: 0.000977
+  Std dev: 0.996094
+
+File 4: 20250908_092156_0005_linear_L1_forward_hifp8_input.pt
+  Layer type: linear
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: input
+  Layer index: 1
+  Shape: [32, 512]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: -0.006989
+  Std dev: 0.996094
+
+File 5: 20250908_092156_0006_linear_L1_forward_hifp8_weight.pt
+  Layer type: linear
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: weight
+  Layer index: 1
+  Shape: [1024, 512]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: -0.000683
+  Std dev: 0.992188
+
+File 6: 20250908_092156_0004_attention_L0_forward_hifp8_output.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: output
+  Layer index: 0
+  Shape: [128, 2, 64]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: 0.001343
+  Std dev: 0.984375
+
+File 7: 20250908_092156_0010_linear_L1_backward_hifp8_output.pt
+  Layer type: linear
+  Operation: backward
+  Quantization type: hifp8
+  Tensor name: output
+  Layer index: 1
+  Shape: [32, 512]
+  Data type: torch.bfloat16
+  Value range: [-3.250000, 3.328125]
+  Mean: -0.006683
+  Std dev: 0.996094
+
+File 8: 20250908_092156_0009_linear_L1_backward_hifp8_weight.pt
+  Layer type: linear
+  Operation: backward
+  Quantization type: hifp8
+  Tensor name: weight
+  Layer index: 1
+  Shape: [1024, 512]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: -0.000683
+  Std dev: 0.992188
+
+File 9: 20250908_092156_0014_attention_L0_forward_bf16_query.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: bf16
+  Tensor name: query
+  Layer index: 0
+  Shape: [1, 4, 32, 16]
+  Data type: torch.bfloat16
+  Value range: [-2.875000, 2.890625]
+  Mean: 0.042725
+  Std dev: 0.957031
+
+File 10: 20250908_092156_0003_attention_L0_forward_hifp8_value.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: value
+  Layer index: 0
+  Shape: [2, 8, 128, 64]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: -0.000664
+  Std dev: 0.992188
+
+File 11: 20250908_092156_0002_attention_L0_forward_hifp8_key.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: key
+  Layer index: 0
+  Shape: [2, 8, 128, 64]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: 0.002563
+  Std dev: 0.992188
+
+File 12: 20250908_092156_0011_attention_L0_forward_hifp8_query.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: query
+  Layer index: 0
+  Shape: [1, 4, 32, 16]
+  Data type: torch.bfloat16
+  Value range: [-3.140625, 3.078125]
+  Mean: -0.000292
+  Std dev: 1.023438
+
+File 13: 20250908_092156_0007_linear_L1_forward_hifp8_output.pt
+  Layer type: linear
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: output
+  Layer index: 1
+  Shape: [32, 1024]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: 0.001862
+  Std dev: 0.992188
+
+File 14: 20250908_092156_0001_attention_L0_forward_hifp8_query.pt
+  Layer type: attention
+  Operation: forward
+  Quantization type: hifp8
+  Tensor name: query
+  Layer index: 0
+  Shape: [2, 8, 128, 64]
+  Data type: torch.bfloat16
+  Value range: [-3.328125, 3.328125]
+  Mean: -0.001396
+  Std dev: 0.992188

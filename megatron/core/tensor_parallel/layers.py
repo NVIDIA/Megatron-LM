@@ -782,7 +782,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         # 保存forward输入tensor (pre-linear)
         from megatron.core.tensor_saver import save_linear_tensors
         import os
-        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+        custom_quant_type = 'hifp8'
         save_linear_tensors(
             input_tensor=total_input,
             weight=weight,
@@ -874,7 +874,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             # 保存backward输入tensor (pre-linear)
             from megatron.core.tensor_saver import save_linear_tensors
             import os
-            custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+            custom_quant_type = 'hifp8'
             save_linear_tensors(
                 input_tensor=grad_output,
                 weight=weight,
@@ -892,7 +892,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+        custom_quant_type = 'hifp8'
         if custom_quant_type == 'mxfp4':
             grad_input = mxfp_matmul(grad_output,weight,'fp4_e2m1').to(torch.bfloat16)
         elif custom_quant_type == 'mxfp8':
@@ -969,7 +969,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             grad_weight = None
             from quant.mxfp import mxfp_matmul
             from quant.hifp import hifp_matmul
-            custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+            custom_quant_type = 'hifp8'
             if custom_quant_type == 'mxfp4':
                 grad_weight = mxfp_matmul(grad_output.t(),total_input,'fp4_e2m1').to(torch.bfloat16)
             elif custom_quant_type == 'mxfp8':

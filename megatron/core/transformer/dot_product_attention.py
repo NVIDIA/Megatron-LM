@@ -128,7 +128,7 @@ class DotProductAttention(MegatronModule):
         # 保存forward输入tensor (pre-FA)
         from megatron.core.tensor_saver import save_attention_tensors
         import os
-        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+        custom_quant_type = 'hifp8'
         save_attention_tensors(
             query=query,
             key=key, 
@@ -184,7 +184,7 @@ class DotProductAttention(MegatronModule):
         from quant.hifp import hifp_baddbmm
         # 从环境变量获取量化类型，默认为hifp8
         import os
-        custom_quant_type = os.environ.get('CUSTOM_QUANT_TYPE', 'hifp8')
+        custom_quant_type = 'hifp8'
         if custom_quant_type == 'mxfp4':
             matmul_result = mxfp_baddbmm(
                 matmul_input_buffer,
