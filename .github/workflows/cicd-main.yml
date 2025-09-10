@@ -95,7 +95,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
-        uses: ./.github/actions/test-template
+        uses: ./.github/actions
         with:
           script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
@@ -114,7 +114,7 @@ jobs:
       matrix:
         include:
           - script: L2_Functional_Tests_GPU
-            runner: self-hosted-nemo
+            runner: nvidia-ci-aws-gpu-x8
             timeout: 30
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
@@ -131,7 +131,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
-        uses: ./.github/actions/test-template
+        uses: ./.github/actions
         with:
           script: ${{ matrix.script }}
           timeout: ${{ matrix.timeout || 10 }}
