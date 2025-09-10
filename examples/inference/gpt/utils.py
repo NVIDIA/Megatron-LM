@@ -81,10 +81,16 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "total number of requests. Set to -1 to add all requests together.",
     )
     group.add_argument(
-        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+        "--model-provider",
+        choices=["mamba", "gpt"],
+        default="gpt",
+        help="Model provider",
     )
     group.add_argument(
-        "--output-path", type=str, default=None, help="Path to save generations as JSON"
+        "--output-path",
+        type=str,
+        default=None,
+        help="Path to save generations as JSON",
     )
     group.add_argument(
         "--output-every-n-results",

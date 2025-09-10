@@ -245,9 +245,8 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        active_requests, finished_requests, step_time = inference_engine.step(
-            sampling_params, verbose=False
-        )
+        result = inference_engine.step(sampling_params, verbose=False)
+        finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
             latency = time.perf_counter() - start_time
