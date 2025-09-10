@@ -53,6 +53,15 @@ from megatron.training import get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
 
+import torch
+import io
+import megatron
+
+torch.serialization.add_safe_globals([io.BytesIO])
+torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
+torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+
+
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
