@@ -28,7 +28,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestStaticInferenceEngine:
+class StaticInferenceEngineTestHarness:
     def setup_engine(
         self,
         engine_max_batch_size=None,
@@ -107,6 +107,8 @@ class TestStaticInferenceEngine:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+
+class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
     @pytest.mark.parametrize(
         "batch_size,num_trials,empty_prompt",
         [(4, 1, False), (4, 1, True), (4, 3, False), (2, 1, False), (8, 1, False)],
