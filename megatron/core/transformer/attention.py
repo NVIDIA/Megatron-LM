@@ -683,9 +683,11 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope,
                 inference_context is None,
                 packed_seq_params is None,
-                rotary_pos_emb is not None,
-                rotary_pos_emb[0] is not None,
-                rotary_pos_emb[1] is not None,
+                (
+                    rotary_pos_emb is not None
+                    and rotary_pos_emb[0] is not None
+                    and rotary_pos_emb[1] is not None
+                ),
                 not self.config.flash_decode,
                 HAVE_FUSED_QKV_ROPE,
                 self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
