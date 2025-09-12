@@ -1,35 +1,36 @@
-__pycache__
-*.so
-build
-.coverage_*
-*.egg-info
-*~
-slurm*
-logs
-.vscode
-local/
-.gitmodules
-wandb/
-onelogger.log
-onelogger.err
-.venv
-test_cases/
-runs/
-model/
-dataset/
-tests/
-checkpoints/
-tensorboard_logs/
-benchmark_cache_llama3_8b_fp8/
-**/dist/
-*.backup
-*.backup.*
-
-# Tensor保存目录 - 只保留enhanced_tensor_logs
-tensor_logs/
-test_tensor_logs/
-demo_tensor_logs/
-improved_tensor_logs/
-custom_tensor_logs/
-env_tensor_logs/
+# 模拟数据和临时文件
+enhanced_tensor_logs/
 draw/
+*.pt
+*.png
+*.jpg
+*.jpeg
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 环境变量文件
+.env
+.venv
+env/
+venv/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 系统文件
+.DS_Store
+Thumbs.db

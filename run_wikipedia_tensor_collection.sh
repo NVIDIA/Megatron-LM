@@ -108,6 +108,48 @@ run_training_for_tensor_collection() {
     # 修改量化类型
     modify_quant_type "$quant_type"
     
+    # 设置tensor保存器的iteration和sample信息
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 设置tensor保存器iteration为0..."
+    export TENSOR_SAVER_ITERATION=0
+    export CURRENT_SAMPLE_IDX=0
+    export LOCAL_RANK=0  # 设置默认rank
+    
+    # 创建初始化脚本
+    cat > "${tensor_path}/init_tensor_collection.py" << 'EOF'
+#!/usr/bin/env python3
+"""初始化tensor收集状态"""
+import sys
+import os
+sys.path.append('/data/charles/codes/Megatron-LM')
+
+# 尝试导入torch.distributed来获取rank
+try:
+    import torch.distributed as dist
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        print(f"从torch.distributed获取rank: {rank}")
+    else:
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        print(f"从环境变量获取rank: {rank}")
+except Exception as e:
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    print(f"无法从torch.distributed获取rank，使用环境变量: {rank}, 错误: {e}")
+
+sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
+iteration = int(os.environ.get("TENSOR_SAVER_ITERATION", 0))
+
+# 导入并初始化tensor收集状态
+from megatron.core.tensor_saver import initialize_tensor_collection
+initialize_tensor_collection(rank=rank, sample_idx=sample_idx, iteration=iteration)
+print(f"Tensor收集状态初始化完成: rank={rank}, sample_idx={sample_idx}, iteration={iteration}")
+EOF
+    
+    chmod +x "${tensor_path}/init_tensor_collection.py"
+    
+    # 在训练开始前运行初始化脚本
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 初始化tensor收集状态..."
+    python "${tensor_path}/init_tensor_collection.py"
+    
     # 运行训练脚本（限制步数）
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 执行训练脚本..."
     
@@ -123,13 +165,32 @@ run_training_for_tensor_collection() {
     # 获取训练进程ID
     TRAINING_PID=$!
     
-    # 等待一段时间让训练开始并收集一些tensor
+    # 等待训练开始并收集至少1个iteration的数据
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 等待训练开始并收集tensor..."
-    sleep 30
     
-    # 检查是否有tensor文件生成
-    tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $tensor_count 个tensor文件"
+    # 监控tensor文件生成，确保至少收集1个iteration的数据
+    iteration_collected=false
+    max_wait_time=300  # 最大等待5分钟
+    wait_time=0
+    
+    while [ $wait_time -lt $max_wait_time ] && [ "$iteration_collected" = false ]; do
+        sleep 10
+        wait_time=$((wait_time + 10))
+        
+        # 检查是否有tensor文件生成
+        tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $tensor_count 个tensor文件 (等待时间: ${wait_time}s)"
+        
+        # 检查是否至少收集了1个iteration的数据（假设每个iteration至少生成10个tensor文件）
+        if [ $tensor_count -ge 10 ]; then
+            iteration_collected=true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 已收集到至少1个iteration的数据"
+        fi
+    done
+    
+    if [ "$iteration_collected" = false ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] 未能在规定时间内收集到足够的tensor数据"
+    fi
     
     # 停止训练进程
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 停止训练进程..."

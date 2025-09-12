@@ -11,6 +11,270 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 
 
+# 全局状态管理
+class TensorCollectionState:
+    """Tensor收集状态管理器"""
+    def __init__(self):
+        self.current_rank = None
+        self.current_sample_idx = None
+        self.current_iteration = 0
+        self.batch_idx = 0
+        self.sequence_idx = 0
+    
+    def set_rank(self, rank: int):
+        """设置当前rank"""
+        self.current_rank = rank
+        print(f"[TensorCollectionState] 设置rank: {rank}")
+    
+    def set_sample_idx(self, sample_idx: int):
+        """设置当前sample索引"""
+        self.current_sample_idx = sample_idx
+        print(f"[TensorCollectionState] 设置sample_idx: {sample_idx}")
+    
+    def set_iteration(self, iteration: int):
+        """设置当前iteration"""
+        self.current_iteration = iteration
+        print(f"[TensorCollectionState] 设置iteration: {iteration}")
+    
+    def set_batch_idx(self, batch_idx: int):
+        """设置当前batch索引"""
+        self.batch_idx = batch_idx
+        print(f"[TensorCollectionState] 设置batch_idx: {batch_idx}")
+    
+    def set_sequence_idx(self, sequence_idx: int):
+        """设置当前sequence索引"""
+        self.sequence_idx = sequence_idx
+        print(f"[TensorCollectionState] 设置sequence_idx: {sequence_idx}")
+    
+    def get_rank(self) -> Optional[int]:
+        """获取当前rank"""
+        if self.current_rank is not None:
+            return self.current_rank
+        
+        # 尝试从分布式环境获取
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                self.current_rank = rank
+                return rank
+        except:
+            pass
+        
+        # 尝试从环境变量获取
+        rank_env = os.environ.get("LOCAL_RANK")
+        if rank_env is not None:
+            try:
+                rank = int(rank_env)
+                self.current_rank = rank
+                return rank
+            except ValueError:
+                pass
+        
+        return None
+    
+    def get_sample_idx(self) -> Optional[int]:
+        """获取当前sample索引"""
+        if self.current_sample_idx is not None:
+            return self.current_sample_idx
+        
+        # 尝试从环境变量获取
+        sample_env = os.environ.get("CURRENT_SAMPLE_IDX")
+        if sample_env is not None:
+            try:
+                sample_idx = int(sample_env)
+                self.current_sample_idx = sample_idx
+                return sample_idx
+            except ValueError:
+                pass
+        
+        return None
+    
+    def get_iteration(self) -> int:
+        """获取当前iteration"""
+        return self.current_iteration
+    
+    def get_batch_idx(self) -> int:
+        """获取当前batch索引"""
+        return self.batch_idx
+    
+    def get_sequence_idx(self) -> int:
+        """获取当前sequence索引"""
+        return self.sequence_idx
+
+# 全局状态实例
+_global_tensor_state = TensorCollectionState()
+
+# 全局tensor索引管理器
+class TensorIndexManager:
+    """Tensor索引管理器，确保同一层的不同tensor使用相同的索引"""
+    def __init__(self):
+        self.layer_tensor_counters = {}  # {layer_key: counter}
+        self.current_layer_key = None
+        self.current_tensor_group = None
+    
+    def get_layer_key(self, layer_type: str, layer_idx: Optional[int], operation: str) -> str:
+        """生成层标识键"""
+        if layer_idx is not None:
+            return f"{layer_type}_L{layer_idx}_{operation}"
+        else:
+            return f"{layer_type}_unknown_{operation}"
+    
+    def get_tensor_group_key(self, layer_type: str, layer_idx: Optional[int], operation: str) -> str:
+        """生成tensor组标识键"""
+        return self.get_layer_key(layer_type, layer_idx, operation)
+    
+    def get_tensor_index(self, layer_type: str, layer_idx: Optional[int], operation: str) -> int:
+        """获取tensor索引"""
+        layer_key = self.get_layer_key(layer_type, layer_idx, operation)
+        
+        if layer_key not in self.layer_tensor_counters:
+            self.layer_tensor_counters[layer_key] = 0
+        
+        # 对于同一层的不同tensor，使用相同的索引
+        return self.layer_tensor_counters[layer_key]
+    
+    def increment_layer_counter(self, layer_type: str, layer_idx: Optional[int], operation: str):
+        """增加层计数器（当该层的所有tensor都保存完毕后调用）"""
+        layer_key = self.get_layer_key(layer_type, layer_idx, operation)
+        if layer_key in self.layer_tensor_counters:
+            self.layer_tensor_counters[layer_key] += 1
+            print(f"[TensorIndexManager] 层 {layer_key} 索引递增到 {self.layer_tensor_counters[layer_key]}")
+    
+    def reset_layer_counter(self, layer_type: str, layer_idx: Optional[int], operation: str):
+        """重置层计数器"""
+        layer_key = self.get_layer_key(layer_type, layer_idx, operation)
+        if layer_key in self.layer_tensor_counters:
+            self.layer_tensor_counters[layer_key] = 0
+            print(f"[TensorIndexManager] 层 {layer_key} 索引重置为 0")
+
+# 全局tensor索引管理器实例
+_global_tensor_index_manager = TensorIndexManager()
+
+def get_tensor_index_manager() -> TensorIndexManager:
+    """获取全局tensor索引管理器"""
+    return _global_tensor_index_manager
+
+def get_tensor_collection_state() -> TensorCollectionState:
+    """获取全局tensor收集状态"""
+    return _global_tensor_state
+
+def set_global_rank(rank: int):
+    """设置全局rank"""
+    _global_tensor_state.set_rank(rank)
+
+def set_global_sample_idx(sample_idx: int):
+    """设置全局sample索引"""
+    _global_tensor_state.set_sample_idx(sample_idx)
+
+def set_global_iteration(iteration: int):
+    """设置全局iteration"""
+    _global_tensor_state.set_iteration(iteration)
+
+def set_global_batch_idx(batch_idx: int):
+    """设置全局batch索引"""
+    _global_tensor_state.set_batch_idx(batch_idx)
+
+def set_global_sequence_idx(sequence_idx: int):
+    """设置全局sequence索引"""
+    _global_tensor_state.set_sequence_idx(sequence_idx)
+
+def get_rank_from_tensor_device(tensor: torch.Tensor) -> Optional[int]:
+    """尝试从tensor设备信息推断rank"""
+    try:
+        if tensor.is_cuda:
+            device_id = tensor.device.index
+            if device_id is not None:
+                # 在某些情况下，device_id可能对应rank
+                return device_id
+    except:
+        pass
+    return None
+
+def get_current_rank_and_sample() -> tuple[Optional[int], Optional[int]]:
+    """获取当前的rank和sample信息"""
+    state = get_tensor_collection_state()
+    
+    # 首先尝试从全局状态获取
+    rank = state.get_rank()
+    sample_idx = state.get_sample_idx()
+    
+    # 如果全局状态中没有，尝试直接从分布式环境获取
+    if rank is None:
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                # 更新全局状态
+                state.set_rank(rank)
+                print(f"[TensorSaver] 从分布式环境获取rank: {rank}")
+        except Exception as e:
+            print(f"[TensorSaver] 无法从分布式环境获取rank: {e}")
+    
+    # 如果仍然没有，尝试从环境变量获取
+    if rank is None:
+        rank_env = os.environ.get("LOCAL_RANK") or os.environ.get("RANK")
+        if rank_env is not None:
+            try:
+                rank = int(rank_env)
+                state.set_rank(rank)
+                print(f"[TensorSaver] 从环境变量获取rank: {rank}")
+            except ValueError:
+                pass
+    
+    # 如果仍然没有，尝试从tensor设备获取
+    if rank is None:
+        try:
+            # 尝试从当前tensor的设备信息推断rank
+            # 这通常不是最可靠的方法，但可以作为备选
+            pass
+        except:
+            pass
+    
+    # 对于sample_idx，也尝试从环境变量获取
+    if sample_idx is None:
+        sample_env = os.environ.get("CURRENT_SAMPLE_IDX") or os.environ.get("BATCH_IDX")
+        if sample_env is not None:
+            try:
+                sample_idx = int(sample_env)
+                state.set_sample_idx(sample_idx)
+                print(f"[TensorSaver] 从环境变量获取sample_idx: {sample_idx}")
+            except ValueError:
+                pass
+    
+    return rank, sample_idx
+
+def initialize_tensor_collection(rank: Optional[int] = None, 
+                               sample_idx: Optional[int] = None, 
+                               iteration: int = 0,
+                               batch_idx: int = 0,
+                               sequence_idx: int = 0):
+    """初始化tensor收集状态"""
+    state = get_tensor_collection_state()
+    
+    if rank is not None:
+        state.set_rank(rank)
+    else:
+        # 尝试自动检测rank
+        auto_rank = state.get_rank()
+        if auto_rank is None:
+            state.set_rank(0)  # 默认值
+    
+    if sample_idx is not None:
+        state.set_sample_idx(sample_idx)
+    else:
+        # 尝试自动检测sample_idx
+        auto_sample_idx = state.get_sample_idx()
+        if auto_sample_idx is None:
+            state.set_sample_idx(0)  # 默认值
+    
+    state.set_iteration(iteration)
+    state.set_batch_idx(batch_idx)
+    state.set_sequence_idx(sequence_idx)
+    
+    print(f"[TensorCollection] 初始化完成 - Rank: {state.get_rank()}, Sample: {state.get_sample_idx()}, Iteration: {state.get_iteration()}")
+
+
 class TensorSaver:
     """Tensor保存器，用于保存量化前后的tensor数据"""
     
@@ -25,23 +289,112 @@ class TensorSaver:
         self.save_dir = Path(save_dir)
         self.enabled = enabled
         self.tensor_counter = 0
+        self.current_iteration = 0
+        self.iteration_data_count = 0
+        self.min_iterations_to_save = 1  # 至少保存1个iteration的数据
         
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
             print(f"[TensorSaver] 初始化完成，保存目录: {self.save_dir}")
     
+    def set_iteration(self, iteration: int):
+        """设置当前iteration"""
+        self.current_iteration = iteration
+        self.iteration_data_count = 0
+        # 同时更新全局状态
+        set_global_iteration(iteration)
+        print(f"[TensorSaver] 设置当前iteration: {iteration}")
+    
+    def increment_iteration_data(self):
+        """增加当前iteration的数据计数"""
+        self.iteration_data_count += 1
+    
     def _get_tensor_info(self, tensor: torch.Tensor) -> Dict[str, Any]:
         """获取tensor的基本信息"""
+        if tensor.numel() == 0:
+            return {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+                "requires_grad": tensor.requires_grad,
+                "is_leaf": tensor.is_leaf,
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+                "std": 0.0,
+                "overflow_info": {
+                    "upper_overflow_count": 0,
+                    "lower_overflow_count": 0,
+                    "upper_overflow_ratio": 0.0,
+                    "lower_overflow_ratio": 0.0,
+                    "total_overflow_ratio": 0.0
+                }
+            }
+        
+        # 计算基本统计信息
+        tensor_flat = tensor.float().flatten()
+        min_val = float(tensor_flat.min().item())
+        max_val = float(tensor_flat.max().item())
+        mean_val = float(tensor_flat.mean().item())
+        std_val = float(tensor_flat.std().item())
+        
+        # 计算溢出信息
+        overflow_info = self._calculate_overflow_info(tensor_flat)
+        
         return {
             "shape": list(tensor.shape),
             "dtype": str(tensor.dtype),
             "device": str(tensor.device),
             "requires_grad": tensor.requires_grad,
             "is_leaf": tensor.is_leaf,
-            "min": float(tensor.min().item()) if tensor.numel() > 0 else 0.0,
-            "max": float(tensor.max().item()) if tensor.numel() > 0 else 0.0,
-            "mean": float(tensor.mean().item()) if tensor.numel() > 0 else 0.0,
-            "std": float(tensor.std().item()) if tensor.numel() > 0 else 0.0,
+            "min": min_val,
+            "max": max_val,
+            "mean": mean_val,
+            "std": std_val,
+            "overflow_info": overflow_info
+        }
+    
+    def _calculate_overflow_info(self, tensor_flat: torch.Tensor) -> Dict[str, Any]:
+        """计算tensor的溢出信息"""
+        total_elements = tensor_flat.numel()
+        
+        # 定义不同数据类型的溢出阈值
+        dtype_thresholds = {
+            'torch.float16': {'max': 65504.0, 'min': -65504.0},
+            'torch.bfloat16': {'max': 3.3895313892515355e+38, 'min': -3.3895313892515355e+38},
+            'torch.float32': {'max': 3.4028235e+38, 'min': -3.4028235e+38},
+            'torch.float64': {'max': 1.7976931348623157e+308, 'min': -1.7976931348623157e+308},
+        }
+        
+        # 获取当前tensor的阈值
+        tensor_dtype = str(tensor_flat.dtype)
+        if tensor_dtype in dtype_thresholds:
+            max_threshold = dtype_thresholds[tensor_dtype]['max']
+            min_threshold = dtype_thresholds[tensor_dtype]['min']
+        else:
+            # 默认使用float32阈值
+            max_threshold = dtype_thresholds['torch.float32']['max']
+            min_threshold = dtype_thresholds['torch.float32']['min']
+        
+        # 计算上溢出和下溢出
+        upper_overflow_mask = tensor_flat > max_threshold
+        lower_overflow_mask = tensor_flat < min_threshold
+        
+        upper_overflow_count = int(upper_overflow_mask.sum().item())
+        lower_overflow_count = int(lower_overflow_mask.sum().item())
+        
+        upper_overflow_ratio = upper_overflow_count / total_elements if total_elements > 0 else 0.0
+        lower_overflow_ratio = lower_overflow_count / total_elements if total_elements > 0 else 0.0
+        total_overflow_ratio = (upper_overflow_count + lower_overflow_count) / total_elements if total_elements > 0 else 0.0
+        
+        return {
+            "upper_overflow_count": upper_overflow_count,
+            "lower_overflow_count": lower_overflow_count,
+            "upper_overflow_ratio": upper_overflow_ratio,
+            "lower_overflow_ratio": lower_overflow_ratio,
+            "total_overflow_ratio": total_overflow_ratio,
+            "max_threshold": max_threshold,
+            "min_threshold": min_threshold
         }
     
     def _generate_filename(self, 
@@ -51,16 +404,40 @@ class TensorSaver:
                           tensor_name: str,
                           layer_idx: Optional[int] = None,
                           phase: str = "unknown",
-                          component: str = "unknown") -> str:
+                          component: str = "unknown",
+                          rank: Optional[int] = None,
+                          sample_idx: Optional[int] = None,
+                          tensor_group_idx: Optional[int] = None) -> str:
         """生成文件名"""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.tensor_counter += 1
         
-        if layer_idx is not None:
-            filename = f"{timestamp}_{self.tensor_counter:04d}_{layer_type}_L{layer_idx}_{operation}_{phase}_{component}_{quant_type}_{tensor_name}.pt"
-        else:
-            filename = f"{timestamp}_{self.tensor_counter:04d}_{layer_type}_{operation}_{phase}_{component}_{quant_type}_{tensor_name}.pt"
+        # 构建文件名组件
+        parts = [
+            timestamp,
+            f"{self.tensor_counter:04d}",
+            f"iter{self.current_iteration:03d}",
+            layer_type
+        ]
         
+        if layer_idx is not None:
+            parts.append(f"L{layer_idx}")
+        
+        parts.extend([operation, phase, component, quant_type])
+        
+        if rank is not None:
+            parts.append(f"rank{rank:02d}")
+        
+        if sample_idx is not None:
+            parts.append(f"sample{sample_idx:03d}")
+        
+        # 添加tensor组索引（同一层的不同tensor使用相同索引）
+        if tensor_group_idx is not None:
+            parts.append(f"group{tensor_group_idx:03d}")
+        
+        parts.append(tensor_name)
+        
+        filename = "_".join(parts) + ".pt"
         return filename
     
     def save_tensor(self, 
@@ -72,6 +449,8 @@ class TensorSaver:
                    layer_idx: Optional[int] = None,
                    phase: str = "unknown",  # "pre" or "post" for forward/backward phases
                    component: str = "unknown",  # "linear" or "FA" for component type
+                   rank: Optional[int] = None,
+                   sample_idx: Optional[int] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
         保存tensor到文件
@@ -85,6 +464,8 @@ class TensorSaver:
             layer_idx: 层索引
             phase: 阶段 ("pre" or "post" for forward/backward phases)
             component: 组件类型 ("linear" or "FA" for component type)
+            rank: GPU rank信息
+            sample_idx: 样本索引
             metadata: 额外的元数据
             
         Returns:
@@ -93,10 +474,50 @@ class TensorSaver:
         if not self.enabled:
             return None
         
+        # 检查是否已经保存了足够的iteration数据
+        if self.iteration_data_count >= self.min_iterations_to_save:
+            return None
+        
+        # 自动获取rank和sample信息（如果未提供）
+        if rank is None or sample_idx is None:
+            auto_rank, auto_sample_idx = get_current_rank_and_sample()
+            if rank is None:
+                rank = auto_rank
+            if sample_idx is None:
+                sample_idx = auto_sample_idx
+        
+        # 如果仍然无法获取rank，尝试从tensor设备信息推断
+        if rank is None:
+            rank = get_rank_from_tensor_device(tensor)
+            if rank is not None:
+                print(f"[TensorSaver] 从tensor设备信息推断rank: {rank}")
+                # 更新全局状态
+                state = get_tensor_collection_state()
+                state.set_rank(rank)
+        
+        # 如果仍然无法获取，使用默认值并打印警告
+        if rank is None:
+            rank = 0  # 默认rank为0
+            print(f"[TensorSaver] 警告: 无法获取rank信息，使用默认值 {rank}")
+        if sample_idx is None:
+            sample_idx = 0  # 默认sample_idx为0
+            print(f"[TensorSaver] 警告: 无法获取sample_idx信息，使用默认值 {sample_idx}")
+        
+        # 获取tensor组索引（同一层的不同tensor使用相同索引）
+        index_manager = get_tensor_index_manager()
+        tensor_group_idx = index_manager.get_tensor_index(layer_type, layer_idx, operation)
+        
+        # 打印调试信息
+        print(f"[TensorSaver] 保存tensor - Rank: {rank}, Sample: {sample_idx}, Layer: {layer_type}, Operation: {operation}, GroupIdx: {tensor_group_idx}")
+        
         try:
             # 生成文件名
-            filename = self._generate_filename(layer_type, operation, quant_type, tensor_name, layer_idx, phase, component)
+            filename = self._generate_filename(layer_type, operation, quant_type, tensor_name, 
+                                            layer_idx, phase, component, rank, sample_idx, tensor_group_idx)
             filepath = self.save_dir / filename
+            
+            # 增加iteration数据计数
+            self.increment_iteration_data()
             
             # 准备保存数据
             save_data = {
@@ -110,6 +531,9 @@ class TensorSaver:
                     "layer_idx": layer_idx,
                     "phase": phase,
                     "component": component,
+                    "rank": rank,
+                    "sample_idx": sample_idx,
+                    "iteration": self.current_iteration,
                     "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                     **(metadata or {})
                 }
@@ -137,6 +561,9 @@ class TensorSaver:
                               layer_idx: Optional[int] = None,
                               phase: str = "pre",
                               component: str = "FA",
+                              rank: Optional[int] = None,
+                              sample_idx: Optional[int] = None,
+                              attention_weights: Optional[torch.Tensor] = None,
                               metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[str]]:
         """
         保存attention层的输入tensor
@@ -148,6 +575,11 @@ class TensorSaver:
             quant_type: 量化类型
             operation: 操作类型
             layer_idx: 层索引
+            phase: 阶段
+            component: 组件类型
+            rank: GPU rank信息
+            sample_idx: 样本索引
+            attention_weights: Attention权重矩阵（P分布）
             metadata: 额外元数据
             
         Returns:
@@ -158,19 +590,25 @@ class TensorSaver:
         # 保存query tensor
         if query is not None:
             results["query"] = self.save_tensor(
-                query, "attention", operation, quant_type, "query", layer_idx, phase, component, metadata
+                query, "attention", operation, quant_type, "query", layer_idx, phase, component, rank, sample_idx, metadata
             )
         
         # 保存key tensor
         if key is not None:
             results["key"] = self.save_tensor(
-                key, "attention", operation, quant_type, "key", layer_idx, phase, component, metadata
+                key, "attention", operation, quant_type, "key", layer_idx, phase, component, rank, sample_idx, metadata
             )
         
         # 保存value tensor
         if value is not None:
             results["value"] = self.save_tensor(
-                value, "attention", operation, quant_type, "value", layer_idx, phase, component, metadata
+                value, "attention", operation, quant_type, "value", layer_idx, phase, component, rank, sample_idx, metadata
+            )
+        
+        # 保存attention权重（P分布）
+        if attention_weights is not None:
+            results["attention_weights"] = self.save_tensor(
+                attention_weights, "attention", operation, quant_type, "attention_weights", layer_idx, phase, component, rank, sample_idx, metadata
             )
         
         return results
@@ -183,6 +621,8 @@ class TensorSaver:
                            layer_idx: Optional[int] = None,
                            phase: str = "pre",
                            component: str = "linear",
+                           rank: Optional[int] = None,
+                           sample_idx: Optional[int] = None,
                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[str]]:
         """
         保存linear层的输入tensor
@@ -193,6 +633,10 @@ class TensorSaver:
             quant_type: 量化类型
             operation: 操作类型
             layer_idx: 层索引
+            phase: 阶段
+            component: 组件类型
+            rank: GPU rank信息
+            sample_idx: 样本索引
             metadata: 额外元数据
             
         Returns:
@@ -203,13 +647,13 @@ class TensorSaver:
         # 保存input tensor
         if input_tensor is not None:
             results["input"] = self.save_tensor(
-                input_tensor, "linear", operation, quant_type, "input", layer_idx, phase, component, metadata
+                input_tensor, "linear", operation, quant_type, "input", layer_idx, phase, component, rank, sample_idx, metadata
             )
         
         # 保存weight tensor
         if weight is not None:
             results["weight"] = self.save_tensor(
-                weight, "linear", operation, quant_type, "weight", layer_idx, phase, component, metadata
+                weight, "linear", operation, quant_type, "weight", layer_idx, phase, component, rank, sample_idx, metadata
             )
         
         return results
@@ -234,6 +678,18 @@ def get_tensor_saver() -> TensorSaver:
             save_dir = os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
             enabled = os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
         _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled)
+        
+        # 从环境变量设置iteration
+        iteration = os.environ.get("TENSOR_SAVER_ITERATION")
+        if iteration is not None:
+            try:
+                _global_tensor_saver.set_iteration(int(iteration))
+            except ValueError:
+                print(f"[TensorSaver] 无效的iteration值: {iteration}")
+        
+        # 初始化tensor收集状态
+        initialize_tensor_collection()
+    
     return _global_tensor_saver
 
 
@@ -245,10 +701,13 @@ def save_attention_tensors(query: torch.Tensor,
                           layer_idx: Optional[int] = None,
                           phase: str = "pre",
                           component: str = "FA",
+                          rank: Optional[int] = None,
+                          sample_idx: Optional[int] = None,
+                          attention_weights: Optional[torch.Tensor] = None,
                           metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[str]]:
     """保存attention层tensor的便捷函数"""
     saver = get_tensor_saver()
-    return saver.save_attention_tensors(query, key, value, quant_type, operation, layer_idx, phase, component, metadata)
+    return saver.save_attention_tensors(query, key, value, quant_type, operation, layer_idx, phase, component, rank, sample_idx, attention_weights, metadata)
 
 
 def save_linear_tensors(input_tensor: torch.Tensor,
@@ -258,10 +717,12 @@ def save_linear_tensors(input_tensor: torch.Tensor,
                        layer_idx: Optional[int] = None,
                        phase: str = "pre",
                        component: str = "linear",
+                       rank: Optional[int] = None,
+                       sample_idx: Optional[int] = None,
                        metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[str]]:
     """保存linear层tensor的便捷函数"""
     saver = get_tensor_saver()
-    return saver.save_linear_tensors(input_tensor, weight, quant_type, operation, layer_idx, phase, component, metadata)
+    return saver.save_linear_tensors(input_tensor, weight, quant_type, operation, layer_idx, phase, component, rank, sample_idx, metadata)
 
 
 def save_tensor(tensor: torch.Tensor,
@@ -272,7 +733,9 @@ def save_tensor(tensor: torch.Tensor,
                 layer_idx: Optional[int] = None,
                 phase: str = "unknown",
                 component: str = "unknown",
+                rank: Optional[int] = None,
+                sample_idx: Optional[int] = None,
                 metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """保存单个tensor的便捷函数"""
     saver = get_tensor_saver()
-    return saver.save_tensor(tensor, layer_type, operation, quant_type, tensor_name, layer_idx, phase, component, metadata)
+    return saver.save_tensor(tensor, layer_type, operation, quant_type, tensor_name, layer_idx, phase, component, rank, sample_idx, metadata)

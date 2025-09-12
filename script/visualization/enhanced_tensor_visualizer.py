@@ -56,7 +56,12 @@ class EnhancedTensorVisualizer:
             'statistics': self.output_dir / 'statistics',
             'attention_analysis': self.output_dir / 'attention_analysis',
             'quantization_analysis': self.output_dir / 'quantization_analysis',
-            'layer_analysis': self.output_dir / 'layer_analysis'
+            'layer_analysis': self.output_dir / 'layer_analysis',
+            'overflow_analysis': self.output_dir / 'overflow_analysis',
+            'fp8_analysis': self.output_dir / 'fp8_analysis',
+            'bf16_analysis': self.output_dir / 'bf16_analysis',
+            'backward_analysis': self.output_dir / 'backward_analysis',
+            'rank_analysis': self.output_dir / 'rank_analysis'
         }
         
         for subdir in self.subdirs.values():
@@ -448,6 +453,587 @@ class EnhancedTensorVisualizer:
         
         print(f"已保存层对比图: {output_path}")
     
+    def plot_overflow_analysis(self, tensors: List[Dict]):
+        """绘制溢出分析图"""
+        print("[EnhancedTensorVisualizer] 生成溢出分析图...")
+        
+        # 收集溢出信息
+        overflow_data = []
+        for tensor_info in tensors:
+            if 'overflow_info' in tensor_info['tensor_info']:
+                overflow_info = tensor_info['tensor_info']['overflow_info']
+                metadata = tensor_info['metadata']
+                
+                overflow_data.append({
+                    'quant_type': metadata['quant_type'],
+                    'layer_type': metadata['layer_type'],
+                    'operation': metadata['operation'],
+                    'tensor_name': metadata['tensor_name'],
+                    'upper_overflow_ratio': overflow_info['upper_overflow_ratio'],
+                    'lower_overflow_ratio': overflow_info['lower_overflow_ratio'],
+                    'total_overflow_ratio': overflow_info['total_overflow_ratio'],
+                    'upper_overflow_count': overflow_info['upper_overflow_count'],
+                    'lower_overflow_count': overflow_info['lower_overflow_count']
+                })
+        
+        if not overflow_data:
+            print("没有找到溢出信息，跳过溢出分析")
+            return
+        
+        df = pd.DataFrame(overflow_data)
+        
+        # 创建溢出分析图
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Tensor溢出分析', fontsize=16, fontweight='bold')
+        
+        # 1. 按量化类型分组的溢出比例
+        ax1 = axes[0, 0]
+        quant_overflow = df.groupby('quant_type')['total_overflow_ratio'].agg(['mean', 'std', 'max']).reset_index()
+        x = np.arange(len(quant_overflow))
+        width = 0.25
+        
+        ax1.bar(x - width, quant_overflow['mean'], width, label='平均溢出比例', alpha=0.8)
+        ax1.bar(x, quant_overflow['max'], width, label='最大溢出比例', alpha=0.8)
+        ax1.bar(x + width, quant_overflow['std'], width, label='标准差', alpha=0.8)
+        
+        ax1.set_xlabel('量化类型')
+        ax1.set_ylabel('溢出比例')
+        ax1.set_title('各量化类型溢出比例对比')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(quant_overflow['quant_type'])
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 上溢出vs下溢出散点图
+        ax2 = axes[0, 1]
+        for quant_type in df['quant_type'].unique():
+            subset = df[df['quant_type'] == quant_type]
+            ax2.scatter(subset['upper_overflow_ratio'], subset['lower_overflow_ratio'], 
+                       label=quant_type, alpha=0.6, s=50)
+        
+        ax2.set_xlabel('上溢出比例')
+        ax2.set_ylabel('下溢出比例')
+        ax2.set_title('上溢出vs下溢出分布')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 按层类型的溢出统计
+        ax3 = axes[1, 0]
+        layer_overflow = df.groupby('layer_type')['total_overflow_ratio'].agg(['mean', 'std']).reset_index()
+        bars = ax3.bar(layer_overflow['layer_type'], layer_overflow['mean'], 
+                      yerr=layer_overflow['std'], capsize=5, alpha=0.8)
+        ax3.set_xlabel('层类型')
+        ax3.set_ylabel('平均溢出比例')
+        ax3.set_title('各层类型溢出比例')
+        ax3.grid(True, alpha=0.3)
+        
+        # 添加数值标签
+        for bar, mean_val, std_val in zip(bars, layer_overflow['mean'], layer_overflow['std']):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std_val + 0.001,
+                    f'{mean_val:.4f}', ha='center', va='bottom')
+        
+        # 4. 溢出比例分布直方图
+        ax4 = axes[1, 1]
+        ax4.hist(df['total_overflow_ratio'], bins=20, alpha=0.7, edgecolor='black')
+        ax4.set_xlabel('总溢出比例')
+        ax4.set_ylabel('频次')
+        ax4.set_title('溢出比例分布直方图')
+        ax4.grid(True, alpha=0.3)
+        
+        # 添加统计信息
+        mean_overflow = df['total_overflow_ratio'].mean()
+        max_overflow = df['total_overflow_ratio'].max()
+        ax4.axvline(mean_overflow, color='red', linestyle='--', label=f'平均值: {mean_overflow:.4f}')
+        ax4.axvline(max_overflow, color='orange', linestyle='--', label=f'最大值: {max_overflow:.4f}')
+        ax4.legend()
+        
+        plt.tight_layout()
+        
+        # 保存图片
+        output_path = self.subdirs['overflow_analysis'] / 'overflow_analysis.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"溢出分析图已保存: {output_path}")
+    
+    def plot_fp8_distribution_analysis(self, tensors: List[Dict]):
+        """绘制FP8分布分析图"""
+        print("[EnhancedTensorVisualizer] 生成FP8分布分析图...")
+        
+        # 筛选FP8相关的tensor
+        fp8_tensors = [t for t in tensors if t['metadata']['quant_type'] in ['hifp8', 'mxfp8']]
+        
+        if not fp8_tensors:
+            print("没有找到FP8 tensor，跳过FP8分析")
+            return
+        
+        # 按量化类型分组
+        hifp8_tensors = [t for t in fp8_tensors if t['metadata']['quant_type'] == 'hifp8']
+        mxfp8_tensors = [t for t in fp8_tensors if t['metadata']['quant_type'] == 'mxfp8']
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('FP8分布分析 (HiFP8 vs MXFP8)', fontsize=16, fontweight='bold')
+        
+        # 1. 分布对比
+        ax1 = axes[0, 0]
+        for tensor_info in hifp8_tensors[:5]:  # 限制显示数量
+            data = tensor_info['tensor'].float().numpy().flatten()
+            ax1.hist(data, bins=50, alpha=0.6, label=f"HiFP8-{tensor_info['metadata']['tensor_name']}", density=True)
+        
+        for tensor_info in mxfp8_tensors[:5]:
+            data = tensor_info['tensor'].float().numpy().flatten()
+            ax1.hist(data, bins=50, alpha=0.6, label=f"MXFP8-{tensor_info['metadata']['tensor_name']}", density=True)
+        
+        ax1.set_xlabel('数值')
+        ax1.set_ylabel('密度')
+        ax1.set_title('FP8数值分布对比')
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 统计信息对比
+        ax2 = axes[0, 1]
+        stats_data = []
+        for quant_type, group in [('hifp8', hifp8_tensors), ('mxfp8', mxfp8_tensors)]:
+            for tensor_info in group:
+                data = tensor_info['tensor'].float().numpy().flatten()
+                stats_data.append({
+                    'quant_type': quant_type,
+                    'mean': np.mean(data),
+                    'std': np.std(data),
+                    'min': np.min(data),
+                    'max': np.max(data),
+                    'tensor_name': tensor_info['metadata']['tensor_name']
+                })
+        
+        stats_df = pd.DataFrame(stats_data)
+        
+        # 绘制箱线图
+        quant_types = stats_df['quant_type'].unique()
+        box_data = [stats_df[stats_df['quant_type'] == qt]['mean'].values for qt in quant_types]
+        bp = ax2.boxplot(box_data, labels=quant_types, patch_artist=True)
+        colors = ['lightblue', 'lightgreen']
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        ax2.set_ylabel('均值')
+        ax2.set_title('FP8均值分布箱线图')
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 相关性分析
+        ax3 = axes[1, 0]
+        if hifp8_tensors and mxfp8_tensors:
+            # 找到相同tensor_name的配对
+            hifp8_by_name = {t['metadata']['tensor_name']: t for t in hifp8_tensors}
+            mxfp8_by_name = {t['metadata']['tensor_name']: t for t in mxfp8_tensors}
+            
+            common_names = set(hifp8_by_name.keys()) & set(mxfp8_by_name.keys())
+            if common_names:
+                for name in list(common_names)[:3]:  # 最多显示3个配对
+                    hifp8_data = hifp8_by_name[name]['tensor'].float().numpy().flatten()
+                    mxfp8_data = mxfp8_by_name[name]['tensor'].float().numpy().flatten()
+                    
+                    # 采样以减少计算量
+                    if len(hifp8_data) > 10000:
+                        indices = np.random.choice(len(hifp8_data), 10000, replace=False)
+                        hifp8_data = hifp8_data[indices]
+                        mxfp8_data = mxfp8_data[indices]
+                    
+                    ax3.scatter(hifp8_data, mxfp8_data, alpha=0.5, s=1, label=name)
+                
+                ax3.set_xlabel('HiFP8')
+                ax3.set_ylabel('MXFP8')
+                ax3.set_title('HiFP8 vs MXFP8 相关性分析')
+                ax3.legend()
+                ax3.grid(True, alpha=0.3)
+        
+        # 4. 拟合度分析
+        ax4 = axes[1, 1]
+        for quant_type, group in [('hifp8', hifp8_tensors), ('mxfp8', mxfp8_tensors)]:
+            all_data = []
+            for tensor_info in group:
+                data = tensor_info['tensor'].float().numpy().flatten()
+                all_data.extend(data)
+            
+            if all_data:
+                # 计算与正态分布的拟合度
+                from scipy import stats
+                _, p_value = stats.normaltest(all_data)
+                
+                ax4.hist(all_data, bins=50, alpha=0.6, label=f'{quant_type} (p={p_value:.4f})', density=True)
+        
+        ax4.set_xlabel('数值')
+        ax4.set_ylabel('密度')
+        ax4.set_title('FP8与正态分布拟合度分析')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # 保存图片
+        output_path = self.subdirs['fp8_analysis'] / 'fp8_distribution_analysis.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"FP8分布分析图已保存: {output_path}")
+    
+    def plot_bf16_analysis(self, tensors: List[Dict]):
+        """绘制BF16特殊分布分析图"""
+        print("[EnhancedTensorVisualizer] 生成BF16分析图...")
+        
+        # 筛选BF16相关的tensor
+        bf16_tensors = [t for t in tensors if t['metadata']['quant_type'] == 'bf16']
+        
+        if not bf16_tensors:
+            print("没有找到BF16 tensor，跳过BF16分析")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('BF16特殊分布分析', fontsize=16, fontweight='bold')
+        
+        # 1. 原始分布
+        ax1 = axes[0, 0]
+        for i, tensor_info in enumerate(bf16_tensors[:5]):
+            data = tensor_info['tensor'].float().numpy().flatten()
+            ax1.hist(data, bins=50, alpha=0.6, label=f"Sample {i+1}", density=True)
+        
+        ax1.set_xlabel('数值')
+        ax1.set_ylabel('密度')
+        ax1.set_title('BF16原始分布')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 归一化密度分析
+        ax2 = axes[0, 1]
+        for i, tensor_info in enumerate(bf16_tensors[:5]):
+            data = tensor_info['tensor'].float().numpy().flatten()
+            
+            # 归一化到[0,1]
+            data_norm = (data - data.min()) / (data.max() - data.min() + 1e-8)
+            
+            ax2.hist(data_norm, bins=50, alpha=0.6, label=f"Sample {i+1} (归一化)", density=True)
+        
+        ax2.set_xlabel('归一化数值')
+        ax2.set_ylabel('密度')
+        ax2.set_title('BF16归一化密度分布')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 密度计算分析
+        ax3 = axes[1, 0]
+        density_analysis = []
+        for i, tensor_info in enumerate(bf16_tensors):
+            data = tensor_info['tensor'].float().numpy().flatten()
+            
+            # 计算密度统计
+            density_stats = {
+                'sample': i+1,
+                'tensor_name': tensor_info['metadata']['tensor_name'],
+                'raw_density': len(data) / (data.max() - data.min() + 1e-8),
+                'normalized_density': len(data) / 1.0,  # 归一化后密度
+                'variance': np.var(data),
+                'skewness': stats.skew(data),
+                'kurtosis': stats.kurtosis(data)
+            }
+            density_analysis.append(density_stats)
+        
+        density_df = pd.DataFrame(density_analysis)
+        
+        # 绘制密度对比
+        x = np.arange(len(density_df))
+        width = 0.35
+        
+        ax3.bar(x - width/2, density_df['raw_density'], width, label='原始密度', alpha=0.8)
+        ax3.bar(x + width/2, density_df['normalized_density'], width, label='归一化密度', alpha=0.8)
+        
+        ax3.set_xlabel('样本')
+        ax3.set_ylabel('密度值')
+        ax3.set_title('BF16密度计算分析')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels([f"S{i+1}" for i in range(len(density_df))])
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. 统计特征分析
+        ax4 = axes[1, 1]
+        features = ['variance', 'skewness', 'kurtosis']
+        feature_data = [density_df[feat].values for feat in features]
+        
+        bp = ax4.boxplot(feature_data, labels=features, patch_artist=True)
+        colors = ['lightcoral', 'lightblue', 'lightgreen']
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        ax4.set_ylabel('特征值')
+        ax4.set_title('BF16统计特征分布')
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # 保存图片
+        output_path = self.subdirs['bf16_analysis'] / 'bf16_analysis.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"BF16分析图已保存: {output_path}")
+    
+    def plot_backward_analysis(self, tensors: List[Dict]):
+        """绘制backward分布分析图"""
+        print("[EnhancedTensorVisualizer] 生成Backward分析图...")
+        
+        # 筛选backward相关的tensor
+        backward_tensors = [t for t in tensors if t['metadata']['operation'] == 'backward']
+        forward_tensors = [t for t in tensors if t['metadata']['operation'] == 'forward']
+        
+        if not backward_tensors:
+            print("没有找到backward tensor，跳过backward分析")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Forward vs Backward分布分析', fontsize=16, fontweight='bold')
+        
+        # 1. Forward vs Backward分布对比
+        ax1 = axes[0, 0]
+        for operation, group in [('forward', forward_tensors), ('backward', backward_tensors)]:
+            all_data = []
+            for tensor_info in group[:10]:  # 限制数量
+                data = tensor_info['tensor'].float().numpy().flatten()
+                all_data.extend(data)
+            
+            if all_data:
+                ax1.hist(all_data, bins=50, alpha=0.6, label=f'{operation.capitalize()}', density=True)
+        
+        ax1.set_xlabel('数值')
+        ax1.set_ylabel('密度')
+        ax1.set_title('Forward vs Backward分布对比')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 按层类型的backward分析
+        ax2 = axes[0, 1]
+        backward_by_layer = {}
+        for tensor_info in backward_tensors:
+            layer_type = tensor_info['metadata']['layer_type']
+            if layer_type not in backward_by_layer:
+                backward_by_layer[layer_type] = []
+            backward_by_layer[layer_type].append(tensor_info)
+        
+        for layer_type, group in backward_by_layer.items():
+            all_data = []
+            for tensor_info in group:
+                data = tensor_info['tensor'].float().numpy().flatten()
+                all_data.extend(data)
+            
+            if all_data:
+                ax2.hist(all_data, bins=30, alpha=0.6, label=layer_type, density=True)
+        
+        ax2.set_xlabel('数值')
+        ax2.set_ylabel('密度')
+        ax2.set_title('各层类型Backward分布')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 统计信息对比
+        ax3 = axes[1, 0]
+        stats_comparison = []
+        for operation, group in [('forward', forward_tensors), ('backward', backward_tensors)]:
+            for tensor_info in group:
+                data = tensor_info['tensor'].float().numpy().flatten()
+                stats_comparison.append({
+                    'operation': operation,
+                    'mean': np.mean(data),
+                    'std': np.std(data),
+                    'min': np.min(data),
+                    'max': np.max(data),
+                    'layer_type': tensor_info['metadata']['layer_type']
+                })
+        
+        stats_df = pd.DataFrame(stats_comparison)
+        
+        # 绘制统计信息对比
+        operations = stats_df['operation'].unique()
+        box_data = [stats_df[stats_df['operation'] == op]['mean'].values for op in operations]
+        bp = ax3.boxplot(box_data, labels=operations, patch_artist=True)
+        colors = ['lightblue', 'lightcoral']
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        ax3.set_ylabel('均值')
+        ax3.set_title('Forward vs Backward均值分布')
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. 梯度分析（如果有梯度信息）
+        ax4 = axes[1, 1]
+        grad_tensors = [t for t in backward_tensors if 'grad' in t['metadata']['tensor_name'].lower()]
+        
+        if grad_tensors:
+            for i, tensor_info in enumerate(grad_tensors[:5]):
+                data = tensor_info['tensor'].float().numpy().flatten()
+                ax4.hist(data, bins=30, alpha=0.6, label=f"Grad {i+1}", density=True)
+            
+            ax4.set_xlabel('梯度值')
+            ax4.set_ylabel('密度')
+            ax4.set_title('梯度分布分析')
+            ax4.legend()
+        else:
+            ax4.text(0.5, 0.5, '没有找到梯度tensor', ha='center', va='center', 
+                    transform=ax4.transAxes, fontsize=12)
+            ax4.set_title('梯度分布分析')
+        
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # 保存图片
+        output_path = self.subdirs['backward_analysis'] / 'backward_analysis.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Backward分析图已保存: {output_path}")
+    
+    def plot_rank_analysis(self, tensors: List[Dict]):
+        """绘制rank分析图"""
+        print("[EnhancedTensorVisualizer] 生成Rank分析图...")
+        
+        # 筛选有rank信息的tensor
+        rank_tensors = [t for t in tensors if t['metadata'].get('rank') is not None]
+        
+        if not rank_tensors:
+            print("没有找到rank信息，跳过rank分析")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Rank分析图', fontsize=16, fontweight='bold')
+        
+        # 1. 按rank分组的分布
+        ax1 = axes[0, 0]
+        rank_groups = {}
+        for tensor_info in rank_tensors:
+            rank = tensor_info['metadata']['rank']
+            if rank not in rank_groups:
+                rank_groups[rank] = []
+            rank_groups[rank].append(tensor_info)
+        
+        for rank, group in rank_groups.items():
+            all_data = []
+            for tensor_info in group:
+                data = tensor_info['tensor'].float().numpy().flatten()
+                all_data.extend(data)
+            
+            if all_data:
+                ax1.hist(all_data, bins=30, alpha=0.6, label=f'Rank {rank}', density=True)
+        
+        ax1.set_xlabel('数值')
+        ax1.set_ylabel('密度')
+        ax1.set_title('各Rank分布对比')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Rank统计信息
+        ax2 = axes[0, 1]
+        rank_stats = []
+        for rank, group in rank_groups.items():
+            for tensor_info in group:
+                data = tensor_info['tensor'].float().numpy().flatten()
+                rank_stats.append({
+                    'rank': rank,
+                    'mean': np.mean(data),
+                    'std': np.std(data),
+                    'tensor_name': tensor_info['metadata']['tensor_name']
+                })
+        
+        rank_df = pd.DataFrame(rank_stats)
+        
+        # 绘制rank统计
+        ranks = sorted(rank_df['rank'].unique())
+        means = [rank_df[rank_df['rank'] == r]['mean'].mean() for r in ranks]
+        stds = [rank_df[rank_df['rank'] == r]['mean'].std() for r in ranks]
+        
+        ax2.errorbar(ranks, means, yerr=stds, marker='o', capsize=5, capthick=2)
+        ax2.set_xlabel('Rank')
+        ax2.set_ylabel('平均均值')
+        ax2.set_title('各Rank统计信息')
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 样本分析
+        ax3 = axes[1, 0]
+        sample_tensors = [t for t in rank_tensors if t['metadata'].get('sample_idx') is not None]
+        
+        if sample_tensors:
+            sample_groups = {}
+            for tensor_info in sample_tensors:
+                sample_idx = tensor_info['metadata']['sample_idx']
+                if sample_idx not in sample_groups:
+                    sample_groups[sample_idx] = []
+                sample_groups[sample_idx].append(tensor_info)
+            
+            for sample_idx, group in list(sample_groups.items())[:5]:  # 最多显示5个样本
+                all_data = []
+                for tensor_info in group:
+                    data = tensor_info['tensor'].float().numpy().flatten()
+                    all_data.extend(data)
+                
+                if all_data:
+                    ax3.hist(all_data, bins=20, alpha=0.6, label=f'Sample {sample_idx}', density=True)
+            
+            ax3.set_xlabel('数值')
+            ax3.set_ylabel('密度')
+            ax3.set_title('各样本分布对比')
+            ax3.legend()
+        else:
+            ax3.text(0.5, 0.5, '没有找到样本信息', ha='center', va='center', 
+                    transform=ax3.transAxes, fontsize=12)
+            ax3.set_title('样本分析')
+        
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. 迭代分析
+        ax4 = axes[1, 1]
+        iter_tensors = [t for t in rank_tensors if t['metadata'].get('iteration') is not None]
+        
+        if iter_tensors:
+            iter_groups = {}
+            for tensor_info in iter_tensors:
+                iteration = tensor_info['metadata']['iteration']
+                if iteration not in iter_groups:
+                    iter_groups[iteration] = []
+                iter_groups[iteration].append(tensor_info)
+            
+            iterations = sorted(iter_groups.keys())
+            means_by_iter = []
+            for iteration in iterations:
+                group = iter_groups[iteration]
+                all_data = []
+                for tensor_info in group:
+                    data = tensor_info['tensor'].float().numpy().flatten()
+                    all_data.extend(data)
+                
+                if all_data:
+                    means_by_iter.append(np.mean(all_data))
+                else:
+                    means_by_iter.append(0)
+            
+            ax4.plot(iterations, means_by_iter, marker='o', linewidth=2, markersize=6)
+            ax4.set_xlabel('迭代次数')
+            ax4.set_ylabel('平均均值')
+            ax4.set_title('迭代过程中数值变化')
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax4.text(0.5, 0.5, '没有找到迭代信息', ha='center', va='center', 
+                    transform=ax4.transAxes, fontsize=12)
+            ax4.set_title('迭代分析')
+        
+        plt.tight_layout()
+        
+        # 保存图片
+        output_path = self.subdirs['rank_analysis'] / 'rank_analysis.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Rank分析图已保存: {output_path}")
+    
     def generate_summary_report(self, tensors: List[Dict]):
         """生成汇总报告"""
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -548,6 +1134,21 @@ class EnhancedTensorVisualizer:
         
         print("\n4. Generating layer type comparison charts...")
         self.plot_layer_comparison(tensors)
+        
+        print("\n5. Generating overflow analysis charts...")
+        self.plot_overflow_analysis(tensors)
+        
+        print("\n6. Generating FP8 distribution analysis charts...")
+        self.plot_fp8_distribution_analysis(tensors)
+        
+        print("\n7. Generating BF16 analysis charts...")
+        self.plot_bf16_analysis(tensors)
+        
+        print("\n8. Generating backward analysis charts...")
+        self.plot_backward_analysis(tensors)
+        
+        print("\n9. Generating rank analysis charts...")
+        self.plot_rank_analysis(tensors)
         
         print(f"\n[EnhancedTensorVisualizer] Visualization complete!")
         print(f"All images saved to: {self.output_dir}")

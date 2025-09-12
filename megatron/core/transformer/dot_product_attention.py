@@ -228,6 +228,45 @@ class DotProductAttention(MegatronModule):
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
 
+        # 保存attention权重（P分布）用于分析
+        from megatron.core.tensor_saver import save_tensor
+        import os
+        
+        # 尝试获取rank信息
+        rank = None
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        
+        if rank is None:
+            rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        # 尝试获取sample信息
+        sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
+        
+        # 保存attention权重（P分布）
+        save_tensor(
+            tensor=attention_probs.detach(),
+            layer_type="attention",
+            operation="forward",
+            quant_type=custom_quant_type,
+            tensor_name="attention_weights",
+            layer_idx=getattr(self, 'layer_number', None),
+            phase="post",
+            component="FA",
+            rank=rank,
+            sample_idx=sample_idx,
+            metadata={
+                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
+                "attention_weights_shape": list(attention_probs.shape),
+                "softmax_scale": self.softmax_scale,
+            }
+        )
+
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 
@@ -278,6 +317,23 @@ class DotProductAttention(MegatronModule):
 
         # 保存forward输出tensor (post-FA)
         from megatron.core.tensor_saver import save_tensor
+        import os
+        
+        # 尝试获取rank信息
+        rank = None
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                rank = dist.get_rank()
+        except:
+            pass
+        
+        if rank is None:
+            rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        # 尝试获取sample信息
+        sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
+        
         save_tensor(
             tensor=context,
             layer_type="attention",
@@ -287,6 +343,8 @@ class DotProductAttention(MegatronModule):
             layer_idx=getattr(self, 'layer_number', None),
             phase="post",
             component="FA",
+            rank=rank,  # 直接获取
+            sample_idx=sample_idx,  # 直接获取
             metadata={
                 "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
                 "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
