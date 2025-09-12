@@ -427,6 +427,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
+        self.offload_self_attn = (
+            self.config.offload_activation
+            and "self_attn" in self.config.offload_modules
+        )
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -521,17 +525,41 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
+        if self.offload_self_attn:
+            from megatron.core.pipeline_parallel.cpu_offload import (
+                PipelineOffloadManager,
+                group_prefetch_offload_start,
+                group_prefetch_offload_commit,
+            )
+            if not input_layernorm_output.is_contiguous():
+                input_layernorm_output = input_layernorm_output.contiguous()
+            input_layernorm_output = group_prefetch_offload_start(input_layernorm_output)
+            input_layernorm_output.offloading_activation = True
+            with PipelineOffloadManager.get_instance():
+                attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+            attention_output_with_bias = group_prefetch_offload_commit(attention_output_with_bias, release_tensors=[input_layernorm_output])
+        else:
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:

@@ -990,6 +990,38 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        if self.offload_modules is None:
+            self.offload_modules = ["core_attn"]
+
+        if len(self.offload_modules) > 0:
+            allowed_modules = {
+                "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1"
+            }
+            if self.multi_latent_attention:
+                flag = "self_attn" in self.offload_modules or "qkv_linear" in self.offload_modules or "core_attn" in self.offload_modules or "attn_linear" in self.offload_modules
+                assert not flag, "(Temporary) self_attn, qkv_linear, core_attn, attn_linear must not be in offload_modules when multi_latent_attention is True"
+            invalid_modules = set(self.offload_modules) - allowed_modules
+            assert not invalid_modules, (
+                f'Invalid choices for offload_modules: {invalid_modules}. '
+                f'Allowed modules are: {allowed_modules}'
+            )
+
+        if "self_attn" in self.offload_modules:
+            if "qkv_linear" in self.offload_modules:
+                self.offload_modules.remove("qkv_linear")
+            if "core_attn" in self.offload_modules:
+                self.offload_modules.remove("core_attn")
+            if "attn_linear" in self.offload_modules:
+                self.offload_modules.remove("attn_linear")
+
+        if "core_attn" in self.offload_modules:
+            warnings.warn(
+                "If you are using transformer_engine as the transformer implementation, "
+                "the core_attn is from transformer_engine and may be the fused version. "
+                "For fused attention, you have no need to set 'core_attn' to offload. "
+                "Please check that the core_attn offload is really needed."
+            )
+
         if (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
