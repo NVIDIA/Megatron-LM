@@ -19,7 +19,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig 
 
 try:
     from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -270,7 +270,10 @@ class MoELayer(BaseMoELayer):
             )
 
         def cuda_graph_early_returns(return_condition):
-            if self.config.external_cuda_graph and self.training and is_graph_capturing():
+            if not (is_graph_capturing() and self.training):
+                return False
+
+            if self.config.external_cuda_graph or self.config.enable_cuda_graph:
                 if return_condition == "router":
                     if (
                         'moe_router' in self.config.cuda_graph_scope
@@ -299,12 +302,12 @@ class MoELayer(BaseMoELayer):
                 return outputs
 
             hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
-
             # Return right here if we are capturing the MoE preprocess.
             if cuda_graph_early_returns("preprocess"):
                 outputs = [hidden_states, probs, residual]
                 if shared_expert_output is not None:
                     outputs.append(shared_expert_output)
+
                 valid_cudagraph_attrs = []
                 for attr_name in self.token_dispatcher.cudagraph_attrs:
                     hier_attr_name = attr_name.split('.')
@@ -315,6 +318,8 @@ class MoELayer(BaseMoELayer):
                             break
                     if isinstance(attr, torch.Tensor):
                         outputs.append(attr)
+                        print(f"TOKEN DISPATCHER APPENDING attr_name {attr_name}  outputs len={len(outputs)}")
+
                         valid_cudagraph_attrs.append(attr_name)
                 if self.token_dispatcher.valid_cudagraph_attrs is None:
                     self.token_dispatcher.valid_cudagraph_attrs = valid_cudagraph_attrs

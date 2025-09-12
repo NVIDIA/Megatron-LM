@@ -276,33 +276,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
-        # Enable cuda graphs.
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert not (
-                config.enable_cuda_graph and config.external_cuda_graph
-            ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
-            if config.enable_cuda_graph:
-                if not self.training:
-                    # Cudagraphs for inference are only enabled with the flash decoding kernel
-                    assert (
-                        self.config.flash_decode
-                    ), "--flash-decode is required to use CUDA graphs during inference"
-                self.cudagraph_manager = CudaGraphManager(config)
-            else:
-                # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
-                # the number of microbatches. Multiple CUDA graphs per layer is required to support
-                # pipelining which requires running FWD graph of multiple microbatches before BWD
-                # graph. To enable CUDA graph, this list should be populated in the model training
-                # script with the graphs returned by make_graphed_callables API before the first
-                # training step.
-                self.cuda_graphs = []
-                # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
-                # graphs. Those hooks and args are collected in this list and should be manually
-                # triggered before CUDA Graph running. This is required to ensure the correct param
-                # all-gather overlap with forward compute.
-                self.cuda_graph_manual_hooks = []
-                self.current_microbatch = -1
-
         if model_comm_pgs is None:
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
 
@@ -432,6 +405,33 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+        # Enable cuda graphs.
+        if config.enable_cuda_graph or config.external_cuda_graph:
+            assert not (
+                config.enable_cuda_graph and config.external_cuda_graph
+            ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
+            if config.enable_cuda_graph:
+                if not self.training:
+                    # Cudagraphs for inference are only enabled with the flash decoding kernel
+                    assert (
+                        self.config.flash_decode
+                    ), "--flash-decode is required to use CUDA graphs during inference"
+                self.cudagraph_manager = CudaGraphManager(config, base_module=self)
+            else:
+                # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
+                # the number of microbatches. Multiple CUDA graphs per layer is required to support
+                # pipelining which requires running FWD graph of multiple microbatches before BWD
+                # graph. To enable CUDA graph, this list should be populated in the model training
+                # script with the graphs returned by make_graphed_callables API before the first
+                # training step.
+                self.cuda_graphs = []
+                # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
+                # graphs. Those hooks and args are collected in this list and should be manually
+                # triggered before CUDA Graph running. This is required to ensure the correct param
+                # all-gather overlap with forward compute.
+                self.cuda_graph_manual_hooks = []
+                self.current_microbatch = -1
+
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
         """
@@ -455,6 +455,18 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+
+        # Return right here if we are partially capturing the MoE.
+        need_early_return = self.is_moe_layer \
+            and self.training \
+            and is_graph_capturing()
+        early_return_for_external_cudagraph = self.config.external_cuda_graph and 'moe_router' in self.config.cuda_graph_scope    
+        if (
+            (need_early_return and early_return_for_external_cudagraph)
+            or (need_early_return and self.config.enable_cuda_graph)
+        ):
+            return output
+
         return output, context
 
     def _forward_attention(
@@ -642,13 +654,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp")
 
         # Return right here if we are partially capturing the MoE.
-        if (
-            self.is_moe_layer
-            and self.config.external_cuda_graph
-            and self.training
-            and is_graph_capturing()
+        need_early_return = self.is_moe_layer \
+            and self.training \
+            and is_graph_capturing() \
             and 'moe_router' in self.config.cuda_graph_scope
-        ):
+
+        if (need_early_return and self.config.external_cuda_graph) \
+            or (need_early_return and self.config.enable_cuda_graph):
             return mlp_output_with_bias + [residual]
 
         return self._forward_post_mlp(mlp_output_with_bias, residual)
@@ -798,6 +810,69 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if context is not None:
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
+
+
+    def cuda_graph_fwd_capture_post_hook(self):
+        if 'moe_preprocess' in self.config.cuda_graph_scope and self.is_moe_layer:
+            outputs = []
+            for attr_name in self.mlp.token_dispatcher.valid_cudagraph_attrs:
+                attr = getattr(self.mlp.token_dispatcher, attr_name)
+                if isinstance(attr, torch.Tensor):
+                    outputs.append(attr)
+                    print(f"TOKEN DISPATCHER APPENDING {attr_name}  outputs len={len(outputs)}")
+
+            return outputs
+        return None
+
+
+    def cuda_graph_fwd_replay_post_hook(self, cuda_graph_outputs, extra_cuda_graph_attrs):
+        #NOOP
+        if not self.is_moe_layer:
+            return cuda_graph_outputs
+
+        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
+            self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
+        ):
+            # CUDA Graph captures the whole MLP/MoE part, so no early return, so do nothing
+            assert False
+    
+        elif self.is_moe_layer and 'moe_router' in self.config.cuda_graph_scope:
+            # CUDA Graph partially captures the MoE.
+            # The rest of the layer runs in eager mode.
+            if 'moe_preprocess' in self.config.cuda_graph_scope:
+                if self.mlp.shared_expert_compute_before_router:
+                    hidden_states, probs, residual, shared_expert_output, mlp_residual = cuda_graph_outputs
+                else:
+                    hidden_states, probs, residual, mlp_residual = cuda_graph_outputs
+                    shared_expert_output = None
+
+                attr_outputs = extra_cuda_graph_attrs
+                valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
+
+                assert len(attr_outputs) == len(
+                    valid_cudagraph_attrs
+                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+                for i, attr_name in enumerate(valid_cudagraph_attrs):
+                    hier_attr_name = attr_name.split('.')
+                    attr = self.mlp.token_dispatcher
+                    for name in hier_attr_name[:-1]:
+                        attr = getattr(attr, name)
+                    setattr(attr, hier_attr_name[-1], attr_outputs[i])
+            else:
+                if self.mlp.shared_expert_compute_before_router:
+                    hidden_states, probs, routing_map, shared_expert_output, mlp_residual = cuda_graph_outputs
+                else:
+                    hidden_states, probs, routing_map, mlp_residual = cuda_graph_outputs
+                    shared_expert_output = None
+
+                hidden_states, probs, residual = self.mlp.preprocess(hidden_states, probs, routing_map)
+
+            mlp_output_with_bias = self.mlp.dispatch_compute_combine(
+                hidden_states, probs, residual, shared_expert_output
+            )
+            out = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
+            context = None
+            return out, context
 
     def _cuda_graph_replay(self, *args, **kwargs):
         """

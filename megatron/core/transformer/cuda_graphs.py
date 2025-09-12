@@ -31,12 +31,15 @@ try:
     from transformer_engine.pytorch.graph import set_capture_end as te_set_capture_end
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+    import transformer_engine as te
 
     HAVE_TE_GRAPHS = True
 except:
     HAVE_TE_GRAPHS = False
 
 _IS_GRAPH_CAPTURING = False
+IS_WARMUP = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,13 @@ def _check_supported_type(arg):
     ), f"Cudagraphs recieved an arg of type {type(arg)} which is not supported."
 
 
+def is_moe_layer_with_early_return(module):
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    return isinstance(module, TransformerLayer) \
+        and module.is_moe_layer \
+        and 'moe_router' in module.config.cuda_graph_scope
+
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
@@ -124,14 +134,6 @@ class _CudagraphGlobalRecord:
         # Otherwise, create all the recorded cudagraphs.
         logging.getLogger(__name__).info(f"Creating {len(cls.cudagraph_record)} CUDA graphs")
 
-        has_te_modules = False
-        if HAVE_TE_GRAPHS:
-            for g in cls.cudagraph_record:
-                base_module = g[0].base_module
-                has_te_modules = has_te_modules or any(
-                    [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
-                )
-
         # If graphing only transformer layers with self attention, then apply the following
         # transformer layer specific optimizations that reduce memory usage and tensor copies:
         # These eventually will become unneccessary with:
@@ -151,10 +153,6 @@ class _CudagraphGlobalRecord:
         gc.collect()
         torch.cuda.empty_cache()
 
-        _set_capture_start()
-        if has_te_modules:
-            te_set_capture_start()
-
         for idx, g in enumerate(cls.cudagraph_record):
             runner, graph_type = g[0:2]
 
@@ -162,14 +160,17 @@ class _CudagraphGlobalRecord:
                 if graph_type == 'fwd':
                     args, kwargs = g[2:]
 
-                    if not runner.is_first_layer:
+                    if not runner.is_first_layer and prev_fwd_hidden_state_output is not None:
                         kwargs['hidden_states'] = prev_fwd_hidden_state_output
                     runner.create_fwd_graph(args, kwargs, clone_inputs=False)
 
                     # The output of TransformerLayer is: (hidden_states, None)
                     # The output of MambaLayer is: (hidden_states,)
                     # make sure to get the hidden states tensor from the tuple
-                    prev_fwd_hidden_state_output = runner.fwd_graph_outputs[0]
+                    if is_moe_layer_with_early_return(runner.base_module):
+                        prev_fwd_hidden_state_output = None
+                    else:
+                        prev_fwd_hidden_state_output = runner.fwd_graph_outputs[0]
 
                 else:
                     # In vision models, encoder and decoder transformers have different
@@ -177,14 +178,13 @@ class _CudagraphGlobalRecord:
                     # are noncontiguous. Reset prev_bwd_hidden_state_inputgrad to None at
                     # each last layer to avoid shape mismatch when transitioning between
                     # encoder and decoder.
-                    if runner.is_last_layer:
+                    if runner.is_last_layer or is_moe_layer_with_early_return(runner.base_module):
                         prev_bwd_hidden_state_inputgrad = None
 
                     runner.create_bwd_graph(prev_bwd_hidden_state_inputgrad)
 
                     # The first input grad TransformerLayer is for 'hidden_states'
-                    if not runner.is_last_layer:
-                        prev_bwd_hidden_state_inputgrad = runner.static_grad_inputs[0]
+                    prev_bwd_hidden_state_inputgrad = runner.static_grad_inputs[0]
             else:
                 runner, graph_type = g[0:2]
                 if graph_type == 'fwd':
@@ -200,9 +200,7 @@ class _CudagraphGlobalRecord:
         cls.cudagraph_created = True
         cls.cudagraph_record = []
 
-        _set_capture_end()
-        if has_te_modules:
-            te_set_capture_end()
+        torch.cuda.set_stream(torch.cuda.default_stream())
 
 
 def create_cudagraphs():
@@ -282,22 +280,24 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         ctx.runner = runner
         if runner.fp8_enabled:
-            for m in runner.base_module.modules():
-                if isinstance(m, TransformerEngineBaseModule):
-                    m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
-                    m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
+            if isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
+                for m in runner.base_module.modules():
+                    if isinstance(m, TransformerEngineBaseModule):
+                        m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
+                        m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
 
-                    if is_te_min_version("1.13.0"):
-                        FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(m.fp8_meta)
-                    else:
-                        FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                            m.fp8_meta, fp8_weights=m._get_fp8_params()
-                        )
+                        if is_te_min_version("1.13.0"):
+                            FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(m.fp8_meta)
+                        else:
+                            FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
+                                m.fp8_meta, fp8_weights=m._get_fp8_params()
+                            )
 
-            is_first_fp8_module = FP8GlobalStateManager.is_first_fp8_module()
-            if is_first_fp8_module:
+            # Note that FP8GlobalStateManager.is_first_fp8_module() does not work as each layer may be in its 
+            # own fp8 context, when the fp8 recipe != delayed_scaling
+            if runner.is_first_layer and (runner.fp8_param_cache_updated != is_first_microbatch):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
-            ctx.is_first_fp8_module = is_first_fp8_module
+                runner.fp8_param_cache_updated = is_first_microbatch
 
         runner.fwd_graph.replay()
 
@@ -307,6 +307,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
             out = tuple(o.clone().detach() for o in runner.fwd_graph_output_surface)
         else:
             out = tuple(o.detach() for o in runner.fwd_graph_output_surface)
+
         return out
 
     @staticmethod
@@ -326,6 +327,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         # Copy new data into bwd graph input buffer
         for user_output_grad, cudagraph_output_grad in zip(grads, runner.static_grad_outputs):
+            if cudagraph_output_grad is None:
+                continue
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
@@ -333,7 +336,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
-        if runner.fp8_enabled and ctx.is_first_fp8_module:
+        if runner.fp8_enabled \
+            and isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
 
         # If using gradient_accumulation_fusion, whenever `main_grad` is calculated
@@ -381,22 +385,13 @@ class _CudaGraphRunner(torch.nn.Module):
         self.bwd_graph_recorded = False
         self.cudagraph_created = False
         self.status = _GraphStatus.FWD_READY
+        self.extra_cuda_graph_attrs = None
 
         self.fuse_wgrad_accumulation = False
         self.backward_retain_grad = False
         self.fp8_enabled = False
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 2
-        if isinstance(self.base_module.config, TransformerConfig):
-            self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
-            self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
-            self.fp8_enabled = self.base_module.config.fp8 is not None
-            self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
-            self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
-
-            if self.fp8_enabled:
-                self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
         from megatron.core.ssm.mamba_layer import MambaLayer
         from megatron.core.transformer.transformer_layer import (
@@ -443,6 +438,22 @@ class _CudaGraphRunner(torch.nn.Module):
             else:
                 self.reuse_input_output_buffer = False
 
+        if isinstance(self.base_module.config, TransformerConfig):
+            self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
+            self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
+            self.fp8_enabled = self.base_module.config.fp8 is not None
+            self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
+            self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
+
+            if self.fp8_enabled:
+                self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(True)
+                # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph replay
+                # so that way we only update the value of this flag in FP8GlobalStateManager when it changes, 
+                # which incurs an expensive HtoD sync
+                if self.is_first_layer:
+                    self.fp8_param_cache_updated = None
+
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
 
@@ -487,6 +498,16 @@ class _CudaGraphRunner(torch.nn.Module):
         for _, state in get_all_rng_states().items():
             self.fwd_graph.register_generator_state(state)
 
+        has_te_modules = False
+        if HAVE_TE_GRAPHS:
+            base_module = self.base_module
+            has_te_modules = has_te_modules or any(
+                [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
+            )
+        _set_capture_start()
+        if has_te_modules:
+            te_set_capture_start()
+
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
             with self.get_fp8_context():
@@ -497,12 +518,12 @@ class _CudaGraphRunner(torch.nn.Module):
                 if isinstance(outputs, torch.Tensor):
                     outputs = (outputs,)
                 outputs = self.get_tensors(outputs)
+                outputs = tuple(o for o in outputs if o.requires_grad)
+
                 grad_inputs = torch.autograd.grad(
-                    outputs=tuple(o for o in outputs if o.requires_grad),
-                    inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
-                    grad_outputs=tuple(
-                        torch.zeros_like(o) if o.requires_grad else None for o in outputs
-                    ),
+                    outputs=outputs,
+                    inputs=tuple(i for i in input_tensors if i.requires_grad),
+                    grad_outputs=tuple(torch.zeros_like(o) for o in outputs),
                     only_inputs=True,
                     allow_unused=True,
                 )
@@ -513,11 +534,18 @@ class _CudaGraphRunner(torch.nn.Module):
                 outputs = self.base_module.forward(
                     *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                 )
+                if hasattr(self.base_module, 'cuda_graph_fwd_capture_post_hook'):
+                    self.extra_cuda_graph_attrs = self.base_module.cuda_graph_fwd_capture_post_hook()
+
+        _set_capture_end()
+        if has_te_modules:
+            te_set_capture_end()
 
         # save cudagraph output buffer
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
         self.fwd_graph_outputs = outputs
+
         self.fwd_graph_output_surface = self.get_tensors(outputs)
 
         if self.training and torch.is_grad_enabled():
@@ -538,6 +566,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if self.fp8_enabled:
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
+
 
     def create_bwd_graph(self, static_grad_outputs=None):
         """Create a bwd cudagraph for this runner. Should be called inside
@@ -642,14 +671,14 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
-            if not self.is_first_layer:
+            # if not self.is_first_layer:
                 # transformer layers hidden_states are already saved as the output of the previous
                 # layer's cudagraph so avoid saving again
-                kwargs_copy = dict(kwargs)
-                kwargs_copy['hidden_states'] = None
-                _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs_copy)
-            else:
-                _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs)
+                # kwargs_copy = dict(kwargs)
+                # kwargs_copy['hidden_states'] = None
+            #     _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs_copy)
+            # else:
+            _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs)
 
             self.fwd_graph_recorded = True
 
@@ -686,8 +715,16 @@ class _CudaGraphRunner(torch.nn.Module):
         func_args = inp_tensors + tuple(self.parameters())
 
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
+
         out = list(out)
-        return tuple(out.pop(0) if torch.is_tensor(o) else o for o in self.fwd_graph_outputs)
+        out = tuple(out.pop(0) if torch.is_tensor(o) else o for o in self.fwd_graph_outputs)
+
+
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+        if is_moe_layer_with_early_return(self.base_module):
+            out = self.base_module.cuda_graph_fwd_replay_post_hook(out, self.extra_cuda_graph_attrs)
+
+        return out
 
     def matches_graph_inputs(self, args, kwargs):
         """Check that the passed args, kwargs match with the arg, kwargs
@@ -735,7 +772,7 @@ class _CudaGraphRunner(torch.nn.Module):
         """Replace all tensors inside arg, kwargs with zeroed copies."""
 
         def clone_tensor(ten):
-            cloned = torch.zeros_like(ten)
+            cloned = torch.clone(ten.detach())
             cloned.requires_grad = ten.requires_grad
             return cloned
 
@@ -803,7 +840,7 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = None):
+    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = None, base_module=None):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -864,6 +901,7 @@ class CudaGraphManager(torch.nn.Module):
         # capture, so change to a side stream.
         self.stream = torch.cuda.current_stream()
         torch.cuda.set_stream(torch.cuda.Stream())
+
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -955,6 +993,9 @@ class CudaGraphManager(torch.nn.Module):
 
             runner = self.get_cudagraph_runner(megatron_module)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+
+            self.is_first_microbatch = False
+
         else:
             if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
                 # Inference generation mode

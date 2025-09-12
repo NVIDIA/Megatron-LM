@@ -431,7 +431,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish": 3,
             "no_sync": 4,
         }
-        if config.external_cuda_graph and 'moe_preprocess' in config.cuda_graph_scope:
+        if (config.external_cuda_graph or config.enable_cuda_graph)  and 'moe_preprocess' in config.cuda_graph_scope:
             self.cuda_dtoh_point = "before_ep_alltoall"
         else:
             self.cuda_dtoh_point = "before_permutation_1"
