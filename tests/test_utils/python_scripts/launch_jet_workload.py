@@ -502,9 +502,10 @@ def main(
             if (
                 "StopIteration" in concat_allranks_logs
                 or "after training is done" in concat_allranks_logs
+                or "exiting program at iteration" in concat_allranks_logs
             ):
                 logger.info("Release training finished")
-                sys.exit(0)
+                sys.exit(int(not success))  # invert for exit 0
 
             if parse_failed_job(logs=mainrank_log):
                 n_attempts += 1
