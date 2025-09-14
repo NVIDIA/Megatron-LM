@@ -2179,6 +2179,16 @@ def train(
             continue
 
         args.curr_iteration = iteration
+        
+        # Update tensor saver iteration if tensor saving is enabled
+        if getattr(args, 'save_tensors', False):
+            try:
+                from megatron.core.tensor_saver import get_tensor_saver
+                tensor_saver = get_tensor_saver()
+                tensor_saver.set_iteration(iteration)
+            except Exception as e:
+                print(f"[Training] Warning: Failed to update tensor saver iteration: {e}")
+        
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 

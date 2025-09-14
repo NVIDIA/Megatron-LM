@@ -476,10 +476,6 @@ class TensorSaver:
         if not self.enabled:
             return None
         
-        # 检查是否已经保存了足够的iteration数据
-        if self.iteration_data_count >= self.min_iterations_to_save:
-            return None
-        
         # 检查是否已经达到控制的iteration数量
         if self.current_iteration >= self.control_iter:
             return None
