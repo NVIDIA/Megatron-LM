@@ -98,7 +98,7 @@ echo "    - 指数范围: [-2, 3]"
 # 运行溢出检测分析
 echo ""
 echo "运行溢出检测分析..."
-python script/visualization/overflow_detection_analyzer.py \
+python script/visualization/overflow_detection_analyzer_improved.py \
     --tensor_dir "$TENSOR_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --max_workers "$MAX_WORKERS"
