@@ -16,6 +16,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import warnings
+from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 # 设置matplotlib后端
@@ -134,16 +135,20 @@ class LayerDistributionAnalyzer:
             'linear': {tensor: [] for tensor in self.linear_tensors}
         }
         
+        # 收集所有需要检查的文件
+        all_files = []
         for quant_type in self.quant_types:
             quant_dir = self.tensor_dir / quant_type
-            if not quant_dir.exists():
-                continue
-            
-            for file_path in quant_dir.glob('*.pt'):
-                file_info = self.parse_filename(file_path.name)
-                if not file_info:
-                    continue
-                
+            if quant_dir.exists():
+                all_files.extend(list(quant_dir.glob('*.pt')))
+        
+        # 使用tqdm显示文件扫描进度
+        print(f"Scanning {len(all_files)} tensor files for Layer {layer}, Sample {sample}, {layer_type}...")
+        pbar = tqdm(total=len(all_files), desc="Scanning files", unit="files")
+        
+        for file_path in all_files:
+            file_info = self.parse_filename(file_path.name)
+            if file_info:
                 # 检查是否匹配指定的层、样本和层类型
                 if (file_info['layer'] == layer and 
                     file_info['sample'] == sample and 
@@ -152,6 +157,17 @@ class LayerDistributionAnalyzer:
                     tensor_name = file_info['tensor_name']
                     if tensor_name in found_files[layer_type]:
                         found_files[layer_type][tensor_name].append(file_info)
+            
+            pbar.update(1)
+        
+        pbar.close()
+        
+        # 显示找到的文件统计
+        total_found = sum(len(files) for files in found_files[layer_type].values())
+        print(f"Found {total_found} matching files:")
+        for tensor_type, files in found_files[layer_type].items():
+            if files:
+                print(f"  - {tensor_type}: {len(files)} files")
         
         return found_files
     
@@ -218,6 +234,10 @@ class LayerDistributionAnalyzer:
         # 颜色映射
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
         
+        # 使用tqdm显示绘图进度
+        print("Loading tensor data and generating plots...")
+        pbar = tqdm(total=min(len(tensor_types), 6), desc="Processing tensor types", unit="types")
+        
         plot_idx = 0
         for i, tensor_type in enumerate(tensor_types):
             if plot_idx >= 6:  # 最多6个子图
@@ -235,6 +255,7 @@ class LayerDistributionAnalyzer:
                        transform=ax.transAxes, fontsize=12)
                 ax.set_title(f'{tensor_type.title()}', fontweight='bold')
                 plot_idx += 1
+                pbar.update(1)
                 continue
             
             # 合并所有相同tensor类型的数据
@@ -249,6 +270,7 @@ class LayerDistributionAnalyzer:
                        transform=ax.transAxes, fontsize=12)
                 ax.set_title(f'{tensor_type.title()}', fontweight='bold')
                 plot_idx += 1
+                pbar.update(1)
                 continue
             
             # 合并数据
@@ -259,6 +281,9 @@ class LayerDistributionAnalyzer:
             self.plot_tensor_distribution(combined_data, f'{tensor_type.title()}', ax, color)
             
             plot_idx += 1
+            pbar.update(1)
+        
+        pbar.close()
         
         # 隐藏未使用的子图
         for i in range(plot_idx, 6):
@@ -266,6 +291,7 @@ class LayerDistributionAnalyzer:
             col = i % 3
             axes[row, col].set_visible(False)
         
+        print("Saving plot...")
         plt.tight_layout()
         
         # 保存图片
@@ -288,6 +314,10 @@ class LayerDistributionAnalyzer:
         
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
         
+        # 使用tqdm显示量化对比进度
+        print("Loading data for quantization comparison...")
+        pbar = tqdm(total=len(self.quant_types), desc="Processing quantization types", unit="types")
+        
         for i, quant_type in enumerate(self.quant_types):
             row = i // 2
             col = i % 2
@@ -299,6 +329,7 @@ class LayerDistributionAnalyzer:
                 ax.text(0.5, 0.5, f'No {quant_type} data', ha='center', va='center', 
                        transform=ax.transAxes, fontsize=12)
                 ax.set_title(f'{quant_type.upper()}', fontweight='bold')
+                pbar.update(1)
                 continue
             
             # 查找匹配的文件
@@ -316,6 +347,7 @@ class LayerDistributionAnalyzer:
                 ax.text(0.5, 0.5, f'No {quant_type} {tensor_type} data', ha='center', va='center', 
                        transform=ax.transAxes, fontsize=12)
                 ax.set_title(f'{quant_type.upper()}', fontweight='bold')
+                pbar.update(1)
                 continue
             
             # 加载并合并数据
@@ -329,12 +361,18 @@ class LayerDistributionAnalyzer:
                 ax.text(0.5, 0.5, f'No valid {quant_type} data', ha='center', va='center', 
                        transform=ax.transAxes, fontsize=12)
                 ax.set_title(f'{quant_type.upper()}', fontweight='bold')
+                pbar.update(1)
                 continue
             
             combined_data = np.concatenate([data.flatten() for data in all_data])
             color = colors[i % len(colors)]
             self.plot_tensor_distribution(combined_data, f'{quant_type.upper()}', ax, color)
+            
+            pbar.update(1)
         
+        pbar.close()
+        
+        print("Saving quantization comparison plot...")
         plt.tight_layout()
         
         # 保存图片
@@ -360,6 +398,10 @@ class LayerDistributionAnalyzer:
         
         report_path = self.output_dir / f'statistics_layer_{layer}_sample_{sample}_{layer_type}.txt'
         
+        # 使用tqdm显示统计报告生成进度
+        print("Processing tensor data for statistics...")
+        pbar = tqdm(total=len(tensor_types), desc="Processing tensor types", unit="types")
+        
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
             f.write(f"Layer {layer} Sample {sample} {layer_type.title()} Statistics Report\n")
@@ -372,6 +414,7 @@ class LayerDistributionAnalyzer:
                 tensor_files = found_files[layer_type][tensor_type]
                 if not tensor_files:
                     f.write("No data found\n\n")
+                    pbar.update(1)
                     continue
                 
                 # 收集所有数据
@@ -383,6 +426,7 @@ class LayerDistributionAnalyzer:
                 
                 if not all_data:
                     f.write("No valid data found\n\n")
+                    pbar.update(1)
                     continue
                 
                 # 合并数据
@@ -394,6 +438,7 @@ class LayerDistributionAnalyzer:
                 
                 if len(valid_data) == 0:
                     f.write("No valid data after filtering\n\n")
+                    pbar.update(1)
                     continue
                 
                 # 计算统计信息
@@ -408,6 +453,10 @@ class LayerDistributionAnalyzer:
                 f.write(f"Q75: {np.percentile(valid_data, 75):.6f}\n")
                 f.write(f"Q95: {np.percentile(valid_data, 95):.6f}\n")
                 f.write(f"Q99: {np.percentile(valid_data, 99):.6f}\n\n")
+                
+                pbar.update(1)
+        
+        pbar.close()
         
         print(f"Statistics report saved: {report_path}")
         return report_path
@@ -445,22 +494,38 @@ def main():
     print("=" * 60)
     
     try:
+        # 确定需要执行的任务
+        tasks = ["Layer analysis"]
+        if args.quantization_comparison and args.tensor_type:
+            tasks.append("Quantization comparison")
+        tasks.append("Statistics report")
+        
+        # 使用tqdm显示总体进度
+        print("Starting analysis tasks...")
+        overall_pbar = tqdm(total=len(tasks), desc="Overall progress", unit="tasks")
+        
         # 生成层分析图
         layer_analysis_path = analyzer.plot_layer_analysis(args.layer, args.sample, args.layer_type)
+        overall_pbar.update(1)
         
         # 生成量化对比图（如果指定了tensor类型）
+        quant_comparison_path = None
         if args.quantization_comparison and args.tensor_type:
             quant_comparison_path = analyzer.plot_quantization_comparison(
                 args.layer, args.sample, args.layer_type, args.tensor_type)
+            overall_pbar.update(1)
         
         # 生成统计报告
         stats_report_path = analyzer.generate_statistics_report(args.layer, args.sample, args.layer_type)
+        overall_pbar.update(1)
+        
+        overall_pbar.close()
         
         print("\n" + "=" * 60)
         print("Analysis completed successfully!")
         print("=" * 60)
         print(f"Layer analysis: {layer_analysis_path}")
-        if args.quantization_comparison and args.tensor_type:
+        if quant_comparison_path:
             print(f"Quantization comparison: {quant_comparison_path}")
         print(f"Statistics report: {stats_report_path}")
         print("=" * 60)
