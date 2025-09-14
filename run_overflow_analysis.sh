@@ -1,19 +1,19 @@
 #!/bin/bash
 
 # =============================================================================
-# Multi-threaded Tensor Drawing Script
-# 支持新的数据结构：bf16, mxfp8, mxfp4, hifp8四个量化类型
-# 支持Sample (0,1,2) 和 Layer (1-16) 的多维度比较
-# 使用多线程加速画图过程
+# Overflow Detection Analysis Script
+# 基于量化类型特征值检测tensor溢出情况
+# 支持bf16, mxfp8, mxfp4, hifp8四种量化类型
+# 支持Sample (0,1,2) 和 Layer (1-16) 的多维度分析
 # =============================================================================
 
 # 设置脚本元数据
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="1.0.0"
 START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 
 echo "=================================================================================="
-echo "Multi-threaded Tensor Drawing Script"
+echo "Overflow Detection Analysis Script"
 echo "Script: $SCRIPT_NAME"
 echo "Version: $SCRIPT_VERSION"
 echo "Start Time: $START_TIME"
@@ -40,15 +40,25 @@ fi
 QUANT_TYPES=("bf16" "mxfp8" "mxfp4" "hifp8")
 echo ""
 echo "检查量化类型目录:"
+total_files=0
 for quant_type in "${QUANT_TYPES[@]}"; do
     quant_dir="$TENSOR_DIR/$quant_type"
     if [ -d "$quant_dir" ]; then
         file_count=$(find "$quant_dir" -name "*.pt" 2>/dev/null | wc -l)
         echo "  ✅ $quant_type: $file_count 个文件"
+        total_files=$((total_files + file_count))
     else
         echo "  ❌ $quant_type: 目录不存在"
     fi
 done
+
+echo ""
+echo "总文件数: $total_files"
+
+if [ $total_files -eq 0 ]; then
+    echo "错误: 没有找到任何tensor文件"
+    exit 1
+fi
 
 # 检查Python环境
 if ! command -v python &> /dev/null; then
@@ -65,27 +75,46 @@ if [ $? -ne 0 ]; then
     pip install matplotlib numpy pandas seaborn scipy
 fi
 
-# 运行多线程可视化
+# 显示量化类型限制值信息
 echo ""
-echo "运行多线程可视化..."
-python script/visualization/multi_threaded_visualizer.py \
+echo "量化类型限制值信息:"
+echo "  bf16:"
+echo "    - 最大正常值: 65504.0"
+echo "    - 最小正常值: 6.103515625e-05"
+echo "    - 指数范围: [-14, 15]"
+echo "  hifp8:"
+echo "    - 最大正常值: 32768.0"
+echo "    - 最小正常值: 3.0517578125e-05"
+echo "    - 指数范围: [-15, 15]"
+echo "  mxfp8 (FP8-E4M3):"
+echo "    - 最大正常值: 448.0"
+echo "    - 最小正常值: 0.015625"
+echo "    - 指数范围: [-6, 8]"
+echo "  mxfp4 (FP8-E5M2):"
+echo "    - 最大正常值: 57344.0"
+echo "    - 最小正常值: 6.103515625e-05"
+echo "    - 指数范围: [-14, 15]"
+
+# 运行溢出检测分析
+echo ""
+echo "运行溢出检测分析..."
+python script/visualization/overflow_detection_analyzer.py \
     --tensor_dir "$TENSOR_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --max_workers "$MAX_WORKERS"
 
 if [ $? -eq 0 ]; then
     echo ""
-    echo "✅ 多线程可视化完成!"
+    echo "✅ 溢出检测分析完成!"
     
     # 显示生成的文件
     echo ""
-    echo "生成的图表文件:"
+    echo "生成的分析文件:"
     find "$OUTPUT_DIR" -name "*.png" | while read file; do
         echo "  - $(basename "$file")"
     done
     
     echo ""
-    echo "生成的报告文件:"
     find "$OUTPUT_DIR" -name "*.txt" | while read file; do
         echo "  - $(basename "$file")"
     done
@@ -93,41 +122,32 @@ if [ $? -eq 0 ]; then
     # 显示主要输出
     echo ""
     echo "主要输出文件:"
-    if [ -f "$OUTPUT_DIR/quantization_analysis/quantization_comparison.png" ]; then
-        echo "  🎯 量化类型比较: $OUTPUT_DIR/quantization_analysis/quantization_comparison.png"
+    if [ -f "$OUTPUT_DIR/overflow_analysis/overflow_analysis_report.png" ]; then
+        echo "  🎯 溢出分析图: $OUTPUT_DIR/overflow_analysis/overflow_analysis_report.png"
     fi
-    if [ -f "$OUTPUT_DIR/sample_analysis/sample_analysis.png" ]; then
-        echo "  📊 样本分析: $OUTPUT_DIR/sample_analysis/sample_analysis.png"
+    if [ -f "$OUTPUT_DIR/detailed_reports/overflow_detection_report.txt" ]; then
+        echo "  📋 详细报告: $OUTPUT_DIR/detailed_reports/overflow_detection_report.txt"
     fi
-    if [ -f "$OUTPUT_DIR/layer_analysis/layer_analysis.png" ]; then
-        echo "  🏗️ 层分析: $OUTPUT_DIR/layer_analysis/layer_analysis.png"
-    fi
-    if [ -f "$OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png" ]; then
-        echo "  🔍 综合比较: $OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png"
-    fi
-    if [ -f "$OUTPUT_DIR/statistics/detailed_statistics_report.txt" ]; then
-        echo "  📋 统计报告: $OUTPUT_DIR/statistics/detailed_statistics_report.txt"
+    
+    # 显示溢出统计摘要
+    echo ""
+    echo "溢出统计摘要:"
+    if [ -f "$OUTPUT_DIR/detailed_reports/overflow_detection_report.txt" ]; then
+        echo "  - 查看详细报告了解各量化类型的溢出情况"
+        echo "  - 上溢出: 数值超过最大正常值"
+        echo "  - 下溢出: 数值小于最小正常值"
+        echo "  - 溢出率: 溢出数值占总数值的百分比"
     fi
     
     END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     echo ""
     echo "=================================================================================="
-    echo "可视化完成"
+    echo "溢出检测分析完成"
     echo "开始时间: $START_TIME"
     echo "结束时间: $END_TIME"
     echo "=================================================================================="
 else
     echo ""
-    echo "❌ 多线程可视化失败"
-    echo "尝试运行基础可视化..."
-    
-    # 回退到基础可视化
-    bash script/visualization/one_click_visualize.sh "$TENSOR_DIR" "$OUTPUT_DIR"
-    
-    if [ $? -eq 0 ]; then
-        echo "✅ 基础可视化完成"
-    else
-        echo "❌ 基础可视化也失败了"
-        exit 1
-    fi
+    echo "❌ 溢出检测分析失败"
+    exit 1
 fi
