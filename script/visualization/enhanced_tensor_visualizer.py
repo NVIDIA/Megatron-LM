@@ -20,7 +20,7 @@ from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-# 设置matplotlib参数
+# Set matplotlib parameters
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.titlesize'] = 12
 plt.rcParams['axes.labelsize'] = 10
@@ -29,7 +29,7 @@ plt.rcParams['ytick.labelsize'] = 8
 plt.rcParams['legend.fontsize'] = 9
 plt.rcParams['figure.titlesize'] = 14
 
-# 设置seaborn样式
+# Set seaborn style
 sns.set_style("whitegrid")
 sns.set_palette("husl")
 
@@ -184,7 +184,7 @@ class EnhancedTensorVisualizer:
             ax2.set_ylabel('Value')
             ax2.grid(True, alpha=0.3)
             
-            # 统计信息对比
+            # Statistical information comparison
             ax3 = axes[1, 0]
             stats_data = []
             for quant_type, data in data_by_quant.items():
@@ -201,26 +201,26 @@ class EnhancedTensorVisualizer:
             x = np.arange(len(stats_df))
             width = 0.2
             
-            ax3.bar(x - width, stats_df['mean'], width, label='均值', alpha=0.8)
-            ax3.bar(x, stats_df['std'], width, label='标准差', alpha=0.8)
-            ax3.bar(x + width, stats_df['max'] - stats_df['min'], width, label='范围', alpha=0.8)
+            ax3.bar(x - width, stats_df['mean'], width, label='Mean', alpha=0.8)
+            ax3.bar(x, stats_df['std'], width, label='Std Dev', alpha=0.8)
+            ax3.bar(x + width, stats_df['max'] - stats_df['min'], width, label='Range', alpha=0.8)
             
-            ax3.set_xlabel('量化类型')
-            ax3.set_ylabel('数值')
-            ax3.set_title('统计信息对比')
+            ax3.set_xlabel('Quantization Type')
+            ax3.set_ylabel('Value')
+            ax3.set_title('Statistical Information Comparison')
             ax3.set_xticks(x)
             ax3.set_xticklabels(stats_df['quant_type'])
             ax3.legend()
             ax3.grid(True, alpha=0.3)
             
-            # 相关性分析
+            # Correlation analysis
             ax4 = axes[1, 1]
             if len(data_by_quant) == 2:
                 quant_types = list(data_by_quant.keys())
                 data1 = data_by_quant[quant_types[0]]
                 data2 = data_by_quant[quant_types[1]]
                 
-                # 采样以减少计算量
+                # Sample to reduce computation
                 if len(data1) > 10000:
                     indices = np.random.choice(len(data1), 10000, replace=False)
                     data1 = data1[indices]
@@ -229,15 +229,15 @@ class EnhancedTensorVisualizer:
                 ax4.scatter(data1, data2, alpha=0.5, s=1)
                 ax4.set_xlabel(quant_types[0])
                 ax4.set_ylabel(quant_types[1])
-                ax4.set_title('相关性分析')
+                ax4.set_title('Correlation Analysis')
                 
-                # 计算相关系数
+                # Calculate correlation coefficient
                 corr = np.corrcoef(data1, data2)[0, 1]
-                ax4.text(0.05, 0.95, f'相关系数: {corr:.4f}', 
+                ax4.text(0.05, 0.95, f'Correlation: {corr:.4f}', 
                         transform=ax4.transAxes, fontsize=10,
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
             else:
-                ax4.text(0.5, 0.5, '需要2个量化类型\n进行相关性分析', 
+                ax4.text(0.5, 0.5, 'Need 2 quantization types\nfor correlation analysis', 
                         ha='center', va='center', transform=ax4.transAxes,
                         fontsize=12, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
                 ax4.set_xlim(0, 1)
@@ -260,21 +260,21 @@ class EnhancedTensorVisualizer:
             print("No attention layer tensors found, skipping attention analysis")
             return
         
-        # 按tensor_name分组
+        # Group by tensor_name
         attention_groups = defaultdict(list)
         for tensor_info in attention_tensors:
             tensor_name = tensor_info['metadata']['tensor_name']
             attention_groups[tensor_name].append(tensor_info)
         
-        # 为每个attention tensor创建分析图
+        # Create analysis chart for each attention tensor
         for tensor_name, group in attention_groups.items():
-            if len(group) < 2:  # 需要多个样本进行分析
+            if len(group) < 2:  # Need multiple samples for analysis
                 continue
                 
             fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            fig.suptitle(f'Attention {tensor_name} 分析', fontsize=16, fontweight='bold')
+            fig.suptitle(f'Attention {tensor_name} Analysis', fontsize=16, fontweight='bold')
             
-            # 收集数据
+            # Collect data
             all_data = []
             quant_types = []
             for tensor_info in group:
@@ -282,17 +282,17 @@ class EnhancedTensorVisualizer:
                 all_data.append(data)
                 quant_types.append(tensor_info['metadata']['quant_type'])
             
-            # 分布分析
+            # Distribution analysis
             ax1 = axes[0, 0]
             for i, (data, quant_type) in enumerate(zip(all_data, quant_types)):
                 ax1.hist(data, bins=50, alpha=0.6, label=quant_type, density=True)
-            ax1.set_title(f'{tensor_name} 数值分布')
-            ax1.set_xlabel('数值')
-            ax1.set_ylabel('密度')
+            ax1.set_title(f'{tensor_name} Value Distribution')
+            ax1.set_xlabel('Value')
+            ax1.set_ylabel('Density')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             
-            # 时间序列分析（如果有多个样本）
+            # Time series analysis (if multiple samples)
             ax2 = axes[0, 1]
             if len(all_data) > 1:
                 means = [np.mean(data) for data in all_data]
@@ -300,47 +300,47 @@ class EnhancedTensorVisualizer:
                 
                 x = range(len(means))
                 ax2.errorbar(x, means, yerr=stds, marker='o', capsize=5, capthick=2)
-                ax2.set_title(f'{tensor_name} 统计信息变化')
-                ax2.set_xlabel('样本索引')
-                ax2.set_ylabel('均值 ± 标准差')
+                ax2.set_title(f'{tensor_name} Statistical Information Changes')
+                ax2.set_xlabel('Sample Index')
+                ax2.set_ylabel('Mean ± Std Dev')
                 ax2.grid(True, alpha=0.3)
             else:
-                ax2.text(0.5, 0.5, '需要多个样本\n进行时间序列分析', 
+                ax2.text(0.5, 0.5, 'Need multiple samples\nfor time series analysis', 
                         ha='center', va='center', transform=ax2.transAxes,
                         fontsize=12, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
                 ax2.set_xlim(0, 1)
                 ax2.set_ylim(0, 1)
             
-            # 热力图（如果是2D tensor）
+            # Heatmap (if 2D tensor)
             ax3 = axes[1, 0]
             if len(group) > 0:
                 sample_tensor = group[0]['tensor'].float().numpy()
                 if len(sample_tensor.shape) == 2:
                     im = ax3.imshow(sample_tensor, cmap='viridis', aspect='auto')
-                    ax3.set_title(f'{tensor_name} 热力图 (样本1)')
-                    ax3.set_xlabel('列')
-                    ax3.set_ylabel('行')
+                    ax3.set_title(f'{tensor_name} Heatmap (Sample 1)')
+                    ax3.set_xlabel('Column')
+                    ax3.set_ylabel('Row')
                     plt.colorbar(im, ax=ax3)
                 else:
-                    # 如果是高维tensor，取平均值
+                    # If high-dimensional tensor, take mean
                     if len(sample_tensor.shape) > 2:
                         sample_tensor = np.mean(sample_tensor, axis=tuple(range(2, len(sample_tensor.shape))))
                     im = ax3.imshow(sample_tensor, cmap='viridis', aspect='auto')
-                    ax3.set_title(f'{tensor_name} 热力图 (平均)')
-                    ax3.set_xlabel('列')
-                    ax3.set_ylabel('行')
+                    ax3.set_title(f'{tensor_name} Heatmap (Average)')
+                    ax3.set_xlabel('Column')
+                    ax3.set_ylabel('Row')
                     plt.colorbar(im, ax=ax3)
             
-            # 统计信息
+            # Statistical information
             ax4 = axes[1, 1]
-            stats_text = f"{tensor_name} 统计信息:\n\n"
+            stats_text = f"{tensor_name} Statistical Information:\n\n"
             for i, (tensor_info, quant_type) in enumerate(zip(group, quant_types)):
                 stats = tensor_info['tensor_info']
-                stats_text += f"样本 {i+1} ({quant_type}):\n"
-                stats_text += f"  形状: {stats['shape']}\n"
-                stats_text += f"  范围: [{stats['min']:.4f}, {stats['max']:.4f}]\n"
-                stats_text += f"  均值: {stats['mean']:.4f}\n"
-                stats_text += f"  标准差: {stats['std']:.4f}\n\n"
+                stats_text += f"Sample {i+1} ({quant_type}):\n"
+                stats_text += f"  Shape: {stats['shape']}\n"
+                stats_text += f"  Range: [{stats['min']:.4f}, {stats['max']:.4f}]\n"
+                stats_text += f"  Mean: {stats['mean']:.4f}\n"
+                stats_text += f"  Std Dev: {stats['std']:.4f}\n\n"
             
             ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes,
                     fontsize=9, verticalalignment='top',
@@ -351,25 +351,25 @@ class EnhancedTensorVisualizer:
             
             plt.tight_layout()
             
-            # 保存图片
+            # Save image
             output_path = self.subdirs['attention_analysis'] / f'{tensor_name}_analysis.png'
             plt.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close()
             
-            print(f"已保存attention分析图: {output_path}")
+            print(f"Attention analysis chart saved: {output_path}")
     
     def plot_layer_comparison(self, tensors: List[Dict]):
-        """绘制层类型对比图"""
+        """Plot layer type comparison chart"""
         layer_groups = self.group_tensors_by_layer_type(tensors)
         
         if len(layer_groups) < 2:
-            print("层类型数量不足，跳过层对比图")
+            print("Insufficient layer types, skipping layer comparison chart")
             return
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('层类型对比分析', fontsize=16, fontweight='bold')
+        fig.suptitle('Layer Type Comparison Analysis', fontsize=16, fontweight='bold')
         
-        # 收集数据
+        # Collect data
         layer_stats = {}
         for layer_type, group in layer_groups.items():
             all_values = []
@@ -378,17 +378,17 @@ class EnhancedTensorVisualizer:
                 all_values.extend(values)
             layer_stats[layer_type] = all_values
         
-        # 分布对比
+        # Distribution comparison
         ax1 = axes[0, 0]
         for layer_type, values in layer_stats.items():
             ax1.hist(values, bins=50, alpha=0.6, label=layer_type, density=True)
-        ax1.set_title('层类型数值分布对比')
-        ax1.set_xlabel('数值')
-        ax1.set_ylabel('密度')
+        ax1.set_title('Layer Type Value Distribution Comparison')
+        ax1.set_xlabel('Value')
+        ax1.set_ylabel('Density')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 统计信息对比
+        # Statistical information comparison
         ax2 = axes[0, 1]
         stats_data = []
         for layer_type, values in layer_stats.items():
@@ -405,19 +405,19 @@ class EnhancedTensorVisualizer:
         x = np.arange(len(stats_df))
         width = 0.2
         
-        ax2.bar(x - width, stats_df['mean'], width, label='均值', alpha=0.8)
-        ax2.bar(x, stats_df['std'], width, label='标准差', alpha=0.8)
-        ax2.bar(x + width, stats_df['max'] - stats_df['min'], width, label='范围', alpha=0.8)
+        ax2.bar(x - width, stats_df['mean'], width, label='Mean', alpha=0.8)
+        ax2.bar(x, stats_df['std'], width, label='Std Dev', alpha=0.8)
+        ax2.bar(x + width, stats_df['max'] - stats_df['min'], width, label='Range', alpha=0.8)
         
-        ax2.set_xlabel('层类型')
-        ax2.set_ylabel('数值')
-        ax2.set_title('层类型统计信息对比')
+        ax2.set_xlabel('Layer Type')
+        ax2.set_ylabel('Value')
+        ax2.set_title('Layer Type Statistical Information Comparison')
         ax2.set_xticks(x)
         ax2.set_xticklabels(stats_df['layer_type'])
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
-        # 箱线图对比
+        # Box plot comparison
         ax3 = axes[1, 0]
         box_data = [layer_stats[lt] for lt in layer_stats.keys()]
         box_labels = list(layer_stats.keys())
@@ -426,38 +426,38 @@ class EnhancedTensorVisualizer:
         for patch, color in zip(bp['boxes'], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
-        ax3.set_title('层类型数值分布箱线图对比')
-        ax3.set_ylabel('数值')
+        ax3.set_title('Layer Type Value Distribution Box Plot Comparison')
+        ax3.set_ylabel('Value')
         ax3.grid(True, alpha=0.3)
         
-        # 数量统计
+        # Count statistics
         ax4 = axes[1, 1]
         counts = [len(layer_stats[lt]) for lt in layer_stats.keys()]
         bars = ax4.bar(layer_stats.keys(), counts, alpha=0.8, color=colors)
-        ax4.set_title('各层类型tensor数量')
-        ax4.set_xlabel('层类型')
-        ax4.set_ylabel('tensor数量')
+        ax4.set_title('Tensor Count by Layer Type')
+        ax4.set_xlabel('Layer Type')
+        ax4.set_ylabel('Tensor Count')
         ax4.grid(True, alpha=0.3)
         
-        # 添加数值标签
+        # Add value labels
         for bar, count in zip(bars, counts):
             ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
                     str(count), ha='center', va='bottom')
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['layer_analysis'] / 'layer_comparison.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"已保存层对比图: {output_path}")
+        print(f"Layer comparison chart saved: {output_path}")
     
     def plot_overflow_analysis(self, tensors: List[Dict]):
-        """绘制溢出分析图"""
-        print("[EnhancedTensorVisualizer] 生成溢出分析图...")
+        """Plot overflow analysis chart"""
+        print("[EnhancedTensorVisualizer] Generating overflow analysis chart...")
         
-        # 收集溢出信息
+        # Collect overflow information
         overflow_data = []
         for tensor_info in tensors:
             if 'overflow_info' in tensor_info['tensor_info']:
@@ -477,14 +477,14 @@ class EnhancedTensorVisualizer:
                 })
         
         if not overflow_data:
-            print("没有找到溢出信息，跳过溢出分析")
+            print("No overflow information found, skipping overflow analysis")
             return
         
         df = pd.DataFrame(overflow_data)
         
-        # 创建溢出分析图
+        # Create overflow analysis chart
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('Tensor溢出分析', fontsize=16, fontweight='bold')
+        fig.suptitle('Tensor Overflow Analysis', fontsize=16, fontweight='bold')
         
         # 1. 按量化类型分组的溢出比例
         ax1 = axes[0, 0]
@@ -549,7 +549,7 @@ class EnhancedTensorVisualizer:
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['overflow_analysis'] / 'overflow_analysis.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -670,7 +670,7 @@ class EnhancedTensorVisualizer:
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['fp8_analysis'] / 'fp8_distribution_analysis.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -771,7 +771,7 @@ class EnhancedTensorVisualizer:
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['bf16_analysis'] / 'bf16_analysis.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -886,7 +886,7 @@ class EnhancedTensorVisualizer:
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['backward_analysis'] / 'backward_analysis.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -1027,7 +1027,7 @@ class EnhancedTensorVisualizer:
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['rank_analysis'] / 'rank_analysis.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -1102,7 +1102,7 @@ class EnhancedTensorVisualizer:
         
         plt.tight_layout()
         
-        # 保存图片
+        # Save image
         output_path = self.subdirs['statistics'] / 'summary_report.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
