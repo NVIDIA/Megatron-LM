@@ -1744,6 +1744,8 @@ def _add_logging_args(parser):
                        help='Enable tensor saving for debugging and analysis.')
     group.add_argument('--tensor-save-dir', type=str, default='./enhanced_tensor_logs',
                        help='Directory to save tensor logs (default: ./enhanced_tensor_logs)')
+    group.add_argument('--control-iter', type=int, default=1,
+                       help='Number of iterations to collect tensors before stopping (default: 1)')
     return parser
 
 

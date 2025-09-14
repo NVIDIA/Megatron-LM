@@ -16,6 +16,31 @@ TOKENIZER_ARG=${3:-"model/llama3.2-1b"} # Path to tokenizer model, or "MOCK"
 # DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
 # DATA_ARG=${4:-"dataset/wikipedia_processed/wikipedia_processed_text_document"}     # Data prefix, or "MOCK"
 DATA_ARG=${4:-"dataset/wikitext_processed/wikitext_processed_text_document"}     # Data prefix, or "MOCK"
+DTYPE=${5:-"fp8"}
+
+# Parse additional arguments
+EXTRA_ARGS=()
+shift 5  # Remove the first 5 positional arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --control-iter)
+            EXTRA_ARGS+=("--control-iter" "$2")
+            shift 2
+            ;;
+        --save-tensors)
+            EXTRA_ARGS+=("--save-tensors")
+            shift
+            ;;
+        --tensor-save-dir)
+            EXTRA_ARGS+=("--tensor-save-dir" "$2")
+            shift 2
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
 
 
 # Create directories if they don't exist
@@ -196,6 +221,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} \
     ${DTYPE_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_ARGS_LIST[@]} \
-    ${EVAL_AND_LOGGING_ARGS[@]}
+    ${EVAL_AND_LOGGING_ARGS[@]} \
+    ${EXTRA_ARGS[@]}
 
 set +x

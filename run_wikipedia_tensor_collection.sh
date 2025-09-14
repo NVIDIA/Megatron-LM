@@ -37,6 +37,29 @@ QUANT_TYPES=("bf16" "mxfp8" "mxfp4" "hifp8")
 # 训练步数（用于快速收集tensor，不需要完整训练）
 TRAINING_STEPS=10
 
+# 控制iteration数量（默认收集1个iteration后停止）
+CONTROL_ITER=1
+
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --control-iter)
+            CONTROL_ITER="$2"
+            shift 2
+            ;;
+        --help)
+            echo "Usage: $0 [--control-iter N]"
+            echo "  --control-iter N: 控制收集的iteration数量，达到后停止收集 (默认: 1)"
+            exit 0
+            ;;
+        *)
+            echo "未知参数: $1"
+            echo "使用 --help 查看帮助信息"
+            exit 1
+            ;;
+    esac
+done
+
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 基础配置:"
 echo "  - 检查点路径: $BASE_CHECKPOINT_PATH"
 echo "  - TensorBoard路径: $BASE_TENSORBOARD_PATH"
@@ -45,6 +68,7 @@ echo "  - 分词器路径: $TOKENIZER_PATH"
 echo "  - 数据路径: $DATA_PATH"
 echo "  - 数据类型: $DTYPE"
 echo "  - 训练步数: $TRAINING_STEPS"
+echo "  - 控制iteration数量: $CONTROL_ITER"
 echo "  - 量化类型: ${QUANT_TYPES[*]}"
 
 # =============================================================================
@@ -113,6 +137,7 @@ run_training_for_tensor_collection() {
     export TENSOR_SAVER_ITERATION=0
     export CURRENT_SAMPLE_IDX=0
     export LOCAL_RANK=0  # 设置默认rank
+    export CONTROL_ITER=$CONTROL_ITER  # 设置控制iteration数量
     
     # 创建初始化脚本
     cat > "${tensor_path}/init_tensor_collection.py" << 'EOF'
@@ -160,15 +185,19 @@ EOF
         "$TOKENIZER_PATH" \
         "$DATA_PATH" \
         "$DTYPE" \
+        --control-iter "$CONTROL_ITER" \
+        --save-tensors \
+        --tensor-save-dir "$tensor_path" \
         2>&1 | tee "${tensorboard_path}/training_${quant_type}_$(date +'%y-%m-%d_%H-%M-%S').log" &
     
     # 获取训练进程ID
     TRAINING_PID=$!
     
-    # 等待训练开始并收集至少1个iteration的数据
+    # 等待训练开始并收集指定数量的iteration数据
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 等待训练开始并收集tensor..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 将收集 $CONTROL_ITER 个iteration的数据"
     
-    # 监控tensor文件生成，确保至少收集1个iteration的数据
+    # 监控tensor文件生成，确保收集到指定数量的iteration数据
     iteration_collected=false
     max_wait_time=300  # 最大等待5分钟
     wait_time=0
@@ -181,10 +210,11 @@ EOF
         tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $tensor_count 个tensor文件 (等待时间: ${wait_time}s)"
         
-        # 检查是否至少收集了1个iteration的数据（假设每个iteration至少生成10个tensor文件）
-        if [ $tensor_count -ge 10 ]; then
+        # 检查是否收集了足够的iteration数据（假设每个iteration至少生成10个tensor文件）
+        required_tensors=$((CONTROL_ITER * 10))
+        if [ $tensor_count -ge $required_tensors ]; then
             iteration_collected=true
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 已收集到至少1个iteration的数据"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 已收集到 $CONTROL_ITER 个iteration的数据"
         fi
     done
     

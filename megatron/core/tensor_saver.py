@@ -278,19 +278,21 @@ def initialize_tensor_collection(rank: Optional[int] = None,
 class TensorSaver:
     """Tensor保存器，用于保存量化前后的tensor数据"""
     
-    def __init__(self, save_dir: str = "./enhanced_tensor_logs", enabled: bool = True):
+    def __init__(self, save_dir: str = "./enhanced_tensor_logs", enabled: bool = True, control_iter: int = 1):
         """
         初始化Tensor保存器
         
         Args:
             save_dir: 保存目录
             enabled: 是否启用保存功能
+            control_iter: 控制收集的iteration数量，达到后停止收集
         """
         self.save_dir = Path(save_dir)
         self.enabled = enabled
         self.tensor_counter = 0
         self.current_iteration = 0
         self.iteration_data_count = 0
+        self.control_iter = control_iter  # 控制收集的iteration数量
         self.min_iterations_to_save = 1  # 至少保存1个iteration的数据
         
         if self.enabled:
@@ -476,6 +478,10 @@ class TensorSaver:
         
         # 检查是否已经保存了足够的iteration数据
         if self.iteration_data_count >= self.min_iterations_to_save:
+            return None
+        
+        # 检查是否已经达到控制的iteration数量
+        if self.current_iteration >= self.control_iter:
             return None
         
         # 自动获取rank和sample信息（如果未提供）
@@ -673,11 +679,13 @@ def get_tensor_saver() -> TensorSaver:
             args = get_args()
             save_dir = getattr(args, 'tensor_save_dir', None) or os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
             enabled = getattr(args, 'save_tensors', False) or os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
+            control_iter = getattr(args, 'control_iter', 1)
         except:
             # 如果无法获取args，则从环境变量获取配置
             save_dir = os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
             enabled = os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
-        _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled)
+            control_iter = int(os.environ.get("CONTROL_ITER", "1"))
+        _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled, control_iter=control_iter)
         
         # 从环境变量设置iteration
         iteration = os.environ.get("TENSOR_SAVER_ITERATION")
