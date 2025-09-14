@@ -199,12 +199,12 @@ EOF
     
     # 监控tensor文件生成，确保收集到指定数量的iteration数据
     iteration_collected=false
-    max_wait_time=300  # 最大等待5分钟
+    max_wait_time=600  # 最大等待10分钟（增加等待时间）
     wait_time=0
     
     while [ $wait_time -lt $max_wait_time ] && [ "$iteration_collected" = false ]; do
-        sleep 10
-        wait_time=$((wait_time + 10))
+        sleep 15  # 增加检查间隔
+        wait_time=$((wait_time + 15))
         
         # 检查是否有tensor文件生成
         tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
@@ -214,6 +214,15 @@ EOF
         # 通过文件名中的iter{iteration:03d}模式来统计不同的iteration
         collected_iterations=$(find "$tensor_path" -name "*.pt" 2>/dev/null | grep -o "iter[0-9][0-9][0-9]" | sort -u | wc -l)
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $collected_iterations 个不同的iteration"
+        
+        # 添加更详细的tensor类型统计
+        attention_count=$(find "$tensor_path" -name "*attention*" 2>/dev/null | wc -l)
+        linear_count=$(find "$tensor_path" -name "*linear*" 2>/dev/null | wc -l)
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 详细统计: attention=$attention_count, linear=$linear_count"
+        
+        # 检查sample分布
+        sample_distribution=$(find "$tensor_path" -name "*.pt" 2>/dev/null | grep -o "sample[0-9][0-9][0-9]" | sort -u | wc -l)
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 不同sample数量: $sample_distribution"
         
         if [ $collected_iterations -ge $CONTROL_ITER ]; then
             iteration_collected=true
@@ -337,18 +346,3 @@ for quant_type in "${QUANT_TYPES[@]}"; do
     fi
 done
 
-echo ""
-echo "下一步操作建议:"
-echo "  1. 使用可视化脚本分析tensor:"
-echo "     python script/visualization/quick_visualize.py --tensor_dir $BASE_TENSOR_PATH"
-echo "  2. 使用一键可视化脚本:"
-echo "     bash script/visualization/one_click_visualize.sh $BASE_TENSOR_PATH"
-echo "  3. 手动分析特定量化类型的tensor:"
-echo "     ls -la $BASE_TENSOR_PATH/mxfp8/"
-echo "     ls -la $BASE_TENSOR_PATH/mxfp4/"
-echo "     ls -la $BASE_TENSOR_PATH/hifp8/"
-
-echo ""
-echo "=================================================================================="
-echo "脚本执行完成"
-echo "=================================================================================="

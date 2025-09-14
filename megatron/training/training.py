@@ -1237,6 +1237,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
 
+        # Update sample index for tensor saving if enabled
+        if getattr(args, 'save_tensors', False):
+            try:
+                from megatron.core.tensor_saver import get_tensor_collection_state
+                state = get_tensor_collection_state()
+                # Reset sample index for each training step
+                state.set_sample_idx(0)
+            except Exception as e:
+                print(f"[TrainStep] Warning: Failed to reset sample index: {e}")
+
         # Forward pass.
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
@@ -2259,7 +2269,7 @@ def train(
         
         # Check if we've reached the control_iter limit and exit if needed
         control_iter = getattr(args, 'control_iter', None)
-        if control_iter is not None and iteration >= control_iter:
+        if control_iter is not None and iteration > control_iter:
             print_rank_0(f"[Training] Reached control_iter limit ({control_iter}), exiting training...")
             # Exit the training loop early
             break

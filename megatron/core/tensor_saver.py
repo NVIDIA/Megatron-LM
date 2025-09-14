@@ -482,7 +482,7 @@ class TensorSaver:
             return None
         
         # 检查是否已经达到控制的iteration数量
-        if self.current_iteration >= self.control_iter:
+        if self.current_iteration > self.control_iter:
             return None
         
         # 自动获取rank和sample信息（如果未提供）
