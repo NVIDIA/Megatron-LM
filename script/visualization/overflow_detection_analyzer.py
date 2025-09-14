@@ -517,7 +517,7 @@ class OverflowDetectionAnalyzer:
                     quant_sample_results = [r for r in results 
                                           if r['quant_type'] == quant_type and r.get('sample') == sample]
                     if quant_sample_results:
-                        total_overflow = sum(r['overflow_upper_percentage'] for r in quant_sample_results)
+                        total_overflow = sum(r.get('overflow_percentage', 0) for r in quant_sample_results)
                         overflow_matrix[i, j] = total_overflow / len(quant_sample_results)
         
         im = ax5.imshow(overflow_matrix, cmap='Reds', aspect='auto')
