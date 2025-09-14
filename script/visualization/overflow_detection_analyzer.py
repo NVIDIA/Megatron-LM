@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Overflow Detection Analyzer
-基于量化类型特征值检测tensor溢出情况
-支持bf16, mxfp8, mxfp4, hifp8四种量化类型
+Detect tensor overflow based on quantization type characteristics
+Supports bf16, mxfp8, mxfp4, hifp8 quantization types
 """
 
 import os
@@ -20,11 +20,11 @@ from typing import Dict, List, Tuple, Optional, NamedTuple
 import warnings
 warnings.filterwarnings('ignore')
 
-# 设置matplotlib后端
+# Set matplotlib backend
 plt.switch_backend('Agg')
 
 class QuantizationLimits(NamedTuple):
-    """量化类型限制值"""
+    """Quantization type limits"""
     max_positive_normal: float
     min_positive_normal: float
     max_positive_denormal: float
@@ -41,14 +41,14 @@ class OverflowDetectionAnalyzer:
         self.output_dir = Path(output_dir)
         self.max_workers = max_workers
         
-        # 支持的量化类型
+        # Supported quantization types
         self.quant_types = ['bf16', 'mxfp8', 'mxfp4', 'hifp8']
         
-        # 支持的样本和层
+        # Supported samples and layers
         self.samples = [0, 1, 2]
-        self.layers = list(range(1, 17))  # 1-16层
+        self.layers = list(range(1, 17))  # 1-16 layers
         
-        # 定义各量化类型的限制值（基于图中的数据）
+        # Define limits for each quantization type (based on chart data)
         self.quantization_limits = {
             'bf16': QuantizationLimits(
                 max_positive_normal=2**15 * (2 - 2**-10),  # 65504
@@ -83,11 +83,11 @@ class OverflowDetectionAnalyzer:
                 supports_nan=True,
                 supports_zero=True
             ),
-            'mxfp4': QuantizationLimits(  # FP4-E2M1: 1位符号 + 2位指数 + 1位尾数
-                max_positive_normal=1.5 * 2**3,  # 12 (最大指数=3, 尾数=1.5)
-                min_positive_normal=2**-2,  # 0.25 (最小指数=-2)
-                max_positive_denormal=1.5 * 2**-3,  # 0.1875 (非正常数最大值)
-                min_positive_denormal=2**-4,  # 0.0625 (非正常数最小值)
+            'mxfp4': QuantizationLimits(  # FP4-E2M1: 1 sign bit + 2 exponent bits + 1 mantissa bit
+                max_positive_normal=1.5 * 2**3,  # 12 (max exponent=3, mantissa=1.5)
+                min_positive_normal=2**-2,  # 0.25 (min exponent=-2)
+                max_positive_denormal=1.5 * 2**-3,  # 0.1875 (max denormal value)
+                min_positive_denormal=2**-4,  # 0.0625 (min denormal value)
                 exponent_range=(-2, 3),
                 exponent_range_with_denormal=(-4, 3),
                 supports_infinity=False,
@@ -96,10 +96,10 @@ class OverflowDetectionAnalyzer:
             )
         }
         
-        # 创建输出目录
+        # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建子目录
+        # Create subdirectories
         self.subdirs = {
             'overflow_analysis': self.output_dir / 'overflow_analysis',
             'statistics': self.output_dir / 'statistics',
@@ -110,14 +110,14 @@ class OverflowDetectionAnalyzer:
             subdir.mkdir(parents=True, exist_ok=True)
     
     def parse_filename(self, filename: str) -> Optional[Dict]:
-        """解析文件名，提取量化类型、层数、样本等信息"""
+        """Parse filename to extract quantization type, layer, sample and other information"""
         try:
             parts = filename.split('_')
             
             if len(parts) < 8:
                 return None
             
-            # 查找量化类型
+            # Find quantization type
             quant_type = None
             for qtype in self.quant_types:
                 if qtype in parts:
@@ -127,11 +127,11 @@ class OverflowDetectionAnalyzer:
             if not quant_type:
                 return None
             
-            # 查找层数
+            # Find layer number
             layer_match = re.search(r'L(\d+)', filename)
             layer = int(layer_match.group(1)) if layer_match else None
             
-            # 查找样本
+            # Find sample
             sample_match = re.search(r'sample(\d+)', filename)
             sample = int(sample_match.group(1)) if sample_match else None
             
