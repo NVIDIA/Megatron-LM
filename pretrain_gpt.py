@@ -131,6 +131,16 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers = get_timers()
     # import pdb;pdb.set_trace()
 
+    # Update sample index for tensor saving if enabled
+    if getattr(args, 'save_tensors', False):
+        try:
+            from megatron.core.tensor_saver import get_tensor_collection_state
+            state = get_tensor_collection_state()
+            current_sample = state.get_sample_idx() or 0
+            state.set_sample_idx(current_sample + 1)
+        except Exception as e:
+            print(f"[ForwardStep] Warning: Failed to update sample index: {e}")
+
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     global stimer

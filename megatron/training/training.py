@@ -2183,9 +2183,11 @@ def train(
         # Update tensor saver iteration if tensor saving is enabled
         if getattr(args, 'save_tensors', False):
             try:
-                from megatron.core.tensor_saver import get_tensor_saver
+                from megatron.core.tensor_saver import get_tensor_saver, set_global_sample_idx
                 tensor_saver = get_tensor_saver()
                 tensor_saver.set_iteration(iteration)
+                # Reset sample idx for each iteration
+                set_global_sample_idx(0)
             except Exception as e:
                 print(f"[Training] Warning: Failed to update tensor saver iteration: {e}")
         
