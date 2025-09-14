@@ -242,6 +242,11 @@ def get_current_rank_and_sample() -> tuple[Optional[int], Optional[int]]:
             except ValueError:
                 pass
     
+    # 如果仍然没有sample_idx，使用默认值0
+    if sample_idx is None:
+        sample_idx = 0
+        print(f"[TensorSaver] 使用默认sample_idx: {sample_idx}")
+    
     return rank, sample_idx
 
 def initialize_tensor_collection(rank: Optional[int] = None, 

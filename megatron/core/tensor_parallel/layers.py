@@ -782,13 +782,35 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         # 保存forward输入tensor (pre-linear)
         from megatron.core.tensor_saver import save_linear_tensors
         import os
+        import inspect
+        
         custom_quant_type = 'hifp8'
+        
+        # 尝试从调用栈获取layer_idx
+        layer_idx = getattr(ctx, 'layer_idx', None)
+        if layer_idx is None:
+            # 尝试从调用栈中获取layer信息
+            try:
+                frame = inspect.currentframe()
+                while frame:
+                    frame = frame.f_back
+                    if frame and 'self' in frame.f_locals:
+                        self_obj = frame.f_locals['self']
+                        if hasattr(self_obj, 'layer_number'):
+                            layer_idx = self_obj.layer_number
+                            break
+                        elif hasattr(self_obj, 'layer_idx'):
+                            layer_idx = self_obj.layer_idx
+                            break
+            except:
+                pass
+        
         save_linear_tensors(
             input_tensor=total_input,
             weight=weight,
             quant_type=custom_quant_type,
             operation="forward",
-            layer_idx=getattr(ctx, 'layer_idx', None),
+            layer_idx=layer_idx,
             phase="pre",
             component="linear",
             metadata={
@@ -814,6 +836,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         # 保存forward输出tensor (post-linear)
         from megatron.core.tensor_saver import save_tensor
         import os
+        import inspect
         
         # 尝试获取rank信息
         rank = None
@@ -830,13 +853,32 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         # 尝试获取sample信息
         sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
         
+        # 尝试从调用栈获取layer_idx
+        layer_idx = getattr(ctx, 'layer_idx', None)
+        if layer_idx is None:
+            # 尝试从调用栈中获取layer信息
+            try:
+                frame = inspect.currentframe()
+                while frame:
+                    frame = frame.f_back
+                    if frame and 'self' in frame.f_locals:
+                        self_obj = frame.f_locals['self']
+                        if hasattr(self_obj, 'layer_number'):
+                            layer_idx = self_obj.layer_number
+                            break
+                        elif hasattr(self_obj, 'layer_idx'):
+                            layer_idx = self_obj.layer_idx
+                            break
+            except:
+                pass
+        
         save_tensor(
             tensor=output,
             layer_type="linear",
             operation="forward",
             quant_type=custom_quant_type,
             tensor_name="output",
-            layer_idx=getattr(ctx, 'layer_idx', None),
+            layer_idx=layer_idx,
             phase="post",
             component="linear",
             rank=rank,  # 直接获取
