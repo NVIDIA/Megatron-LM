@@ -2269,7 +2269,7 @@ def train(
         
         # Check if we've reached the control_iter limit and exit if needed
         control_iter = getattr(args, 'control_iter', None)
-        if control_iter is not None and iteration > control_iter:
+        if control_iter is not None and iteration >= control_iter:
             print_rank_0(f"[Training] Reached control_iter limit ({control_iter}), exiting training...")
             # Exit the training loop early
             break
