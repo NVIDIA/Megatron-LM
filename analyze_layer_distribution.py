@@ -31,7 +31,7 @@ class LayerDistributionAnalyzer:
         self.quant_types = ['bf16', 'mxfp8', 'mxfp4', 'hifp8']
         
         # 支持的tensor类型
-        self.attention_tensors = ['query', 'key', 'value', 'output', 'attention_weights']
+        self.attention_tensors = ['query', 'key', 'value', 'output', 'attention_weights', 'weights']
         self.linear_tensors = ['input', 'weight', 'output', 'bias', 'hidden']
         
     def parse_filename(self, filename: str) -> Optional[Dict]:
