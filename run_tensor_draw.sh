@@ -2,12 +2,12 @@
 
 # =============================================================================
 # Multi-threaded Tensor Drawing Script
-# 支持新的数据结构：bf16, mxfp8, mxfp4, hifp8四个量化类型
-# 支持Sample (0,1,2) 和 Layer (1-16) 的多维度比较
-# 使用多线程加速画图过程
+# Supports new data structure: bf16, mxfp8, mxfp4, hifp8 quantization types
+# Supports multi-dimensional comparison of Sample (0,1,2) and Layer (1-16)
+# Uses multi-threading to accelerate plotting process
 # =============================================================================
 
-# 设置脚本元数据
+# Set script metadata
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_VERSION="2.0.0"
 START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
@@ -19,55 +19,55 @@ echo "Version: $SCRIPT_VERSION"
 echo "Start Time: $START_TIME"
 echo "=================================================================================="
 
-# 默认参数
+# Default parameters
 TENSOR_DIR=${1:-"./enhanced_tensor_logs"}
 OUTPUT_DIR=${2:-"./draw"}
 MAX_WORKERS=${3:-4}
 
-echo "参数设置:"
-echo "  - Tensor目录: $TENSOR_DIR"
-echo "  - 输出目录: $OUTPUT_DIR"
-echo "  - 最大线程数: $MAX_WORKERS"
+echo "Parameter settings:"
+echo "  - Tensor directory: $TENSOR_DIR"
+echo "  - Output directory: $OUTPUT_DIR"
+echo "  - Max workers: $MAX_WORKERS"
 
-# 检查tensor目录是否存在
+# Check if tensor directory exists
 if [ ! -d "$TENSOR_DIR" ]; then
-    echo "错误: Tensor目录不存在: $TENSOR_DIR"
-    echo "请确保已经运行了训练脚本并生成了tensor文件"
+    echo "Error: Tensor directory does not exist: $TENSOR_DIR"
+    echo "Please ensure training script has been run and tensor files generated"
     exit 1
 fi
 
-# 检查量化类型目录
+# Check quantization type directories
 QUANT_TYPES=("bf16" "mxfp8" "mxfp4" "hifp8")
 echo ""
-echo "检查量化类型目录:"
+echo "Checking quantization type directories:"
 for quant_type in "${QUANT_TYPES[@]}"; do
     quant_dir="$TENSOR_DIR/$quant_type"
     if [ -d "$quant_dir" ]; then
         file_count=$(find "$quant_dir" -name "*.pt" 2>/dev/null | wc -l)
-        echo "  ✅ $quant_type: $file_count 个文件"
+        echo "  ✅ $quant_type: $file_count files"
     else
-        echo "  ❌ $quant_type: 目录不存在"
+        echo "  ❌ $quant_type: directory does not exist"
     fi
 done
 
-# 检查Python环境
+# Check Python environment
 if ! command -v python &> /dev/null; then
-    echo "错误: 未找到Python"
+    echo "Error: Python not found"
     exit 1
 fi
 
-# 检查必要的Python包
+# Check required Python packages
 echo ""
-echo "检查Python依赖..."
+echo "Checking Python dependencies..."
 python -c "import torch, matplotlib, numpy, pandas, seaborn, concurrent.futures" 2>/dev/null
 if [ $? -ne 0 ]; then
-    echo "警告: 缺少必要的Python包，正在尝试安装..."
+    echo "Warning: Missing required Python packages, attempting to install..."
     pip install matplotlib numpy pandas seaborn scipy
 fi
 
-# 运行多线程可视化
+# Run multi-threaded visualization
 echo ""
-echo "运行多线程可视化..."
+echo "Running multi-threaded visualization..."
 python script/visualization/multi_threaded_visualizer.py \
     --tensor_dir "$TENSOR_DIR" \
     --output_dir "$OUTPUT_DIR" \
@@ -75,59 +75,59 @@ python script/visualization/multi_threaded_visualizer.py \
 
 if [ $? -eq 0 ]; then
     echo ""
-    echo "✅ 多线程可视化完成!"
+    echo "✅ Multi-threaded visualization completed!"
     
-    # 显示生成的文件
+    # Show generated files
     echo ""
-    echo "生成的图表文件:"
+    echo "Generated chart files:"
     find "$OUTPUT_DIR" -name "*.png" | while read file; do
         echo "  - $(basename "$file")"
     done
     
     echo ""
-    echo "生成的报告文件:"
+    echo "Generated report files:"
     find "$OUTPUT_DIR" -name "*.txt" | while read file; do
         echo "  - $(basename "$file")"
     done
     
-    # 显示主要输出
+    # Show main outputs
     echo ""
-    echo "主要输出文件:"
+    echo "Main output files:"
     if [ -f "$OUTPUT_DIR/quantization_analysis/quantization_comparison.png" ]; then
-        echo "  🎯 量化类型比较: $OUTPUT_DIR/quantization_analysis/quantization_comparison.png"
+        echo "  🎯 Quantization comparison: $OUTPUT_DIR/quantization_analysis/quantization_comparison.png"
     fi
     if [ -f "$OUTPUT_DIR/sample_analysis/sample_analysis.png" ]; then
-        echo "  📊 样本分析: $OUTPUT_DIR/sample_analysis/sample_analysis.png"
+        echo "  📊 Sample analysis: $OUTPUT_DIR/sample_analysis/sample_analysis.png"
     fi
     if [ -f "$OUTPUT_DIR/layer_analysis/layer_analysis.png" ]; then
-        echo "  🏗️ 层分析: $OUTPUT_DIR/layer_analysis/layer_analysis.png"
+        echo "  🏗️ Layer analysis: $OUTPUT_DIR/layer_analysis/layer_analysis.png"
     fi
     if [ -f "$OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png" ]; then
-        echo "  🔍 综合比较: $OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png"
+        echo "  🔍 Comprehensive comparison: $OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png"
     fi
     if [ -f "$OUTPUT_DIR/statistics/detailed_statistics_report.txt" ]; then
-        echo "  📋 统计报告: $OUTPUT_DIR/statistics/detailed_statistics_report.txt"
+        echo "  📋 Statistics report: $OUTPUT_DIR/statistics/detailed_statistics_report.txt"
     fi
     
     END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     echo ""
     echo "=================================================================================="
-    echo "可视化完成"
-    echo "开始时间: $START_TIME"
-    echo "结束时间: $END_TIME"
+    echo "Visualization completed"
+    echo "Start time: $START_TIME"
+    echo "End time: $END_TIME"
     echo "=================================================================================="
 else
     echo ""
-    echo "❌ 多线程可视化失败"
-    echo "尝试运行基础可视化..."
+    echo "❌ Multi-threaded visualization failed"
+    echo "Attempting to run basic visualization..."
     
-    # 回退到基础可视化
+    # Fallback to basic visualization
     bash script/visualization/one_click_visualize.sh "$TENSOR_DIR" "$OUTPUT_DIR"
     
     if [ $? -eq 0 ]; then
-        echo "✅ 基础可视化完成"
+        echo "✅ Basic visualization completed"
     else
-        echo "❌ 基础可视化也失败了"
+        echo "❌ Basic visualization also failed"
         exit 1
     fi
 fi

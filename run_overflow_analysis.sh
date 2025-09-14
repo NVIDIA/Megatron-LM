@@ -22,7 +22,7 @@ echo "==========================================================================
 # 默认参数
 TENSOR_DIR=${1:-"./enhanced_tensor_logs"}
 OUTPUT_DIR=${2:-"./draw"}
-MAX_WORKERS=${3:-4}
+MAX_WORKERS=${3:-32}
 
 echo "参数设置:"
 echo "  - Tensor目录: $TENSOR_DIR"
