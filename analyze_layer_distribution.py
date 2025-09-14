@@ -95,10 +95,18 @@ class LayerDistributionAnalyzer:
             print(f"Failed to parse filename: {filename}, error: {e}")
             return None
     
-    def load_tensor_data_with_timeout(self, file_info: Dict, timeout: int = 30) -> Optional[np.ndarray]:
+    def load_tensor_data_with_timeout(self, file_info: Dict, timeout: int = 60) -> Optional[np.ndarray]:
         """带超时的tensor数据加载"""
         def timeout_handler(signum, frame):
             raise TimeoutError(f"Loading {file_info['filename']} timed out after {timeout} seconds")
+        
+        # 检查文件大小，大文件使用更长的超时时间
+        file_path = self.tensor_dir / file_info['quant_type'] / file_info['filename']
+        if file_path.exists():
+            file_size = file_path.stat().st_size
+            if file_size > 500 * 1024 * 1024:  # 500MB
+                timeout = 120  # 大文件使用2分钟超时
+                print(f"    Using extended timeout ({timeout}s) for large file")
         
         # 设置超时信号
         old_handler = signal.signal(signal.SIGALRM, timeout_handler)
@@ -119,6 +127,51 @@ class LayerDistributionAnalyzer:
         finally:
             signal.signal(signal.SIGALRM, old_handler)
     
+    def load_large_tensor_data(self, file_path: Path, filename: str) -> Optional[np.ndarray]:
+        """内存高效地加载大tensor文件"""
+        try:
+            print(f"    Loading large tensor {filename} with memory-efficient method...")
+            
+            # 使用mmap模式加载，减少内存使用
+            try:
+                # 尝试使用weights_only=True来减少内存使用
+                data = torch.load(file_path, map_location='cpu', weights_only=True)
+            except Exception:
+                # 如果失败，尝试常规加载
+                data = torch.load(file_path, map_location='cpu', weights_only=False)
+            
+            if isinstance(data, torch.Tensor):
+                # 对于大tensor，直接进行采样
+                if data.numel() > 1_000_000:  # 1M elements
+                    print(f"    Sampling large tensor ({data.numel()} elements)...")
+                    # 使用更激进的采样策略
+                    flat_data = data.flatten()
+                    sample_size = min(500_000, len(flat_data))  # 最多采样50万个元素
+                    indices = np.random.choice(len(flat_data), sample_size, replace=False)
+                    sampled_data = flat_data[indices].numpy()
+                    print(f"    ✓ Sampled to {sampled_data.shape} tensor")
+                    return sampled_data
+                else:
+                    return data.numpy()
+            elif isinstance(data, dict) and 'tensor' in data:
+                tensor = data['tensor']
+                if isinstance(tensor, torch.Tensor):
+                    if tensor.numel() > 1_000_000:
+                        print(f"    Sampling large tensor ({tensor.numel()} elements)...")
+                        flat_data = tensor.flatten()
+                        sample_size = min(500_000, len(flat_data))
+                        indices = np.random.choice(len(flat_data), sample_size, replace=False)
+                        sampled_data = flat_data[indices].numpy()
+                        print(f"    ✓ Sampled to {sampled_data.shape} tensor")
+                        return sampled_data
+                    else:
+                        return tensor.numpy()
+            
+            return None
+        except Exception as e:
+            print(f"    ✗ Failed to load large file {filename}: {e}")
+            return None
+    
     def load_tensor_data(self, file_info: Dict) -> Optional[np.ndarray]:
         """加载tensor数据"""
         try:
@@ -130,11 +183,11 @@ class LayerDistributionAnalyzer:
             if file_path.stat().st_size == 0:
                 return None
             
-            # 检查文件大小，如果太大则跳过
+            # 检查文件大小，如果太大则使用特殊处理
             file_size = file_path.stat().st_size
             if file_size > 500 * 1024 * 1024:  # 500MB
-                print(f"Warning: Skipping large file {file_info['filename']} ({file_size / 1024 / 1024:.1f}MB)")
-                return None
+                print(f"Warning: Large file {file_info['filename']} ({file_size / 1024 / 1024:.1f}MB), using memory-efficient loading...")
+                return self.load_large_tensor_data(file_path, file_info['filename'])
             
             # 尝试加载tensor
             try:
