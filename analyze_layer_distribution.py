@@ -95,6 +95,28 @@ class LayerDistributionAnalyzer:
             print(f"Failed to parse filename: {filename}, error: {e}")
             return None
     
+    def convert_tensor_dtype(self, data, filename: str = ""):
+        """转换tensor数据类型以支持可视化"""
+        if isinstance(data, torch.Tensor):
+            if data.dtype == torch.bfloat16:
+                print(f"    Converting BFloat16 to Float32 for {filename}")
+                return data.float()
+            elif data.dtype not in [torch.float32, torch.float64, torch.float16]:
+                print(f"    Converting {data.dtype} to Float32 for {filename}")
+                return data.float()
+            return data
+        elif isinstance(data, dict) and 'tensor' in data:
+            tensor = data['tensor']
+            if isinstance(tensor, torch.Tensor):
+                if tensor.dtype == torch.bfloat16:
+                    print(f"    Converting BFloat16 to Float32 for {filename}")
+                    data['tensor'] = tensor.float()
+                elif tensor.dtype not in [torch.float32, torch.float64, torch.float16]:
+                    print(f"    Converting {tensor.dtype} to Float32 for {filename}")
+                    data['tensor'] = tensor.float()
+            return data
+        return data
+    
     def load_tensor_data_with_timeout(self, file_info: Dict, timeout: int = 60) -> Optional[np.ndarray]:
         """带超时的tensor数据加载"""
         def timeout_handler(signum, frame):
@@ -137,8 +159,15 @@ class LayerDistributionAnalyzer:
                 # 尝试使用weights_only=True来减少内存使用
                 data = torch.load(file_path, map_location='cpu', weights_only=True)
             except Exception:
-                # 如果失败，尝试常规加载
-                data = torch.load(file_path, map_location='cpu', weights_only=False)
+                try:
+                    # 如果失败，尝试常规加载
+                    data = torch.load(file_path, map_location='cpu', weights_only=False)
+                except Exception:
+                    # 尝试处理BFloat16类型问题
+                    data = torch.load(file_path, map_location='cpu', weights_only=False)
+            
+            # 转换数据类型
+            data = self.convert_tensor_dtype(data, filename)
             
             if isinstance(data, torch.Tensor):
                 # 对于大tensor，直接进行采样
@@ -196,8 +225,24 @@ class LayerDistributionAnalyzer:
                 try:
                     data = torch.load(file_path, map_location='cpu', weights_only=True)
                 except Exception as e2:
-                    print(f"Warning: Failed to load {file_info['filename']}: {e2}")
-                    return None
+                    # 尝试处理BFloat16类型问题
+                    try:
+                        data = torch.load(file_path, map_location='cpu', weights_only=False)
+                        # 如果数据是tensor且类型是BFloat16，转换为Float32
+                        if isinstance(data, torch.Tensor) and data.dtype == torch.bfloat16:
+                            print(f"    Converting BFloat16 to Float32 for {file_info['filename']}")
+                            data = data.float()
+                        elif isinstance(data, dict) and 'tensor' in data:
+                            tensor = data['tensor']
+                            if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.bfloat16:
+                                print(f"    Converting BFloat16 to Float32 for {file_info['filename']}")
+                                data['tensor'] = tensor.float()
+                    except Exception as e3:
+                        print(f"Warning: Failed to load {file_info['filename']}: {e3}")
+                        return None
+            
+            # 转换数据类型
+            data = self.convert_tensor_dtype(data, file_info['filename'])
             
             # 处理不同的数据格式
             if isinstance(data, torch.Tensor):
