@@ -191,7 +191,8 @@ EOF
         2>&1 | tee "${tensorboard_path}/training_${quant_type}_$(date +'%y-%m-%d_%H-%M-%S').log" &
     
     # 获取训练进程ID
-    TRAINING_PID=$!
+    TRAIN_PID=$!
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 训练进程启动，PID: $TRAIN_PID"
     
     # 等待训练开始并收集指定数量的iteration数据
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 等待训练开始并收集tensor..."
@@ -199,11 +200,11 @@ EOF
     
     # 监控tensor文件生成，确保收集到指定数量的iteration数据
     iteration_collected=false
-    max_wait_time=600  # 最大等待10分钟（增加等待时间）
+    max_wait_time=600  # 最大等待10分钟
     wait_time=0
     
     while [ $wait_time -lt $max_wait_time ] && [ "$iteration_collected" = false ]; do
-        sleep 15  # 增加检查间隔
+        sleep 15  # 检查间隔
         wait_time=$((wait_time + 15))
         
         # 检查是否有tensor文件生成
@@ -236,8 +237,13 @@ EOF
     
     # 停止训练进程
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 停止训练进程..."
-    kill $TRAINING_PID 2>/dev/null
-    wait $TRAINING_PID 2>/dev/null
+    if kill -0 $TRAIN_PID 2>/dev/null; then
+        kill $TRAIN_PID
+        wait $TRAIN_PID 2>/dev/null
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 训练进程已停止"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 训练进程已自然结束"
+    fi
     
     # 统计收集到的tensor
     final_tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
