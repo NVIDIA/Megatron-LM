@@ -83,15 +83,15 @@ class OverflowDetectionAnalyzer:
                 supports_nan=True,
                 supports_zero=True
             ),
-            'mxfp4': QuantizationLimits(  # 假设mxfp4为FP8-E5M2
-                max_positive_normal=1.75 * 2**15,  # 57344
-                min_positive_normal=2**-14,  # 6.103515625e-05
-                max_positive_denormal=1.5 * 2**-16,  # 2.288818359375e-05
-                min_positive_denormal=2**-16,  # 1.52587890625e-05
-                exponent_range=(-14, 15),
-                exponent_range_with_denormal=(-16, 15),
-                supports_infinity=True,
-                supports_nan=True,
+            'mxfp4': QuantizationLimits(  # FP4-E2M1: 1位符号 + 2位指数 + 1位尾数
+                max_positive_normal=1.5 * 2**3,  # 12 (最大指数=3, 尾数=1.5)
+                min_positive_normal=2**-2,  # 0.25 (最小指数=-2)
+                max_positive_denormal=1.5 * 2**-3,  # 0.1875 (非正常数最大值)
+                min_positive_denormal=2**-4,  # 0.0625 (非正常数最小值)
+                exponent_range=(-2, 3),
+                exponent_range_with_denormal=(-4, 3),
+                supports_infinity=False,
+                supports_nan=False,
                 supports_zero=True
             )
         }
