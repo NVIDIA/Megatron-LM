@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import warnings
 from tqdm import tqdm
+import signal
+import time
 warnings.filterwarnings('ignore')
 
 # 设置matplotlib后端
@@ -93,6 +95,30 @@ class LayerDistributionAnalyzer:
             print(f"Failed to parse filename: {filename}, error: {e}")
             return None
     
+    def load_tensor_data_with_timeout(self, file_info: Dict, timeout: int = 30) -> Optional[np.ndarray]:
+        """带超时的tensor数据加载"""
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"Loading {file_info['filename']} timed out after {timeout} seconds")
+        
+        # 设置超时信号
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
+        
+        try:
+            result = self.load_tensor_data(file_info)
+            signal.alarm(0)  # 取消超时
+            return result
+        except TimeoutError as e:
+            print(f"    ⚠ Timeout: {e}")
+            signal.alarm(0)
+            return None
+        except Exception as e:
+            print(f"    ✗ Error: {e}")
+            signal.alarm(0)
+            return None
+        finally:
+            signal.signal(signal.SIGALRM, old_handler)
+    
     def load_tensor_data(self, file_info: Dict) -> Optional[np.ndarray]:
         """加载tensor数据"""
         try:
@@ -104,6 +130,12 @@ class LayerDistributionAnalyzer:
             if file_path.stat().st_size == 0:
                 return None
             
+            # 检查文件大小，如果太大则跳过
+            file_size = file_path.stat().st_size
+            if file_size > 500 * 1024 * 1024:  # 500MB
+                print(f"Warning: Skipping large file {file_info['filename']} ({file_size / 1024 / 1024:.1f}MB)")
+                return None
+            
             # 尝试加载tensor
             try:
                 data = torch.load(file_path, map_location='cpu', weights_only=False)
@@ -111,21 +143,39 @@ class LayerDistributionAnalyzer:
                 try:
                     data = torch.load(file_path, map_location='cpu', weights_only=True)
                 except Exception as e2:
+                    print(f"Warning: Failed to load {file_info['filename']}: {e2}")
                     return None
             
             # 处理不同的数据格式
             if isinstance(data, torch.Tensor):
+                # 检查tensor大小，如果太大则采样
+                if data.numel() > 10_000_000:  # 10M elements
+                    print(f"Warning: Large tensor {file_info['filename']} ({data.numel()} elements), sampling...")
+                    # 随机采样
+                    flat_data = data.flatten()
+                    sample_size = min(1_000_000, len(flat_data))  # 最多采样1M个元素
+                    indices = np.random.choice(len(flat_data), sample_size, replace=False)
+                    return flat_data[indices].numpy()
                 return data.numpy()
             elif isinstance(data, dict):
                 if 'tensor' in data:
                     if isinstance(data['tensor'], torch.Tensor):
-                        return data['tensor'].numpy()
+                        tensor = data['tensor']
+                        # 检查tensor大小
+                        if tensor.numel() > 10_000_000:
+                            print(f"Warning: Large tensor {file_info['filename']} ({tensor.numel()} elements), sampling...")
+                            flat_data = tensor.flatten()
+                            sample_size = min(1_000_000, len(flat_data))
+                            indices = np.random.choice(len(flat_data), sample_size, replace=False)
+                            return flat_data[indices].numpy()
+                        return tensor.numpy()
                 elif 'tensor_info' in data:
                     # 这是旧的格式，尝试从tensor_info中获取数据
                     return None
             
             return None
         except Exception as e:
+            print(f"Warning: Error loading {file_info['filename']}: {e}")
             return None
     
     def find_tensor_files(self, layer: int, sample: int, layer_type: str) -> Dict[str, List[Dict]]:
@@ -260,10 +310,15 @@ class LayerDistributionAnalyzer:
             
             # 合并所有相同tensor类型的数据
             all_data = []
-            for file_info in tensor_files:
-                data = self.load_tensor_data(file_info)
+            print(f"  Loading {len(tensor_files)} {tensor_type} files...")
+            for j, file_info in enumerate(tensor_files):
+                print(f"    Loading {file_info['filename']} ({j+1}/{len(tensor_files)})...")
+                data = self.load_tensor_data_with_timeout(file_info, timeout=30)
                 if data is not None:
                     all_data.append(data)
+                    print(f"    ✓ Loaded {data.shape} tensor")
+                else:
+                    print(f"    ✗ Failed to load")
             
             if not all_data:
                 ax.text(0.5, 0.5, f'No valid {tensor_type} data', ha='center', va='center', 
@@ -352,10 +407,15 @@ class LayerDistributionAnalyzer:
             
             # 加载并合并数据
             all_data = []
-            for file_info in matching_files:
-                data = self.load_tensor_data(file_info)
+            print(f"  Loading {len(matching_files)} {quant_type} {tensor_type} files...")
+            for j, file_info in enumerate(matching_files):
+                print(f"    Loading {file_info['filename']} ({j+1}/{len(matching_files)})...")
+                data = self.load_tensor_data_with_timeout(file_info, timeout=30)
                 if data is not None:
                     all_data.append(data)
+                    print(f"    ✓ Loaded {data.shape} tensor")
+                else:
+                    print(f"    ✗ Failed to load")
             
             if not all_data:
                 ax.text(0.5, 0.5, f'No valid {quant_type} data', ha='center', va='center', 
@@ -419,10 +479,15 @@ class LayerDistributionAnalyzer:
                 
                 # 收集所有数据
                 all_data = []
-                for file_info in tensor_files:
-                    data = self.load_tensor_data(file_info)
+                print(f"  Loading {len(tensor_files)} {tensor_type} files for statistics...")
+                for j, file_info in enumerate(tensor_files):
+                    print(f"    Loading {file_info['filename']} ({j+1}/{len(tensor_files)})...")
+                    data = self.load_tensor_data_with_timeout(file_info, timeout=30)
                     if data is not None:
                         all_data.append(data)
+                        print(f"    ✓ Loaded {data.shape} tensor")
+                    else:
+                        print(f"    ✗ Failed to load")
                 
                 if not all_data:
                     f.write("No valid data found\n\n")
