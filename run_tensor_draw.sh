@@ -1,19 +1,25 @@
 #!/bin/bash
 
 # =============================================================================
-# Multi-threaded Tensor Drawing Script
+# Enhanced Multi-threaded Tensor Drawing Script
 # Supports new data structure: bf16, mxfp8, mxfp4, hifp8 quantization types
 # Supports multi-dimensional comparison of Sample (0,1,2) and Layer (1-16)
 # Uses multi-threading to accelerate plotting process
+# Features:
+#   - HiFP8 distribution analysis with line plots and statistical measures
+#   - Layer-Sample analysis for selected layers (1, 4, 8, 12, 16)
+#   - Global statistics with detailed JSON and text reports
+#   - Progress bars for all operations using tqdm
+#   - Enhanced visualization with comprehensive analysis
 # =============================================================================
 
 # Set script metadata
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="3.0.0"
 START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 
 echo "=================================================================================="
-echo "Multi-threaded Tensor Drawing Script"
+echo "Enhanced Multi-threaded Tensor Drawing Script"
 echo "Script: $SCRIPT_NAME"
 echo "Version: $SCRIPT_VERSION"
 echo "Start Time: $START_TIME"
@@ -65,10 +71,10 @@ if [ $? -ne 0 ]; then
     pip install matplotlib numpy pandas seaborn scipy
 fi
 
-# Run multi-threaded visualization
+# Run enhanced multi-threaded visualization
 echo ""
-echo "Running multi-threaded visualization..."
-python script/visualization/multi_threaded_visualizer.py \
+echo "Running enhanced multi-threaded visualization..."
+python script/visualization/enhanced_multi_threaded_visualizer.py \
     --tensor_dir "$TENSOR_DIR" \
     --output_dir "$OUTPUT_DIR" \
     --max_workers "$MAX_WORKERS"
@@ -104,6 +110,18 @@ if [ $? -eq 0 ]; then
     fi
     if [ -f "$OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png" ]; then
         echo "  🔍 Comprehensive comparison: $OUTPUT_DIR/comparison_analysis/comprehensive_comparison.png"
+    fi
+    if [ -f "$OUTPUT_DIR/hifp8_analysis/hifp8_distribution_analysis.png" ]; then
+        echo "  🔬 HiFP8 distribution analysis: $OUTPUT_DIR/hifp8_analysis/hifp8_distribution_analysis.png"
+    fi
+    if [ -f "$OUTPUT_DIR/layer_sample_analysis/layer_sample_analysis.png" ]; then
+        echo "  📈 Layer-Sample analysis: $OUTPUT_DIR/layer_sample_analysis/layer_sample_analysis.png"
+    fi
+    if [ -f "$OUTPUT_DIR/global_statistics/global_statistics.json" ]; then
+        echo "  📊 Global statistics (JSON): $OUTPUT_DIR/global_statistics/global_statistics.json"
+    fi
+    if [ -f "$OUTPUT_DIR/global_statistics/global_statistics_report.txt" ]; then
+        echo "  📋 Global statistics report: $OUTPUT_DIR/global_statistics/global_statistics_report.txt"
     fi
     if [ -f "$OUTPUT_DIR/statistics/detailed_statistics_report.txt" ]; then
         echo "  📋 Statistics report: $OUTPUT_DIR/statistics/detailed_statistics_report.txt"
