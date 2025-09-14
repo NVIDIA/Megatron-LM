@@ -210,9 +210,12 @@ EOF
         tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $tensor_count 个tensor文件 (等待时间: ${wait_time}s)"
         
-        # 检查是否收集了足够的iteration数据（假设每个iteration至少生成10个tensor文件）
-        required_tensors=$((CONTROL_ITER * 10))
-        if [ $tensor_count -ge $required_tensors ]; then
+        # 检查是否收集了指定数量的iteration数据
+        # 通过文件名中的iter{iteration:03d}模式来统计不同的iteration
+        collected_iterations=$(find "$tensor_path" -name "*.pt" 2>/dev/null | grep -o "iter[0-9][0-9][0-9]" | sort -u | wc -l)
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $collected_iterations 个不同的iteration"
+        
+        if [ $collected_iterations -ge $CONTROL_ITER ]; then
             iteration_collected=true
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 已收集到 $CONTROL_ITER 个iteration的数据"
         fi
