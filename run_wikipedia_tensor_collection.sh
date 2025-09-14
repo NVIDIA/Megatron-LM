@@ -178,7 +178,10 @@ EOF
     # 运行训练脚本（限制步数）
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 执行训练脚本..."
     
-    # 使用训练脚本，但限制步数
+    # 使用训练脚本，control_iter会自动控制训练结束
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 执行训练脚本，将收集 $CONTROL_ITER 个iteration的数据..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 训练将在完成 $CONTROL_ITER 个iteration后自动结束"
+    
     bash examples/llama/train_llama32_1b_h100_fp8.sh \
         "$checkpoint_path" \
         "$tensorboard_path" \
@@ -188,62 +191,9 @@ EOF
         --control-iter "$CONTROL_ITER" \
         --save-tensors \
         --tensor-save-dir "$tensor_path" \
-        2>&1 | tee "${tensorboard_path}/training_${quant_type}_$(date +'%y-%m-%d_%H-%M-%S').log" &
+        2>&1 | tee "${tensorboard_path}/training_${quant_type}_$(date +'%y-%m-%d_%H-%M-%S').log"
     
-    # 获取训练进程ID
-    TRAIN_PID=$!
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 训练进程启动，PID: $TRAIN_PID"
-    
-    # 等待训练开始并收集指定数量的iteration数据
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 等待训练开始并收集tensor..."
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 将收集 $CONTROL_ITER 个iteration的数据"
-    
-    # 监控tensor文件生成，确保收集到指定数量的iteration数据
-    iteration_collected=false
-    max_wait_time=600  # 最大等待10分钟
-    wait_time=0
-    
-    while [ $wait_time -lt $max_wait_time ] && [ "$iteration_collected" = false ]; do
-        sleep 15  # 检查间隔
-        wait_time=$((wait_time + 15))
-        
-        # 检查是否有tensor文件生成
-        tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $tensor_count 个tensor文件 (等待时间: ${wait_time}s)"
-        
-        # 检查是否收集了指定数量的iteration数据
-        # 通过文件名中的iter{iteration:03d}模式来统计不同的iteration
-        collected_iterations=$(find "$tensor_path" -name "*.pt" 2>/dev/null | grep -o "iter[0-9][0-9][0-9]" | sort -u | wc -l)
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 已收集到 $collected_iterations 个不同的iteration"
-        
-        # 添加更详细的tensor类型统计
-        attention_count=$(find "$tensor_path" -name "*attention*" 2>/dev/null | wc -l)
-        linear_count=$(find "$tensor_path" -name "*linear*" 2>/dev/null | wc -l)
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 详细统计: attention=$attention_count, linear=$linear_count"
-        
-        # 检查sample分布
-        sample_distribution=$(find "$tensor_path" -name "*.pt" 2>/dev/null | grep -o "sample[0-9][0-9][0-9]" | sort -u | wc -l)
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 不同sample数量: $sample_distribution"
-        
-        if [ $collected_iterations -ge $CONTROL_ITER ]; then
-            iteration_collected=true
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 已收集到 $CONTROL_ITER 个iteration的数据"
-        fi
-    done
-    
-    if [ "$iteration_collected" = false ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] 未能在规定时间内收集到足够的tensor数据"
-    fi
-    
-    # 停止训练进程
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 停止训练进程..."
-    if kill -0 $TRAIN_PID 2>/dev/null; then
-        kill $TRAIN_PID
-        wait $TRAIN_PID 2>/dev/null
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 训练进程已停止"
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 训练进程已自然结束"
-    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] 训练已完成，control_iter自动控制结束"
     
     # 统计收集到的tensor
     final_tensor_count=$(find "$tensor_path" -name "*.pt" 2>/dev/null | wc -l)
