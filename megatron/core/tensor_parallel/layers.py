@@ -933,13 +933,36 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             # 保存backward输入tensor (pre-linear)
             from megatron.core.tensor_saver import save_linear_tensors
             import os
+            import inspect
             custom_quant_type = 'hifp8'
+            
+            # 尝试从调用栈获取layer_idx（与forward阶段保持一致）
+            layer_idx = getattr(ctx, 'layer_idx', None)
+            if layer_idx is None:
+                try:
+                    # 从调用栈中查找layer_idx
+                    frame = inspect.currentframe()
+                    while frame:
+                        frame = frame.f_back
+                        if frame:
+                            local_vars = frame.f_locals
+                            if 'self' in local_vars:
+                                self_obj = local_vars['self']
+                                if hasattr(self_obj, 'layer_number'):
+                                    layer_idx = self_obj.layer_number
+                                    break
+                                elif hasattr(self_obj, 'layer_idx'):
+                                    layer_idx = self_obj.layer_idx
+                                    break
+                except:
+                    pass
+            
             save_linear_tensors(
                 input_tensor=grad_output,
                 weight=weight,
                 quant_type=custom_quant_type,
                 operation="backward",
-                layer_idx=getattr(ctx, 'layer_idx', None),
+                layer_idx=layer_idx,
                 phase="pre",
                 component="linear",
                 metadata={
