@@ -38,8 +38,8 @@ class TensorVisualizer:
         # Supported quantization types
         self.quant_types = ['bf16', 'mxfp8', 'mxfp4', 'hifp8']
         
-        # Supported samples and layers
-        self.samples = [0, 1, 2]
+        # Supported ranks and layers (no sample concept since only one micro_batch is collected)
+        self.ranks = [0, 1, 2, 3, 4, 5, 6, 7]  # Common GPU ranks
         self.layers = list(range(1, 17))  # 1-16 layers
         
         # Create output directory
@@ -48,12 +48,12 @@ class TensorVisualizer:
         # Create subdirectories
         self.subdirs = {
             'quantization_analysis': self.output_dir / 'quantization_analysis',
-            'sample_analysis': self.output_dir / 'sample_analysis',
+            'rank_analysis': self.output_dir / 'rank_analysis',
             'layer_analysis': self.output_dir / 'layer_analysis',
             'comparison_analysis': self.output_dir / 'comparison_analysis',
             'statistics': self.output_dir / 'statistics',
             'hifp8_analysis': self.output_dir / 'hifp8_analysis',
-            'layer_sample_analysis': self.output_dir / 'layer_sample_analysis',
+            'layer_rank_analysis': self.output_dir / 'layer_rank_analysis',
             'global_statistics': self.output_dir / 'global_statistics',
             'overflow_analysis': self.output_dir / 'overflow_analysis'
         }
@@ -62,10 +62,10 @@ class TensorVisualizer:
             subdir.mkdir(parents=True, exist_ok=True)
     
     def parse_filename(self, filename: str) -> Optional[Dict]:
-        """Parse filename to extract quantization type, layer, rank as sample and other information"""
+        """Parse filename to extract quantization type, layer, rank and other information"""
         try:
             # Filename format: YYYYMMDD_HHMMSS_XXXX_iterXXX_layer_type_operation_quant_type_rankXX_groupXXX_tensor_name.pt
-            # Since only one micro_batch_size is collected, rank represents different samples
+            # Since only one micro_batch_size is collected, rank represents different GPUs
             parts = filename.split('_')
             
             if len(parts) < 8:
@@ -85,10 +85,9 @@ class TensorVisualizer:
             layer_match = re.search(r'L(\d+)', filename)
             layer = int(layer_match.group(1)) if layer_match else None
             
-            # Find rank (use as sample since only one micro_batch is collected)
+            # Find rank (GPU number)
             rank_match = re.search(r'rank(\d+)', filename)
             rank = int(rank_match.group(1)) if rank_match else None
-            sample = rank  # Use rank as sample
             
             # Find layer type
             layer_type = None
@@ -119,8 +118,7 @@ class TensorVisualizer:
             return {
                 'quant_type': quant_type,
                 'layer': layer,
-                'sample': sample,  # This is now the rank
-                'rank': rank,      # Keep original rank for reference
+                'rank': rank,      # GPU rank
                 'layer_type': layer_type,
                 'operation': operation,
                 'tensor_name': tensor_name,
@@ -137,7 +135,7 @@ class TensorVisualizer:
         data = {
             'files': [],
             'by_quant_type': {qtype: [] for qtype in self.quant_types},
-            'by_sample': {sample: [] for sample in self.samples},
+            'by_rank': {rank: [] for rank in self.ranks},
             'by_layer': {layer: [] for layer in self.layers},
             'by_layer_type': {'attention': [], 'linear': []},
             'statistics': {}
@@ -164,10 +162,10 @@ class TensorVisualizer:
                 data['files'].append(file_info)
                 data['by_quant_type'][file_info['quant_type']].append(file_info)
                 
-                if file_info['sample'] is not None:
-                    if file_info['sample'] not in data['by_sample']:
-                        data['by_sample'][file_info['sample']] = []
-                    data['by_sample'][file_info['sample']].append(file_info)
+                if file_info['rank'] is not None:
+                    if file_info['rank'] not in data['by_rank']:
+                        data['by_rank'][file_info['rank']] = []
+                    data['by_rank'][file_info['rank']].append(file_info)
                 
                 if file_info['layer'] is not None:
                     if file_info['layer'] not in data['by_layer']:
@@ -228,7 +226,7 @@ class TensorVisualizer:
         
         stats = {
             'quant_type_stats': {},
-            'sample_stats': {},
+            'rank_stats': {},
             'layer_stats': {},
             'layer_type_stats': {},
             'overall_stats': {}
@@ -242,19 +240,19 @@ class TensorVisualizer:
                 stats['quant_type_stats'][quant_type] = {
                     'count': len(files),
                     'layers': len(set(f['layer'] for f in files if f['layer'] is not None)),
-                    'samples': len(set(f['sample'] for f in files if f['sample'] is not None)),
+                    'ranks': len(set(f['rank'] for f in files if f['rank'] is not None)),
                     'layer_types': list(set(f['layer_type'] for f in files if f['layer_type'] is not None))
                 }
             pbar.update(1)
         pbar.close()
         
-        # Statistics by sample
-        actual_samples = list(data['by_sample'].keys())
-        pbar = tqdm(total=len(actual_samples), desc="Processing samples", unit="samples")
-        for sample in actual_samples:
-            files = data['by_sample'][sample]
+        # Statistics by rank
+        actual_ranks = list(data['by_rank'].keys())
+        pbar = tqdm(total=len(actual_ranks), desc="Processing ranks", unit="ranks")
+        for rank in actual_ranks:
+            files = data['by_rank'][rank]
             if files:
-                stats['sample_stats'][sample] = {
+                stats['rank_stats'][rank] = {
                     'count': len(files),
                     'quant_types': list(set(f['quant_type'] for f in files if f['quant_type'] is not None)),
                     'layers': len(set(f['layer'] for f in files if f['layer'] is not None))
@@ -271,7 +269,7 @@ class TensorVisualizer:
                 stats['layer_stats'][layer] = {
                     'count': len(files),
                     'quant_types': list(set(f['quant_type'] for f in files if f['quant_type'] is not None)),
-                    'samples': len(set(f['sample'] for f in files if f['sample'] is not None)),
+                    'ranks': len(set(f['rank'] for f in files if f['rank'] is not None)),
                     'layer_types': list(set(f['layer_type'] for f in files if f['layer_type'] is not None))
                 }
             pbar.update(1)
@@ -294,7 +292,7 @@ class TensorVisualizer:
         stats['overall_stats'] = {
             'total_files': len(data['files']),
             'quant_types': len([q for q in self.quant_types if data['by_quant_type'][q]]),
-            'samples': len([s for s in self.samples if data['by_sample'][s]]),
+            'ranks': len([r for r in self.ranks if data['by_rank'][r]]),
             'layers': len([l for l in self.layers if data['by_layer'][l]]),
             'layer_types': len([lt for lt in ['attention', 'linear'] if data['by_layer_type'][lt]])
         }
@@ -351,17 +349,17 @@ class TensorVisualizer:
             ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(layers)*0.01,
                     f'{layer}', ha='center', va='bottom', fontweight='bold')
         
-        # 3. Sample distribution
+        # 3. Rank distribution
         ax3 = axes[1, 0]
-        samples = [d['samples'] for d in quant_data]
-        bars3 = ax3.bar(quant_types, samples, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-        ax3.set_title('Sample Distribution by Quantization Type', fontweight='bold')
-        ax3.set_ylabel('Sample Count')
+        ranks = [d['ranks'] for d in quant_data]
+        bars3 = ax3.bar(quant_types, ranks, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+        ax3.set_title('Rank Distribution by Quantization Type', fontweight='bold')
+        ax3.set_ylabel('Rank Count')
         ax3.tick_params(axis='x', rotation=45)
         
-        for bar, sample in zip(bars3, samples):
-            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(samples)*0.01,
-                    f'{sample}', ha='center', va='bottom', fontweight='bold')
+        for bar, rank in zip(bars3, ranks):
+            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(ranks)*0.01,
+                    f'{rank}', ha='center', va='bottom', fontweight='bold')
         
         # 4. Comprehensive comparison
         ax4 = axes[1, 1]
@@ -370,7 +368,7 @@ class TensorVisualizer:
         
         bars4_1 = ax4.bar(x - width, counts, width, label='File Count', alpha=0.8)
         bars4_2 = ax4.bar(x, layers, width, label='Layer Count', alpha=0.8)
-        bars4_3 = ax4.bar(x + width, samples, width, label='Sample Count', alpha=0.8)
+        bars4_3 = ax4.bar(x + width, ranks, width, label='Rank Count', alpha=0.8)
         
         ax4.set_title('Comprehensive Comparison', fontweight='bold')
         ax4.set_ylabel('Count')
@@ -405,7 +403,7 @@ class TensorVisualizer:
                     'file_info': file_info,
                     'values': tensor_values.flatten(),
                     'layer': file_info.get('layer'),
-                    'sample': file_info.get('sample'),
+                    'rank': file_info.get('rank'),
                     'layer_type': file_info.get('layer_type'),
                     'tensor_name': file_info.get('tensor_name')
                 })
@@ -448,19 +446,19 @@ class TensorVisualizer:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 2. Value distribution by sample (line plot)
+        # 2. Value distribution by rank (line plot)
         ax2 = axes[0, 1]
-        sample_stats = {}
+        rank_stats = {}
         for item in hifp8_data:
-            sample = item['sample']
-            if sample is not None and item['values'] is not None:
-                if sample not in sample_stats:
-                    sample_stats[sample] = []
-                sample_stats[sample].extend(item['values'])
+            rank = item['rank']
+            if rank is not None and item['values'] is not None:
+                if rank not in rank_stats:
+                    rank_stats[rank] = []
+                rank_stats[rank].extend(item['values'])
         
-        samples = sorted(sample_stats.keys())
-        for sample in samples:
-            values = np.array(sample_stats[sample])
+        ranks = sorted(rank_stats.keys())
+        for rank in ranks:
+            values = np.array(rank_stats[rank])
             # Sample for plotting if too many points
             if len(values) > 10000:
                 values = np.random.choice(values, 10000, replace=False)
@@ -468,11 +466,11 @@ class TensorVisualizer:
             # Create histogram and plot as line
             hist, bins = np.histogram(values, bins=50, density=True)
             bin_centers = (bins[:-1] + bins[1:]) / 2
-            ax2.plot(bin_centers, hist, label=f'Sample {sample}', alpha=0.7, linewidth=2)
+            ax2.plot(bin_centers, hist, label=f'Rank {rank}', alpha=0.7, linewidth=2)
         
         ax2.set_xlabel('Value')
         ax2.set_ylabel('Density')
-        ax2.set_title('HiFP8 Value Distribution by Sample')
+        ax2.set_title('HiFP8 Value Distribution by Rank')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
@@ -518,24 +516,24 @@ class TensorVisualizer:
         ax4.set_title('HiFP8 Overall Value Distribution')
         ax4.grid(True, alpha=0.3)
         
-        # 5. Layer-Sample heatmap
+        # 5. Layer-Rank heatmap
         ax5 = axes[1, 1]
-        layer_sample_matrix = np.zeros((len(layers), len(samples)))
+        layer_rank_matrix = np.zeros((len(layers), len(ranks)))
         
         for i, layer in enumerate(layers):
-            for j, sample in enumerate(samples):
-                layer_sample_data = [item for item in hifp8_data 
-                                   if item['layer'] == layer and item['sample'] == sample]
-                if layer_sample_data:
-                    all_values = np.concatenate([item['values'] for item in layer_sample_data])
-                    layer_sample_matrix[i, j] = np.mean(all_values)
+            for j, rank in enumerate(ranks):
+                layer_rank_data = [item for item in hifp8_data 
+                                  if item['layer'] == layer and item['rank'] == rank]
+                if layer_rank_data:
+                    all_values = np.concatenate([item['values'] for item in layer_rank_data])
+                    layer_rank_matrix[i, j] = np.mean(all_values)
         
-        im = ax5.imshow(layer_sample_matrix, cmap='viridis', aspect='auto')
-        ax5.set_title('HiFP8 Mean Values: Layer vs Sample')
-        ax5.set_xlabel('Sample Number')
+        im = ax5.imshow(layer_rank_matrix, cmap='viridis', aspect='auto')
+        ax5.set_title('HiFP8 Mean Values: Layer vs Rank')
+        ax5.set_xlabel('Rank Number')
         ax5.set_ylabel('Layer Number')
-        ax5.set_xticks(range(len(samples)))
-        ax5.set_xticklabels(samples)
+        ax5.set_xticks(range(len(ranks)))
+        ax5.set_xticklabels(ranks)
         ax5.set_yticks(range(len(layers)))
         ax5.set_yticklabels(layers)
         
@@ -600,7 +598,7 @@ class TensorVisualizer:
             },
             'quantization_types': {},
             'layers': {},
-            'samples': {},
+            'ranks': {},
             'layer_types': {},
             'tensor_names': {},
             'overall_distribution': {}
@@ -648,15 +646,16 @@ class TensorVisualizer:
             pbar.update(1)
         pbar.close()
         
-        # Process each sample
-        pbar = tqdm(total=len(self.samples), desc="Processing samples", unit="samples")
-        for sample in self.samples:
-            sample_data = [item for item in all_tensor_data if item['file_info'].get('sample') == sample]
-            if sample_data:
-                all_values = np.concatenate([item['values'] for item in sample_data])
+        # Process each rank
+        actual_ranks = list(set(item['file_info'].get('rank') for item in all_tensor_data if item['file_info'].get('rank') is not None))
+        pbar = tqdm(total=len(actual_ranks), desc="Processing ranks", unit="ranks")
+        for rank in actual_ranks:
+            rank_data = [item for item in all_tensor_data if item['file_info'].get('rank') == rank]
+            if rank_data:
+                all_values = np.concatenate([item['values'] for item in rank_data])
                 
-                global_stats['samples'][sample] = {
-                    'file_count': len(sample_data),
+                global_stats['ranks'][rank] = {
+                    'file_count': len(rank_data),
                     'total_values': len(all_values),
                     'mean': float(np.mean(all_values)),
                     'std': float(np.std(all_values)),
@@ -861,20 +860,20 @@ class TensorVisualizer:
         report_path = self.subdirs['overflow_analysis'] / 'overflow_analysis_report.png'
         self._create_placeholder_plot(report_path, "Overflow Analysis Report")
     
-    def _analyze_layer_distribution(self, layer: int, sample: int, layer_type: str, 
+    def _analyze_layer_distribution(self, layer: int, rank: int, layer_type: str, 
                                   tensor_type: str, quantization_comparison: bool):
         """Analyze layer-specific tensor distribution"""
         print(f"Analyzing layer {layer} distribution...")
-        print(f"  - Sample {sample} (represents GPU rank {sample})")
+        print(f"  - Rank {rank} (GPU rank)")
         
         # Load tensor data
         data = self.load_tensor_data()
         
-        # Filter data for specific layer and sample (rank)
+        # Filter data for specific layer and rank
         filtered_data = []
         for file_info in data['files']:
             if (file_info['layer'] == layer and 
-                file_info['sample'] == sample and 
+                file_info['rank'] == rank and 
                 file_info['layer_type'] == layer_type and
                 file_info['tensor_name'] is not None):
                 if not tensor_type or tensor_type in file_info['tensor_name']:
@@ -883,7 +882,7 @@ class TensorVisualizer:
         print(f"  - Found {len(filtered_data)} matching tensor files")
         
         if not filtered_data:
-            print(f"  - No tensor files found for layer {layer}, sample {sample}, type {layer_type}")
+            print(f"  - No tensor files found for layer {layer}, rank {rank}, type {layer_type}")
             return
         
         # Load actual tensor data
@@ -915,7 +914,7 @@ class TensorVisualizer:
         
         # Create distribution plot
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle(f'Layer {layer} Analysis (Sample {sample} = Rank {sample})', fontsize=16)
+        fig.suptitle(f'Layer {layer} Analysis (Rank {rank})', fontsize=16)
         
         # Plot 1: Tensor value distribution
         ax1 = axes[0, 0]
@@ -1061,11 +1060,11 @@ class TensorVisualizer:
         
         print("✅ Overflow analysis completed!")
     
-    def run_layer_analysis(self, layer: int = 1, sample: int = 0, 
+    def run_layer_analysis(self, layer: int = 1, rank: int = 0, 
                           layer_type: str = 'attention', tensor_type: str = '',
                           quantization_comparison: bool = False):
         """Run layer-specific analysis"""
-        print(f"Starting layer analysis for Layer {layer}, Sample {sample}, Type {layer_type}")
+        print(f"Starting layer analysis for Layer {layer}, Rank {rank}, Type {layer_type}")
         print(f"Tensor directory: {self.tensor_dir}")
         print(f"Output directory: {self.output_dir}")
         
@@ -1073,7 +1072,7 @@ class TensorVisualizer:
         self._create_output_directories()
         
         # Run layer analysis
-        self._analyze_layer_distribution(layer, sample, layer_type, tensor_type, quantization_comparison)
+        self._analyze_layer_distribution(layer, rank, layer_type, tensor_type, quantization_comparison)
         
         print("✅ Layer analysis completed!")
 
@@ -1089,8 +1088,8 @@ def main():
     # Layer analysis parameters
     parser.add_argument('--layer', type=int, default=1,
                        help='Layer number for analysis')
-    parser.add_argument('--sample', type=int, default=0,
-                       help='Sample number for analysis (now represents GPU rank since only one micro_batch is collected)')
+    parser.add_argument('--rank', type=int, default=0,
+                       help='GPU rank for analysis')
     parser.add_argument('--layer_type', type=str, default='attention',
                        choices=['attention', 'linear'],
                        help='Layer type for analysis')
@@ -1119,7 +1118,7 @@ def main():
     elif args.analysis_type == 'layer':
         visualizer.run_layer_analysis(
             layer=args.layer,
-            sample=args.sample,
+            rank=args.rank,
             layer_type=args.layer_type,
             tensor_type=args.tensor_type,
             quantization_comparison=args.quantization_comparison
