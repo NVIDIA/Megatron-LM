@@ -615,6 +615,11 @@ def forward_backward_no_pipelining(
                 try:
                     from megatron.core.tensor_saver import get_tensor_saver
                     tensor_saver = get_tensor_saver()
+                    print(f"[Pipeline DEBUG] No-pipelining阶段检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
+                    if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
+                        # 在no-pipelining模式下，第一个microbatch就收集tensor
+                        print(f"[Pipeline DEBUG] 在no-pipelining模式标记tensor收集")
+                        tensor_saver.mark_warmup_collection()
                     if tensor_saver.should_exit_after_forward():
                         print(f"[Pipeline] 已完成tensor收集，退出no_pipelining训练循环")
                         break
@@ -644,6 +649,18 @@ def forward_backward_no_pipelining(
         )
 
         total_num_tokens += num_tokens
+        
+        # 检查最后一个microbatch的tensor收集
+        try:
+            from megatron.core.tensor_saver import get_tensor_saver
+            tensor_saver = get_tensor_saver()
+            print(f"[Pipeline DEBUG] No-pipelining最后microbatch检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
+            if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
+                # 在no-pipelining模式下，第一个microbatch就收集tensor
+                print(f"[Pipeline DEBUG] 在no-pipelining模式最后microbatch标记tensor收集")
+                tensor_saver.mark_warmup_collection()
+        except Exception as e:
+            print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -2231,7 +2248,6 @@ def forward_backward_pipelining_without_interleaving(
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
         total_num_tokens += num_tokens
-        import pdb;pdb.set_trace()
         
         # 检查是否应该退出（tensor已在warmup阶段收集完成）
         try:
