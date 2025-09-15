@@ -2126,7 +2126,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=[['adam', 'sgd', 'soap', 'muon', 'dist_soap', 'dist_muon'],
+                       choices=['adam', 'sgd', 'soap', 'muon', 'dist_soap', 'dist_muon'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
