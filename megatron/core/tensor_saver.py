@@ -294,7 +294,18 @@ class TensorSaver:
     
     def should_exit_after_forward(self) -> bool:
         """检查是否应该在forward后退出"""
-        return self.enabled and self.collection_completed
+        # 只有在启用tensor保存且已完成收集时才退出
+        # 这里应该检查collection_completed，因为这是真正的收集完成标记
+        result = self.enabled and self.collection_completed
+        print(f"[TensorSaver DEBUG] should_exit_after_forward - enabled: {self.enabled}, collection_completed: {self.collection_completed}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, result: {result}")
+        return result
+    
+    def should_collect_tensor(self) -> bool:
+        """检查是否应该收集tensor"""
+        # 只有在启用tensor保存且未在warmup阶段收集过时才收集
+        result = self.enabled and not self.tensor_collected_in_warmup
+        print(f"[TensorSaver DEBUG] should_collect_tensor - enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, result: {result}")
+        return result
     
     def mark_warmup_collection(self):
         """标记已在warmup阶段收集过tensor"""
@@ -463,13 +474,8 @@ class TensorSaver:
         """
         print(f"[TensorSaver DEBUG] save_tensor调用 - layer_type: {layer_type}, operation: {operation}, enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}")
         
-        if not self.enabled:
-            print(f"[TensorSaver DEBUG] Tensor保存未启用，跳过")
-            return None
-        
-        # 如果已在warmup阶段收集过tensor，跳过steady state阶段的收集
-        if self.tensor_collected_in_warmup:
-            print(f"[TensorSaver DEBUG] 已在warmup阶段收集过tensor，跳过steady state阶段收集")
+        if not self.should_collect_tensor():
+            print(f"[TensorSaver DEBUG] 不应该收集tensor，跳过")
             return None
         
         # 当启用tensor保存时，会在一次forward后自动退出，无需额外检查

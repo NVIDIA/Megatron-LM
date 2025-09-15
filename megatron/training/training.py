@@ -1257,11 +1257,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
             print(f"[Training DEBUG] train_step完成 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
-            if tensor_saver.enabled and not tensor_saver.collection_completed:
+            if tensor_saver.enabled and tensor_saver.tensor_collected_in_warmup and not tensor_saver.collection_completed:
                 print(f"[Training DEBUG] 在train_step中标记tensor收集完成")
                 tensor_saver.mark_collection_completed()
             else:
-                print(f"[Training DEBUG] 跳过标记tensor收集完成 - enabled: {tensor_saver.enabled}, already_completed: {tensor_saver.collection_completed}")
+                print(f"[Training DEBUG] 跳过标记tensor收集完成 - enabled: {tensor_saver.enabled}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}, already_completed: {tensor_saver.collection_completed}")
         except Exception as e:
             print(f"[Training] Warning: 无法标记tensor收集完成: {e}")
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()

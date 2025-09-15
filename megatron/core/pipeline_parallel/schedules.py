@@ -2181,9 +2181,8 @@ def forward_backward_pipelining_without_interleaving(
                 # 在warmup阶段收集tensor
                 print(f"[Pipeline DEBUG] 在warmup阶段标记tensor收集")
                 tensor_saver.mark_warmup_collection()
-                tensor_saver.mark_collection_completed()
-                print(f"[Pipeline] 已在warmup阶段收集tensor，准备退出")
-                break
+                # 注意：这里不立即标记collection_completed，让tensor实际保存后再标记
+                print(f"[Pipeline] 已在warmup阶段开始收集tensor，继续运行以完成收集")
             else:
                 print(f"[Pipeline DEBUG] Warmup阶段跳过tensor收集 - enabled: {tensor_saver.enabled}, already_collected: {tensor_saver.tensor_collected_in_warmup}")
         except Exception as e:
@@ -2239,7 +2238,7 @@ def forward_backward_pipelining_without_interleaving(
             tensor_saver = get_tensor_saver()
             print(f"[Pipeline DEBUG] Steady state阶段检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
             if tensor_saver.should_exit_after_forward():
-                print(f"[Pipeline] Tensor已在warmup阶段收集完成，退出训练循环")
+                print(f"[Pipeline] Tensor收集已完成，退出训练循环")
                 break
             else:
                 print(f"[Pipeline DEBUG] Steady state阶段继续运行 - should_exit: {tensor_saver.should_exit_after_forward()}")
