@@ -488,33 +488,89 @@ class TensorSaver:
             
             # iteration数据计数已简化，无需手动增加
             
-            # 准备保存数据
-            save_data = {
-                "tensor": tensor.detach().cpu(),  # 移动到CPU并分离梯度
-                "tensor_info": self._get_tensor_info(tensor),
-                "metadata": {
-                    "layer_type": layer_type,
-                    "operation": operation,
-                    "quant_type": quant_type,
-                    "tensor_name": tensor_name,
-                    "layer_idx": layer_idx,
-                    "phase": phase,
-                    "component": component,
-                    "rank": rank,
-                    "iteration": self.current_iteration,
-                    "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    **(metadata or {})
+            # 准备保存数据 - 添加更安全的tensor处理
+            try:
+                # 先获取tensor信息（在移动之前）
+                tensor_info = self._get_tensor_info(tensor)
+                
+                # 安全地处理tensor
+                if tensor.is_cuda:
+                    tensor_cpu = tensor.detach().cpu()
+                else:
+                    tensor_cpu = tensor.detach().clone()
+                
+                # 确保tensor是连续的
+                if not tensor_cpu.is_contiguous():
+                    tensor_cpu = tensor_cpu.contiguous()
+                
+                save_data = {
+                    "tensor": tensor_cpu,
+                    "tensor_info": tensor_info,
+                    "metadata": {
+                        "layer_type": layer_type,
+                        "operation": operation,
+                        "quant_type": quant_type,
+                        "tensor_name": tensor_name,
+                        "layer_idx": layer_idx,
+                        "phase": phase,
+                        "component": component,
+                        "rank": rank,
+                        "iteration": self.current_iteration,
+                        "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        **(metadata or {})
+                    }
                 }
-            }
+            except Exception as tensor_error:
+                print(f"[TensorSaver] 处理tensor时出错: {tensor_error}")
+                # 如果tensor处理失败，尝试更简单的方式
+                save_data = {
+                    "tensor": tensor.detach().cpu().contiguous(),
+                    "tensor_info": {"shape": list(tensor.shape), "dtype": str(tensor.dtype)},
+                    "metadata": {
+                        "layer_type": layer_type,
+                        "operation": operation,
+                        "quant_type": quant_type,
+                        "tensor_name": tensor_name,
+                        "layer_idx": layer_idx,
+                        "phase": phase,
+                        "component": component,
+                        "rank": rank,
+                        "iteration": self.current_iteration,
+                        "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        **(metadata or {})
+                    }
+                }
             
-            # 保存到文件
-            torch.save(save_data, filepath)
-            
-            print(f"[TensorSaver] 已保存: {filename} "
-                  f"(shape={tensor.shape}, dtype={tensor.dtype}, "
-                  f"range=[{save_data['tensor_info']['min']:.4f}, {save_data['tensor_info']['max']:.4f}])")
-            
-            return str(filepath)
+            # 保存到文件 - 添加更安全的保存过程
+            try:
+                # 确保目录存在
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+                
+                # 使用更安全的保存方式
+                torch.save(save_data, filepath, _use_new_zipfile_serialization=False)
+                
+                # 验证文件是否保存成功
+                if filepath.exists() and filepath.stat().st_size > 0:
+                    print(f"[TensorSaver] 已保存: {filename} "
+                          f"(shape={tensor.shape}, dtype={tensor.dtype}, "
+                          f"size={filepath.stat().st_size} bytes)")
+                    return str(filepath)
+                else:
+                    print(f"[TensorSaver] 保存失败: 文件为空或不存在")
+                    return None
+                    
+            except Exception as save_error:
+                print(f"[TensorSaver] 保存文件时出错: {save_error}")
+                # 尝试使用pickle保存
+                try:
+                    import pickle
+                    with open(filepath.with_suffix('.pkl'), 'wb') as f:
+                        pickle.dump(save_data, f)
+                    print(f"[TensorSaver] 使用pickle保存成功: {filename}")
+                    return str(filepath.with_suffix('.pkl'))
+                except Exception as pickle_error:
+                    print(f"[TensorSaver] pickle保存也失败: {pickle_error}")
+                    return None
             
         except Exception as e:
             print(f"[TensorSaver] 保存tensor失败: {e}")
