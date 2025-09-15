@@ -277,6 +277,7 @@ class TensorSaver:
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
             print(f"[TensorSaver] 初始化完成，保存目录: {self.save_dir}")
+            print(f"[TensorSaver] 保存目录绝对路径: {self.save_dir.absolute()}")
             print(f"[TensorSaver DEBUG] 初始化状态 - enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, collection_completed: {self.collection_completed}")
     
     def set_iteration(self, iteration: int):
@@ -510,6 +511,8 @@ class TensorSaver:
             filename = self._generate_filename(layer_type, operation, quant_type, tensor_name, 
                                             layer_idx, phase, component, rank, tensor_group_idx)
             filepath = self.save_dir / filename
+            print(f"[TensorSaver DEBUG] 文件路径 - save_dir: {self.save_dir}, filename: {filename}, filepath: {filepath}")
+            print(f"[TensorSaver DEBUG] 文件路径绝对路径: {filepath.absolute()}")
             
             # iteration数据计数已简化，无需手动增加
             
@@ -716,18 +719,24 @@ def get_tensor_saver() -> TensorSaver:
         save_dir = os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
         enabled = os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
         
+        print(f"[TensorSaver DEBUG] 环境变量 - TENSOR_SAVE_DIR: {os.environ.get('TENSOR_SAVE_DIR')}, TENSOR_SAVE_ENABLED: {os.environ.get('TENSOR_SAVE_ENABLED')}")
+        print(f"[TensorSaver DEBUG] 初始配置 - save_dir: {save_dir}, enabled: {enabled}")
+        
         # 尝试从命令行参数获取配置（如果可用）
         try:
             from megatron.training.global_vars import get_args
             args = get_args()
+            print(f"[TensorSaver DEBUG] 命令行参数 - tensor_save_dir: {getattr(args, 'tensor_save_dir', None)}, save_tensors: {getattr(args, 'save_tensors', None)}")
             if hasattr(args, 'tensor_save_dir') and args.tensor_save_dir:
+                print(f"[TensorSaver DEBUG] 使用命令行参数 tensor_save_dir: {args.tensor_save_dir}")
                 save_dir = args.tensor_save_dir
             if hasattr(args, 'save_tensors'):
+                print(f"[TensorSaver DEBUG] 使用命令行参数 save_tensors: {args.save_tensors}")
                 enabled = args.save_tensors or enabled
         except Exception as e:
             print(f"[TensorSaver] 无法从命令行参数获取配置，使用环境变量: {e}")
         
-        print(f"[TensorSaver] 初始化配置 - save_dir: {save_dir}, enabled: {enabled}, control_micro_batches: 1 (固定)")
+        print(f"[TensorSaver] 最终配置 - save_dir: {save_dir}, enabled: {enabled}, control_micro_batches: 1 (固定)")
         _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled)
         
         # 从环境变量设置iteration
