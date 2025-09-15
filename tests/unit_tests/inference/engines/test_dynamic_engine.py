@@ -327,9 +327,8 @@ class TestDynamicInferenceEngine:
     def _run_step(cls, env):
         set_rounder(4)
         # Step inference engine (i.e., generate one token per request).
-        active_requests, finished_requests, step_time = env.engine.step(
-            env.sampling_params, verbose=False
-        )
+        result = env.engine.step_modern(env.sampling_params, verbose=False)
+        finished_requests = result["finished_requests"]
 
         # Nothing done?
         if len(finished_requests) == 0:
@@ -786,7 +785,7 @@ if __name__ == "__main__":
     test.test_overflow_factor()
     test.test_request_overflow()
     test.test_token_overflow_transient()
-    test.test_token_overflow_nontransient()
+    # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
     test.test_chunk_overflow()
     test.test_multi_add()
     test.test_fixed_output_lengths()
@@ -795,6 +794,7 @@ if __name__ == "__main__":
     test.test_generate_function()
     asyncio.run(test.test_run_engine())
     test.test_return_log_probs()
+    test.test_parallel_inference()
     test.teardown_method(None)
     print("~~~")
     print("success.")
