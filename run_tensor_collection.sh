@@ -228,6 +228,16 @@ export CONTROL_ITER="$control_iter"
     echo "  - 检查点路径: $checkpoint_path"
     echo "  - TensorBoard路径: $HOST_TENSORBOARD_LOGS_PATH"
     echo "  - 控制micro_batch数量: $control_iter"
+    echo ""
+    echo "环境变量设置:"
+    echo "  - TENSOR_SAVE_ENABLED: $TENSOR_SAVE_ENABLED"
+    echo "  - TENSOR_SAVE_DIR: $TENSOR_SAVE_DIR"
+    echo "  - CONTROL_ITER: $CONTROL_ITER"
+    echo ""
+    echo "训练命令参数:"
+    echo "  - --save-tensors: 启用"
+    echo "  - --tensor-save-dir: $tensor_path"
+    echo "  - --control-iter: $control_iter"
     
     # 运行训练脚本
     local log_file="training_${quant_type}_$(date +'%y-%m-%d_%H-%M-%S').log"
@@ -238,7 +248,8 @@ export CONTROL_ITER="$control_iter"
         "$DATA_PATH" \
         "$DTYPE" \
         --control-iter "$control_iter" \
-        # collect_micro_batches已固定为1，无需传递参数
+        --save-tensors \
+        --tensor-save-dir "$tensor_path" \
         2>&1 | tee "$log_file" 
     
     # 最终统计
@@ -246,6 +257,15 @@ export CONTROL_ITER="$control_iter"
     echo ""
     echo "✅ $quant_type 量化类型tensor收集完成"
     echo "  - 最终收集到: $final_count 个tensor文件"
+    echo "  - 实际保存路径: $tensor_path"
+    
+    # 检查父目录是否有文件
+    local parent_path=$(dirname "$tensor_path")
+    local parent_count=$(find "$parent_path" -name "*.pt" 2>/dev/null | wc -l)
+    if [ $parent_count -gt 0 ]; then
+        echo "  - 父目录文件数量: $parent_count (可能数据保存在父目录)"
+        echo "  - 父目录路径: $parent_path"
+    fi
     
     # 显示统计信息
     if [ $final_count -gt 0 ]; then
