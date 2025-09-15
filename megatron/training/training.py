@@ -2228,6 +2228,18 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
+        
+        # 检查tensor收集是否完成，如果完成则设置should_exit
+        if getattr(args, 'save_tensors', False):
+            try:
+                from megatron.core.tensor_saver import get_tensor_saver
+                tensor_saver = get_tensor_saver()
+                if tensor_saver.should_exit_after_forward():
+                    print_rank_0(f"[Training] Tensor收集已完成，准备退出训练")
+                    should_exit = True
+            except Exception as e:
+                print(f"[Training] Warning: 无法检查tensor saver状态: {e}")
+        
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
