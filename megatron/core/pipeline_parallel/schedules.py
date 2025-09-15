@@ -2176,8 +2176,11 @@ def forward_backward_pipelining_without_interleaving(
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            if tensor_saver.should_exit_after_forward():
-                print(f"[Pipeline] 已完成tensor收集，退出warmup阶段")
+            if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
+                # 在warmup阶段收集tensor
+                tensor_saver.mark_warmup_collection()
+                tensor_saver.mark_collection_completed()
+                print(f"[Pipeline] 已在warmup阶段收集tensor，准备退出")
                 break
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
@@ -2226,12 +2229,12 @@ def forward_backward_pipelining_without_interleaving(
         )
         total_num_tokens += num_tokens
         
-        # 检查是否应该退出（在完成一个完整forward pass后）
+        # 检查是否应该退出（tensor已在warmup阶段收集完成）
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
             if tensor_saver.should_exit_after_forward():
-                print(f"[Pipeline] 已完成tensor收集，退出训练循环")
+                print(f"[Pipeline] Tensor已在warmup阶段收集完成，退出训练循环")
                 break
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")

@@ -272,6 +272,7 @@ class TensorSaver:
         self.micro_batch_count = 0
         self.control_micro_batches = 1  # 固定为1，进行一次完整forward后跳出
         self.collection_completed = False  # 标记是否已完成收集
+        self.tensor_collected_in_warmup = False  # 标记是否已在warmup阶段收集过tensor
         
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +294,15 @@ class TensorSaver:
     def should_exit_after_forward(self) -> bool:
         """检查是否应该在forward后退出"""
         return self.enabled and self.collection_completed
+    
+    def mark_warmup_collection(self):
+        """标记已在warmup阶段收集过tensor"""
+        self.tensor_collected_in_warmup = True
+        print(f"[TensorSaver] 标记已在warmup阶段收集tensor")
+    
+    def should_collect_in_steady_state(self) -> bool:
+        """检查是否应该在steady state阶段收集tensor"""
+        return self.enabled and not self.tensor_collected_in_warmup
     
     def _get_tensor_info(self, tensor: torch.Tensor) -> Dict[str, Any]:
         """获取tensor的基本信息"""
@@ -451,6 +461,10 @@ class TensorSaver:
             保存的文件路径，如果未启用则返回None
         """
         if not self.enabled:
+            return None
+        
+        # 如果已在warmup阶段收集过tensor，跳过steady state阶段的收集
+        if self.tensor_collected_in_warmup:
             return None
         
         # 当启用tensor保存时，会在一次forward后自动退出，无需额外检查
