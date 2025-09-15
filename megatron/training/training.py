@@ -1256,8 +1256,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
+            print(f"[Training DEBUG] train_step完成 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
             if tensor_saver.enabled and not tensor_saver.collection_completed:
+                print(f"[Training DEBUG] 在train_step中标记tensor收集完成")
                 tensor_saver.mark_collection_completed()
+            else:
+                print(f"[Training DEBUG] 跳过标记tensor收集完成 - enabled: {tensor_saver.enabled}, already_completed: {tensor_saver.collection_completed}")
         except Exception as e:
             print(f"[Training] Warning: 无法标记tensor收集完成: {e}")
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
@@ -2234,9 +2238,12 @@ def train(
             try:
                 from megatron.core.tensor_saver import get_tensor_saver
                 tensor_saver = get_tensor_saver()
+                print_rank_0(f"[Training DEBUG] 主循环检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}, should_exit: {tensor_saver.should_exit_after_forward()}")
                 if tensor_saver.should_exit_after_forward():
                     print_rank_0(f"[Training] Tensor收集已完成，准备退出训练")
                     should_exit = True
+                else:
+                    print_rank_0(f"[Training DEBUG] 继续训练 - should_exit: {tensor_saver.should_exit_after_forward()}")
             except Exception as e:
                 print(f"[Training] Warning: 无法检查tensor saver状态: {e}")
         

@@ -277,6 +277,7 @@ class TensorSaver:
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
             print(f"[TensorSaver] 初始化完成，保存目录: {self.save_dir}")
+            print(f"[TensorSaver DEBUG] 初始化状态 - enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, collection_completed: {self.collection_completed}")
     
     def set_iteration(self, iteration: int):
         """设置当前iteration"""
@@ -460,11 +461,15 @@ class TensorSaver:
         Returns:
             保存的文件路径，如果未启用则返回None
         """
+        print(f"[TensorSaver DEBUG] save_tensor调用 - layer_type: {layer_type}, operation: {operation}, enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}")
+        
         if not self.enabled:
+            print(f"[TensorSaver DEBUG] Tensor保存未启用，跳过")
             return None
         
         # 如果已在warmup阶段收集过tensor，跳过steady state阶段的收集
         if self.tensor_collected_in_warmup:
+            print(f"[TensorSaver DEBUG] 已在warmup阶段收集过tensor，跳过steady state阶段收集")
             return None
         
         # 当启用tensor保存时，会在一次forward后自动退出，无需额外检查
