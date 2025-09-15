@@ -4,7 +4,7 @@ import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from llm_shower.orthogonalized_optimizers.muon import Muon
+from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
 
