@@ -176,15 +176,6 @@ check_requirements() {
         exit 1
     fi
     
-    if [ ! -d "$DATA_PATH" ]; then
-        echo "错误: 数据路径不存在: $DATA_PATH"
-        exit 1
-    fi
-    
-    if [ ! -d "$TOKENIZER_PATH" ]; then
-        echo "警告: 分词器路径不存在: $TOKENIZER_PATH"
-    fi
-    
     echo "✅ 必要文件检查完成"
 }
 
