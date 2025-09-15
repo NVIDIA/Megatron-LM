@@ -457,6 +457,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+            # Metadata for mapping requests to slots in the static Mamba state buffer
+            self.request_to_mamba_state_idx = torch.full(
+                (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.request_to_mamba_state_idx_decode_only = torch.full(
+                (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            # Allocator for Mamba state slots
+            self.mamba_state_free_slots = torch.arange(
+                self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.mamba_state_free_slot_count = self.max_requests
         else:
             self.mamba_conv_states = None
             self.mamba_ssm_states = None
@@ -622,14 +634,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
-
-        paused_request_count = self.paused_request_count
-        total_request_count = paused_request_count + self.padded_active_request_count
-
-        # TODO(ksanthanam): Handle padding tokens for non-decode CUDA graphs
-        layer_number = self.layer_map[layer_number - 1]
-        conv_state = self.mamba_conv_states[layer_number][paused_request_count:total_request_count]
-        ssm_state = self.mamba_ssm_states[layer_number][paused_request_count:total_request_count]
+        
+        mamba_layer_number = self.layer_map[layer_number - 1]
+        conv_state = self.mamba_conv_states[mamba_layer_number]
+        ssm_state = self.mamba_ssm_states[mamba_layer_number]
+        
         return (conv_state, ssm_state)
 
     def apply_rotary_emb_query(
@@ -712,12 +721,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_seq_lengths_decode_only.fill_(0)
         self.request_to_kv_chunk_ids_decode_only.fill_(0)
         self.block_table = None
+        if self.is_hybrid_model:
+            self.mamba_block_table = None
+            self.request_to_mamba_state_idx_decode_only.fill_(-1)
 
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
             self.mamba_conv_states.fill_(0)
             self.mamba_ssm_states.fill_(0)
+            self.mamba_state_free_slots = torch.arange(
+                self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.mamba_state_free_slot_count = self.max_requests
 
     def initialize_attention_state(self, *, num_warmup_requests: Optional[int] = None) -> None:
         """Initialize attention state so that every layer can use it.
@@ -846,6 +862,22 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_request_count : self.total_request_count
             ]
 
+        # Create Mamba state block table if it's a hybrid model
+        if self.is_hybrid_model:
+            active_mamba_indices = self.request_to_mamba_state_idx[
+                self.paused_request_count : self.total_request_count
+            ]
+
+            if self.is_decode_only():
+                self.request_to_mamba_state_idx_decode_only[
+                    0 : self.total_request_count - self.paused_request_count
+                ] = active_mamba_indices
+                self.mamba_block_table = self.request_to_mamba_state_idx_decode_only[
+                    : self.padded_active_request_count
+                ]
+            else:
+                self.mamba_block_table = active_mamba_indices
+
     def reset(self) -> None:
         """Reset entire context.
 
@@ -876,6 +908,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_id.fill_(-1)
         self.request_last_kv_chunk_offset.fill_(0)
         self.request_to_kv_chunk_ids.fill_(-1)
+        if self.is_hybrid_model:
+            self.request_to_mamba_state_idx.fill_(-1)
 
         # Reset token indexes.
         self.token_to_input_ids.fill_(0)
@@ -1025,8 +1059,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         ] = (arange_context_length % self.chunk_size_tokens)
 
         if self.is_hybrid_model:
-            self.mamba_conv_states[:, self.total_request_count] = 0.0
-            self.mamba_ssm_states[:, self.total_request_count] = 0.0
+            # Allocate a slot for Mamba states
+            assert self.mamba_state_free_slot_count > 0, "Not enough Mamba state slots available."
+            self.mamba_state_free_slot_count -= 1
+            mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+            self.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
+
+            # Initialize the allocated Mamba state
+            self.mamba_conv_states[:, mamba_idx] = 0.0
+            self.mamba_ssm_states[:, mamba_idx] = 0.0
 
         # Increment request and token counts.
         self.total_request_count += 1
@@ -1048,8 +1089,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
 
         if self.is_hybrid_model:
-            self.mamba_conv_states[:, dst_idxs] = self.mamba_conv_states[:, src_idxs]
-            self.mamba_ssm_states[:, dst_idxs] = self.mamba_ssm_states[:, src_idxs]
+            self.request_to_mamba_state_idx[dst_idxs] = self.request_to_mamba_state_idx[src_idxs]
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> None:
@@ -1116,6 +1156,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 non_zero_values_in_kv_memory = kv_chunks_assigned[kv_chunks_assigned != -1]
                 self.chunk_allocator.release_memory_chunks(non_zero_values_in_kv_memory)
 
+                if self.is_hybrid_model:
+                    mamba_indices_to_free = self.request_to_mamba_state_idx[finished_idxs]
+                    mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
+                    num_to_free = len(mamba_indices_to_free)
+                    if num_to_free > 0:
+                        start_idx = self.mamba_state_free_slot_count
+                        end_idx = start_idx + num_to_free
+                        self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
+                        self.mamba_state_free_slot_count = end_idx
+                    self.request_to_mamba_state_idx[finished_idxs] = -1
+
             # Reset request/token counts.
             self.request_to_kv_chunk_ids.fill_(-1)
             self.total_request_count = 0
@@ -1151,10 +1202,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             # and updates it instead of the original tensor.
             self.request_to_kv_chunk_ids[finished_idxs] = -1
 
-            # Reset the Mamba states for finished requests.
             if self.is_hybrid_model:
-                self.mamba_conv_states[:, finished_idxs] = 0
-                self.mamba_ssm_states[:, finished_idxs] = 0
+                # Get the Mamba state indices for finished requests
+                mamba_indices_to_free = self.request_to_mamba_state_idx[finished_idxs]
+                # Filter out any invalid indices (-1)
+                mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
+                num_to_free = len(mamba_indices_to_free)
+
+                if num_to_free > 0:
+                    # Add the freed indices back to the free slot pool
+                    start_idx = self.mamba_state_free_slot_count
+                    end_idx = start_idx + num_to_free
+                    self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
+                    self.mamba_state_free_slot_count = end_idx
+
+                # Invalidate the Mamba state index for the finished requests
+                self.request_to_mamba_state_idx[finished_idxs] = -1
 
             if active_request_count > 0:
                 finished_idxs_on_left = (
@@ -1178,8 +1241,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Reset chunk ids for recently moved requests.
                 self.request_to_kv_chunk_ids[active_idxs_on_right] = -1
                 if self.is_hybrid_model:
-                    self.mamba_conv_states[:, active_idxs_on_right] = 0
-                    self.mamba_ssm_states[:, active_idxs_on_right] = 0
+                    self.request_to_mamba_state_idx[active_idxs_on_right] = -1
 
         # 5. We identify requests that require a new chunk and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current chunk and  require a new one in a pause state temporarily

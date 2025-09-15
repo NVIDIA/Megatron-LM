@@ -671,13 +671,10 @@ class MambaMixer(MegatronModule):
 
         # Fast path: decode-only
         if context.is_decode_only():
-            hidden_states = hidden_states[: context.active_token_count]
-            conv_state = conv_state[: context.active_token_count]
-            ssm_state = ssm_state[: context.active_token_count]
+            batch_indices = context.request_to_mamba_state_idx_decode_only 
 
-            out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state)
-            out, out_bias = self._pad(out.transpose(0, 1), out_bias, context)
-            return out, out_bias
+            out, out_bias, _, _ = self.step(hidden_states.transpose(0, 1), conv_state, ssm_state, batch_indices)
+            return out.transpose(0, 1), out_bias
 
         # Compute split between decode and prefill
         seq_idx, cu_seqlens, _return_varlen_states = self._get_varlen_generation_state(context)
@@ -729,7 +726,7 @@ class MambaMixer(MegatronModule):
         out, out_bias = self._pad(out, out_bias, context)
         return out, out_bias
 
-    def step(self, hidden_states, conv_state, ssm_state):
+    def step(self, hidden_states, conv_state, ssm_state, batch_indices=None):
         """
         Performs inference step for decoding
         """
@@ -779,6 +776,7 @@ class MambaMixer(MegatronModule):
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
+                conv_state_indices=batch_indices,
             )
 
         x, B, C = torch.split(
@@ -859,6 +857,7 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=dt_bias,
                 dt_softplus=True,
+                state_batch_indices=batch_indices,
             )
             y = rearrange(y, "b h p -> b (h p)")
 
@@ -906,7 +905,7 @@ class MambaMixer(MegatronModule):
         # TODO(ksanthanam): Handle padding tokens for non-decode CUDA graphs
         active_token_count = inference_context.active_token_count
         seq_idx = (
-            inference_context.token_to_request_idx[:active_token_count]
+            inference_context.token_to_request_idx
             .clone()
             .to(torch.int32)
             .unsqueeze(0)
