@@ -269,11 +269,13 @@ class TensorVisualizer:
                         return None
             
             if isinstance(tensor, torch.Tensor):
-                return tensor.numpy()
+                # Convert to float32 before numpy conversion to handle BFloat16
+                return tensor.cpu().float().numpy()
             elif isinstance(tensor, dict) and 'tensor' in tensor:
                 # Handle enhanced tensor format
                 if isinstance(tensor['tensor'], torch.Tensor):
-                    return tensor['tensor'].numpy()
+                    # Convert to float32 before numpy conversion to handle BFloat16
+                    return tensor['tensor'].cpu().float().numpy()
             return None
         except Exception as e:
             # Silent failure for corrupted files
@@ -982,7 +984,8 @@ class TensorVisualizer:
         for i, tensor_info in enumerate(tensors[:5]):  # Limit to first 5 tensors
             tensor = tensor_info['tensor']
             if tensor is not None and tensor.numel() > 0:
-                tensor_values = tensor.flatten().cpu().numpy()
+                # Convert to float32 before numpy conversion to handle BFloat16
+                tensor_values = tensor.flatten().cpu().float().numpy()
                 if len(tensor_values) > 0:
                     ax1.hist(tensor_values, bins=50, alpha=0.7, 
                             label=f"{tensor_info['info']['tensor_name']}")
@@ -1000,7 +1003,8 @@ class TensorVisualizer:
         for tensor_info in tensors[:5]:
             tensor = tensor_info['tensor']
             if tensor is not None and tensor.numel() > 0:
-                tensor_values = tensor.flatten().cpu().numpy()
+                # Convert to float32 before numpy conversion to handle BFloat16
+                tensor_values = tensor.flatten().cpu().float().numpy()
                 if len(tensor_values) > 0:
                     tensor_names.append(tensor_info['info']['tensor_name'])
                     means.append(np.mean(tensor_values))
@@ -1026,7 +1030,8 @@ class TensorVisualizer:
                 tensor = tensor_info['tensor']
                 if (quant_type is not None and tensor is not None and 
                     tensor.numel() > 0):
-                    tensor_values = tensor.flatten().cpu().numpy()
+                    # Convert to float32 before numpy conversion to handle BFloat16
+                    tensor_values = tensor.flatten().cpu().float().numpy()
                     if len(tensor_values) > 0:
                         if quant_type not in quant_stats:
                             quant_stats[quant_type] = []
@@ -1051,7 +1056,8 @@ class TensorVisualizer:
         for tensor_info in tensors:
             tensor = tensor_info['tensor']
             if tensor is not None and tensor.numel() > 0:
-                tensor_values = tensor.flatten().cpu().numpy()
+                # Convert to float32 before numpy conversion to handle BFloat16
+                tensor_values = tensor.flatten().cpu().float().numpy()
                 if len(tensor_values) > 0:
                     summary_data.append({
                         'name': tensor_info['info']['tensor_name'],
