@@ -160,8 +160,8 @@ runs:
           --env HF_HOME=/home/TestData/HF_HOME \
           --env NEMO_HOME=/home/TestData/nemo_home \
           --env RUN_ID=${{ github.run_id }} \
-          --workdir /opt/Megatron-LM \
-          --volume ${{ github.workspace }}/Megatron-LM:/opt/Megatron-LM \
+          --workdir /opt/megatron-lm/ \
+          --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
           megatron-bridge \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
