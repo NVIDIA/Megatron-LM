@@ -104,8 +104,17 @@ class TensorVisualizer:
             elif 'backward' in filename:
                 operation = 'backward'
             
-            # Find tensor name
+            # Find tensor name (filter out bias and hidden states that are not actually saved)
             tensor_name = parts[-1].replace('.pt', '')
+            
+            # Skip bias and hidden states that are not actually saved
+            if 'bias' in tensor_name.lower() or 'hidden' in tensor_name.lower():
+                return None
+            
+            # Only process actual saved tensors: input, output, weight, attention_weights
+            valid_tensor_names = ['input', 'output', 'weight', 'attention_weights', 'grad_input', 'grad_output']
+            if not any(valid_name in tensor_name.lower() for valid_name in valid_tensor_names):
+                return None
             
             return {
                 'quant_type': quant_type,
@@ -230,7 +239,7 @@ class TensorVisualizer:
                     'count': len(files),
                     'layers': len(set(f['layer'] for f in files if f['layer'] is not None)),
                     'samples': len(set(f['sample'] for f in files if f['sample'] is not None)),
-                    'layer_types': list(set(f['layer_type'] for f in files if f['layer_type']))
+                    'layer_types': list(set(f['layer_type'] for f in files if f['layer_type'] is not None))
                 }
             pbar.update(1)
         pbar.close()
@@ -242,7 +251,7 @@ class TensorVisualizer:
             if files:
                 stats['sample_stats'][sample] = {
                     'count': len(files),
-                    'quant_types': list(set(f['quant_type'] for f in files)),
+                    'quant_types': list(set(f['quant_type'] for f in files if f['quant_type'] is not None)),
                     'layers': len(set(f['layer'] for f in files if f['layer'] is not None))
                 }
             pbar.update(1)
@@ -255,9 +264,9 @@ class TensorVisualizer:
             if files:
                 stats['layer_stats'][layer] = {
                     'count': len(files),
-                    'quant_types': list(set(f['quant_type'] for f in files)),
+                    'quant_types': list(set(f['quant_type'] for f in files if f['quant_type'] is not None)),
                     'samples': len(set(f['sample'] for f in files if f['sample'] is not None)),
-                    'layer_types': list(set(f['layer_type'] for f in files if f['layer_type']))
+                    'layer_types': list(set(f['layer_type'] for f in files if f['layer_type'] is not None))
                 }
             pbar.update(1)
         pbar.close()
@@ -269,7 +278,7 @@ class TensorVisualizer:
             if files:
                 stats['layer_type_stats'][layer_type] = {
                     'count': len(files),
-                    'quant_types': list(set(f['quant_type'] for f in files)),
+                    'quant_types': list(set(f['quant_type'] for f in files if f['quant_type'] is not None)),
                     'layers': len(set(f['layer'] for f in files if f['layer'] is not None))
                 }
             pbar.update(1)
@@ -410,7 +419,7 @@ class TensorVisualizer:
         layer_stats = {}
         for item in hifp8_data:
             layer = item['layer']
-            if layer is not None:
+            if layer is not None and item['values'] is not None:
                 if layer not in layer_stats:
                     layer_stats[layer] = []
                 layer_stats[layer].extend(item['values'])
@@ -438,7 +447,7 @@ class TensorVisualizer:
         sample_stats = {}
         for item in hifp8_data:
             sample = item['sample']
-            if sample is not None:
+            if sample is not None and item['values'] is not None:
                 if sample not in sample_stats:
                     sample_stats[sample] = []
                 sample_stats[sample].extend(item['values'])
@@ -562,7 +571,7 @@ class TensorVisualizer:
         
         for file_info in data['files']:
             tensor_values = self.load_tensor_values(file_info)
-            if tensor_values is not None:
+            if tensor_values is not None and len(tensor_values) > 0:
                 all_tensor_data.append({
                     'file_info': file_info,
                     'values': tensor_values.flatten(),
@@ -860,7 +869,8 @@ class TensorVisualizer:
         for file_info in data['files']:
             if (file_info['layer'] == layer and 
                 file_info['sample'] == sample and 
-                file_info['layer_type'] == layer_type):
+                file_info['layer_type'] == layer_type and
+                file_info['tensor_name'] is not None):
                 if not tensor_type or tensor_type in file_info['tensor_name']:
                     filtered_data.append(file_info)
         
@@ -875,11 +885,13 @@ class TensorVisualizer:
         for file_info in filtered_data:
             try:
                 tensor_data = torch.load(file_info['file_path'])
-                if 'tensor' in tensor_data:
-                    tensors.append({
-                        'tensor': tensor_data['tensor'],
-                        'info': file_info
-                    })
+                if 'tensor' in tensor_data and tensor_data['tensor'] is not None:
+                    tensor = tensor_data['tensor']
+                    if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                        tensors.append({
+                            'tensor': tensor,
+                            'info': file_info
+                        })
             except Exception as e:
                 print(f"  - Failed to load {file_info['filename']}: {e}")
         
@@ -902,8 +914,12 @@ class TensorVisualizer:
         # Plot 1: Tensor value distribution
         ax1 = axes[0, 0]
         for i, tensor_info in enumerate(tensors[:5]):  # Limit to first 5 tensors
-            tensor = tensor_info['tensor'].flatten().cpu().numpy()
-            ax1.hist(tensor, bins=50, alpha=0.7, label=f"{tensor_info['info']['tensor_name']}")
+            tensor = tensor_info['tensor']
+            if tensor is not None and tensor.numel() > 0:
+                tensor_values = tensor.flatten().cpu().numpy()
+                if len(tensor_values) > 0:
+                    ax1.hist(tensor_values, bins=50, alpha=0.7, 
+                            label=f"{tensor_info['info']['tensor_name']}")
         ax1.set_title('Value Distribution')
         ax1.set_xlabel('Value')
         ax1.set_ylabel('Frequency')
@@ -916,10 +932,13 @@ class TensorVisualizer:
         means = []
         stds = []
         for tensor_info in tensors[:5]:
-            tensor = tensor_info['tensor'].flatten().cpu().numpy()
-            tensor_names.append(tensor_info['info']['tensor_name'])
-            means.append(np.mean(tensor))
-            stds.append(np.std(tensor))
+            tensor = tensor_info['tensor']
+            if tensor is not None and tensor.numel() > 0:
+                tensor_values = tensor.flatten().cpu().numpy()
+                if len(tensor_values) > 0:
+                    tensor_names.append(tensor_info['info']['tensor_name'])
+                    means.append(np.mean(tensor_values))
+                    stds.append(np.std(tensor_values))
         
         x = np.arange(len(tensor_names))
         ax2.bar(x - 0.2, means, 0.4, label='Mean', alpha=0.7)
@@ -938,13 +957,18 @@ class TensorVisualizer:
             quant_stats = {}
             for tensor_info in tensors:
                 quant_type = tensor_info['info']['quant_type']
-                tensor = tensor_info['tensor'].flatten().cpu().numpy()
-                if quant_type not in quant_stats:
-                    quant_stats[quant_type] = []
-                quant_stats[quant_type].extend(tensor)
+                tensor = tensor_info['tensor']
+                if (quant_type is not None and tensor is not None and 
+                    tensor.numel() > 0):
+                    tensor_values = tensor.flatten().cpu().numpy()
+                    if len(tensor_values) > 0:
+                        if quant_type not in quant_stats:
+                            quant_stats[quant_type] = []
+                        quant_stats[quant_type].extend(tensor_values)
             
             for quant_type, values in quant_stats.items():
-                ax3.hist(values, bins=30, alpha=0.7, label=f"{quant_type}")
+                if len(values) > 0:
+                    ax3.hist(values, bins=30, alpha=0.7, label=f"{quant_type}")
             ax3.set_title('Quantization Type Comparison')
             ax3.set_xlabel('Value')
             ax3.set_ylabel('Frequency')
@@ -959,14 +983,17 @@ class TensorVisualizer:
         ax4 = axes[1, 1]
         summary_data = []
         for tensor_info in tensors:
-            tensor = tensor_info['tensor'].flatten().cpu().numpy()
-            summary_data.append({
-                'name': tensor_info['info']['tensor_name'],
-                'mean': np.mean(tensor),
-                'std': np.std(tensor),
-                'min': np.min(tensor),
-                'max': np.max(tensor)
-            })
+            tensor = tensor_info['tensor']
+            if tensor is not None and tensor.numel() > 0:
+                tensor_values = tensor.flatten().cpu().numpy()
+                if len(tensor_values) > 0:
+                    summary_data.append({
+                        'name': tensor_info['info']['tensor_name'],
+                        'mean': np.mean(tensor_values),
+                        'std': np.std(tensor_values),
+                        'min': np.min(tensor_values),
+                        'max': np.max(tensor_values)
+                    })
         
         ax4.axis('off')
         table_data = []
