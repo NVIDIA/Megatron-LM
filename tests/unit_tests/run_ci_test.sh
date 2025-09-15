@@ -147,7 +147,7 @@ DISTRIBUTED_ARGS=(
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
-    --node_rank $SLURM_NODEID
+    --node_rank $NODE_RANK
     --log-dir $LOG_DIR
     --tee "0:3"
     --redirects "3"
