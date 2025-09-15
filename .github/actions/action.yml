@@ -100,6 +100,14 @@ runs:
         dockerfile: docker/Dockerfile.ci.dev
         skip-extraction: ${{ steps.cache.outputs.cache-hit }}
 
+    - name: Download test data
+      shell: bash
+      run: |
+        echo "::group::Download test data"
+        pip install --no-cache-dir pygithub click
+        python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+        echo "::endgroup::"
+
     - name: Build container
       shell: bash
       env:
