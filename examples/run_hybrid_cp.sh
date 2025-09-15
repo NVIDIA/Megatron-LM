@@ -8,10 +8,10 @@
 #SBATCH -t 00:30:00
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=8
-#SBATCH --nodes=4
+#SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --gpus-per-node=8
-#SBATCH --job-name=video_sft_stage3_qwen_2p5_7b_radio_research_cp_0518_exp
+#SBATCH --job-name=hetero_cp_global
 
 export NCCL_IB_SL=1
 export TOKENIZERS_PARALLELISM="false"
@@ -33,7 +33,7 @@ USE_TE_CE=0
 USE_FLASH_ATTN=0
 USE_FSDP=0
 USE_CUSTOM_FSDP=0
-PROFILE=1
+PROFILE=0
 
 # Remember to update model and job name if running in batch mode!!
 if [[ $BATCH -eq 0 ]]; then
@@ -41,7 +41,7 @@ if [[ $BATCH -eq 0 ]]; then
     MODEL_NAME="interactive_hybrid_cp"
     DEBUG=1
 else
-    MODEL_NAME="hybrid_cp_0821_exp"
+    MODEL_NAME="interactive_hybrid_cp"
 fi
 
 WORKSPACE="/lustre/fsw/portfolios/coreai/users/pmannan/workspace"
@@ -108,18 +108,17 @@ fi
 
 # CHECKPOINT_DIR="/lustre/fsw/portfolios/llmservice/users/trintamaki/workspace/output/video_sft_stage2_qwen_2p5_7b_radio_research_cp_0429_tp2/checkpoints"
 TP=1
-EXTRA_ARGS+=" --ckpt-format torch --use-distributed-optimizer "
+EXTRA_ARGS+=" --ckpt-format torch_dist --use-distributed-optimizer "
 # EXTRA_ARGS+=" --overlap-param-gather --overlap-grad-reduce "
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 EXTRA_ARGS+=" --use-precision-aware-optimizer --main-grads-dtype bf16 --main-params-dtype fp16 --exp-avg-dtype fp16 --exp-avg-sq-dtype fp16 "
 
 OPTIONS=" \
-    --use-checkpoint-args \
     --disable-bias-linear \
     --sft \
     --tokenizer-type SFTTokenizer \
-    --sft-tokenizer-prompt-format nemotron-h-aligned
+    --sft-tokenizer-prompt-format nemotron-h-aligned \
     --tokenizer-model /lustre/fsw/portfolios/llmservice/users/kezhik/images/Nemotron-H-4B-Instruct \
     --transformer-impl transformer_engine \
     --normalization RMSNorm \
@@ -134,7 +133,7 @@ OPTIONS=" \
     --tensor-model-parallel-size ${TP}  \
     --pipeline-model-parallel-size 1  \
     --rerun-mode disabled \
-    --num-layers 2 \
+    --num-layers 4 \
     --hidden-size 2048 \
     --ffn-hidden-size 8192 \
     --add-qkv-bias \
@@ -172,9 +171,11 @@ OPTIONS=" \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
     --calculate-per-token-loss \
+    --attention-backend flash \
+    --disable-gloo-process-groups \
+    --use-dist-ckpt \
     --hybrid-context-parallel \
     --max-seqlen-per-cp-rank 16384 \
-    --attention-backend flash \
 "
 # --hybrid-context-parallel \
 #     --max-seqlen-per-cp-rank 16384 \
@@ -182,13 +183,13 @@ OPTIONS=" \
 # Interactive or batch mode
 if [[ $BATCH -eq 0 ]]; then
     if [[ $PROFILE -eq 1 ]]; then
-        nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o gpt_sft_hetero_cp_iter7_8_flash torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
+        nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o gpt_sft_hetero_cp_iter7_8_flash_global_64 torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
     else
         torchrun --nproc_per_node ${NUM_GPU} pretrain_gpt.py ${OPTIONS}
     fi
 else
     if [[ $PROFILE -eq 1 ]]; then
-        run_cmd="cd ${SOURCE}; nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi --capture-range-end stop -o stage3_iter3_4_tp2cp4_w_tpcp_shard_%q{SLURM_PROCID} python -u pretrain_gpt.py ${OPTIONS}"
+        run_cmd="cd ${SOURCE}; nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi --capture-range-end stop -o without_hetero_cp_global_%q{SLURM_PROCID} python -u pretrain_gpt.py ${OPTIONS}"
     else
         run_cmd="cd ${SOURCE}; python -u pretrain_gpt.py ${OPTIONS}"
     fi

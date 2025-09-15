@@ -198,6 +198,8 @@ class HybridCPDataLoaderWrapper():
                 sub_sample_dict = {}
                 start_idx = sample["cu_seqlens"][sub_sample]
                 end_idx = sample["cu_seqlens"][sub_sample + 1]
+                if end_idx - start_idx == 0:
+                    continue
                 for key in sample.keys():
                     if key in ["cu_seqlens", "batch_idx", "max_seqlen"]:
                         continue
@@ -214,6 +216,7 @@ class HybridCPDataLoaderWrapper():
         for sample in batch:
             subsample_seqlens.extend([int(sample["cu_seqlens"][i+1] - sample["cu_seqlens"][i]) for i in range(0, sample["cu_seqlens"].shape[0] - 1)])
         subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
+        subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
         seqlens_gathered, offsets = self.get_global_seqlens(subsample_seqlens)
 
