@@ -478,8 +478,7 @@ class TensorSaver:
                                             layer_idx, phase, component, rank, tensor_group_idx)
             filepath = self.save_dir / filename
             
-            # 增加iteration数据计数
-            self.increment_iteration_data()
+            # iteration数据计数已简化，无需手动增加
             
             # 准备保存数据
             save_data = {
