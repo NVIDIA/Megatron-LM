@@ -850,8 +850,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         if rank is None:
             rank = int(os.environ.get("LOCAL_RANK", 0))
         
-        # 尝试获取sample信息
-        sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
+        # Sample information is no longer used in tensor saving
         
         # 尝试从调用栈获取layer_idx
         layer_idx = getattr(ctx, 'layer_idx', None)
@@ -882,7 +881,6 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             phase="post",
             component="linear",
             rank=rank,  # 直接获取
-            sample_idx=sample_idx,  # 直接获取
             metadata={
                 "sequence_parallel": sequence_parallel,
                 "use_bias": ctx.use_bias,
@@ -1057,9 +1055,6 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         if rank is None:
             rank = int(os.environ.get("LOCAL_RANK", 0))
         
-        # 尝试获取sample信息
-        sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
-        
         save_tensor(
             tensor=grad_input,
             layer_type="linear",
@@ -1070,7 +1065,6 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             phase="post",
             component="linear",
             rank=rank,  # 直接获取
-            sample_idx=sample_idx,  # 直接获取
             metadata={
                 "sequence_parallel": ctx.sequence_parallel,
                 "wgrad_compute": wgrad_compute,

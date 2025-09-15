@@ -244,8 +244,7 @@ class DotProductAttention(MegatronModule):
         if rank is None:
             rank = int(os.environ.get("LOCAL_RANK", 0))
         
-        # 尝试获取sample信息
-        sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
+        # Sample information is no longer used in tensor saving
         
         # 保存attention权重（P分布）
         save_tensor(
@@ -258,7 +257,6 @@ class DotProductAttention(MegatronModule):
             phase="post",
             component="FA",
             rank=rank,
-            sample_idx=sample_idx,
             metadata={
                 "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
                 "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
@@ -331,9 +329,6 @@ class DotProductAttention(MegatronModule):
         if rank is None:
             rank = int(os.environ.get("LOCAL_RANK", 0))
         
-        # 尝试获取sample信息
-        sample_idx = int(os.environ.get("CURRENT_SAMPLE_IDX", 0))
-        
         save_tensor(
             tensor=context,
             layer_type="attention",
@@ -344,7 +339,6 @@ class DotProductAttention(MegatronModule):
             phase="post",
             component="FA",
             rank=rank,  # 直接获取
-            sample_idx=sample_idx,  # 直接获取
             metadata={
                 "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
                 "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,

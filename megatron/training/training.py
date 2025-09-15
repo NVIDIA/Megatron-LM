@@ -1237,18 +1237,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
 
-        # Update sample index for tensor saving if enabled
-        if getattr(args, 'save_tensors', False):
-            try:
-                from megatron.core.tensor_saver import get_tensor_collection_state, set_global_sample_idx
-                state = get_tensor_collection_state()
-                # 在micro batch循环中更新sample_idx的逻辑将在forward_backward_func内部处理
-                # 这里我们确保初始状态正确
-                state.set_sample_idx(0)
-            except Exception as e:
-                print(f"[TrainStep] Warning: Failed to initialize sample index: {e}")
-            except Exception as e:
-                print(f"[TrainStep] Warning: Failed to reset sample index: {e}")
+        # Tensor saving is now handled automatically in the pipeline functions
 
         # Forward pass.
         losses_reduced = forward_backward_func(
@@ -2196,11 +2185,9 @@ def train(
         # Update tensor saver iteration if tensor saving is enabled
         if getattr(args, 'save_tensors', False):
             try:
-                from megatron.core.tensor_saver import get_tensor_saver, set_global_sample_idx
+                from megatron.core.tensor_saver import get_tensor_saver
                 tensor_saver = get_tensor_saver()
                 tensor_saver.set_iteration(iteration)
-                # Reset sample idx for each iteration
-                set_global_sample_idx(0)
             except Exception as e:
                 print(f"[Training] Warning: Failed to update tensor saver iteration: {e}")
         
