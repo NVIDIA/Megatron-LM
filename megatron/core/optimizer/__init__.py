@@ -4,10 +4,9 @@ import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from llm_shower.orthogonalized_optimizers.muon import Muon
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
-
-from llm_shower.orthogonalized_optimizers.muon import Muon
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -634,6 +633,7 @@ def get_megatron_optimizer(
 
     return ChainedOptimizer(optimizers)
 
+
 # self-contained change depends on this but doesn't modify existing function.
 # will move to optimizer implementation directory
 def get_megatron_muon_optimizer(
@@ -681,7 +681,9 @@ def get_megatron_muon_optimizer(
             if not param.requires_grad:
                 continue
             # TODO: revisit this condition. name?
-            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (len(param.shape) == 1):
+            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (
+                len(param.shape) == 1
+            ):
                 linear_params.append(param)
             else:
                 nonlinear_params.append(param)
@@ -735,8 +737,9 @@ def get_megatron_muon_optimizer(
         param.requires_grad = False
 
     # call original get. linear params will be skipped since they're freezed
-    chained_adam = get_megatron_optimizer(config, model_chunks, no_weight_decay_cond,
-                                          scale_lr_cond, lr_mult, use_gloo_process_groups)
+    chained_adam = get_megatron_optimizer(
+        config, model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult, use_gloo_process_groups
+    )
 
     # unfreeze everything
     for param in linear_params:
@@ -748,8 +751,8 @@ def get_megatron_muon_optimizer(
     if layer_wise_distributed_optimizer:
         log_single_rank(logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for Muon')
         return LayerWiseDistributedOptimizer(
-                optimizers,
-                parallel_state.get_data_parallel_group(with_context_parallel=True),
-                parallel_state.get_expert_data_parallel_group(),
-            )
+            optimizers,
+            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            parallel_state.get_expert_data_parallel_group(),
+        )
     return ChainedOptimizer(optimizers)

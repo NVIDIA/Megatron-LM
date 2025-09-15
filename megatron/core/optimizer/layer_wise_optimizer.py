@@ -1,17 +1,19 @@
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import List
 
 import torch
 
+from .clip_grads import clip_grad_by_total_norm_fp32
 from .optimizer import ChainedOptimizer, MegatronOptimizer
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
-    This is a experimental distributed optimizer wrapper that distributes weight to DP ranks by full layer.
-    It is implemented as a Chained optimizer to support cases where different weight group uses different
-    optimizers (adam + muon) for example.
-    When using, keep distributed optimizer related options OFF.
+    This is a experimental distributed optimizer wrapper that distributes weight to DP ranks by full
+    layer. It is implemented as a Chained optimizer to support cases where different weight group
+    uses different optimizers (adam + muon) for example. When using, keep distributed optimizer
+    related options OFF.
     """
+
     def __init__(
         self,
         chained_optimizers: List[MegatronOptimizer],
@@ -27,18 +29,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # 4. allgather updated params to every rank(currently through broadcast loop)
 
         # TODO: potential future perf optimization (deyu, kunlun suggested)
-        # since allreduce is unchanged and handled by megatron DDP, they're already in contiguous gbuf
-        # so instead of shard param by layer randomly, we can still shard by buf range but keep some "extras"
-        # to keep boundary weight not sharded. This way each rank do some duplicated work but we can call
-        # single allgather later and all current distopt optimization can be applied
+        # since allreduce is unchanged and handled by megatron DDP, they're already in contiguous
+        # gbuf so instead of shard param by layer randomly, we can still shard by buf range but keep
+        # some "extras" to keep boundary weight not sharded. This way each rank do some duplicated
+        # work but we can call single allgather later and all current distopt optimization can be
+        # applied
 
         self.grad_comm_pg = grad_comm_pg
         self.ep_grad_comm_pg = ep_grad_comm_pg
         self.shard_params()
 
     def shard_params(self):
-        """Shard all params into lists by rank. """
-        # keep logic simple now since we'll optimize sharding later. should be ok since linear are separate already
+        """Shard all params into lists by rank."""
+        # keep logic simple now since we'll optimize sharding later. should be ok since linear are
+        # separate already.
         # separate dp, ep_dp
         dp_idx, ep_idx = 0, 0
         dp_size = self.grad_comm_pg.size()
@@ -61,7 +65,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             self.ep_params_list = []
 
     def drop_grads(self):
-        """Drop grads of params belong to other ranks. """
+        """Drop grads of params belong to other ranks."""
         for i, params in enumerate(self.shard_params_list):
             if self.grad_comm_pg.rank() != i:
                 for p in params:
@@ -72,7 +76,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     p.grad = None
 
     def broadcast_params(self):
-        """All rank broadcast updated local params(allgatherv). """
+        """All rank broadcast updated local params(allgatherv)."""
         # Broadcast linear layer weights to all other ranks.
         # This may not be slower than PyTorch allgatherv which calls broadcast internally.
         # TODO(skyw): Profile and implement more efficient version.
