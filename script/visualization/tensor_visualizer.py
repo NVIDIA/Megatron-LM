@@ -62,9 +62,10 @@ class TensorVisualizer:
             subdir.mkdir(parents=True, exist_ok=True)
     
     def parse_filename(self, filename: str) -> Optional[Dict]:
-        """Parse filename to extract quantization type, layer, sample and other information"""
+        """Parse filename to extract quantization type, layer, rank as sample and other information"""
         try:
-            # Filename format: YYYYMMDD_HHMMSS_XXXX_iterXXX_layer_type_operation_quant_type_rankXX_sampleXXX_groupXXX_tensor_name.pt
+            # Filename format: YYYYMMDD_HHMMSS_XXXX_iterXXX_layer_type_operation_quant_type_rankXX_groupXXX_tensor_name.pt
+            # Since only one micro_batch_size is collected, rank represents different samples
             parts = filename.split('_')
             
             if len(parts) < 8:
@@ -84,9 +85,10 @@ class TensorVisualizer:
             layer_match = re.search(r'L(\d+)', filename)
             layer = int(layer_match.group(1)) if layer_match else None
             
-            # Find sample
-            sample_match = re.search(r'sample(\d+)', filename)
-            sample = int(sample_match.group(1)) if sample_match else None
+            # Find rank (use as sample since only one micro_batch is collected)
+            rank_match = re.search(r'rank(\d+)', filename)
+            rank = int(rank_match.group(1)) if rank_match else None
+            sample = rank  # Use rank as sample
             
             # Find layer type
             layer_type = None
@@ -108,7 +110,8 @@ class TensorVisualizer:
             return {
                 'quant_type': quant_type,
                 'layer': layer,
-                'sample': sample,
+                'sample': sample,  # This is now the rank
+                'rank': rank,      # Keep original rank for reference
                 'layer_type': layer_type,
                 'operation': operation,
                 'tensor_name': tensor_name,
@@ -847,19 +850,152 @@ class TensorVisualizer:
                                   tensor_type: str, quantization_comparison: bool):
         """Analyze layer-specific tensor distribution"""
         print(f"Analyzing layer {layer} distribution...")
+        print(f"  - Sample {sample} (represents GPU rank {sample})")
         
-        # This is a placeholder implementation
-        # In a real implementation, you would load and analyze specific layer tensors
-        print(f"  - Loading layer {layer} tensors...")
-        print(f"  - Analyzing {layer_type} tensors...")
-        if tensor_type:
-            print(f"  - Focusing on {tensor_type} tensors...")
+        # Load tensor data
+        data = self.load_tensor_data()
+        
+        # Filter data for specific layer and sample (rank)
+        filtered_data = []
+        for file_info in data['files']:
+            if (file_info['layer'] == layer and 
+                file_info['sample'] == sample and 
+                file_info['layer_type'] == layer_type):
+                if not tensor_type or tensor_type in file_info['tensor_name']:
+                    filtered_data.append(file_info)
+        
+        print(f"  - Found {len(filtered_data)} matching tensor files")
+        
+        if not filtered_data:
+            print(f"  - No tensor files found for layer {layer}, sample {sample}, type {layer_type}")
+            return
+        
+        # Load actual tensor data
+        tensors = []
+        for file_info in filtered_data:
+            try:
+                tensor_data = torch.load(file_info['file_path'])
+                if 'tensor' in tensor_data:
+                    tensors.append({
+                        'tensor': tensor_data['tensor'],
+                        'info': file_info
+                    })
+            except Exception as e:
+                print(f"  - Failed to load {file_info['filename']}: {e}")
+        
+        print(f"  - Successfully loaded {len(tensors)} tensors")
+        
+        # Create analysis plots
+        if tensors:
+            self._create_layer_analysis_plots(tensors, layer, sample, layer_type, tensor_type, quantization_comparison)
+    
+    def _create_layer_analysis_plots(self, tensors, layer: int, sample: int, layer_type: str, 
+                                   tensor_type: str, quantization_comparison: bool):
+        """Create layer analysis plots"""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Create distribution plot
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle(f'Layer {layer} Analysis (Sample {sample} = Rank {sample})', fontsize=16)
+        
+        # Plot 1: Tensor value distribution
+        ax1 = axes[0, 0]
+        for i, tensor_info in enumerate(tensors[:5]):  # Limit to first 5 tensors
+            tensor = tensor_info['tensor'].flatten().cpu().numpy()
+            ax1.hist(tensor, bins=50, alpha=0.7, label=f"{tensor_info['info']['tensor_name']}")
+        ax1.set_title('Value Distribution')
+        ax1.set_xlabel('Value')
+        ax1.set_ylabel('Frequency')
+        ax1.legend()
+        ax1.grid(True)
+        
+        # Plot 2: Statistics comparison
+        ax2 = axes[0, 1]
+        tensor_names = []
+        means = []
+        stds = []
+        for tensor_info in tensors[:5]:
+            tensor = tensor_info['tensor'].flatten().cpu().numpy()
+            tensor_names.append(tensor_info['info']['tensor_name'])
+            means.append(np.mean(tensor))
+            stds.append(np.std(tensor))
+        
+        x = np.arange(len(tensor_names))
+        ax2.bar(x - 0.2, means, 0.4, label='Mean', alpha=0.7)
+        ax2.bar(x + 0.2, stds, 0.4, label='Std', alpha=0.7)
+        ax2.set_title('Statistics Comparison')
+        ax2.set_xlabel('Tensor')
+        ax2.set_ylabel('Value')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(tensor_names, rotation=45)
+        ax2.legend()
+        ax2.grid(True)
+        
+        # Plot 3: Quantization type comparison (if enabled)
+        ax3 = axes[1, 0]
         if quantization_comparison:
-            print("  - Comparing quantization types...")
+            quant_stats = {}
+            for tensor_info in tensors:
+                quant_type = tensor_info['info']['quant_type']
+                tensor = tensor_info['tensor'].flatten().cpu().numpy()
+                if quant_type not in quant_stats:
+                    quant_stats[quant_type] = []
+                quant_stats[quant_type].extend(tensor)
+            
+            for quant_type, values in quant_stats.items():
+                ax3.hist(values, bins=30, alpha=0.7, label=f"{quant_type}")
+            ax3.set_title('Quantization Type Comparison')
+            ax3.set_xlabel('Value')
+            ax3.set_ylabel('Frequency')
+            ax3.legend()
+        else:
+            ax3.text(0.5, 0.5, 'Quantization comparison\nnot enabled', 
+                    ha='center', va='center', transform=ax3.transAxes)
+            ax3.set_title('Quantization Comparison')
+        ax3.grid(True)
         
-        # Create a simple layer analysis plot
+        # Plot 4: Summary statistics
+        ax4 = axes[1, 1]
+        summary_data = []
+        for tensor_info in tensors:
+            tensor = tensor_info['tensor'].flatten().cpu().numpy()
+            summary_data.append({
+                'name': tensor_info['info']['tensor_name'],
+                'mean': np.mean(tensor),
+                'std': np.std(tensor),
+                'min': np.min(tensor),
+                'max': np.max(tensor)
+            })
+        
+        ax4.axis('off')
+        table_data = []
+        for data in summary_data:
+            table_data.append([
+                data['name'],
+                f"{data['mean']:.4f}",
+                f"{data['std']:.4f}",
+                f"{data['min']:.4f}",
+                f"{data['max']:.4f}"
+            ])
+        
+        table = ax4.table(cellText=table_data,
+                         colLabels=['Tensor', 'Mean', 'Std', 'Min', 'Max'],
+                         cellLoc='center',
+                         loc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.5)
+        ax4.set_title('Summary Statistics')
+        
+        plt.tight_layout()
+        
+        # Save plot
         plot_path = self.subdirs['layer_analysis'] / f'layer_{layer}_sample_{sample}_{layer_type}_analysis.png'
-        self._create_placeholder_plot(plot_path, f"Layer {layer} Analysis")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  - Layer analysis plot saved: {plot_path}")
     
     def _create_placeholder_plot(self, filepath: Path, title: str):
         """Create a placeholder plot for demonstration"""
@@ -921,7 +1057,7 @@ def main():
     parser.add_argument('--layer', type=int, default=1,
                        help='Layer number for analysis')
     parser.add_argument('--sample', type=int, default=0,
-                       help='Sample number for analysis')
+                       help='Sample number for analysis (now represents GPU rank since only one micro_batch is collected)')
     parser.add_argument('--layer_type', type=str, default='attention',
                        choices=['attention', 'linear'],
                        help='Layer type for analysis')
