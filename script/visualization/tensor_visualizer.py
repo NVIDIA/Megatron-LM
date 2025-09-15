@@ -1161,7 +1161,7 @@ def main():
                        help='Enable quantization comparison analysis')
     
     # Analysis type
-    parser.add_argument('--analysis_type', type=str, default='all',
+    parser.add_argument('--analysis_type', type=str, default='layer',
                        choices=['all', 'overflow', 'layer', 'distribution'],
                        help='Type of analysis to perform')
     
@@ -1192,7 +1192,7 @@ def main():
             quantization_comparison=args.quantization_comparison,
             efficient_mode=efficient_mode
         )
-    else:
+    else:  # 'all' or 'distribution'
         visualizer.run_visualization()
 
 if __name__ == "__main__":
