@@ -182,6 +182,65 @@ class TensorVisualizer:
         print(f"Total loaded {len(data['files'])} tensor files")
         return data
     
+    def load_specific_tensor_data(self, layer: int, rank: int, layer_type: str) -> Dict:
+        """Load only specific layer and rank tensor data for efficiency"""
+        print(f"Loading tensor data for Layer {layer}, Rank {rank}, Type {layer_type}...")
+        
+        data = {
+            'files': [],
+            'by_quant_type': {qtype: [] for qtype in self.quant_types},
+            'by_rank': {rank: []},
+            'by_layer': {layer: []},
+            'by_layer_type': {'attention': [], 'linear': []},
+            'statistics': {}
+        }
+        
+        # Build filename pattern for specific layer and rank
+        # Pattern: *_L{layer}_*_rank{rank:02d}_*
+        layer_pattern = f"L{layer}"
+        rank_pattern = f"rank{rank:02d}"
+        
+        # Scan only relevant tensor files
+        all_files = []
+        for quant_type in self.quant_types:
+            quant_dir = self.tensor_dir / quant_type
+            if not quant_dir.exists():
+                print(f"Warning: Quantization type directory does not exist: {quant_dir}")
+                continue
+            
+            # Use glob pattern to filter files by layer and rank
+            pattern = f"*{layer_pattern}*{rank_pattern}*"
+            pt_files = list(quant_dir.glob(pattern))
+            all_files.extend(pt_files)
+        
+        if not all_files:
+            print(f"No tensor files found for Layer {layer}, Rank {rank}, Type {layer_type}")
+            return data
+        
+        print(f"Found {len(all_files)} tensor files matching criteria")
+        
+        # Process files with progress bar
+        pbar = tqdm(total=len(all_files), desc="Loading specific tensor files", unit="files")
+        
+        for file_path in all_files:
+            file_info = self.parse_filename(file_path.name)
+            if file_info and file_info['layer'] == layer and file_info['rank'] == rank:
+                file_info['file_path'] = file_path
+                data['files'].append(file_info)
+                data['by_quant_type'][file_info['quant_type']].append(file_info)
+                data['by_rank'][rank].append(file_info)
+                data['by_layer'][layer].append(file_info)
+                
+                if file_info['layer_type']:
+                    data['by_layer_type'][file_info['layer_type']].append(file_info)
+            
+            pbar.update(1)
+        
+        pbar.close()
+        
+        print(f"Successfully loaded {len(data['files'])} tensor files")
+        return data
+    
     def load_tensor_values(self, file_info: Dict) -> Optional[np.ndarray]:
         """Load tensor values with improved error handling"""
         try:
@@ -861,20 +920,22 @@ class TensorVisualizer:
         self._create_placeholder_plot(report_path, "Overflow Analysis Report")
     
     def _analyze_layer_distribution(self, layer: int, rank: int, layer_type: str, 
-                                  tensor_type: str, quantization_comparison: bool):
+                                  tensor_type: str, quantization_comparison: bool, efficient_mode: bool = True):
         """Analyze layer-specific tensor distribution"""
         print(f"Analyzing layer {layer} distribution...")
         print(f"  - Rank {rank} (GPU rank)")
+        print(f"  - Efficient mode: {efficient_mode}")
         
-        # Load tensor data
-        data = self.load_tensor_data()
+        # Load tensor data based on mode
+        if efficient_mode:
+            data = self.load_specific_tensor_data(layer, rank, layer_type)
+        else:
+            data = self.load_tensor_data()
         
-        # Filter data for specific layer and rank
+        # Filter data for specific layer type and tensor type
         filtered_data = []
         for file_info in data['files']:
-            if (file_info['layer'] == layer and 
-                file_info['rank'] == rank and 
-                file_info['layer_type'] == layer_type and
+            if (file_info['layer_type'] == layer_type and
                 file_info['tensor_name'] is not None):
                 if not tensor_type or tensor_type in file_info['tensor_name']:
                     filtered_data.append(file_info)
@@ -1062,17 +1123,18 @@ class TensorVisualizer:
     
     def run_layer_analysis(self, layer: int = 1, rank: int = 0, 
                           layer_type: str = 'attention', tensor_type: str = '',
-                          quantization_comparison: bool = False):
+                          quantization_comparison: bool = False, efficient_mode: bool = True):
         """Run layer-specific analysis"""
         print(f"Starting layer analysis for Layer {layer}, Rank {rank}, Type {layer_type}")
         print(f"Tensor directory: {self.tensor_dir}")
         print(f"Output directory: {self.output_dir}")
+        print(f"Efficient mode: {efficient_mode}")
         
         # Create output directories
         self._create_output_directories()
         
         # Run layer analysis
-        self._analyze_layer_distribution(layer, rank, layer_type, tensor_type, quantization_comparison)
+        self._analyze_layer_distribution(layer, rank, layer_type, tensor_type, quantization_comparison, efficient_mode)
         
         print("✅ Layer analysis completed!")
 
@@ -1103,6 +1165,11 @@ def main():
                        choices=['all', 'overflow', 'layer', 'distribution'],
                        help='Type of analysis to perform')
     
+    # Efficient mode
+    parser.add_argument('--efficient_mode', type=str, default='true',
+                       choices=['true', 'false'],
+                       help='Use efficient mode to load only specific layer/rank files')
+    
     args = parser.parse_args()
     
     # Create visualizer
@@ -1116,12 +1183,14 @@ def main():
     if args.analysis_type == 'overflow':
         visualizer.run_overflow_analysis()
     elif args.analysis_type == 'layer':
+        efficient_mode = args.efficient_mode.lower() == 'true'
         visualizer.run_layer_analysis(
             layer=args.layer,
             rank=args.rank,
             layer_type=args.layer_type,
             tensor_type=args.tensor_type,
-            quantization_comparison=args.quantization_comparison
+            quantization_comparison=args.quantization_comparison,
+            efficient_mode=efficient_mode
         )
     else:
         visualizer.run_visualization()

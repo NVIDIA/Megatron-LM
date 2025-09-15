@@ -25,6 +25,7 @@ RANK=${4:-0}  # GPU rank (different GPUs = different ranks)
 LAYER_TYPE=${5:-"attention"}
 TENSOR_TYPE=${6:-""}
 QUANTIZATION_COMPARISON=${7:-"false"}
+EFFICIENT_MODE=${8:-"true"}  # Use efficient mode to load only specific files
 
 echo "Parameter settings:"
 echo "  - Tensor directory: $TENSOR_DIR"
@@ -34,6 +35,7 @@ echo "  - Rank: $RANK (GPU rank)"
 echo "  - Layer type: $LAYER_TYPE"
 echo "  - Tensor type: $TENSOR_TYPE"
 echo "  - Quantization comparison: $QUANTIZATION_COMPARISON"
+echo "  - Efficient mode: $EFFICIENT_MODE (load only specific layer/rank files)"
 
 # 检查tensor目录是否存在
 if [ ! -d "$TENSOR_DIR" ]; then
@@ -58,7 +60,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # 构建Python命令
-PYTHON_CMD="python script/visualization/tensor_visualizer.py --tensor_dir \"$TENSOR_DIR\" --output_dir \"$OUTPUT_DIR\" --layer $LAYER --rank $RANK --layer_type $LAYER_TYPE"
+PYTHON_CMD="python script/visualization/tensor_visualizer.py --tensor_dir \"$TENSOR_DIR\" --output_dir \"$OUTPUT_DIR\" --layer $LAYER --rank $RANK --layer_type $LAYER_TYPE --efficient_mode $EFFICIENT_MODE"
 
 # 如果指定了tensor类型，添加参数
 if [ -n "$TENSOR_TYPE" ]; then
