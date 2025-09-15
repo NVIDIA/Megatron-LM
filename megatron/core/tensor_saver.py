@@ -276,9 +276,7 @@ class TensorSaver:
         
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[TensorSaver] 初始化完成，保存目录: {self.save_dir}")
-            print(f"[TensorSaver] 保存目录绝对路径: {self.save_dir.absolute()}")
-            print(f"[TensorSaver DEBUG] 初始化状态 - enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, collection_completed: {self.collection_completed}")
+            print(f"[TensorSaver] 保存目录: {self.save_dir}")
     
     def set_iteration(self, iteration: int):
         """设置当前iteration"""
@@ -291,27 +289,20 @@ class TensorSaver:
     def mark_collection_completed(self):
         """标记tensor收集已完成"""
         self.collection_completed = True
-        print(f"[TensorSaver] 标记tensor收集已完成")
     
     def should_exit_after_forward(self) -> bool:
         """检查是否应该在forward后退出"""
         # 只有在启用tensor保存且已完成收集时才退出
-        # 这里应该检查collection_completed，因为这是真正的收集完成标记
-        result = self.enabled and self.collection_completed
-        print(f"[TensorSaver DEBUG] should_exit_after_forward - enabled: {self.enabled}, collection_completed: {self.collection_completed}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, result: {result}")
-        return result
+        return self.enabled and self.collection_completed
     
     def should_collect_tensor(self) -> bool:
         """检查是否应该收集tensor"""
         # 只有在启用tensor保存且未在warmup阶段收集过时才收集
-        result = self.enabled and not self.tensor_collected_in_warmup
-        print(f"[TensorSaver DEBUG] should_collect_tensor - enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}, result: {result}")
-        return result
+        return self.enabled and not self.tensor_collected_in_warmup
     
     def mark_warmup_collection(self):
         """标记已在warmup阶段收集过tensor"""
         self.tensor_collected_in_warmup = True
-        print(f"[TensorSaver] 标记已在warmup阶段收集tensor")
     
     def should_collect_in_steady_state(self) -> bool:
         """检查是否应该在steady state阶段收集tensor"""
@@ -473,10 +464,7 @@ class TensorSaver:
         Returns:
             保存的文件路径，如果未启用则返回None
         """
-        print(f"[TensorSaver DEBUG] save_tensor调用 - layer_type: {layer_type}, operation: {operation}, enabled: {self.enabled}, tensor_collected_in_warmup: {self.tensor_collected_in_warmup}")
-        
         if not self.should_collect_tensor():
-            print(f"[TensorSaver DEBUG] 不应该收集tensor，跳过")
             return None
         
         # 当启用tensor保存时，会在一次forward后自动退出，无需额外检查
@@ -503,16 +491,11 @@ class TensorSaver:
         index_manager = get_tensor_index_manager()
         tensor_group_idx = index_manager.get_tensor_index(layer_type, layer_idx, operation)
         
-        # 打印调试信息
-        print(f"[TensorSaver] 保存tensor - Rank: {rank}, Layer: {layer_type}, Operation: {operation}, GroupIdx: {tensor_group_idx}")
-        
         try:
             # 生成文件名
             filename = self._generate_filename(layer_type, operation, quant_type, tensor_name, 
                                             layer_idx, phase, component, rank, tensor_group_idx)
             filepath = self.save_dir / filename
-            print(f"[TensorSaver DEBUG] 文件路径 - save_dir: {self.save_dir}, filename: {filename}, filepath: {filepath}")
-            print(f"[TensorSaver DEBUG] 文件路径绝对路径: {filepath.absolute()}")
             
             # iteration数据计数已简化，无需手动增加
             
@@ -579,9 +562,7 @@ class TensorSaver:
                 
                 # 验证文件是否保存成功
                 if filepath.exists() and filepath.stat().st_size > 0:
-                    print(f"[TensorSaver] 已保存: {filename} "
-                          f"(shape={tensor.shape}, dtype={tensor.dtype}, "
-                          f"size={filepath.stat().st_size} bytes)")
+                    print(f"[TensorSaver] 已保存: {filename}")
                     return str(filepath)
                 else:
                     print(f"[TensorSaver] 保存失败: 文件为空或不存在")
@@ -719,24 +700,18 @@ def get_tensor_saver() -> TensorSaver:
         save_dir = os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
         enabled = os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
         
-        print(f"[TensorSaver DEBUG] 环境变量 - TENSOR_SAVE_DIR: {os.environ.get('TENSOR_SAVE_DIR')}, TENSOR_SAVE_ENABLED: {os.environ.get('TENSOR_SAVE_ENABLED')}")
-        print(f"[TensorSaver DEBUG] 初始配置 - save_dir: {save_dir}, enabled: {enabled}")
-        
         # 尝试从命令行参数获取配置（如果可用）
         try:
             from megatron.training.global_vars import get_args
             args = get_args()
-            print(f"[TensorSaver DEBUG] 命令行参数 - tensor_save_dir: {getattr(args, 'tensor_save_dir', None)}, save_tensors: {getattr(args, 'save_tensors', None)}")
             if hasattr(args, 'tensor_save_dir') and args.tensor_save_dir:
-                print(f"[TensorSaver DEBUG] 使用命令行参数 tensor_save_dir: {args.tensor_save_dir}")
                 save_dir = args.tensor_save_dir
             if hasattr(args, 'save_tensors'):
-                print(f"[TensorSaver DEBUG] 使用命令行参数 save_tensors: {args.save_tensors}")
                 enabled = args.save_tensors or enabled
         except Exception as e:
-            print(f"[TensorSaver] 无法从命令行参数获取配置，使用环境变量: {e}")
+            pass
         
-        print(f"[TensorSaver] 最终配置 - save_dir: {save_dir}, enabled: {enabled}, control_micro_batches: 1 (固定)")
+        print(f"[TensorSaver] 初始化 - 保存目录: {save_dir}, 启用: {enabled}")
         _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled)
         
         # 从环境变量设置iteration
