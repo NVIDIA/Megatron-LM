@@ -82,7 +82,7 @@ runs:
     - name: Checkout repository
       uses: actions/checkout@v2
       with:
-        path: ${{ github.workspace }}/Megatron-Bridge
+        path: ${{ github.workspace }}/Megatron-LM
 
     - name: Cache uv
       uses: actions/cache@v4
