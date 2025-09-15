@@ -611,12 +611,12 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 
-                # 当启用tensor保存时，在第一个micro_batch后退出
+                # 检查是否应该退出（在完成一个完整forward pass后）
                 try:
                     from megatron.core.tensor_saver import get_tensor_saver
                     tensor_saver = get_tensor_saver()
-                    if tensor_saver.enabled:
-                        print(f"[Pipeline] 已收集第一个micro_batch的tensor，退出no_pipelining训练循环")
+                    if tensor_saver.should_exit_after_forward():
+                        print(f"[Pipeline] 已完成tensor收集，退出no_pipelining训练循环")
                         break
                 except Exception as e:
                     print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
@@ -1237,12 +1237,12 @@ def forward_backward_pipelining_with_interleaving(
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
         
-        # 当启用tensor保存时，在第一个micro_batch后退出
+        # 检查是否应该退出（在完成一个完整forward pass后）
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            if tensor_saver.enabled:
-                print(f"[Pipeline] 已收集第一个micro_batch的tensor，退出interleaving训练循环")
+            if tensor_saver.should_exit_after_forward():
+                print(f"[Pipeline] 已完成tensor收集，退出interleaving训练循环")
                 # 返回None表示需要提前退出
                 return None
         except Exception as e:
@@ -2172,12 +2172,12 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
         total_num_tokens += num_tokens
         
-        # 当启用tensor保存时，在第一个micro_batch后退出
+        # 检查是否应该退出（在完成一个完整forward pass后）
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            if tensor_saver.enabled:
-                print(f"[Pipeline] 已收集第一个micro_batch的tensor，退出warmup阶段")
+            if tensor_saver.should_exit_after_forward():
+                print(f"[Pipeline] 已完成tensor收集，退出warmup阶段")
                 break
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
@@ -2226,12 +2226,12 @@ def forward_backward_pipelining_without_interleaving(
         )
         total_num_tokens += num_tokens
         
-        # 当启用tensor保存时，在第一个micro_batch后退出
+        # 检查是否应该退出（在完成一个完整forward pass后）
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            if tensor_saver.enabled:
-                print(f"[Pipeline] 已收集第一个micro_batch的tensor，退出训练循环")
+            if tensor_saver.should_exit_after_forward():
+                print(f"[Pipeline] 已完成tensor收集，退出训练循环")
                 break
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")

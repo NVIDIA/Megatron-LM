@@ -271,6 +271,7 @@ class TensorSaver:
         self.current_iteration = 0
         self.micro_batch_count = 0
         self.control_micro_batches = 1  # 固定为1，进行一次完整forward后跳出
+        self.collection_completed = False  # 标记是否已完成收集
         
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -284,7 +285,14 @@ class TensorSaver:
         set_global_iteration(iteration)
         print(f"[TensorSaver] 设置当前iteration: {iteration}")
     
-    # micro_batch控制方法已移除，当启用tensor保存时自动在一次forward后退出
+    def mark_collection_completed(self):
+        """标记tensor收集已完成"""
+        self.collection_completed = True
+        print(f"[TensorSaver] 标记tensor收集已完成")
+    
+    def should_exit_after_forward(self) -> bool:
+        """检查是否应该在forward后退出"""
+        return self.enabled and self.collection_completed
     
     def _get_tensor_info(self, tensor: torch.Tensor) -> Dict[str, Any]:
         """获取tensor的基本信息"""

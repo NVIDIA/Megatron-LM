@@ -1251,6 +1251,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        
+        # 标记tensor收集已完成（如果启用了tensor保存）
+        try:
+            from megatron.core.tensor_saver import get_tensor_saver
+            tensor_saver = get_tensor_saver()
+            if tensor_saver.enabled and not tensor_saver.collection_completed:
+                tensor_saver.mark_collection_completed()
+        except Exception as e:
+            print(f"[Training] Warning: 无法标记tensor收集完成: {e}")
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
