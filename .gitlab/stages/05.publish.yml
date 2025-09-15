@@ -418,7 +418,13 @@ publish:test_release_notify:
   variables:
     PUBLISH_DRYRUN: "yes"
   script:
+    - set -x
+    - env
     - echo $PUBLISH_DRYRUN
+    - PLATFORM=amd64
+    - PACKAGE=megatron-core
+    - var=EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}
+    - RELEASE_NUMBER=$(echo "${!var}")
     - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
     - |
       cat << EOF > message.json
