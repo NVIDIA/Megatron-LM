@@ -1746,6 +1746,8 @@ def _add_logging_args(parser):
                        help='Directory to save tensor logs (default: ./enhanced_tensor_logs)')
     group.add_argument('--control-iter', type=int, default=1,
                        help='Number of iterations to collect tensors before stopping (default: 1)')
+    group.add_argument('--collect-micro-batches', type=int, default=1,
+                       help='Number of micro-batches to collect before stopping (default: 1)')
     return parser
 
 

@@ -610,6 +610,18 @@ def forward_backward_no_pipelining(
                     current_microbatch=i,
                 )
                 total_num_tokens += num_tokens
+                
+                # 增加tensor saver的micro_batch计数并检查是否应该退出
+                try:
+                    from megatron.core.tensor_saver import get_tensor_saver
+                    tensor_saver = get_tensor_saver()
+                    tensor_saver.increment_micro_batch()
+                    if not tensor_saver.should_continue_collection():
+                        print(f"[Pipeline] 已达到micro_batch收集限制，提前退出no_pipelining训练循环")
+                        break
+                except Exception as e:
+                    print(f"[Pipeline] Warning: 无法更新tensor saver micro_batch计数: {e}")
+                
                 if not forward_only:
                     backward_step(
                         input_tensor, output_tensor, output_tensor_grad, model_type, config
@@ -1225,6 +1237,18 @@ def forward_backward_pipelining_with_interleaving(
         )
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
+        
+        # 增加tensor saver的micro_batch计数并检查是否应该退出
+        try:
+            from megatron.core.tensor_saver import get_tensor_saver
+            tensor_saver = get_tensor_saver()
+            tensor_saver.increment_micro_batch()
+            if not tensor_saver.should_continue_collection():
+                print(f"[Pipeline] 已达到micro_batch收集限制，提前退出interleaving训练循环")
+                # 返回None表示需要提前退出
+                return None
+        except Exception as e:
+            print(f"[Pipeline] Warning: 无法更新tensor saver micro_batch计数: {e}")
 
         return output_tensor
 
@@ -1336,6 +1360,10 @@ def forward_backward_pipelining_with_interleaving(
                 forward_output_tensor = forward_step_helper(
                     f_virtual_microbatch_id, checkpoint_activations_microbatch
                 )
+                # 检查是否需要提前退出
+                if forward_output_tensor is None:
+                    print(f"[Pipeline] 检测到提前退出信号，停止interleaving训练循环")
+                    return forward_output_tensor, backward_input_tensor_grad
                 if post_forward is not None:
                     forward_output_tensor = post_forward(forward_output_tensor)
 
@@ -2145,6 +2173,17 @@ def forward_backward_pipelining_without_interleaving(
         )
         p2p_communicator.send_forward(output_tensor, is_pp_last_stage(p2p_communicator.pp_group))
         total_num_tokens += num_tokens
+        
+        # 增加tensor saver的micro_batch计数并检查是否应该退出
+        try:
+            from megatron.core.tensor_saver import get_tensor_saver
+            tensor_saver = get_tensor_saver()
+            tensor_saver.increment_micro_batch()
+            if not tensor_saver.should_continue_collection():
+                print(f"[Pipeline] 已达到micro_batch收集限制，提前退出warmup阶段")
+                break
+        except Exception as e:
+            print(f"[Pipeline] Warning: 无法更新tensor saver micro_batch计数: {e}")
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -2189,6 +2228,17 @@ def forward_backward_pipelining_without_interleaving(
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
         total_num_tokens += num_tokens
+        
+        # 增加tensor saver的micro_batch计数并检查是否应该退出
+        try:
+            from megatron.core.tensor_saver import get_tensor_saver
+            tensor_saver = get_tensor_saver()
+            tensor_saver.increment_micro_batch()
+            if not tensor_saver.should_continue_collection():
+                print(f"[Pipeline] 已达到micro_batch收集限制，提前退出训练循环")
+                break
+        except Exception as e:
+            print(f"[Pipeline] Warning: 无法更新tensor saver micro_batch计数: {e}")
 
         if forward_only:
             p2p_communicator.send_forward(

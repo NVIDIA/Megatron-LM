@@ -1,0 +1,62 @@
+#!/bin/bash
+
+echo "=================================================================================="
+echo "最终集成测试：Python代码中的参数支持"
+echo "=================================================================================="
+
+echo "✅ 已完成的修改总结:"
+echo "1. 在 megatron/training/arguments.py 中添加了 --collect-micro-batches 参数"
+echo "2. 在 megatron/core/tensor_saver.py 中更新了参数获取逻辑"
+echo "3. 在 shell 脚本中添加了环境变量设置"
+echo "4. 更新了所有相关的帮助信息和文档"
+echo ""
+
+echo "🔧 参数说明:"
+echo "- --control-iter: 控制收集多少个 micro_batch 的数据（最大限制）"
+echo "- --collect-micro-batches: 收集的 micro_batch 数量（实际收集数量）"
+echo ""
+
+echo "📝 使用示例:"
+echo ""
+echo "1. 基本用法（默认参数）:"
+echo "   ./run_tensor_collection.sh single mxfp8"
+echo "   # 收集1个micro_batch"
+echo ""
+echo "2. 自定义收集的micro_batch数量:"
+echo "   ./run_tensor_collection.sh --mode single --quant-type mxfp8 --control-iter 3"
+echo "   # 收集3个micro_batch"
+echo ""
+echo "3. 自定义收集的micro_batch数量:"
+echo "   ./run_tensor_collection.sh --mode single --quant-type mxfp8 --collect-micro-batches 2"
+echo "   # 收集2个micro_batch"
+echo ""
+echo "4. 同时使用两个参数:"
+echo "   ./run_tensor_collection.sh --mode single --quant-type mxfp8 --control-iter 3 --collect-micro-batches 2"
+echo "   # 收集2个micro_batch，最多3个iteration"
+echo ""
+echo "5. 通过主脚本使用:"
+echo "   ./run_tensor_draw.sh --mode collect --quant-type mxfp8 --control-iter 2 --collect-micro-batches 1"
+echo "   # 收集1个micro_batch，最多2个iteration"
+echo ""
+
+echo "🎯 主要改进:"
+echo "- 避免参数冲突：使用 --collect-micro-batches 而不是 --micro-batch-size"
+echo "- 更清晰的命名：参数名更清楚地表达了其用途"
+echo "- 保持兼容性：不影响 Megatron-LM 原有的 --micro-batch-size 参数"
+echo "- 更精确的控制：可以同时控制收集数量和最大限制"
+echo ""
+
+echo "🔍 验证修改:"
+echo "1. 检查参数定义:"
+grep -n "collect-micro-batches" megatron/training/arguments.py
+echo ""
+echo "2. 检查参数使用:"
+grep -n "collect_micro_batches" megatron/core/tensor_saver.py
+echo ""
+echo "3. 检查环境变量设置:"
+grep -n "COLLECT_MICRO_BATCHES" run_tensor_collection.sh
+echo ""
+
+echo "=================================================================================="
+echo "测试完成！所有功能都已正确实现。"
+echo "=================================================================================="

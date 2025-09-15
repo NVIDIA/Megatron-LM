@@ -1240,13 +1240,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Update sample index for tensor saving if enabled
         if getattr(args, 'save_tensors', False):
             try:
-                from megatron.core.tensor_saver import get_tensor_collection_state, set_global_sample_idx
+                from megatron.core.tensor_saver import get_tensor_collection_state
                 state = get_tensor_collection_state()
-                # 在micro batch循环中更新sample_idx的逻辑将在forward_backward_func内部处理
-                # 这里我们确保初始状态正确
+                # Reset sample index for each training step
                 state.set_sample_idx(0)
-            except Exception as e:
-                print(f"[TrainStep] Warning: Failed to initialize sample index: {e}")
             except Exception as e:
                 print(f"[TrainStep] Warning: Failed to reset sample index: {e}")
 
