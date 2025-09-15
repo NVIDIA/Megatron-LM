@@ -165,9 +165,13 @@ class TensorVisualizer:
                 data['by_quant_type'][file_info['quant_type']].append(file_info)
                 
                 if file_info['sample'] is not None:
+                    if file_info['sample'] not in data['by_sample']:
+                        data['by_sample'][file_info['sample']] = []
                     data['by_sample'][file_info['sample']].append(file_info)
                 
                 if file_info['layer'] is not None:
+                    if file_info['layer'] not in data['by_layer']:
+                        data['by_layer'][file_info['layer']] = []
                     data['by_layer'][file_info['layer']].append(file_info)
                 
                 if file_info['layer_type']:
@@ -245,8 +249,9 @@ class TensorVisualizer:
         pbar.close()
         
         # Statistics by sample
-        pbar = tqdm(total=len(self.samples), desc="Processing samples", unit="samples")
-        for sample in self.samples:
+        actual_samples = list(data['by_sample'].keys())
+        pbar = tqdm(total=len(actual_samples), desc="Processing samples", unit="samples")
+        for sample in actual_samples:
             files = data['by_sample'][sample]
             if files:
                 stats['sample_stats'][sample] = {
@@ -258,8 +263,9 @@ class TensorVisualizer:
         pbar.close()
         
         # Statistics by layer
-        pbar = tqdm(total=len(self.layers), desc="Processing layers", unit="layers")
-        for layer in self.layers:
+        actual_layers = list(data['by_layer'].keys())
+        pbar = tqdm(total=len(actual_layers), desc="Processing layers", unit="layers")
+        for layer in actual_layers:
             files = data['by_layer'][layer]
             if files:
                 stats['layer_stats'][layer] = {
