@@ -93,6 +93,8 @@ class DynamicInferenceEngine(AbstractEngine):
         termination_id: int,
         enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
+        *,
+        track_paused_request_events: bool = False,
     ):
 
         if enable_cuda_graph is not None:
@@ -112,9 +114,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
         self.termination_id = termination_id
         self.random_seed = random_seed
+        self.track_paused_request_events = track_paused_request_events
         self.step_count = 0
         self.finished_request_count = 0
         self.waiting_request_ids = deque()
+        self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
         self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
@@ -367,6 +371,38 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_count = 0
         self.finished_request_count = 0
 
+    def _add_request(
+        self, request: DynamicInferenceRequest
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+
+        request_id = request.request_id
+        self.requests[request_id] = request
+        if request.status is None:
+            request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        try:
+            # Add request to context.
+            self.context.add_request(
+                request_id, request.prompt_tokens, request.sampling_params.num_tokens_to_generate
+            )
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task, self._notify_cond_for_new_request()
+            )
+            request.add_event_add()
+        except ContextOverflowError as e:
+            if e.is_transient:
+                request.status = Status.WAITING_IN_QUEUE
+                self.waiting_request_ids.append(request_id)
+                request.add_event_error_transient(e)
+            else:
+                request.status = Status.FAILED
+                self.failed_request_ids.append(request_id)
+                request.add_event_error_nontransient(e)
+
+        # Create a new asyncio Future to notify the user when the request has completed.
+        self.request_completion_futures[request_id] = asyncio.Future()
+        return self.request_completion_futures[request_id]
+
     def add_request(
         self,
         request_id: int,
@@ -406,26 +442,15 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        self.requests[request_id] = DynamicInferenceRequest(
+        # Initialize request.
+        request = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),
         )
-        try:
-            # Add request to context.
-            self.context.add_request(request_id, tokens, num_tokens_to_generate)
-            self._loop.call_soon_threadsafe(
-                asyncio.create_task, self._notify_cond_for_new_request()
-            )
-        except ContextOverflowError as e:
-            if e.is_transient:
-                self.waiting_request_ids.append(request_id)
-            else:
-                raise e
 
-        # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
-        return self.request_completion_futures[request_id]
+        # Add request.
+        return self._add_request(request)
 
     def post_process_requests(
         self,
@@ -500,6 +525,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     waiting_request.prompt_tokens,
                     waiting_request.sampling_params.num_tokens_to_generate,
                 )
+                waiting_request.add_event_add()
                 self.waiting_request_ids.popleft()
             except Exception as e:
                 break
@@ -549,15 +575,24 @@ class DynamicInferenceEngine(AbstractEngine):
         cuda_graph_request_count = None
         if result is not None:
             active_request_ids = result["active_request_ids"]
+            newly_paused_request_ids = result["newly_paused_request_ids"]
             finished_request_ids = result["finished_request_ids"]
             sample = result["sample"]
             log_probs = result["log_probs"]
             cuda_graph_request_count = result["cuda_graph_request_count"]
 
+            # Add paused events.
+            if newly_paused_request_ids is not None and self.track_paused_request_events:
+                newly_paused_request_ids = newly_paused_request_ids.tolist()
+                [self.requests[i].add_event_pause() for i in newly_paused_request_ids]
+
             # TODO: Move this to a background thread?
             self.schedule_waiting_requests()
 
-            # TODO: Move this to a background thread?
+            # Mark requests finished.
+            [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
+
+            # Add finished events.
             if post_process_requests_locally:
                 (active_requests, finished_requests) = self.post_process_requests(
                     active_request_ids, finished_request_ids, step_time, sample, log_probs
@@ -570,6 +605,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 return None
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
+
+        # Failed requests.
+        for failed_request_id in self.failed_request_ids:
+            failed_request = self.requests.pop(failed_request_id)
+            failed_request.status = Status.FAILED
+            failed_request.add_event_fail()
+            finished_requests.append(failed_request)
+            self.request_completion_futures[failed_request_id].set_result(failed_request)
+        self.failed_request_ids.clear()
 
         # Print context state.
         if verbose:

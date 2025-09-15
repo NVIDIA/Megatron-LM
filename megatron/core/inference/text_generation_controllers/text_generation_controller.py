@@ -410,14 +410,15 @@ class TextGenerationController:
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
-    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
         """Forward step the model and update the inference context.
 
         Args:
             sampling_params (SamplingParams): Parameters for sampling logits.
 
         Return:
-            (Optional[Tuple[Tensor, Tensor, Tensor]]) Current request IDs, new sample.
+            (Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]) Current request IDs,
+                paused request IDs, finished request IDs, new sample.
         """
 
         context = self.inference_wrapped_model.inference_context
@@ -542,10 +543,11 @@ class TextGenerationController:
             )
 
         # Update requests.
-        context.update_requests(active_request_mask, new_sample_copy)
+        newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
 
         return {
             "active_request_ids": active_request_ids,
+            "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
             "sample": new_sample,
             "log_probs": log_probs,

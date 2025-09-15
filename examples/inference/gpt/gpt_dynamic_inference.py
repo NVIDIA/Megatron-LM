@@ -138,9 +138,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
         ),
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
@@ -361,6 +361,7 @@ def main():
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
+        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -401,11 +402,16 @@ def main():
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
-            output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
             prompt_text_escaped = escape_str(prompt_text)
-            output_text_escaped = escape_str(request.output_text)
             num_prompt_tokens = len(requests[request_idx].prompt_tokens)
-            num_output_tokens = len(requests[request_idx].output_tokens)
+            if request.output_text is not None:
+                output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
+                output_text_escaped = escape_str(request.output_text)
+                num_output_tokens = len(requests[request_idx].output_tokens)
+            else:
+                output_text_hash = "--"
+                output_text_escaped = "--"
+                num_output_tokens = 0
             print(
                 f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
                 f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
