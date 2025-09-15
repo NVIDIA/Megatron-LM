@@ -2248,6 +2248,7 @@ def forward_backward_pipelining_without_interleaving(
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
         total_num_tokens += num_tokens
+        # import pdb;pdb.set_trace()
         
         # 检查是否应该退出（tensor已在warmup阶段收集完成）
         try:
