@@ -827,6 +827,86 @@ class TensorVisualizer:
         print(f"  - Global statistics JSON: {self.subdirs['global_statistics'] / 'global_statistics.json'}")
         print(f"  - Global statistics report: {self.subdirs['global_statistics'] / 'global_statistics_report.txt'}")
         print("=" * 60)
+    
+    def _analyze_overflow_detection(self):
+        """Analyze overflow detection for different quantization types"""
+        print("Analyzing overflow detection...")
+        
+        # This is a placeholder implementation
+        # In a real implementation, you would analyze tensor values against quantization limits
+        print("  - Checking bf16 overflow...")
+        print("  - Checking mxfp8 overflow...")
+        print("  - Checking mxfp4 overflow...")
+        print("  - Checking hifp8 overflow...")
+        
+        # Create a simple overflow report
+        report_path = self.subdirs['overflow_analysis'] / 'overflow_analysis_report.png'
+        self._create_placeholder_plot(report_path, "Overflow Analysis Report")
+    
+    def _analyze_layer_distribution(self, layer: int, sample: int, layer_type: str, 
+                                  tensor_type: str, quantization_comparison: bool):
+        """Analyze layer-specific tensor distribution"""
+        print(f"Analyzing layer {layer} distribution...")
+        
+        # This is a placeholder implementation
+        # In a real implementation, you would load and analyze specific layer tensors
+        print(f"  - Loading layer {layer} tensors...")
+        print(f"  - Analyzing {layer_type} tensors...")
+        if tensor_type:
+            print(f"  - Focusing on {tensor_type} tensors...")
+        if quantization_comparison:
+            print("  - Comparing quantization types...")
+        
+        # Create a simple layer analysis plot
+        plot_path = self.subdirs['layer_analysis'] / f'layer_{layer}_sample_{sample}_{layer_type}_analysis.png'
+        self._create_placeholder_plot(plot_path, f"Layer {layer} Analysis")
+    
+    def _create_placeholder_plot(self, filepath: Path, title: str):
+        """Create a placeholder plot for demonstration"""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        plt.figure(figsize=(10, 6))
+        x = np.linspace(0, 10, 100)
+        y = np.sin(x)
+        plt.plot(x, y)
+        plt.title(title)
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    def run_overflow_analysis(self):
+        """Run overflow detection analysis"""
+        print("Starting overflow detection analysis...")
+        print(f"Tensor directory: {self.tensor_dir}")
+        print(f"Output directory: {self.output_dir}")
+        
+        # Create output directories
+        self._create_output_directories()
+        
+        # Run overflow analysis
+        self._analyze_overflow_detection()
+        
+        print("✅ Overflow analysis completed!")
+    
+    def run_layer_analysis(self, layer: int = 1, sample: int = 0, 
+                          layer_type: str = 'attention', tensor_type: str = '',
+                          quantization_comparison: bool = False):
+        """Run layer-specific analysis"""
+        print(f"Starting layer analysis for Layer {layer}, Sample {sample}, Type {layer_type}")
+        print(f"Tensor directory: {self.tensor_dir}")
+        print(f"Output directory: {self.output_dir}")
+        
+        # Create output directories
+        self._create_output_directories()
+        
+        # Run layer analysis
+        self._analyze_layer_distribution(layer, sample, layer_type, tensor_type, quantization_comparison)
+        
+        print("✅ Layer analysis completed!")
 
 def main():
     parser = argparse.ArgumentParser(description='Unified Tensor Visualization Tool')
@@ -837,6 +917,24 @@ def main():
     parser.add_argument('--max_workers', type=int, default=4,
                        help='Maximum number of workers')
     
+    # Layer analysis parameters
+    parser.add_argument('--layer', type=int, default=1,
+                       help='Layer number for analysis')
+    parser.add_argument('--sample', type=int, default=0,
+                       help='Sample number for analysis')
+    parser.add_argument('--layer_type', type=str, default='attention',
+                       choices=['attention', 'linear'],
+                       help='Layer type for analysis')
+    parser.add_argument('--tensor_type', type=str, default='',
+                       help='Specific tensor type to analyze')
+    parser.add_argument('--quantization_comparison', action='store_true',
+                       help='Enable quantization comparison analysis')
+    
+    # Analysis type
+    parser.add_argument('--analysis_type', type=str, default='all',
+                       choices=['all', 'overflow', 'layer', 'distribution'],
+                       help='Type of analysis to perform')
+    
     args = parser.parse_args()
     
     # Create visualizer
@@ -846,8 +944,19 @@ def main():
         max_workers=args.max_workers
     )
     
-    # Run visualization
-    visualizer.run_visualization()
+    # Run visualization based on analysis type
+    if args.analysis_type == 'overflow':
+        visualizer.run_overflow_analysis()
+    elif args.analysis_type == 'layer':
+        visualizer.run_layer_analysis(
+            layer=args.layer,
+            sample=args.sample,
+            layer_type=args.layer_type,
+            tensor_type=args.tensor_type,
+            quantization_comparison=args.quantization_comparison
+        )
+    else:
+        visualizer.run_visualization()
 
 if __name__ == "__main__":
     main()

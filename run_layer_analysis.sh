@@ -58,7 +58,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # 构建Python命令
-PYTHON_CMD="python analyze_layer_distribution.py --tensor_dir \"$TENSOR_DIR\" --output_dir \"$OUTPUT_DIR\" --layer $LAYER --sample $SAMPLE --layer_type $LAYER_TYPE"
+PYTHON_CMD="python script/visualization/tensor_visualizer.py --tensor_dir \"$TENSOR_DIR\" --output_dir \"$OUTPUT_DIR\" --layer $LAYER --sample $SAMPLE --layer_type $LAYER_TYPE"
 
 # 如果指定了tensor类型，添加参数
 if [ -n "$TENSOR_TYPE" ]; then
