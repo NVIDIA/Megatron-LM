@@ -287,7 +287,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         grad_dtype,
                         params,
                         data_parallel_group,
-                        self.bucket_size,
+                        max(self.bucket_size, 1e6 * data_parallel_group.size()),
                         param_to_name,
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
