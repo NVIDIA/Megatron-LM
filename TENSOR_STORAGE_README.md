@@ -56,8 +56,8 @@ Megatron-LM/
 # 收集单个量化类型（默认1个iteration）
 ./run_tensor_collection.sh single mxfp8
 
-# 收集3个micro_batch的数据（使用命令行参数）
-./run_tensor_collection.sh --mode single --quant-type mxfp8 --control-iter 3 --collect-micro-batches 2
+# 收集tensor数据（使用命令行参数）
+./run_tensor_collection.sh --mode single --quant-type mxfp8 --control-iter 3
 
 # 批量收集所有类型
 ./run_tensor_collection.sh batch
@@ -83,8 +83,8 @@ Megatron-LM/
 # 收集并可视化（默认1个iteration）
 ./run_tensor_draw.sh both mxfp8
 
-# 收集3个micro_batch的数据并可视化（使用命令行参数）
-./run_tensor_draw.sh --mode both --quant-type mxfp8 --control-iter 3 --collect-micro-batches 2
+# 收集tensor数据并可视化（使用命令行参数）
+./run_tensor_draw.sh --mode both --quant-type mxfp8 --control-iter 3
 
 # 使用默认参数
 ./run_tensor_draw.sh both
@@ -129,19 +129,20 @@ Megatron-LM/
 
 #### 使用示例
 ```bash
-# 快速测试（1个micro_batch）
+# 快速测试（1个iteration，自动在一次forward后退出）
 ./run_tensor_collection.sh single mxfp8
 
-# 中等规模分析（3个micro_batch）
+# 中等规模分析（3个iteration）
 ./run_tensor_collection.sh --mode single --quant-type mxfp8 --control-iter 3
 
-# 深度分析（10个micro_batch）
+# 深度分析（10个iteration）
 ./run_tensor_collection.sh --mode single --quant-type mxfp8 --control-iter 10
 ```
 
 #### 注意事项
-1. **存储空间**：micro_batch数量越多，需要的存储空间越大
-2. **收集时间**：micro_batch数量越多，收集时间越长
+1. **自动退出**：当启用 `--save-tensors` 时，会在一次完整forward后自动跳出训练
+2. **存储空间**：每次只收集一个micro_batch的数据，节省存储空间
+3. **收集时间**：收集时间大大缩短，适合快速测试和分析
 3. **分析质量**：更多micro_batch的数据可以提供更全面的分析
 4. **测试建议**：建议先用小值（1-3）进行测试，确认无误后再使用大值
 

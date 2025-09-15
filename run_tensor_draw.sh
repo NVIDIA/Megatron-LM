@@ -32,7 +32,7 @@ OUTPUT_DIR="./draw"
 MAX_WORKERS=4
 QUANT_TYPE="mxfp8"
 CONTROL_ITER=1  # 控制收集的micro_batch数量
-COLLECT_MICRO_BATCHES=1  # 收集的micro_batch数量
+# collect_micro_batches已固定为1，进行一次完整forward后跳出
 
 # 显示使用帮助
 show_help() {
@@ -46,7 +46,7 @@ show_help() {
     echo "  --max-workers NUM       最大工作线程数 [默认: 4]"
     echo "  --quant-type TYPE       量化类型 (bf16|mxfp8|mxfp4|hifp8) [默认: mxfp8]"
     echo "  --control-iter NUM      控制收集的micro_batch数量 [默认: 1]"
-    echo "  --collect-micro-batches NUM  收集的micro_batch数量 [默认: 1]"
+    echo "  (collect_micro_batches已固定为1，进行一次完整forward后跳出)"
     echo ""
     echo "位置参数:"
     echo "  MODE                    运行模式 (collect|visualize|both)"
@@ -57,7 +57,7 @@ show_help() {
     echo "  $0 visualize"
     echo ""
     echo "  # 使用命令行参数"
-    echo "  $0 --mode both --quant-type mxfp8 --control-iter 3 --collect-micro-batches 2"
+    echo "  $0 --mode both --quant-type mxfp8 --control-iter 3"
     echo ""
     echo "  # 收集tensor"
     echo "  $0 collect mxfp8"
@@ -100,10 +100,7 @@ while [[ $# -gt 0 ]]; do
             CONTROL_ITER="$2"
             shift 2
             ;;
-        --collect-micro-batches)
-            COLLECT_MICRO_BATCHES="$2"
-            shift 2
-            ;;
+        # collect_micro_batches参数已移除
         collect|visualize|both)
             MODE="$1"
             shift
@@ -127,14 +124,14 @@ echo "  - Output directory: $OUTPUT_DIR"
 echo "  - Max workers: $MAX_WORKERS"
 echo "  - Quantization type: $QUANT_TYPE"
 echo "  - Control micro_batches: $CONTROL_ITER"
-echo "  - 收集micro_batch数量: $COLLECT_MICRO_BATCHES"
+echo "  - 收集micro_batch数量: 1 (固定，一次forward后跳出)"
 
 # Handle different modes
 case "$MODE" in
     "collect")
         echo ""
         echo "Running tensor collection mode..."
-        bash run_tensor_collection.sh --mode single --quant-type "$QUANT_TYPE" --tensor-path "$TENSOR_DIR" --control-iter "$CONTROL_ITER" --collect-micro-batches "$COLLECT_MICRO_BATCHES"
+        bash run_tensor_collection.sh --mode single --quant-type "$QUANT_TYPE" --tensor-path "$TENSOR_DIR" --control-iter "$CONTROL_ITER"
         if [ $? -eq 0 ]; then
             echo "✅ Tensor collection completed"
         else
@@ -145,7 +142,7 @@ case "$MODE" in
     "both")
         echo ""
         echo "Running both tensor collection and visualization..."
-        bash run_tensor_collection.sh --mode single --quant-type "$QUANT_TYPE" --tensor-path "$TENSOR_DIR" --control-iter "$CONTROL_ITER" --collect-micro-batches "$COLLECT_MICRO_BATCHES"
+        bash run_tensor_collection.sh --mode single --quant-type "$QUANT_TYPE" --tensor-path "$TENSOR_DIR" --control-iter "$CONTROL_ITER"
         if [ $? -eq 0 ]; then
             echo "✅ Tensor collection completed, proceeding to visualization..."
         else

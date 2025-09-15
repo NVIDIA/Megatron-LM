@@ -25,7 +25,7 @@ TOKENIZER_PATH="model/llama3.2-1b"
 DATA_PATH="dataset/wikipedia_processed/wikipedia_processed_text_document"
 DTYPE="bf16"
 CONTROL_ITER=1  # 控制收集的micro_batch数量
-COLLECT_MICRO_BATCHES=1  # 收集的micro_batch数量
+# collect_micro_batches已固定为1，进行一次完整forward后跳出
 
 # 显示使用帮助
 show_help() {
@@ -40,7 +40,7 @@ show_help() {
     echo "  --data-path PATH        数据路径 [默认: dataset/wikipedia_processed/wikipedia_processed_text_document]"
     echo "  --dtype TYPE            数据类型 [默认: bf16]"
     echo "  --control-iter NUM      控制收集的micro_batch数量 [默认: 1]"
-    echo "  --collect-micro-batches NUM  收集的micro_batch数量 [默认: 1]"
+    echo "  (collect_micro_batches已固定为1，进行一次完整forward后跳出)"
     echo ""
     echo "位置参数:"
     echo "  MODE                    收集模式 (single|batch|quick)"
@@ -65,8 +65,8 @@ show_help() {
     echo "  # 收集多个micro_batch的数据"
     echo "  $0 --mode single --quant-type mxfp8 --control-iter 5"
     echo ""
-    echo "  # 自定义收集的micro_batch数量"
-    echo "  $0 --mode single --quant-type mxfp8 --collect-micro-batches 2 --control-iter 3"
+    echo "  # 收集tensor（固定为1个micro_batch）"
+    echo "  $0 --mode single --quant-type mxfp8 --control-iter 3"
 }
 
 # 解析命令行参数
@@ -104,10 +104,7 @@ while [[ $# -gt 0 ]]; do
             CONTROL_ITER="$2"
             shift 2
             ;;
-        --collect-micro-batches)
-            COLLECT_MICRO_BATCHES="$2"
-            shift 2
-            ;;
+        # collect_micro_batches参数已移除，固定为1
         single|batch|quick)
             MODE="$1"
             shift
@@ -149,19 +146,14 @@ if ! [[ "$CONTROL_ITER" =~ ^[0-9]+$ ]] || [ "$CONTROL_ITER" -lt 0 ]; then
     exit 1
 fi
 
-# 验证collect_micro_batches参数
-if ! [[ "$COLLECT_MICRO_BATCHES" =~ ^[0-9]+$ ]] || [ "$COLLECT_MICRO_BATCHES" -lt 1 ]; then
-    echo "错误: collect_micro_batches 必须是大于0的整数"
-    echo "当前值: $COLLECT_MICRO_BATCHES"
-    exit 1
-fi
+# collect_micro_batches已固定为1，无需验证
 
 echo "配置信息:"
 echo "  - 模式: $MODE"
 echo "  - 量化类型: $QUANT_TYPE"
 echo "  - Tensor保存路径: $BASE_TENSOR_PATH"
 echo "  - 控制micro_batch数量: $CONTROL_ITER"
-echo "  - 收集micro_batch数量: $COLLECT_MICRO_BATCHES"
+echo "  - 收集micro_batch数量: 1 (固定)"
 echo "  - 分词器路径: $TOKENIZER_PATH"
 echo "  - 数据路径: $DATA_PATH"
 echo "  - 数据类型: $DTYPE"
@@ -206,7 +198,7 @@ collect_single_quant_type() {
     local tensor_path="$BASE_TENSOR_PATH/${quant_type}"
     local max_wait=300  # 最大等待时间（秒）
     local control_iter=$CONTROL_ITER  # 控制收集的micro_batch数量
-    local collect_micro_batches=$COLLECT_MICRO_BATCHES  # 收集的micro_batch数量
+    # collect_micro_batches已固定为1
     
     echo ""
     echo "=================================================================================="
@@ -218,7 +210,7 @@ export TENSOR_SAVE_ENABLED="true"
 export TENSOR_SAVE_DIR="$tensor_path"
 export HOST_TENSORBOARD_LOGS_PATH="tensorboard_logs/${quant_type}"
 export CONTROL_ITER="$control_iter"
-export COLLECT_MICRO_BATCHES="$collect_micro_batches"
+# collect_micro_batches已固定为1，无需设置环境变量
     
     # 创建目录
     mkdir -p "$tensor_path"
@@ -246,7 +238,7 @@ export COLLECT_MICRO_BATCHES="$collect_micro_batches"
         "$DATA_PATH" \
         "$DTYPE" \
         --control-iter "$control_iter" \
-        --collect-micro-batches "$collect_micro_batches" \
+        # collect_micro_batches已固定为1，无需传递参数
         2>&1 | tee "$log_file" 
     
     # 最终统计

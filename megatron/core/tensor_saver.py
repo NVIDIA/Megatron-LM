@@ -257,21 +257,20 @@ def initialize_tensor_collection(rank: Optional[int] = None,
 class TensorSaver:
     """Tensor保存器，用于保存量化前后的tensor数据"""
     
-    def __init__(self, save_dir: str = "./enhanced_tensor_logs", enabled: bool = True, control_micro_batches: int = 1):
+    def __init__(self, save_dir: str = "./enhanced_tensor_logs", enabled: bool = True):
         """
         初始化Tensor保存器
         
         Args:
             save_dir: 保存目录
             enabled: 是否启用保存功能
-            control_micro_batches: 控制收集的micro_batch数量，达到后停止收集
         """
         self.save_dir = Path(save_dir)
         self.enabled = enabled
         self.tensor_counter = 0
         self.current_iteration = 0
         self.micro_batch_count = 0
-        self.control_micro_batches = control_micro_batches  # 控制收集的micro_batch数量
+        self.control_micro_batches = 1  # 固定为1，进行一次完整forward后跳出
         
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -285,14 +284,7 @@ class TensorSaver:
         set_global_iteration(iteration)
         print(f"[TensorSaver] 设置当前iteration: {iteration}")
     
-    def increment_micro_batch(self):
-        """增加micro_batch计数"""
-        self.micro_batch_count += 1
-        print(f"[TensorSaver] Micro batch count: {self.micro_batch_count}/{self.control_micro_batches}")
-    
-    def should_continue_collection(self) -> bool:
-        """检查是否应该继续收集tensor"""
-        return self.micro_batch_count < self.control_micro_batches
+    # micro_batch控制方法已移除，当启用tensor保存时自动在一次forward后退出
     
     def _get_tensor_info(self, tensor: torch.Tensor) -> Dict[str, Any]:
         """获取tensor的基本信息"""
@@ -453,9 +445,7 @@ class TensorSaver:
         if not self.enabled:
             return None
         
-        # 检查是否已经达到控制的micro_batch数量
-        if not self.should_continue_collection():
-            return None
+        # 当启用tensor保存时，会在一次forward后自动退出，无需额外检查
         
         # 自动获取rank信息（如果未提供）
         if rank is None:
@@ -634,10 +624,9 @@ def get_tensor_saver() -> TensorSaver:
     """获取全局tensor保存器实例"""
     global _global_tensor_saver
     if _global_tensor_saver is None:
-        # 优先从环境变量获取配置，然后从命令行参数获取
+        # 从环境变量和命令行参数获取配置
         save_dir = os.environ.get("TENSOR_SAVE_DIR", "./enhanced_tensor_logs")
         enabled = os.environ.get("TENSOR_SAVE_ENABLED", "false").lower() == "true"
-        control_micro_batches = int(os.environ.get("COLLECT_MICRO_BATCHES", "1"))
         
         # 尝试从命令行参数获取配置（如果可用）
         try:
@@ -647,14 +636,11 @@ def get_tensor_saver() -> TensorSaver:
                 save_dir = args.tensor_save_dir
             if hasattr(args, 'save_tensors'):
                 enabled = args.save_tensors or enabled
-            if hasattr(args, 'collect_micro_batches'):
-                control_micro_batches = args.collect_micro_batches
-                print(f"[TensorSaver] 从命令行参数获取collect_micro_batches: {control_micro_batches}")
         except Exception as e:
             print(f"[TensorSaver] 无法从命令行参数获取配置，使用环境变量: {e}")
         
-        print(f"[TensorSaver] 初始化配置 - save_dir: {save_dir}, enabled: {enabled}, control_micro_batches: {control_micro_batches}")
-        _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled, control_micro_batches=control_micro_batches)
+        print(f"[TensorSaver] 初始化配置 - save_dir: {save_dir}, enabled: {enabled}, control_micro_batches: 1 (固定)")
+        _global_tensor_saver = TensorSaver(save_dir=save_dir, enabled=enabled)
         
         # 从环境变量设置iteration
         iteration = os.environ.get("TENSOR_SAVER_ITERATION")

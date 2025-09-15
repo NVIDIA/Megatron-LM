@@ -35,10 +35,7 @@ while [[ $# -gt 0 ]]; do
             EXTRA_ARGS+=("--tensor-save-dir" "$2")
             shift 2
             ;;
-        --collect-micro-batches)
-            EXTRA_ARGS+=("--collect-micro-batches" "$2")
-            shift 2
-            ;;
+        # collect_micro_batches参数已移除
         *)
             EXTRA_ARGS+=("$1")
             shift
