@@ -431,7 +431,7 @@ publish:test_release_notify:
       RELEASE_NUMBER=$(echo "${!var}")
       URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
 
-      cat << EOF > message.json
+      cat <<MSG > message.json
       {
           "blocks": [
             {
@@ -443,7 +443,7 @@ publish:test_release_notify:
             }
           ]
       }
-      EOF
+      MSG
 
       cat message.json
 
