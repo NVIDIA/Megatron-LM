@@ -7,6 +7,8 @@ import torch
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
 
+from llm_shower.orthogonalized_optimizers.muon import Muon
+
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
     from transformer_engine.pytorch.optimizers import FusedSGD as SGD
@@ -33,6 +35,7 @@ from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -629,4 +632,124 @@ def get_megatron_optimizer(
             )
         )
 
+    return ChainedOptimizer(optimizers)
+
+# self-contained change depends on this but doesn't modify existing function.
+# will move to optimizer implementation directory
+def get_megatron_muon_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Optional[Callable] = None,
+    scale_lr_cond: Optional[Callable] = None,
+    lr_mult: float = 1.0,
+    use_gloo_process_groups: bool = True,
+    layer_wise_distributed_optimizer: bool = False,
+) -> MegatronOptimizer:
+    """
+    This function is used to get the muon optimizer for the model chunks.
+    It is used to get the muon optimizer for the model chunks.
+    Args:
+        config (OptimizerConfig): optimizer configuration object.
+        model_chunks (List[MegatronModule]): model chunks to get optimizer for.
+        no_weight_decay_cond (func, optional): function to determine whether a parameter
+            should not perform weight decay. Defaults to None.
+        scale_lr_cond (func, optional): function to determine whether a parameter
+            should have a scaled learning rate. Defaults to None.
+        lr_mult (float, optional): learning rate multiplier for parameters that
+            satisfy scale_lr_cond. Defaults to 1.0.
+        use_gloo_process_groups (bool): if false, disable use of Gloo process groups
+            in underlying Megatron optimizers.
+        layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
+            Defaults to False.
+    """
+    # currently it is only supporting muon, will add soaps later
+
+    # dist-optim is not supported due to strong coupling with how DDP init grad buffer
+    # in thoery we can put some weight to use non-dist-muon and rest to dist-adam
+    # but there are strong dependency and assumption in DDP that prevent it
+    if config.use_distributed_optimizer:
+        raise Exception('muon with dist optimizer is not supported.')
+
+    log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
+
+    optimizers = []
+    # record list of non/linear params
+    linear_params = []
+    nonlinear_params = []
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            # TODO: revisit this condition. name?
+            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (len(param.shape) == 1):
+                linear_params.append(param)
+            else:
+                nonlinear_params.append(param)
+
+    # freezing nonlinear params and get param groups for muon
+    for param in nonlinear_params:
+        param.requires_grad = False
+
+    # TODO: merge expert parallel group since dist-opt is off
+    linear_param_groups = _get_param_groups(
+        model_chunks,
+        no_weight_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+        lr=config.lr,
+        min_lr=config.min_lr,
+        decoupled_lr=config.decoupled_lr,
+        decoupled_min_lr=config.decoupled_min_lr,
+    )
+
+    optimizer = Muon(
+        linear_param_groups,
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        momentum_beta=config.muon_momentum,
+        use_nesterov=config.muon_use_nesterov,
+        num_ns_steps=config.muon_num_ns_steps,
+        fp32_matmul_prec=config.muon_fp32_matmul_prec,
+        scale_mode=config.muon_scale_mode,
+        split_qkv=False,
+        qkv_split_shapes=None,
+        tp_group=parallel_state.get_tensor_model_parallel_group(),
+        tp_mode=config.muon_tp_mode,
+    )
+
+    # set config here to: 1. get adam later and 2. avoid ChainedOptimizer check fail
+    # side effect is muon optimizer will have wrong name str, i.e. config.optimizer == 'adam'
+    config.optimizer = 'adam'
+    # need to wrap into megatron mix precision optimizer. (only support bf16 w/o loss scale now)
+    if config.bf16:
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, None)
+    else:
+        optimizer = FP32Optimizer(optimizer, config, None)
+
+    optimizers.append(optimizer)
+
+    # done with muon, unfreeze nonlinear and freeze linear
+    for param in nonlinear_params:
+        param.requires_grad = True
+    for param in linear_params:
+        param.requires_grad = False
+
+    # call original get. linear params will be skipped since they're freezed
+    chained_adam = get_megatron_optimizer(config, model_chunks, no_weight_decay_cond,
+                                          scale_lr_cond, lr_mult, use_gloo_process_groups)
+
+    # unfreeze everything
+    for param in linear_params:
+        param.requires_grad = True
+
+    # chain everything together
+    optimizers += chained_adam.chained_optimizers
+
+    if layer_wise_distributed_optimizer:
+        log_single_rank(logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for Muon')
+        return LayerWiseDistributedOptimizer(
+                optimizers,
+                parallel_state.get_data_parallel_group(with_context_parallel=True),
+                parallel_state.get_expert_data_parallel_group(),
+            )
     return ChainedOptimizer(optimizers)

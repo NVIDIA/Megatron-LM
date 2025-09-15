@@ -16,7 +16,7 @@ class OptimizerConfig:
     # General
     ##############
     optimizer: str = 'adam'
-    """Optimizer to use (one of Adam or SGD)."""
+    """Optimizer to use (one of Adam, SGD, or Muon)."""
 
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
@@ -118,6 +118,25 @@ class OptimizerConfig:
     # SGD.
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
+
+    # Muon
+    muon_momentum: float = 0.95
+    """The momentum used by the internal SGD."""
+
+    muon_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum in the internal SGD."""
+
+    muon_scale_mode: str = "spectral"
+    """The mode to use for the scale factor. Defaults to "spectral"."""
+
+    muon_fp32_matmul_prec: str = "medium"
+    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_num_ns_steps: int = 5
+    """The number of iteration steps to use in the Newton-Schulz iteration."""
+
+    muon_tp_mode: str = "blockwise"
+    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
     #######################
     # Distributed optimizer
