@@ -1113,9 +1113,6 @@ class TensorVisualizer:
         print(f"Tensor directory: {self.tensor_dir}")
         print(f"Output directory: {self.output_dir}")
         
-        # Create output directories
-        self._create_output_directories()
-        
         # Run overflow analysis
         self._analyze_overflow_detection()
         
@@ -1129,9 +1126,6 @@ class TensorVisualizer:
         print(f"Tensor directory: {self.tensor_dir}")
         print(f"Output directory: {self.output_dir}")
         print(f"Efficient mode: {efficient_mode}")
-        
-        # Create output directories
-        self._create_output_directories()
         
         # Run layer analysis
         self._analyze_layer_distribution(layer, rank, layer_type, tensor_type, quantization_comparison, efficient_mode)
