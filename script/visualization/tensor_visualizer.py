@@ -904,9 +904,9 @@ class TensorVisualizer:
         
         # Create analysis plots
         if tensors:
-            self._create_layer_analysis_plots(tensors, layer, sample, layer_type, tensor_type, quantization_comparison)
+            self._create_layer_analysis_plots(tensors, layer, rank, layer_type, tensor_type, quantization_comparison)
     
-    def _create_layer_analysis_plots(self, tensors, layer: int, sample: int, layer_type: str, 
+    def _create_layer_analysis_plots(self, tensors, layer: int, rank: int, layer_type: str, 
                                    tensor_type: str, quantization_comparison: bool):
         """Create layer analysis plots"""
         import matplotlib.pyplot as plt
@@ -1023,7 +1023,7 @@ class TensorVisualizer:
         plt.tight_layout()
         
         # Save plot
-        plot_path = self.subdirs['layer_analysis'] / f'layer_{layer}_sample_{sample}_{layer_type}_analysis.png'
+        plot_path = self.subdirs['layer_analysis'] / f'layer_{layer}_rank_{rank}_{layer_type}_analysis.png'
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         

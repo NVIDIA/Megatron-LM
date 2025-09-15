@@ -21,7 +21,7 @@ echo "==========================================================================
 TENSOR_DIR=${1:-"./enhanced_tensor_logs"}
 OUTPUT_DIR=${2:-"./layer_analysis_output"}
 LAYER=${3:-1}
-SAMPLE=${4:-0}  # Sample now represents rank (different GPUs = different samples)
+RANK=${4:-0}  # GPU rank (different GPUs = different ranks)
 LAYER_TYPE=${5:-"attention"}
 TENSOR_TYPE=${6:-""}
 QUANTIZATION_COMPARISON=${7:-"false"}
@@ -30,7 +30,7 @@ echo "Parameter settings:"
 echo "  - Tensor directory: $TENSOR_DIR"
 echo "  - Output directory: $OUTPUT_DIR"
 echo "  - Layer: $LAYER"
-echo "  - Sample (Rank): $SAMPLE (Note: Sample now represents GPU rank since only one micro_batch is collected)"
+echo "  - Rank: $RANK (GPU rank)"
 echo "  - Layer type: $LAYER_TYPE"
 echo "  - Tensor type: $TENSOR_TYPE"
 echo "  - Quantization comparison: $QUANTIZATION_COMPARISON"
@@ -58,7 +58,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # 构建Python命令
-PYTHON_CMD="python script/visualization/tensor_visualizer.py --tensor_dir \"$TENSOR_DIR\" --output_dir \"$OUTPUT_DIR\" --layer $LAYER --sample $SAMPLE --layer_type $LAYER_TYPE"
+PYTHON_CMD="python script/visualization/tensor_visualizer.py --tensor_dir \"$TENSOR_DIR\" --output_dir \"$OUTPUT_DIR\" --layer $LAYER --rank $RANK --layer_type $LAYER_TYPE"
 
 # 如果指定了tensor类型，添加参数
 if [ -n "$TENSOR_TYPE" ]; then
@@ -94,16 +94,16 @@ if [ $? -eq 0 ]; then
     # 显示主要输出
     echo ""
     echo "Main output files:"
-    if [ -f "$OUTPUT_DIR/layer_analysis/layer_${LAYER}_sample_${SAMPLE}_${LAYER_TYPE}_analysis.png" ]; then
-        echo "  🎯 Layer analysis: $OUTPUT_DIR/layer_analysis/layer_${LAYER}_sample_${SAMPLE}_${LAYER_TYPE}_analysis.png"
+    if [ -f "$OUTPUT_DIR/layer_analysis/layer_${LAYER}_rank_${RANK}_${LAYER_TYPE}_analysis.png" ]; then
+        echo "  🎯 Layer analysis: $OUTPUT_DIR/layer_analysis/layer_${LAYER}_rank_${RANK}_${LAYER_TYPE}_analysis.png"
     fi
     if [ -n "$TENSOR_TYPE" ] && [ "$QUANTIZATION_COMPARISON" = "true" ]; then
-        if [ -f "$OUTPUT_DIR/quantization_analysis/quantization_comparison_layer_${LAYER}_sample_${SAMPLE}_${LAYER_TYPE}_${TENSOR_TYPE}.png" ]; then
-            echo "  🔍 Quantization comparison: $OUTPUT_DIR/quantization_analysis/quantization_comparison_layer_${LAYER}_sample_${SAMPLE}_${LAYER_TYPE}_${TENSOR_TYPE}.png"
+        if [ -f "$OUTPUT_DIR/quantization_analysis/quantization_comparison_layer_${LAYER}_rank_${RANK}_${LAYER_TYPE}_${TENSOR_TYPE}.png" ]; then
+            echo "  🔍 Quantization comparison: $OUTPUT_DIR/quantization_analysis/quantization_comparison_layer_${LAYER}_rank_${RANK}_${LAYER_TYPE}_${TENSOR_TYPE}.png"
         fi
     fi
-    if [ -f "$OUTPUT_DIR/global_statistics/statistics_layer_${LAYER}_sample_${SAMPLE}_${LAYER_TYPE}.txt" ]; then
-        echo "  📋 Statistics report: $OUTPUT_DIR/global_statistics/statistics_layer_${LAYER}_sample_${SAMPLE}_${LAYER_TYPE}.txt"
+    if [ -f "$OUTPUT_DIR/global_statistics/statistics_layer_${LAYER}_rank_${RANK}_${LAYER_TYPE}.txt" ]; then
+        echo "  📋 Statistics report: $OUTPUT_DIR/global_statistics/statistics_layer_${LAYER}_rank_${RANK}_${LAYER_TYPE}.txt"
     fi
     
     END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
