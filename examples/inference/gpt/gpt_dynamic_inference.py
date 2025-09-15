@@ -394,6 +394,7 @@ def main():
 
     # >>>
     engine.suspend()
+    torch.cuda.synchronize()
     engine.resume()
     raise Exception("hi.")
     # <<<

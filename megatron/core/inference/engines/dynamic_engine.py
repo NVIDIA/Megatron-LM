@@ -409,6 +409,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         try:
 
+            # >>>
+            torch.cuda.synchronize()
+            # <<<
             start_mem = torch.cuda.memory_stats()
 
             start_time = time.time()
