@@ -549,13 +549,9 @@ class BalancedCPScheduler:
             if not existing_group_sizes:
                 return  # No groups exist, cannot redistribute
 
-            # TODO(pmannan): Should we assert that no GPU has more than 1 sub-sample assigned to it?
-            # Why would there be empty GPUs if some GPUs have multiple sub-samples assigned to it?
-            # But if it does happen if seq len forces it, I need to change the assumptions below.
-            # Below code assumes that there is 1 sub-sample in the GPUs that we will expand.
-            
             min_group_size = min(existing_group_sizes)
-            next_power = min_group_size * 2
+            # We have Hybrid DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
+            next_power = min(min_group_size * 2, total_gpus)
             
             # Find the first group of min_group_size that can be expanded
             expandable_gid = None
