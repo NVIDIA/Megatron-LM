@@ -25,6 +25,12 @@ from .mapping import (
 )
 from .utils import extract_sharded_tensors_and_factories
 
+KEEP_VARS_HINT = (
+    " Make sure state dict contains original torch.nn.Parameters (not pure torch.Tensors)"
+    " by passing `keep_vars=True` to `.state_dict()`. If any transformation of the original"
+    " parameter is needed, use a ShardedTensorFactory."
+)
+
 
 def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -> Dict[int, int]:
     """Generate mapping from optimizer param to optimizer state id."""

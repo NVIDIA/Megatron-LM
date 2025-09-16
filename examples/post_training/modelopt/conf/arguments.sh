@@ -34,7 +34,7 @@ else
     source ${MLM_ENV_SETUP}
 fi
 
-if [ -z ${MLM_EXTRA_ARGS} ]; then
+if [[ -z ${MLM_EXTRA_ARGS} ]]; then
     printf "${MLM_WARNING} Use ${PURPLE}MLM_EXTRA_ARGS${WHITE} to provide additional arguments!\n"
 fi
 

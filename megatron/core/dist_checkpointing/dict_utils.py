@@ -103,11 +103,19 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
     else:
         only_left = []
         only_right = []
+        mismatch_debug_data = [prefix, type(x1), type(x2)]
         if isinstance(x1, torch.Tensor) and isinstance(x2, torch.Tensor):
-            if x1.device != x2.device:
-                _is_mismatch = not torch.all(x1.cpu() == x2.cpu())
-            else:
-                _is_mismatch = not torch.all(x1 == x2)
+            try:
+                if x1.device != x2.device:
+                    _is_mismatch = not torch.all(x1.cpu() == x2.cpu())
+                else:
+                    _is_mismatch = not torch.all(x1 == x2)
+                mismatch_debug_data.extend(
+                    [(x1 != x2).sum(), (x1 != x2).shape, (x1 != x2).nonzero().tolist()]
+                )
+            except (RuntimeError, TypeError, ValueError):
+                _is_mismatch = True
+                mismatch_debug_data.extend([x1.shape, x2.shape])
         # TODO: change with concrete type that has both replica_id and data attrs
         elif hasattr(x1, "replica_id") and hasattr(x2, "replica_id"):
             assert type(x1) == type(x2)
@@ -122,7 +130,7 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
                 _is_mismatch = True
 
         if _is_mismatch:
-            mismatch.append((prefix, type(x1), type(x2)))
+            mismatch.append(tuple(mismatch_debug_data))
 
     return only_left, only_right, mismatch
 

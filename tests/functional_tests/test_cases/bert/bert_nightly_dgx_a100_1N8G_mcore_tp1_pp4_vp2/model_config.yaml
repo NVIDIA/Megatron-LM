@@ -42,4 +42,5 @@ MODEL_ARGS:
   --bf16: true
   --ckpt-format: torch
   --attention-backend: unfused
+  --legacy-tokenizer: true
 TEST_TYPE: regular

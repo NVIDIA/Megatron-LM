@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -28,9 +29,18 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestStaticInferenceEngine:
-    def setup_engine(self, engine_max_batch_size=None, vocab_size=100):
+    def setup_engine(
+        self,
+        engine_max_batch_size=None,
+        vocab_size=100,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        sequence_parallel=False,
+    ):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
         )
 
         model_parallel_cuda_manual_seed(123)
@@ -43,6 +53,14 @@ class TestStaticInferenceEngine:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            inference_rng_tracker=True,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            num_moe_experts=None if expert_model_parallel_size == 1 else expert_model_parallel_size,
+            sequence_parallel=sequence_parallel,
+            pipeline_dtype=torch.bfloat16,
+            add_bias_linear=expert_model_parallel_size == 1,
         )
 
         gpt_model = GPTModel(
@@ -51,6 +69,8 @@ class TestStaticInferenceEngine:
             vocab_size=self.vocab_size,
             max_sequence_length=self.sequence_length,
             parallel_output=True,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
 
         inference_wrapper_config = InferenceWrapperConfig(
@@ -87,8 +107,6 @@ class TestStaticInferenceEngine:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize(
         "batch_size,num_trials,empty_prompt",
         [(4, 1, False), (4, 1, True), (4, 3, False), (2, 1, False), (8, 1, False)],
@@ -221,3 +239,65 @@ class TestStaticInferenceEngine:
                 f"result.generated_log_probs={result.generated_log_probs}, "
                 f"final_streamed_token.generated_log_probs={final_streamed_token.generated_log_probs}"
             )
+
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_parallel_inference(self, tp_size, pp_size, ep_size, sequence_parallel):
+        if tp_size == 1 and pp_size == 1 and ep_size == 1:
+            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
+        elif not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        min_world_size = tp_size * pp_size * ep_size
+        if world_size < min_world_size:
+            pytest.skip(f"Test requires at least {min_world_size} GPUs")
+        elif tp_size == 1 and sequence_parallel:
+            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
+        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
+            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
+
+        batch_size = 8
+
+        self.setup_engine(
+            engine_max_batch_size=batch_size,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=sequence_parallel,
+        )
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.eod = -1
+
+        random.seed(42)
+
+        # Generating random length integer prompts, ensuring sequence length is divisible by TP size
+        self.mock_tokenizer.tokenize.return_value = [
+            random.randint(0, self.vocab_size - 1) for _ in range(32)
+        ]
+        # Generates some random string
+        self.mock_tokenizer.detokenize.return_value = ''.join(
+            random.choices(string.ascii_letters, k=random.randint(4, 10))
+        )
+
+        prompts = ["sample" * (i + 1) for i in range(batch_size)]
+
+        if sequence_parallel and (ep_size == 1 or tp_size == 1):
+            with pytest.raises(NotImplementedError):
+                results: List[InferenceRequest] = self.static_engine.generate(
+                    prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
+                )
+            return
+        else:
+            results: List[InferenceRequest] = self.static_engine.generate(
+                prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
+            )
+
+        assert len(results) == batch_size
+        for result in results:
+            assert (
+                result.status == Status.COMPLETED
+            ), f"Status should be completed but its {result.status}"
+            assert result.generated_length > 0, f"Generated length should be greater than zero"
+            assert result.generated_text is not None, f'Generated text should not be None'

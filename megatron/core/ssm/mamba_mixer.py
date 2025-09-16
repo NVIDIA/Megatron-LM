@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -117,7 +117,7 @@ class MambaMixer(MegatronModule):
         chunk_size: The chunk size for the fused kernel.
         use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
         layer_number: The layer number of this Mamba layer.
-        model_comm_pgs: The required process groups to use for tensor model parallel and context
+        pg_collection: The required process groups to use for tensor model parallel and context
             parallel.
     """
 
@@ -147,7 +147,7 @@ class MambaMixer(MegatronModule):
         d_state=None,
         headdim=None,
         ngroups=None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -170,8 +170,8 @@ class MambaMixer(MegatronModule):
         self.chunk_size = chunk_size
         self.layer_number = layer_number
         self.cached_batch_size = None
-        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaMixer"
-        self.model_comm_pgs = model_comm_pgs
+        assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
+        self.pg_collection = pg_collection
 
         # Check for deprecated arguments and raise warnings
         if use_mem_eff_path is not None:
@@ -222,7 +222,7 @@ class MambaMixer(MegatronModule):
                 "input projection output tensor must be a multiple of 16."
             )
 
-        tp_size = self.model_comm_pgs.tp.size()
+        tp_size = self.pg_collection.tp.size()
 
         # Ensure that each TP rank gets at least one head:
         assert self.nheads % tp_size == 0, "nheads must be evenly divisble by tp_size"
@@ -254,7 +254,7 @@ class MambaMixer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="fc1",
-            tp_group=self.model_comm_pgs.tp,
+            tp_group=self.pg_collection.tp,
         )
 
         if not self.use_mem_eff_path:
@@ -357,7 +357,7 @@ class MambaMixer(MegatronModule):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name="fc2",
-            tp_group=self.model_comm_pgs.tp,
+            tp_group=self.pg_collection.tp,
         )
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
@@ -366,7 +366,7 @@ class MambaMixer(MegatronModule):
         # rank store the same trainable variables, but only use and update their unique/independent
         # slice of them.
         self.cp = MambaContextParallel(
-            cp_group=self.model_comm_pgs.cp,
+            cp_group=self.pg_collection.cp,
             d_inner_local_tp=self.d_inner_local_tp,
             nheads_local_tp=self.nheads_local_tp,
             ngroups_local_tp=self.ngroups_local_tp,

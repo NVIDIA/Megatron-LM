@@ -672,7 +672,7 @@ class TestDynamicContext:
             request_data[req_id]["initial_token_offset"] = current_token_idx
             current_token_idx += data["prefill_len"]
 
-        # --- Simulate Prefill Step ---
+        # Simulate prefill step
         total_active_tokens = dynamic_context.active_token_count
         vocab_size = 50000
         # logits will have shape [1, total_active_tokens, vocab_size]
@@ -680,19 +680,21 @@ class TestDynamicContext:
             1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
         )
 
+        # New tokens from prefill (one token per active request)
+        num_active_requests = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
+
         # Call the function for prefill
-        prefill_log_probs = dynamic_context.calculate_log_probs(prefill_logits)
+        prefill_log_probs = dynamic_context.calculate_log_probs(prefill_logits, prefill_new_tokens)
 
         # Calculate expected prefill log probs for the selected tokens
-        expected_prefill_log_probs_all_logits = torch.nn.functional.log_softmax(
-            prefill_logits.squeeze(0), dim=-1
-        ).to(torch.float32)
-
-        active_token_ids = dynamic_context.token_to_input_ids[:total_active_tokens]
-        sequence_indices = torch.arange(total_active_tokens, device=prefill_logits.device)
-        expected_prefill_log_probs_selected = expected_prefill_log_probs_all_logits[
-            sequence_indices, active_token_ids
-        ]
+        expected_prefill_log_probs = (
+            torch.nn.functional.log_softmax(prefill_logits.squeeze(0), dim=-1)
+            .to(torch.float32)
+            .cpu()
+        )
 
         for i, (req_id, data) in enumerate(request_data.items()):
             req_len = data["tokens"].shape[0]
@@ -700,56 +702,131 @@ class TestDynamicContext:
 
             assert len(prefill_log_probs[i]) == req_len, len(prefill_log_probs[i])
 
-            # Extract the relevant slice of expected log probs for this request's tokens
-            expected_prefill_log_probs_selected_for_request = expected_prefill_log_probs_selected[
-                initial_token_offset : initial_token_offset + req_len
-            ]
+            # Get the prompt tokens for this request and add the new sampled token
+            request_tokens = data["tokens"][1:].tolist()
+            request_tokens.append(prefill_new_tokens[i].item())
 
-            # Compare the values (using allclose for float tensors)
-            assert torch.allclose(
-                torch.tensor(prefill_log_probs[i]),
-                expected_prefill_log_probs_selected_for_request.cpu(),
-            )
+            for j, token in enumerate(request_tokens):
+                assert (
+                    prefill_log_probs[i][j]
+                    == expected_prefill_log_probs[initial_token_offset + j, token].item()
+                )
 
-        # --- Simulate Decode Step ---
+        # Simulate decode step
         # All requests are active, so the mask will be all ones for the current active requests
         active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
 
-        # New tokens for the decode step (one token per active request)
-        num_active_requests = dynamic_context.total_request_count
-        decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').int()
-
         dynamic_context.update_requests(
-            active_requests_mask=active_requests_mask, new_tokens=decode_new_tokens
+            active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
         )
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
         decode_logits = torch.randn(
             1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
         )
-        decode_log_probs = dynamic_context.calculate_log_probs(decode_logits)
+        decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
+        decode_log_probs = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
 
         # Verify the stored decode log probabilities
-        expected_decode_log_probs_all_logits = torch.nn.functional.log_softmax(
+        expected_decode_log_probs = torch.nn.functional.log_softmax(
             decode_logits.squeeze(0), dim=-1
         ).to(torch.float32)
-
-        total_active_tokens = dynamic_context.active_token_count
-        active_token_ids = dynamic_context.token_to_input_ids[:total_active_tokens]
-        sequence_indices = torch.arange(total_active_tokens, device=prefill_logits.device)
-        expected_decode_log_probs_selected = expected_decode_log_probs_all_logits[
-            sequence_indices, active_token_ids
-        ]
 
         for i, (req_id, data) in enumerate(request_data.items()):
             assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
 
-            # Extract the relevant slice of expected log probs for this request's tokens
-            expected_decode_log_probs_selected_for_request = expected_decode_log_probs_selected[
-                i : i + 1
-            ]
+            token = decode_new_tokens[i].item()
+            assert decode_log_probs[i][0] == expected_decode_log_probs[i, token].item()
 
-            assert torch.allclose(
-                torch.tensor(decode_log_probs[i]),
-                expected_decode_log_probs_selected_for_request.cpu(),
-            )
+        # Simulate mixed prefill and decode step (adding a new request to existing context)
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
+        )
+
+        # Add a new prefill request to the existing context
+        new_request_id = 1004
+        new_request_tokens = torch.randint(0, 100, (12,), device='cuda').long()
+        new_request_prefill_len = new_request_tokens.shape[0]
+        initial_token_offset_new_request = dynamic_context.active_token_count
+        dynamic_context.add_request(new_request_id, new_request_tokens)
+        request_data[new_request_id] = {
+            "tokens": new_request_tokens,
+            "prefill_len": new_request_prefill_len,
+            "initial_token_offset": initial_token_offset_new_request,
+        }
+
+        # Simulate the step after adding the new prefill request.
+        # This step will involve both prefill (for the new request) and decode (for existing requests).
+
+        dynamic_context.initialize_attention_state()
+
+        total_active_tokens_mixed_step = dynamic_context.active_token_count
+        mixed_step_logits = torch.randn(
+            1, total_active_tokens_mixed_step, vocab_size, device='cuda', dtype=torch.float32
+        )
+
+        num_active_requests_mixed_step = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        mixed_step_new_tokens = torch.randint(
+            0, 100, (num_active_requests_mixed_step,), device='cuda'
+        ).long()
+
+        mixed_step_log_probs = dynamic_context.calculate_log_probs(
+            mixed_step_logits, mixed_step_new_tokens
+        )
+
+        expected_mixed_step_log_probs = (
+            torch.nn.functional.log_softmax(mixed_step_logits.squeeze(0), dim=-1)
+            .to(torch.float32)
+            .cpu()
+        )
+
+        # Verify log probs for the mixed step
+        current_global_token_offset = 0
+        for i, (req_id, data) in enumerate(request_data.items()):
+
+            # This logic needs to consider if the request was new (prefill) or existing (decode)
+            if req_id == new_request_id:
+                # This is the newly added prefill request
+                expected_len = data["prefill_len"]
+                assert len(mixed_step_log_probs[i]) == expected_len
+
+                # For prefill, the log probs are for tokens[1:] + new_token
+                prompt_tokens = data["tokens"][1:].tolist()
+                new_sampled_token = mixed_step_new_tokens[i].item()
+
+                for j in range(expected_len - 1):
+                    # For prompt tokens
+                    assert (
+                        mixed_step_log_probs[i][j]
+                        == expected_mixed_step_log_probs[
+                            current_global_token_offset + j, prompt_tokens[j]
+                        ].item()
+                    )
+
+                # For the newly sampled token
+                assert (
+                    mixed_step_log_probs[i][expected_len - 1]
+                    == expected_mixed_step_log_probs[
+                        current_global_token_offset + expected_len - 1, new_sampled_token
+                    ].item()
+                )
+
+                current_global_token_offset += expected_len
+
+            else:
+                # These are existing requests, now in decode phase
+                expected_len = 1
+                assert len(mixed_step_log_probs[i]) == expected_len
+
+                # For decode, the log prob is for the single new token
+                new_sampled_token = mixed_step_new_tokens[i].item()
+                assert (
+                    mixed_step_log_probs[i][0]
+                    == expected_mixed_step_log_probs[
+                        current_global_token_offset, new_sampled_token
+                    ].item()
+                )
+
+                current_global_token_offset += expected_len

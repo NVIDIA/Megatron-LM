@@ -2,6 +2,7 @@
 
 """ModelOpt GPT model provider."""
 
+import json
 import os
 from argparse import Namespace
 from typing import Any, Dict
@@ -149,6 +150,14 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input 
 
     if args.export_model_type == "GPTModel":
+        if args.export_offline_model:
+            # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
+            config.original_num_layers = config.num_layers
+            # Set num_layers to 0 for base model in offline mode
+            config.num_layers = 0
+            # SP is not used for offline
+            # TODO: DSR1 MTP may require SP
+            config.sequence_parallel = False
         if config.heterogeneous_block_specs:
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
                 config=config,
@@ -204,14 +213,15 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     else:
         raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
 
-    # import modelopt.torch.speculative as mtsp
-    # config = {"eagle_num_layers": 1}
-    # model = mtsp.convert(model, [("eagle", config)])
-
-    # Load modelopt_state
-    modelopt_state = load_modelopt_state(model=model) if args.load else {}
-    if modelopt_state:
-        model = mto.restore_from_modelopt_state(model, modelopt_state)
+    # [IMPORTANT] Load modelopt_state immediately before returning the model back to `get_model()`.
+    # 
+    # ModelOpt can create additional trainable parameters (e.g. for online speculative
+    # decoding training or PEFT). Hence resuming modelopt_state during checkpoint loading is already
+    # too late since Megatron created the optimizer right after calling model_provider before loading
+    # the checkpoint. To ensure all trainable parameters are reigistered, we try to resume the
+    # modelopt_state (which transforms the model to have additional parameters) before returning.
+    if args.load is not None:
+        load_modelopt_state(model=model)
 
     _add_load_convert_hooks(model)
 

@@ -346,8 +346,11 @@ class ModelParallelConfig:
     cpu_offloading_activations: bool = True
     """If True, offloads the activations to CPU."""
 
-    cpu_offloading_weights: bool = True
+    cpu_offloading_weights: bool = False
     """If True, offloads the weights to CPU."""
+
+    cpu_offloading_double_buffering: bool = False
+    """If True, enables double buffering across layers while reloading activations from CPU."""
 
     ###################
     # Timing
@@ -396,8 +399,8 @@ class ModelParallelConfig:
 
         if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
-                raise ValueError(
-                    "When using expert parallelism and tensor parallelism, "
+                warnings.warn(
+                    "When using expert parallelism and tensor parallelism for training, "
                     "sequence parallelism must be used"
                 )
 
