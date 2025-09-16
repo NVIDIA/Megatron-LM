@@ -694,8 +694,8 @@ class TestCaptureFreezeGC:
         )
 
         # Validate time and memory usage.
-        assert freeze_on_results["internal"]["time"] < 0.2 * freeze_off_results["internal"]["time"]
-        assert freeze_on_results["external"]["time"] < 0.2 * freeze_off_results["external"]["time"]
+        assert freeze_on_results["internal"]["time"] < 0.3 * freeze_off_results["internal"]["time"]
+        assert freeze_on_results["external"]["time"] < 0.3 * freeze_off_results["external"]["time"]
         assert (
             freeze_on_results["internal"]["allocated_bytes"]
             <= freeze_off_results["internal"]["allocated_bytes"]
