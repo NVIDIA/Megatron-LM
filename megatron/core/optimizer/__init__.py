@@ -715,8 +715,8 @@ def get_megatron_muon_optimizer(
         scale_mode=config.muon_scale_mode,
         split_qkv=False,
         qkv_split_shapes=None,
-        tp_group=parallel_state.get_tensor_model_parallel_group(),
-        tp_mode=config.muon_tp_mode,
+        # tp_group=parallel_state.get_tensor_model_parallel_group(),
+        # tp_mode=config.muon_tp_mode,
     )
 
     # set config here to: 1. get adam later and 2. avoid ChainedOptimizer check fail
