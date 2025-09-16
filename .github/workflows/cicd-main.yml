@@ -102,7 +102,7 @@ jobs:
   Nemo_CICD_Test:
     needs:
       - pre-flight
-      - cicd-unit-tests
+      - cicd-unit-tests-latest
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
