@@ -153,7 +153,6 @@ runs:
           --runtime=nvidia --gpus all \
           --shm-size=64g \
           --ipc=host \
-          -e NCCL_DEBUG=INFO \
           -e NCCL_IB_DISABLE=1 \
           -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
