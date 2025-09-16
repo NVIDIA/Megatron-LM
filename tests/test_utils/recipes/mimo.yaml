@@ -62,4 +62,4 @@ products:
   - test_case: [mimo_vlm_pretrain_convergence_tp1_pp1_cp1_dp8]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [flaky]

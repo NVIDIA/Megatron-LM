@@ -67,6 +67,7 @@ class TestParallelTransformerBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
@@ -258,6 +259,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
 
     # Teardown
     Utils.destroy_model_parallel()
+    _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
@@ -344,6 +346,7 @@ class TestLLaVACudaGraph:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -423,6 +426,15 @@ class TestLLaVACudaGraph:
             loss = output1.sum()
         loss.backward()
 
+        # Import the CUDA graph creation function
+        from megatron.core.transformer.cuda_graphs import create_cudagraphs
+
+        # Create the CUDA graphs - this is where the is_last_layer logic is tested
+        create_cudagraphs()
+
+        # Verify that CUDA graphs were created successfully
+        assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
+
         if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
             self.llava_model.vision_model.decoder, 'layers'
         ):
@@ -474,6 +486,7 @@ class TestParallelMambaBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(

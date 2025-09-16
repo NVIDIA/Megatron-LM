@@ -418,10 +418,20 @@ publish:test_release_notify:
   variables:
     PUBLISH_DRYRUN: "yes"
   script:
-    - echo $PUBLISH_DRYRUN
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
+    - set -x
+    - env
+    - apk add --no-cache bash
     - |
-      cat << EOF > message.json
+      bash <<'EOF'
+      set -x
+      echo $PUBLISH_DRYRUN
+      PLATFORM=amd64
+      PACKAGE=megatron-core
+      var=EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}
+      RELEASE_NUMBER=$(echo "${!var}")
+      URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
+
+      cat <<MSG > message.json
       {
           "blocks": [
             {
@@ -433,11 +443,10 @@ publish:test_release_notify:
             }
           ]
       }
-      EOF
+      MSG
 
-    - cat message.json
+      cat message.json
 
-    - |
       CMD=$(echo curl \
         -X POST \
         -H "Content-type: application/json" \
@@ -449,6 +458,7 @@ publish:test_release_notify:
       else
         eval "$CMD"
       fi
+      EOF
 
 publish:release_pypi_build_wheel:
   extends: [publish:test_release_pypi_build_wheel, .publish_common_release]

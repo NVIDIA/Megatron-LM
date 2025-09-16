@@ -2,6 +2,7 @@
 
 """Convert a GPTModel."""
 import functools
+import json
 import os
 import sys
 import warnings
@@ -41,55 +42,21 @@ def add_convert_args(parser):
         "--extra-model-path", type=str, default=None, help="Extra module weights to load"
     )
     group.add_argument(
+        '--algorithm',
+        type=str,
+        choices=["medusa", "eagle1", "eagle3", "None"],
+        default="None",
+        help='Chosing between different speculative decoding algorithms. Default is None.',
+    )
+    group.add_argument(
         '--export-num-medusa-heads',
         type=int,
         default=0,
         help='Number of Medusa heads for speculative decoding.',
     )
     group.add_argument(
-        '--export-eagle-algorithm',
-        type=str,
-        choices=['eagle1', 'eagle3', 'eagle-mtp'],
-        default="eagle-mtp",
-        help='Chosing the between different flavors of EAGLE algorithms.',
-    )
-    group.add_argument(
-        '--export-num-eagle-layers',
-        type=int,
-        default=0,
-        help='Number of EAGLE layers for speculative decoding.',
-    )
-    group.add_argument(
-        '--export-draft-vocab-size',
-        type=int,
-        default=0,
-        help='The reduced vocabulary size of the draft model.',
-    )
-    group.add_argument(
-        '--export-eagle-ffn-hidden-size',
-        type=int,
-        default=0,
-        help='ffn_hidden_size of the eagle module. Using base model ffn_hidden_size is set to 0.',
-    )
-
-    group.add_argument(
-        '--export-num-mtp',
-        type=int,
-        default=0,
-        help='Number of MTP modules for speculative decoding.',
-    )
-    group.add_argument(
-        '--export-freeze-mtp',
-        type=int,
-        nargs="*",
-        default=[],
-        help='Index of MTP that will be frozen in training.',
-    )
-    group.add_argument(
-        '--export-parallel-draft-step',
-        type=int,
-        default=1,
-        help='The number of tokens generated in parallel draft. If set to 1, draft is not in parallel mode.',
+        "--eagle-config", type=str, default=None, help="EAGLE architecture config. If not given, " \
+        "a default config will be use. If provided, it will overwrite the default config."
     )
 
     add_modelopt_args(parser)
@@ -165,12 +132,20 @@ if __name__ == "__main__":
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
-    if args.export_num_eagle_layers > 0:
-        mtsp_config = ALGO_TO_CONFIG[args.export_eagle_algorithm]
-        mtsp_config["config"]["eagle_num_layers"] = args.export_num_eagle_layers
-        mtsp_config["config"]["draft_vocab_size"] = args.export_draft_vocab_size
-        mtsp_config["config"]["ffn_hidden_size"] = args.export_eagle_ffn_hidden_size
-        mtsp_config["config"]["parallel_draft_step"] = args.export_parallel_draft_step
+    if args.algorithm in ("eagle1", "eagle3"):
+        mtsp_config = ALGO_TO_CONFIG[args.algorithm]
+        if args.eagle_config:
+            with open(args.eagle_config)as f:
+                eagle_config = json.load(f)
+            mtsp_config["config"]["eagle_architecture_config"].update(eagle_config)
+        # Update eagle hidden_size and vocab_size according to the base model
+        mtsp_config["config"]["eagle_architecture_config"]["hidden_size"] = unwrapped_model.config.hidden_size
+        mtsp_config["config"]["eagle_architecture_config"]["vocab_size"] = unwrapped_model.vocab_size
+        if not args.eagle_config or "draft_vocab_size" not in eagle_config:
+            # If draft_vocab_size is not provided, set it to vocab_size
+            mtsp_config["config"]["eagle_architecture_config"]["draft_vocab_size"] = unwrapped_model.vocab_size
+        if args.export_offline_model:
+            mtsp_config["config"]["eagle_offline"] = True
 
         unwrapped_model = mtsp.convert(unwrapped_model, mtsp_config)
 
@@ -181,28 +156,19 @@ if __name__ == "__main__":
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
 
         # Add mask tokens for parallel draft
-        if args.export_parallel_draft_step > 1:
-            assert args.export_parallel_draft_step <= 4, "Parallel draft only supports steps less than or equal to 4."
+        if unwrapped_model.eagle_config.parallel_draft_step > 1:
+            assert unwrapped_model.eagle_config.parallel_draft_step <= 4, "Parallel draft only supports steps less than or equal to 4."
             tokenizer = get_tokenizer()
-            for i in range(args.export_parallel_draft_step - 1):
+            for i in range(unwrapped_model.eagle_config.parallel_draft_step - 1):
                 mask_token = "[MASK_{}]".format(i)
                 tokenizer._tokenizer.add_tokens([mask_token], special_tokens=True) 
                 token_id = tokenizer._tokenizer.convert_tokens_to_ids(mask_token)
                 setattr(unwrapped_model, "mask_token_{}".format(i), torch.tensor(token_id))
                 
-
-    if args.export_num_medusa_heads > 0:
+    elif args.algorithm == "medusa":
         config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
         unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])
 
-    if args.export_num_mtp > 0:
-        config = {
-            "mtp_num_module": args.export_num_mtp,
-            "mtp_num_layers": 1,
-            "mtp_freeze_list": args.export_freeze_mtp,
-            "use_last_layernorm": False,
-        }
-        unwrapped_model = mtsp.convert(unwrapped_model, [("mtp", config)])
 
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()

@@ -34,6 +34,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import squared_relu
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -374,6 +375,12 @@ def validate_args(args, defaults={}):
 
     # Batch size checks if running RL.
     if args.perform_rl_step:
+        assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
+            "Cannot use both remove-kv-cache-during-training and offload-kv-cache-during-training"
+
+        assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
+            "Cannot use both partial-rollouts and remove-kv-cache-during-training"
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -1219,6 +1226,10 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.squared_relu:
         assert not args.swiglu
         kw_args['activation_func'] = squared_relu
+    elif args.quick_geglu:
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -1407,6 +1418,11 @@ def _add_inference_args(parser):
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
                        'number of cuda graphs may not equal this argument.')
+    group.add_argument('--inference-dynamic-batching-track-paused-request-events',
+                       action='store_true',
+                       help='Track paused request ids by adding \'paused\' events '
+                       'to each request\'s event history. This has a very minor '
+                       'impact on latency.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
@@ -1570,6 +1586,14 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--quick-geglu', action='store_true',
+                       help='Use quick geglu activation instead of default gelu')
+    group.add_argument('--activation-func-clamp-value', type=float, default=None,
+                       help='Clamp the output of the linear_fc1 in the activation function. Only used when '
+                            'activation_func is quick_gelu.')
+    group.add_argument('--glu-linear-offset', type=float, default=0.0,
+                       help='Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). '
+                            'Only used when gated_linear_unit is True')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
@@ -1859,6 +1883,20 @@ def _add_rl_args(parser):
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
+    group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
+                       help='Offload KV cache to CPU during training to save GPU memory')
+    group.add_argument('--rl-remove-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
+                       help='Remove KV cache during training to save GPU memory')
+    group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, use partial rollouts.')
+    group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='If set, use inference logprobs in importance sampling correction of the loss.')
+    group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
+                       help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, calculate the intra-group similarity of rollouts.')
     return parser
 
 def _add_training_args(parser):

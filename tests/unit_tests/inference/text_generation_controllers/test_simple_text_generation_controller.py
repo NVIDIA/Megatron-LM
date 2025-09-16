@@ -670,11 +670,10 @@ class TestTextGenerationController:
                 )
             sampling_params = SamplingParams(top_k=10, return_log_probs=True)
             while context.has_unfinished_requests():
-                _, _, new_tokens, _ = (
-                    self.text_generation_controller.generate_output_tokens_dynamic_batch(
-                        sampling_params=sampling_params, termination_id=-1
-                    )
+                result = self.text_generation_controller.generate_output_tokens_dynamic_batch(
+                    sampling_params=sampling_params, termination_id=-1
                 )
+                new_tokens = result["sample"]
                 assert len(new_tokens) == len(active_requests)
                 for i, token in enumerate(new_tokens.tolist()):
                     all_generated_tokens[i].append(token)
