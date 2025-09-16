@@ -95,8 +95,8 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          script: ${{ matrix.script }}
-          timeout: ${{ matrix.timeout || 10 }}
+          bucket: ${{ matrix.bucket }}
+          timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
 
