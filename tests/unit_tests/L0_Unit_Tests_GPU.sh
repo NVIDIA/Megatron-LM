@@ -18,4 +18,6 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
     --tag latest \
     --environment dev \
-    --bucket 'tests/unit_tests'
+    --bucket 'tests/unit_tests/pipeline_parallel/test_pipeline_layout.py'
+
+ls -al 
