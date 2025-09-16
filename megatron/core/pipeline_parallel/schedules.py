@@ -2027,8 +2027,8 @@ def get_tensor_shapes(
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
-    tp_group: torch.distributed.ProcessGroup,
-    cp_group: torch.distributed.ProcessGroup,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """
     Determine right tensor sizes (based on position of rank with respect to split rank) and
@@ -2036,15 +2036,23 @@ def get_tensor_shapes(
     """
 
     tensor_shapes = []
-    # Use decoder_seq_length if provided, otherwise use seq_length
-    effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    if config.variable_seq_lengths:
+        # this is actually not used
+        # with variable seq_lengths, ranks exchange the tensor shape with each other
+        tensor_shapes.append(())
+        return tensor_shapes
+    else:
+        # Use decoder_seq_length if provided, otherwise use seq_length
+        assert cp_group is not None, "cp_group is required for non-variable seq_lengths"
+        assert tp_group is not None, "tp_group is required for non-variable seq_lengths"
+        effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
+        effective_seq_length = effective_seq_length // cp_group.size()
 
-    if config.sequence_parallel:
-        effective_seq_length = effective_seq_length // tp_group.size()
+        if config.sequence_parallel:
+            effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
-    return tensor_shapes
+        tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+        return tensor_shapes
 
 
 def forward_backward_pipelining_without_interleaving(
@@ -2061,7 +2069,7 @@ def forward_backward_pipelining_without_interleaving(
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[Union[P2PCommunicator, MultiModulePipelineCommunicator]] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
+    pg_collection: Optional[Union[ProcessGroupCollection, List[ProcessGroupCollection]]] = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2082,7 +2090,7 @@ def forward_backward_pipelining_without_interleaving(
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
-
+    tp_group, cp_group = None, None
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
@@ -2102,33 +2110,21 @@ def forward_backward_pipelining_without_interleaving(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        llm_cp_size = cp_group.size()
     elif p2p_communicator is not None and pg_collection is not None:
-        model_type = get_model_type(model)
-        assert model_type != ModelType.encoder_and_decoder, (
-            "encoder PP stages not yet supported when passing custom process groups. "
-            "support coming soon!"
-        )
-        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
-        assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
-        assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
-        assert hasattr(pg_collection, 'embd'), (
-            "pg_collection must have a embd. In previous version, it is used default "
-            "`parallel_state.default_embedding_ranks` to create the process group. "
-            " If you are using the default process group, please use "
-            " `parallel_state.get_embedding_group()` "
-            "If you don't need embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pos_embd'), (
-            "pg_collection must have a pos_embd. In previous version, it is used default "
-            "`parallel_state.default_position_embedding_ranks` to create the process group. "
-            " If you are using the default process group, please use  "
-            " `parallel_state.get_position_embedding_group()` "
-            "If you don't need pos_embd_group, you need to explicitly set it to None."
-        )
-        assert hasattr(pg_collection, 'pp'), "pg_collection must have pp_group"
-        assert hasattr(pg_collection, 'dp_cp'), "pg_collection must have dp_cp_group"
-        tp_group = pg_collection.tp
-        cp_group = pg_collection.cp
+        if isinstance(pg_collection, list):
+            # cases when multiple modules are colocated
+            assert config.variable_seq_lengths, "variable seq_lengths is required when multiple modules are colocated"
+            # when llm is colocated for now assume last collection in the list is the llm
+            # TODO: ykarnati: Have a better interface to handle this (without breaking backward compatibility)
+            assert hasattr(pg_collection[-1], 'cp'), "pg_collection must have cp_group"
+            llm_cp_size = pg_collection[-1].cp.size()
+        else:
+            assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
+            assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
+            tp_group = pg_collection.tp
+            cp_group = pg_collection.cp
+            llm_cp_size = pg_collection.cp.size()
     else:
         raise ValueError(
             "Invalid combination of p2p_communicator, pg_collection "
@@ -2239,7 +2235,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=llm_cp_size,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
@@ -2282,7 +2278,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor,
             forward_data_store,
             config,
-            cp_group_size=pg_collection.cp.size(),
+            cp_group_size=llm_cp_size,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(

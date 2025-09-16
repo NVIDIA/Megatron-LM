@@ -278,7 +278,7 @@ class BridgeCommunicator:
                 self._communicate_shapes(tensor_to_send_next=tensor_splits[0])
                 for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
                     logging.debug(
-                        f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
+                        f"[Bridge Comunicator] [send_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] Rank {self.current_rank} "
                         f"send to rank {dest_rank}"
                     )
                     dist.send(tensor_split, dst=dest_rank)
@@ -301,7 +301,7 @@ class BridgeCommunicator:
 
         rank_info = self.comm_map.get(self.current_rank)
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
-
+        logging.debug(f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] Receiver Rank {self.current_rank} rank_info: {rank_info}")
         if rank_info.role == 'RECEIVER':
             assert (
                 self.current_rank == self.dest_local_leader_rank
@@ -309,7 +309,7 @@ class BridgeCommunicator:
             # p2p call to receive the tensor
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_prev=True)
             logging.debug(
-                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] Receiver Rank {self.current_rank} "
                 f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
             )
             received_tensors_list = []
@@ -322,14 +322,14 @@ class BridgeCommunicator:
                 )
                 dist.recv(tensor_to_recv, src=src_rank)
                 logging.debug(
-                    f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                    f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] Receiver Rank {self.current_rank} "
                     f"received tensor from src rank {src_rank} "
                     f"shape {tensor_to_recv.shape} sum {tensor_to_recv.sum()}"
                 )
                 received_tensors_list.append(tensor_to_recv)
             aggregated_tensor = torch.cat(received_tensors_list, dim=self.dim_mapping['b'])
             logging.debug(
-                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] Receiver Rank {self.current_rank} "
                 f"broadcasting tensor {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
             )
 
@@ -349,9 +349,11 @@ class BridgeCommunicator:
         elif rank_info.role == 'MEMBER' and self.current_rank in self.dest_grid_broadcast_ranks:
             # Non-leader rank - participate in broadcast
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            logging.debug(f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] MEMBER Rank {self.current_rank} broadcasting shape_tensor to leader rank {self.dest_local_leader_rank}")
             dist.broadcast(
                 shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
+            logging.debug(f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] MEMBER Rank {self.current_rank} shape_tensor received: {shape_tensor}")
 
             received_shape = tuple(shape_tensor.tolist())
             received_tensor = torch.empty(
@@ -367,7 +369,7 @@ class BridgeCommunicator:
             )
 
             logging.debug(
-                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                f"[Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] MEMBER Rank {self.current_rank} "
                 f"received tensor via broadcast, shape {received_tensor.shape}"
             )
             return received_tensor

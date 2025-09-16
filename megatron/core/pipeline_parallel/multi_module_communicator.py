@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
-
+import logging
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
@@ -203,13 +203,15 @@ class MultiModulePipelineCommunicator:
                 # If so, initialize bridge communicator
                 if pp_stage == 0:
                     for bridge_comm in self.bridge_comms:
-                        if bridge_comm.is_current_rank_in_grid(bridge_comm.dest_grid):
+                        if (bridge_comm.is_current_rank_in_grid(bridge_comm.dest_grid) and 
+                            bridge_comm.dest_module_name == module_name):
                             bridge_comms_as_dest_module.append(bridge_comm)
                 # If last stage, check if the module has any outgoing modules
                 # If so, initialize bridge communicator
                 if pp_stage == pp_size - 1:
                     for bridge_comm in self.bridge_comms:
-                        if bridge_comm.is_current_rank_in_grid(bridge_comm.src_grid):
+                        if (bridge_comm.is_current_rank_in_grid(bridge_comm.src_grid) and 
+                            bridge_comm.src_module_name == module_name):
                             bridge_comms_as_src_module.append(bridge_comm)
                 # Build RankModuleInfo for the module
                 rank_module_info = RankModuleInfo(
@@ -239,9 +241,11 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
+                    logging.debug(f'[MultiModulePipelineCommunicator] rank {dist.get_rank()} recv_forward using bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} ')
                     input_dict[bridge_comm.src_module_name] = bridge_comm.recv_forward()
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
+                logging.debug(f'[MultiModulePipelineCommunicator] rank {dist.get_rank()} recv_forward using p2p comm module_name: {module_name} ')
                 input_dict[module_name] = rank_module_info.p2p_communicator.recv_forward(
                     tensor_shapes=tensor_shape, is_first_stage=False
                 )
@@ -258,9 +262,11 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    logging.debug(f'[MultiModulePipelineCommunicator] rank {dist.get_rank()} send_forward using bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} output_dict keys: {output_dict.keys()}')
                     bridge_comm.send_forward(output_dict[module_name])
             else:
                 # If not last stage, send forward activation by using P2P communicator.
+                logging.debug(f'[MultiModulePipelineCommunicator] rank {dist.get_rank()} send_forward using p2p comm module_name: {module_name} ')
                 rank_module_info.p2p_communicator.send_forward(
                     output_dict[module_name], is_last_stage=False
                 )
