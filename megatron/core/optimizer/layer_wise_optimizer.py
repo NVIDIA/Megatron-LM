@@ -19,12 +19,16 @@ from typing import Any, Callable, Tuple
 import torch
 from absl import logging
 from emerging_optimizers import utils
-from emerging_optimizers.orthogonalized_optimizers import muon
+from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
-from megatron.core import optimizer as mcore_optimizer
 from megatron.core.models.gpt import gpt_model as mcore_gpt_model
-from megatron.core.optimizer import Adam as AdamW
-from megatron.core.optimizer import clip_grads
+from megatron.core.optimizer import Adam, clip_grads
+from megatron.core.optimizer.optimizer import (
+    ChainedOptimizer,
+    Float16OptimizerWithFloat16Params,
+    FP32Optimizer,
+)
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 
 def default_params_group_func(
@@ -145,18 +149,18 @@ def group_params_layer_wise(
     return layer_wise_optimizer, broadcast_params_list
 
 
-class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
+class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
     Warning:
-        This is a experimental optimizer that distributes optimizers of linear and embedding layers 
+        This is a experimental optimizer that distributes optimizers of linear and embedding layers
         to different ranks with the option to use different optimizer for different layer types.
         Generic tensor parallelism support is still work in progress.
 
     Args:
         module: A megatron core model chunk.
         linear_optimizer_cls: Optimizer class for linear layers.
-        opt_kwargs_list: List of keyword arguments for different optimizer types. Must have same 
+        opt_kwargs_list: List of keyword arguments for different optimizer types. Must have same
             length as what returned by params_group_func.
         mcore_optimizer_config: Megatron-core optimizer configuration.
         pg_collection: A collection of process groups.
@@ -170,7 +174,7 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         module: torch.nn.Module,
         linear_optimizer_cls: type[torch.optim.Optimizer],
         opt_kwargs_list: list[dict],
-        mcore_optimizer_config: mcore_optimizer.OptimizerConfig,
+        mcore_optimizer_config: OptimizerConfig,
         pg_collection: dict[str, torch.distributed.ProcessGroup],
         params_group_func: (
             Callable[[torch.nn.Module], Tuple[list[torch.nn.Parameter], ...]] | None
@@ -204,10 +208,10 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         )
 
         if mcore_optimizer_config.bf16:
-            optimizer_wrapper = mcore_optimizer.Float16OptimizerWithFloat16Params
+            optimizer_wrapper = Float16OptimizerWithFloat16Params
             wrapper_args = [mcore_optimizer_config, None, None]
         elif not mcore_optimizer_config.fp16:
-            optimizer_wrapper = mcore_optimizer.FP32Optimizer
+            optimizer_wrapper = FP32Optimizer
             wrapper_args = [mcore_optimizer_config, None]
         else:
             raise ValueError("Unsupported optimizer precision")
@@ -248,12 +252,12 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
 
         if len(embed_params_list) > 0:
             embed_optimizer = optimizer_wrapper(
-                AdamW(embed_params_list, **embed_opt_kwargs), *wrapper_args
+                Adam(embed_params_list, **embed_opt_kwargs), *wrapper_args
             )
         else:
             embed_optimizer = None
         norm_optimizer = optimizer_wrapper(
-            AdamW(norm_params_list, **default_opt_kwargs), *wrapper_args
+            Adam(norm_params_list, **default_opt_kwargs), *wrapper_args
         )
         assert norm_optimizer, "Norm optimizer should not be empty."
 
@@ -278,7 +282,7 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         """step function for layer-wise optimizer
 
         Note:
-            A lot of code from ChainedOptimizer.step() is copied here because there are bug fixes 
+            A lot of code from ChainedOptimizer.step() is copied here because there are bug fixes
             after core 0.12.
         """
         found_inf_flag = self.prepare_grads()
@@ -373,7 +377,7 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
 
 def get_shower_optimizer_for_mcore(
     model: torch.nn.Module,
-    config: mcore_optimizer.OptimizerConfig,
+    config: OptimizerConfig,
     linear_optimizer: str = "muon",
     split_qkv: bool = False,
     **kwargs: Any,
@@ -382,7 +386,7 @@ def get_shower_optimizer_for_mcore(
 
     Warning:
         Megatron monkey patches a lot of attributes to variety of objects.
-        This function tries to encapsulate fragile functionalities that depends on those fragile 
+        This function tries to encapsulate fragile functionalities that depends on those fragile
         patches and isolate them from the main LayerWiseDistributedOptimizer class.
 
     Args:
@@ -413,19 +417,19 @@ def get_shower_optimizer_for_mcore(
 
             Checks all tensors that is a parameter of the model and has the same shape as defined by
              `fused_qkv_shape`.
-            Note: Other tensors might have the same shape but are not fused QKV tensors and this 
+            Note: Other tensors might have the same shape but are not fused QKV tensors and this
                 function will still return True.
 
             Args:
                 x: tensor to check.
 
             Returns:
-                True if the tensor is a fused QKV tensor only by shape `fused_qkv_shape`, False 
+                True if the tensor is a fused QKV tensor only by shape `fused_qkv_shape`, False
                 otherwise.
             """
             return x.shape == fused_qkv_shape
 
-        linear_optimizer_cls = muon.Muon
+        linear_optimizer_cls = Muon
         linear_opt_kwargs = dict(
             lr=config.lr,
             weight_decay=getattr(config, "muon_linear_wd", config.weight_decay),
