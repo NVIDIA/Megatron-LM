@@ -548,6 +548,11 @@ class BalancedCPScheduler:
             existing_group_sizes = set(group_size.values())
             if not existing_group_sizes:
                 return  # No groups exist, cannot redistribute
+
+            # TODO(pmannan): Should we assert that no GPU has more than 1 sub-sample assigned to it?
+            # Why would there be empty GPUs if some GPUs have multiple sub-samples assigned to it?
+            # But if it does happen if seq len forces it, I need to change the assumptions below.
+            # Below code assumes that there is 1 sub-sample in the GPUs that we will expand.
             
             min_group_size = min(existing_group_sizes)
             next_power = min_group_size * 2
@@ -560,34 +565,37 @@ class BalancedCPScheduler:
             for gid, size in group_size.items():
                 if size == min_group_size:
                     members = group_members[gid]
-                    # get_new_work_queue(members[-1], min_group_size)
-                    needed_count = min_group_size
-                    current_gpu = members[-1]
+                    needed_count = next_power - min_group_size
+                    group_start_gpu = members[0]
+                    group_end_gpu = members[-1]
                     empty_gpu = [idx for idx, work in enumerate(micro_batches) if not work][0]
                     assert not all(work for work in micro_batches[empty_gpu:empty_gpu+needed_count]), f"Not enough empty GPUs to expand or there are empty GPUs between work scheduled which is not allowed."
-                    work_to_push = micro_batches[current_gpu + 1 : empty_gpu] # This is work of all other subsequent sub-samples
-                    exec_times_to_push = exec_times[current_gpu + 1 : empty_gpu]
-                    sample_ids_to_push = sample_ids_per_gpu[current_gpu + 1 : empty_gpu]
+                    work_to_push = micro_batches[group_end_gpu + 1 : empty_gpu] # This is work of all other subsequent sub-samples
+                    exec_times_to_push = exec_times[group_end_gpu + 1 : empty_gpu]
+                    sample_ids_to_push = sample_ids_per_gpu[group_end_gpu + 1 : empty_gpu]
                     
 
                     new_micro_batches = [[]] * len(micro_batches)
                     new_exec_times = [0.0] * len(exec_times)
                     new_sample_ids_per_gpu = [[]] * len(sample_ids_per_gpu)
 
-                    for i in range(current_gpu+1):
+                    # No change in work until the group selected for expansion
+                    for i in range(group_start_gpu):
                         new_micro_batches[i] = micro_batches[i]
                         new_exec_times[i] = exec_times[i]
                         new_sample_ids_per_gpu[i] = sample_ids_per_gpu[i]
 
-                    for i in range(needed_count):
-                        new_micro_batches[current_gpu + 1 +i] = micro_batches[current_gpu]
-                        new_exec_times[current_gpu + 1 + i] = exec_times[current_gpu]
-                        new_sample_ids_per_gpu[current_gpu + 1 + i] = sample_ids_per_gpu[current_gpu]
+                    # The work is distributed across the expanded group
+                    for i in range(group_start_gpu, group_end_gpu + needed_count + 1):
+                        new_micro_batches[i] = micro_batches[group_end_gpu]
+                        new_exec_times[i] = self.get_total_workload(micro_batches[group_end_gpu][0], next_power)
+                        new_sample_ids_per_gpu[i] = sample_ids_per_gpu[group_end_gpu]
 
+                    # Any assigned work on expanded GPUs is pushed
                     for i, work in enumerate(work_to_push):
-                        new_micro_batches[current_gpu + needed_count + 1 + i] = work
-                        new_exec_times[current_gpu + needed_count + 1 + i] = exec_times_to_push[i]
-                        new_sample_ids_per_gpu[current_gpu + needed_count + 1 + i] = sample_ids_to_push[i]
+                        new_micro_batches[group_end_gpu + needed_count + 1 + i] = work
+                        new_exec_times[group_end_gpu + needed_count + 1 + i] = exec_times_to_push[i]
+                        new_sample_ids_per_gpu[group_end_gpu + needed_count + 1 + i] = sample_ids_to_push[i]
                     
                     group_size[gid] = next_power
                     group_members[gid] = list(range(members[0], members[-1] + needed_count + 1))
