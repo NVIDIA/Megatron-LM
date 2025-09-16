@@ -393,10 +393,10 @@ def main():
     )
 
     # >>>
-    engine.suspend()
-    torch.cuda.synchronize()
-    engine.resume()
-    raise Exception("hi.")
+    # engine.suspend()
+    # torch.cuda.synchronize()
+    # engine.resume()
+    # raise Exception("hi.")
     # <<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
