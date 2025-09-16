@@ -175,7 +175,9 @@ class RotaryEmbedding(nn.Module):
         emb = emb[:, None, None, :]
         return emb
 
-    def forward(self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None) -> Tensor:
+    def forward(
+        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> Tensor:
         """Forward pass of RoPE embedding.
 
         Args:
@@ -199,7 +201,7 @@ class RotaryEmbedding(nn.Module):
                 # slice rotary_pos_emb along sequence dimension and select the parition of the current
                 # CP rank
                 emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
-            
+
         return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):

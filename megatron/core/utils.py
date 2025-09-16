@@ -1800,7 +1800,9 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = None, cp_rank: Optional[int] = None):
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], cp_size: Optional[int] = None, cp_rank: Optional[int] = None
+):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
@@ -1812,7 +1814,9 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = No
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     if cp_size is not None or cp_rank is not None:
-        assert cp_size is not None and cp_rank is not None, "Both cp_size and cp_rank must be provided for batch slicing"
+        assert (
+            cp_size is not None and cp_rank is not None
+        ), "Both cp_size and cp_rank must be provided for batch slicing"
 
     if cp_size is None:
         cp_size = parallel_state.get_context_parallel_world_size()
