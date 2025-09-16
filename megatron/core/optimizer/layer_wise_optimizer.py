@@ -14,26 +14,26 @@
 # limitations under the License.
 import math
 import re
-from typing import Tuple, Callable, Any
-
-from absl import logging
+from typing import Any, Callable, Tuple
 
 import torch
+from absl import logging
+from emerging_optimizers import utils
+from emerging_optimizers.orthogonalized_optimizers import muon
 
 from megatron.core import optimizer as mcore_optimizer
-from megatron.core.optimizer import clip_grads, Adam as AdamW
 from megatron.core.models.gpt import gpt_model as mcore_gpt_model
-
-from llm_shower.soap.soap import SOAP
-from llm_shower.orthogonalized_optimizers import muon
-from llm_shower import utils
+from megatron.core.optimizer import Adam as AdamW
+from megatron.core.optimizer import clip_grads
 
 
-def default_params_group_func(mcore_te_model: mcore_gpt_model.GPTModel) -> Tuple[list[torch.nn.Parameter], ...]:
+def default_params_group_func(
+    mcore_te_model: mcore_gpt_model.GPTModel,
+) -> Tuple[list[torch.nn.Parameter], ...]:
     """Default parameter group function for LayerWiseDistributedOptimizer.
 
-    It is designed to be used with Megatron-core models with transformer engine backend. Filtering is strongly
-    based on layer names.
+    It is designed to be used with Megatron-core models with transformer engine backend. Filtering
+    is strongly based on layer names.
     """
     # Strip out module inside DDP and other wrappers
     module = mcore_te_model.module if hasattr(mcore_te_model, "module") else mcore_te_model
@@ -48,8 +48,9 @@ def default_params_group_func(mcore_te_model: mcore_gpt_model.GPTModel) -> Tuple
     non_ep_linear_names = []
     ep_linear_names = []
     for name, param in module.decoder.named_parameters():
-        # NOTE: Megatron-core uses allreduce to indicate experts MLP layers that are in EP, not actually needs
-        # allreduce. And not all of the parameters have the "allreduce" attribute patched.
+        # NOTE: Megatron-core uses allreduce to indicate experts MLP layers that are in EP, not
+        # actually needs allreduce. And not all of the parameters have the "allreduce" attribute
+        # patched.
         is_ep_mlp = getattr(param, "allreduce", False)
         if "norm" not in name and re.search(r".weight(\d*)$", name):
             if not is_ep_mlp:
@@ -67,12 +68,16 @@ def default_params_group_func(mcore_te_model: mcore_gpt_model.GPTModel) -> Tuple
     logging.debug(f"Non EP linear layer names: {non_ep_linear_names}")
     logging.debug(f"EP linear layer names: {ep_linear_names}")
 
-    # TODO(skyw): Revisit whether we should put positional embedding on separate GPU or together with word embedding
+    # TODO(skyw): Revisit whether we should put positional embedding on separate GPU or together
+    # with word embedding
     embed_params_list = []
     if hasattr(module, "embedding"):
         embed_params_list.append(module.embedding.word_embeddings.weight)
 
-        assert not hasattr(module.embedding, "token_type_embeddings"), "Token type embedding is not supported"
+        assert not hasattr(
+            module.embedding, "token_type_embeddings"
+        ), "Token type embedding is \
+            not supported"
         assert not hasattr(
             module.embedding, "position_embeddings"
         ), "Traditional position embedding is not supported in favor of RoPE"
@@ -81,22 +86,20 @@ def default_params_group_func(mcore_te_model: mcore_gpt_model.GPTModel) -> Tuple
         embed_params_list.append(module.output_layer.weight)
 
     collected_num_params = (
-        len(attn_linear_params_list) + len(mlp_linear_params_list) + len(norm_params_list) + len(embed_params_list)
+        len(attn_linear_params_list)
+        + len(mlp_linear_params_list)
+        + len(norm_params_list)
+        + len(embed_params_list)
     )
     total_num_params = sum(1 for _ in module.parameters())
     assert (
         total_num_params == collected_num_params
-    ), "Total number of parameters should be equal to the sum of linear, norm and embedding parameters"
+    ), "Total number of parameters should be equal to the sum of linear, norm and embedding \
+        parameters"
 
-    # NOTE: Moving to param_groups is WIP. The goal is to pass necessary information to the optimizer.
-    linear_param_groups = [
-        {
-            "params": attn_linear_params_list,
-        },
-        {
-            "params": mlp_linear_params_list,
-        },
-    ]
+    # NOTE: Moving to param_groups is WIP. The goal is to pass necessary information to the
+    # optimizer.
+    linear_param_groups = [{"params": attn_linear_params_list}, {"params": mlp_linear_params_list}]
     return linear_param_groups, norm_params_list, embed_params_list
 
 
@@ -108,6 +111,19 @@ def group_params_layer_wise(
     wrapper_args: list[Any],
     group: torch.distributed.ProcessGroup,
 ) -> tuple[torch.optim.Optimizer, list[list[torch.nn.Parameter]]]:
+    """Group parameters layer-wise and distribute to different ranks.
+
+    Args:
+        linear_params_list: List of linear parameters to be distributed.
+        optimizer_wrapper: Optimizer wrapper class.
+        linear_optimizer_cls: Linear optimizer class.
+        linear_opt_kwargs: Keyword arguments for linear optimizer.
+        wrapper_args: Arguments for optimizer wrapper.
+        group: Process group.
+
+    Returns:
+        A tuple of the layer-wise optimizer and the list of broadcast parameters.
+    """
     layer_wise_optimizer = None
     broadcast_params_list = []
     num_linear_params_per_rank = math.ceil(len(linear_params_list) / group.size())
@@ -116,14 +132,15 @@ def group_params_layer_wise(
         broadcast_params_list.append(local_linear_params_list)
         if group.rank() == i:
             layer_wise_optimizer = optimizer_wrapper(
-                linear_optimizer_cls(local_linear_params_list, **linear_opt_kwargs),
-                *wrapper_args,
+                linear_optimizer_cls(local_linear_params_list, **linear_opt_kwargs), *wrapper_args
             )
             logging.info(f"Rank {group.rank()} has {num_linear_params_per_rank} layers")
 
     assert (
         l := len(broadcast_params_list)
-    ) <= group.size(), f"Broadcast params list ({l}) should be smaller than world size ({group.size()})"
+    ) <= group.size(), (
+        f"Broadcast params list ({l}) should be smaller than world size ({group.size()})"
+    )
 
     return layer_wise_optimizer, broadcast_params_list
 
@@ -132,19 +149,19 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
     Warning:
-        This is a experimental optimizer that distributes optimizers of linear and embedding layers to different ranks
-        with the option to use different optimizer for different layer types.
+        This is a experimental optimizer that distributes optimizers of linear and embedding layers 
+        to different ranks with the option to use different optimizer for different layer types.
         Generic tensor parallelism support is still work in progress.
 
     Args:
         module: A megatron core model chunk.
         linear_optimizer_cls: Optimizer class for linear layers.
-        opt_kwargs_list: List of keyword arguments for different optimizer types. Must have same length as
-            what returned by params_group_func.
+        opt_kwargs_list: List of keyword arguments for different optimizer types. Must have same 
+            length as what returned by params_group_func.
         mcore_optimizer_config: Megatron-core optimizer configuration.
         pg_collection: A collection of process groups.
-            It is currently implemented as a dictionary with keys matching mcore convention. It will be updated to
-            mcore ProcessGroupCollection after release of Mcore r0.14.1.
+            It is currently implemented as a dictionary with keys matching mcore convention. It will
+            be updated to mcore ProcessGroupCollection after release of Mcore r0.14.1.
         params_group_func: A function that returns a list of parameters iterables.
     """
 
@@ -155,19 +172,25 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         opt_kwargs_list: list[dict],
         mcore_optimizer_config: mcore_optimizer.OptimizerConfig,
         pg_collection: dict[str, torch.distributed.ProcessGroup],
-        params_group_func: Callable[[torch.nn.Module], Tuple[list[torch.nn.Parameter], ...]] | None = None,
+        params_group_func: (
+            Callable[[torch.nn.Module], Tuple[list[torch.nn.Parameter], ...]] | None
+        ) = None,
     ) -> None:
         if isinstance(module, list):
             assert len(module) == 1, "LayerWiseDistributedOptimizer only supports one model chunk"
             module = module[0]
         assert len(opt_kwargs_list) == 3, "LayerWiseDistributedOptimizer requires 3 optimizer types"
-        assert all(isinstance(opt_kwargs, dict) for opt_kwargs in opt_kwargs_list), "All optimizer kwargs must be dicts"
+        assert all(
+            isinstance(opt_kwargs, dict) for opt_kwargs in opt_kwargs_list
+        ), "All optimizer kwargs must be dicts"
         linear_opt_kwargs, embed_opt_kwargs, default_opt_kwargs = opt_kwargs_list
 
         # TODO(skyw): Add consistency check for optimizer kwargs and optimizer config.
         self.dp_cp_group = pg_collection.get("dp_cp", None)
         self.expt_dp_group = pg_collection.get("expt_dp", None)
-        assert self.dp_cp_group is not None, f"dp_cp group is required for {self.__class__.__name__}"
+        assert (
+            self.dp_cp_group is not None
+        ), f"dp_cp group is required for {self.__class__.__name__}"
         logging.debug(f"dp_cp_group : {self.dp_cp_group}, expt_dp_group: {self.expt_dp_group}")
 
         if params_group_func is None:
@@ -175,7 +198,8 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         linear_param_groups, norm_params_list, embed_params_list = params_group_func(module)
         logging.info(
             f"Collected {len(linear_param_groups[0]['params'])} attention linear parameters and "
-            f"{len(linear_param_groups[1]['params'])} MLP linear parameters and {len(norm_params_list)} norm parameters "
+            f"{len(linear_param_groups[1]['params'])} MLP linear parameters "
+            f"and {len(norm_params_list)} norm parameters "
             f"and {len(embed_params_list)} embedding parameters."
         )
 
@@ -194,7 +218,9 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         moe_linear_params_list = []
         # If MoE is used, attention and MLP layers will have different DP groups.
         if not self.is_moe:
-            non_moe_linear_params_list = linear_param_groups[0]["params"] + linear_param_groups[1]["params"]
+            non_moe_linear_params_list = (
+                linear_param_groups[0]["params"] + linear_param_groups[1]["params"]
+            )
         else:
             non_moe_linear_params_list = linear_param_groups[0]["params"]
             moe_linear_params_list = linear_param_groups[1]["params"]
@@ -221,10 +247,14 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
             self.moe_broadcast_params_list = []
 
         if len(embed_params_list) > 0:
-            embed_optimizer = optimizer_wrapper(AdamW(embed_params_list, **embed_opt_kwargs), *wrapper_args)
+            embed_optimizer = optimizer_wrapper(
+                AdamW(embed_params_list, **embed_opt_kwargs), *wrapper_args
+            )
         else:
             embed_optimizer = None
-        norm_optimizer = optimizer_wrapper(AdamW(norm_params_list, **default_opt_kwargs), *wrapper_args)
+        norm_optimizer = optimizer_wrapper(
+            AdamW(norm_params_list, **default_opt_kwargs), *wrapper_args
+        )
         assert norm_optimizer, "Norm optimizer should not be empty."
 
         self.has_non_moe_layer_wise_opt = False
@@ -248,7 +278,8 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         """step function for layer-wise optimizer
 
         Note:
-            A lot of code from ChainedOptimizer.step() is copied here because there are bug fixes after core 0.12
+            A lot of code from ChainedOptimizer.step() is copied here because there are bug fixes 
+            after core 0.12.
         """
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -286,6 +317,7 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
     def broadcast_params(
         self, params_list: list[list[torch.nn.Parameter]], group: torch.distributed.ProcessGroup
     ) -> None:
+        """Broadcast parameters to all other ranks."""
         for i, params_list in enumerate(params_list):
             src_global_rank = torch.distributed.get_global_rank(group, i)
             for param in params_list:
@@ -308,15 +340,21 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
         moe_out_list = [0 for _ in range(utils.get_pg_size(self.expt_dp_group))]
 
         # TODO(skyw): Determine whether it is too big of an overhead to use all_gather_object.
-        torch.distributed.all_gather_object(non_moe_out_list, non_moe_layer_wise_grad_norm**2, group=self.dp_cp_group)
+        torch.distributed.all_gather_object(
+            non_moe_out_list, non_moe_layer_wise_grad_norm**2, group=self.dp_cp_group
+        )
         if self.is_moe:
-            torch.distributed.all_gather_object(moe_out_list, moe_layer_wise_grad_norm**2, group=self.expt_dp_group)
+            torch.distributed.all_gather_object(
+                moe_out_list, moe_layer_wise_grad_norm**2, group=self.expt_dp_group
+            )
 
         # Add the gradient norm of the norm layers which is duplicated among all ranks.
         duplicated_grad_square_sum = 0.0
         for optimizer in self.chained_optimizers[opt_offset:]:
             duplicated_grad_square_sum += optimizer.get_grad_norm() ** 2
-        final_norm = math.sqrt(sum(non_moe_out_list) + sum(moe_out_list) + duplicated_grad_square_sum)
+        final_norm = math.sqrt(
+            sum(non_moe_out_list) + sum(moe_out_list) + duplicated_grad_square_sum
+        )
 
         return final_norm
 
@@ -336,7 +374,7 @@ class LayerWiseDistributedOptimizer(mcore_optimizer.ChainedOptimizer):
 def get_shower_optimizer_for_mcore(
     model: torch.nn.Module,
     config: mcore_optimizer.OptimizerConfig,
-    linear_optimizer: str = "soap",
+    linear_optimizer: str = "muon",
     split_qkv: bool = False,
     **kwargs: Any,
 ) -> LayerWiseDistributedOptimizer:
@@ -344,8 +382,8 @@ def get_shower_optimizer_for_mcore(
 
     Warning:
         Megatron monkey patches a lot of attributes to variety of objects.
-        This function tries to encapsulate fragile functionalities that depends on those fragile patches and
-        isolate them from the main LayerWiseDistributedOptimizer class.
+        This function tries to encapsulate fragile functionalities that depends on those fragile 
+        patches and isolate them from the main LayerWiseDistributedOptimizer class.
 
     Args:
         model: A MCore GPTModel.
@@ -359,37 +397,7 @@ def get_shower_optimizer_for_mcore(
     """
     linear_optimizer_cls: type[torch.optim.Optimizer]
     if linear_optimizer == "soap":
-        linear_optimizer_cls = SOAP
-        linear_opt_kwargs = dict(
-            lr=config.lr,
-            betas=(config.adam_beta1, config.adam_beta2),
-            weight_decay=config.weight_decay,
-        )
-        soap_config_keys = [
-            "shampoo_beta",
-            "eps",
-            "use_decoupled_weight_decay",
-            "use_nesterov",
-            "precondition_frequency",
-            "precondition_warmup_steps",
-            "adam_warmup_steps",
-            "precondition_1d",
-            "trace_normalization",
-            "normalize_preconditioned_grads",
-            "correct_bias",
-            "fp32_matmul_prec",
-            "use_eigh",
-            "qr_fp32_matmul_prec",
-            "use_adaptive_criteria",
-            "adaptive_update_tolerance",
-            "power_iter_steps",
-            "max_update_rms",
-        ]
-        for attr_name in soap_config_keys:
-            if hasattr(config, attr_name):
-                linear_opt_kwargs[attr_name] = getattr(config, attr_name)
-            else:
-                logging.warning(f"Config attribute {attr_name} not found in config.")
+        raise NotImplementedError("SOAP is not supported yet.")
     elif linear_optimizer == "muon":
         transformer_config = model.config if not isinstance(model, list) else model[0].config
         qkv_split_shapes = (
@@ -403,14 +411,17 @@ def get_shower_optimizer_for_mcore(
         def is_qkv_fn(x: torch.Tensor) -> bool:
             """Check if a tensor is a fused QKV tensor by shape.
 
-            Checks all tensors that is a parameter of the model and has the same shape as defined by `fused_qkv_shape`.
-            Note: Other tensors might have the same shape but are not fused QKV tensors and this function will still return True.
+            Checks all tensors that is a parameter of the model and has the same shape as defined by
+             `fused_qkv_shape`.
+            Note: Other tensors might have the same shape but are not fused QKV tensors and this 
+                function will still return True.
 
             Args:
                 x: tensor to check.
 
             Returns:
-                True if the tensor is a fused QKV tensor only by shape `fused_qkv_shape`, False otherwise.
+                True if the tensor is a fused QKV tensor only by shape `fused_qkv_shape`, False 
+                otherwise.
             """
             return x.shape == fused_qkv_shape
 
@@ -438,9 +449,13 @@ def get_shower_optimizer_for_mcore(
             elif hasattr(config, attr_name):
                 linear_opt_kwargs[attr_name] = getattr(config, attr_name)
             else:
-                logging.warning(f"Config attribute {attr_name} (or {prefixed_attr_name}) not found in config.")
+                logging.warning(
+                    f"Config attribute {attr_name} (or {prefixed_attr_name}) not found in config."
+                )
     else:
-        raise ValueError(f"Unsupported linear optimizer: {linear_optimizer}, must be one of ['soap', 'muon']")
+        raise ValueError(
+            f"Unsupported linear optimizer: {linear_optimizer}, must be one of ['soap', 'muon']"
+        )
 
     # strip out arguments
     embed_adam_kwargs = {
