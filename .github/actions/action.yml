@@ -47,8 +47,6 @@ runs:
       shell: bash
       run: |
         docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi  # Check driver version
-        docker run --rm --runtime=nvidia --gpus all ubuntu nvcc --version  # Check CUDA toolkit version
-        nvcc --version  # Check CUDA toolkit version
 
     - name: Install curl, sudo
       shell: bash
