@@ -69,15 +69,13 @@ jobs:
         run: |
           echo "Running CI tests"
 
-  cicd-unit-tests:
+  cicd-unit-tests-latest:
     strategy:
       fail-fast: false
       matrix:
         include:
           - bucket: "tests/unit_tests/data/"
-            tag: latest
           - bucket: "tests/unit_tests/dist_checkpointing/*.py"
-            tag: latest
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: nvidia-ci-aws-gpu-x8
     name: "Unit tests: ${{ matrix.bucket }} - ${{ matrix.tag }}"
@@ -96,6 +94,7 @@ jobs:
         uses: ./.github/actions
         with:
           bucket: ${{ matrix.bucket }}
+          tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
