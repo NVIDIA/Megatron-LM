@@ -372,7 +372,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @contextmanager
     @staticmethod
-    def suspend_resume_ctx(key: str, *, newline: bool = True) -> None:
+    def suspend_resume_ctx(
+        key: str,
+        *,
+        unified_memory_level: int,
+        newline: bool = True,
+    ) -> None:
         """Context manager for of suspending and resuming the engine.
 
         This context manager records the time and memory usage when suspending
@@ -421,7 +426,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
             )
             print(
-                f"[rank {rank_str}] dynamic engine {key}, {dir_str} "
+                f"[rank {rank_str}] dynamic engine {key}, "
+                f"unified {unified_memory_level}, "
+                f"{dir_str} "
                 f"{relative_mem_str} in {relative_time_str} ... "
                 f"abs mem usage: {total_mem_str}",
                 end=".\n" if newline else "",
@@ -431,7 +438,10 @@ class DynamicInferenceEngine(AbstractEngine):
         """Suspend engine by deallocating context's GPU state."""
 
         # Deallocate context tensors.
-        with self.__class__.suspend_resume_ctx("suspended"):
+        with self.__class__.suspend_resume_ctx(
+            "suspended",
+            unified_memory_level=self.unified_memory_level,
+        ):
             self.context.deallocate_all_tensors()
 
         # Delete cuda graphs when not using unified memory at all (level 0). For
@@ -443,7 +453,11 @@ class DynamicInferenceEngine(AbstractEngine):
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
-        with self.__class__.suspend_resume_ctx("resumed", newline=False):
+        with self.__class__.suspend_resume_ctx(
+            "resumed",
+            unified_memory_level=self.unified_memory_level,
+            newline=False,
+        ):
 
             # Maintain references to requests before reset.
             waiting_request_ids = list(self.waiting_request_ids)

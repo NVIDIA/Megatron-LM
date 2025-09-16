@@ -615,13 +615,6 @@ class _CudaGraphRunner(torch.nn.Module):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
-        # >>>
-        # # Freeze GC, to speed up capture time ~15-20x.
-        # freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        # if freeze_gc:
-        #     gc.freeze()
-        # <<<
-
         # save grads and other variables that may be affected by graph warmup
         if self.training and torch.is_grad_enabled():
             save_main_grads = [
