@@ -372,12 +372,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @contextmanager
     @staticmethod
-    def suspend_resume_ctx(
-        key: str,
-        *,
-        unified_memory_level: int,
-        newline: bool = True,
-    ) -> None:
+    def suspend_resume_ctx(key: str, *, unified_memory_level: int, newline: bool = True) -> None:
         """Context manager for of suspending and resuming the engine.
 
         This context manager records the time and memory usage when suspending
@@ -422,9 +417,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             process = psutil.Process()
             mem_info = process.memory_info()
-            total_mem_str = (
-                f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
-            )
+            total_mem_str = f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
             print(
                 f"[rank {rank_str}] dynamic engine {key}, "
                 f"unified {unified_memory_level}, "
@@ -439,8 +432,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
-            "suspended",
-            unified_memory_level=self.unified_memory_level,
+            "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_all_tensors()
 
@@ -454,9 +446,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Resume engine by reallocating context's GPU state."""
 
         with self.__class__.suspend_resume_ctx(
-            "resumed",
-            unified_memory_level=self.unified_memory_level,
-            newline=False,
+            "resumed", unified_memory_level=self.unified_memory_level, newline=False
         ):
 
             # Maintain references to requests before reset.
