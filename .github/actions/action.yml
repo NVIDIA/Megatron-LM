@@ -157,7 +157,6 @@ runs:
         RUN_TEST_EOF
         )
         echo "$cmd" | tee "job.sh"        
-        )
         echo "::endgroup::"
 
     - name: Set timeout
