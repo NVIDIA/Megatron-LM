@@ -52,6 +52,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    force_eod: Optional[bool] = False
+    """Option to force an EOD at the end of every data sample in SFT."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
