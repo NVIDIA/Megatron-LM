@@ -103,7 +103,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=args.inference_max_seq_length,
-		num_cuda_graphs=num_cuda_graphs,
+        num_cuda_graphs=num_cuda_graphs,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
@@ -111,6 +111,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        materialize_only_last_token_logits=True,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
@@ -146,6 +147,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             top_p=request.generation_args.top_p or 0.0,
             termination_id=self._coordinator.engine.controller.tokenizer.eod,
             return_log_probs=True,
+            skip_prompt_log_probs_for_dynamic_inference=True,
         )
         request_ids = [
             self._coordinator.schedule_request(prompt=prompt, sampling_params=sampling_params)
@@ -171,7 +173,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model)
         coordinator = DynamicEngineCoordinator(
-            inference_engine, inference_max_requests=args.inference_max_batch_size
+            inference_engine,
+            inference_max_requests=inference_engine.context.max_requests,
+            log_level=0,
         )
         launched_server = cls(**kwargs)
         launched_server._coordinator = coordinator
@@ -184,6 +188,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def kill(self):
         await self._coordinator.shutdown()
+
+    async def suspend(self):
+        await self._coordinator.suspend_engine()
 
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
