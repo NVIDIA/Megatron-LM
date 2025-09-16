@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
+from megatron.core.tokenizers import MegatronTokenizerBase
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +66,8 @@ class BlendedMegatronDatasetConfig:
        constructor.
     """
 
-    tokenizer: Optional[MegatronTokenizer] = None
-    """The MegatronTokenizer instance. Required for datasets that do online tokenization."""
+    tokenizer: Optional[MegatronTokenizerBase] = None
+    """The MegatronTokenizerBase instance. Required for datasets that do online tokenization."""
 
     mid_level_dataset_surplus: float = 0.005
     """The sample surplus to build for the mid-level datasets(s). Defaults arbitrarily to 0.005.

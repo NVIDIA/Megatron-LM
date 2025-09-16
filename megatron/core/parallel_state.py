@@ -617,7 +617,8 @@ def initialize_model_parallel(
     # NCCL restricts IB SHARP usage to a single communicator group—the first one created
     # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
     # set to 0 for subsequent groups.
-    os.environ["NCCL_COLLNET_ENABLE"] = "0"
+    if "NCCL_COLLNET_ENABLE" in os.environ:
+        del os.environ["NCCL_COLLNET_ENABLE"]
 
     if use_sharp:
         if sharp_enabled_group is None:
@@ -831,7 +832,8 @@ def initialize_model_parallel(
         )
         torch.cuda.synchronize()
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
-        os.environ["NCCL_COLLNET_ENABLE"] = "0"
+        if "NCCL_COLLNET_ENABLE" in os.environ:
+            del os.environ["NCCL_COLLNET_ENABLE"]
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1201,7 +1203,8 @@ def initialize_model_parallel(
                     )
                     torch.cuda.synchronize()
                 # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
-                os.environ["NCCL_COLLNET_ENABLE"] = "0"
+                if "NCCL_COLLNET_ENABLE" in os.environ:
+                    del os.environ["NCCL_COLLNET_ENABLE"]
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
@@ -1386,17 +1389,19 @@ def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False
             return _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_tensor_and_data_parallel_group(with_context_parallel=False):
+def get_tensor_and_data_parallel_group(check_initialized=True, with_context_parallel=False):
     """Get the tensor- and data-parallel group the caller rank belongs to."""
     if with_context_parallel:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), "tensor and data parallel group is not initialized"
+        if check_initialized:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+            ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     else:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-        ), "tensor and data parallel group is not initialized"
+        if check_initialized:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+            ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 

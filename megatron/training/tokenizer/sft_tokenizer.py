@@ -4,13 +4,13 @@
 from typing import Dict, List, Union
 import numpy as np
 
-nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
+nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
 
-class SFTTokenizer(MegatronTokenizer):  
+class SFTTokenizer(MegatronLegacyTokenizer):  
     """SFT Tokenizer."""
 
     def __init__(
@@ -41,11 +41,11 @@ class SFTTokenizer(MegatronTokenizer):
         self._vocab_size = len(tokenizer)
         self._tokenizer = tokenizer
 
-        if prompt_format == "nemotron-h-aligned":
+        if prompt_format == "nemotron-nano-v2":
             self._prompt_config = PromptConfig(
-                assistant_prefix_len=0,
-                pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
-                custom_chat_template=nemotron_h_aligned_custom_template,
+                assistant_prefix_len=3,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=nemotron_nano_v2_custom_template,
                 has_bos=False,
                 has_system_role=True,
             )

@@ -30,7 +30,6 @@ warnings.filterwarnings('ignore')
 QUANT_CFG_CHOICES = {
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
-    "fp8_real_quant": mtq.FP8_DEFAULT_CFG,
     "fp8_blockwise": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
@@ -58,6 +57,21 @@ def add_text_generate_ptq_args(parser):
     )
     group.add_argument(
         "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
+    )
+    group.add_argument(
+        "--compress",
+        action="store_true",
+        help="Enable real low-bit quantization.",
+    )
+    group.add_argument(
+        "--disable-qkv-quant",
+        action="store_true",
+        help="Disable q, k, v linear from being quantized.",
+    )
+    group.add_argument(
+        "--weight-only",
+        action="store_true",
+        help="Disable input quantization.",
     )
     group.add_argument(
         "--force-all-expert-routing",
@@ -91,6 +105,8 @@ def get_modelopt_torch_quantization_config():
         "axis": None,
         "enable": True,
     }
+    # Disable mamba-mixer quantization for now.
+    mtq_config["quant_cfg"]["*mixer.*"] = {"enable": False}
     if "fp8" == args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
@@ -102,8 +118,14 @@ def get_modelopt_torch_quantization_config():
         if isinstance(weight_quantizer, list):
             weight_quantizer = weight_quantizer[0]
         weight_quantizer["block_sizes"][-1] = 128
-    if args.export_kv_cache_quant:
+   
+    # Customization
+    if args.disable_qkv_quant:
+        mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
+    if args.export_kv_cache_quant and not args.compress:
         mtq_config["quant_cfg"]["*linear_qkv.output_quantizer"] = fp8_config
+    if args.weight_only:
+        mtq_config["quant_cfg"]["*input_quantizer"] = {"enable": False}
 
     return mtq_config
 
@@ -188,23 +210,29 @@ if __name__ == "__main__":
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
         ptq_forward_loop_func = _hf_dataset_forword_loop_func
-        if hasattr(unwrapped_model, "calibration_mode"):
+
+        if args.weight_only:
+            mtq.quantize(unwrapped_model, mtq_config)
+        elif hasattr(unwrapped_model, "calibration_mode"):
             unwrapped_model.calibration_mode = True
             mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
             unwrapped_model.calibration_mode = False
         else:
             mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
-        if "real_quant" in args.export_quant_cfg:
+
+        if args.compress:
             mtq.compress(unwrapped_model)
+            print_rank_0("Weights are now compressed to low-bit!")
 
     print_rank_0(f"Fake Quantized Model:\n {unwrapped_model}")
 
     if torch.distributed.get_rank() == 0:
         for k, v in unwrapped_model.state_dict().items():
-            if "amax" not in k:
+            if "amax" not in k and "_scale" not in k:
                 continue
             if isinstance(v, torch.Tensor):
-                print("{:80} {:32} max {:.4e}".format(k, str(v.shape), torch.max(torch.abs(v))))
+                v_amax = torch.max(torch.abs(v.clone().detach().to(torch.bfloat16)))
+                print("{:80} {:32} {:32} max {:.4e}".format(k, str(v.dtype), str(v.shape), v_amax))
             else:
                 print("{:80}".format(k))
 

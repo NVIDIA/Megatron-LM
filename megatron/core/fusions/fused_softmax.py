@@ -1,6 +1,5 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -19,6 +18,7 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
+        """forward pass"""
         import scaled_upper_triang_masked_softmax_cuda
 
         scale_t = torch.tensor([scale])
@@ -29,6 +29,7 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
+        """backward pass"""
         import scaled_upper_triang_masked_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
@@ -49,6 +50,7 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, mask, scale):
+        """forward pass"""
         import scaled_masked_softmax_cuda
 
         scale_t = torch.tensor([scale])
@@ -59,6 +61,7 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
+        """backward pass"""
         import scaled_masked_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
@@ -76,6 +79,7 @@ class ScaledSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inputs, scale):
+        """forward pass"""
         import scaled_softmax_cuda
 
         scale_t = torch.tensor([scale])
@@ -86,12 +90,38 @@ class ScaledSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grads):
+        """backward pass"""
         import scaled_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
 
         input_grads = scaled_softmax_cuda.backward(output_grads, softmax_results, scale_t[0])
         return input_grads, None, None
+
+
+class SoftmaxOne(nn.Module):
+    r"""
+    Softmax-off-by-one function as introduced in
+    https://www.evanmiller.org/attention-is-off-by-one.html
+    Supports fixed or learnable offset
+    """
+
+    def __init__(
+        self, dim: Optional[int] = None, denominator_offset: Union[torch.Tensor, float] = 1.0
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.denominator_offset = denominator_offset
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """forward pass"""
+        # sink: [np] --> [1, np, 1, 1] --> [b, np, sq, 1]
+        sink = self.denominator_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1)
+        # qk: [b, np, sq, sk] --> [b, np, sq, sk+1]
+        qk = torch.cat([x, sink], dim=-1)
+        # do softmax, and remove sink token at the end
+        ret = torch.softmax(qk, dim=-1)[..., :-1]
+        return ret
 
 
 class FusedScaleMaskSoftmax(nn.Module):
@@ -121,6 +151,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
         self.input_in_bf16 = input_in_bf16
+
         assert not (
             self.input_in_fp16 and self.input_in_bf16
         ), "both fp16 and bf16 flags cannot be active at the same time."
@@ -133,7 +164,12 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         assert self.scale is None or softmax_in_fp32, "softmax should be in fp32 when scaled"
 
-    def forward(self, input: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(
+        self,
+        input: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        softmax_offset: Optional[torch.Tensor] = None,
+    ):
         """Forward pass of softmax with masked input.
 
         In case attn_mask_type is causal the mask is generated and None can be passed.
@@ -142,12 +178,13 @@ class FusedScaleMaskSoftmax(nn.Module):
         # [b, np, sq, sk]
         assert input.dim() == 4
 
-        if self.is_kernel_available(mask, *input.size()):
+        if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
             return self.forward_fused_softmax(input, mask)
         else:
-            return self.forward_torch_softmax(input, mask)
+            return self.forward_torch_softmax(input, mask, softmax_offset)
 
     def is_kernel_available(self, mask, b, np, sq, sk):
+        """Detect whether fused softmax kernel is available"""
         attn_batches = b * np
 
         if (
@@ -170,6 +207,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         return False
 
     def forward_fused_softmax(self, input, mask):
+        """forward pass for fused softmax"""
         b, np, sq, sk = input.size()
         scale = self.scale if self.scale is not None else 1.0
 
@@ -187,7 +225,8 @@ class FusedScaleMaskSoftmax(nn.Module):
             else:
                 return ScaledSoftmax.apply(input, scale)
 
-    def forward_torch_softmax(self, input, mask):
+    def forward_torch_softmax(self, input, mask, softmax_offset=None):
+        """forward pass for unfused torch softmax"""
         if self.input_in_float16 and self.softmax_in_fp32:
             input = input.float()
 
@@ -203,8 +242,12 @@ class FusedScaleMaskSoftmax(nn.Module):
             mask = get_default_causal_mask(sq)
 
         mask_output = self.mask_func(input, mask) if mask is not None else input
-        probs = torch.nn.Softmax(dim=-1)(mask_output)
+        if softmax_offset is None:
+            softmax_fn = torch.nn.Softmax(dim=-1)
+        else:
+            softmax_fn = SoftmaxOne(-1, softmax_offset.to(input.device))
 
+        probs = softmax_fn(mask_output)
         if self.input_in_float16 and self.softmax_in_fp32:
             if self.input_in_fp16:
                 probs = probs.half()
@@ -215,6 +258,7 @@ class FusedScaleMaskSoftmax(nn.Module):
 
     @staticmethod
     def get_batch_per_block(sq, sk, b, np):
+        """get fused softmax batch per block"""
         import scaled_masked_softmax_cuda
 
         return scaled_masked_softmax_cuda.get_batch_per_block(sq, sk, b, np)

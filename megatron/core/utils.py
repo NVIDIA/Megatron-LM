@@ -3,6 +3,7 @@
 """Utility functions used throughout Megatron core"""
 
 import array
+import asyncio
 import functools
 import hashlib
 import inspect
@@ -738,7 +739,13 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
         logger.log(*args, **kwargs)
 
 
-def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any):
+def log_on_each_pipeline_stage(
+    logger: logging.Logger,
+    *args: Any,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    **kwargs: Any,
+):
     """Log on first rank in each pipeline stage
 
     Args:
@@ -750,10 +757,16 @@ def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any
     """
     assert torch.distributed.is_initialized()
 
-    if (
-        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-        and parallel_state.get_tensor_model_parallel_rank() == 0
-    ):
+    if tp_group is None and dp_cp_group is None:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    elif tp_group is not None and dp_cp_group is not None:
+        tp_rank = tp_group.rank()
+        dp_cp_rank = dp_cp_group.rank()
+    else:
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(*args, **kwargs)
 
 
@@ -872,28 +885,6 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    if hasattr(tensor, "fully_shard_param_local_shard"):
-        assert len(replica_id) == 3, f"Expected replica_id format (PP, TP, DP), got: {replica_id}"
-        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
-
-        sh_ten = ShardedTensor.from_rank_offsets_flat(
-            key,
-            tensor.fully_shard_param_local_shard,
-            tensor.shape,
-            *prepend_offsets,
-            (
-                tp_axis + prepend_axis_num,
-                parallel_state.get_tensor_model_parallel_rank(),
-                parallel_state.get_tensor_model_parallel_world_size(),
-            ),
-            flattened_range=slice(*tensor.fully_shard_param_local_index),
-            replica_id=replica_id,
-            prepend_axis_num=prepend_axis_num,
-            **kwargs,
-        )
-        setattr(sh_ten, "is_data_parallel_fully_shard", True)
-        return sh_ten
-
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -926,23 +917,6 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if replica_id is None:
         replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
-
-    if hasattr(tensor, "fully_shard_param_local_shard"):
-        assert len(replica_id) == 3, f"Expected replica_id format (PP, TP, DP), got: {replica_id}"
-        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
-
-        sh_ten = ShardedTensor.from_rank_offsets_flat(
-            key,
-            tensor.fully_shard_param_local_shard,
-            tensor.shape,
-            *prepend_offsets,
-            flattened_range=slice(*tensor.fully_shard_param_local_index),
-            replica_id=replica_id,
-            prepend_axis_num=prepend_axis_num,
-            **kwargs,
-        )
-        setattr(sh_ten, "is_data_parallel_fully_shard", True)
-        return sh_ten
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -2066,10 +2040,12 @@ def unwrap_model(model, module_instances=None):
     if module_instances is None:
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-        from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            FullyShardedDataParallel as megatron_FSDP,
+        )
         from megatron.core.transformer.module import Float16Module
 
-        module_instances = (DDP, torch_FSDP, custom_FSDP, Float16Module)
+        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
 
     return_list = True
     if not isinstance(model, list):
@@ -2093,3 +2069,13 @@ def maybe_cat(a, b, dim=0, *, required=False):
             raise ValueError("both tensors are None")
         return None
     return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
+
+
+def get_asyncio_loop():
+    """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as e:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop

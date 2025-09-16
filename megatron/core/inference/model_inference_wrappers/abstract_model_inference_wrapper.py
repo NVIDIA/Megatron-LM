@@ -20,7 +20,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_model_config
 
 
@@ -39,7 +39,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             hidden size, vocab size etc.
         inference_context (BaseInferenceContext): Context for managing KV
             cache and other inference params.
-        model_comm_pgs (ModelCommProcessGroups): Process groups for model communication.
+        pg_collection (ProcessGroupCollection): Process groups for model communication.
     """
 
     def __init__(
@@ -47,7 +47,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
         inference_wrapper_config: InferenceWrapperConfig,
         inference_context: Optional[BaseInferenceContext] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert not isinstance(
             model, Iterable
@@ -72,16 +72,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context = inference_context
 
-        if model_comm_pgs is None:
-            # For backward compatibility, remove in v0.14 and raise error
-            # raise ValueError("TEDotProductAttention was called without ModelCommProcessGroups")
-            model_comm_pgs = ModelCommProcessGroups(
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection(
                 tp=parallel_state.get_tensor_model_parallel_group(),
                 pp=parallel_state.get_pipeline_model_parallel_group(),
             )
 
-        self.tp_group = model_comm_pgs.tp
-        self.pp_group = model_comm_pgs.pp
+        self.tp_group = pg_collection.tp
+        self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
         if self.inference_wrapper_config.fp8 is not None:
@@ -365,7 +363,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
         """
-        if self.model_is_pipeline_parallel:
+        # Check if we are in a PP model
+        if not (
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+        ):
             tokens = inference_input["tokens"]
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(
                 tokens, recv_buffer_seq_len

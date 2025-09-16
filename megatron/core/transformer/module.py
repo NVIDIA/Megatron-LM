@@ -92,7 +92,11 @@ class MegatronModule(torch.nn.Module):
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
         """
-        if self.config.fp8 is not None or getattr(self.config, 'use_kitchen', False):
+        if (
+            self.config.fp8 is not None
+            or self.config.fp4 is not None
+            or getattr(self.config, 'use_kitchen', False)
+        ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():
@@ -231,11 +235,36 @@ class Float16Module(MegatronModule):
     def set_input_tensor(self, input_tensor):  # pylint: disable=missing-function-docstring
         return self.module.set_input_tensor(input_tensor)
 
-    def forward(self, *inputs, **kwargs):  # pylint: disable=missing-function-docstring
+    def forward(self, *inputs, fp32_output=True, **kwargs):
+        """
+        Execute the wrapped module in model precision and optionally upcast outputs to fp32.
+
+        On the first pipeline stage, positional/keyword tensor inputs are converted to the
+        module precision (fp16 or bf16) before invoking the wrapped module. The wrapped module
+        is called with the provided inputs and keyword arguments. On the last pipeline stage
+        only, outputs are upcast to fp32 if ``fp32_output`` is True; otherwise, outputs are
+        returned in the model precision (fp16/bf16).
+
+        Args:
+            *inputs: Positional inputs forwarded to the wrapped module (converted to fp16/bf16 on
+                the pipeline first stage).
+            fp32_output (bool, keyword-only): If True (default), upcast outputs to fp32 on the
+                pipeline last stage. Has no effect on non-last stages. Set to False to keep outputs
+                in model precision when downstream consumers expect half precision or to avoid
+                extra casts.
+            **kwargs: Keyword arguments forwarded to the wrapped module.
+
+        Returns:
+            The wrapped module's outputs, potentially upcast to fp32 depending on pipeline stage
+            and ``fp32_output``.
+        """
         if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage):
+        if (
+            parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage)
+            and fp32_output is True
+        ):
             outputs = float16_to_fp32(outputs)
         return outputs
 

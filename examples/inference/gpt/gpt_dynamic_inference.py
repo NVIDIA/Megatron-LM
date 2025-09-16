@@ -1,14 +1,22 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import hashlib
+import json
+import math
 import os
+import pickle
+import sys
 import torch
 from argparse import ArgumentParser
 from collections import defaultdict
+from functools import partial
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
 import sys
 import os
+
+import torch
+from tqdm import tqdm
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -23,6 +31,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -33,15 +42,31 @@ from megatron.training import get_args, get_model as _get_model, get_tokenizer, 
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider as gpt_model_provider
 from pretrain_mamba import model_provider as mamba_model_provider
+from model_provider import model_provider
+from gpt_builders import gpt_builder
 import json
 
 from examples.inference.gpt.utils import (
-    add_common_inference_args,
-    build_requests,
-    build_dynamic_engine_setup_prefix,
-    get_curr_time,
     Request,
+    add_common_inference_args,
+    build_dynamic_engine_setup_prefix,
+    build_requests,
+    get_curr_time,
 )
+from megatron.training import get_args
+from megatron.training import get_model as _get_model
+from megatron.training import get_tokenizer, initialize_megatron
+from megatron.training.checkpointing import load_checkpoint
+from pretrain_gpt import model_provider
+
+import torch
+import io
+import megatron
+
+torch.serialization.add_safe_globals([io.BytesIO])
+torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
+torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -55,6 +80,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
+    group.add_argument(
+        "--termination-id", type=int, default=None,
+        help="Termination ID that overrides `tokenizer.eod`."
+    )
+
     return parser
 
 
@@ -64,12 +94,10 @@ def get_model() -> MegatronModule:
     args = get_args()
 
     # Build model.
-    if args.model_provider == "gpt":
-        model = _get_model(gpt_model_provider, wrap_with_ddp=False)
-    elif args.model_provider == "mamba":
-        model = _get_model(mamba_model_provider, wrap_with_ddp=False)
-    else:
-        raise ValueError(f"Unknown model provider {args.model_provider}")
+    model = _get_model(
+        partial(model_provider, gpt_builder),
+        wrap_with_ddp=False
+    )
 
     # Load checkpoint.
     assert args.load is not None
@@ -122,9 +150,9 @@ def get_inference_context(
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
         ),
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
@@ -155,7 +183,10 @@ def get_inference_controller(
     """
 
     args = get_args()
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Wrap model in inference wrapper.
     model = GPTInferenceWrapper(model, args, context)
@@ -187,6 +218,8 @@ def run_inference(
         A dictionary of step times with `prefill` and `decode` keys.
     """
 
+    args = get_args()
+
     # Initialize request arrival times.
     base_arrival_time = get_curr_time()
     for request in requests:
@@ -204,34 +237,60 @@ def run_inference(
     if rank == 0:
         tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
-    while True:
-        curr_time = get_curr_time()
+    if args.enable_cuda_graph:
+        cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
+    else:
+        cuda_graph_request_count_map = None
 
-        # Add requests with 'earlier' arrival time.
+    def _add_request():
+        """Add request to engine.
+
+        *Note: Using `prompt_text` instead of `prompt_tokens` for fair comparison.
+        """
+        nonlocal num_requests_added
+        _request = requests[num_requests_added]
+        engine.add_request(
+            num_requests_added,
+            _request.prompt_text,
+            sampling_params.num_tokens_to_generate,
+        )
+        _request.time_start = get_curr_time()
+        _request.state = "started"
+        num_requests_added += 1
+        tbar.update(1)
+
+    while True:
+        # Add requests.
         add_start = get_curr_time()
-        while num_requests_added < num_requests_total:
-            request = requests[num_requests_added]
-            if request.time_arrival > curr_time:
-                break
-            try:
-                # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(
-                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
-                )
-                request.time_start = get_curr_time()
-                request.state = "started"
-                num_requests_added += 1
-                if rank == 0:
-                    tbar.update(1)
-            except ContextOverflowError:
-                break
+        if args.incoming_requests_per_step is None:
+            # Add requests with 'earlier' arrival time.
+            while num_requests_added < num_requests_total:
+                if requests[num_requests_added].time_arrival > add_start:
+                    break
+                _add_request()
+        else:
+            # Add deterministic number of requests (generally used for debugging).
+            for i in range(min(
+                args.incoming_requests_per_step,
+                num_requests_total - num_requests_added,
+            )):
+                _add_request()
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
-        active_requests, finished_requests, step_time = engine.step(sampling_params, verbose=True)
+        result = engine.step_modern(sampling_params, verbose=True)
         step_id += 1
 
+        # Record cuda_graph_request_count.
+        cuda_graph_request_count = result["cuda_graph_request_count"]
+        if args.enable_cuda_graph and cuda_graph_request_count is not None:
+            cuda_graph_request_count_map[cuda_graph_request_count] += 1
+
+        # Update requests.
+        active_requests = result["active_requests"]
+        finished_requests = result["finished_requests"]
+        step_time = result["step_time"]
         if len(active_requests) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
@@ -239,6 +298,7 @@ def run_inference(
                 step_times["prefill"].append(step_time)
 
             # Append output tokens.
+            output_start = get_curr_time()
             for finished_request in finished_requests:
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
@@ -252,16 +312,24 @@ def run_inference(
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 num_requests_finished += 1
+            output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
-    return step_times, add_times, output_times, total_output_tokens
+    return {
+        "step_times" : step_times,
+        "add_times" : add_times,
+        "output_times" : output_times,
+        "total_output_tokens" : total_output_tokens,
+        "cuda_graph_request_count_map" : cuda_graph_request_count_map,
+    }
 
 
 @torch.inference_mode()
 def main():
+
     # Initialize Megatron.
     initialize_megatron(
         extra_args_provider=add_dynamic_inference_args,
@@ -273,7 +341,10 @@ def main():
         torch.cuda.cudart().cudaProfilerStart()
 
     args = get_args()
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sampling params.
     sampling_params = SamplingParams(
@@ -306,13 +377,24 @@ def main():
     )
     controller = get_inference_controller(model, context)
 
+    # Validate all context_length's <= max_tokens.
+    invalid_prompt_length_map = {}
+    for request_idx, request in enumerate(requests):
+        if len(request.prompt_tokens) > context.max_tokens:
+            invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+    assert not invalid_prompt_length_map, (
+        "request idxs with prompts longer than context.max_tokens: "
+        ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+    )
+
     # Inference engine.
     engine = DynamicInferenceEngine(
         controller,
         context,
-        termination_id=tokenizer.eod,
+        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
+        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
     )
 
     if torch.distributed.get_rank() == 0:
@@ -323,18 +405,25 @@ def main():
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times, total_output_tokens = run_inference(
-        requests, sampling_params, engine
-    )
+    result = run_inference(requests, sampling_params, engine)
+    step_times = result["step_times"]
+    add_times = result["add_times"]
+    output_times = result["output_times"]
+    total_output_tokens = result["total_output_tokens"]
     torch.cuda.synchronize()
     total_time = get_curr_time() - t
 
     # Validate all requests finished.
     for request in requests:
-        assert request.state == "finished"
+        assert request.state == "finished", (
+            f"request.state == '{request.state}' != 'finished'."
+        )
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
+
+        def escape_str(s):
+            return s.replace("\n", "\\n")
 
         print("~~~~ Unique prompts + outputs. ~~~~")
 
@@ -347,23 +436,35 @@ def main():
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
-            output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
-            output_text_escaped = request.output_text.replace("\n", "\\n")
+            prompt_text_escaped = escape_str(prompt_text)
+            num_prompt_tokens = len(requests[request_idx].prompt_tokens)
+            if request.output_text is not None:
+                output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
+                output_text_escaped = escape_str(request.output_text)
+                num_output_tokens = len(requests[request_idx].output_tokens)
+            else:
+                output_text_hash = "--"
+                output_text_escaped = "--"
+                num_output_tokens = 0
             print(
-                f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
-                f"{prompt_text} ... {output_text_escaped}"
+                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
+                f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
+                f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
             )
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
 
-            for idx, req in enumerate(requests):
+            # Write every 'n' requests, plus the final request.
+            for req in [ *requests[::args.output_every_n_results], requests[-1] ]:
                 result_dict = {
                     "input_prompt": req.prompt_text,
                     "generated_text": req.output_text,
                     "generated_tokens": req.output_tokens,
                     "latency": req.time_end - req.time_start,
+                    "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
+                    "step_count" : engine.step_count,
                 }
                 if sampling_params.return_log_probs:
                     response_logprobs = req.log_probs

@@ -57,6 +57,7 @@ class TestDynamicContext:
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
+            use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
             buffer_size_gb=buffer_size_gb,
             buffer_guaranteed_fraction=buffer_guaranteed_fraction,
             chunk_size_tokens=chunk_size_tokens,
@@ -289,6 +290,7 @@ class TestDynamicContext:
         )
         assert torch.all(dynamic_context.request_to_kv_chunk_ids == -1)
         if is_hybrid_model:
+            assert torch.all(dynamic_context.request_to_mamba_state_idx == -1)
             assert torch.all(dynamic_context.mamba_conv_states == 0)
             assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
@@ -530,6 +532,9 @@ class TestDynamicContext:
 
         if is_hybrid_model:
             # Dummy fill for states to be non-zero before update
+            for i in range(total_request_count):
+                dynamic_context.request_to_mamba_state_idx[i] = i
+            dynamic_context.mamba_state_free_slot_count -= total_request_count
             dynamic_context.mamba_conv_states[:, 0:total_request_count, :, :] = 1.0
             dynamic_context.mamba_ssm_states[:, 0:total_request_count, :, :, :] = 1.0
 
@@ -620,14 +625,6 @@ class TestDynamicContext:
                 )
             )
 
-        if is_hybrid_model:
-            # Verify Mamba states for finished requests are reset (filled with 0)
-            # and active requests are moved correctly.
-            # The indices 7, 8, 9 (original request IDs 3, 7, 8) are the finished ones.
-            # Their corresponding mamba states should be zeroed out.
-            assert torch.all(dynamic_context.mamba_conv_states[:, 7:10, :, :] == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states[:, 7:10, :, :, :] == 0)
-
     @pytest.mark.experimental
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_chunks_for_finished_requests(self, is_hybrid_model: bool):
@@ -668,6 +665,8 @@ class TestDynamicContext:
                     float(i + 1)
                 )  # Fill with distinct values
                 dynamic_context.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
+                dynamic_context.request_to_mamba_state_idx[i] = i
+                dynamic_context.mamba_state_free_slot_count -= 1
 
         # Create an active_requests_mask where requests 0, 2, and 4 are finished (0),
         # and requests 1 and 3 are still active (1)
@@ -690,13 +689,14 @@ class TestDynamicContext:
         if is_hybrid_model:
             # Request at position 3 now moves into finished request position 0
             # Request at position 1 remains active
-            assert torch.all(dynamic_context.mamba_conv_states[:, 0, :, :] == 4.0)
-            assert torch.all(dynamic_context.mamba_ssm_states[:, 0, :, :, :] == 4.0)
-            assert torch.all(dynamic_context.mamba_conv_states[:, 1, :, :] == 2.0)
-            assert torch.all(dynamic_context.mamba_ssm_states[:, 1, :, :, :] == 2.0)
-            # All other states (from index 2 onwards) should be zero
-            assert torch.all(dynamic_context.mamba_conv_states[:, 2:, :, :] == 0)
-            assert torch.all(dynamic_context.mamba_ssm_states[:, 2:, :, :, :] == 0)
+            mamba_idx = {i: dynamic_context.request_to_mamba_state_idx[i] for i in range(5)}
+            assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx[0], :, :] == 4.0)
+            assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx[0], :, :, :] == 4.0)
+            assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx[1], :, :] == 2.0)
+            assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx[1], :, :, :] == 2.0)
+            assert mamba_idx[2] == -1
+            assert mamba_idx[3] == -1
+            assert mamba_idx[4] == -1
 
     @pytest.mark.experimental
     @pytest.mark.parametrize("is_hybrid_model", [False, True])

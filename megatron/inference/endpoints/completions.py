@@ -103,7 +103,7 @@ class MegatronCompletions(Resource):
             logprobs = local_kwargs["return_output_log_probs"]
             top_n_logprobs = local_kwargs["return_topk_logprobs"]
             random_seed = local_kwargs["random_seed"]
-
+            
             response_dict = run_mcore_engine(
                 engine=self.engine,
                 prompts=prompts,

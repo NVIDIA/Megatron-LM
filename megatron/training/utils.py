@@ -5,7 +5,9 @@ import json
 import os
 import sys
 import warnings
+from contextlib import contextmanager
 from datetime import datetime
+from collections import defaultdict
 
 import torch
 
@@ -47,13 +49,29 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     args = get_args()
     if not isinstance(model, list):
         model = [model]
+
+    if getattr(args, 'use_megatron_fsdp', False):
+        # All Megatron FSDP parameters are expected to be PyTorch DTensor.
+        # params_data is a dict of device_mesh -> list of local tensors.
+        params = []
+        for model_chunk in model:
+            model_chunk.stop_communication()
+            for name, param in model_chunk.named_parameters():
+                if not hasattr(param, "_local_tensor"):
+                    raise RuntimeError(
+                        f"Megatron FSDP requires parameters are PyTorch DTensor. "
+                        f"Parameter {name} is not a DTensor."
+                    )
+                params.append(param)
+
+        return calc_dtensor_params_l2_norm(params)
+
     # Seperate moe and dense params
     params_data = []
     moe_params_data = []
     sharded_params_data = []
     data_parallel_group = None
 
-    custom_fsdp_all_param_is_shared = False
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
@@ -61,15 +79,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
-            if hasattr(param, "fully_shard_param_local_shard"):
-                param = param.fully_shard_param_local_shard
-                assert [
-                    getattr(p, "fully_shard_param_local_shard", None) is not None
-                    for p in model_chunk.parameters()
-                ]
-                custom_fsdp_all_param_is_shared = True
-                if param.numel() == 0:
-                    continue
             if not getattr(param, 'allreduce', True):
                 # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
@@ -119,19 +128,16 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-        # Sum over all DP groups, including CP since distributed optimizer state is
-        # sharded jointly over DP+CP.
-        torch.distributed.all_reduce(
-            sharded_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_data_parallel_group(with_context_parallel=True)
-        )
-        norm_2 += sharded_norm_2
-
-    if custom_fsdp_all_param_is_shared:
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
-        )
+    else:
+        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    # Sum over all DP groups, including CP since distributed optimizer state is
+    # sharded jointly over DP+CP.
+    torch.distributed.all_reduce(
+        sharded_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=True)
+    )
+    norm_2 += sharded_norm_2
 
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
@@ -143,12 +149,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         moe_norm_2 = moe_norm * moe_norm
 
-        if custom_fsdp_all_param_is_shared:
-            torch.distributed.all_reduce(
-                moe_norm_2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=mpu.get_expert_data_parallel_group(),
-            )
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
@@ -180,6 +180,43 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         norm_2 += moe_norm_2
 
     return norm_2.item() ** 0.5
+
+
+def calc_dtensor_params_l2_norm(params):
+    """Calculate l2 norm of DTensor parameters."""
+    params_data = defaultdict(list)
+    for param in params:
+        params_data[param._spec].append(param._local_tensor)
+
+    total_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')
+    for dtensor_spec, local_tensors in params_data.items():
+        local_tensors = [t for t in local_tensors if t.numel() > 0]
+        if len(local_tensors) == 0:
+            norm = torch.zeros((1,), dtype=torch.float32, device='cuda')
+        else:
+            norm, _ = multi_tensor_applier(
+                multi_tensor_l2norm, dummy_overflow_buf, [local_tensors], False  # no per-parameter norm.
+            )
+        norm_2 = norm * norm
+        for pg, placement in zip(
+            dtensor_spec.device_mesh.get_all_groups(),
+            dtensor_spec.placements,
+        ):
+            if placement.is_shard():
+                torch.distributed.all_reduce(
+                    norm_2, op=torch.distributed.ReduceOp.SUM, group=pg
+                )
+            elif placement.is_replicate():
+                # Replicated parameters are already summed across all ranks.
+                pass
+            else:
+                raise RuntimeError(
+                    f"Unsupported placement {placement} for Megatron FSDP."
+                )
+        total_norm_2 += norm_2
+
+    return total_norm_2.item() ** 0.5
 
 
 def average_losses_across_data_parallel_group(losses):
@@ -275,9 +312,13 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(
-    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss
-):
+def get_ltor_masks_and_position_ids(data,
+                                    eod_token,
+                                    pad_token,
+                                    reset_position_ids,
+                                    reset_attention_mask,
+                                    eod_mask_loss,
+                                    pad_mask_loss):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -296,6 +337,8 @@ def get_ltor_masks_and_position_ids(
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
     if eod_mask_loss:
         loss_mask[data == eod_token] = 0.0
+    if pad_mask_loss:
+        loss_mask[data == pad_token] = 0.0
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
@@ -309,7 +352,7 @@ def get_ltor_masks_and_position_ids(
         for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
-            eod_index = position_ids[b, data[b] == eod_token]
+            eod_index = position_ids[b, data[b] == eod_token] & position_ids[b, data[b] == pad_token]
             # Detach indecies from positions if going to modify positions.
             if reset_position_ids:
                 eod_index = eod_index.clone()
@@ -372,6 +415,18 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def is_first_or_last_pipeline_stage(vp_stage):
+    """Return True if on first or last pipeline stage, taking into account virtual
+    pipeline parallelism."""
+    ignore_virtual = True
+    if vp_stage is not None:
+        ignore_virtual = False
+    return (
+        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+    )
 
 
 def get_device_arch_version():
@@ -459,11 +514,8 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 
-        if data_iterator is not None:
-            data = next(data_iterator)
-        else:
-            data = None
-
+        assert data_iterator is not None
+        data = next(data_iterator)
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
@@ -573,3 +625,52 @@ def get_batch_on_this_tp_rank(data_iterator):
 
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
+
+
+def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, recurse=True):
+    """Move tensors to device if not meta device; otherwise materialize with empty_like().
+
+    Officially, torch suggests to_empty() for meta device materialization. Under the hood,
+    torch.empty_like() is applied to all parameters or buffers (see _apply). This may
+    accidently overwrite buffers with precomputed values during construction. Given the
+    goal is to only materialize those tensors on meta device, this function checks the
+    device first and only move the tensor to the destination if it is not on meta device.
+   
+    Args:
+        module: The target module to apply this transformation.
+        device: The desired device of the parameters
+            and buffers in this module.
+        recurse: Whether parameters and buffers of submodules should
+            be recursively moved to the specified device.
+    """
+
+    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
+        if tensor.device == torch.device("meta"):
+            return torch.empty_like(tensor, device=device)
+        else:
+            return tensor.to(device)
+
+    return module._apply(
+        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
+    )
+
+
+def get_nvtx_range():
+    """Create an NVTX range context manager."""
+    try:
+        from torch.cuda import nvtx
+
+        @contextmanager
+        def nvtx_range(msg):
+            try:
+                nvtx.range_push(msg)
+                yield
+            finally:
+                nvtx.range_pop()
+
+        return nvtx_range
+    except:
+        @contextmanager
+        def dummy_range(msg):
+            yield
+        return dummy_range

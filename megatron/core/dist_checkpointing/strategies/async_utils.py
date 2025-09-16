@@ -79,9 +79,24 @@ class AsyncRequest(NamedTuple):
 
         This logic is equivalent to what should happen in case of the async call.
         """
+        # preload tensors.
+        async_fn_args = list(self.async_fn_args)
+        if self.preload_fn:
+            assert len(async_fn_args) == 3, "Expected 3 args to be passed to async function"
+            # The async_fn is passed as a partial functool with pre-determined args
+            # In the async_fn_args we pass the remaining positional args required by the async_fn
+            # async_fn_args[1] refers to the write_buckets
+            # To ensure we stage the write_buckets to CPU memory for sync CP,
+            # we replace it with preload_fn callable that returns the CPU staged tensors
+            async_fn_args[1] = self.preload_fn()
+        # persist the state
         if self.async_fn is not None:
-            self.async_fn(*self.async_fn_args)
+            self.async_fn(*async_fn_args, **self.async_fn_kwargs)
+
+        # This utility implements a sync cp save. Hence the barrier.
         torch.distributed.barrier()
+
+        # Finalize the CP state
         for finalize_fn in self.finalize_fns:
             finalize_fn()
 
@@ -150,7 +165,7 @@ class AsyncCaller(ABC):
         return ten[0] == 0
 
     @abstractmethod
-    def close(self):
+    def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
         logger.info(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
 
@@ -237,15 +252,23 @@ class TemporalAsyncCaller(AsyncCaller):
             is_done = True
         return is_done
 
-    def close(self):
+    def close(self, abort=False):
         """For TemporalAsyncCaller, this method is called explictly in `is_current_async_calls_done`
 
         This method make sure the TemporalAsyncCaller terminated
         with all its assigned async request completed
+
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
         """
         if self.process:
             logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
-            self.process.join()
+            if abort:
+                logger.warning(f"Temporal worker aborted in rank {torch.distributed.get_rank()}")
+                self.process.kill()
+            else:
+                self.process.join()
             self.process = None
             logger.debug(
                 "TemporalAsyncCaller: Async process join finished "
@@ -388,18 +411,25 @@ class PersistentAsyncCaller(AsyncCaller):
 
         return is_done
 
-    def close(self):
+    def close(self, abort=False):
         """Wait on the left async requests and terminate the PersistentAsyncCaller
 
         Signals the PersistentAsyncCaller by sending a 'DONE' message to make it terminated
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
         """
         logger.info(
             f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
         )
         if self.process:
-            self.queue.put('DONE')
-            self.queue.join()
-            self.process.join()
+            if abort:
+                logger.warning(f"Persistent worker aborted in rank {torch.distributed.get_rank()}")
+                self.process.kill()
+            else:
+                self.queue.put('DONE')
+                self.queue.join()
+                self.process.join()
             self.process = None
 
     def __del__(self):
@@ -528,6 +558,9 @@ class AsyncCallsQueue:
             blocking (bool, optional): if True, will wait until all active requests
                 are done. Otherwise, finalizes only the async request that already
                 finished. Defaults to False.
+
+            no_dist (bool, Optional): if True, training ranks simply check its
+                asynchronous checkpoint writer without synchronization.
         Returns:
             List[int]: list of indices (as returned by `schedule_async_request`)
                 of async calls that have been successfully finalized.
@@ -545,8 +578,8 @@ class AsyncCallsQueue:
                     finalize_fn()
                 ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
                 torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
-                assert ten.item() == call_idx, 'Unmatched async calls. '
-                'That probably means not all ranks are participating in async finalization'
+                assert ten.item() == call_idx, "Unmatched async calls. "
+                "That probably means not all ranks are participating in async finalization"
                 call_idx_finalized.append(call_idx)
         return call_idx_finalized
 
@@ -554,8 +587,13 @@ class AsyncCallsQueue:
         """Get the number of active async calls."""
         return len(self.async_calls)
 
-    def close(self):
-        """Finalize all calls upon closing."""
-        self.maybe_finalize_async_calls(blocking=True)
+    def close(self, abort=False):
+        """Finalize all calls upon closing.
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
+        """
+        if not abort:
+            self.maybe_finalize_async_calls(blocking=True)
         if self.persistent and self.persistent_caller:
-            self.persistent_caller.close()
+            self.persistent_caller.close(abort=abort)

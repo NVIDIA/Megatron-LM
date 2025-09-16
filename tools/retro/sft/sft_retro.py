@@ -19,7 +19,9 @@ from megatron.core.datasets.utils import get_blend_from_list
 from megatron.training import pretrain
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from megatron.training.utils import average_losses_across_data_parallel_group
-from pretrain_gpt import model_provider, is_dataset_built_on_rank
+from pretrain_gpt import is_dataset_built_on_rank
+from model_provider import model_provider
+from gpt_builders import gpt_builder
 from tools.retro.sft.dataset_conv import JsonQADataset, JsonQADatasetConfig, RetroJsonQADataset, RetroJsonQADatasetConfig
 
 
@@ -269,7 +271,7 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    pretrain(train_valid_test_datasets_provider, model_provider,
+    pretrain(train_valid_test_datasets_provider, partial(model_provider, gpt_builder),
         ModelType.retro_decoder,  # ModelType.encoder_or_decoder,
         forward_step,
         extra_args_provider=get_tasks_args
