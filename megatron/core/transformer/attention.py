@@ -677,7 +677,7 @@ class Attention(MegatronModule, ABC):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
-        split_qkv = not all(
+        split_qkv = (self.attention_type == "cross") or not all(
             [
                 not self.config.test_mode,
                 self.config.fused_single_qkv_rope,
