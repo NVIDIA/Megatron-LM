@@ -74,11 +74,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - bucket: "tests/unit_tests"
           - bucket: "tests/unit_tests/data/"
           - bucket: "tests/unit_tests/dist_checkpointing/*.py"
+          - bucket: "tests/unit_tests/dist_checkpointing/models/"
+          - bucket: "tests/unit_tests/transformer/*.py"
+          - bucket: "tests/unit_tests/transformer/moe"
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: nvidia-ci-aws-gpu-x8
-    name: "Unit tests: ${{ matrix.bucket }} - ${{ matrix.tag }}"
+    name: "Unit tests: ${{ matrix.bucket }} - latest"
     environment: nemo-ci
     if: |
       (
