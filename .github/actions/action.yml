@@ -46,7 +46,7 @@ runs:
     - name: Nvidia driver check
       shell: bash
       run: |
-        docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi  # Check driver version
+        docker run --rm --ipc=host --runtime=nvidia --gpus all ubuntu nvidia-smi  # Check driver version
 
     - name: Install curl, sudo
       shell: bash
@@ -152,6 +152,10 @@ runs:
           --name test_container_${{ github.run_id }} \
           --runtime=nvidia --gpus all \
           --shm-size=64g \
+          --ipc=host \
+          -e NCCL_DEBUG=INFO \
+          -e NCCL_IB_DISABLE=1 \
+          -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
