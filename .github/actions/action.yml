@@ -94,6 +94,28 @@ runs:
         docker container rm -f test-data-container || true
         echo "::endgroup::"
 
+    - name: Create run-script
+      id: create
+      shell: bash
+      if: inputs.is_unit_test == 'true'
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+
+        docker exec -t test_container_${{ github.run_id }} bash -c '
+          set -e
+          bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
+            --tag ${{ inputs.tag }} \
+            --environment dev \
+            --bucket '${{ inputs.bucket }}'
+        '
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"        
+        echo "::endgroup::"
+
     - name: Build container
       shell: bash
       env:
@@ -135,28 +157,6 @@ runs:
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
-        echo "::endgroup::"
-
-    - name: Create run-script
-      id: create
-      shell: bash
-      if: inputs.is_unit_test == 'true'
-      run: |
-        echo "::group::Create run-script"
-        cmd=$(cat <<'RUN_TEST_EOF'
-        #!/bin/bash
-
-        docker exec -t test_container_${{ github.run_id }} bash -c '
-          set -e
-          bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
-            --tag ${{ inputs.tag }} \
-            --environment dev \
-            --bucket ${{ inputs.bucket }}
-        '
-
-        RUN_TEST_EOF
-        )
-        echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
 
     - name: Set timeout
