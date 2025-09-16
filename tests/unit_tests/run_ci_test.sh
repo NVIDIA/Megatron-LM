@@ -157,6 +157,8 @@ DISTRIBUTED_ARGS=(
 export NCCL_MAX_NCHANNELS=1
 export NCCL_NVLS_ENABLE=0
 export ONE_LOGGER_JOB_CATEGORY=test
+export NVTE_DEBUG=1 
+export NVTE_DEBUG_LEVEL=2 
 
 for i in $(seq $UNIT_TEST_REPEAT); do
     echo "Running prod test suite."
