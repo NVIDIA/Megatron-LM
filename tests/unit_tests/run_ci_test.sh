@@ -181,3 +181,5 @@ for i in $(seq $UNIT_TEST_REPEAT); do
     fi
 
 done
+
+coverage combine -q

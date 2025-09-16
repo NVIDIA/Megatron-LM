@@ -193,7 +193,6 @@ markers = [
 ]
 
 [tool.coverage.run]
-data_file = ".coverage_$LOCAL_RANK"
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
