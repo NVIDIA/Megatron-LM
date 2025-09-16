@@ -251,6 +251,7 @@ class TransformerLayerNode(ScheduleNode):
         self.submodule = submodule
         self.detached = tuple()
         self.before_detached = tuple()
+        self.is_mtp = extra_args.get("is_mtp", False)
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -459,9 +460,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         # release tensor reference after use
         node.layer_state.residual = None
+        
+        # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm
-        mtp = getattr(node.chunk_state.model, "mtp", None)
-        if mtp is None and final_layernorm and node.is_last_layer:
+        if not node.is_mtp and final_layernorm and node.is_last_layer:
             output = final_layernorm(output)
             output = make_viewless_tensor(
                 inp=output, requires_grad=True, keep_graph=True
@@ -505,14 +507,6 @@ def build_mtp_layer_callables(layer):
     def submodule_mtp_attn_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
-            # Final layer norm from Decoder
-            final_layernorm = node.chunk_state.model.decoder.final_layernorm
-            if final_layernorm:
-                hidden_states = final_layernorm(hidden_states)
-                hidden_states = make_viewless_tensor(
-                    inp=hidden_states, requires_grad=True, keep_graph=True
-                )
-                hidden_states = node.detach(hidden_states)
             offset = get_mtp_layer_offset(layer.config)
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
