@@ -198,8 +198,8 @@ class RotaryEmbedding(nn.Module):
             else:
                 cp_group = None
             if cp_group is not None:
-                # slice rotary_pos_emb along sequence dimension and select the parition of the current
-                # CP rank
+                # slice rotary_pos_emb along sequence dimension
+                # and select the parition of the current CP rank
                 emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
         return emb

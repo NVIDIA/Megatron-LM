@@ -6,7 +6,6 @@ import array
 import asyncio
 import functools
 import hashlib
-import heapq
 import inspect
 import logging
 import math
@@ -30,7 +29,6 @@ import torch
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from torch.distributed._tensor import DTensor
@@ -1840,6 +1838,7 @@ def get_batch_on_this_cp_rank(
                 batch[key] = val
 
     return batch
+
 
 ######################
 ### NVTX profiling ###

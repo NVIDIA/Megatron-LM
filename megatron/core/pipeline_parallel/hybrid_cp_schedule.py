@@ -1,13 +1,11 @@
-import heapq
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
@@ -73,6 +71,14 @@ class HybridCPDataLoaderWrapper:
         return self
 
     def get_global_seqlens(self, subsample_seqlens: torch.Tensor) -> List[int]:
+        """
+        Gathers the sequence lengths of all subsamples from all DP ranks.
+        Each DP rank loads the same number of microbatches but each microbatch
+        may have a different number of subsamples.
+
+        We find the number of subsamples each rank holds and then gather the
+        sequence lengths of all subsamples from all ranks.
+        """
         # Collect the number of subsamples from all ranks
         local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
         dp_subsample_count = [
@@ -83,7 +89,7 @@ class HybridCPDataLoaderWrapper:
             dp_subsample_count, local_len, group=parallel_state.get_data_parallel_group()
         )
 
-        # Find the maximum number of subsamples across all ranks and pad the subsample_seqlens to the max length
+        # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
         dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
         max_sub_samples = int(dp_subsample_counts.max().item())
 
@@ -123,7 +129,15 @@ class HybridCPDataLoaderWrapper:
         return seqlens_gathered, offsets
 
     def get_global_id_seqlens(self, num_local_subsamples, offsets, seqlens_gathered):
-        # Calculate the global ID for each subsample
+        """
+        Calculates the global ID for each subsample.
+
+        We assign a unique global ID to each subsample.
+
+        Returns:
+        global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
+        global_ids_this_rank: list of global IDs locally present on this rank.
+        """
         dp_rank = parallel_state.get_data_parallel_rank()
         global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
         # Create a list of (global_id, seqlen) tuples for scheduling
@@ -145,6 +159,14 @@ class HybridCPDataLoaderWrapper:
     def reroute_samples_to_hdp_ranks(
         self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
     ):
+        """
+        Reroutes the sub-samples to the correct rank after scheduling.
+
+        For each key in the batch dict, we perform an all-to-all communication
+        to transfer the data to the correct ranks.
+        Since all CP ranks within a DP group have the same data, we only need
+        to transfer data between matching CP ranks.
+        """
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
         hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
         dp_ranks = torch.distributed.get_process_group_ranks(
@@ -197,8 +219,6 @@ class HybridCPDataLoaderWrapper:
                 [global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]]
             )
 
-        # print(f"rank: {torch.distributed.get_rank()}, recv_lens_split: {recv_lens_split} send_lens_split: {send_lens_split}")
-
         recv_ids_sorted = [
             gid for d in range(self.total_hdp_gpus) for gid in recv_sample_id_groups[d]
         ]
@@ -244,6 +264,12 @@ class HybridCPDataLoaderWrapper:
         return recv_sample_with_id
 
     def unpack_batch(self, batch):
+        """
+        Unpacks the packed samples into a list of sub-samples.
+        Since each sub-sample may be routed to different DPxCP ranks,
+        we unpack the sample here to avoid unnecessarily transferring
+        the entire packed sample.
+        """
         batch_unpacked = []
         for sample in batch:
             for sub_sample in range(sample["cu_seqlens"].shape[0] - 1):
@@ -280,24 +306,24 @@ class HybridCPDataLoaderWrapper:
         global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(
             subsample_seqlens.shape[0], offsets, seqlens_gathered
         )
-        # global_id_seqlens = sorted(global_id_seqlens, key=lambda x: x[1], reverse=True)
 
         groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(
             global_id_seqlens, self.config
         )
-        # sample["groups"] = groups
-        # sample["sample_id_groups"] = sample_id_groups
 
         batch = self.unpack_batch(batch)
         samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(
             batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
         )
-        # for sample_id, sample in samples_this_rank_with_id.items():
-        #     sample["sample_id_groups"]
         return samples_this_rank_with_id, sample_id_groups
 
 
 class BalancedCPScheduler:
+    """
+    This class provides the functionality to form groups of sub-samples
+    such that all DPxCP ranks have a roughly balanced workload in the group.
+    """
+
     def __init__(self, max_seq_len_per_rank: int):
         self.max_seq_len_per_rank = max_seq_len_per_rank
         self.num_subsamples = 0
@@ -326,6 +352,11 @@ class BalancedCPScheduler:
 
     @lru_cache(maxsize=128)
     def gpus_needed(self, seq_len: int) -> int:
+        """
+        Calculates the number of GPUs needed for a given sequence length
+        and max sequence length per CP rank.
+        This is used to determine the CP size of a sub-sample.
+        """
         return max(1, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
 
     def make_buckets_equal(
@@ -388,23 +419,26 @@ class BalancedCPScheduler:
     ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
         """
         Given a list of (sample_id, sequence_length) tuples, this function aims to assign
-        sequences to a microbatch such that all GPUs in the CP domain have a roughly balanced workload.
-        Once each microbatch is roughly balanced, we exit and return the microbatch and the leftover sequences.
+        sequences in a group such that all GPUs in the DPxCP group have a roughly balanced
+        workload. Once each group is roughly balanced, we exit and return the
+        group and the leftover sequences.
 
         The function performs the following passes in order to form a balanced microbatch:
         1. We create buckets of sequences that are roughly balanced.
         We try to create as many buckets as possible CP sizes.
-        2. Given a bucket has sequences available, we assign the microbatch
+        2. Given a bucket has sequences available, we assign the sample
             a. To a new set of GPUs if there are enough free GPUs.
             b. To an existing set of GPUs with the lowest load.
-        3. We check if the microbatch is balanced whenever we need to move onto a new CP size in the same set of GPUs.
-        4. We trim the microbatch if removing the last added sequence helps improve balance.
+        3. We check if the group is balanced whenever we need to move onto a new CP size
+        in the same set of GPUs.
+        4. We trim the group if removing the last added sequence helps improve balance.
         5. If we run out of sequences to assign and there are empty GPUs,
-        we redistribute work to empty GPUs by recursively increasing the CP size of a sample until no empty GPUs are left..
+        we redistribute work to empty GPUs by recursively increasing the CP size of a
+        sample until no empty GPUs are left.
 
         #TODO: Add clarification on when we check for balance. What does prev_needed do?
 
-        Returns (*micro_batches*, *leftover_sample_seqlens*, *exec_times*, *sample_ids_per_gpu*).
+        Returns (micro_batches, leftover_sample_seqlens, exec_times, sample_ids_per_gpu).
         """
         if not sample_seqlens:
             return (
@@ -525,30 +559,32 @@ class BalancedCPScheduler:
                 buckets.pop(0)
                 pp_cursor %= max(1, len(buckets))
 
-            # TODO: Should I pre-emptively break out if slack is already within delta?
-            # Feels like if we have global batch level samples, we will have lots with same CP size.
-            # So we can just keep adding samples.
-            # We already have trim workload to handle imbalanced cases.
-            # TODO: Removing this helps reduce the number of groups when we have lots of samples with same CP size.
-            # But because we don't exit as soon as we get balanced, even if there is one group available that can take the next sample,
+            # TODO: Removing this helps reduce the number of groups when we have
+            # lots of samples with same CP size.
+            # But because we don't exit as soon as we get balanced,
+            # even if there is one group available that can take the next sample,
             # we will keep adding samples to the same group.
-            # trim_overload() does not help because it only checks if removing the last added sample helps.
-            # We cannot check after adding every sample because there will always be imbalance if we don't wait for future scheduling.
+            # trim_overload() does not help because it only checks if removing the
+            # last added sample helps.
+            # We cannot check after adding every sample because there will always be imbalance
+            # if we don't wait for future scheduling.
 
             # IMPORTANT: So we need a solution here
             if needed < prev_needed:
-                # When we get into a lower CP size in the same group, we can start checking for balance.
-                # There is still a gotcha here.
+                # When we get into a lower CP size in the same group,
+                # we can start checking for balance. There is still a gotcha here.
                 # Let's say we have a group of 3 GPU 0-2, then we move onto group of 2.
-                # We keep assigning group of 2 as we do in descending order but GPU 7/15 never sees a microbatch assigned to it
+                # We keep assigning group of 2 as we do in descending order but GPU 7/15
+                # never sees a microbatch assigned to it
                 # until we run out of samples with CP2.
                 # This means we are never balanced as min(exec_times) will always be 0.
-                # We need a smart way of identifying that we have run out of big samples and if we are having to
-                # assign work to a GPU already working, is it because there are empty GPUs?
+                # We need a smart way of identifying that we have run out of big samples
+                # and if we are having to assign work to a GPU already working,
+                # is it because there are empty GPUs?
                 # Would assigning work to empty GPUs first by moving onto next CP bucket help?
-                # But we need to remember to come back to this CP size bucket and then check for balance.
-                # Maybe the scheduling algorithm should look at empty GPUs and find work rather than going
-                # sequence by sequence.
+                # But we need to remember to come back to this CP size bucket and then
+                # check for balance. Maybe the scheduling algorithm should look at empty
+                # GPUs and find work rather than going sequence by sequence.
                 check_balance = True
 
             if (
@@ -652,7 +688,7 @@ class BalancedCPScheduler:
                     empty_gpu = [idx for idx, work in enumerate(micro_batches) if not work][0]
                     assert not all(
                         work for work in micro_batches[empty_gpu : empty_gpu + needed_count]
-                    ), f"Not enough empty GPUs to expand or there are empty GPUs between work scheduled which is not allowed."
+                    ), f"Empty GPUs were detected but not enough to expand."
                     work_to_push = micro_batches[
                         group_end_gpu + 1 : empty_gpu
                     ]  # This is work of all other subsequent sub-samples
@@ -719,9 +755,13 @@ class BalancedCPScheduler:
         return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
     def get_groups_and_subsamples(self, sample_id_seqlens, config):
+        """
+        This function recursively forms groups of sub-samples such that all DPxCP ranks
+        have a roughly balanced workload in the group.
+        """
         groups = []
         sample_id_groups = []
-        # We assign a sample_id to each sub-sample in order to track the right assignment to each GPU.
+        # We assign a sample_id to each sub-sample in order to track assignment to each GPU.
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
         while sample_id_seqlens:
             mb, sample_id_seqlens, exec_times, sample_ids = self.next_hdp_group(
@@ -761,17 +801,12 @@ def hybrid_context_parallel_forward_backward(
     3. The number of sub-samples per group each CP rank should execute
 
     A group is defined by a set of samples that can run across the CP domain without any barrier.
-    There are many reasons why we may not be able to run endless number of samples within a single group.
+    There are many reasons why we may not be able to run endless samples within a single group.
     For example, if we have 8 GPUs,
     if GPU 0-5 are assigned a long sample that requires CP6,
     GPU 6-7 are assigned a short sample that requires CP2,
     The next sample which requires CP4 can be assigned GPU 4-7.
     But GPU 6-7 will finish first and get deadlocked if GPU 4-5 are not participating in the group.
-
-    As of now, the number of microbatches is pre-determined by GBS and DP size.
-    We perform the scheduling for each microbatch.
-    In the future, when we schedule over the entire global batch, we will remove the need for step #2 and
-    number of microbatches will be determined by the number of groups.
     """
     from .schedules import backward_step, forward_step
 
@@ -796,12 +831,10 @@ def hybrid_context_parallel_forward_backward(
                 partner_cp_size = len(
                     [True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids]
                 )
-                assert (
-                    partner_cp_size > 0
-                ), f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[j]}"
                 sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
                 new_data_iterator = RerunDataIterator(iter([sample]))
-                # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
+                # TODO: Find the usage of current_microbatch and is_first_microbatch and
+                # how that may affect my usage.
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
                     new_data_iterator,
@@ -861,14 +894,12 @@ def hybrid_context_parallel_forward_backward(
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
-    # The last sub-sample of the last group of the last microbatch is run out of the context handler.
+    # The last sub-sample of the last group of the last microbatch is
+    # run out of the context handler.
     sub_sample_id = sample_ids_this_group[-1]
     partner_cp_size = len(
         [True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids]
     )
-    assert (
-        partner_cp_size > 0
-    ), f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[-1]}"
     sample = batch[sub_sample_id]
     sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
     new_data_iterator = RerunDataIterator(iter([sample]))
@@ -893,13 +924,4 @@ def hybrid_context_parallel_forward_backward(
 
     torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
 
-<<<<<<< HEAD
     return forward_data_store, total_num_tokens
-=======
-    # TODO: Before returning forward_data_store, do we need to change the loss?
-    # If loss calculation is done as sum(loss_per_token) / sum(total_tokens_per_sample),
-    # we don't need to change the loss.
-    # But if the loss calculation is different, then the user needs to define a new loss function
-    # for hybrid context parallel in their training script.
-    return forward_data_store, total_num_tokens
->>>>>>> dc8139f2ddd22bb1a70ded90f33d2280b6f8c48e

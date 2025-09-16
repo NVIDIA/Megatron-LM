@@ -368,6 +368,11 @@ def create_hierarchical_groups(
 
 
 def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+    """
+    Creates groups required for hybrid DPxCP.
+    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Returns a dictionary indexed by group size.
+    """
     hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
