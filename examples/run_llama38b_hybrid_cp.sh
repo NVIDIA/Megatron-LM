@@ -117,6 +117,7 @@ EXTRA_ARGS+=" --use-precision-aware-optimizer --main-grads-dtype bf16 --main-par
 OPTIONS=" \
     --disable-bias-linear \
     --sft \
+    --legacy-tokenizer \
     --tokenizer-type SFTTokenizer \
     --sft-tokenizer-prompt-format nemotron-h-aligned \
     --tokenizer-model /lustre/fsw/portfolios/llmservice/users/kezhik/images/Nemotron-H-4B-Instruct \
