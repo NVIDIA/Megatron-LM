@@ -161,16 +161,17 @@ runs:
 
     - name: Set timeout
       shell: bash
+      id: timeout_in_seconds
       run: |
         echo "::group::Set timeout"
-        echo "timeout_in_seconds=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
+        echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
 
     - name: Run main script
       uses: nick-fields/retry@v3
       id: run-main-script
       with:
-        timeout_seconds: ${{ steps.create.outputs.timeout_in_seconds }}
+        timeout_seconds: ${{ steps.timeout_in_seconds.outputs.main }}
         max_attempts: 3
         shell: bash
         retry_on: timeout
