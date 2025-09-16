@@ -31,7 +31,7 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_adlr_autoresume
+from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -661,12 +661,17 @@ def get_nvtx_range():
         from torch.cuda import nvtx
 
         @contextmanager
-        def nvtx_range(msg):
+        def nvtx_range(msg, time=False):
+            if time:
+                timers = get_timers()
+                timers(msg, log_level=0).start()
             try:
                 nvtx.range_push(msg)
                 yield
             finally:
                 nvtx.range_pop()
+                if time:
+                    timers(msg, log_level=0).stop()
 
         return nvtx_range
     except:

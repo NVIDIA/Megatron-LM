@@ -7,6 +7,7 @@ from typing import Annotated, Any, ClassVar
 
 from pydantic import BaseModel, BeforeValidator, ValidationError
 
+from ..__init__ import GenericGenerationArgs
 from ..inference.api import (
     ChatInferenceRequest,
     ChatInferenceResponse,
@@ -14,6 +15,7 @@ from ..inference.api import (
     GroupedInferenceResponse,
     InferenceRequest,
     InferenceResponse,
+    LLMChatMessage,
 )
 from ..inference.chat_templates import ConversationTemplate
 
@@ -32,6 +34,12 @@ class InferenceInterface(BaseModel):
         arbitrary_types_allowed = True
 
     supports_n: ClassVar[bool] = False
+
+    def prepare_request(
+        self, prompts: list[str], generation_args: GenericGenerationArgs
+    ) -> InferenceRequest:
+        assert all(isinstance(p, str) for p in prompts), "Prompt must be a list of strings"
+        return InferenceRequest(prompt=prompts, generation_args=generation_args)
 
     @abstractmethod
     async def base_generate(self, request: InferenceRequest) -> list[InferenceResponse]:
@@ -92,6 +100,14 @@ class ChatInferenceInterface(InferenceInterface):
     """Inference interface for chat models."""
 
     conversation_template: Annotated[ConversationTemplate, BeforeValidator(ensure_template)]
+
+    def prepare_request(
+        self, prompts: list[str | list[LLMChatMessage]], generation_args: GenericGenerationArgs
+    ) -> ChatInferenceRequest:
+        prompt = [
+            [LLMChatMessage(role='user', content=p)] if isinstance(p, str) else p for p in prompts
+        ]
+        return ChatInferenceRequest(prompt=prompt, generation_args=generation_args)
 
     async def base_generate(self, request: ChatInferenceRequest) -> list[ChatInferenceResponse]:
         base_generate_results = await super().base_generate(

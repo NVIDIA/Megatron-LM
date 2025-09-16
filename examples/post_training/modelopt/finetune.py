@@ -7,6 +7,7 @@ import sys
 from functools import partial
 from typing import Any, Dict, Optional
 
+import json
 import jsonlines
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -35,7 +36,20 @@ REMOVE_THINK_CHAT_TEMPLATE = (
 )
 
 
+def add_finetune_args(parser):
+    """Add additional arguments for finetune."""
+    group = parser.add_argument_group(title='Finetune')
+    group.add_argument("--offline-distillation-data", type=str, help="Path to the offline dataset directory with base model features.")
+
+
+    add_modelopt_args(parser)
+    return parser
+
 def get_eos_id():
+    """Return the eos token id.
+    
+    We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
+    we need to replace it with some other special tokens that do not appear in message."""
     tokenizer = get_tokenizer()
     hf_tokenizer = tokenizer._tokenizer
 
@@ -45,9 +59,31 @@ def get_eos_id():
         return 200001
     if hf_tokenizer.eos_token == "<|im_end|>":
         return 151643
+    if hf_tokenizer.eos_token == "<|return|>":
+        return 199999
 
     return hf_tokenizer.eos_token_id
 
+
+class OfflineDataset(torch.utils.data.Dataset):
+    def __init__(self, data_dir: str, num_samples):
+        self.data_dir = data_dir
+        self.num_samples = num_samples
+        self.file_paths = []
+
+        for item in os.listdir(data_dir):
+            item_path = os.path.join(data_dir, item)
+            if os.path.isfile(item_path):
+                self.file_paths.append(item_path)
+
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        idx = idx % len(self.file_paths)
+        file_path = self.file_paths[idx]
+        sample = torch.load(file_path)
+        return sample
 
 class SFTDataset(torch.utils.data.Dataset):
 
@@ -317,48 +353,69 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
-    kwargs = {
-        "tokenizer": tokenizer._tokenizer,
-        "seq_length": args.seq_length,
-        # Optional kwargs
-        "hf_dataset": args.finetune_hf_dataset,
-        "num_shards": mpu.get_expert_data_parallel_world_size(),
-        "shard_index": mpu.get_expert_data_parallel_rank(),
-    }
+    if args.export_offline_model:
+        train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
+        valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
+        test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
 
-    data_path = [
-        args.train_data_path[0] if args.train_data_path else None,
-        args.valid_data_path[0] if args.valid_data_path else None,
-        args.test_data_path[0] if args.test_data_path else None,
-    ]
+        print_rank_0("> finished creating offline SFT datasets ...")
+    else:
+        kwargs = {
+            "tokenizer": tokenizer._tokenizer,
+            "seq_length": args.seq_length,
+            # Optional kwargs
+            "hf_dataset": args.finetune_hf_dataset,
+            "num_shards": mpu.get_expert_data_parallel_world_size(),
+            "shard_index": mpu.get_expert_data_parallel_rank(),
+        }
 
-    train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
-    valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
-    test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+        data_path = [
+            args.train_data_path[0] if args.train_data_path else None,
+            args.valid_data_path[0] if args.valid_data_path else None,
+            args.test_data_path[0] if args.test_data_path else None,
+        ]
 
-    print_rank_0("> finished creating SFT datasets ...")
+        train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
+        valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
+        test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+
+        print_rank_0("> finished creating SFT datasets ...")
 
     return train_ds, valid_ds, test_ds
 
 
 def get_batch(data_iterator):
-    """Generate a batch."""
+    """Generate a batch.
+    
+    For OfflineDataset, the aux_hidden_states and final hidden_states from the
+    base model are loaded for offline speculative model training."""
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
     args = get_args()
 
-    # Items and their type.
-    keys = ["input_ids", "loss_mask"]
-    datatype = torch.int64
-
     # Broadcast data since only TP rank-0 has the data_iterator.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    if not args.export_offline_model:
+        keys = ["input_ids", "loss_mask"]
+        datatype = torch.int64
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    else:
+        keys = ["input_ids"]
+        datatype = torch.int64
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+        data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
+        data_b["loss_mask"][data_b["loss_mask"]==get_eos_id()] = 0
+        data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
+
+        keys = ["aux_hidden_states", "hidden_states"]
+        datatype = torch.bfloat16
+        feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
+
 
     # Unpack the data received.
     tokens_ = data_b["input_ids"]
@@ -368,7 +425,7 @@ def get_batch(data_iterator):
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens, get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss
+        tokens, get_eos_id(), get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss, False
     )
     loss_mask = loss_mask * answer_only_loss_mask.to(dtype=loss_mask.dtype)
 
@@ -383,10 +440,15 @@ def get_batch(data_iterator):
         "attention_mask": attention_mask,
         "position_ids": position_ids,
     }
+
+    if args.export_offline_model:
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:args.seq_length]
+        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:args.seq_length]
+
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
-    return batch.values()
+    return batch
 
 
 def _mask_loss(output_tensor, loss_mask, mp_reduce=False):
@@ -452,7 +514,9 @@ def loss_func(loss_mask: torch.Tensor, model: GPTModel, output_tensor: torch.Ten
 
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
-    report_draft_acceptance_length(model)
+    args = get_args()
+    if not args.export_offline_model:
+        report_draft_acceptance_length(model)
 
 
 
@@ -465,12 +529,25 @@ def forward_step(data_iterator, model: GPTModel):
     """
     timers = get_timers()
 
+    args = get_args()
+
     # Get the batch.
     timers("batch-generator", log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+    batch = get_batch(data_iterator)
+    tokens = batch["tokens"]
+    labels = batch["labels"]
+    loss_mask = batch["loss_mask"]
+    attention_mask = batch["attention_mask"]
+    position_ids = batch["position_ids"]
+    if args.export_offline_model:
+        aux_hidden_states = batch["aux_hidden_states"]
+        hidden_states = batch["hidden_states"]
     timers("batch-generator").stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+    if args.export_offline_model:
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
+    else:
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask, model)
 
@@ -481,7 +558,7 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        extra_args_provider=add_modelopt_args,
+        extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
         non_loss_data_func=non_loss_data_func,
     )

@@ -130,111 +130,50 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, EvaluationAgent
 
         return rollout
 
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+    async def rollout(self, request: RolloutRequest) -> Rollout:
 
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            self.chat_mode = True
-        else:
-            self.chat_mode = False
+        prompt, golden = await self.get_prompt(validation=request.validation)
 
-        async def rollout() -> Rollout:
+        inference_request = request.inference_interface.prepare_request(
+            [prompt], request.generation_args
+        )
 
-            prompt, golden = await self.get_prompt(validation=request.validation)
+        responses = await request.inference_interface.agenerate(inference_request)
+        assert (
+            len(responses) == 1
+        ), "get_reward_rollouts only requested a single response but got multiple responses"
+        response = responses[0]
 
-            if isinstance(request.inference_interface, ChatInferenceInterface):
-                inference_request = ChatInferenceRequest(
-                    prompt=[[LLMChatMessage(role='user', content=prompt)]],
-                    generation_args=request.generation_args,
-                )
-            else:
-                inference_request = InferenceRequest(
-                    prompt=[prompt], generation_args=request.generation_args
-                )
+        return await self.rollout_from_response(request, response, golden)
 
-            responses = await request.inference_interface.agenerate(inference_request)
-            assert (
-                len(responses) == 1
-            ), "get_reward_rollouts only requested a single response but got multiple responses"
-            response = responses[0]
+    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
 
-            return await self.rollout_from_response(request, response, golden)
+        prompt, golden = await self.get_prompt(validation=request.validation)
 
-        return await tqdm.gather(*[rollout() for _ in range(request.num_rollouts)])
+        inference_request = request.inference_interface.prepare_request(
+            [prompt], request.generation_args
+        )
+        inference_request.n = request.rollouts_per_group
 
-    async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+        groups = await request.inference_interface.agenerate(inference_request)
+        assert (
+            len(groups) == 1
+        ), "get_grouped_rollouts only requested a single group but got multiple groups"
+        responses = groups[0].responses
 
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            self.chat_mode = True
-        else:
-            self.chat_mode = False
+        rollouts = await asyncio.gather(
+            *[self.rollout_from_response(request, response, golden) for response in responses]
+        )
 
-        async def group_rollout() -> list[Rollout]:
-
-            prompt, golden = await self.get_prompt(validation=request.validation)
-
-            if isinstance(request.inference_interface, ChatInferenceInterface):
-                inference_request = ChatInferenceRequest(
-                    prompt=[[LLMChatMessage(role='user', content=prompt)]],
-                    generation_args=request.generation_args,
-                    n=request.rollouts_per_group,
-                )
-            else:
-                inference_request = InferenceRequest(
-                    prompt=[prompt],
-                    generation_args=request.generation_args,
-                    n=request.rollouts_per_group,
-                )
-
-            groups = await request.inference_interface.agenerate(inference_request)
-            assert (
-                len(groups) == 1
-            ), "get_grouped_rollouts only requested a single group but got multiple groups"
-            responses = groups[0].responses
-
-            rollouts = await asyncio.gather(
-                *[self.rollout_from_response(request, response, golden) for response in responses]
-            )
-
-            return rollouts
-
-        grouped_rollouts = []
-        # Start with total number of groups, reduce by 2 every request to minize amount of data with throw away.
-        groups_to_request = request.num_groups
-        while True:
-            # We are doing a bit more work than required here, but this is fine for now.
-            unfiltered_rollouts = await tqdm.gather(
-                *[group_rollout() for _ in range(groups_to_request)]
-            )
-            if not request.filter_groups_with_same_reward:
-                return unfiltered_rollouts
-
-            for group in unfiltered_rollouts:
-                if np.std([r.reward for r in group]) > 1e-6:
-                    grouped_rollouts.append(group)
-                    # We have enough.
-                    if len(grouped_rollouts) == request.num_groups:
-                        return grouped_rollouts
-            groups_to_request = max(groups_to_request // 2, 1)
+        return rollouts
 
     async def evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
     ) -> RewardOnlyEvaluationResponse:
 
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            inference_request = ChatInferenceRequest(
-                prompt=[[LLMChatMessage(role='user', content=prompt)]],
-                generation_args=request.generation_args,
-            )
-        else:
-            inference_request = InferenceRequest(
-                prompt=[prompt], generation_args=request.generation_args
-            )
+        inference_request = request.inference_interface.prepare_request(
+            [prompt], request.generation_args
+        )
 
         responses = await request.inference_interface.agenerate(inference_request)
         assert (
@@ -332,16 +271,10 @@ class PassAtEvaluationAgent(RewardOnlyAgent):
         self, prompt: str, golden: dict, request: EvaluationRequest
     ) -> PassAtEvaluationResponse:
 
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            inference_request = ChatInferenceRequest(
-                prompt=[[LLMChatMessage(role='user', content=prompt)]],
-                generation_args=request.generation_args,
-                n=self.max_k,
-            )
-        else:
-            inference_request = InferenceRequest(
-                prompt=[prompt], generation_args=request.generation_args, n=self.max_k
-            )
+        inference_request = request.inference_interface.prepare_request(
+            [prompt], request.generation_args
+        )
+        inference_request.n = self.max_k
 
         groups = await request.inference_interface.agenerate(inference_request)
         assert (
@@ -375,15 +308,9 @@ class PassAtEvaluationAgent(RewardOnlyAgent):
         greedy_generation_args = request.generation_args.add(
             GenericGenerationArgs(top_k=1, temperature=0.0, top_p=0.0)
         )
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            inference_request = ChatInferenceRequest(
-                prompt=[[LLMChatMessage(role='user', content=prompt)]],
-                generation_args=greedy_generation_args,
-            )
-        else:
-            inference_request = InferenceRequest(
-                prompt=[prompt], generation_args=greedy_generation_args
-            )
+        inference_request = request.inference_interface.prepare_request(
+            [prompt], greedy_generation_args
+        )
 
         responses = await request.inference_interface.agenerate(inference_request)
         assert (
