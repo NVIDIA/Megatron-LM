@@ -74,15 +74,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - bucket: "tests/unit_tests"
-          - bucket: "tests/unit_tests/data/"
-          - bucket: "tests/unit_tests/dist_checkpointing/*.py"
-          - bucket: "tests/unit_tests/dist_checkpointing/models/"
-          - bucket: "tests/unit_tests/transformer/*.py"
-          - bucket: "tests/unit_tests/transformer/moe"
+          - bucket: "unit_tests"
+          - bucket: "unit_tests/data/"
+          - bucket: "unit_tests/dist_checkpointing/*.py"
+          - bucket: "unit_tests/dist_checkpointing/models/"
+          - bucket: "unit_tests/transformer/*.py"
+          - bucket: "unit_tests/transformer/moe"
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: nvidia-ci-aws-gpu-x8
-    name: "${{ matrix.bucket[6:] }} - latest"
+    name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
     if: |
       (
@@ -97,7 +97,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          bucket: ${{ matrix.bucket }}
+          bucket: tests/${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
