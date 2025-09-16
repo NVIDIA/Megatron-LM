@@ -147,7 +147,6 @@ runs:
           --name test_container_${{ github.run_id }} \
           --runtime=nvidia --gpus all \
           --shm-size=64g \
-          --env TRANSFORMERS_OFFLINE=1 \
           --workdir /opt/megatron-lm/ \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
