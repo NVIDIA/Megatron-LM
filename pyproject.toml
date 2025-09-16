@@ -200,7 +200,7 @@ omit = [
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
 parallel = true
-sigterm = true
+sigterm = false
 
 [tool.coverage.paths]
 source = [
