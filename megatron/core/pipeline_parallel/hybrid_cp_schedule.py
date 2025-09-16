@@ -1,30 +1,30 @@
+import heapq
+from collections import deque
+from functools import lru_cache
+from math import ceil, log2
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+
 import torch
+
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import RerunDataIterator
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
-from functools import lru_cache
-from collections import deque
-from math import ceil, log2
-import heapq
 
-class HybridCPDatasetWrapper():
+
+class HybridCPDatasetWrapper:
     """
     A wrapper class that wraps around any existing dataset.
     It adds batch_idx to the sample and returns the sample.
-    
+
     This is required if certains DP ranks need the dataset idx
     to access the appropriate sub-sample assigned to them from
     the file system even if it was not originally assigned to them.
-    
+
     Args:
         dataset: The original dataset to wrap around
     """
-    
-    def __init__(
-        self, 
-        dataset,
-    ):
+
+    def __init__(self, dataset):
         self.dataset = dataset
 
     def __len__(self):
@@ -36,61 +36,82 @@ class HybridCPDatasetWrapper():
         """
         sample = self.dataset[idx]
         sample["batch_idx"] = idx
-        assert "cu_seqlens" in sample, "cu_seqlens must be in the sample to use hybrid context parallel"
+        assert (
+            "cu_seqlens" in sample
+        ), "cu_seqlens must be in the sample to use hybrid context parallel"
         return sample
 
-class HybridCPDataLoaderWrapper():
+
+class HybridCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.
-    For every __next__ call, 
+    For every __next__ call,
     1. Each DP rank pulls a batch of packed samples.
     2. Extracts the sequence lengths of each sub-sample and all-gathers across the DP group.
     3. Schedules the sub-samples to the DPxCP ranks using the BalancedCPScheduler.
     4. Based on the schedule, reroutes the sub-samples to the correct rank using all-to-all.
     5. Returns the assigned sub-samples to this rank.
-    
+
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_cp_rank
     """
-    
-    def __init__(
-        self, 
-        data_iterator,
-        config,
-    ):
+
+    def __init__(self, data_iterator, config):
         self.data_iterator = data_iterator
         self.sample_count = 0
         self.config = config
-        self.cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=self.config.max_seqlen_per_cp_rank)
-        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        self.cp_balancing_scheduler = BalancedCPScheduler(
+            max_seq_len_per_rank=self.config.max_seqlen_per_cp_rank
+        )
+        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(
+            with_context_parallel=True
+        )
 
     def __iter__(self):
         """Return self as an iterator."""
         return self
-    
+
     def get_global_seqlens(self, subsample_seqlens: torch.Tensor) -> List[int]:
         # Collect the number of subsamples from all ranks
         local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
-        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(parallel_state.get_data_parallel_world_size())]
-        torch.distributed.all_gather(dp_subsample_count, local_len, group=parallel_state.get_data_parallel_group())
-        
+        dp_subsample_count = [
+            torch.zeros_like(local_len)
+            for _ in range(parallel_state.get_data_parallel_world_size())
+        ]
+        torch.distributed.all_gather(
+            dp_subsample_count, local_len, group=parallel_state.get_data_parallel_group()
+        )
+
         # Find the maximum number of subsamples across all ranks and pad the subsample_seqlens to the max length
         dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
         max_sub_samples = int(dp_subsample_counts.max().item())
 
         if local_len.item() < max_sub_samples:
-            subsample_seqlens_padded = torch.cat([subsample_seqlens, torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda()], dim=0)
+            subsample_seqlens_padded = torch.cat(
+                [
+                    subsample_seqlens,
+                    torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda(),
+                ],
+                dim=0,
+            )
         else:
             subsample_seqlens_padded = subsample_seqlens
 
         # Gather the subsample_seqlens from all ranks
-        seqlens_gathered = [torch.empty_like(subsample_seqlens_padded) for _ in range(parallel_state.get_data_parallel_world_size())]
-        torch.distributed.all_gather(seqlens_gathered, subsample_seqlens_padded, group=parallel_state.get_data_parallel_group())
-        
+        seqlens_gathered = [
+            torch.empty_like(subsample_seqlens_padded)
+            for _ in range(parallel_state.get_data_parallel_world_size())
+        ]
+        torch.distributed.all_gather(
+            seqlens_gathered,
+            subsample_seqlens_padded,
+            group=parallel_state.get_data_parallel_group(),
+        )
+
         # Trim each seqlens_gathered to the length of the correct sample
         for dp_rank, seqlen in enumerate(seqlens_gathered):
-            seqlens_gathered[dp_rank] = seqlen[:dp_subsample_counts[dp_rank]]
+            seqlens_gathered[dp_rank] = seqlen[: dp_subsample_counts[dp_rank]]
 
         seqlens_gathered = torch.cat(seqlens_gathered, dim=0)
         seqlens_gathered = seqlens_gathered.cpu().tolist()
@@ -108,19 +129,27 @@ class HybridCPDataLoaderWrapper():
         # Create a list of (global_id, seqlen) tuples for scheduling
         global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
         # Get the global IDs locally present on this rank
-        global_ids_this_rank = global_ids[offsets[dp_rank]:offsets[dp_rank] + num_local_subsamples]
+        global_ids_this_rank = global_ids[
+            offsets[dp_rank] : offsets[dp_rank] + num_local_subsamples
+        ]
 
         return global_id_seqlens, global_ids_this_rank
 
     def _gid_to_src_rank(self, gid: int, offsets: List[int]) -> int:
-        dp_src_rank = torch.bucketize(gid, offsets[1:]-1)
-        hdp_rank = torch.distributed.get_process_group_ranks(parallel_state.get_data_parallel_group())[dp_src_rank]
+        dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
+        hdp_rank = torch.distributed.get_process_group_ranks(
+            parallel_state.get_data_parallel_group()
+        )[dp_src_rank]
         return hdp_rank
-    
-    def reroute_samples_to_hdp_ranks(self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets):
+
+    def reroute_samples_to_hdp_ranks(
+        self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
+    ):
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
         hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-        dp_ranks = torch.distributed.get_process_group_ranks(parallel_state.get_data_parallel_group())
+        dp_ranks = torch.distributed.get_process_group_ranks(
+            parallel_state.get_data_parallel_group()
+        )
         data_keys = batch[0].keys()
 
         # Create the send plan
@@ -128,19 +157,30 @@ class HybridCPDataLoaderWrapper():
 
         for d in range(self.total_hdp_gpus):
             for sample_id_group in sample_id_groups:
-                    combined_sample_id_groups[d].extend(sample_id_group[d])
+                combined_sample_id_groups[d].extend(sample_id_group[d])
 
         for dest_rank in range(self.total_hdp_gpus):
             combined_sample_id_groups[dest_rank].sort()
 
         # Filter out samples that are not present on this rank
-        send_ids_sorted = [gid for d in dp_ranks for gid in combined_sample_id_groups[d] if gid in global_ids_this_rank]
+        send_ids_sorted = [
+            gid
+            for d in dp_ranks
+            for gid in combined_sample_id_groups[d]
+            if gid in global_ids_this_rank
+        ]
         # send_counts = [len(combined_sample_id_groups[d]) for d in range(self.total_hdp_gpus)]
 
         send_lens_split = [0] * self.total_hdp_gpus
         for dest_rank in range(self.total_hdp_gpus):
             if dest_rank in dp_ranks:
-                send_lens_split[dest_rank] = sum([global_id_seqlens[gid][1] for gid in combined_sample_id_groups[dest_rank] if gid in global_ids_this_rank])
+                send_lens_split[dest_rank] = sum(
+                    [
+                        global_id_seqlens[gid][1]
+                        for gid in combined_sample_id_groups[dest_rank]
+                        if gid in global_ids_this_rank
+                    ]
+                )
             else:
                 # We only need to share local data with DP ranks that have different data.
                 send_lens_split[dest_rank] = 0
@@ -150,14 +190,18 @@ class HybridCPDataLoaderWrapper():
         for gid in combined_sample_id_groups[hdp_rank]:
             src_rank = self._gid_to_src_rank(gid, offsets)
             recv_sample_id_groups[src_rank].append(gid)
-        
+
         recv_lens_split = [0] * self.total_hdp_gpus
         for src_rank in range(self.total_hdp_gpus):
-            recv_lens_split[src_rank] = sum([global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]])
+            recv_lens_split[src_rank] = sum(
+                [global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]]
+            )
 
         # print(f"rank: {torch.distributed.get_rank()}, recv_lens_split: {recv_lens_split} send_lens_split: {send_lens_split}")
 
-        recv_ids_sorted = [gid for d in range(self.total_hdp_gpus) for gid in recv_sample_id_groups[d]]
+        recv_ids_sorted = [
+            gid for d in range(self.total_hdp_gpus) for gid in recv_sample_id_groups[d]
+        ]
         recv_counts = [len(recv_sample_id_groups[d]) for d in range(self.total_hdp_gpus)]
 
         recv_samples = [{k: None for k in data_keys} for _ in range(sum(recv_counts))]
@@ -167,18 +211,24 @@ class HybridCPDataLoaderWrapper():
             for gid in send_ids_sorted:
                 t = batch[gid2local_id[gid]][key].to(torch.cuda.current_device(), non_blocking=True)
                 flattened_tensors.append(t)
-            return torch.cat(flattened_tensors, dim=0) if flattened_tensors else torch.empty(0, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
+            return (
+                torch.cat(flattened_tensors, dim=0)
+                if flattened_tensors
+                else torch.empty(0, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
+            )
 
         def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
             cursor = 0
             for i, gid in enumerate(recv_ids_sorted):
                 sample_len = global_id_seqlens[gid][1]
-                recv_samples[i][key] = recv_tensor[cursor:cursor+sample_len]
+                recv_samples[i][key] = recv_tensor[cursor : cursor + sample_len]
                 cursor += sample_len
-        
+
         for key in data_keys:
             send_tensor = _pack_sample_by_key(key)
-            recv_tensor = torch.empty(sum(recv_lens_split), device=torch.cuda.current_device(), dtype=send_tensor.dtype)
+            recv_tensor = torch.empty(
+                sum(recv_lens_split), device=torch.cuda.current_device(), dtype=send_tensor.dtype
+            )
             torch.distributed.all_to_all_single(
                 output=recv_tensor,
                 input=send_tensor,
@@ -187,8 +237,10 @@ class HybridCPDataLoaderWrapper():
                 group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
             _unpack_sample_by_key(key, recv_tensor)
-        
-        recv_sample_with_id = {recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)}
+
+        recv_sample_with_id = {
+            recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)
+        }
         return recv_sample_with_id
 
     def unpack_batch(self, batch):
@@ -206,7 +258,7 @@ class HybridCPDataLoaderWrapper():
                     sub_sample_dict[key] = sample[key][start_idx:end_idx]
                 batch_unpacked.append(sub_sample_dict)
         return batch_unpacked
-    
+
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
@@ -214,24 +266,36 @@ class HybridCPDataLoaderWrapper():
         batch = next(self.data_iterator)
         subsample_seqlens = []
         for sample in batch:
-            subsample_seqlens.extend([int(sample["cu_seqlens"][i+1] - sample["cu_seqlens"][i]) for i in range(0, sample["cu_seqlens"].shape[0] - 1)])
+            subsample_seqlens.extend(
+                [
+                    int(sample["cu_seqlens"][i + 1] - sample["cu_seqlens"][i])
+                    for i in range(0, sample["cu_seqlens"].shape[0] - 1)
+                ]
+            )
         subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
         subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
         seqlens_gathered, offsets = self.get_global_seqlens(subsample_seqlens)
 
-        global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(subsample_seqlens.shape[0], offsets, seqlens_gathered)
+        global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(
+            subsample_seqlens.shape[0], offsets, seqlens_gathered
+        )
         # global_id_seqlens = sorted(global_id_seqlens, key=lambda x: x[1], reverse=True)
 
-        groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(global_id_seqlens, self.config)
+        groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(
+            global_id_seqlens, self.config
+        )
         # sample["groups"] = groups
         # sample["sample_id_groups"] = sample_id_groups
 
         batch = self.unpack_batch(batch)
-        samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets)
+        samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(
+            batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
+        )
         # for sample_id, sample in samples_this_rank_with_id.items():
         #     sample["sample_id_groups"]
         return samples_this_rank_with_id, sample_id_groups
+
 
 class BalancedCPScheduler:
     def __init__(self, max_seq_len_per_rank: int):
@@ -239,7 +303,9 @@ class BalancedCPScheduler:
         self.num_subsamples = 0
         self.num_subsamples_processed = 0
         self.free_resources = []
-        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(
+            with_context_parallel=True
+        )
 
     @lru_cache(maxsize=128)
     def get_total_workload(self, seq_length: int, cp_size: Optional[int] = None):
@@ -273,10 +339,10 @@ class BalancedCPScheduler:
         """
         # Extract just the sequence lengths for determining k
         seqlens = [seq_len for _, seq_len in sample_seqlens]
-        
+
         # Determine k based on unique GPU categories needed
         k = len({self.gpus_needed(L) for L in seqlens})
-        
+
         # Use the existing contiguous_equal_buckets function but with sample_seqlens
         # We need to modify it to work with tuples
         work = []
@@ -292,22 +358,23 @@ class BalancedCPScheduler:
         for i, (sample_id, seq_len) in enumerate(sample_seqlens):
             work = compute_estimator(seq_len)
             projected = cur_work + work
-            
+
             # Check if we should close this bucket
-            if (cur and 
-                (projected > target * 1.1 or  # Too much work
-                len(sample_seqlens) - i <= remaining_k - len(buckets))):  # Need to save sequences for remaining buckets
+            if cur and (
+                projected > target * 1.1  # Too much work
+                or len(sample_seqlens) - i <= remaining_k - len(buckets)
+            ):  # Need to save sequences for remaining buckets
                 buckets.append(deque(cur))
                 cur, cur_work = [], 0.0
                 remaining_work -= sum(compute_estimator(seq_len) for _, seq_len in cur)
                 remaining_k -= 1
-            
+
             cur.append((sample_id, seq_len))
             cur_work += work
-        
+
         if cur:
             buckets.append(deque(cur))
-        
+
         return buckets
 
     def next_hdp_group(
@@ -315,9 +382,9 @@ class BalancedCPScheduler:
         sample_seqlens: List[Tuple[int, int]],  # List of (sample_id, sequence_length) tuples
         compute_estimator: Callable[[int], float],
         total_gpus: int,
-        delta: float = 0.05,                # balance slack (e.g. 5 %)
-        strategy: str = "dp",               # "dp" or "pp"
-        eps_bucket: float = 0.10,           # ε target for bucket balance
+        delta: float = 0.05,  # balance slack (e.g. 5 %)
+        strategy: str = "dp",  # "dp" or "pp"
+        eps_bucket: float = 0.10,  # ε target for bucket balance
     ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
         """
         Given a list of (sample_id, sequence_length) tuples, this function aims to assign
@@ -325,14 +392,14 @@ class BalancedCPScheduler:
         Once each microbatch is roughly balanced, we exit and return the microbatch and the leftover sequences.
 
         The function performs the following passes in order to form a balanced microbatch:
-        1. We create buckets of sequences that are roughly balanced. 
+        1. We create buckets of sequences that are roughly balanced.
         We try to create as many buckets as possible CP sizes.
         2. Given a bucket has sequences available, we assign the microbatch
             a. To a new set of GPUs if there are enough free GPUs.
             b. To an existing set of GPUs with the lowest load.
         3. We check if the microbatch is balanced whenever we need to move onto a new CP size in the same set of GPUs.
         4. We trim the microbatch if removing the last added sequence helps improve balance.
-        5. If we run out of sequences to assign and there are empty GPUs, 
+        5. If we run out of sequences to assign and there are empty GPUs,
         we redistribute work to empty GPUs by recursively increasing the CP size of a sample until no empty GPUs are left..
 
         #TODO: Add clarification on when we check for balance. What does prev_needed do?
@@ -340,32 +407,38 @@ class BalancedCPScheduler:
         Returns (*micro_batches*, *leftover_sample_seqlens*, *exec_times*, *sample_ids_per_gpu*).
         """
         if not sample_seqlens:
-            return [[] for _ in range(total_gpus)], [], [0.0 for _ in range(total_gpus)], [[] for _ in range(total_gpus)]
+            return (
+                [[] for _ in range(total_gpus)],
+                [],
+                [0.0 for _ in range(total_gpus)],
+                [[] for _ in range(total_gpus)],
+            )
 
         # Use the improved bucketing that works with (sample_id, seq_len) tuples
         buckets = self.make_buckets_equal(sample_seqlens, compute_estimator)
 
         # Initialize tracking structures
-        micro_batches   = [[] for _ in range(total_gpus)]
-        exec_times      = [0.0 for _ in range(total_gpus)]
+        micro_batches = [[] for _ in range(total_gpus)]
+        exec_times = [0.0 for _ in range(total_gpus)]
         sample_ids_per_gpu = [[] for _ in range(total_gpus)]
 
-        gpu_group_id    = [None] * total_gpus
-        group_members   = {}
-        group_size      = {}
-        next_gid        = 0
+        gpu_group_id = [None] * total_gpus
+        group_members = {}
+        group_size = {}
+        next_gid = 0
 
-        pp_cursor       = 0
-        prev_needed     = None
-        check_balance   = False
+        pp_cursor = 0
+        prev_needed = None
+        check_balance = False
 
         while buckets:
             # ---- Step 1 – pick the next sequence we COULD place ------------------
             sample_seq_tuple = bucket_idx = None
-            needed  = None
+            needed = None
 
             scan_order = (
-                range(len(buckets)) if strategy == "dp"
+                range(len(buckets))
+                if strategy == "dp"
                 else [(pp_cursor + i) % len(buckets) for i in range(len(buckets))]
             )
 
@@ -398,14 +471,14 @@ class BalancedCPScheduler:
                 prev_needed = needed
 
             # (a)  Existing groups of exactly this size
-            candidate_gids = [
-                gid for gid, sz in group_size.items() if sz == needed
-            ]
+            candidate_gids = [gid for gid, sz in group_size.items() if sz == needed]
             if candidate_gids:
                 best_gid, best_load = min(
-                    ((gid, max(exec_times[r] for r in group_members[gid]))
-                    for gid in candidate_gids),
-                    key=lambda t: t[1]
+                    (
+                        (gid, max(exec_times[r] for r in group_members[gid]))
+                        for gid in candidate_gids
+                    ),
+                    key=lambda t: t[1],
                 )
             else:
                 best_gid, best_load = None, float("inf")
@@ -415,7 +488,7 @@ class BalancedCPScheduler:
             if len(free_ranks) >= needed:
                 free_sorted = sorted(free_ranks, key=lambda r: exec_times[r])
                 new_members = free_sorted[:needed]
-                new_load    = exec_times[new_members[-1]]
+                new_load = exec_times[new_members[-1]]
 
                 if new_load < best_load:
                     best_gid = None
@@ -432,13 +505,13 @@ class BalancedCPScheduler:
                 best_gid = next_gid
                 next_gid += 1
                 group_members[best_gid] = chosen_members
-                group_size[best_gid]    = needed
+                group_size[best_gid] = needed
                 for r in chosen_members:
                     gpu_group_id[r] = best_gid
 
             # ---- Step 3 – assign the sequence to every member of that group ------
             per_gpu_cost = compute_estimator(seq_len)
-            
+
             for r in chosen_members:
                 micro_batches[r].append(seq_len)
                 exec_times[r] += per_gpu_cost
@@ -470,15 +543,19 @@ class BalancedCPScheduler:
                 # We keep assigning group of 2 as we do in descending order but GPU 7/15 never sees a microbatch assigned to it
                 # until we run out of samples with CP2.
                 # This means we are never balanced as min(exec_times) will always be 0.
-                # We need a smart way of identifying that we have run out of big samples and if we are having to 
+                # We need a smart way of identifying that we have run out of big samples and if we are having to
                 # assign work to a GPU already working, is it because there are empty GPUs?
                 # Would assigning work to empty GPUs first by moving onto next CP bucket help?
                 # But we need to remember to come back to this CP size bucket and then check for balance.
-                # Maybe the scheduling algorithm should look at empty GPUs and find work rather than going 
+                # Maybe the scheduling algorithm should look at empty GPUs and find work rather than going
                 # sequence by sequence.
                 check_balance = True
 
-            if check_balance and buckets and max(exec_times) - min(exec_times) <= delta * max(exec_times):
+            if (
+                check_balance
+                and buckets
+                and max(exec_times) - min(exec_times) <= delta * max(exec_times)
+            ):
                 break
 
         # Gather leftovers (flatten remaining buckets, preserve order)
@@ -486,7 +563,7 @@ class BalancedCPScheduler:
         for b in buckets:
             for sample_seq_tuple in b:
                 leftovers.append(sample_seq_tuple)
-        
+
         # ---------------------------------------------------------------------------
         def trim_overload():
             """
@@ -494,21 +571,21 @@ class BalancedCPScheduler:
             whenever doing so reduces the global slack.
             """
             while True:
-                cur_max  = max(exec_times)
-                cur_min  = min(exec_times)
+                cur_max = max(exec_times)
+                cur_min = min(exec_times)
                 cur_slack = cur_max - cur_min
                 if cur_slack <= delta * cur_max:
                     break
 
-                max_r   = exec_times.index(cur_max)
-                gid     = gpu_group_id[max_r]
+                max_r = exec_times.index(cur_max)
+                gid = gpu_group_id[max_r]
                 members = group_members[gid]
 
                 if not micro_batches[max_r] or len(micro_batches[max_r]) <= 1:
                     break
 
-                seq   = micro_batches[max_r][-1]
-                need  = group_size[gid]
+                seq = micro_batches[max_r][-1]
+                need = group_size[gid]
                 per_gpu_cost = compute_estimator(seq)
 
                 proj_times = exec_times[:]
@@ -533,7 +610,9 @@ class BalancedCPScheduler:
         total_work_before = sum(len(mb) for mb in micro_batches)
 
         # Check for empty GPUs and redistribute work
-        def fill_empty_gpus(micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size):
+        def fill_empty_gpus(
+            micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size
+        ):
             """
             Recursively check for empty GPUs and redistribute work by increasing
             the number of GPUs sharing samples. This ensures all GPUs have work.
@@ -542,8 +621,14 @@ class BalancedCPScheduler:
             # Find empty GPUs
             empty_gpus = [i for i in range(total_gpus) if not micro_batches[i]]
             if not empty_gpus:
-                return micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size # No empty GPUs, we're done
-            
+                return (
+                    micro_batches,
+                    exec_times,
+                    sample_ids_per_gpu,
+                    group_members,
+                    group_size,
+                )  # No empty GPUs, we're done
+
             # Find the smallest group size that exists
             existing_group_sizes = set(group_size.values())
             if not existing_group_sizes:
@@ -552,12 +637,12 @@ class BalancedCPScheduler:
             min_group_size = min(existing_group_sizes)
             # We have Hybrid DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
             next_power = min(min_group_size * 2, total_gpus)
-            
+
             # Find the first group of min_group_size that can be expanded
             expandable_gid = None
             expandable_members = None
             expandable_new_gpus = None
-            
+
             for gid, size in group_size.items():
                 if size == min_group_size:
                     members = group_members[gid]
@@ -565,11 +650,14 @@ class BalancedCPScheduler:
                     group_start_gpu = members[0]
                     group_end_gpu = members[-1]
                     empty_gpu = [idx for idx, work in enumerate(micro_batches) if not work][0]
-                    assert not all(work for work in micro_batches[empty_gpu:empty_gpu+needed_count]), f"Not enough empty GPUs to expand or there are empty GPUs between work scheduled which is not allowed."
-                    work_to_push = micro_batches[group_end_gpu + 1 : empty_gpu] # This is work of all other subsequent sub-samples
+                    assert not all(
+                        work for work in micro_batches[empty_gpu : empty_gpu + needed_count]
+                    ), f"Not enough empty GPUs to expand or there are empty GPUs between work scheduled which is not allowed."
+                    work_to_push = micro_batches[
+                        group_end_gpu + 1 : empty_gpu
+                    ]  # This is work of all other subsequent sub-samples
                     exec_times_to_push = exec_times[group_end_gpu + 1 : empty_gpu]
                     sample_ids_to_push = sample_ids_per_gpu[group_end_gpu + 1 : empty_gpu]
-                    
 
                     new_micro_batches = [[]] * len(micro_batches)
                     new_exec_times = [0.0] * len(exec_times)
@@ -584,40 +672,53 @@ class BalancedCPScheduler:
                     # The work is distributed across the expanded group
                     for i in range(group_start_gpu, group_end_gpu + needed_count + 1):
                         new_micro_batches[i] = micro_batches[group_end_gpu]
-                        new_exec_times[i] = self.get_total_workload(micro_batches[group_end_gpu][0], next_power)
+                        new_exec_times[i] = self.get_total_workload(
+                            micro_batches[group_end_gpu][0], next_power
+                        )
                         new_sample_ids_per_gpu[i] = sample_ids_per_gpu[group_end_gpu]
 
                     # Any assigned work on expanded GPUs is pushed
                     for i, work in enumerate(work_to_push):
                         new_micro_batches[group_end_gpu + needed_count + 1 + i] = work
                         new_exec_times[group_end_gpu + needed_count + 1 + i] = exec_times_to_push[i]
-                        new_sample_ids_per_gpu[group_end_gpu + needed_count + 1 + i] = sample_ids_to_push[i]
-                    
+                        new_sample_ids_per_gpu[group_end_gpu + needed_count + 1 + i] = (
+                            sample_ids_to_push[i]
+                        )
+
                     group_size[gid] = next_power
                     group_members[gid] = list(range(members[0], members[-1] + needed_count + 1))
                     for pushed_gid in group_size.keys():
                         if pushed_gid > gid:
-                            group_members[pushed_gid] = [x + needed_count for x in group_members[pushed_gid]]                
-                    
-                    return new_micro_batches, new_exec_times, new_sample_ids_per_gpu, group_members, group_size
-            
+                            group_members[pushed_gid] = [
+                                x + needed_count for x in group_members[pushed_gid]
+                            ]
+
+                    return (
+                        new_micro_batches,
+                        new_exec_times,
+                        new_sample_ids_per_gpu,
+                        group_members,
+                        group_size,
+                    )
 
         empty_gpus = any([not micro_batches[i] for i in range(total_gpus)])
         while empty_gpus:
-            micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size = fill_empty_gpus(micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size)
+            micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size = (
+                fill_empty_gpus(
+                    micro_batches, exec_times, sample_ids_per_gpu, group_members, group_size
+                )
+            )
             empty_gpus = any([not micro_batches[i] for i in range(total_gpus)])
 
         # Assert that no work has been completely removed
         total_work_after = sum(len(mb) for mb in micro_batches)
-        assert total_work_after >= total_work_before, f"Work was removed: {total_work_before} -> {total_work_after}"
+        assert (
+            total_work_after >= total_work_before
+        ), f"Work was removed: {total_work_before} -> {total_work_after}"
 
         return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
-    def get_groups_and_subsamples(
-        self,
-        sample_id_seqlens,
-        config,
-    ):
+    def get_groups_and_subsamples(self, sample_id_seqlens, config):
         # TODO: Protect for model parallelism
         # TODO: Reduce access to file system as much as possible.
         groups = []
@@ -625,13 +726,16 @@ class BalancedCPScheduler:
         # We assign a sample_id to each sub-sample in order to track the right assignment to each GPU.
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
         while sample_id_seqlens:
-            mb, sample_id_seqlens, exec_times, sample_ids = self.next_hdp_group(sample_id_seqlens, self.get_total_workload, self.total_hdp_gpus)
+            mb, sample_id_seqlens, exec_times, sample_ids = self.next_hdp_group(
+                sample_id_seqlens, self.get_total_workload, self.total_hdp_gpus
+            )
             groups.append(mb)
             if len(sample_ids) < self.total_hdp_gpus:
                 sample_ids.extend([] * (self.total_hdp_gpus - len(sample_ids)))
             sample_id_groups.append(sample_ids)
-        
+
         return groups, sample_id_groups
+
 
 def hybrid_context_parallel_forward_backward(
     forward_step_func,
@@ -660,8 +764,8 @@ def hybrid_context_parallel_forward_backward(
 
     A group is defined by a set of samples that can run across the CP domain without any barrier.
     There are many reasons why we may not be able to run endless number of samples within a single group.
-    For example, if we have 8 GPUs, 
-    if GPU 0-5 are assigned a long sample that requires CP6, 
+    For example, if we have 8 GPUs,
+    if GPU 0-5 are assigned a long sample that requires CP6,
     GPU 6-7 are assigned a short sample that requires CP2,
     The next sample which requires CP4 can be assigned GPU 4-7.
     But GPU 6-7 will finish first and get deadlocked if GPU 4-5 are not participating in the group.
@@ -671,7 +775,7 @@ def hybrid_context_parallel_forward_backward(
     In the future, when we schedule over the entire global batch, we will remove the need for step #2 and
     number of microbatches will be determined by the number of groups.
     """
-    from .schedules import forward_step, backward_step
+    from .schedules import backward_step, forward_step
 
     cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=config.max_seqlen_per_cp_rank)
     # We get data once per global batch and schedule the sub-samples.
@@ -689,12 +793,18 @@ def hybrid_context_parallel_forward_backward(
     # Upto last group, we don't need any sync.
     with no_sync_func():
         for j in range(len(sample_id_groups) - 1):
-            sample_ids_this_group = sample_id_groups[j][parallel_state.get_data_parallel_rank(with_context_parallel=True)]
+            sample_ids_this_group = sample_id_groups[j][
+                parallel_state.get_data_parallel_rank(with_context_parallel=True)
+            ]
             for sub_sample_id in sample_ids_this_group:
                 # Call forward step for each sub-sample
                 sample = batch[sub_sample_id]
-                partner_cp_size = len([True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids])
-                assert partner_cp_size > 0, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[j]}"
+                partner_cp_size = len(
+                    [True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids]
+                )
+                assert (
+                    partner_cp_size > 0
+                ), f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[j]}"
                 sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
                 sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
                 new_data_iterator = RerunDataIterator(iter([sample]))
@@ -708,26 +818,36 @@ def hybrid_context_parallel_forward_backward(
                     forward_data_store,
                     config,
                     collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, num_microbatches == 1),
+                    is_first_microbatch=check_first_val_step(
+                        first_val_step, forward_only, num_microbatches == 1
+                    ),
                     current_microbatch=num_microbatches - 1,
                 )
                 total_num_tokens += num_tokens.item()
                 if not forward_only:
-                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-            
+                    backward_step(
+                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+                    )
+
             # Create a barrier at end of each group.
             # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
             # no rank is starting a sub-sample ahead of it's partner ranks.
-            torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
+            torch.distributed.barrier(
+                parallel_state.get_data_parallel_group(with_context_parallel=True)
+            )
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     # TODO: Find num sub-samples per group in this group?
     with no_sync_func():
-        sample_ids_this_group = sample_id_groups[-1][parallel_state.get_data_parallel_rank(with_context_parallel=True)]
+        sample_ids_this_group = sample_id_groups[-1][
+            parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        ]
         for k in range(len(sample_ids_this_group) - 1):
             sub_sample_id = sample_ids_this_group[k]
             sample = batch[sub_sample_id]
-            partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
+            partner_cp_size = len(
+                [True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids]
+            )
             sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
             sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
             new_data_iterator = RerunDataIterator(iter([sample]))
@@ -741,17 +861,23 @@ def hybrid_context_parallel_forward_backward(
                 forward_data_store,
                 config,
                 collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(first_val_step, forward_only, num_microbatches == 1),
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, num_microbatches == 1
+                ),
                 current_microbatch=num_microbatches - 1,
             )
             total_num_tokens += num_tokens.item()
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-        
+
     # The last sub-sample of the last group of the last microbatch is run out of the context handler.
     sub_sample_id = sample_ids_this_group[-1]
-    partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
-    assert partner_cp_size > 0, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[-1]}"
+    partner_cp_size = len(
+        [True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids]
+    )
+    assert (
+        partner_cp_size > 0
+    ), f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[-1]}"
     sample = batch[sub_sample_id]
     sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
     sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
@@ -766,7 +892,9 @@ def hybrid_context_parallel_forward_backward(
         forward_data_store,
         config,
         collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(first_val_step, forward_only, num_microbatches == 1),
+        is_first_microbatch=check_first_val_step(
+            first_val_step, forward_only, num_microbatches == 1
+        ),
         current_microbatch=num_microbatches - 1,
     )
     total_num_tokens += num_tokens.item()

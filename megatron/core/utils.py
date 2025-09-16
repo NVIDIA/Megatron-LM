@@ -1800,7 +1800,9 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = None, cp_rank: Optional[int] = None):
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], cp_size: Optional[int] = None, cp_rank: Optional[int] = None
+):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
@@ -1812,7 +1814,9 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = No
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     if cp_size is not None or cp_rank is not None:
-        assert cp_size is not None and cp_rank is not None, "Both cp_size and cp_rank must be provided for batch slicing"
+        assert (
+            cp_size is not None and cp_rank is not None
+        ), "Both cp_size and cp_rank must be provided for batch slicing"
 
     if cp_size is None:
         cp_size = parallel_state.get_context_parallel_world_size()
@@ -1837,9 +1841,10 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = No
 
     return batch
 
+
 def get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_seq_params):
     """
-    For a packed sequence, this function returns 
+    For a packed sequence, this function returns
     1. The sub-sample of the sequence assigned to this CP rank.
     2. The appropriate CP group for the new CP assignment.
     3. The updated packed sequence parameters.
@@ -1852,7 +1857,7 @@ def get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_se
     """
     cu_lengths = packed_seq_params.cu_seqlens_q_padded
     start_index = cu_lengths[scheduled_id]
-    end_index = cu_lengths[scheduled_id+1]
+    end_index = cu_lengths[scheduled_id + 1]
     # TODO (flexible HCP): New CP size also means new padding requirement. CP4 to CP3 changes padding requirement.
     for key, data in batch.items():
         if key in {'attention_mask', 'cu_seqlens', 'max_seqlen', 'scheduled_id', 'local_cp_size'}:
@@ -1868,16 +1873,48 @@ def get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_se
 
     sub_sample_packed_seq_params = PackedSeqParams(
         qkv_format="sbhd",
-        cu_seqlens_q=torch.tensor([0, packed_seq_params.cu_seqlens_q[scheduled_id+1] - packed_seq_params.cu_seqlens_q[scheduled_id]], device="cuda", pin_memory=True),
-        cu_seqlens_kv=torch.tensor([0, packed_seq_params.cu_seqlens_kv[scheduled_id+1] - packed_seq_params.cu_seqlens_kv[scheduled_id]], device="cuda", pin_memory=True),
-        cu_seqlens_q_padded=torch.tensor([0, packed_seq_params.cu_seqlens_q_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_q_padded[scheduled_id]], device="cuda", pin_memory=True),
-        cu_seqlens_kv_padded=torch.tensor([0, packed_seq_params.cu_seqlens_kv_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_kv_padded[scheduled_id]], device="cuda", pin_memory=True),
+        cu_seqlens_q=torch.tensor(
+            [
+                0,
+                packed_seq_params.cu_seqlens_q[scheduled_id + 1]
+                - packed_seq_params.cu_seqlens_q[scheduled_id],
+            ],
+            device="cuda",
+            pin_memory=True,
+        ),
+        cu_seqlens_kv=torch.tensor(
+            [
+                0,
+                packed_seq_params.cu_seqlens_kv[scheduled_id + 1]
+                - packed_seq_params.cu_seqlens_kv[scheduled_id],
+            ],
+            device="cuda",
+            pin_memory=True,
+        ),
+        cu_seqlens_q_padded=torch.tensor(
+            [
+                0,
+                packed_seq_params.cu_seqlens_q_padded[scheduled_id + 1]
+                - packed_seq_params.cu_seqlens_q_padded[scheduled_id],
+            ],
+            device="cuda",
+            pin_memory=True,
+        ),
+        cu_seqlens_kv_padded=torch.tensor(
+            [
+                0,
+                packed_seq_params.cu_seqlens_kv_padded[scheduled_id + 1]
+                - packed_seq_params.cu_seqlens_kv_padded[scheduled_id],
+            ],
+            device="cuda",
+            pin_memory=True,
+        ),
         max_seqlen_q=end_index - start_index,
         max_seqlen_kv=end_index - start_index,
         local_cp_size=local_cp_size,
     )
     # TODO: Should we return the sharded sample directly here?
-    
+
     return batch, cp_group, sub_sample_packed_seq_params
 
 
