@@ -18,31 +18,24 @@ inputs:
   timeout:
     description: "Max runtime of test in minutes"
     required: false
-    default: "10"
+    default: "30"
   script:
     description: "Test script to execute"
     required: true
   is-optional:
-    description: "Failure will cancel all other tests if set to true"
+    description: "Pass this job on failure."
     required: false
     default: "false"
   is_unit_test:
     description: "Upload coverage as unit test"
     required: false
     default: "false"
-  azure-client-id:
-    description: "Azure Client ID"
+  tag:
+    description: Latest or legacy test suite
     required: true
-  azure-tenant-id:
-    description: "Azure Tenant ID"
+  bucket:
+    description: Unit test bucket to launch
     required: true
-  azure-subscription-id:
-    description: "Azure Subscription ID"
-    required: true
-  has-azure-credentials:
-    description: "Has Azure credentials"
-    required: false
-    default: "false"
   PAT:
     description: "GitHub Personal Access Token"
     required: true
@@ -55,29 +48,6 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y curl uuid-runtime
-
-    - name: Install Azure CLI
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        echo "::group::Install Azure CLI"
-        # Create systemd override for proper dependencies
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-        echo "::endgroup::"
-
-    - name: Azure Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      uses: azure/login@v2
-      with:
-        client-id: ${{ inputs.azure-client-id }}
-        tenant-id: ${{ inputs.azure-tenant-id }}
-        subscription-id: ${{ inputs.azure-subscription-id }}
-
-    - name: Azure ACR Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        az acr login --name nemoci
 
     - name: Checkout repository
       uses: actions/checkout@v2
@@ -130,7 +100,7 @@ runs:
         GH_TOKEN: ${{ inputs.PAT }}
       run: |
         echo "::group::Build test container"
-        docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.05-py3" --target=main -t megatron-bridge .
+        docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.05-py3" --target=main -t megatron-core .
         echo "::endgroup::"
 
     - name: Start container
@@ -148,22 +118,17 @@ runs:
 
         cmd=$(cat <<RUN_TEST_EOF
         #!/bin/bash
-        docker container rm -f nemo_container_${{ github.run_id }} || true
+        docker container rm -f test_container_${{ github.run_id }} || true
         docker run \
           --rm \
           -d \
-          --name nemo_container_${{ github.run_id }} \
+          --name test_container_${{ github.run_id }} \
           --runtime=nvidia --gpus all \
           --shm-size=64g \
-          --env TRANSFORMERS_OFFLINE=0 \
-          --env HYDRA_FULL_ERROR=1 \
-          --env HF_HOME=/home/TestData/HF_HOME \
-          --env NEMO_HOME=/home/TestData/nemo_home \
-          --env RUN_ID=${{ github.run_id }} \
           --workdir /opt/megatron-lm/ \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
-          megatron-bridge \
+          megatron-core \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )
@@ -175,25 +140,31 @@ runs:
     - name: Create run-script
       id: create
       shell: bash
+      if: inputs.is_unit_test == 'true'
       run: |
         echo "::group::Create run-script"
-        COVERAGE_PREFIX=$([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e")
-        echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
-
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
-        docker exec -t nemo_container_${{ github.run_id }} bash -c '
+        docker exec -t test_container_${{ github.run_id }} bash -c '
           set -e
-          export GH_TOKEN=${{ inputs.PAT }}
-          bash tests/${{ inputs.is_unit_test == 'true' && 'unit_tests' || 'functional_tests' }}/${{ inputs.script }}.sh
+          bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
+            --tag ${{ inputs.tag }} \
+            --environment dev \
+            --bucket ${{ inputs.bucket }}
         '
 
         RUN_TEST_EOF
         )
+        echo "$cmd" | tee "job.sh"        
+        )
+        echo "::endgroup::"
 
+    - name: Set timeout
+      shell: bash
+      run: |
+        echo "::group::Set timeout"
         echo "timeout_in_seconds=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
-        echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
     - name: Run main script
@@ -213,12 +184,12 @@ runs:
       run: |
         echo "::group::Check result"
 
-        docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage xml
-        docker cp nemo_container_${{ github.run_id }}:/opt/megatron-lm/.coverage .coverage
-        docker cp nemo_container_${{ github.run_id }}:/opt/megatron-lm/coverage.xml coverage.xml
+        docker exec test_container_${{ github.run_id }} /opt/venv/bin/coverage xml
+        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/.coverage .coverage
+        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/coverage.xml coverage.xml
 
-        coverage_report=coverage-${{ steps.create.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
-        echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
+        coverage_report=coverage-${{ inputs.is_unit_test == 'true' && 'unit-test' || 'e2e' }}-${{ github.run_id }}-$(uuidgen)
+        echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
@@ -232,7 +203,7 @@ runs:
           echo Test did not finish successfully.
           exit 1
         else
-          docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i
+          docker exec -t test_container_${{ github.run_id }} /opt/venv/bin/coverage report -i
         fi
 
         exit $EXIT_CODE
@@ -252,4 +223,4 @@ runs:
       if: always()
       shell: bash
       run: |
-        docker container rm -f nemo_container_${{ github.run_id }} || true
+        docker container rm -f test_container_${{ github.run_id }} || true
