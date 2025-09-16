@@ -32,6 +32,14 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.ssm.gated_delta_net_mixer import (
+    GatedDeltaNetMixer,
+    GatedDeltaNetMixerSubmodules,
+)
+from megatron.core.ssm.mamba_mixer import (
+    MambaMixer,
+    MambaMixerSubmodules,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -74,6 +82,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    linear_attention_type: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
@@ -124,7 +133,40 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_activation_func=use_te_activation_func,
     )
 
-    if multi_latent_attention:
+    if linear_attention_type is not None:
+        if linear_attention_type == "mamba":
+            attention_spec = ModuleSpec(
+                module=MambaMixer,
+                submodules=MambaMixerSubmodules(
+                    in_proj=backend.column_parallel_layer_norm_linear(),
+                    out_proj=backend.row_parallel_linear(),
+                ),
+            ),
+        elif linear_attention_type == "gated_delta_net":
+            attention_spec = ModuleSpec(
+                module=GatedDeltaNetMixer,
+                submodules=GatedDeltaNetMixerSubmodules(
+                    in_proj=backend.column_parallel_layer_norm_linear(),
+                    out_norm=backend.layer_norm(),
+                    out_proj=backend.row_parallel_linear(),
+                    # do not need q_layernorm and k_layernorm
+                    # because they are fused with Gated Delta Rule
+                )
+            )
+        else:
+            raise ValueError(f"Invalid linear attention type: {linear_attention_type}")
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=backend.layer_norm(),
+                self_attention=attention_spec,
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+            ),
+        )
+    elif multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_up_proj = (
             backend.column_parallel_layer_norm_linear()
@@ -202,6 +244,7 @@ def get_gpt_layer_local_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    linear_attention_type: Optional[str] = None,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
@@ -410,56 +453,56 @@ def get_gpt_decoder_block_spec(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    get_layer_spec_kwargs = {
+        "qk_layernorm": config.qk_layernorm,
+        "moe_use_legacy_grouped_gemm": config.moe_use_legacy_grouped_gemm,
+        "qk_l2_norm": qk_l2_norm,
+        "use_kitchen": config.use_kitchen,
+    }
     if use_transformer_engine:
         layer_norm_impl = TENorm
-        dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
-        )
-        moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
-        )
+        get_layer_spec_kwargs["use_te_activation_func"] = config.use_te_activation_func
+        get_layer_spec_fn = get_gpt_layer_with_transformer_engine_spec
     else:
         layer_norm_impl = LNImpl
-        dense_layer_spec = get_gpt_layer_local_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            normalization=normalization,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-        )
-        moe_layer_spec = get_gpt_layer_local_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            normalization=normalization,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-        )
+        get_layer_spec_kwargs["normalization"] = normalization
+        get_layer_spec_fn = get_gpt_layer_local_spec
+    
+    layer_spec_dict = {}
+    for moe in [0, 1]:
+        for la in [0, 1]:
+            if moe and config.moe_layer_freq is None:
+                continue
+            if la and config.linear_attention_type is None:
+                continue
+            
+            if moe:
+                num_experts = config.num_moe_experts
+                moe_grouped_gemm = config.moe_grouped_gemm
+            else:
+                num_experts = None
+                moe_grouped_gemm = None
+            if la:
+                linear_attention_type = config.linear_attention_type
+                multi_latent_attention = None
+            else:
+                linear_attention_type = None
+                multi_latent_attention = config.multi_latent_attention
+
+            layer_spec_dict[f"moe{moe}_la{la}"] = get_layer_spec_fn(
+                num_experts=num_experts,
+                moe_grouped_gemm=moe_grouped_gemm,
+                multi_latent_attention=multi_latent_attention,
+                linear_attention_type=linear_attention_type,
+                **get_layer_spec_kwargs,
+            )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
     # For integer N: Creates a pattern with one expert layer every N layers.
     # For string pattern: Evaluates the str directly (e.g. "[1,0,1]" for alternating expert/dense).
     if isinstance(config.moe_layer_freq, int):
+        # [1,0,0,...,0,1,0,0,...,0,...]
         moe_layer_pattern = [
             1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
         ]
@@ -474,16 +517,39 @@ def get_gpt_decoder_block_spec(
         raise ValueError(
             f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
         )
+    
+    # Parse config.linear_attention_freq to determine the pattern of expert/dense layers.
+    # 0 stands for SDPA layers, 1 stands for LA layers.
+    # For integer N: Creates a pattern with (N-1) LA layers and 1 SDPA layer every N layers.
+    # For string pattern: Evaluates the str directly (e.g. "[1,0,1]" for alternating LA/SDPA).
+    if isinstance(config.linear_attention_freq, int):
+        linear_attention_pattern = [
+            # [1,1,...,1,0,1,1,...,1,0,...]
+            0 if ((i + 1) % config.linear_attention_freq == 0)
+            else 1 for i in range(config.num_layers)
+        ]
+    elif isinstance(config.linear_attention_freq, list):
+        linear_attention_pattern = config.linear_attention_freq
+        assert len(linear_attention_pattern) == config.num_layers, (
+            f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
+            f"expected {config.num_layers}, "
+            f"current linear attention pattern: {config.linear_attention_freq}"
+        )
+    else:
+        raise ValueError(
+            f"Invalid linear_attention_freq: {type(config.linear_attention_freq)},"
+            f" {config.linear_attention_freq}"
+        )
 
     # Create the layer specs for the model.
     layer_specs = []
     for layer_number in range(config.num_layers):
-        if moe_layer_pattern[layer_number] == 1:
-            layer_specs.append(moe_layer_spec)
-        elif moe_layer_pattern[layer_number] == 0:
-            layer_specs.append(dense_layer_spec)
-        else:
-            raise ValueError(f"Invalid layer pattern: {moe_layer_pattern}")
+        moe = moe_layer_pattern[layer_number]
+        la = linear_attention_pattern[layer_number]
+        layer_spec_key = f"moe{moe}_la{la}"
+        if layer_spec_key not in layer_spec_dict:
+            raise ValueError(f"Invalid layer spec key: {layer_spec_key}")
+        layer_specs.append(layer_spec_dict[layer_spec_key])
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1

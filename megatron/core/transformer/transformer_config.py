@@ -192,6 +192,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    attention_output_gate: bool = False
+    """Whether to apply output gate to the attention layers."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -211,6 +214,37 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
+
+    ####################
+    # linear attention
+    ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use. Currently support gated_delta_net."""
+    
+    linear_attention_freq: Optional[Union[int, List[int]]] = None
+    """Frequency between LA (linear attention) layers and SDPA (scaled dot-product attention) layers.
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+
+    gdn_conv_kernel_dim: Optional[int] = None
+    """Conv kernel dimension for the gated delta net."""
+
+    gdn_qk_head_dim: Optional[int] = None
+    """Query and key head dimension for the gated delta net."""
+
+    gdn_v_head_dim: Optional[int] = None
+    """Value and gate head dimension for the gated delta net."""
+
+    gdn_num_qk_heads: Optional[int] = None
+    """Number of query and key heads for the gated delta net."""
+
+    gdn_num_v_heads: Optional[int] = None
+    """Number of value and gate heads for the gated delta net."""
+
+    gdn_output_gate: bool = True
+    """Whether to apply output gate to the gated delta net."""
+    
 
     ####################
     # initialization
@@ -740,6 +774,66 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+        
+        if self.linear_attention_type is not None:
+            supported_la_types = [
+                "gated_delta_net",
+                "mamba",
+            ]
+            assert self.linear_attention_type in supported_la_types, (
+                f"linear_attention_type ({self.linear_attention_type}) only support"
+                f" one of {supported_la_types}."
+            )
+            assert self.linear_attention_freq is not None, (
+                f"linear_attention_freq must be set for linear attention."
+            )
+
+            if self.linear_attention_type == "gated_delta_net":
+                # Check required parameters
+                assert self.gdn_conv_kernel_dim is not None, (
+                    "gdn_conv_kernel_dim must be set for gated delta net."
+                )
+                assert self.gdn_qk_head_dim is not None, (
+                    "gdn_qk_head_dim must be set for gated delta net."
+                )
+                assert self.gdn_v_head_dim is not None, (
+                    "gdn_v_head_dim must be set for gated delta net."
+                )
+                assert self.gdn_num_qk_heads is not None, (
+                    "gdn_num_qk_heads must be set for gated delta net."
+                )
+                assert self.gdn_num_v_heads is not None, (
+                    "gdn_num_v_heads must be set for gated delta net."
+                )
+                assert self.gdn_num_v_heads % self.gdn_num_qk_heads == 0, (
+                    f"gdn_num_v_heads ({self.gdn_num_v_heads}) must be a multiple of "
+                    f"gdn_num_qk_heads ({self.gdn_num_qk_heads})."
+                )
+
+                # Check tensor parallelism compatibility
+                assert self.gdn_num_qk_heads % self.tensor_model_parallel_size == 0, (
+                    "gdn_num_qk_heads must be a multiple of tensor_model_parallel_size."
+                )
+                assert self.gdn_num_v_heads % self.tensor_model_parallel_size == 0, (
+                    "gdn_num_v_heads must be a multiple of tensor_model_parallel_size."
+                )
+
+                # Do not support yet, but coming soon.
+                assert self.tensor_model_parallel_size == 1, (
+                    f"Gated delta net does not support tensor model parallel for now,"
+                    f" but got {self.tensor_model_parallel_size=}."
+                )
+                assert self.context_parallel_size == 1, (
+                    f"Gated delta net does not support context parallel for now,"
+                    f" but got {self.context_parallel_size=}."
+                )
+                assert self.gdn_output_gate, (
+                    "Output gate is forced for gated delta net now."
+                )
+            elif self.linear_attention_type == "mamba":
+                raise NotImplementedError("Mamba is not supported yet. Coming soon.")
+
+
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1566,6 +1660,9 @@ class MLATransformerConfig(TransformerConfig):
                 "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
                 "and assigned max_position_embeddings back to the original value."
             )
+        
+        if self.attention_output_gate:
+            raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (
