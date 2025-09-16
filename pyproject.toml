@@ -200,10 +200,15 @@ omit = [
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
-relative_files = true
+parallel = true
+sigterm = true
 
 [tool.coverage.paths]
-source = ["/opt/megatron-lm/"]
+source = [
+    ".",
+    "/opt/megatron-lm/",
+    "/home/runner/work/Megatron-LM/Megatron-LM/",
+]
 
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the

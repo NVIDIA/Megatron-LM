@@ -161,12 +161,12 @@ export ONE_LOGGER_JOB_CATEGORY=test
 for i in $(seq $UNIT_TEST_REPEAT); do
     echo "Running prod test suite."
     CMD=$(echo uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        -m coverage run \
+        --data-file=.coverage.unit_tests \
+        --source=megatron/core \
         -m pytest \
         -xvs \
-        --cov-report=term \
-        --cov=megatron/core \
-        --cov-report xml:coverage.xml \
-        --no-cov-on-fail ${IGNORE_ARGS[@]} \
+        ${IGNORE_ARGS[@]} \
         -m "'not experimental and ${MARKER_ARG}'" $BUCKET)
     eval "$CMD"
 
