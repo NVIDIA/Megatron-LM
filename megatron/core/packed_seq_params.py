@@ -21,5 +21,4 @@ class PackedSeqParams:
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
     local_cp_size: int = None
-    scheduled_id: int = None
     cp_group: dist.ProcessGroup = None

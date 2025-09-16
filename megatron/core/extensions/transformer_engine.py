@@ -968,7 +968,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
-        self.kept_packed_seq_params.discard("scheduled_id")
 
         if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H

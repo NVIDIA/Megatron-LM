@@ -618,8 +618,6 @@ class BalancedCPScheduler:
         sample_id_seqlens,
         config,
     ):
-        # TODO: Protect for model parallelism
-        # TODO: Reduce access to file system as much as possible.
         groups = []
         sample_id_groups = []
         # We assign a sample_id to each sub-sample in order to track the right assignment to each GPU.
@@ -675,10 +673,6 @@ def hybrid_context_parallel_forward_backward(
 
     cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=config.max_seqlen_per_cp_rank)
     # We get data once per global batch and schedule the sub-samples.
-    # TODO(pmannan): We will change from 3 for loop to 2 for loops.
-    # groups and sample_id_groups will be provided by the scheduler.
-    # sample_id_groups will now directly be a list of sub-samples per group and we iterate over it.
-    # data will be a list of sub-samples with sample_id.
     # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
     data = next(data_iterator)
     sample_id_groups = data[1]
@@ -696,7 +690,6 @@ def hybrid_context_parallel_forward_backward(
                 partner_cp_size = len([True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids])
                 assert partner_cp_size > 0, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[j]}"
                 sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-                sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
                 new_data_iterator = RerunDataIterator(iter([sample]))
                 # TODO: Find the usage of current_microbatch and is_first_microbatch and how that may affect my usage.
                 output_tensor, num_tokens = forward_step(
@@ -721,7 +714,6 @@ def hybrid_context_parallel_forward_backward(
             torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
 
     # For the last group, we need to run the last sub-sample out of the context handler.
-    # TODO: Find num sub-samples per group in this group?
     with no_sync_func():
         sample_ids_this_group = sample_id_groups[-1][parallel_state.get_data_parallel_rank(with_context_parallel=True)]
         for k in range(len(sample_ids_this_group) - 1):
@@ -729,7 +721,6 @@ def hybrid_context_parallel_forward_backward(
             sample = batch[sub_sample_id]
             partner_cp_size = len([True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids])
             sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-            sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
             new_data_iterator = RerunDataIterator(iter([sample]))
             # Call forward step for each sub-sample
             output_tensor, num_tokens = forward_step(
@@ -754,7 +745,6 @@ def hybrid_context_parallel_forward_backward(
     assert partner_cp_size > 0, f"rank: {torch.distributed.get_rank()}, sub_sample_id: {sub_sample_id} sample_ids_this_group: {sample_id_groups[-1]}"
     sample = batch[sub_sample_id]
     sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-    sample["scheduled_id"] = torch.tensor(sub_sample_id, dtype=torch.int32)
     new_data_iterator = RerunDataIterator(iter([sample]))
     # Call forward step for each sub-sample
     output_tensor, num_tokens = forward_step(
@@ -775,9 +765,4 @@ def hybrid_context_parallel_forward_backward(
 
     torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
 
-    # TODO: Before returning forward_data_store, do we need to change the loss?
-    # If loss calculation is done as sum(loss_per_token) / sum(total_tokens_per_sample),
-    # we don't need to change the loss.
-    # But if the loss calculation is different, then the user needs to define a new loss function
-    # for hybrid context parallel in their training script.
     return forward_data_store, total_num_tokens

@@ -19,7 +19,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector, get_sub_sample_on_this_cp_rank
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.utils import (
@@ -62,15 +62,10 @@ def get_batch(data_iterator, vp_stage=None):
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
 
-    # slice batch along sequence dimension for context parallelism
-    # batch = get_batch_on_this_cp_rank(batch)
-
     cu_seqlens = batch.pop('cu_seqlens')
     max_seqlen = batch.pop('max_seqlen')
-    scheduled_id = batch.pop('scheduled_id')
     local_cp_size = batch.pop('local_cp_size')
-    if scheduled_id is not None:
-        scheduled_id = int(scheduled_id.item())
+    if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
     if cu_seqlens is not None:
@@ -120,8 +115,6 @@ def get_batch(data_iterator, vp_stage=None):
                 batch[key] = data.index_select(1, index)
     else: # Hybrid CP format
         assert local_cp_size is not None
-        assert scheduled_id is not None
-        # batch, cp_group, packed_seq_params = get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_seq_params)
         if local_cp_size > 1:
             cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
         else:
@@ -134,10 +127,6 @@ def get_batch(data_iterator, vp_stage=None):
             batch[key] = torch.stack([data], 0)
         sample_length = batch['tokens'].shape[1]
         # Create packed_seq_params for SBHD format with cp group information.
-        # TODO(pmannan): Since entire PackedSeqParams is not needed, should we create a new dataclass with our information?
-        # We will need to update the logic in extensions/transformer_engine to support this.
-        # Piping through a new dataclass from training script might be adding extra overhead.
-        # Take ADLR recommendation on this.
         packed_seq_params = PackedSeqParams(
             qkv_format="sbhd",
             cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
