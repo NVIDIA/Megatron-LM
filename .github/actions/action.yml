@@ -43,6 +43,12 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Nvidia driver check
+      shell: bash
+      run: |
+        nvidia-smi  # Check driver version
+        nvcc --version  # Check CUDA toolkit version
+
     - name: Install curl, sudo
       shell: bash
       run: |
