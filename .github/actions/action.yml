@@ -108,7 +108,7 @@ runs:
           bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
             --tag ${{ inputs.tag }} \
             --environment dev \
-            --bucket '${{ inputs.bucket }}'
+            --bucket '\''${{ inputs.bucket }}'\''
         '
 
         RUN_TEST_EOF
