@@ -82,7 +82,7 @@ jobs:
           - bucket: "tests/unit_tests/transformer/moe"
     needs: [pre-flight, cicd-wait-in-queue]
     runs-on: nvidia-ci-aws-gpu-x8
-    name: "Unit tests: ${{ matrix.bucket }} - latest"
+    name: "${{ matrix.bucket[6:] }} - latest"
     environment: nemo-ci
     if: |
       (
