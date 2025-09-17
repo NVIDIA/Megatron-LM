@@ -90,6 +90,7 @@ runs:
           -d \
           --name test-data-container \
           -v $(pwd):/workdir \
+          -v /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/shard00:/workspace/data/gpt3_data \
           -w /workdir \
           -e GH_TOKEN=$GH_TOKEN \
           python:3.10-slim \
