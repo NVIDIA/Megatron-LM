@@ -193,11 +193,14 @@ runs:
         echo "::group::Check result"
 
         docker exec test_container_${{ github.run_id }} /opt/venv/bin/coverage xml
+        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/logs ./
         docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/.coverage .coverage
         docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/coverage.xml coverage.xml
 
         coverage_report=coverage-${{ inputs.is_unit_test == 'true' && 'unit-test' || 'e2e' }}-${{ github.run_id }}-$(uuidgen)
         echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
+        logs_report=logs-${{ github.run_id }}-$(uuidgen)
+        echo "logs_report=$logs_report" | tee -a "$GITHUB_OUTPUT"
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
@@ -217,7 +220,7 @@ runs:
         exit $EXIT_CODE
         echo "::endgroup::"
 
-    - name: Upload artifacts
+    - name: Upload coverage
       uses: actions/upload-artifact@v4
       if: ${{ steps.check.outputs.coverage_report != 'none' }}
       with:
@@ -225,6 +228,13 @@ runs:
         path: |
           coverage.xml
           .coverage
+        include-hidden-files: true
+
+    - name: Upload logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: logs-${{ steps.check.outputs.logs_report }}
+        path: logs
         include-hidden-files: true
 
     - name: Container shutdown
