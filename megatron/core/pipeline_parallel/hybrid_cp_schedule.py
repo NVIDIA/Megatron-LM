@@ -59,7 +59,6 @@ class HybridCPDataLoaderWrapper:
 
     def __init__(self, data_iterator, config):
         self.data_iterator = data_iterator
-        self.sample_count = 0
         self.config = config
         self.cp_balancing_scheduler = BalancedCPScheduler(
             max_seq_len_per_rank=self.config.max_seqlen_per_cp_rank
