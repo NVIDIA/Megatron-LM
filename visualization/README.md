@@ -83,21 +83,29 @@ This will generate:
 
 ### 4. Layer-Specific Analysis
 
-Analyze specific layers, ranks, and tensor types:
+Analyze specific layers, ranks, and tensor types (supports multi-parameter combinations):
 
 ```python
-# Analyze layer 0, rank 0, linear operations
+# Single combination analysis
 python layer_analysis.py --layer 0 --rank 0 --type linear
 
-# Analyze layer 16, rank 5, attention operations
-python layer_analysis.py --layer 16 --rank 5 --type attention
+# Multi-parameter analysis (automatic combinations)
+python layer_analysis.py --layer 1,8,15,16 --rank 0,1 --type linear,attention
+
+# Mixed single and multiple parameters
+python layer_analysis.py --layer 0 --rank 0,1,2 --type attention
 
 # Analyze specific data format only
 python layer_analysis.py --layer 0 --rank 0 --type linear --format bf16
 
 # Custom input/output directories
-python layer_analysis.py --layer 0 --rank 0 --type linear --base-dir /path/to/logs --output-dir /path/to/output
+python layer_analysis.py --layer 1,2 --rank 0,1 --type linear --base-dir /path/to/logs --output-dir /path/to/output
 ```
+
+**Multi-parameter examples:**
+- `--layer 1,8,15,16 --rank 0,1 --type linear,attention` generates 16 combinations (4×2×2)
+- Each combination produces separate plots and reports
+- Progress bar shows real-time processing status
 
 This will generate:
 - `layer_X_rank_Y_TYPE_analysis.png` - Distribution plots for all data formats

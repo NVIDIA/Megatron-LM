@@ -14,6 +14,8 @@ from matplotlib.gridspec import GridSpec
 import argparse
 from pathlib import Path
 from datetime import datetime
+from itertools import product
+from tqdm import tqdm
 
 # Define numerical format ranges and representable values
 DATA_TYPE_INFO = {
@@ -523,13 +525,26 @@ def generate_analysis_report(tensor_stats_list, layer, rank, tensor_type, output
     
     print(f"Analysis report saved to: {report_file}")
 
+def parse_multi_values(value_str, value_type=str):
+    """Parse comma-separated values into a list with type conversion."""
+    if ',' in value_str:
+        values = [item.strip() for item in value_str.split(',')]
+    else:
+        values = [value_str.strip()]
+    
+    if value_type == int:
+        return [int(v) for v in values]
+    return values
+
 def main():
     """Main function for layer analysis."""
     parser = argparse.ArgumentParser(description='Analyze and visualize layer-specific tensor distributions')
-    parser.add_argument('--layer', type=int, required=True, help='Layer number to analyze')
-    parser.add_argument('--rank', type=int, required=True, help='Rank number to analyze')
-    parser.add_argument('--type', choices=['linear', 'attention'], required=True, 
-                        help='Type of tensor operation to analyze')
+    parser.add_argument('--layer', required=True, 
+                        help='Layer number(s) to analyze (single: 1, multiple: 1,8,15,16)')
+    parser.add_argument('--rank', required=True,
+                        help='Rank number(s) to analyze (single: 0, multiple: 0,1)')
+    parser.add_argument('--type', required=True,
+                        help='Type(s) of tensor operation (single: linear, multiple: linear,attention)')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs',
                         help='Base directory containing tensor files (default: enhanced_tensor_logs)')
     parser.add_argument('--output-dir', default='./draw/layer_analysis/',
@@ -538,6 +553,18 @@ def main():
                         help='Specific data format to analyze (default: all formats)')
     
     args = parser.parse_args()
+    
+    # Parse multi-value inputs
+    layers = parse_multi_values(args.layer, int)
+    ranks = parse_multi_values(args.rank, int)
+    types = parse_multi_values(args.type, str)
+    
+    # Validate tensor types
+    valid_types = ['linear', 'attention']
+    for tensor_type in types:
+        if tensor_type not in valid_types:
+            print(f"Error: Invalid tensor type '{tensor_type}'. Must be one of: {valid_types}")
+            return 1
     
     # Setup paths
     base_dir = Path(args.base_dir)
@@ -548,45 +575,74 @@ def main():
         print(f"Error: Base directory not found: {base_dir}")
         return 1
     
-    print(f"Analyzing Layer {args.layer}, Rank {args.rank}, Type: {args.type}")
+    # Generate all combinations
+    combinations = list(product(layers, ranks, types))
+    
+    print(f"Multi-Parameter Analysis")
+    print("=" * 60)
+    print(f"Layers: {layers}")
+    print(f"Ranks: {ranks}")
+    print(f"Types: {types}")
+    print(f"Total combinations: {len(combinations)}")
     print("=" * 60)
     
-    # Find matching files
-    matching_files = find_matching_files(base_dir, args.layer, args.rank, args.type, args.format)
+    successful_analyses = 0
+    failed_analyses = 0
     
-    if not matching_files:
-        print(f"No matching files found for Layer {args.layer}, Rank {args.rank}, Type: {args.type}")
-        return 1
+    # Process each combination with progress bar
+    for layer, rank, tensor_type in tqdm(combinations, desc="Processing combinations", unit="combo"):
+        try:
+            # Find matching files
+            matching_files = find_matching_files(
+                base_dir=base_dir,
+                layer=layer,
+                rank=rank,
+                tensor_type=tensor_type,
+                data_format=args.format
+            )
+            
+            if not matching_files:
+                tqdm.write(f"No matching files found for Layer {layer}, Rank {rank}, Type: {tensor_type}")
+                failed_analyses += 1
+                continue
+            
+            # Analyze tensors
+            tensor_stats_list = []
+            
+            for data_format, file_list in matching_files.items():
+                for file_path in file_list:
+                    stats = analyze_tensor(file_path, data_format)
+                    if stats:
+                        tensor_stats_list.append(stats)
+            
+            if not tensor_stats_list:
+                tqdm.write(f"No valid tensor data found for Layer {layer}, Rank {rank}, Type: {tensor_type}")
+                failed_analyses += 1
+                continue
+            
+            # Generate visualizations and reports
+            create_distribution_plot(tensor_stats_list, layer, rank, tensor_type, output_dir)
+            generate_analysis_report(tensor_stats_list, layer, rank, tensor_type, output_dir)
+            
+            successful_analyses += 1
+            tqdm.write(f"✅ Completed Layer {layer}, Rank {rank}, Type: {tensor_type} ({len(tensor_stats_list)} files)")
+            
+        except Exception as e:
+            tqdm.write(f"❌ Error processing Layer {layer}, Rank {rank}, Type: {tensor_type}: {str(e)}")
+            failed_analyses += 1
+            continue
     
-    # Analyze tensors
-    tensor_stats_list = []
-    
-    for data_format, file_list in matching_files.items():
-        print(f"\nAnalyzing {data_format.upper()} files:")
-        
-        for file_path in file_list:
-            print(f"  Processing: {file_path.name}")
-            stats = analyze_tensor(file_path, data_format)
-            if stats:
-                tensor_stats_list.append(stats)
-    
-    if not tensor_stats_list:
-        print("No valid tensor data found for analysis")
-        return 1
-    
-    print(f"\nSuccessfully analyzed {len(tensor_stats_list)} tensor files")
-    
-    # Generate visualizations and reports
-    print("\nGenerating distribution plots...")
-    create_distribution_plot(tensor_stats_list, args.layer, args.rank, args.type, output_dir)
-    
-    print("Generating analysis report...")
-    generate_analysis_report(tensor_stats_list, args.layer, args.rank, args.type, output_dir)
-    
-    print("\nAnalysis complete!")
+    # Final summary
+    print("\n" + "=" * 60)
+    print("ANALYSIS SUMMARY")
+    print("=" * 60)
+    print(f"Total combinations: {len(combinations)}")
+    print(f"Successful analyses: {successful_analyses}")
+    print(f"Failed analyses: {failed_analyses}")
+    print(f"Success rate: {(successful_analyses/len(combinations)*100):.1f}%")
     print(f"Output files saved in: {output_dir}")
     
-    return 0
+    return 0 if successful_analyses > 0 else 1
 
 if __name__ == "__main__":
     exit(main())
