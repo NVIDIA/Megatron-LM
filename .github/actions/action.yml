@@ -99,7 +99,7 @@ runs:
         docker container rm -f test-data-container || true
         echo "::endgroup::"
 
-    - name: Create run-script
+    - name: Create run-script (unit test)
       id: create
       shell: bash
       if: inputs.is_unit_test == 'true'
@@ -114,6 +114,27 @@ runs:
             --tag ${{ inputs.tag }} \
             --environment dev \
             --bucket '\''${{ inputs.bucket }}'\''
+        '
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"        
+        echo "::endgroup::"
+
+    - name: Create run-script (e2e test)
+      id: create
+      shell: bash
+      if: inputs.is_unit_test == 'false'
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+
+        docker exec -t test_container_${{ github.run_id }} bash -c '
+          set -e
+          NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
+
+          bash ./
         '
 
         RUN_TEST_EOF
@@ -200,7 +221,7 @@ runs:
         coverage_report=coverage-${{ inputs.is_unit_test == 'true' && 'unit-test' || 'e2e' }}-${{ github.run_id }}-$(uuidgen)
         echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
         logs_report=logs-${{ inputs.bucket }}-${{ github.run_id }}-$(uuidgen)
-        echo "logs_report=$logs_report" | tee -a "$GITHUB_OUTPUT"
+        echo "logs_report=$logs_report" | jq -sRr @uri | tee -a "$GITHUB_OUTPUT"
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
