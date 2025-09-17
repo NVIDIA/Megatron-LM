@@ -234,7 +234,7 @@ def analyze_tensor(tensor_path, data_format):
         dict: Analysis results
     """
     try:
-        tensor = torch.load(tensor_path, map_location='cpu')
+        tensor = torch.load(tensor_path, map_location='cpu', weights_only=False)
         
         if not isinstance(tensor, torch.Tensor):
             if isinstance(tensor, dict) and 'tensor' in tensor:
@@ -244,11 +244,25 @@ def analyze_tensor(tensor_path, data_format):
             else:
                 return None
         
+        # Convert BFloat16 and other unsupported types to Float32 for CPU processing
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        elif tensor.dtype in [torch.float16, torch.half]:
+            tensor = tensor.float()
+        elif tensor.dtype in [torch.int8, torch.int16, torch.int32, torch.int64]:
+            tensor = tensor.float()
+        elif tensor.dtype in [torch.uint8]:
+            tensor = tensor.float()
+        
         # Convert to numpy for analysis
         if tensor.is_cuda:
             tensor_np = tensor.cpu().numpy()
         else:
             tensor_np = tensor.numpy()
+        
+        # Handle empty tensors
+        if tensor_np.size == 0:
+            return None
         
         # Handle complex tensors
         if tensor_np.dtype in [np.complex64, np.complex128]:

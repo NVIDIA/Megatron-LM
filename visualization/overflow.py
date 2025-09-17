@@ -97,6 +97,28 @@ def analyze_tensor_overflow(tensor, data_format):
     else:
         tensor_np = tensor.numpy()
     
+    # Handle empty tensors
+    if tensor_np.size == 0:
+        return {
+            'filename': 'empty_tensor',
+            'data_format': data_format,
+            'total_elements': 0,
+            'overflow_count': 0,
+            'underflow_count': 0,
+            'overflow_percent': 0.0,
+            'underflow_percent': 0.0,
+            'has_overflow': False,
+            'has_underflow': False,
+            'has_issues': False,
+            'tensor_min': 0.0,
+            'tensor_max': 0.0,
+            'tensor_mean': 0.0,
+            'tensor_std': 0.0,
+            'format_min_denormal': min_denormal,
+            'format_max': max_val,
+            'shape': list(tensor.shape)
+        }
+    
     # Handle different tensor types
     if tensor_np.dtype == np.complex64 or tensor_np.dtype == np.complex128:
         # For complex tensors, analyze magnitude
@@ -164,7 +186,7 @@ def analyze_file(filepath):
             return None
         
         # Load tensor
-        tensor = torch.load(filepath, map_location='cpu')
+        tensor = torch.load(filepath, map_location='cpu', weights_only=False)
         
         # Handle case where loaded object is not a tensor
         if not isinstance(tensor, torch.Tensor):
@@ -175,6 +197,16 @@ def analyze_file(filepath):
             else:
                 print(f"Warning: Loaded object is not a tensor: {filename}")
                 return None
+        
+        # Convert BFloat16 and other unsupported types to Float32 for CPU processing
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        elif tensor.dtype in [torch.float16, torch.half]:
+            tensor = tensor.float()
+        elif tensor.dtype in [torch.int8, torch.int16, torch.int32, torch.int64]:
+            tensor = tensor.float()
+        elif tensor.dtype in [torch.uint8]:
+            tensor = tensor.float()
         
         # Analyze overflow
         result = analyze_tensor_overflow(tensor, data_format)
