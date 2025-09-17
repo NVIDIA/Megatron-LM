@@ -148,7 +148,7 @@ runs:
             "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
             "TRAINING_SCRIPT_PATH=pretrain_bert.py"
             "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/model_config.yaml"
-            "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dgx_h100.json"
+            "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dev_dgx_h100.json"
             "N_REPEAT=5"
             "ENABLE_LIGHTWEIGHT_MODE=false"
             "RECORD_CHECKPOINTS=false"
