@@ -160,7 +160,7 @@ export ONE_LOGGER_JOB_CATEGORY=test
 
 for i in $(seq $UNIT_TEST_REPEAT); do
     echo "Running prod test suite."
-    CMD=$(echo uv run --frozen --active python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+    CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
         -m coverage run \
         --data-file=.coverage.unit_tests \
         --source=megatron/core \
@@ -171,7 +171,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
     eval "$CMD"
 
     if [[ "$TAG" == "latest" ]]; then
-        CMD=$(echo uv run --frozen --active python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
+        CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
             -xvs \
             --experimental \
              ${IGNORE_ARGS[@]} \
