@@ -199,7 +199,7 @@ runs:
 
         coverage_report=coverage-${{ inputs.is_unit_test == 'true' && 'unit-test' || 'e2e' }}-${{ github.run_id }}-$(uuidgen)
         echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
-        logs_report=logs-${{ github.run_id }}-$(uuidgen)
+        logs_report=logs-${{ inputs.bucket }}-${{ github.run_id }}-$(uuidgen)
         echo "logs_report=$logs_report" | tee -a "$GITHUB_OUTPUT"
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
@@ -233,7 +233,7 @@ runs:
     - name: Upload logs
       uses: actions/upload-artifact@v4
       with:
-        name: logs-${{ steps.check.outputs.logs_report }}
+        name: ${{ steps.check.outputs.logs_report }}
         path: logs
         include-hidden-files: true
 
