@@ -1854,6 +1854,8 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'global', 'global_dist'],
                        help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-split-qkv', action='store_true',
+                       help='Whether to split QKV for Muon optimizer')
     return parser
 
 

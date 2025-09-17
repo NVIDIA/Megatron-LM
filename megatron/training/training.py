@@ -75,6 +75,7 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig, get_megatron_muon_optimizer
+from megatron.core.optimizer.layer_wise_optimizer import get_shower_optimizer_for_mcore
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1099,15 +1100,25 @@ def setup_model_and_optimizer(
             default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
         )
     else:
-        optimizer = get_megatron_muon_optimizer( 
-            config,
-            model,
-            no_wd_decay_cond,
-            scale_lr_cond,
-            lr_mult,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-            layer_wise_distributed_optimizer='dist' in config.optimizer,
-        )
+        if "dist" in config.optimizer:
+            optimizer = get_shower_optimizer_for_mcore(
+                model, config,
+                pg_collection={
+                    "dp_cp": mpu.get_data_parallel_group(True),
+                    "tp": mpu.get_tensor_model_parallel_group(),
+                    "expt_dp": mpu.get_expert_data_parallel_group()},
+                linear_optimizer=config.optimizer.replace("dist_", ""),
+                split_qkv=args.muon_split_qkv,
+            )
+        else:
+            optimizer = get_megatron_muon_optimizer(
+                config,
+                model,
+                no_wd_decay_cond,
+                scale_lr_cond,
+                lr_mult,
+                use_gloo_process_groups=args.enable_gloo_process_groups,
+            )
 
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})

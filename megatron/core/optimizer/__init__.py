@@ -643,7 +643,6 @@ def get_megatron_muon_optimizer(
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
     use_gloo_process_groups: bool = True,
-    layer_wise_distributed_optimizer: bool = False,
 ) -> MegatronOptimizer:
     """
     This function is used to get the muon optimizer for the model chunks.
@@ -659,8 +658,6 @@ def get_megatron_muon_optimizer(
             satisfy scale_lr_cond. Defaults to 1.0.
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
-        layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
-            Defaults to False.
     """
     # currently it is only supporting muon, will add soaps later
 
@@ -748,11 +745,4 @@ def get_megatron_muon_optimizer(
     # chain everything together
     optimizers += chained_adam.chained_optimizers
 
-    if layer_wise_distributed_optimizer:
-        log_single_rank(logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for Muon')
-        return LayerWiseDistributedOptimizer(
-            optimizers,
-            parallel_state.get_data_parallel_group(with_context_parallel=True),
-            parallel_state.get_expert_data_parallel_group(),
-        )
     return ChainedOptimizer(optimizers)
