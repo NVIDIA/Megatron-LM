@@ -222,7 +222,7 @@ def analyze_file(filepath):
 def main():
     parser = argparse.ArgumentParser(description='Analyze tensor files for overflow/underflow conditions')
     parser.add_argument('input_path', help='Path to tensor file or directory')
-    parser.add_argument('--output', '-o', help='Output file for results (default: print to stdout)')
+    parser.add_argument('--output', '-o', default='./draw/tensor_overflow/', help='Output file for results (default: ./draw/tensor_overflow/)')
     parser.add_argument('--format', '-f', choices=['txt', 'csv', 'json'], default='txt',
                         help='Output format (default: txt)')
     parser.add_argument('--recursive', '-r', action='store_true',
@@ -256,7 +256,24 @@ def main():
     # Output results
     if args.output:
         output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # If output is a directory (like the default), generate filename based on input
+        if str(output_path).endswith('/') or output_path.is_dir() or (not output_path.suffix and not output_path.exists()):
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            # Generate filename: same as input but with .log extension
+            input_path_obj = Path(args.input_path)
+            if input_path_obj.is_file():
+                # For single file: change extension to .log
+                filename = input_path_obj.stem + '.log'
+            else:
+                # For directory: use directory name + .log
+                filename = input_path_obj.name + '.log'
+            
+            output_path = output_path / filename
+        else:
+            # If specific filename provided, create parent directories
+            output_path.parent.mkdir(parents=True, exist_ok=True)
         
         if args.format == 'json':
             import json
@@ -272,6 +289,8 @@ def main():
         else:  # txt format
             with open(output_path, 'w') as f:
                 write_text_report(f, results)
+        
+        print(f"Results saved to: {output_path}")
     else:
         write_text_report(None, results)
     
