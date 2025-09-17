@@ -460,6 +460,9 @@ class TransformerConfig(ModelParallelConfig):
     there are multiple shared experts.
     None means no shared expert."""
 
+    moe_shared_expert_gate: bool = False
+    """Enable gate for shared expert."""
+
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
