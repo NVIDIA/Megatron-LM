@@ -253,46 +253,48 @@ def main():
         print("No valid tensor files found or processed.")
         return 1
     
-    # Output results
-    if args.output:
-        output_path = Path(args.output)
+    # Always output results to console first
+    print("Analysis Results:")
+    print("=" * 50)
+    write_text_report(None, results)
+    
+    # Then save to file
+    output_path = Path(args.output)
+    
+    # If output is a directory (like the default), generate filename based on input
+    if str(output_path).endswith('/') or output_path.is_dir() or (not output_path.suffix and not output_path.exists()):
+        output_path.mkdir(parents=True, exist_ok=True)
         
-        # If output is a directory (like the default), generate filename based on input
-        if str(output_path).endswith('/') or output_path.is_dir() or (not output_path.suffix and not output_path.exists()):
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            # Generate filename: same as input but with .log extension
-            input_path_obj = Path(args.input_path)
-            if input_path_obj.is_file():
-                # For single file: change extension to .log
-                filename = input_path_obj.stem + '.log'
-            else:
-                # For directory: use directory name + .log
-                filename = input_path_obj.name + '.log'
-            
-            output_path = output_path / filename
+        # Generate filename: same as input but with .log extension
+        input_path_obj = Path(args.input_path)
+        if input_path_obj.is_file():
+            # For single file: change extension to .log
+            filename = input_path_obj.stem + '.log'
         else:
-            # If specific filename provided, create parent directories
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # For directory: use directory name + .log
+            filename = input_path_obj.name + '.log'
         
-        if args.format == 'json':
-            import json
-            with open(output_path, 'w') as f:
-                json.dump(results, f, indent=2, default=str)
-        elif args.format == 'csv':
-            import csv
-            with open(output_path, 'w', newline='') as f:
-                if results:
-                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                    writer.writeheader()
-                    writer.writerows(results)
-        else:  # txt format
-            with open(output_path, 'w') as f:
-                write_text_report(f, results)
-        
-        print(f"Results saved to: {output_path}")
+        output_path = output_path / filename
     else:
-        write_text_report(None, results)
+        # If specific filename provided, create parent directories
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if args.format == 'json':
+        import json
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+    elif args.format == 'csv':
+        import csv
+        with open(output_path, 'w', newline='') as f:
+            if results:
+                writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                writer.writeheader()
+                writer.writerows(results)
+    else:  # txt format
+        with open(output_path, 'w') as f:
+            write_text_report(f, results)
+    
+    print(f"\nResults saved to: {output_path}")
     
     return 0
 
