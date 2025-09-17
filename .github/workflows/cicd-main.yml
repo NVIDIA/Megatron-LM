@@ -97,16 +97,48 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          bucket: tests/${{ matrix.bucket }}
+          test_case: tests/${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
+          PAT: ${{ secrets.PAT }}
+
+  cicd-functional-tests-latest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test_case: "bert_mr_mcore_tp2_pp2_dgx_a100_1N8G"
+            model: "bert"
+    needs: [pre-flight, cicd-wait-in-queue]
+    runs-on: nvidia-ci-aws-gpu-x8
+    name: "${{ matrix.bucket }} - latest"
+    environment: nemo-ci
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions
+        with:
+          test_case: tests/${{ matrix.test_case }}
+          model: ${{ matrix.model }}
+          tag: latest
+          timeout: ${{ matrix.timeout || 30 }}
+          is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
 
   Nemo_CICD_Test:
     needs:
       - pre-flight
       - cicd-unit-tests-latest
+      - cicd-functional-tests-latest
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
