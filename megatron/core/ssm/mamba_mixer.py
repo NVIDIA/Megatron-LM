@@ -695,7 +695,7 @@ class MambaMixer(MegatronModule):
         # Decode slice (requests before prefill start)
         if first_prefill_request_idx > 0:
             hidden_states_decode = hidden_states[:first_prefill_token_idx]
-            batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
+            batch_indices = context.request_to_mamba_state_idx[
                 : first_prefill_token_idx
             ]
             out_decode, out_bias_decode, _, _ = self.step(
@@ -706,7 +706,7 @@ class MambaMixer(MegatronModule):
         # Prefill slice (remaining active tokens/requests)
         active_token_count = context.active_token_count
         active_request_count = context.get_active_request_count()
-        batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
+        batch_indices = context.request_to_mamba_state_idx[
             first_prefill_request_idx : active_request_count
         ]
 

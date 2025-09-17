@@ -757,7 +757,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_chunk_ids_cudagraph_only.fill_(0)
         self.block_table = None
         if self.is_hybrid_model:
-            self.mamba_block_table = None
             self.request_to_mamba_state_idx_cudagraph_only.fill_(-1)
 
     def reset_mamba_state(self) -> None:
@@ -960,11 +959,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_to_mamba_state_idx_cudagraph_only[
                     0 : self.total_request_count - self.paused_request_count
                 ] = active_mamba_indices
-                self.mamba_block_table = self.request_to_mamba_state_idx_cudagraph_only[
-                    : self.padded_active_request_count
-                ]
-            else:
-                self.mamba_block_table = active_mamba_indices
 
     def reset(self) -> None:
         """Reset entire context.
