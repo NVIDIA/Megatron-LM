@@ -135,10 +135,12 @@ else
     TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
     # Split into array while preserving quotes
     eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
-    PARAMS=(
-        "--exit-duration-in-mins"
-        $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
-    )
+    if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        PARAMS=(
+            "--exit-duration-in-mins"
+            $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+        )
+    fi
 fi
 
 # Extract training params
