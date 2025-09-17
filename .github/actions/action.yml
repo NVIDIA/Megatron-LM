@@ -197,7 +197,7 @@ runs:
           -e NCCL_IB_DISABLE=1 \
           -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
-          -v /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/shard00:/workspace/data/gpt3_data \
+          -v /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00:/workspace/data/bert_data \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
           megatron-core \
