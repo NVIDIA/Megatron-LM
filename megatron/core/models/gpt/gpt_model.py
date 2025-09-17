@@ -33,7 +33,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from megatron.core.models.gpt.utils import offloading_checker
 from megatron.core.pipeline_parallel.cpu_offload import PipelineOffloadManager
 
 
@@ -374,7 +373,6 @@ class GPTModel(LanguageModule):
             self.config.offload_activation,
             0,
         )
-        PipelineOffloadManager.get_instance().cur_forward_chunk().set_offloading_checker(offloading_checker)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

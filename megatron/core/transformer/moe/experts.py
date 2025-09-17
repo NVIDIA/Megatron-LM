@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+import contextlib
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.activations import squared_relu
@@ -111,6 +112,7 @@ class GroupedMLP(MegatronModule):
         self,
         num_local_experts: int,
         config: TransformerConfig,
+        layer_number: Optional[int] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         super().__init__(config=config)
@@ -758,11 +760,13 @@ class TEGroupedMLP(MegatronModule):
         num_local_experts,
         config: TransformerConfig,
         submodules: MLPSubmodules,
+        layer_number: Optional[int] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
+        self.layer_number = layer_number
         assert (
             config.add_bias_linear == False
         ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
@@ -814,6 +818,11 @@ class TEGroupedMLP(MegatronModule):
             and "router_fc1" in self.config.offload_modules
         )
 
+        self.offload_moe_act = (
+            self.config.offload_activation
+            and "moe_act" in self.config.offload_modules
+        )
+
         self.offload_router_fc2 = (
             self.config.offload_activation
             and "router_fc2" in self.config.offload_modules
@@ -832,6 +841,10 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number for the TEGroupedMLP."""
+        self.layer_number = layer_number
 
     def forward(
         self,
@@ -872,24 +885,17 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        offload_context = contextlib.nullcontext()
         if self.offload_router_fc1:
-            if not permuted_local_hidden_states.is_contiguous():
-                permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
-            permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states)
-            permuted_local_hidden_states.offloading_activation = True
-            with PipelineOffloadManager.get_instance():
-                intermediate_parallel, bias_parallel = self.linear_fc1(
-                    permuted_local_hidden_states, tokens_per_expert
-                )
-            intermediate_parallel, bias_parallel = group_prefetch_offload_commit(
-                intermediate_parallel,
-                bias_parallel,
-                release_tensors=[permuted_local_hidden_states]
-            )
-        else:
-            intermediate_parallel, bias_parallel = self.linear_fc1(
+                permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, is_last_layer=(self.layer_number == self.config.num_layers))
+                offload_context = PipelineOffloadManager.get_instance()
+        with offload_context:
+            fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
-            )
+        )
+        if self.offload_router_fc1:
+            fc1_output, bias_parallel = group_prefetch_offload_commit(fc1_output, bias_parallel, release_tensors=[permuted_local_hidden_states])
+            offload_context = contextlib.nullcontext()
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
@@ -946,18 +952,29 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
+        if self.offload_moe_act:
+            fc1_output = group_prefetch_offload_start(fc1_output, is_last_layer=(self.layer_number == self.config.num_layers))
+            offload_context = PipelineOffloadManager.get_instance()
+
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            intermediate_parallel = self.activation_checkpoint.checkpoint(
-                bias_act_func, intermediate_parallel, bias_parallel, permuted_probs
-            )
-            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
-            self.activation_checkpoint.discard_output_and_register_recompute(output)
+            with offload_context:
+                bias_act_output = self.activation_checkpoint.checkpoint(
+                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+                )
         else:
-            intermediate_parallel = bias_act_func(
-                intermediate_parallel, bias_parallel, permuted_probs
-            )
-            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+            with offload_context:
+                bias_act_output = bias_act_func(
+                    fc1_output, bias_parallel, permuted_probs
+                )
+
+        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
+        if self.activation_recompute:
+            self.activation_checkpoint.discard_output_and_register_recompute(output)
+        if self.offload_moe_act:
+            output, = group_prefetch_offload_commit(output, release_tensors=[fc1_output])
+            offload_context = contextlib.nullcontext()
+
 
         # upad and concat the output
         if self.config.fp8:
@@ -1025,6 +1042,7 @@ class SequentialMLP(MegatronModule):
         num_local_experts,
         config: TransformerConfig,
         submodules: MLPSubmodules,
+        layer_number: Optional[int] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
 

@@ -263,6 +263,15 @@ class MultiLatentAttention(Attention):
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
+        elif self.offload_core_attention and self.training:
+            core_attn_out = self._offload_core_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
         else:
             if inference_context is None or inference_context.is_static_batching():
                 core_attn_out = self.core_attention(

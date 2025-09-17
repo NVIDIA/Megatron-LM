@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed
 from torch import Tensor
+import contextlib
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -429,6 +430,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             self.config.offload_activation
             and "self_attn" in self.config.offload_modules
         )
+        self.offload_layernorm = (
+            self.config.offload_activation
+            and "layernorm" in self.config.offload_modules
+        )
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -519,41 +524,26 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
+        offload_context = contextlib.nullcontext()
         if self.offload_self_attn:
-            from megatron.core.pipeline_parallel.cpu_offload import (
-                PipelineOffloadManager,
-                group_prefetch_offload_start,
-                group_prefetch_offload_commit,
-            )
-            if not input_layernorm_output.is_contiguous():
-                input_layernorm_output = input_layernorm_output.contiguous()
-            input_layernorm_output = group_prefetch_offload_start(input_layernorm_output)
-            input_layernorm_output.offloading_activation = True
-            with PipelineOffloadManager.get_instance():
-                attention_output_with_bias = self.self_attention(
-                input_layernorm_output,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-            )
-            attention_output_with_bias = group_prefetch_offload_commit(attention_output_with_bias, release_tensors=[input_layernorm_output])
-        else:
+            input_layernorm_output = group_prefetch_offload_start(input_layernorm_output,
+                is_last_layer=(self.layer_number == self.config.num_layers))
+            offload_context = PipelineOffloadManager.get_instance()
+        with offload_context:
             attention_output_with_bias = self.self_attention(
-                input_layernorm_output,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-            )
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        if self.offload_self_attn:
+            attention_output_with_bias, = group_prefetch_offload_commit(attention_output_with_bias, release_tensors=[input_layernorm_output])
+            offload_context = contextlib.nullcontext()
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
@@ -612,14 +602,25 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        offload_context = contextlib.nullcontext()
+        if self.offload_layernorm:
+            from megatron.core.pipeline_parallel.cpu_offload import (
+                PipelineOffloadManager,
+                group_prefetch_offload_start,
+                group_prefetch_offload_commit,
+            )
+            hidden_states = group_prefetch_offload_start(hidden_states, is_last_layer=(self.layer_number == self.config.num_layers))
+            offload_context = PipelineOffloadManager.get_instance()
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
+            with offload_context:
+                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                    self.pre_mlp_layernorm, hidden_states
+                )
         else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+            with offload_context:
+                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -679,6 +680,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
+        if self.offload_layernorm:
+            hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
+            offload_context = contextlib.nullcontext()
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

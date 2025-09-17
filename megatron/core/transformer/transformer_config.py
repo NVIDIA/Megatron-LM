@@ -944,11 +944,11 @@ class TransformerConfig(ModelParallelConfig):
 
         if len(self.offload_modules) > 0:
             allowed_modules = {
-                "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1"
+                "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1", "moe_act", "layernorm"
             }
             if self.multi_latent_attention:
-                flag = "self_attn" in self.offload_modules or "qkv_linear" in self.offload_modules or "core_attn" in self.offload_modules or "attn_linear" in self.offload_modules
-                assert not flag, "(Temporary) self_attn, qkv_linear, core_attn, attn_linear must not be in offload_modules when multi_latent_attention is True"
+                flag = "self_attn" in self.offload_modules or "qkv_linear" in self.offload_modules or "attn_linear" in self.offload_modules
+                assert not flag, "(Temporary) self_attn, qkv_linear, attn_linear must not be in offload_modules when multi_latent_attention is True"
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for offload_modules: {invalid_modules}. '
