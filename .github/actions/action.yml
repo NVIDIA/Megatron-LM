@@ -138,7 +138,7 @@ runs:
 
         docker exec -t test_container_${{ github.run_id }} bash -c '
           set -e
-          ls -al /artifacts/text/the_pile/shard00
+          ls -al /workspace/data/bert_data
           ARGUMENTS=(
             "DATA_PATH=/workspace/data/bert_data"
             "DATA_CACHE_PATH=/workspace/data/cache" 
