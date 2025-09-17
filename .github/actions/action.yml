@@ -173,16 +173,13 @@ runs:
 
     - name: Start container
       shell: bash
-      env:
-        MNT_PATH: ${{ steps.azure-fileshare.outputs.MNT_PATH }}
-        MOUNT_FS: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' }}
       run: |
         echo "::group::Start test container"
-        if [[ "$MOUNT_FS" == "true" ]]; then
-          VOLUME_ARGS="--volume /mnt/datadrive/TestData:/home/TestData"
-        else
-          VOLUME_ARGS=""
-        fi
+        set -x
+        mkdir -p /mnt/datadrive-cache/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00
+        cp -a \
+          /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/. \
+          /mnt/datadrive-cache/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/
 
         cmd=$(cat <<RUN_TEST_EOF
         #!/bin/bash
@@ -197,7 +194,7 @@ runs:
           -e NCCL_IB_DISABLE=1 \
           -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
-          -v /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00:/workspace/data/bert_data \
+          -v /mnt/datadrive-cache/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00:/workspace/data/bert_data \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
           megatron-core \
