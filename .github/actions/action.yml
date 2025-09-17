@@ -56,6 +56,12 @@ runs:
       run: |
         ls -al /mnt/datadrive/TestData/megatron-lm/
 
+    - name: Copy data
+      shell: bash
+      run: |
+        mkdir -p /home/runner/_work/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00
+        cp -a /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/. /home/runner/_work/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/
+
     - name: Install curl, sudo
       shell: bash
       run: |
@@ -176,10 +182,6 @@ runs:
       run: |
         echo "::group::Start test container"
         set -x
-        mkdir -p /mnt/datadrive-cache/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00
-        cp -a \
-          /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/. \
-          /mnt/datadrive-cache/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/
 
         cmd=$(cat <<RUN_TEST_EOF
         #!/bin/bash
@@ -194,7 +196,7 @@ runs:
           -e NCCL_IB_DISABLE=1 \
           -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
-          -v /mnt/datadrive-cache/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00:/workspace/data/bert_data \
+          -v home/runner/_work/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00:/workspace/data/bert_data \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
           megatron-core \
