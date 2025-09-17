@@ -51,6 +51,11 @@ runs:
       run: |
         docker run --rm --ipc=host --runtime=nvidia --gpus all ubuntu nvidia-smi  # Check driver version
 
+    - name: FS check
+      shell: bash
+      run: |
+        ls -al /mnt/datadrive/TestData/megatron-lm/
+
     - name: Install curl, sudo
       shell: bash
       run: |
@@ -113,6 +118,7 @@ runs:
 
         docker exec -t test_container_${{ github.run_id }} bash -c '
           set -e
+          ls -al /workspace/
           bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
             --tag ${{ inputs.tag }} \
             --environment dev \
