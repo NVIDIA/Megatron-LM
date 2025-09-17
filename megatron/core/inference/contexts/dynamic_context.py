@@ -37,8 +37,12 @@ class ContextOverflowError(Exception):
             permanent (i.e., request will never fit in this context).
     """
 
-    def __init__(self, message: Optional[str] = None, *, is_transient: bool = True):
-        super().__init__(message)
+    def __init__(
+        self, request_id: Optional[int], message: Optional[str] = None, *, is_transient: bool = True
+    ):
+        request_str = '--' if request_id is None else str(request_id)
+        message = "" if message is None else f" | {message}"
+        super().__init__(f"request {request_str}{message}")
         self.is_transient = is_transient
 
 
@@ -57,8 +61,8 @@ class TokenOverflowError(ContextOverflowError):
 class MaxSequenceLengthOverflowError(ContextOverflowError):
     """Adding request would overflow max sequence length."""
 
-    def __init__(self, message: Optional[str] = None):
-        super().__init__(message=message, is_transient=False)
+    def __init__(self, request_id, message: Optional[str] = None):
+        super().__init__(request_id, message=message, is_transient=False)
 
 
 class ChunkOverflowError(ContextOverflowError):
@@ -74,8 +78,9 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
     def __init__(self, max_request_count, active_request_count):
         assert active_request_count > max_request_count
         super().__init__(
+            None,
             "active_request_count (%d) > max_request_count (%d)."
-            % (active_request_count, max_request_count)
+            % (active_request_count, max_request_count),
         )
 
 
@@ -1075,7 +1080,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.tensor_swap(self.request_last_kv_chunk_offset, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
-    def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> None:
+    def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
 
         This method is responsible for:
@@ -1113,7 +1118,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_tokens (Tensor): Newly sampled tokens, with one token per active request.
 
         Return:
-            None
+            (Tensor) Newly paused request IDs.
         """
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
@@ -1202,6 +1207,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #       a) Put requests that have filled their current chunk and  require a new one in a pause state temporarily
         #       b) Move the paused requests to the left, and active requets to the right
         #       c) Update the paused request count and active_request_count appropriately
+        newly_paused_request_ids = None
         if active_request_count > 0:
             num_tokens_in_last_chunk = self.request_last_kv_chunk_offset[
                 self.paused_request_count : (active_request_count + self.paused_request_count)
@@ -1251,6 +1257,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._move_book_keeping_tensors(
                     src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
                 )
+                newly_paused_request_ids = self.request_ids[dst_idxs]
 
             self.paused_request_count += active_requests_requiring_new_chunk_count
             active_request_count -= active_requests_requiring_new_chunk_count
@@ -1282,6 +1289,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
                 next_tokens=next_tokens,
             )
+        # Remove resumed requests from newly_paused_request_ids. We do this by
+        # truncating the end of newly_paused_request_ids, which works because we
+        # resume requests in LIFO order. If resume_request_count >
+        # len(newly_paused_request_ids), this means that none of the paused
+        # requests are newly paused during this update.
+        if newly_paused_request_ids is not None and resume_request_count > 0:
+            newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
@@ -1350,6 +1364,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_chunk[: self.active_token_count] = (
             self.request_last_kv_chunk_offset[self.paused_request_count : self.total_request_count]
         )
+
+        return newly_paused_request_ids
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False

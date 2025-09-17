@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
-from typing import Any, Type
+from typing import Any, AsyncGenerator, Optional, Type
+
+import numpy as np
 
 from .. import import_class
 from .api import (
@@ -94,7 +96,7 @@ class WeightedMultiTask(
 
         return cls(agent_configs)
 
-    def _distribute_counts(self, total_count: int) -> list[int]:
+    def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
 
         This implementation ensures the most balanced distribution possible while
@@ -102,6 +104,7 @@ class WeightedMultiTask(
 
         Args:
             total_count: Total number of items to distribute
+            distribute_remainder: Whether to distribute the remainder of the counts to the agents with the largest fractional parts
 
         Returns:
             List of counts for each agent, summing to total_count
@@ -120,15 +123,16 @@ class WeightedMultiTask(
         base_counts = [int(count) for count in exact_counts]
         remaining = total_count - sum(base_counts)
 
-        # Sort indices by fractional parts to distribute remaining counts
-        # to those with largest fractional parts first
-        fractional_parts = [count - int(count) for count in exact_counts]
-        indices = list(range(len(rollout_weights)))
-        indices.sort(key=lambda i: fractional_parts[i], reverse=True)
+        if distribute_remainder:
+            # Sort indices by fractional parts to distribute remaining counts
+            # to those with largest fractional parts first
+            fractional_parts = [count - int(count) for count in exact_counts]
+            indices = list(range(len(rollout_weights)))
+            indices.sort(key=lambda i: fractional_parts[i], reverse=True)
 
-        # Distribute remaining counts
-        for i in range(remaining):
-            base_counts[indices[i]] += 1
+            # Distribute remaining counts
+            for i in range(remaining):
+                base_counts[indices[i]] += 1
 
         # Map back to original indices, skipping evaluation-only agents
         final_counts = []
@@ -141,6 +145,16 @@ class WeightedMultiTask(
                 rollout_idx += 1
 
         return final_counts
+
+    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
+        raise NotImplementedError(
+            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
+        )
+
+    async def rollout(self, request: RolloutRequest) -> Rollout:
+        raise NotImplementedError(
+            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."
+        )
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
         """Distribute rollouts across sub-agents according to weights."""
@@ -162,14 +176,20 @@ class WeightedMultiTask(
         all_rollouts_lists = await asyncio.gather(*tasks)
         return [rollout for rollouts in all_rollouts_lists for rollout in rollouts]
 
-    async def get_grouped_rollouts(self, request: GroupedRolloutRequest) -> list[list[Rollout]]:
+    async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
+        if request.num_groups > 0:
+            agent_groups = self._distribute_counts(request.num_groups)
+        else:
+            agent_groups = [-1 if not agent.evaluation_only else 0 for agent in self.agent_configs]
+        parallel_generation_tasks = request.num_groups if request.num_groups > 0 else 10
+        agent_slots = self._distribute_counts(parallel_generation_tasks, distribute_remainder=False)
+        agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
         # Create tasks for each agent with non-zero groups
-        tasks = []
+        generators: list[AsyncGenerator[list[Rollout], None]] = []
         for agent, num_groups in zip(self.agents, agent_groups):
-            if num_groups > 0:
+            if num_groups != 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
@@ -183,11 +203,40 @@ class WeightedMultiTask(
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
                 )
-                tasks.append(agent.get_grouped_rollouts(agent_request))
+                group_generator = agent.get_grouped_rollouts(agent_request)
+                generators.append(group_generator)
+            else:
+                generators.append(None)
 
-        # Run all tasks concurrently and gather results
-        all_groups_lists = await asyncio.gather(*tasks)
-        return [group for groups in all_groups_lists for group in groups]
+        while any(generators):
+            balanced_rollouts = asyncio.Queue()
+
+            async def get_balanced_rollouts_if_remaining(agent_id):
+                generated_rollouts = 0
+                while generated_rollouts < agent_slots[agent_id]:
+                    if generators[agent_id] is None:
+                        return
+                    try:
+                        await balanced_rollouts.put(await anext(generators[agent_id]))
+                        generated_rollouts += 1
+                    except StopAsyncIteration:
+                        await balanced_rollouts.put(None)
+                        generators[agent_id] = None
+                        return
+
+            tasks = [
+                asyncio.create_task(get_balanced_rollouts_if_remaining(agent_id))
+                for agent_id in range(len(generators))
+            ]
+
+            try:
+                while balanced_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
+                    rollout = await balanced_rollouts.get()
+                    if rollout is not None:
+                        yield rollout
+            finally:
+                for task in tasks:
+                    task.cancel()
 
     async def get_contrastive_rollouts(self, request: RolloutRequest) -> list[ContrastiveRollout]:
         """Distribute contrastive rollouts across sub-agents according to weights."""

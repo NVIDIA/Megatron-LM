@@ -410,14 +410,15 @@ class TextGenerationController:
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
-    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
         """Forward step the model and update the inference context.
 
         Args:
             sampling_params (SamplingParams): Parameters for sampling logits.
 
         Return:
-            (Optional[Tuple[Tensor, Tensor, Tensor]]) Current request IDs, new sample.
+            (Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]) Current request IDs,
+                paused request IDs, finished request IDs, new sample.
         """
 
         context = self.inference_wrapped_model.inference_context
@@ -441,6 +442,9 @@ class TextGenerationController:
 
         # Initialize attention state.
         context.initialize_attention_state()
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
 
         # Get flat tokens, position ids.
         input_ids, position_ids = context.current_input_and_position_ids()
@@ -513,7 +517,7 @@ class TextGenerationController:
         )
 
         # Active sequence lengths.
-        current_request_ids = context.request_ids[
+        active_request_ids = context.request_ids[
             context.paused_request_count : context.total_request_count
         ].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -539,9 +543,16 @@ class TextGenerationController:
             )
 
         # Update requests.
-        context.update_requests(active_request_mask, new_sample_copy)
+        newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
 
-        return current_request_ids, finished_request_ids, new_sample, log_probs
+        return {
+            "active_request_ids": active_request_ids,
+            "newly_paused_request_ids": newly_paused_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "sample": new_sample,
+            "log_probs": log_probs,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

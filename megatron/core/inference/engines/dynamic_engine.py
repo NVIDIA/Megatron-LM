@@ -94,6 +94,8 @@ class DynamicInferenceEngine(AbstractEngine):
         termination_id: int,
         enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
+        *,
+        track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
     ):
 
@@ -114,9 +116,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
         self.termination_id = termination_id
         self.random_seed = random_seed
+        self.track_paused_request_events = track_paused_request_events
         self.step_count = 0
         self.finished_request_count = 0
         self.waiting_request_ids = deque()
+        self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
         self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
@@ -370,6 +374,35 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_count = 0
         self.finished_request_count = 0
 
+    def _add_request(
+        self, request: DynamicInferenceRequest
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+
+        request_id = request.request_id
+        self.requests[request_id] = request
+        if request.status is None:
+            request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        if request.sampling_params.num_tokens_to_generate is None:
+            request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(request.prompt_tokens)
+        elif len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate > self.context.max_sequence_length:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(MaxSequenceLengthOverflowError())
+            self.waiting_request_ids.append(request_id)
+            raise MaxSequenceLengthOverflowError()
+
+        if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(TokenOverflowError())
+            self.waiting_request_ids.append(request_id)
+            raise TokenOverflowError()
+
+        self.waiting_request_ids.append(request_id)
+
+        # Create a new asyncio Future to notify the user when the request has completed.
+        self.request_completion_futures[request_id] = asyncio.Future()
+        return self.request_completion_futures[request_id]
+
     def add_request(
         self,
         request_id: int,
@@ -409,25 +442,15 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        if num_tokens_to_generate is None:
-            num_tokens_to_generate = self.context.max_sequence_length - len(tokens)
-        elif len(tokens) + num_tokens_to_generate > self.context.max_sequence_length:
-            raise MaxSequenceLengthOverflowError()
-
-        if len(tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
-            raise TokenOverflowError()
-
-        self.requests[request_id] = DynamicInferenceRequest(
+        # Initialize request.
+        request = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),
         )
 
-        self.waiting_request_ids.append(request_id)
-
-        # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
-        return self.request_completion_futures[request_id]
+        # Add request.
+        return self._add_request(request)
 
     def post_process_requests(
         self,
@@ -523,6 +546,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._loop.call_soon_threadsafe(
                     asyncio.create_task, self._notify_cond_for_new_request()
                 )
+
+                req.add_event_add()
                 self.waiting_request_ids.popleft()
             else:
                 break
@@ -567,6 +592,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._loop.call_soon_threadsafe(
                         asyncio.create_task, self._notify_cond_for_new_request()
                     )
+                    req.add_event_add()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                 elif token_partially_satisfied:
@@ -630,22 +656,46 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
 
+        # Increment finished_request_count.
+        cuda_graph_request_count = None
         if result is not None:
-            request_ids, finished_request_ids, sample, log_probs = result
+            active_request_ids = result["active_request_ids"]
+            newly_paused_request_ids = result["newly_paused_request_ids"]
+            finished_request_ids = result["finished_request_ids"]
+            sample = result["sample"]
+            log_probs = result["log_probs"]
+            cuda_graph_request_count = result["cuda_graph_request_count"]
 
-            # TODO: Move this to a background thread?
+            # Add paused events.
+            if newly_paused_request_ids is not None and self.track_paused_request_events:
+                newly_paused_request_ids = newly_paused_request_ids.tolist()
+                [self.requests[i].add_event_pause() for i in newly_paused_request_ids]
+
+            # Mark requests finished.
+            [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
+
+            # Add finished events.
             if post_process_requests_locally:
                 (active_requests, finished_requests) = self.post_process_requests(
-                    request_ids, finished_request_ids, step_time, sample, log_probs
+                    active_request_ids, finished_request_ids, step_time, sample, log_probs
                 )
             else:
-                return request_ids, finished_request_ids, sample, log_probs
+                return active_request_ids, finished_request_ids, sample, log_probs
 
         else:
             if not post_process_requests_locally:
                 return None
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
+
+        # Failed requests.
+        for failed_request_id in self.failed_request_ids:
+            failed_request = self.requests.pop(failed_request_id)
+            failed_request.status = Status.FAILED
+            failed_request.add_event_fail()
+            finished_requests.append(failed_request)
+            self.request_completion_futures[failed_request_id].set_result(failed_request)
+        self.failed_request_ids.clear()
 
         # Print context state.
         if verbose:
@@ -689,15 +739,38 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_count += 1
         self.is_decode_only = is_decode_only
         range_pop()
-        return active_requests, finished_requests, step_time
+        return {
+            "active_requests": active_requests,
+            "finished_requests": finished_requests,
+            "step_time": step_time,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
 
-    def step(
+    def step_modern(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         return self._loop.run_until_complete(
             self.async_step(sampling_params=sampling_params, verbose=verbose)
         )
+
+    def step_legacy(
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """Synchronous wrapper for `self.async_step`."""
+        warnings.warn(
+            "`step_legacy()` is deprecated and will be removed in `megatron-core` "
+            "0.16. Please use `step_modern()` going forward, which will eventually "
+            "be renamed to `step()`."
+        )
+        result = self._loop.run_until_complete(
+            self.async_step(sampling_params=sampling_params, verbose=verbose)
+        )
+        return (result["active_requests"], result["finished_requests"], result["step_time"])
+
+    # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
+    # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
+    step = step_legacy
 
     def generate(
         self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
@@ -710,8 +783,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         finished_requests_list = []
         while self.has_unfinished_requests():
-            active_requests, finished_requests, step_time = self.step(sampling_params)
-            finished_requests_list.extend(finished_requests)
+            result = self.step_modern(sampling_params)
+            finished_requests_list.extend(result["finished_requests"])
 
         return finished_requests_list
 

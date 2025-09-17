@@ -29,11 +29,11 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
-	--expert-tensor-parallel-size ${ETP} \
+        --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
-	--pretrained-model-path ${HF_MODEL_CKPT} \
+        --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_QUANT_CKPT} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
@@ -42,7 +42,7 @@ else
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
-	--expert-tensor-parallel-size ${ETP} \
+        --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
         --tokenizer-model ${TOKENIZER_MODEL} \

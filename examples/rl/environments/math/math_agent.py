@@ -1,4 +1,5 @@
 import re
+import traceback
 
 from megatron.rl.agent.reward_only_agent import PassAtEvaluationAgent
 
@@ -16,6 +17,8 @@ else:
 assert (
     MATHVERIFY_AVAILABLE
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
+
+NEGATIVE_REWARD = 0.0
 
 
 class MathAgent(PassAtEvaluationAgent):
@@ -42,9 +45,15 @@ class MathAgent(PassAtEvaluationAgent):
                 break
         else:
             # Did not format the answer correctly
-            return 0.0
+            return NEGATIVE_REWARD
 
-        parsed_answer = parse(final_answer)
+        try:
+            parsed_answer = parse(final_answer)
+        except ValueError as e:
+            print("Failed to parse the answer.")
+            traceback.print_stack()
+            return NEGATIVE_REWARD
+
         correct_answer = verify(str(golden[golden_key]), parsed_answer)
         if correct_answer:
             return 1.0

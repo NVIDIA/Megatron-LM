@@ -39,32 +39,16 @@ spec:
     ls
     cd /opt/megatron-lm
 
-    ARGUMENTS=(
-        "CHECKPOINT_LOAD_PATH=/workspace/data"
-        "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
-        "DATA_PATH=/workspace/data"
-        "DATA_CACHE_PATH=/workspace/data/cache"
-        "TRAINING_SCRIPT_PATH=examples/inference/gpt/gpt_dynamic_inference_with_coordinator.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
-        "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/generations.json"
-        "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=false"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
-    )
-
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+    uv run python -m torch.distributed.run \
+      --log-dir {assets_dir}/logs/1 \
+      --tee "0:3,7:3" \
+      --redirects "3" \
+      --nproc_per_node 1 \
+      tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation/cuda_graphs.py --checkpoint-dir /workspace/data/mcore_mistral/model --tokenizer-model /workspace/data/mcore_mistral/tokenizer/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
 
 products:
-  - test_case: [gpt_dynamic_inference_tp8_pp1_dp1_583m_logitsmatch_zmq]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation]
     products:
       - environment: [dev]
-        scope: [flaky]
+        scope: [mr-broken]
         platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  
