@@ -291,8 +291,8 @@ def main():
     parser = argparse.ArgumentParser(description='Comprehensive tensor overflow/underflow analysis')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs',
                         help='Base directory containing tensor files (default: enhanced_tensor_logs)')
-    parser.add_argument('--output-dir', default='visualization',
-                        help='Output directory for reports (default: visualization)')
+    parser.add_argument('--output-dir', default='./draw/overflow_summary/',
+                        help='Output directory for reports (default: ./draw/overflow_summary/)')
     
     args = parser.parse_args()
     

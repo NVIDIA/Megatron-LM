@@ -1,5 +1,0 @@
-data_format,description,total_files,total_elements,total_overflow,total_underflow,overflow_percent,underflow_percent,files_with_overflow,files_with_underflow,global_min,global_max,avg_mean,format_min,format_max
-bf16,Brain Float 16-bit,194,589840961,0,12,0.0,2.034446705711237e-06,0,11,-30.451574,42.0,1.0982466,-65504.0,65504.0
-hifp8,Huawei HiFP8 E4M3 format,194,588840967,2,51,3.396502811598705e-07,8.661082169576696e-06,1,26,-11.879945,42.0,nan,-32768.0,32768.0
-mxfp8,Microsoft MX FP8 E4M3 format,194,589840961,0,601451,0.0,0.10196833379972742,0,193,-9.479769,42.0,1.0985436,-448.0,448.0
-mxfp4,Microsoft MX FP4 E2M1 format,193,588840961,2954983,88442948,0.5018304084997238,15.01983623044865,193,192,-9.639844,42.0,1.6456704,-6.0,6.0

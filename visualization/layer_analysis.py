@@ -532,8 +532,8 @@ def main():
                         help='Type of tensor operation to analyze')
     parser.add_argument('--base-dir', default='enhanced_tensor_logs',
                         help='Base directory containing tensor files (default: enhanced_tensor_logs)')
-    parser.add_argument('--output-dir', default='visualization',
-                        help='Output directory for plots and reports (default: visualization)')
+    parser.add_argument('--output-dir', default='./draw/layer_analysis/',
+                        help='Output directory for plots and reports (default: ./draw/layer_analysis/)')
     parser.add_argument('--format', choices=['bf16', 'hifp8', 'mxfp8', 'mxfp4'],
                         help='Specific data format to analyze (default: all formats)')
     
