@@ -104,6 +104,31 @@ def create_distribution_plot(tensor_data, data_format, filename, output_path):
     
     format_info = DATA_TYPE_INFO[data_format]
     
+    # Calculate data statistics for dynamic range adjustment
+    data_min, data_max = np.min(tensor_data), np.max(tensor_data)
+    data_range = data_max - data_min
+    data_abs_max = max(abs(data_min), abs(data_max))
+    
+    # Check for actual overflow/underflow
+    min_denormal = format_info['min_denormal']
+    max_normal = format_info['max']
+    
+    has_overflow = np.any(np.abs(tensor_data) > max_normal)
+    has_underflow = np.any((tensor_data != 0.0) & (np.abs(tensor_data) < min_denormal))
+    
+    # Dynamic range calculation - focus on data distribution
+    if data_range > 0:
+        margin = data_range * 0.15  # 15% margin
+        plot_min = data_min - margin
+        plot_max = data_max + margin
+        
+        # Ensure underflow boundary is visible if relevant
+        if min_denormal > 0 and data_abs_max > min_denormal * 0.1:
+            plot_min = min(plot_min, -min_denormal * 1.5)
+            plot_max = max(plot_max, min_denormal * 1.5)
+    else:
+        plot_min, plot_max = data_min - 1, data_max + 1
+    
     # Create figure
     plt.figure(figsize=(14, 10))
     
@@ -113,40 +138,40 @@ def create_distribution_plot(tensor_data, data_format, filename, output_path):
                                    color=format_info['color'], density=True,
                                    label=f'Tensor Values (n={len(tensor_data):,})')
     
-    # Get y-axis limits for vertical lines
-    y_min, y_max = plt.ylim()
+    # Set dynamic x-axis range
+    plt.xlim(plot_min, plot_max)
     
-    # Add representable values as vertical red lines
+    # Add representable values as vertical red lines (filtered to plot range)
     if format_info['representable_values'] is not None:
         rep_values = np.array(format_info['representable_values'])
+        visible_rep_values = rep_values[(rep_values >= plot_min) & (rep_values <= plot_max)]
         
-        # Filter representable values to visible range (with some margin)
-        data_min, data_max = np.min(tensor_data), np.max(tensor_data)
-        data_range = data_max - data_min
-        margin = data_range * 0.2  # 20% margin on each side
-        visible_min = data_min - margin
-        visible_max = data_max + margin
-        
-        visible_rep_values = rep_values[(rep_values >= visible_min) & (rep_values <= visible_max)]
-        
-        print(f"Showing {len(visible_rep_values)} representable values in visible range [{visible_min:.3f}, {visible_max:.3f}]")
+        print(f"Showing {len(visible_rep_values)} representable values in range [{plot_min:.3f}, {plot_max:.3f}]")
         
         # Add vertical lines for representable values
         for val in visible_rep_values:
             plt.axvline(val, color='red', alpha=0.6, linewidth=1.0, zorder=3)
     
-    # Add format boundary indicators
-    plt.axvline(format_info['max'], color='darkred', linestyle='--', linewidth=2, 
-               alpha=0.9, label=f'Max Normal (±{format_info["max"]:.1e})', zorder=4)
-    plt.axvline(-format_info['max'], color='darkred', linestyle='--', linewidth=2, 
-               alpha=0.9, zorder=4)
+    # Add overflow boundaries only if relevant (actual overflow or values close to boundary)
+    if has_overflow or data_abs_max > max_normal * 0.5:
+        if plot_max >= max_normal:
+            plt.axvline(max_normal, color='darkred', linestyle='--', linewidth=2, 
+                       alpha=0.9, label=f'Overflow Boundary (+{max_normal:.1e})', zorder=4)
+        if plot_min <= -max_normal:
+            plt.axvline(-max_normal, color='darkred', linestyle='--', linewidth=2, 
+                       alpha=0.9, label=f'Overflow Boundary (-{max_normal:.1e})', zorder=4)
     
-    # Add underflow threshold indicators
-    min_denormal = format_info['min_denormal']
-    plt.axvline(min_denormal, color='orange', linestyle=':', linewidth=2, 
-               alpha=0.9, label=f'Min Denormal (+{min_denormal:.1e})', zorder=4)
-    plt.axvline(-min_denormal, color='orange', linestyle=':', linewidth=2, 
-               alpha=0.9, zorder=4)
+    # Always show underflow boundaries (critical for precision analysis)
+    if plot_max >= min_denormal:
+        plt.axvline(min_denormal, color='orange', linestyle=':', linewidth=2, 
+                   alpha=0.9, label=f'Underflow Boundary (+{min_denormal:.1e})', zorder=4)
+    if plot_min <= -min_denormal:
+        plt.axvline(-min_denormal, color='orange', linestyle=':', linewidth=2, 
+                   alpha=0.9, label=f'Underflow Boundary (-{min_denormal:.1e})', zorder=4)
+    
+    # Add zero reference line
+    if plot_min < 0 < plot_max:
+        plt.axvline(0, color='gray', linestyle='-', linewidth=1, alpha=0.5, label='Zero')
     
     # Calculate and display statistics
     tensor_min = np.min(tensor_data)
