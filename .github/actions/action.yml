@@ -118,7 +118,6 @@ runs:
 
         docker exec -t test_container_${{ github.run_id }} bash -c '
           set -e
-          ls -al /workspace/
           bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
             --tag ${{ inputs.tag }} \
             --environment dev \
@@ -140,6 +139,7 @@ runs:
 
         docker exec -t test_container_${{ github.run_id }} bash -c '
           set -e
+          ls -al /workspace/
           ARGUMENTS=(
             "DATA_PATH=/workspace/data/bert_data"
             "DATA_CACHE_PATH=/workspace/data/cache" 
