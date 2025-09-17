@@ -7,6 +7,7 @@ This directory contains tools for analyzing and visualizing tensor data across d
 - `overflow.py` - **Value-level analysis**: Shows percentage of tensor values that overflow/underflow within files
 - `overflow_summary.py` - **File-level analysis**: Shows percentage of tensor files that have overflow/underflow issues  
 - `layer_analysis.py` - Layer-specific analysis and visualization
+- `distribution.py` - **Single tensor distribution**: Visualizes tensor value distribution against format's representable values
 - `README.md` - This documentation file
 
 ### Key Difference
@@ -58,7 +59,26 @@ python overflow.py enhanced_tensor_logs/bf16/ --recursive --output bf16_value_an
 python overflow.py enhanced_tensor_logs/mxfp4/ --recursive --format csv --output mxfp4_value_results.csv
 ```
 
-### 3. Layer-Specific Analysis
+### 3. Single Tensor Distribution Analysis
+
+Visualize how well a specific tensor fits within a data format's representable values:
+
+```python
+# Basic distribution analysis
+python distribution.py enhanced_tensor_logs/bf16/tensor_file.pt
+
+# With detailed statistics
+python distribution.py enhanced_tensor_logs/mxfp4/tensor_file.pt --show-stats
+
+# Custom output directory
+python distribution.py tensor_file.pt --output-dir /path/to/output/
+```
+
+This will generate:
+- `tensor_name.png` - Distribution plot with representable values overlay
+- Console output with usability assessment (EXCELLENT/GOOD/CAUTION/POOR)
+
+### 4. Layer-Specific Analysis
 
 Analyze specific layers, ranks, and tensor types:
 
@@ -105,6 +125,16 @@ This will generate:
    - **Primary focus**: Percentage of values that overflow/underflow within each file
    - Detailed statistics for each tensor file
    - File-by-file breakdown of problematic values
+
+### Distribution Analysis Outputs (from distribution.py)
+
+1. **Distribution Plots (PNG files)**
+   - Histogram of tensor value distribution
+   - **Red vertical lines**: All representable values in the data format
+   - **Dark red dashed lines**: Overflow boundaries (±max_normal)
+   - **Orange dotted lines**: Underflow boundaries (±min_denormal)
+   - **Statistics box**: Complete analysis summary
+   - **Usability assessment**: Color-coded recommendation (🟢🟡🟠🔴)
 
 ### Layer Analysis Outputs
 
