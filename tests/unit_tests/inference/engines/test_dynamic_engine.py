@@ -463,6 +463,7 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         for request_id, request in enumerate(env.requests):
             env.engine.add_request(request_id, request.prompt, request.num_tokens_to_generate)
+        env.engine.schedule_waiting_requests()
         assert list(env.engine.waiting_request_ids) == [
             1,
             2,
@@ -640,6 +641,7 @@ class TestDynamicInferenceEngine:
             env.engine.add_request(
                 request_id, env.requests[request_id].prompt, num_tokens_to_generate=1
             )
+        env.engine.schedule_waiting_requests()
 
         # we should now have more active tokens than max requests.
         context.initialize_attention_state()

@@ -405,7 +405,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
 
         # Deal with chunked prefill
-        self.have_chunked_prefill = False
+        self.chunked_prefill_request_id = -1
 
         # Reset attention state.
         self.reset_attention_state()
@@ -706,7 +706,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * self.cuda_graph_step_size
             )
             self.padded_active_token_count = min(self.padded_active_token_count, self.max_requests)
-            assert self.padded_active_token_count in self.cuda_graph_token_counts_set
+            assert (
+                self.padded_active_token_count in self.cuda_graph_token_counts_set
+            ), f"padded_active_token_count: {self.padded_active_token_count} not in cuda_graph_token_counts_set: {self.cuda_graph_token_counts_set}"
             assert self.padded_active_token_count >= active_token_count
         else:
             self.padded_active_token_count = self.round_up_tokens(self.active_token_count)
@@ -868,6 +870,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunk_allocator.reset()
         self.request_to_kv_chunk_ids.fill_(-1)
 
+        # Reset chunked prefill state
+        self.chunked_prefill_request_id = -1
+
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -926,8 +931,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_satisfied = self.total_request_count < self.max_requests
         token_satisfied = self.active_token_count + req.prompt_length <= self.max_tokens
         chunks = math.ceil(
-            (req.prompt_length + req.finished_chunked_tokens) / self.chunk_size_tokens
-        ) - math.ceil(req.finished_chunked_tokens / self.chunk_size_tokens)
+            (req.prompt_length + req.finished_chunk_token_count) / self.chunk_size_tokens
+        ) - math.ceil(req.finished_chunk_token_count / self.chunk_size_tokens)
         kv_cache_available = self.chunk_allocator.is_memory_available(chunks, safe=safe)
         return request_satisfied, token_satisfied, kv_cache_available
 
@@ -935,7 +940,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
         Args:
-            req (ContextWaitingRequest): Request to add.
+            req (DynamicInferenceRequest): Request to add.
             chunk_length (Optional[int]): Length of chunk to add. If None, the request will be fully added.
 
         Return:
@@ -944,26 +949,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         if chunk_length is None:
             chunk_length = req.prompt_length
 
+        assert chunk_length > 0, "Chunk length is 0"
+        assert chunk_length <= req.prompt_length, "Chunk length is greater than prompt length"
+        if self.active_token_count + chunk_length > self.max_tokens:
+            raise TokenOverflowError()
+
         this_round_tokens = req.prompt_tokens[:chunk_length]
-        this_round_length = len(this_round_tokens)
-        assert this_round_length > 0, "Chunk length is 0"
-        assert this_round_length <= req.prompt_length, "Chunk length is greater than prompt length"
-        # `context_length` here is the equal to prompt length, and does not
-        # include output length.
-        context_length = this_round_length
-        if context_length > self.max_tokens:
-            # **Note**: for `megatron-core >= 0.15`, this assert should be
-            # `is_transient=False`. For backwards compatibility with legacy tests,
-            # this must be `True` for one version cycle of `megatron-core`.
-            # raise TokenOverflowError(is_transient=False)
-            raise TokenOverflowError(is_transient=True)
 
         # only allocate new chunks
         already_allocated_chunks = (
-            req.finished_chunked_tokens + self.chunk_size_tokens - 1
+            req.finished_chunk_token_count + self.chunk_size_tokens - 1
         ) // self.chunk_size_tokens  # ceiling division
         overall_required_chunks = (
-            req.finished_chunked_tokens + this_round_length + self.chunk_size_tokens - 1
+            req.finished_chunk_token_count + chunk_length + self.chunk_size_tokens - 1
         ) // self.chunk_size_tokens  # ceiling division
 
         num_chunks_needed = overall_required_chunks - already_allocated_chunks
@@ -972,14 +970,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(
                 num_chunks_needed, safe=True
             )
-            assert (
-                new_chunk_ids is not None and len(new_chunk_ids) == num_chunks_needed
-            ), "Chunk allocation failed"
+            if new_chunk_ids is None or len(new_chunk_ids) != num_chunks_needed:
+                raise ChunkOverflowError()
 
-        # req.finished_chunked_tokens > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
+        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
         # in this case, it is exactly the last request in the current system (see dynamic_engine.py, schedule_chunked_prefill invariants)
         # no need to update count, as it is already here
-        if req.finished_chunked_tokens > 0:
+        if req.finished_chunk_token_count > 0:
             current_id = self.total_request_count - 1
             self.active_token_count -= (
                 1  # Overwrite the last token, which is the useless token from chunked prefill
@@ -990,51 +987,57 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             current_id = self.total_request_count
 
+        if current_id >= self.max_requests:
+            raise RequestOverflowError()
+
+        if self.active_token_count + chunk_length > self.max_tokens:
+            raise TokenOverflowError()
+
         self.request_ids[current_id] = req.request_id
-        self.request_query_lengths[current_id] = this_round_length
+        self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
-            req.finished_chunked_tokens
-            + this_round_length
+            req.finished_chunk_token_count
+            + chunk_length
             + req.sampling_params.num_tokens_to_generate
         )
         if num_chunks_needed > 0:
             self.request_to_kv_chunk_ids[current_id][
                 already_allocated_chunks:overall_required_chunks
             ] = new_chunk_ids
-        self.request_kv_length_offsets[current_id] = req.finished_chunked_tokens
+        self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count
         self.request_kv_chunk_counts[current_id] = overall_required_chunks
         self.request_last_kv_chunk_id[current_id] = self.request_to_kv_chunk_ids[current_id][
             overall_required_chunks - 1
         ]
         self.request_last_kv_chunk_offset[current_id] = (
-            this_round_length + req.finished_chunked_tokens - 1
+            chunk_length + req.finished_chunk_token_count - 1
         ) % self.chunk_size_tokens
         # self.num_prefill_requests += 1 # FUTURE MR: in update, all requests are set to decode, so here we need to add 1 for both chunked or not
         token_offset_range = torch.arange(
-            req.finished_chunked_tokens,
-            req.finished_chunked_tokens + this_round_length,
+            req.finished_chunk_token_count,
+            req.finished_chunk_token_count + chunk_length,
             device=self.token_to_pos_ids.device,
         )
-        self.token_to_pos_ids[
-            self.active_token_count : self.active_token_count + this_round_length
-        ] = token_offset_range
+        self.token_to_pos_ids[self.active_token_count : self.active_token_count + chunk_length] = (
+            token_offset_range
+        )
         self.token_to_input_ids[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = this_round_tokens
         self.token_to_request_idx[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = current_id
         self.token_to_position_in_request[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = token_offset_range
         self.token_to_chunk_idx[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = self.request_to_kv_chunk_ids[current_id][token_offset_range // self.chunk_size_tokens]
         self.token_to_local_position_within_kv_chunk[
-            self.active_token_count : self.active_token_count + this_round_length
+            self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.chunk_size_tokens)
-        self.active_token_count += this_round_length
-        self.total_request_count += 0 if req.finished_chunked_tokens > 0 else 1
+        self.active_token_count += chunk_length
+        self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
 
     def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
@@ -1116,13 +1119,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
 
-        if self.have_chunked_prefill:
+        if self.chunked_prefill_request_id != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
-            current_chunk_request_id = self.request_ids[
-                len(active_requests_mask) + self.paused_request_count - 1
-            ]
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -1210,9 +1210,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_tokens_in_last_chunk == self.chunk_size_tokens - 1
             ).byte()
 
-            if self.have_chunked_prefill:
-                # find the id in request_ids that is the current_chunk_request_id. Only one request should be chunked.
-                pos = torch.where(self.request_ids == current_chunk_request_id)[0][0]
+            if self.chunked_prefill_request_id != -1:
+                # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
+                pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
                 active_requests_requiring_new_chunk[pos] = 0  # chunked prefill should not be paused
 
             active_requests_requiring_new_chunk_count = (
@@ -1275,14 +1275,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert active_request_count > 0, "active_request_count == %d." % active_request_count
 
         # finally, swap the chunked prefill to the end of the active requests to obey the invariant
-        if self.have_chunked_prefill:
-            pos = torch.where(self.request_ids == current_chunk_request_id)[0][0]
+        if self.chunked_prefill_request_id != -1:
+            pos = torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
             self._swap_book_keeping_tensors(
                 src_idxs=torch.tensor([pos]),
                 dst_idxs=torch.tensor([active_request_count + self.paused_request_count - 1]),
                 next_tokens=next_tokens,
             )
-            self.have_chunked_prefill = False
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
