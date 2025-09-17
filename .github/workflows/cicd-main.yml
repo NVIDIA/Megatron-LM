@@ -127,7 +127,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          test_case: tests/${{ matrix.test_case }}
+          test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
