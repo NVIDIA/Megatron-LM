@@ -221,7 +221,7 @@ def analyze_file(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze tensor files for overflow/underflow conditions')
-    parser.add_argument('input_path', help='Path to tensor file or directory')
+    parser.add_argument('input_paths', nargs='+', help='Path(s) to tensor file(s) or directory')
     parser.add_argument('--output', '-o', default='./draw/tensor_overflow/', help='Output file for results (default: ./draw/tensor_overflow/)')
     parser.add_argument('--format', '-f', choices=['txt', 'csv', 'json'], default='txt',
                         help='Output format (default: txt)')
@@ -230,24 +230,29 @@ def main():
     
     args = parser.parse_args()
     
-    input_path = Path(args.input_path)
     results = []
     
-    if input_path.is_file():
-        # Single file analysis
-        result = analyze_file(str(input_path))
-        if result:
-            results.append(result)
-    elif input_path.is_dir():
-        # Directory analysis
-        pattern = "**/*.pt" if args.recursive else "*.pt"
-        for filepath in input_path.glob(pattern):
-            result = analyze_file(str(filepath))
+    # Process each input path
+    for input_path_str in args.input_paths:
+        input_path = Path(input_path_str)
+        
+        if input_path.is_file():
+            # Single file analysis
+            print(f"Processing file: {input_path.name}")
+            result = analyze_file(str(input_path))
             if result:
                 results.append(result)
-    else:
-        print(f"Error: Path does not exist: {input_path}")
-        return 1
+        elif input_path.is_dir():
+            # Directory analysis
+            print(f"Processing directory: {input_path.name}")
+            pattern = "**/*.pt" if args.recursive else "*.pt"
+            for filepath in input_path.glob(pattern):
+                result = analyze_file(str(filepath))
+                if result:
+                    results.append(result)
+        else:
+            print(f"Warning: Path does not exist: {input_path}")
+            continue
     
     if not results:
         print("No valid tensor files found or processed.")
@@ -265,14 +270,19 @@ def main():
     if str(output_path).endswith('/') or output_path.is_dir() or (not output_path.suffix and not output_path.exists()):
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Generate filename: same as input but with .log extension
-        input_path_obj = Path(args.input_path)
-        if input_path_obj.is_file():
-            # For single file: change extension to .log
-            filename = input_path_obj.stem + '.log'
+        # Generate filename based on input paths
+        if len(args.input_paths) == 1:
+            # Single input: same as input but with .log extension
+            input_path_obj = Path(args.input_paths[0])
+            if input_path_obj.is_file():
+                filename = input_path_obj.stem + '.log'
+            else:
+                filename = input_path_obj.name + '.log'
         else:
-            # For directory: use directory name + .log
-            filename = input_path_obj.name + '.log'
+            # Multiple inputs: use timestamp-based filename
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"multi_tensor_analysis_{timestamp}.log"
         
         output_path = output_path / filename
     else:

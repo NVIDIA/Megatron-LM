@@ -47,13 +47,16 @@ Analyze what percentage of tensor values overflow/underflow within specific file
 
 ```python
 # Analyze a single tensor file (shows % of values that overflow)
-python overflow.py enhanced_tensor_logs/bf16/20250915_040743_0272_iter000_linear_L16_forward_post_linear_bf16_rank07_group000_output.pt
+python overflow.py enhanced_tensor_logs/bf16/tensor_file.pt
+
+# Analyze multiple tensor files at once
+python overflow.py file1.pt file2.pt file3.pt
 
 # Analyze all files in a directory (shows % of values in each file)
 python overflow.py enhanced_tensor_logs/bf16/ --recursive
 
-# Save results to file
-python overflow.py enhanced_tensor_logs/bf16/ --recursive --output bf16_value_analysis.txt
+# Mix files and directories
+python overflow.py tensor1.pt enhanced_tensor_logs/bf16/ tensor2.pt --recursive
 
 # Generate CSV output
 python overflow.py enhanced_tensor_logs/mxfp4/ --recursive --format csv --output mxfp4_value_results.csv
