@@ -29,7 +29,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
-
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DataIterator:
 
@@ -231,15 +231,16 @@ class DualEncoderModel(SingleEncoderModel):
                 self.llm_input_tensor = input_tensor[0]["llm"][0]
             elif 'encoder_1' in input_tensor[0] and 'encoder_2' in input_tensor[0]:
                 # concat across sequence dimension (s, b, h)
-                self.llm_input_tensor = torch.concat(input_tensor[0]["encoder_1"], input_tensor[0]["encoder_2"], dim=0)
+                logging.debug(f'In DualEncoderModel LLM set_input_tensor rank {dist.get_rank()} encoder_1 shape: {input_tensor[0]["encoder_1"].shape} encoder_2 shape: {input_tensor[0]["encoder_2"].shape}')
+                self.llm_input_tensor = torch.concat([input_tensor[0]["encoder_1"], input_tensor[0]["encoder_2"]], dim=0)
                 logging.debug(f" In DualEncoderModel LLM set_input_tensor rank {dist.get_rank()} llm_input_tensor shape: {self.llm_input_tensor.shape}")
             else:
                 raise ValueError(f"Rank {dist.get_rank()} is not valid")
     
-    def finalize_model_grads(self):
+    def finalize_model_grads(self, module=None, num_tokens=None, pg_collection=None):
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
-                finalize_model_grads(module, num_tokens=None, pg_collection=_get_pg_collection_from_grid(grid))
+                finalize_model_grads([self], num_tokens=None, pg_collection=_get_pg_collection_with_embedding_groups(grid))
                
 
     def forward(self, hidden_states):
@@ -270,7 +271,7 @@ class DualEncoderModel(SingleEncoderModel):
             ), "LLM input tensor is not provided for pp rank > 0"
             input_tensor = self.llm_input_tensor
             output_dict["llm"] = self.llm(input_tensor, attention_mask=None)
-        print(f"[Yash] Debug: model fwd pass in rank {dist.get_rank()} output_dict keys: {output_dict.keys()}")
+        logging.debug(f"[DualEncoderModel] model fwd pass in rank {dist.get_rank()} output_dict keys: {output_dict.keys()}")
         return output_dict
 
 def _create_transformer_block(
@@ -526,7 +527,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
 def test_forward_backward_pipelining_without_interleaving_multi_module_dual_encoder(
     mocker, encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
 ):
-
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
     Utils.initialize_distributed()
 
     def step_func(data_iterator, model):
