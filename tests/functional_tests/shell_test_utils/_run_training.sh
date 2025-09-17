@@ -152,9 +152,9 @@ export WANDB_API_KEY="${WANDB_API_KEY:-}"
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
 LAST_RANK=7
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
@@ -164,7 +164,7 @@ DISTRIBUTED_ARGS=(
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
-    --node_rank $SLURM_NODEID
+    --node_rank $NODE_RANK
     --log-dir $LOG_DIR
     --tee "0:3,7:3"
     --redirects "3"
