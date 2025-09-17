@@ -206,6 +206,29 @@ jobs:
             exit 1
           fi
 
+  Coverage_Fake:
+    runs-on: ubuntu-latest
+    needs: [Nemo_CICD_Test, pre-flight]
+    if: |
+      (needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && !cancelled()
+    environment: nemo-ci
+    steps:
+      - name: Generate fake coverage report
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo, 
+              sha: context.sha,
+              state: 'success',
+              description: 'No code changes - coverage check skipped',
+              context: 'codecov/patch'
+            });
+
   Coverage:
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test]
