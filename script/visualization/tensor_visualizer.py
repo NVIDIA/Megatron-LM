@@ -373,7 +373,7 @@ class TensorVisualizer:
                     'quant_type': quant_type,
                     'count': len(files),
                     'layers': len(set(f['layer'] for f in files if f['layer'] is not None)),
-                    'ranks': len(set(f['rank'] for f in files if f['rank'] is not None))
+                    'samples': len(set(f['sample'] for f in files if f['sample'] is not None))
                 })
         
         if not quant_data:
@@ -826,11 +826,11 @@ class TensorVisualizer:
                 f.write(f"  Max: {stats['max']:.6f}\n")
                 f.write(f"  Median: {stats['median']:.6f}\n\n")
             
-            # By rank
-            f.write("By Rank:\n")
+            # By sample
+            f.write("By Sample:\n")
             f.write("-" * 40 + "\n")
-            for rank, stats in global_stats['ranks'].items():
-                f.write(f"Rank {rank}:\n")
+            for sample, stats in global_stats['samples'].items():
+                f.write(f"Sample {sample}:\n")
                 f.write(f"  Files: {stats['file_count']:,}\n")
                 f.write(f"  Values: {stats['total_values']:,}\n")
                 f.write(f"  Mean: {stats['mean']:.6f}\n")

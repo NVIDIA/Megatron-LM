@@ -212,3 +212,4 @@ bash -x ./run_draw_all.sh
 - 脚本版本: 1.0.0
 - 支持的分析类型: all, overflow, layer, distribution
 - 支持的量化类型: bf16, mxfp8, mxfp4, hifp8
+
