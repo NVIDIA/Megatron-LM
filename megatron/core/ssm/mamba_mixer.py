@@ -685,32 +685,34 @@ class MambaMixer(MegatronModule):
             context.paused_request_count : context.total_request_count
         ]
 
-        if torch.nonzero(active_query_lengths > 1).numel() == 0:
-            torch.distributed.breakpoint(0)
-
         # First request with query len > 1 is prefill-start
         first_prefill_request_idx = torch.nonzero(active_query_lengths > 1)[0].int()
         first_prefill_token_idx = cu_seqlens[first_prefill_request_idx]
+        assert first_prefill_token_idx == first_prefill_request_idx
 
         out_decode, out_bias_decode = None, None
 
         # Decode slice (requests before prefill start)
         if first_prefill_request_idx > 0:
             hidden_states_decode = hidden_states[:first_prefill_token_idx]
-            conv_state_decode = conv_state[:first_prefill_request_idx]
-            ssm_state_decode = ssm_state[:first_prefill_request_idx]
+            batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
+                : first_prefill_token_idx
+            ]
             out_decode, out_bias_decode, _, _ = self.step(
-                hidden_states_decode.transpose(0, 1), conv_state_decode, ssm_state_decode
+                hidden_states_decode.transpose(0, 1), conv_state, ssm_state, batch_indices=batch_indices
             )
             out_decode = out_decode.transpose(0, 1)
 
         # Prefill slice (remaining active tokens/requests)
         active_token_count = context.active_token_count
         active_request_count = context.get_active_request_count()
+        batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
+            first_prefill_request_idx : active_request_count
+        ]
 
         hidden_states_prefill = hidden_states[first_prefill_token_idx:active_token_count]
-        conv_state_prefill = conv_state[first_prefill_request_idx:active_request_count]
-        ssm_state_prefill = ssm_state[first_prefill_request_idx:active_request_count]
+        conv_state_prefill = conv_state[batch_indices]
+        ssm_state_prefill = ssm_state[batch_indices]
         cu_seqlens_prefill = F.pad(
             cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
         )
@@ -726,6 +728,9 @@ class MambaMixer(MegatronModule):
             cu_seqlens=cu_seqlens_prefill,
             return_varlen_states=True,
         )
+        # TODO(ksanthanam): Patch the upstream repos to support block table for prefill
+        conv_state[batch_indices] = conv_state_prefill
+        ssm_state[batch_indices] = ssm_state_prefill
 
         out = maybe_cat(out_decode, out_prefill, required=True)
         out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)

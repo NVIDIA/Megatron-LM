@@ -1163,11 +1163,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
             self.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
-            if torch.distributed.get_rank() == 0:
-                print(
-                    f"Assigning self.request_to_mamba_state_idx[{self.total_request_count}] to {mamba_idx}"
-                )
-
             # Initialize the allocated Mamba state
             self.mamba_conv_states[:, mamba_idx] = 0.0
             self.mamba_ssm_states[:, mamba_idx] = 0.0

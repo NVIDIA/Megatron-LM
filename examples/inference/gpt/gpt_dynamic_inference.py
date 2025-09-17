@@ -44,6 +44,7 @@ from pretrain_gpt import model_provider as gpt_model_provider
 from pretrain_mamba import model_provider as mamba_model_provider
 from model_provider import model_provider
 from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 import json
 
 from examples.inference.gpt.utils import (
@@ -93,9 +94,16 @@ def get_model() -> MegatronModule:
 
     args = get_args()
 
+    if args.model_provider == "gpt":
+        model_builder = gpt_builder
+    elif args.model_provider == "mamba":
+        model_builder = mamba_builder
+    else:
+        raise ValueError(f"Invalid model provider {args.model_provider}")
+
     # Build model.
     model = _get_model(
-        partial(model_provider, gpt_builder),
+        partial(model_provider, model_builder),
         wrap_with_ddp=False
     )
 
@@ -164,6 +172,7 @@ def get_inference_context(
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+        use_cuda_graphs_for_non_decode_steps=layer_type_list is None,
     )
 
     return context
@@ -257,7 +266,8 @@ def run_inference(
         _request.time_start = get_curr_time()
         _request.state = "started"
         num_requests_added += 1
-        tbar.update(1)
+        if rank == 0:
+            tbar.update(1)
 
     while True:
         # Add requests.
