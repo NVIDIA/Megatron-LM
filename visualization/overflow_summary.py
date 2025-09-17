@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 import subprocess
+from tqdm import tqdm
 
 # Add current directory to path to import overflow module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,11 +59,8 @@ def analyze_all_tensors(base_dir="enhanced_tensor_logs", output_dir="visualizati
         
         print(f"  Found {len(tensor_files)} tensor files")
         
-        # Analyze each tensor file
-        for i, tensor_file in enumerate(tensor_files):
-            if i % 50 == 0 and i > 0:
-                print(f"  Processed {i}/{len(tensor_files)} files...")
-            
+        # Analyze each tensor file with progress bar
+        for tensor_file in tqdm(tensor_files, desc=f"  Processing {data_format.upper()}", unit="files"):
             result = analyze_file(str(tensor_file))
             if result:
                 format_results.append(result)
