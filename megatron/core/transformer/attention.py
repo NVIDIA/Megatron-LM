@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -24,6 +24,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -179,15 +182,26 @@ class Attention(MegatronModule, ABC):
             self.query_projection_size, self.config.num_attention_heads
         )
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.num_query_groups < world_size:
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(self.config.num_attention_heads,
+                                                            self.config.num_query_groups)
+        else:
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        if self.config.num_query_groups < world_size:
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -1111,6 +1125,12 @@ class SelfAttention(Attention):
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
+        if self.config.num_query_groups < self.world_size:
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+            idx = get_tensor_model_parallel_rank() // (self.world_size // self.config.num_query_groups)
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size:(idx + 1) * size]
+
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
@@ -1148,6 +1168,11 @@ class SelfAttention(Attention):
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.config.num_query_groups < self.world_size:
+            idx = get_tensor_model_parallel_rank() % (self.world_size // self.config.num_query_groups)
+            size = self.num_attention_heads_per_partition // (self.world_size // self.config.num_query_groups)
+            query = query[:, :, idx * size:(idx + 1) * size, :]
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
