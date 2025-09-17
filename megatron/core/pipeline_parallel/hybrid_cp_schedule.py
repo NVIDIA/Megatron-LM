@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
