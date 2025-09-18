@@ -2325,7 +2325,7 @@ def forward_backward_pipelining_without_interleaving(
             if num_warmup_microbatches == 0 and last_iteration:
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
-            logging.debug(f'[Rank {dist.get_rank()} ][forward_backward_pipelining_without_interleaving] [steady state] [backward_step]')
+            logging.debug(f'[Rank {dist.get_rank()} ][forward_backward_pipelining_without_interleaving] [steady state] [backward_step] num_warmup_microbatches {num_warmup_microbatches} last_iteration {last_iteration} no_sync_context {no_sync_context}')
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
