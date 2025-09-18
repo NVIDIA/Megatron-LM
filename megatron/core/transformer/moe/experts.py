@@ -41,7 +41,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.pipeline_parallel.cpu_offload import (
+from megatron.core.transformer.cpu_offload import (
     PipelineOffloadManager,
     group_prefetch_offload_start,
     group_prefetch_offload_commit,
@@ -887,7 +887,7 @@ class TEGroupedMLP(MegatronModule):
 
         offload_context = contextlib.nullcontext()
         if self.offload_router_fc1:
-                permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, is_last_layer=(self.layer_number == self.config.num_layers))
+                permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, name="router_fc1")
                 offload_context = PipelineOffloadManager.get_instance()
         with offload_context:
             fc1_output, bias_parallel = self.linear_fc1(
@@ -953,7 +953,7 @@ class TEGroupedMLP(MegatronModule):
             return intermediate_parallel
 
         if self.offload_moe_act:
-            fc1_output = group_prefetch_offload_start(fc1_output, is_last_layer=(self.layer_number == self.config.num_layers))
+            fc1_output = group_prefetch_offload_start(fc1_output, name="moe_act")
             offload_context = PipelineOffloadManager.get_instance()
 
         if self.activation_recompute:

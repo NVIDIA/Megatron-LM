@@ -33,7 +33,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from megatron.core.pipeline_parallel.cpu_offload import PipelineOffloadManager
+from megatron.core.transformer.cpu_offload import PipelineOffloadManager
 
 
 class GPTModel(LanguageModule):
@@ -372,6 +372,7 @@ class GPTModel(LanguageModule):
             self.vp_stage,
             self.config.offload_activation,
             0,
+            self.config.offload_module_count_per_layer,
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)

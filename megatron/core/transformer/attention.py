@@ -6,6 +6,7 @@ from typing import NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+import contextlib
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -37,7 +38,7 @@ from megatron.core.utils import (
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
-from megatron.core.pipeline_parallel.cpu_offload import (
+from megatron.core.transformer.cpu_offload import (
     PipelineOffloadManager,
     group_prefetch_offload_start,
     group_prefetch_offload_commit,
@@ -194,9 +195,9 @@ class Attention(MegatronModule, ABC):
             and "core_attn" in self.config.offload_modules
         )
 
-        self.offload_attn_linear = (
+        self.offload_attn_proj = (
             self.config.offload_activation
-            and "attn_linear" in self.config.offload_modules
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -304,14 +305,12 @@ class Attention(MegatronModule, ABC):
         value = value.contiguous()
 
         query = group_prefetch_offload_start(query)
-        key = group_prefetch_offload_start(key)
-        value = group_prefetch_offload_start(value)
 
-        handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
-        handler.register_offload_tensor([query, key, value])
-        query.offloading_activation = True
-        key.offloading_activation = True
-        value.offloading_activation = True
+        # handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
+        # handler.register_offload_tensor([query, key, value])
+        # query.offloading_activation = True
+        # key.offloading_activation = True
+        # value.offloading_activation = True
         with PipelineOffloadManager.get_instance():
             hidden_states = custom_forward(
                 query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
@@ -936,16 +935,7 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        if self.offload_attn_linear:
-            if not core_attn_out.is_contiguous():
-                core_attn_out = core_attn_out.contiguous()
-            core_attn_out = group_prefetch_offload_start(core_attn_out)
-            core_attn_out.offloading_activation = True
-            with PipelineOffloadManager.get_instance():
-                output, bias = self.linear_proj(core_attn_out)
-            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
-        else:
-            output, bias = self.linear_proj(core_attn_out)
+        output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias

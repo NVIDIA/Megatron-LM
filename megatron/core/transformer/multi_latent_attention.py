@@ -37,6 +37,12 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params, is_te_min_version
+from megatron.core.transformer.cpu_offload import (
+    PipelineOffloadManager,
+    group_prefetch_offload_start,
+    group_prefetch_offload_commit,
+)
+import contextlib
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -263,18 +269,15 @@ class MultiLatentAttention(Attention):
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
-        elif self.offload_core_attention and self.training:
-            core_attn_out = self._offload_core_attention_forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=packed_seq_params,
-            )
         else:
+            offload_context = contextlib.nullcontext()
+            if self.offload_core_attention and self.training:
+                query = group_prefetch_offload_start(query, name="core_attn")
+                offload_context = PipelineOffloadManager.get_instance()
+
             if inference_context is None or inference_context.is_static_batching():
-                core_attn_out = self.core_attention(
+                with offload_context:
+                    core_attn_out = self.core_attention(
                     query,
                     key,
                     value,
@@ -302,6 +305,9 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+        if self.offload_core_attention and self.training:
+            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[query, key, value])
+            offload_context = contextlib.nullcontext()
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -327,7 +333,15 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        offload_context = contextlib.nullcontext()
+        if self.offload_attn_proj:
+            core_attn_out = group_prefetch_offload_start(core_attn_out, name="attn_proj")
+            offload_context = PipelineOffloadManager.get_instance()
+        with offload_context:
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
+            offload_context = contextlib.nullcontext()
 
         return output, bias
 

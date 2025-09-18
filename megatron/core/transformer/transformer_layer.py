@@ -31,6 +31,11 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.transformer.cpu_offload import (
+    PipelineOffloadManager,
+    group_prefetch_offload_start,
+    group_prefetch_offload_commit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -430,9 +435,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             self.config.offload_activation
             and "self_attn" in self.config.offload_modules
         )
-        self.offload_layernorm = (
+        self.offload_attn_norm = (
             self.config.offload_activation
-            and "layernorm" in self.config.offload_modules
+            and "attn_norm" in self.config.offload_modules
+        )
+        self.offload_mlp_norm = (
+            self.config.offload_activation
+            and "mlp_norm" in self.config.offload_modules
         )
 
         # @jcasper how should we handle nvfuser?
@@ -513,21 +522,26 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        offload_context = contextlib.nullcontext()
+        if self.offload_attn_norm:
+            hidden_states = group_prefetch_offload_start(hidden_states, name="attn_norm")
+            offload_context = PipelineOffloadManager.get_instance()
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                self.input_layernorm, hidden_states
-            )
+            with offload_context:
+                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                    self.input_layernorm, hidden_states
+                )
         else:
-            input_layernorm_output = self.input_layernorm(hidden_states)
+            with offload_context:
+                input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         offload_context = contextlib.nullcontext()
         if self.offload_self_attn:
-            input_layernorm_output = group_prefetch_offload_start(input_layernorm_output,
-                is_last_layer=(self.layer_number == self.config.num_layers))
+            input_layernorm_output = group_prefetch_offload_start(input_layernorm_output, name="self_attn")
             offload_context = PipelineOffloadManager.get_instance()
         with offload_context:
             attention_output_with_bias = self.self_attention(
@@ -561,6 +575,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 attention_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="self_attn_bda")
+
+        if self.offload_attn_norm:
+            hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
+            offload_context = contextlib.nullcontext()
 
         # Residual connection.
         residual = hidden_states
@@ -603,13 +621,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         offload_context = contextlib.nullcontext()
-        if self.offload_layernorm:
-            from megatron.core.pipeline_parallel.cpu_offload import (
-                PipelineOffloadManager,
-                group_prefetch_offload_start,
-                group_prefetch_offload_commit,
-            )
-            hidden_states = group_prefetch_offload_start(hidden_states, is_last_layer=(self.layer_number == self.config.num_layers))
+        if self.offload_mlp_norm:
+            hidden_states = group_prefetch_offload_start(hidden_states, name="mlp_norm")
             offload_context = PipelineOffloadManager.get_instance()
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
@@ -680,7 +693,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
-        if self.offload_layernorm:
+        if self.offload_mlp_norm:
             hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
             offload_context = contextlib.nullcontext()
 

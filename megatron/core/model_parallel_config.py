@@ -330,6 +330,8 @@ class ModelParallelConfig:
     "moe_act": offload the moe act part of the transformer layer.
     "router_fc2": offload the moe router_fc2 part of the transformer layer.
     """
+    offload_module_count_per_layer: Optional[int] = 0
+    """The number of modules to offload per layer. default: 0."""
     
     ###################
     # CPU Offloading
