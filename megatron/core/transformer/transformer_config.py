@@ -959,22 +959,11 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if "router_fc1" in self.offload_modules and self.tensor_model_parallel_size > 1:
+                raise ValueError(
+                    "(Bug) router_fc1 cannot be set to offload_modules when tensor_model_parallel_size > 1."
+                )
 
-        # if "self_attn" in self.offload_modules:
-        #     if "qkv_linear" in self.offload_modules:
-        #         self.offload_modules.remove("qkv_linear")
-        #     if "core_attn" in self.offload_modules:
-        #         self.offload_modules.remove("core_attn")
-        #     if "attn_linear" in self.offload_modules:
-        #         self.offload_modules.remove("attn_linear")
-
-        # if "core_attn" in self.offload_modules:
-        #     warnings.warn(
-        #         "If you are using transformer_engine as the transformer implementation, "
-        #         "the core_attn is from transformer_engine and may be the fused version. "
-        #         "For fused attention, you have no need to set 'core_attn' to offload. "
-        #         "Please check that the core_attn offload is really needed."
-        #     )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None

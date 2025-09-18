@@ -5,7 +5,7 @@ from transformer_engine.pytorch.float8_tensor import Float8Tensor
 from transformer_engine.pytorch.cpu_offload import AsyncDoubleBufferGroupOffloadHandler
 
 # cpu offload for pipeline
-DEBUG = True
+DEBUG = False
 DEBUG_RANK = 5
 MIN_OFFLOADED_TENSOR_SIZE = 1024 * 1024
 
