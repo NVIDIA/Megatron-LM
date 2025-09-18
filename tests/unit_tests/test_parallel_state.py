@@ -516,7 +516,7 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     if actual_world_size != world_size:
         pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size, hybrid_data_context_parallel=True
+        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size, hybrid_context_parallel=True
     )
 
     dp_cp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
