@@ -842,11 +842,10 @@ class Attention(MegatronModule, ABC):
 
         # Output gate
         if gate is not None:
-            act_fn = self.config.activation_func
             nvtx_range_push(suffix="output_gate")
             core_attn_out_dtype = core_attn_out.dtype
             gate = gate.view(*core_attn_out.shape)
-            core_attn_out = core_attn_out * act_fn(gate.float())
+            core_attn_out = core_attn_out * torch.sigmoid(gate.float())
             core_attn_out = core_attn_out.to(core_attn_out_dtype)
             nvtx_range_pop(suffix="output_gate")
 

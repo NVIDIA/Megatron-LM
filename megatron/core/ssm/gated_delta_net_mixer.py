@@ -108,6 +108,8 @@ class GatedDeltaNetMixer(MegatronModule):
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
+        assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
+        self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNetMixer"
         self.pg_collection = pg_collection
@@ -126,7 +128,6 @@ class GatedDeltaNetMixer(MegatronModule):
         self.num_v_heads = config.gdn_num_v_heads
         self.qk_dim = self.qk_head_dim * self.num_qk_heads
         self.v_dim = self.v_head_dim * self.num_v_heads
-        self.output_gate = config.gdn_output_gate
 
         # TODO: support TP w/o SP
         if config.tensor_model_parallel_size > 1:
@@ -161,51 +162,43 @@ class GatedDeltaNetMixer(MegatronModule):
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
-        with get_cuda_rng_tracker().fork():
-            # weight shape: [conv_dim, 1, d_conv]
-            # bias shape: [conv_dim]
-            self.conv1d = nn.Conv1d(
-                in_channels=self.conv_dim_local_tp,
-                out_channels=self.conv_dim_local_tp,
-                bias=conv_bias,
-                kernel_size=self.conv_kernel_dim,
-                groups=self.conv_dim_local_tp,
-                padding=self.conv_kernel_dim - 1,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
-            setattr(self.conv1d.weight, "tensor_model_parallel", True)
-            if conv_bias:
-                setattr(self.conv1d.bias, "tensor_model_parallel", True)
-
-            if self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+        
+        # weight shape: [conv_dim, 1, d_conv]
+        # bias shape: [conv_dim]
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim_local_tp,
+            out_channels=self.conv_dim_local_tp,
+            bias=conv_bias,
+            kernel_size=self.conv_kernel_dim,
+            groups=self.conv_dim_local_tp,
+            padding=self.conv_kernel_dim - 1,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
+        setattr(self.conv1d.weight, "tensor_model_parallel", True)
+        if conv_bias:
+            setattr(self.conv1d.bias, "tensor_model_parallel", True)
         
         # Time step projection (discretization)
         self.num_v_heads_local_tp = self.num_v_heads // self.tp_size
-        with get_cuda_rng_tracker().fork():
-            self.dt_bias = nn.Parameter(torch.ones(
-                self.num_v_heads_local_tp,
-                dtype=torch.float32,
-                device=torch.cuda.current_device()))
-            # Our initialization would set all Linear.bias to zero,
-            # need to mark this one as _no_reinit
-            self.dt_bias._no_reinit = True
-            # Just to be explicit. Without this we already don't
-            # put wd on dt_bias because of the check
-            # name.endswith("bias") in param_grouping.py
-            self.dt_bias._no_weight_decay = True
-            setattr(self.dt_bias, "tensor_model_parallel", True)
-
-            # A parameter
-            assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
-            A = torch.empty(
-                self.num_v_heads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-            ).uniform_(*A_init_range)
-            A_log = torch.log(A)  # Keep A_log in fp32
-            self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
-            setattr(self.A_log, "tensor_model_parallel", True)
+        # dt_bias parameter
+        self.dt_bias = nn.Parameter(torch.empty(
+            self.num_v_heads_local_tp,
+            dtype=config.params_dtype,
+            device=torch.cuda.current_device()))
+        # Just to be explicit. Without this we already don't
+        # put wd on dt_bias because of the check
+        # name.endswith("bias") in param_grouping.py
+        self.dt_bias._no_weight_decay = True
+        setattr(self.dt_bias, "tensor_model_parallel", True)
+        # A_log parameter
+        self.A_log = nn.Parameter(torch.empty(
+            self.num_v_heads_local_tp,
+            dtype=config.params_dtype,
+            device=torch.cuda.current_device()
+        ))
+        self.A_log._no_weight_decay = True
+        setattr(self.A_log, "tensor_model_parallel", True)
         
         # Output layernorm before projection
         self.out_norm = build_module(
@@ -233,6 +226,30 @@ class GatedDeltaNetMixer(MegatronModule):
 
         # TODO: support CP
 
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        """Reset the parameters."""
+        if self.config.perform_initialization:
+            with get_cuda_rng_tracker().fork():
+                # conv1d.weight
+                if self.conv_init is not None:
+                    nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                # dt_bias
+                torch.ones(
+                    self.num_v_heads_local_tp,
+                    out=self.dt_bias.data,
+                    dtype=self.config.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                # A_log
+                A = torch.empty(
+                    self.num_v_heads_local_tp,
+                    dtype=self.config.params_dtype,
+                    device=torch.cuda.current_device(),
+                ).uniform_(*self.A_init_range)
+                self.A_log.data.copy_(A)
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -257,6 +274,7 @@ class GatedDeltaNetMixer(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         seq_len, batch, _ = hidden_states.shape
+        seq_len = seq_len * self.sp_size
 
         if inference_context is not None:
             assert (
@@ -279,9 +297,9 @@ class GatedDeltaNetMixer(MegatronModule):
             self.num_v_heads // self.sp_size,
             self.num_v_heads // self.sp_size,
         ], dim=-1)
-        gate = gate.view(batch, seq_len, -1, self.v_head_dim)
-        beta = beta.view(batch, seq_len, -1)
-        alpha = alpha.view(batch, seq_len, -1)
+        gate = gate.reshape(batch, seq_len, -1, self.v_head_dim)
+        beta = beta.reshape(batch, seq_len, -1)
+        alpha = alpha.reshape(batch, seq_len, -1)
 
         # Convolution on qkv
         qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
@@ -291,7 +309,7 @@ class GatedDeltaNetMixer(MegatronModule):
             assert self.activation in ["silu", "swish"]
             qkv = causal_conv1d_fn(
                 x=qkv,
-                weight=self.conv1d.weight.unsqueeze(1),  # d, 1, w -> d, w
+                weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
                 bias=self.conv1d.bias,
                 activation=self.activation,
             )
@@ -302,9 +320,9 @@ class GatedDeltaNetMixer(MegatronModule):
             self.qk_dim // self.sp_size,
             self.v_dim // self.sp_size,
         ], dim=-1)
-        query = query.view(batch, seq_len, -1, self.qk_head_dim)
-        key = key.view(batch, seq_len, -1, self.qk_head_dim)
-        value = value.view(batch, seq_len, -1, self.v_head_dim)
+        query = query.reshape(batch, seq_len, -1, self.qk_head_dim)
+        key = key.reshape(batch, seq_len, -1, self.qk_head_dim)
+        value = value.reshape(batch, seq_len, -1, self.v_head_dim)
         if self.num_v_heads // self.num_qk_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
@@ -382,8 +400,9 @@ class GatedDeltaNetMixer(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == self.in_proj_dim, (
-            self.in_proj_dim,
+        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
+            in_proj_dim_local_tp,
             sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 

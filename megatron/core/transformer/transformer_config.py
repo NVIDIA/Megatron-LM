@@ -241,9 +241,6 @@ class TransformerConfig(ModelParallelConfig):
 
     gdn_num_v_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
-
-    gdn_output_gate: bool = True
-    """Whether to apply output gate to the gated delta net."""
     
 
     ####################
@@ -822,16 +819,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
                 # Do not support yet, but coming soon.
-                assert self.tensor_model_parallel_size == 1, (
-                    f"Gated delta net does not support tensor model parallel for now,"
-                    f" but got {self.tensor_model_parallel_size=}."
-                )
                 assert self.context_parallel_size == 1, (
                     f"Gated delta net does not support context parallel for now,"
                     f" but got {self.context_parallel_size=}."
-                )
-                assert self.gdn_output_gate, (
-                    "Output gate is forced for gated delta net now."
                 )
             elif self.linear_attention_type == "mamba":
                 raise NotImplementedError("Mamba is not supported yet. Coming soon.")

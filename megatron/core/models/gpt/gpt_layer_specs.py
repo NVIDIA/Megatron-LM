@@ -158,7 +158,6 @@ def get_gpt_layer_with_transformer_engine_spec(
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=backend.layer_norm(),
                 self_attention=attention_spec,
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
@@ -285,6 +284,9 @@ def get_gpt_layer_local_spec(
             'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
+    
+    if linear_attention_type is not None:
+        raise NotImplementedError("Linear attention is not supported with local spec yet.")
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,

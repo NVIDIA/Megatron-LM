@@ -3171,8 +3171,6 @@ def _add_linear_attention_args(parser):
                        help='Number of query and key heads for the gated delta net.')
     group.add_argument('--gdn-num-v-heads', default=32, type=int,
                        help='Number of value and gate heads for the gated delta net.')
-    group.add_argument('--gdn-output-gate', action='store_true',
-                       help='Whether to apply output gate to the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):
