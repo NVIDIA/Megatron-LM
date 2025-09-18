@@ -190,17 +190,20 @@ class RotaryEmbedding(nn.Module):
         """
         emb = self.get_emb(max_seq_len, offset)
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
-            if packed_seq_params.local_cp_size is None:
-                cp_group = self.cp_group
-            elif packed_seq_params.local_cp_size > 1:
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            if packed_seq_params.local_cp_size > 1:
+                # Set CP group to dynamic CP group for CP slicing
                 cp_group = packed_seq_params.cp_group
             else:
+                # Set CP group to None to avoid CP slicing
                 cp_group = None
-            if cp_group is not None:
-                # slice rotary_pos_emb along sequence dimension
-                # and select the parition of the current CP rank
-                emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+        else:
+            cp_group = self.cp_group
+
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+            # slice rotary_pos_emb along sequence dimension
+            # and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
         return emb
 

@@ -518,10 +518,10 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
         hybrid_context_parallel=True,
     )
 
-    dp_cp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
     group_sizes = [2**i for i in range(int(log2(dp_cp_size)))][1:]
     for group_size in group_sizes:
-        group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=group_size)
+        group = ps.get_hybrid_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
 
     Utils.destroy_model_parallel()
