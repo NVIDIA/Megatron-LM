@@ -1792,7 +1792,7 @@ def post_training_step_callbacks(
     if (
         args.profile
         and iteration == args.profile_step_end
-        and torch.distributed.get_rank() in args.profile_ranks
+        # and torch.distributed.get_rank() in args.profile_ranks
     ):
         if args.use_pytorch_profiler:
             assert prof is not None
@@ -2124,7 +2124,7 @@ def train(
     prof = None
     if (
         args.profile
-        and torch.distributed.get_rank() in args.profile_ranks
+        # and torch.distributed.get_rank() in args.profile_ranks
         and args.use_pytorch_profiler
     ):
         prof = torch.profiler.profile(
@@ -2134,7 +2134,11 @@ def train(
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir, 
+                worker_name=f"kineto-trace-{torch.distributed.get_rank()}.json",
+                use_gzip=True),
+            execution_trace_observer=(
+                torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/rank-{torch.distributed.get_rank()}.json")
             record_shapes=True,
             with_stack=True,
         )
@@ -2173,7 +2177,8 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
-        if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+        # if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+        if args.profile:
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
