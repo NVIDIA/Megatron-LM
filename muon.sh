@@ -1,59 +1,30 @@
 #!/bin/bash
 
-#SBATCH -p batch
-#SBATCH --account=your_account
-#SBATCH --exclusive
-#SBATCH -t 4:00:00
-#SBATCH --mem=0
-#SBATCH --ntasks-per-node=8
-#SBATCH --dependency=singleton
-#SBATCH --job-name=your_job_name
+# To use this script, please
+# 1. Add your wandb api key and entity to the script (optional)
+# 2. Add your tokenizer model path and data path to the script
+# 3. Select your optimizer from [muon, dist_muon, adam], defaults to dist_muon
 
 
-# 621M baseline size
-# 0: Number of parameters in transformer layers in billions:  0.35
-# 0: Number of parameters in embedding layers in billions: 0.27
-# 0: Total number of parameters in billions: 0.62
-# 0: Number of parameters in most loaded shard in billions: 0.6209
-# 0: Theoretical memory footprints: weight and optimizer=3774.61 MB
-
-# export NCCL_DEBUG=INFO
-# export NCCL_DEBUG_SUBSYS=COLL
-# export NCCL_DEBUG_FILE="/results/nccl-debug-${RANK}"
-export WANDB_API_KEY=<YOUR_WANDB_API_KEY>
-export WANDB_ENTITY=<YOUR_WANDB_ENTITY>
-
-export NCCL_IB_SL=1
-export NCCL_IB_TIMEOUT=19
-export NCCL_IB_QPS_PER_CONNECTION=4
-export UB_TIMEOUT=720
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NVTE_FWD_LAYERNORM_SM_MARGIN=16
-export NVTE_BWD_LAYERNORM_SM_MARGIN=16
-# with NVTE_FUSED_ATTN=0, have to use --attention-backend flash
-export NVTE_FUSED_ATTN=1  
-export NCCL_P2P_NET_CHUNKSIZE=2097152
-
-export NCCL_SHM_DISABLE=1
-export NCCL_PROTO=simple
-export NCCL_NVLS_ENABLE=0
+# TODO: Paths and parameters to be added
+export WANDB_API_KEY=<your_wandb_api_key> # optional
+export WANDB_ENTITY=<your_wandb_entity> # optional
+optimizer=dist_muon # choose from [muon, dist_muon, adam]
+TOKENIZER_MODEL="your_path"
+DATA_PATH="your_path"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
-DIR="your_path_to_workspace"
-
-optimizer=dist_muon
-
-EXP_NAME="621M_bf16_100B_${optimizer}_tp8_split_qkv_bs_1536_lr_1.0e-3_N${SLURM_NNODES}"
+DIR=$PWD
+EXP_NAME="bf16_100B_${optimizer}_lr_1.0e-3_N${SLURM_NNODES}"
 RUN_DIR="${DIR}/experiments/${EXP_NAME}"
 LOG_DIR="${RUN_DIR}/logs"
 CHECKPOINT_DIR="${RUN_DIR}/checkpoints"
 TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
 DATACACHE_DIR="${DIR}/data-cache-phase-1/"
-MEGATRON_PATH="your_path_to_megatron_lm"
-EMERGING_OPTIMIZERS_PATH="your_path_to_emerging_optimizers"
+MEGATRON_PATH="${DIR}/Megatron-LM"
+EMERGING_OPTIMIZERS_PATH="${DIR}/Emerging-Optimizers"
 export TRITON_CACHE_DIR=${RUN_DIR}/triton_cache
-#export TRITON_CACHE_MANAGER=megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager
 export TORCHINDUCTOR_CACHE_DIR=${RUN_DIR}/inductor_cache
 
 mkdir -p ${LOG_DIR}
@@ -66,9 +37,16 @@ mkdir -p ${TORCHINDUCTOR_CACHE_DIR}
 echo ${LOG_DIR}
 echo ${TENSORBOARD_DIR}
 
-TOKENIZER_MODEL="your_path"
-DATA_PATH="your_path"
+# Optimizer related parameters
+OPTIMIZER_ARGS=(
+    --optimizer $optimizer
+    --muon-momentum 0.9
+    --muon-scale-mode spectral
+    --muon-fp32-matmul-prec medium
+    --muon-num-ns-steps 5
+)
 
+# MoE related parameters
 MOE_ARGS=(
     --num-experts 8
     --moe-router-topk 2
@@ -84,16 +62,16 @@ MOE_ARGS=(
 options=(
     --global-batch-size 512
     --micro-batch-size 1
-    --seq-length 2048
-    --max-position-embeddings 2048
+    --seq-length 1024
+    --max-position-embeddings 1024
     --tensor-model-parallel-size 1
     --context-parallel-size 1
     --pipeline-model-parallel-size 1
-    --expert-model-parallel-size 8
+    # --expert-model-parallel-size 8
 
-    --num-layers 10
-    --hidden-size 2048
-    --ffn-hidden-size 8192
+    --num-layers 30
+    --hidden-size 4096
+    --ffn-hidden-size 14336
     --num-attention-heads 32
     --group-query-attention
     --num-query-groups 8
@@ -120,7 +98,7 @@ options=(
 
     --distributed-timeout-minutes 60
     --ckpt-format torch
-    --data-cache-path ${MEGATRON_PATH}/data_cache
+    --data-cache-path ${DATACACHE_DIR}
     --exit-duration-in-mins 235
     --train-samples 1953125
     --lr-decay-samples 1949218
@@ -145,17 +123,18 @@ options=(
 
     --wandb-project "muon-test"
     --wandb-exp-name "muon-test"
-    --wandb-save-dir ${MEGATRON_PATH}/wandb/muon-test
+    --wandb-save-dir ${RUN_DIR}/wandb/muon-test
     --log-timers-to-tensorboard
     --log-memory-to-tensorboard
     --log-validation-ppl-to-tensorboard
-    --tensorboard-dir ${MEGATRON_PATH}/tensorboard
+    --tensorboard-dir ${RUN_DIR}/tensorboard
 
-    --optimizer $optimizer
-    ${MOE_ARGS[@]}
+    ${OPTIMIZER_ARGS[@]}
+
+    # ${MOE_ARGS[@]}
 )
 
 
-export PYTHONPATH=${MEGATRON_PATH}:${EMERGING_OPTIMIZERS_PATH}
+export PYTHONPATH=${MEGATRON_PATH}:${EMERGING_OPTIMIZERS_PATH}:${PYTHONPATH}
 echo $PYTHONPATH
 torchrun --nproc_per_node=8 ${MEGATRON_PATH}/pretrain_gpt.py ${options[@]}
