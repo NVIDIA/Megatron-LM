@@ -15,6 +15,55 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 
 logger = logging.getLogger(__name__)
 
+@lru_cache(maxsize=32)
+def _yarn_rope_forward(
+    beta_fast,
+    beta_slow,
+    dim,
+    rotary_base,
+    original_max_position_embeddings,
+    inv_freq_extra,
+    inv_freq_inter,
+    scaling_factor,
+    mscale,
+    mscale_all_dim,
+    max_seq_len: int,
+    offset: int = 0,
+    packed_seq: bool = False,
+):
+    if inv_freq_extra.device.type == 'cpu':
+        # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
+        inv_freq_extra = inv_freq_extra.to(device=torch.cuda.current_device())
+
+    if inv_freq_inter.device.type == 'cpu':
+        # move `inv_freq_inter` to GPU once at the first micro-batch forward pass
+        inv_freq_inter = inv_freq_inter.to(device=torch.cuda.current_device())
+    low, high = _yarn_find_correction_range(
+        beta_fast,
+        beta_slow,
+        dim,
+        rotary_base,
+        original_max_position_embeddings,
+    )
+    inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2).to(
+        device=inv_freq_extra.device, dtype=torch.float32
+    )
+    inv_freq = inv_freq_inter * (1 - inv_freq_mask) + inv_freq_extra * inv_freq_mask
+    seq = (
+        torch.arange(max_seq_len, device=inv_freq_extra.device, dtype=inv_freq_extra.dtype)
+        + offset
+    )
+    freqs = torch.outer(seq, inv_freq)
+
+    _mscale = float(
+        _yarn_get_mscale(scaling_factor, mscale)
+        / _yarn_get_mscale(scaling_factor, mscale_all_dim)
+    )
+
+    emb = torch.cat((freqs, freqs), dim=-1)
+    # emb [seq_length, .., dim]
+    emb = emb[:, None, None, :]
+    return emb, _mscale
 
 class YarnRotaryEmbedding(RotaryEmbedding):
     """Yarn Rotary Embedding for language model.
@@ -93,7 +142,6 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
             )
 
-    @lru_cache(maxsize=32)
     def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -108,44 +156,21 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         assert (
             not self.rotary_interleaved
         ), "Yarn RoPE does not support interleaved rotary embeddings"
-
-        if self.inv_freq_extra.device.type == 'cpu':
-            # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
-            self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
-
-        if self.inv_freq_inter.device.type == 'cpu':
-            # move `inv_freq_inter` to GPU once at the first micro-batch forward pass
-            self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
-
-        low, high = _yarn_find_correction_range(
+        emb, _mscale = _yarn_rope_forward(
             self.beta_fast,
             self.beta_slow,
             self.dim,
             self.rotary_base,
             self.original_max_position_embeddings,
+            self.inv_freq_extra,
+            self.inv_freq_inter,
+            self.scaling_factor,
+            self.mscale,
+            self.mscale_all_dim,
+            max_seq_len,
+            offset,
+            packed_seq,
         )
-        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, self.dim // 2).to(
-            device=self.inv_freq_extra.device, dtype=torch.float32
-        )
-        inv_freq = self.inv_freq_inter * (1 - inv_freq_mask) + self.inv_freq_extra * inv_freq_mask
-
-        seq = (
-            torch.arange(
-                max_seq_len, device=self.inv_freq_extra.device, dtype=self.inv_freq_extra.dtype
-            )
-            + offset
-        )
-
-        freqs = torch.outer(seq, inv_freq)
-
-        _mscale = float(
-            _yarn_get_mscale(self.scaling_factor, self.mscale)
-            / _yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-        )
-
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # emb [seq_length, .., dim]
-        emb = emb[:, None, None, :]
         if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
