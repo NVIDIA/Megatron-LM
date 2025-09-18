@@ -2,7 +2,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from .optimizer import ChainedOptimizer, MegatronOptimizer
+from .optimizer import ChainedOptimizer, MegatronOptimizer, Float16OptimizerWithFloat16Params
+from .optimizer_config import OptimizerConfig
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -15,63 +16,76 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """
     def __init__(
         self,
-        chained_optimizers: List[MegatronOptimizer],
+        optimizers: List[MegatronOptimizer],
         grad_comm_pg: torch.distributed.ProcessGroup,
         ep_grad_comm_pg: torch.distributed.ProcessGroup,
+        config: OptimizerConfig,
     ) -> None:
-        super().__init__(chained_optimizers)
+        self.grad_comm_pg = grad_comm_pg
+        self.ep_grad_comm_pg = ep_grad_comm_pg
+        self.shard_params(optimizers)
+        # wrap optimizer after sharding to avoid unnecessary master weight creation
+        if config.bf16:
+            if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
+                raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer.')
+            optimizers = [Float16OptimizerWithFloat16Params(optim, config, None, None) for optim in optimizers]
+        super().__init__(optimizers)
 
         # how LayerWiseDistributedOptimizer work:
         # 1. Megatron DDP handle allreduce grad for all params
-        # 2. Drop grad for params doesn't belong to this DP rank
-        # 3. Do regular update with chained optimizers
+        # 2. optimizer is modified so only param belong to this DP rank is kept
+        # 3. Do regular update with chained optimizers, get_gran_norm and count_zeros are overwritten
         # 4. allgather updated params to every rank(currently through broadcast loop)
 
-        # TODO: potential future perf optimization (deyu, kunlun suggested)
+        # TODO: (kunlun, deyu) potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in contiguous gbuf
         # so instead of shard param by layer randomly, we can still shard by buf range but keep some "extras"
         # to keep boundary weight not sharded. This way each rank do some duplicated work but we can call
         # single allgather later and all current distopt optimization can be applied
 
-        self.grad_comm_pg = grad_comm_pg
-        self.ep_grad_comm_pg = ep_grad_comm_pg
-        self.shard_params()
-
-    def shard_params(self):
+    def shard_params(self, optimizers):
         """Shard all params into lists by rank. """
         # keep logic simple now since we'll optimize sharding later. should be ok since linear are separate already
         # separate dp, ep_dp
         dp_idx, ep_idx = 0, 0
         dp_size = self.grad_comm_pg.size()
+        dp_rank = self.grad_comm_pg.rank()
         ep_size = self.ep_grad_comm_pg.size()
+        ep_rank = self.ep_grad_comm_pg.rank()
         self.shard_params_list = [[] for _ in range(dp_size)]
         self.ep_params_list = [[] for _ in range(ep_size)]
-        for group in self.param_groups:
+        # simplify when DP size is 1
+        if dp_size == 1:
+            self.shard_params_list = []
+            self.ep_params_list = []
+            return
+
+        # get all param groups, this is called before init so cannot rely on Chained optimizer method
+        param_groups = []
+        for optimizer in optimizers:
+            param_groups += optimizer.param_groups
+        for group in param_groups:
+            params_this_rank = []
             if group["is_expert_parallel"]:
                 for p in group["params"]:
+                    if ep_idx == ep_rank:
+                        params_this_rank.append(p)
                     self.ep_params_list[ep_idx].append(p)
                     ep_idx = (ep_idx + 1) % ep_size
             else:
                 for p in group["params"]:
+                    if dp_idx == dp_rank:
+                        params_this_rank.append(p)
                     self.shard_params_list[dp_idx].append(p)
                     dp_idx = (dp_idx + 1) % dp_size
-        # simplify when DP/EP size is 1, or EP is off
-        if dp_size == 1:
-            self.shard_params_list = []
+            # now we modify the group to only handle local params
+            group["params"] = params_this_rank
+
+        # simplify when EP size is 1 or EP is off
         if ep_size == 1 or len(self.ep_params_list[0]) == 0:
             self.ep_params_list = []
 
-    def drop_grads(self):
-        """Drop grads of params belong to other ranks. """
-        for i, params in enumerate(self.shard_params_list):
-            if self.grad_comm_pg.rank() != i:
-                for p in params:
-                    p.grad = None
-        for i, params in enumerate(self.ep_params_list):
-            if self.ep_grad_comm_pg.rank() != i:
-                for p in params:
-                    p.grad = None
-
+    @torch.no_grad()
     def broadcast_params(self):
         """All rank broadcast updated local params(allgatherv). """
         # Broadcast linear layer weights to all other ranks.
@@ -87,49 +101,34 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 torch.distributed.broadcast(p, src_global_rank, self.ep_grad_comm_pg)
 
     @torch.no_grad()
+    def get_grad_norm(self):
+        # similar to dist opt, always aggregate globally
+        grads_for_norm = []
+        for optimizer in self.chained_optimizers:
+            grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=None
+        )
+        return grad_norm
+
+    @torch.no_grad()
+    def count_zeros(self):
+        params = []
+        for optimizer in self.chained_optimizers:
+            params += optimizer.get_parameters()
+        return count_zeros_fp32(
+            params,
+            grad_stats_parallel_group=None,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+        )
+
+    @torch.no_grad()
     def step(self):  # type: ignore[no-untyped-def]
         """step function for layer-wise optimizer."""
-        found_inf_flag = self.prepare_grads()
-        if found_inf_flag:
-            return False, None, None
-
-        grad_norm = self.get_grad_norm()
-
-        # now that we have grad norm, nuke grads belong to other rank
-        # clip_grad_by_total_norm_fp32, count_zeros and step_with_ready_grads below all checks
-        # if grad is None and will only update params belong to this rank
-        self.drop_grads()
-
-        # Begin unchanged chained optimizer code
-        # Clip gradients.
-        for optimizer in self.chained_optimizers:
-            if hasattr(optimizer, "is_stub_optimizer") and optimizer.is_stub_optimizer:
-                continue
-            parameters = optimizer.get_parameters()
-            if len(parameters) == 0:
-                continue
-            if optimizer.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    parameters,
-                    max_norm=optimizer.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=(
-                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                    ),
-                )
-
-        # # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
-
-        update_successful = self.step_with_ready_grads()
-        # End unchanged chained optimizer code
+        update_successful, grad_norm, num_zeros_in_grad = super().step()
 
         # All gather updated params.
         self.broadcast_params()
-        # TODO(deyu): need to all gather model param instead of main param above. temp fix
-        for optim in self.chained_optimizers:
-            if hasattr(optim, "_copy_main_params_to_model_params"):
-                optim._copy_main_params_to_model_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 

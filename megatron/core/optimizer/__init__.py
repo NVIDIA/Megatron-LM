@@ -844,9 +844,21 @@ def get_megatron_muon_optimizer(
     # set config here to: 1. get adam later and 2. avoid ChainedOptimizer check fail
     # side effect is muon optimizer will have wrong name str, i.e. config.optimizer == 'adam'
     config.optimizer = 'adam'
+
     # need to wrap into megatron mix precision optimizer. (only support bf16 w/o loss scale now)
+    if config.fp16:
+        raise Exception('muon with fp16 is not supported.')
+    reset_config_bf16 = False
     if config.bf16:
-        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, None)
+        if layer_wise_distributed_optimizer:
+            # creating master weight before layerwise sharding will lead to unnecessary master weight
+            # so here we delay master weight creation into layer_wise
+            # unset config.bf16 will also result in all optimizers below(adam) to also not be wrapped
+            config.bf16 = False
+            reset_config_bf16 = True
+        else:
+            # if not using layer_wise wrapper, just create master weight here is fine
+            optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, None)
     else:
         optimizer = FP32Optimizer(optimizer, config, None)
 
@@ -871,9 +883,12 @@ def get_megatron_muon_optimizer(
 
     if layer_wise_distributed_optimizer:
         log_single_rank(logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for Muon')
+        if reset_config_bf16:
+            config.bf16 = True
         return LayerWiseDistributedOptimizer(
                 optimizers,
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
                 parallel_state.get_expert_data_parallel_group(),
+                config=config,
             )
     return ChainedOptimizer(optimizers)
