@@ -116,9 +116,12 @@ jobs:
             model: "bert"
           - test_case: "bert_mr_mcore_tp2_pp2_dgx_a100_1N8G"
             model: "bert"
-    needs: [pre-flight, cicd-wait-in-queue, cicd-unit-tests-latest]
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      # - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
-    name: "${{ matrix.model }} ${{ matrix.test_case }} - latest"
+    name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
     if: |
       (

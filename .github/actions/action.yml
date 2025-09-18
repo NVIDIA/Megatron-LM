@@ -56,15 +56,15 @@ runs:
       run: |
         ls -al /mnt/datadrive/TestData/megatron-lm/
 
-    - name: Copy data
-      shell: bash
-      if: inputs.is_unit_test == 'false'
-      env:
-        SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
-        TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
-      run: |
-        mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
-        cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/the_pile/bert_shard00/
+    # - name: Copy data
+    #   shell: bash
+    #   if: inputs.is_unit_test == 'false'
+    #   env:
+    #     SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
+    #     TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
+    #   run: |
+    #     mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
+    #     cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/the_pile/bert_shard00/
 
     - name: Install curl, sudo
       shell: bash
