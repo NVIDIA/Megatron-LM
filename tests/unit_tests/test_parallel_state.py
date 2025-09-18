@@ -1,4 +1,5 @@
 from math import log2
+
 import pytest
 import torch
 
