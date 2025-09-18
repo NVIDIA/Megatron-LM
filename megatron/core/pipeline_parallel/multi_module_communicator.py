@@ -297,17 +297,22 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward_recv_backward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} output_dict keys: {output_dict.keys()}')
+
                     grad_dict[bridge_comm.src_module_name] = bridge_comm.send_forward_recv_backward(
                         output_dict[module_name]
                     )
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward_recv_backward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} grad_dict keys: {grad_dict.keys()} DONE')
             else:
                 # If not last stage, send forward activation and receive backward gradient
                 # by using P2P communicator.
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward_recv_backward] p2p comm module_name: {module_name} ')
                 grad_dict[module_name] = (
                     rank_module_info.p2p_communicator.send_forward_recv_backward(
                         output_dict[module_name], tensor_shapes=tensor_shape, is_last_stage=False
                     )
                 )
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward_recv_backward] p2p comm module_name: {module_name} DONE')
         return grad_dict
 
     def send_backward_recv_forward(
@@ -331,19 +336,23 @@ class MultiModulePipelineCommunicator:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_backward_recv_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} grad_dict keys: {grad_dict.keys()}')
                     input_dict[bridge_comm.src_module_name] = (
                         bridge_comm.send_backward_recv_forward(
                             grad_dict[bridge_comm.src_module_name]
                         )
                     )
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_backward_recv_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} input_dict keys: {input_dict.keys()} DONE')
             else:
                 # If not first stage, send backward gradient and receive forward activation
                 # by using P2P communicator.
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_backward_recv_forward] p2p comm module_name: {module_name} ')
                 input_dict[module_name] = (
                     rank_module_info.p2p_communicator.send_backward_recv_forward(
                         grad_dict[module_name], tensor_shapes=tensor_shape, is_first_stage=False
                     )
                 )
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_backward_recv_forward] p2p comm module_name: {module_name} DONE got tensor {input_dict[module_name].shape}')
         return input_dict
 
     def recv_backward(
@@ -363,13 +372,17 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [recv_backward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} ')
                     grad_dict[bridge_comm.src_module_name] = bridge_comm.recv_backward()
                     # time.sleep(10)
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [recv_backward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} DONE')
             else:
                 # If not last stage, receive backward gradient by using P2P communicator.
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [recv_backward] p2p comm module_name: {module_name} ')
                 grad_dict[module_name] = rank_module_info.p2p_communicator.recv_backward(
                     tensor_shapes=tensor_shape, is_last_stage=False
                 )
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [recv_backward] p2p comm module_name: {module_name} DONE')
         return grad_dict
 
     def send_backward(self, grad_dict: Dict[str, torch.Tensor], is_first_stage: bool = False):
@@ -383,7 +396,9 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_backward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} ')
                     bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
+                    logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_backward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} DONE')
             else:
                 # If not first stage, send backward activation by using P2P communicator.
                 rank_module_info.p2p_communicator.send_backward(
