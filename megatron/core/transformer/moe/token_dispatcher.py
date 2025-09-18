@@ -1303,6 +1303,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
+            # Attributes that need to be captured in cudagraph. These attributes are returned
+            # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_enable_hybridep:
             self._comm_manager = _HybridepManager(
                 group=self.tp_ep_group,
@@ -1311,10 +1314,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 router_topk=self.tp_size * self.config.moe_router_topk,
                 config=self.config,
             )
+            # Attributes that need to be captured in cudagraph. These attributes are returned
+            # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
 
-        # Attributes that need to be captured in cudagraph. These attributes are returned
-        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
-        self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
 
     def set_shared_experts(self, shared_experts):
         self.shared_experts = shared_experts
