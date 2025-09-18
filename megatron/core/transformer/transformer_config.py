@@ -187,6 +187,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
+    moe_hybridep_num_sms: int =16
+    """Number of SMs to use for HybridEP."""
+
     ####################
     # initialization
     ####################
@@ -491,6 +494,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
+
+    moe_enable_hybridep: bool = False
+    """[Experimental] Enable HybridEP for efficient token dispatching and combine in MoE models."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""

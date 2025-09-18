@@ -262,3 +262,105 @@ else:
     fused_dispatch = None
     fused_combine = None
     set_deepep_num_sms = None
+
+
+try:
+    from hybrid_ep.controller import Controller
+    HAVE_HYBRIDEP = True
+except ImportError:
+    HAVE_HYBRIDEP = False
+
+_controller = None
+
+def init_controller(group: torch.distributed.ProcessGroup, hidden_dim: int, seq_len: int, num_local_experts: int, num_of_experts: int, topk: int, num_sms_dispatch_api: int, num_sms_combine_api: int, fp8_dispatch: bool):
+    assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    global _controller
+    _controller = Controller(
+        ep_group=group,
+        hidden_dim=hidden_dim,  
+        seq_len=seq_len,
+        num_local_experts=num_local_experts,
+        num_of_experts=num_of_experts,
+        fp8_dispatch=fp8_dispatch,
+        use_shared_buffer=True,
+        num_sms_dispatch_api=num_sms_dispatch_api,
+        num_sms_combine_api=num_sms_combine_api,
+
+    )
+    _controller.init_ep_config(topk = topk)
+    _controller.init_underlying()
+
+class HybridEPDispatch(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, routing_map, probs, group, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, pad_multiple):
+        if _controller is None:
+            seq_len, hidden_dim = x.shape[-2:]
+            fp8_dispatch = False # Currently, we do not support fp8 dispatch
+            init_controller(group, hidden_dim, seq_len, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, fp8_dispatch)
+        enable_permute = True # Curently, we only support fuse permute to hybrid-ep
+        dispatched_hidden, dispatched_probs, dispatched_scaling_factor, tokens_per_expert, handle = _controller.dispatch(
+            hidden=x,
+            routing_map=routing_map,
+            probs=probs,
+            scaling_factor=None,
+            enable_permute=True, # if set to True, the local permute will be enbaled on the hybrid-ep
+            pad_multiple=pad_multiple,
+        )
+        
+        ctx.handle = handle
+        ctx.enable_permute = enable_permute
+        ctx.pad_multiple = pad_multiple
+        return dispatched_hidden, dispatched_probs, dispatched_scaling_factor, tokens_per_expert, handle
+
+
+    @staticmethod
+    def backward(ctx, grad_x, grad_probs, grad_scaling_factor, grad_tokens_per_expert, grad_handle):
+        handle = ctx.handle
+        combined_hidden, combined_probs = _controller.combine(
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            enable_unpermute=ctx.enable_permute,
+            pad_multiple=ctx.pad_multiple,
+        )
+        return combined_hidden, combined_probs, None, None, None, None, None, None, None, None
+
+class HybridEPCombine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, num_permuted_tokens, handle, pad_multiple):
+        enable_unpermute = True
+        combined_hidden, _ = _controller.combine(
+            hidden=x,
+            handle=handle,
+            enable_unpermute=enable_unpermute,
+            pad_multiple=pad_multiple,
+        )
+        ctx.handle = handle
+        ctx.enable_unpermute = enable_unpermute
+        ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.pad_multiple = pad_multiple
+        return combined_hidden
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        handle = ctx.handle
+        dispatched_hidden, _, _, _, _ = _controller.dispatch(
+            hidden=grad_x,
+            num_permuted_tokens=ctx.num_permuted_tokens,
+            scaling_factor=None,
+            handle=handle,
+            enable_permute=ctx.enable_unpermute, # if set to True, the local permute will be enbaled on the hybrid-ep
+            pad_multiple=ctx.pad_multiple,
+        )
+        return dispatched_hidden, None, None, None, None
+
+if HAVE_HYBRIDEP:
+    def hybrid_ep_dispatch(x, routing_map, probs, group, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, pad_multiple):
+        return HybridEPDispatch.apply(x, routing_map, probs, group, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, pad_multiple)
+
+    def hybrid_ep_combine(x, num_permuted_tokens, handle, pad_multiple):
+        return HybridEPCombine.apply(x, num_permuted_tokens, handle, pad_multiple)
+
+else:
+    hybrid_ep_dispatch = None
+    hybrid_ep_combine = None

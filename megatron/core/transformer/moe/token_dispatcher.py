@@ -19,6 +19,9 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
     set_deepep_num_sms,
+    init_controller,
+    hybrid_ep_dispatch,
+    hybrid_ep_combine,
 )
 from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
@@ -952,6 +955,79 @@ class _DispatchManager(ABC):
         pass
 
 
+class _HybridepManager(_DispatchManager):
+    def __init__(self, group: torch.distributed.ProcessGroup, num_local_experts: int, num_experts: int, router_topk: int, config: TransformerConfig):
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.num_experts = num_experts
+        self.config = config
+        self.router_topk = router_topk
+        self.permute_fusion = config.moe_permute_fusion
+
+        # Metadata
+        self.token_probs: Optional[torch.Tensor] = None
+        # Handle used for combine operation
+        self.handle = None
+        # Used for padding the output for each expert
+        self.pad_multiple = 0
+
+        if hybrid_ep_dispatch is None:
+            raise ImportError(
+                "HybridEP is not installed."
+            )
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        num_tokens = routing_map.shape[0]
+        self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        self.token_probs = probs.reshape(num_tokens, self.num_experts)
+
+    def dispatch(self, hidden_states: torch.Tensor, async_finish: bool = True, allocate_on_comm_stream: bool = True) -> torch.Tensor:
+        # HybridEP only supports float32 probs
+        if self.token_probs.dtype != torch.float32:
+            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                print("HybridEP only supports float32 probs, please set --moe-router-dtype=fp32")
+            self.token_probs = self.token_probs.float()  # downcast or upcast
+        if self.config.moe_router_padding_for_fp8:
+            self.pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        dispatched_hidden, self.dispatched_probs, _, self.tokens_per_expert, self.handle = (
+            hybrid_ep_dispatch(
+                hidden_states,
+                self.routing_map,
+                self.token_probs,
+                self.group,
+                self.num_local_experts,
+                self.num_experts,
+                self.router_topk,
+                self.config.moe_hybridep_num_sms,
+                self.config.moe_hybridep_num_sms,
+                self.pad_multiple,
+            )
+        )
+        self.tokens_per_expert = self.tokens_per_expert.cpu()
+        return dispatched_hidden
+
+    def combine(self, hidden_states: torch.Tensor, async_finish: bool = True, allocate_on_comm_stream: bool = True) -> torch.Tensor:
+        hidden_states = hybrid_ep_combine(
+            hidden_states,
+            num_permuted_tokens=self.tokens_per_expert.sum(),  
+            handle=self.handle,
+            pad_multiple=self.pad_multiple,
+        )
+        self.handle = None
+        return hidden_states
+
+    def get_dispached_metadata(self) -> torch.Tensor:
+        return self.tokens_per_expert, self.dispatched_probs
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states, self.dispatched_probs
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+    
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        return self.tokens_per_expert
+
 class _DeepepManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -1214,18 +1290,27 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self.local_expert_indices = local_expert_indices
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
         assert (
-            self.config.moe_enable_deepep
-        ), "DeepEP is not enabled. Please set --moe-enable-deepep to use DeepEP backend."
+            self.config.moe_enable_deepep or self.config.moe_enable_hybridep
+        ), "DeepEP and HybridEP is not enabled. Please set --moe-enable-deepep or --moe-enable-hybridep to use DeepEP or HybridEP backend in the flex token dispatcher."
         assert (
             self.config.moe_pad_expert_input_to_capacity is False
         ), "Flex token dispatcher does not support --moe-pad-expert-input-to-capacity"
-        self._comm_manager = _DeepepManager(
-            group=self.tp_ep_group,
-            num_local_experts=self.num_local_experts,
-            router_topk=self.tp_size * self.config.moe_router_topk,
-            num_experts=self.tp_size * self.config.num_moe_experts,
-            config=self.config,
-        )
+        if self.config.moe_enable_deepep:
+            self._comm_manager = _DeepepManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+        elif self.config.moe_enable_hybridep:
+            self._comm_manager = _HybridepManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                config=self.config,
+            )
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
