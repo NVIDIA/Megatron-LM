@@ -500,23 +500,22 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
 
 @pytest.mark.parametrize(
     "world_size, tp_size, cp_size, dp_size",
-    [
-        (8, 1, 2, 4),  # 8 GPUs, 1 TP, 2 CP, 4 DP
-        (8, 1, 1, 8),  # 8 GPUs, 1 TP, 1 CP, 8 DP
-    ],
+    [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
 )
 def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     """
     Test that hybrid DPxCP groups are created correctly.
     """
     Utils.destroy_model_parallel()
-    
+
     # Skip if world size doesn't match
     actual_world_size = torch.cuda.device_count()
     if actual_world_size != world_size:
         pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size, hybrid_context_parallel=True
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        hybrid_data_context_parallel=True,
     )
 
     dp_cp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
@@ -524,5 +523,5 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     for group_size in group_sizes:
         group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
-    
+
     Utils.destroy_model_parallel()
