@@ -275,6 +275,7 @@ class BridgeCommunicator:
             num_sends = len(rank_info.send_to_ranks)
             if num_sends > 0:
                 tensor_splits = self._split_tensor_at_batch_dim(tensor_to_send, num_sends)
+                logging.debug(f"[Rank {self.current_rank} ][Bridge Comunicator] [send_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] starting to communicate shapes")
                 self._communicate_shapes(tensor_to_send_next=tensor_splits[0])
                 logging.debug(f"[Rank {self.current_rank} ][Bridge Comunicator] [send_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] communicate shapes DONE")
                 for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
@@ -308,6 +309,7 @@ class BridgeCommunicator:
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
             # p2p call to receive the tensor
+            logging.debug(f"[Rank {self.current_rank} ][Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] starting to communicate shapes")
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_prev=True)
             logging.debug(
                 f"[Rank {self.current_rank} ][Bridge Communicator] [receive_forward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] "
@@ -519,7 +521,7 @@ class BridgeCommunicator:
 
         rank_info = self.comm_map.get(self.current_rank)
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
-
+        logging.debug(f"[Rank {self.current_rank} ][Bridge Communicator] [send_forward_recv_backward] [src - {self.src_module_name}] [dest - {self.dest_module_name}] rank_info: {rank_info}")
         if rank_info.role == 'SENDER':
             assert (
                 self.current_rank == self.src_local_leader_rank
@@ -769,9 +771,13 @@ class BridgeCommunicator:
 
         recv_forward_shapes = []
         recv_grad_shapes = []
+        import traceback
+        stack = traceback.extract_stack()
+        caller = stack[-2]  # -1 is current line, -2 is caller
         logging.debug(
             f"[Rank {self.current_rank} ][Bridge Communicator] [communicate_shapes] [src - {self.src_module_name}] [dest - {self.dest_module_name}] "
-            f"is a {rank_info.role} and is running the shape communication"
+            f"is a {rank_info.role} and is running the shape communication "
+            f"[Called from {caller.filename}:{caller.lineno} in {caller.name}()]"
         )
         # Collect all P2P operations for batch execution
         ops = []

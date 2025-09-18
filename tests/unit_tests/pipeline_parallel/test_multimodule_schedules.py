@@ -126,19 +126,23 @@ class SingleEncoderModel(torch.nn.Module):
 
     def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
         if self.is_current_rank_in_grid(self.encoder_grid) and 'encoder' in input_tensor[0]:
-            logging.info(
-                f"Current rank: {dist.get_rank()} setting encoder input tensor with shape {input_tensor[0]['encoder'][0].shape} dtype {input_tensor[0]['encoder'][0].dtype}"
+            logging.debug(
+                f"[Rank {dist.get_rank()} ][SingleEncoderModel] [set_input_tensor] [encoder] input tensor shape: {input_tensor[0]['encoder'][0].shape}"
             )
             self.encoder_input_tensor = input_tensor[0]["encoder"][0]
         elif self.is_current_rank_in_grid(self.llm_grid):
             if 'llm' in input_tensor[0]:
-                logging.info(
-                    f"Current rank: {dist.get_rank()} setting llm input tensor with shape {input_tensor[0]['llm'][0].shape} dtype {input_tensor[0]['llm'][0].dtype}"
+                if isinstance(input_tensor[0]["llm"], list):
+                    llm_input_tensor = input_tensor[0]["llm"][0]
+                else:
+                    llm_input_tensor = input_tensor[0]["llm"]
+                logging.debug(
+                    f"[Rank {dist.get_rank()} ][SingleEncoderModel] [set_input_tensor] [llm] input tensor shape: {llm_input_tensor.shape}"
                 )
-                self.llm_input_tensor = input_tensor[0]["llm"][0]
+                self.llm_input_tensor = llm_input_tensor
             elif 'encoder' in input_tensor[0]:
-                logging.info(
-                    f"Current rank: {dist.get_rank()} setting encoder input tensor with shape {input_tensor[0]['encoder'].shape} dtype {input_tensor[0]['encoder'][0].dtype}"
+                logging.debug(
+                    f"[Rank {dist.get_rank()} ][SingleEncoderModel] [set_input_tensor] [encoder] input tensor shape: {input_tensor[0]['encoder'].shape}"
                 )
                 self.llm_input_tensor = input_tensor[0]["encoder"]
             else:
@@ -157,8 +161,8 @@ class SingleEncoderModel(torch.nn.Module):
                     self.encoder_input_tensor is not None
                 ), "Encoder input tensor is not provided for pp rank > 0"
                 input_tensor = self.encoder_input_tensor
-            logging.info(
-                f"Current rank: {dist.get_rank()} encoder forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}"
+            logging.debug(
+                f"[Rank {dist.get_rank()} ][SingleEncoderModel] [forward] [encoder] input tensor shape: {input_tensor.shape}"
             )
             output_dict["encoder"] = self.encoder(input_tensor, attention_mask=None)
         elif self.is_current_rank_in_grid(self.llm_grid):
@@ -166,8 +170,8 @@ class SingleEncoderModel(torch.nn.Module):
                 self.llm_input_tensor is not None
             ), "LLM input tensor is not provided for pp rank > 0"
             input_tensor = self.llm_input_tensor
-            logging.info(
-                f"Current rank: {dist.get_rank()} llm forward with input_tensor shape {input_tensor.shape} dtype {input_tensor.dtype}"
+            logging.debug(
+                f"[Rank {dist.get_rank()} ][SingleEncoderModel] [forward] [llm] input tensor shape: {input_tensor.shape}"
             )
             output_dict["llm"] = self.llm(input_tensor, attention_mask=None)
         else:
@@ -498,7 +502,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
         'forward_step_func': step_func,
         'data_iterator': data_iterator,
         'model': [model],
-        'num_microbatches': micro_batch_size,
+        'num_microbatches': 16,
         'seq_length': sequence_length,
         'micro_batch_size': micro_batch_size,
         'forward_only': False,
@@ -527,7 +531,6 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
 def test_forward_backward_pipelining_without_interleaving_multi_module_dual_encoder(
     mocker, encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
 ):
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
     Utils.initialize_distributed()
 
     def step_func(data_iterator, model):
@@ -607,7 +610,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_dual_enco
         'forward_step_func': step_func,
         'data_iterator': data_iterator,
         'model': [model],
-        'num_microbatches': micro_batch_size,
+        'num_microbatches': 16,
         'seq_length': sequence_length,
         'micro_batch_size': micro_batch_size,
         'forward_only': False,
@@ -639,7 +642,7 @@ if __name__ == "__main__":
     mock_mocker = Mock()
 
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
-    test_forward_backward_pipelining_without_interleaving_multi_module_dual_encoder(
+    test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
         mock_mocker, 
         encoder_tp=2, 
         encoder_pp=2, 
