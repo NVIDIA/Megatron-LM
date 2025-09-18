@@ -87,10 +87,6 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
-        if hasattr(self.experts, 'set_layer_number'):
-            self.experts.set_layer_number(layer_number)
-        if hasattr(self.shared_experts, 'set_layer_number'):
-            self.shared_experts.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
