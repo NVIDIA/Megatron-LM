@@ -144,10 +144,14 @@ class SingleEncoderModel(torch.nn.Module):
 
     def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
         if self.is_current_rank_in_grid(self.encoder_grid) and 'encoder' in input_tensor[0]:
+            if isinstance(input_tensor[0]["encoder"], list):
+                encoder_input_tensor = input_tensor[0]["encoder"][0]
+            else:
+                encoder_input_tensor = input_tensor[0]["encoder"]
             logging.debug(
                 f"[Rank {dist.get_rank()} ][SingleEncoderModel] [set_input_tensor] [encoder] input tensor shape: {input_tensor[0]['encoder'][0].shape}"
             )
-            self.encoder_input_tensor = input_tensor[0]["encoder"][0]
+            self.encoder_input_tensor = encoder_input_tensor
         elif self.is_current_rank_in_grid(self.llm_grid):
             if 'llm' in input_tensor[0]:
                 if isinstance(input_tensor[0]["llm"], list):
