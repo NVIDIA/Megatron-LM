@@ -141,6 +141,7 @@ class DynamicInferenceRequest(InferenceRequest):
         Get the length of the prompt tokens.
         """
         return len(self.prompt_tokens)
+
     events: List[DynamicInferenceEvent] = field(default_factory=list)
 
     def __str__(self):

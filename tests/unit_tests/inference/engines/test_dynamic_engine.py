@@ -4,7 +4,7 @@ import asyncio
 import random
 import types
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
 
 import pytest
 import torch
@@ -394,7 +394,7 @@ class TestDynamicInferenceEngine:
             [41, 56, 15, 58],
             [28, 17, 6, 37],
             [17, 2, 54, 47],
-            [], # this request is failed due to max sequence length overflow
+            [],  # this request is failed due to max sequence length overflow
         ]
 
         assert len(env.requests) == len(expected_generated_tokens_list)

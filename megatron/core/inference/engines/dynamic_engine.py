@@ -384,8 +384,13 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
         if request.sampling_params.num_tokens_to_generate is None:
-            request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(request.prompt_tokens)
-        elif len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate > self.context.max_sequence_length:
+            request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
+                request.prompt_tokens
+            )
+        elif (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+            > self.context.max_sequence_length
+        ):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
