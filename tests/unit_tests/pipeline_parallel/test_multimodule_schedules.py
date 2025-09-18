@@ -1,7 +1,7 @@
 import logging
 import os
 from typing import Dict, List
-
+from contextlib import contextmanager
 import pytest
 import torch
 import torch.distributed as dist
@@ -103,6 +103,24 @@ class SingleEncoderModel(torch.nn.Module):
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
                 module.finish_grad_sync()
+    @contextmanager
+    def no_sync(self):
+        contexts = []
+        if self.is_current_rank_in_grid(self.encoder_grid):
+            contexts.append(self.encoder.no_sync())
+        if self.is_current_rank_in_grid(self.llm_grid):
+            contexts.append(self.llm.no_sync())
+        
+        # Enter all contexts
+        for ctx in contexts:
+            ctx.__enter__()
+        
+        try:
+            yield
+        finally:
+            # Exit all contexts in reverse order
+            for ctx in reversed(contexts):
+                ctx.__exit__(None, None, None)
 
     @property
     def ddp_config(self):
@@ -474,6 +492,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
     config.moe_router_enable_expert_bias = False
     config.moe_router_load_balancing_type = "aux_loss"
     config.variable_seq_lengths = True
+    config.no_sync_func = model.no_sync
 
     # Add grad scale function to convert float losses to tensors
     def grad_scale_func(loss):
