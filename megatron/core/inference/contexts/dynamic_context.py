@@ -957,7 +957,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert chunk_length > 0, "Chunk length is 0"
         assert chunk_length <= req.prompt_length, "Chunk length is greater than prompt length"
         if self.active_token_count + chunk_length > self.max_tokens:
-            raise TokenOverflowError()
+            raise TokenOverflowError(req.request_id)
 
         this_round_tokens = req.prompt_tokens[:chunk_length]
 
@@ -976,7 +976,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_chunks_needed, safe=True
             )
             if new_chunk_ids is None or len(new_chunk_ids) != num_chunks_needed:
-                raise ChunkOverflowError()
+                raise ChunkOverflowError(req.request_id)
 
         # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
         # in this case, it is exactly the last request in the current system (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -993,10 +993,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             current_id = self.total_request_count
 
         if current_id >= self.max_requests:
-            raise RequestOverflowError()
+            raise RequestOverflowError(req.request_id)
 
         if self.active_token_count + chunk_length > self.max_tokens:
-            raise TokenOverflowError()
+            raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
         self.request_query_lengths[current_id] = chunk_length

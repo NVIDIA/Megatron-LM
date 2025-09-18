@@ -387,17 +387,14 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(request.prompt_tokens)
         elif len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate > self.context.max_sequence_length:
             request.status = Status.FAILED
-            request.add_event_error_nontransient(MaxSequenceLengthOverflowError())
-            self.waiting_request_ids.append(request_id)
-            raise MaxSequenceLengthOverflowError()
+            request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
-            request.add_event_error_nontransient(TokenOverflowError())
-            self.waiting_request_ids.append(request_id)
-            raise TokenOverflowError()
+            request.add_event_error_nontransient(TokenOverflowError(request_id))
 
-        self.waiting_request_ids.append(request_id)
+        if request.status != Status.FAILED:
+            self.waiting_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()

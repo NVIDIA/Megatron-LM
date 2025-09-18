@@ -394,7 +394,7 @@ class TestDynamicInferenceEngine:
             [41, 56, 15, 58],
             [28, 17, 6, 37],
             [17, 2, 54, 47],
-            [],
+            [], # this request is failed due to max sequence length overflow
         ]
 
         assert len(env.requests) == len(expected_generated_tokens_list)
