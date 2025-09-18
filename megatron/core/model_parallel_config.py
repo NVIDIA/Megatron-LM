@@ -337,6 +337,9 @@ class ModelParallelConfig:
     cpu_offloading_weights: bool = True
     """If True, offloads the weights to CPU."""
 
+    cpu_offloading_double_buffering: bool = False
+    """If True, enables double buffering across layers while reloading activations from CPU."""
+
     ###################
     # Timing
     ###################
