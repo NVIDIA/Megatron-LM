@@ -55,7 +55,7 @@ def default_params_group_func(
         # NOTE: Megatron-core uses allreduce to indicate experts MLP layers that are in EP, not
         # actually needs allreduce. And not all of the parameters have the "allreduce" attribute
         # patched.
-        is_ep_mlp = getattr(param, "allreduce", False)
+        is_ep_mlp = not getattr(param, "allreduce", True)
         if "norm" not in name and re.search(r".weight(\d*)$", name):
             if not is_ep_mlp:
                 attn_linear_params_list.append(param)
@@ -221,7 +221,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         non_moe_linear_params_list = []
         moe_linear_params_list = []
         # If MoE is used, attention and MLP layers will have different DP groups.
-        if not self.is_moe:
+        if self.is_moe:
             non_moe_linear_params_list = (
                 linear_param_groups[0]["params"] + linear_param_groups[1]["params"]
             )
@@ -237,7 +237,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             wrapper_args,
             self.dp_cp_group,
         )
-        if self.is_moe:
+        if self.is_moe and moe_linear_params_list:
             moe_layer_wise_optimizer, self.moe_broadcast_params_list = group_params_layer_wise(
                 moe_linear_params_list,
                 optimizer_wrapper,
