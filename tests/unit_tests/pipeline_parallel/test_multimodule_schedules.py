@@ -142,6 +142,24 @@ class SingleEncoderModel(torch.nn.Module):
         """Check if the current rank is in the grid."""
         return grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size)
 
+    @contextmanager
+    def no_sync(self):
+        contexts = []
+        for module, grid in self.modules_and_grids:
+            if module is not None and self.is_current_rank_in_grid(grid):
+                contexts.append(module.no_sync())
+        
+        # Enter all contexts
+        for ctx in contexts:
+            ctx.__enter__()
+        
+        try:
+            yield
+        finally:
+            # Exit all contexts in reverse order
+            for ctx in reversed(contexts):
+                ctx.__exit__(None, None, None)
+
     def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
         if self.is_current_rank_in_grid(self.encoder_grid) and 'encoder' in input_tensor[0]:
             if isinstance(input_tensor[0]["encoder"], list):
@@ -249,12 +267,21 @@ class DualEncoderModel(SingleEncoderModel):
     def set_input_tensor(self, input_tensor: List[Dict[str, torch.Tensor]]):
         logging.debug(f" In DualEncoderModel set_input_tensor rank {dist.get_rank()} input_tensor keys: {input_tensor[0].keys()}")
         if self.is_current_rank_in_grid(self.encoder_1_grid) and 'encoder_1' in input_tensor[0]:
-            self.encoder_1_input_tensor = input_tensor[0]["encoder_1"][0]
+            if isinstance(input_tensor[0]["encoder_1"], list):
+                self.encoder_1_input_tensor = input_tensor[0]["encoder_1"][0]
+            else:
+                self.encoder_1_input_tensor = input_tensor[0]["encoder_1"]
         if self.is_current_rank_in_grid(self.encoder_2_grid) and 'encoder_2' in input_tensor[0]:
-            self.encoder_2_input_tensor = input_tensor[0]["encoder_2"][0]
+            if isinstance(input_tensor[0]["encoder_2"], list):
+                self.encoder_2_input_tensor = input_tensor[0]["encoder_2"][0]
+            else:
+                self.encoder_2_input_tensor = input_tensor[0]["encoder_2"]
         if self.is_current_rank_in_grid(self.llm_grid):
             if 'llm' in input_tensor[0]:
-                self.llm_input_tensor = input_tensor[0]["llm"][0]
+                if isinstance(input_tensor[0]["llm"], list):
+                    self.llm_input_tensor = input_tensor[0]["llm"][0]
+                else:
+                    self.llm_input_tensor = input_tensor[0]["llm"]
             elif 'encoder_1' in input_tensor[0] and 'encoder_2' in input_tensor[0]:
                 # concat across sequence dimension (s, b, h)
                 logging.debug(f'In DualEncoderModel LLM set_input_tensor rank {dist.get_rank()} encoder_1 shape: {input_tensor[0]["encoder_1"].shape} encoder_2 shape: {input_tensor[0]["encoder_2"].shape}')
@@ -605,6 +632,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_dual_enco
     config.moe_router_enable_expert_bias = False
     config.moe_router_load_balancing_type = "aux_loss"
     config.variable_seq_lengths = True
+    config.no_sync_func = model.no_sync
 
     # Add grad scale function to convert float losses to tensors
     def grad_scale_func(loss):
@@ -665,7 +693,7 @@ if __name__ == "__main__":
     mock_mocker = Mock()
 
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
-    test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
+    test_forward_backward_pipelining_without_interleaving_multi_module_dual_encoder(
         mock_mocker, 
         encoder_tp=2, 
         encoder_pp=2, 
