@@ -36,7 +36,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, is_te_min_version
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -49,12 +49,16 @@ except:
 
 
 try:
-    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELinear,
+        set_save_original_input,
+    )
     from megatron.core.post_training.modelopt.layers import Linear
 
     HAVE_TE = True
 except ImportError:
-    TEColumnParallelLinear, TELinear, Linear = None, None, None
+    TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
     HAVE_TE = False
 
 
@@ -170,6 +174,19 @@ class MultiLatentAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='proj',
         )
+
+        if (
+            HAVE_TE
+            and self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
+            and isinstance(self.linear_proj, TELinear)
+        ):
+            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
 
     def forward(
         self,
@@ -890,3 +907,11 @@ class MLASelfAttention(MultiLatentAttention):
     def _backward_output_proj(self):
         """Computes weight gradients of output projection layer"""
         self.linear_proj.backward_dw()
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        if self.config.q_lora_rank is not None:
+            set_save_original_input(self.linear_q_down_proj)
+        set_save_original_input(self.linear_kv_down_proj)

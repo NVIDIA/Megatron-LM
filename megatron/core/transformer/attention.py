@@ -30,6 +30,7 @@ from megatron.core.utils import (
     divide,
     get_pg_size,
     is_fa_min_version,
+    is_te_min_version,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -73,10 +74,14 @@ try:
     import transformer_engine  # pylint: disable=unused-import
 
     HAVE_TE = True
-    from megatron.core.extensions.transformer_engine import SplitAlongDim
+    from megatron.core.extensions.transformer_engine import (
+        SplitAlongDim,
+        TELinear,
+        set_save_original_input,
+    )
 except ImportError:
     HAVE_TE = False
-    SplitAlongDim = None
+    SplitAlongDim, TELinear, set_save_original_input = None, None, None
 
 
 @dataclass
@@ -188,6 +193,19 @@ class Attention(MegatronModule, ABC):
             tp_comm_buffer_name='proj',
             tp_group=self.model_comm_pgs.tp,
         )
+
+        if (
+            HAVE_TE
+            and self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
+            and isinstance(self.linear_proj, TELinear)
+        ):
+            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
 
     def _checkpointed_attention_forward(
         self,
@@ -830,6 +848,10 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
+
 
 class SelfAttention(Attention):
     """Self-attention layer class
@@ -1026,6 +1048,12 @@ class SelfAttention(Attention):
     def _backward_output_proj(self):
         """Update weights for output projection layer"""
         self.linear_proj.backward_dw()
+
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        set_save_original_input(self.linear_qkv)
 
 
 class CrossAttention(Attention):
