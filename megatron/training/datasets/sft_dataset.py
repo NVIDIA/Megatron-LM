@@ -78,7 +78,7 @@ class SFTDataset(MegatronDataset):
             conversation_list, return_target=True, add_generation_prompt=False
         )
 
-        force_eod_length = int(config.force_eod)
+        force_eod_length = int(tokenizer.force_eod)
 
         if len(tokens) > max_seq_len - force_eod_length:
             tokens = tokens[: max_seq_len - force_eod_length]
@@ -88,9 +88,7 @@ class SFTDataset(MegatronDataset):
         num_tokens = len(tokens) + force_eod_length
         padding_len = max_seq_len - num_tokens
         assert padding_len >= 0
-        filler = [tokenizer.pad] * (padding_len + 1)
-        if config.force_eod:
-            filler = [tokenizer.eod] + filler
+        filler = [tokenizer.eod] * force_eod_length + [tokenizer.pad] * (padding_len + 1)
 
         tokens = np.array(tokens.tolist() + filler, dtype=np.int64)
         target = np.array(target.tolist() + filler, dtype=np.int64)

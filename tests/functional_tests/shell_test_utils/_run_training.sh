@@ -92,14 +92,14 @@ else
     # If this is a second run (of checkpoint-resume), we might want to use a
     # different model configuration than during first time. So if key `MODEL_ARGS_2`
     # exists we use it, otherwise we use the same as for the first run.
-    if [[ $RUN_NUMBER -eq 2 && $(/usr/local/bin/yq 'has("MODEL_ARGS_2")' "$TRAINING_PARAMS_PATH") == true ]]; then
-        export KEY="MODEL_ARGS_2"
+    if [[ $RUN_NUMBER -gt 1 && $(/usr/local/bin/yq 'has("MODEL_ARGS_'$RUN_NUMBER'")' "$TRAINING_PARAMS_PATH") == true ]]; then
+        export KEY="MODEL_ARGS_$RUN_NUMBER"
     else
         export KEY="MODEL_ARGS"
     fi
 
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(/usr/local/bin/yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(/usr/local/bin/yq 'explode(.) | ... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
