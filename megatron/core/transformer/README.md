@@ -2,10 +2,10 @@
 
 Fine-grained Activation Offloading
 =============
-
+<h4>NVIDIA, XiaoHongShu</h4>
 <div align="left">
 
-## Quick Start
+# Quick Start
 
 ```bash
 # Enable fine-grained activation offloading
@@ -16,7 +16,7 @@ Fine-grained Activation Offloading
 --offload-modules core_attn
 ```
 
-# Current statue
+# Current status
 ## Features
 * Support PP=1/PP/Interleaved PP
 * Compatible with fine-grained recomputation
@@ -59,10 +59,20 @@ In bprop, the three parts above will:
 ## Compatible with PP&Interleaved PP
 
 `PipelineOffloadManager` is used to manage the chunks across different model chunks in fprop and bprop.
-Before the model.forward() start, the `PipelineOffloadManager.get_instance().reset_chunk_handler` will be executed. In the fprop of this methond, we create a `ChunkOffloadHandler` to handle the offloading context of one model chunk and then push it to a buffer, which will be poped out in a specific order in bprop.
+Before the model.forward() start, the `PipelineOffloadManager.get_instance().reset_chunk_handler` will be executed. In the fprop of this method, we create a `ChunkOffloadHandler` to handle the offloading context of one model chunk and then push it to a buffer, which will be popped out in a specific order in bprop.
+
+<img width="1182" height="537" alt="image" src="https://github.com/user-attachments/assets/9d1655cc-d6d4-44de-acaf-35099cb902c2" />
+
 
 ## Compatible with fine-grained recomputation
+
+<img width="2873" height="1494" alt="offload_and_recompute" src="https://github.com/user-attachments/assets/b857112f-4cf6-480f-aaf8-496bfe821faa" />
+
 
 ## A special case: attn_norm/mlp_norm
 
 # Performance (WIP)
+
+# Acknowledgement
+
+This work refers to the previous work from Kuaishou: https://www.usenix.org/conference/atc24/presentation/yuan
