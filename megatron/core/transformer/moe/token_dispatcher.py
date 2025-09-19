@@ -956,12 +956,11 @@ class _DispatchManager(ABC):
 
 
 class _HybridepManager(_DispatchManager):
-    def __init__(self, group: torch.distributed.ProcessGroup, num_local_experts: int, num_experts: int, router_topk: int, config: TransformerConfig):
+    def __init__(self, group: torch.distributed.ProcessGroup, num_local_experts: int, num_experts: int, config: TransformerConfig):
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
         self.config = config
-        self.router_topk = router_topk
         self.permute_fusion = config.moe_permute_fusion
 
         # Metadata
@@ -997,7 +996,6 @@ class _HybridepManager(_DispatchManager):
                 self.group,
                 self.num_local_experts,
                 self.num_experts,
-                self.router_topk,
                 self.config.moe_hybridep_num_sms,
                 self.config.moe_hybridep_num_sms,
                 self.pad_multiple,
@@ -1311,7 +1309,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
                 num_experts=self.tp_size * self.config.num_moe_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
                 config=self.config,
             )
             # Attributes that need to be captured in cudagraph. These attributes are returned

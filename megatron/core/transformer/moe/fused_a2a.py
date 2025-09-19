@@ -272,7 +272,7 @@ except ImportError:
 
 _controller = None
 
-def init_controller(group: torch.distributed.ProcessGroup, hidden_dim: int, seq_len: int, num_local_experts: int, num_of_experts: int, topk: int, num_sms_dispatch_api: int, num_sms_combine_api: int, fp8_dispatch: bool):
+def init_controller(group: torch.distributed.ProcessGroup, hidden_dim: int, seq_len: int, num_local_experts: int, num_of_experts: int, num_sms_dispatch_api: int, num_sms_combine_api: int, fp8_dispatch: bool):
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _controller
     _controller = Controller(
@@ -287,16 +287,16 @@ def init_controller(group: torch.distributed.ProcessGroup, hidden_dim: int, seq_
         num_sms_combine_api=num_sms_combine_api,
 
     )
-    _controller.init_ep_config(topk = topk)
+    _controller.init_ep_config()
     _controller.init_underlying()
 
 class HybridEPDispatch(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, routing_map, probs, group, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, pad_multiple):
+    def forward(ctx, x, routing_map, probs, group, num_local_experts, num_of_experts, num_sms_dispatch_api, num_sms_combine_api, pad_multiple):
         if _controller is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False # Currently, we do not support fp8 dispatch
-            init_controller(group, hidden_dim, seq_len, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, fp8_dispatch)
+            init_controller(group, hidden_dim, seq_len, num_local_experts, num_of_experts, num_sms_dispatch_api, num_sms_combine_api, fp8_dispatch)
         enable_permute = True # Curently, we only support fuse permute to hybrid-ep
         dispatched_hidden, dispatched_probs, dispatched_scaling_factor, tokens_per_expert, handle = _controller.dispatch(
             hidden=x,
@@ -355,8 +355,8 @@ class HybridEPCombine(torch.autograd.Function):
         return dispatched_hidden, None, None, None, None
 
 if HAVE_HYBRIDEP:
-    def hybrid_ep_dispatch(x, routing_map, probs, group, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, pad_multiple):
-        return HybridEPDispatch.apply(x, routing_map, probs, group, num_local_experts, num_of_experts, topk, num_sms_dispatch_api, num_sms_combine_api, pad_multiple)
+    def hybrid_ep_dispatch(x, routing_map, probs, group, num_local_experts, num_of_experts, num_sms_dispatch_api, num_sms_combine_api, pad_multiple):
+        return HybridEPDispatch.apply(x, routing_map, probs, group, num_local_experts, num_of_experts, num_sms_dispatch_api, num_sms_combine_api, pad_multiple)
 
     def hybrid_ep_combine(x, num_permuted_tokens, handle, pad_multiple):
         return HybridEPCombine.apply(x, num_permuted_tokens, handle, pad_multiple)
