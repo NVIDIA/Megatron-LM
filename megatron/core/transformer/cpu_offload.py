@@ -413,8 +413,10 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
         self._offloaded_group_index = self._offloaded_group_index - 1
 
     def on_group_start_forward(self, name):
-        if self._offloaded_group_index % self.offloaded_groups_count_per_layer == 0:
-            torch.cuda.current_stream().wait_stream(self.d2h_stream)
+        # # wait for the offloaded groups of one layer are fully offloaded.
+        # # This is not necessary but good to have.
+        # if self._offloaded_group_index % self.offloaded_groups_count_per_layer == 0:
+        #     torch.cuda.current_stream().wait_stream(self.d2h_stream)
         if self._offloaded_group_index // self.offloaded_groups_count_per_layer == self._num_layers - 1:
             self.is_last_layer = True
         else:
@@ -422,8 +424,6 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
         self._offloaded_group_index = self._offloaded_group_index + 1
         self._tensor_count_current_group = 0
         self._groups_to_offload.append((self._offloaded_group_index, name))
-        # wait for the offloaded groups of one layer are fully offloaded.
-        # This is not necessary but good to have.
 
     def on_group_start_backward(self):
         if torch.distributed.get_rank() == DEBUG_RANK and DEBUG:

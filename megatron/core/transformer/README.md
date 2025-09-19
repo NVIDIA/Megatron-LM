@@ -2,7 +2,7 @@
 
 Fine-grained Activation Offloading
 =============
-<h4>NVIDIA, XiaoHongShu</h4>
+<h4>NVIDIA, rednote</h4>
 <div align="left">
 
 # Quick Start
