@@ -486,7 +486,7 @@ class MambaMixer(MegatronModule):
         seq_idx: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         return_varlen_states: bool = False,
-        active_token_count: Optional[int] = None,
+        batch_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encapsulates the core selective scan block logic which is shared between
@@ -500,6 +500,8 @@ class MambaMixer(MegatronModule):
             seq_idx: A map from token index to request index for variable-length sequences.
             cu_seqlens: Cumulative sequence lengths for variable-length sequences.
             return_varlen_states: Whether to return variable-length states from the SSM kernel.
+            batch_indices: A map from batch id to position in the Mamba state tensors for
+                dynamic inference.
 
         Returns:
             A tuple containing the output tensor and the output bias tensor.
@@ -522,10 +524,9 @@ class MambaMixer(MegatronModule):
         # Compute short convolution
         if conv_state is not None and is_dynamic_batching:
             # xBC should have shape (b l d) for causal_conv1d_varlen_states
-            conv_state.copy_(
-                causal_conv1d_varlen_states(
-                    xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
-                )
+            assert batch_indices is not None
+            conv_state[batch_indices] = causal_conv1d_varlen_states(
+                xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
             )
             # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
@@ -615,12 +616,14 @@ class MambaMixer(MegatronModule):
 
         if ssm_state is not None:
             if return_varlen_states:
+                assert batch_indices is not None
+
                 y, _, varlen_states = y
 
                 # This has to be varlen_states, NOT last_state
                 # See reference implementation:
                 # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
-                ssm_state.copy_(varlen_states)
+                ssm_state[batch_indices] = varlen_states
             else:
                 y, last_state = y
                 ssm_state.copy_(last_state)
@@ -675,7 +678,7 @@ class MambaMixer(MegatronModule):
                 : context.padded_active_token_count
             ]
             out, out_bias, _, _ = self.step(
-                hidden_states.transpose(0, 1), conv_state, ssm_state, batch_indices
+                hidden_states.transpose(0, 1), conv_state, ssm_state, batch_indices=batch_indices
             )
             return out.transpose(0, 1), out_bias
 
@@ -684,53 +687,48 @@ class MambaMixer(MegatronModule):
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
         ]
+        batch_indices = context.request_to_mamba_state_idx
 
         # First request with query len > 1 is prefill-start
-        first_prefill_request_idx = torch.nonzero(active_query_lengths > 1)[0].int()
-        first_prefill_token_idx = cu_seqlens[first_prefill_request_idx]
-        assert first_prefill_token_idx == first_prefill_request_idx
+        first_prefill_token_idx = torch.nonzero(active_query_lengths > 1)[0].int()
 
         out_decode, out_bias_decode = None, None
 
         # Decode slice (requests before prefill start)
-        if first_prefill_request_idx > 0:
+        if first_prefill_token_idx > 0:
             hidden_states_decode = hidden_states[:first_prefill_token_idx]
-            batch_indices = context.request_to_mamba_state_idx[
-                : first_prefill_token_idx
-            ]
+            batch_indices_decode = batch_indices[:first_prefill_token_idx]
             out_decode, out_bias_decode, _, _ = self.step(
-                hidden_states_decode.transpose(0, 1), conv_state, ssm_state, batch_indices=batch_indices
+                hidden_states_decode.transpose(0, 1),
+                conv_state,
+                ssm_state,
+                batch_indices=batch_indices_decode,
             )
             out_decode = out_decode.transpose(0, 1)
 
         # Prefill slice (remaining active tokens/requests)
         active_token_count = context.active_token_count
         active_request_count = context.get_active_request_count()
-        batch_indices = context.request_to_mamba_state_idx[
-            first_prefill_request_idx : active_request_count
-        ]
 
         hidden_states_prefill = hidden_states[first_prefill_token_idx:active_token_count]
-        conv_state_prefill = conv_state[batch_indices]
-        ssm_state_prefill = ssm_state[batch_indices]
         cu_seqlens_prefill = F.pad(
-            cu_seqlens[first_prefill_request_idx + 1 :] - first_prefill_request_idx, (1, 0)
+            cu_seqlens[first_prefill_token_idx + 1 :] - first_prefill_token_idx, (1, 0)
         )
         seq_idx_prefill = (
-            seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_request_idx
+            seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_token_idx
         )
+        batch_indices_prefill = batch_indices[first_prefill_token_idx:active_request_count]
+
         zxBCdt_prefill = self.compute_in_proj(hidden_states_prefill)
         out_prefill, out_bias_prefill = self.ssm_block(
             zxBCdt_prefill,
-            conv_state=conv_state_prefill,
-            ssm_state=ssm_state_prefill,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
             seq_idx=seq_idx_prefill,
             cu_seqlens=cu_seqlens_prefill,
             return_varlen_states=True,
+            batch_indices=batch_indices_prefill,
         )
-        # TODO(ksanthanam): Patch the upstream repos to support block table for prefill
-        conv_state[batch_indices] = conv_state_prefill
-        ssm_state[batch_indices] = ssm_state_prefill
 
         out = maybe_cat(out_decode, out_prefill, required=True)
         out_bias = maybe_cat(out_bias_decode, out_bias_prefill, required=False)
