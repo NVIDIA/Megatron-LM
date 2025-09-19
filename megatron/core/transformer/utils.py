@@ -3,7 +3,7 @@
 """Utilities for transformer layers."""
 from functools import lru_cache
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
@@ -14,6 +14,9 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.transformer import TransformerConfig
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -30,6 +33,17 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
     return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+
+
+@lru_cache(maxsize=32)
+def get_sliding_window_causal_mask(sq, skv, window_size):
+    """Create the equivalent attention mask for SWA in [sq, skv] shape"""
+    m = torch.ones(sq, skv, dtype=torch.bool, device="cuda")
+    mu = torch.triu(m, diagonal=skv - sq - window_size[0])
+    ml = torch.tril(mu, diagonal=skv - sq + window_size[1])
+    ml = ~ml
+
+    return ml
 
 
 # pylint: disable=missing-function-docstring
@@ -383,3 +397,22 @@ def toggle_cuda_graphs(model, set_to=False, reset_cuda_graphs=True):
     # if we are resetting cuda graphs we need to reset all the state
     if reset_cuda_graphs and set_to == False:
         delete_cuda_graphs()
+
+
+def is_layer_window_attention(
+    window_size: Optional[Tuple[int, int]], window_attn_skip_freq: int | list, layer_number: int
+) -> bool:
+    # layer_number is 1-indexed
+    if not window_size:
+        return False
+    if window_attn_skip_freq is None:
+        return True
+    if isinstance(window_attn_skip_freq, int):
+        return layer_number % window_attn_skip_freq != 0
+    if isinstance(window_attn_skip_freq, list):
+        return bool(window_attn_skip_freq[layer_number - 1])
+
+    raise ValueError(
+        f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
+        f"{window_attn_skip_freq}"
+    )
