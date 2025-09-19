@@ -186,17 +186,17 @@ class Attention(MegatronModule, ABC):
         )
 
         self.offload_qkv_linear = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "qkv_linear" in self.config.offload_modules
         )
 
         self.offload_core_attention = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "core_attn" in self.config.offload_modules
         )
 
         self.offload_attn_proj = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "attn_proj" in self.config.offload_modules
         )
 

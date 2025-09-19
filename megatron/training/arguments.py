@@ -1113,8 +1113,8 @@ def validate_args(args, defaults={}):
                 "when enabling delay_wgrad_compute"
             )
     
-    if args.offload_activation:
-        assert not args.overlap_grad_reduce, "overlap_grad_reduce is not supported with offload_activation"
+    if args.fine_grained_activation_offloading:
+        assert not args.overlap_grad_reduce, "overlap_grad_reduce is not supported with fine_grained_activation_offloading"
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -2116,10 +2116,10 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--use-te-activation-func', action='store_true',
                        help='Use activation function kernel from Transformer Engine in MLP module.')
-    group.add_argument('--offload-activation', action='store_true',
+    group.add_argument('--fine-grained-activation-offloading', action='store_true',
                        help='Offload the activation to the CPU.')
     group.add_argument('--offload-modules', nargs='*', type=str, default=[],
-                       help='The submodules to offload. Choices: "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1", "router_fc2", "shared_fc1", "shared_fc2".')
+                       help='The submodules to offload. Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
     return parser
 
 

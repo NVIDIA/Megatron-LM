@@ -316,20 +316,19 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
-    offload_activation: bool = False
+    fine_grained_activation_offloading: bool = False
     """If True, offload the activation to the CPU."""
 
     offload_modules: Optional[list[str]] = None
     """The submodules to offload.
-    choices: "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1", "moe_act", "router_fc2".
+    choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
     default: ["core_attn"].
-    "self_attn": offload the self_attn part of the transformer layer.
-    "qkv_linear": offload the qkv_linear part of the transformer layer.
-    "core_attn": offload the core attention part of the transformer layer.
-    "attn_linear": offload the attn linear projection part of the transformer layer.
-    "router_fc1": offload the moe router_fc1 part of the transformer layer.
-    "moe_act": offload the moe act part of the transformer layer.
-    "router_fc2": offload the moe router_fc2 part of the transformer layer.
+    "attn_norm": offload the input of the normalization in the attention part.
+    "core_attn": offload the input of the core attention part.
+    "mlp_norm": offload the input of the normalization in the mlp part.
+    "attn_proj": offload the input of the attn linear projection part.
+    "expert_fc1": offload the input of the expert fc1 part.
+    "moe_act": offload the input of the moe act part.
     """
     offload_module_count_per_layer: Optional[int] = 0
     """The number of modules to offload per layer. default: 0."""

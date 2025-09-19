@@ -432,15 +432,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
         self.offload_self_attn = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "self_attn" in self.config.offload_modules
         )
         self.offload_attn_norm = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "attn_norm" in self.config.offload_modules
         )
         self.offload_mlp_norm = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "mlp_norm" in self.config.offload_modules
         )
 

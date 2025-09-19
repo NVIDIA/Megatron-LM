@@ -945,7 +945,7 @@ class TransformerConfig(ModelParallelConfig):
         if len(self.offload_modules) > 0:
             self.offload_modules = list(set(self.offload_modules))
             allowed_modules = {
-                "core_attn", "attn_proj", "router_fc1", "moe_act", "attn_norm", "mlp_norm"
+                "core_attn", "attn_proj", "expert_fc1", "moe_act", "attn_norm", "mlp_norm"
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
@@ -959,9 +959,9 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
-            if "router_fc1" in self.offload_modules and self.tensor_model_parallel_size > 1:
+            if "expert_fc1" in self.offload_modules and self.tensor_model_parallel_size > 1:
                 raise ValueError(
-                    "(Bug) router_fc1 cannot be set to offload_modules when tensor_model_parallel_size > 1."
+                    "(Bug) expert_fc1 cannot be set to offload_modules when tensor_model_parallel_size > 1."
                 )
 
 

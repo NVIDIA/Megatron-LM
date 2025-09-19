@@ -810,13 +810,13 @@ class TEGroupedMLP(MegatronModule):
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
-        self.offload_router_fc1 = (
-            self.config.offload_activation
-            and "router_fc1" in self.config.offload_modules
+        self.offload_expert_fc1 = (
+            self.config.fine_grained_activation_offloading
+            and "expert_fc1" in self.config.offload_modules
         )
 
         self.offload_moe_act = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "moe_act" in self.config.offload_modules
         )
 
@@ -874,14 +874,14 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         offload_context = contextlib.nullcontext()
-        if self.offload_router_fc1:
-                permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, name="router_fc1")
+        if self.offload_expert_fc1:
+                permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, name="expert_fc1")
                 offload_context = PipelineOffloadManager.get_instance()
         with offload_context:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
         )
-        if self.offload_router_fc1:
+        if self.offload_expert_fc1:
             fc1_output, bias_parallel = group_prefetch_offload_commit(fc1_output, bias_parallel, release_tensors=[permuted_local_hidden_states])
             offload_context = contextlib.nullcontext()
 
