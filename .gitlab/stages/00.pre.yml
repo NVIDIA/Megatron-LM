@@ -30,7 +30,7 @@ pre:mirror_to_github:
     GIT_STRATEGY: 'clone'
   script:
     - git checkout $CI_COMMIT_BRANCH
-    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
+    - git remote add github https://github.com/NVIDIA/Megatron-LM.git || true
     - git push -u github $CI_COMMIT_BRANCH
 
 pre:create_ci_branches:
@@ -115,7 +115,7 @@ pre:maybe_cherry_pick_commit:
           echo Release branch does not yet exist, will not  cherry-pick
           continue
         fi
-        
+
         (
           git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH
           git switch --force-create cherry-pick-$MR_ID-$RELEASE_BRANCH $RELEASE_BRANCH
