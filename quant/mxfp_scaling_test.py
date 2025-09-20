@@ -200,7 +200,7 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         log_func(f"Testing scale exponent {scale_exp:.2f} ({i+1}/{num_levels})...")
         
         # Create a custom quantize function with fixed scale exponent
-        quantized_tensor = quantize_with_fixed_scale(
+        quantized_tensor, underflow_analysis = quantize_with_fixed_scale(
             input_tensor, elem_format, scale_bits, scale_exp, 
             ebits, mbits, max_norm
         )
@@ -211,7 +211,8 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         # Store results
         results['metrics'][f'scale_{i}'] = {
             'scale_exponent': float(scale_exp),
-            'metrics': metrics
+            'metrics': metrics,
+            'underflow_analysis': underflow_analysis
         }
         
         # Print current metrics
@@ -429,6 +430,109 @@ def analyze_scaling_results(results, logger=None):
     
     return analysis
 
+def analyze_underflow_results(results, logger=None):
+    """
+    Analyze and display underflow results from scaling tests.
+    
+    Args:
+        results (dict): Results from test_scaling_levels
+        logger: Logger instance for output
+    """
+    log_func = logger.info if logger else print
+    
+    scale_exponents = results['scale_exponents']
+    elem_format = results['elem_format']
+    
+    # Collect all underflow analyses
+    underflow_results = []
+    significant_underflows = []
+    
+    for i in range(len(scale_exponents)):
+        scale_key = f'scale_{i}'
+        if scale_key in results['metrics']:
+            underflow_analysis = results['metrics'][scale_key]['underflow_analysis']
+            underflow_analysis['scale_exp'] = scale_exponents[i]
+            underflow_analysis['scale_factor'] = 2 ** scale_exponents[i]
+            underflow_results.append(underflow_analysis)
+            
+            if underflow_analysis['has_significant_underflow']:
+                significant_underflows.append(underflow_analysis)
+    
+    # Only display analysis if there are significant underflows
+    if not significant_underflows:
+        log_func("\n✅ No significant underflow issues detected across all scaling levels")
+        return
+    
+    # Display comprehensive underflow analysis
+    log_func("\n" + "=" * 80)
+    log_func("UNDERFLOW ANALYSIS SUMMARY")
+    log_func("=" * 80)
+    
+    log_func(f"Format: {elem_format}")
+    log_func(f"Analyzed {len(scale_exponents)} scaling levels")
+    log_func(f"Significant underflow detected in {len(significant_underflows)} levels")
+    log_func("-" * 80)
+    
+    # Group by severity
+    high_severity = [u for u in significant_underflows if u['severity'] == 'high']
+    moderate_severity = [u for u in significant_underflows if u['severity'] == 'moderate']
+    
+    if high_severity:
+        log_func("🔴 HIGH UNDERFLOW SEVERITY:")
+        log_func("-" * 40)
+        for uf in high_severity:
+            log_func(f"  Scale Exp: {uf['scale_exp']:.2f} (Factor: {uf['scale_factor']:.6f})")
+            log_func(f"    Underflow: {uf['underflow_count']:,} ({uf['underflow_percent']:.2f}%)")
+            log_func(f"    Flush to Zero: {uf['flush_count']:,} ({uf['flush_percent']:.2f}%)")
+            log_func(f"    Tensor Range: [{uf['tensor_range'][0]:.2e}, {uf['tensor_range'][1]:.2e}]")
+            log_func("")
+    
+    if moderate_severity:
+        log_func("🟡 MODERATE UNDERFLOW SEVERITY:")
+        log_func("-" * 40)
+        for uf in moderate_severity:
+            log_func(f"  Scale Exp: {uf['scale_exp']:.2f} (Factor: {uf['scale_factor']:.6f})")
+            log_func(f"    Underflow: {uf['underflow_count']:,} ({uf['underflow_percent']:.2f}%)")
+            log_func(f"    Flush to Zero: {uf['flush_count']:,} ({uf['flush_percent']:.2f}%)")
+            log_func("")
+    
+    # Find best and worst cases
+    if significant_underflows:
+        worst_underflow = max(significant_underflows, key=lambda x: x['underflow_percent'])
+        best_underflow = min(significant_underflows, key=lambda x: x['underflow_percent'])
+        
+        log_func("UNDERFLOW EXTREMES:")
+        log_func("-" * 40)
+        log_func(f"Worst Underflow: Scale Exp {worst_underflow['scale_exp']:.2f}")
+        log_func(f"  {worst_underflow['underflow_percent']:.2f}% underflow, {worst_underflow['flush_percent']:.2f}% flushed to zero")
+        log_func(f"Best Underflow: Scale Exp {best_underflow['scale_exp']:.2f}")
+        log_func(f"  {best_underflow['underflow_percent']:.2f}% underflow, {best_underflow['flush_percent']:.2f}% flushed to zero")
+    
+    # Recommendations
+    log_func("-" * 80)
+    log_func("UNDERFLOW RECOMMENDATIONS:")
+    log_func("-" * 40)
+    
+    if high_severity:
+        log_func("⚠️  AVOID scaling factors with HIGH underflow severity")
+        log_func("   These factors cause significant precision loss")
+    
+    if moderate_severity:
+        log_func("💡 Consider MODERATE underflow levels for specific use cases")
+        log_func("   Balance between underflow and overflow risks")
+    
+    # Find optimal range
+    no_underflow_levels = [u for u in underflow_results if not u['has_significant_underflow']]
+    if no_underflow_levels:
+        optimal_range = [min(u['scale_exp'] for u in no_underflow_levels),
+                        max(u['scale_exp'] for u in no_underflow_levels)]
+        log_func(f"✅ RECOMMENDED scaling range: {optimal_range[0]:.2f} to {optimal_range[1]:.2f}")
+        log_func("   This range minimizes underflow issues")
+    else:
+        log_func("⚠️  All scaling levels have some underflow - choose least problematic")
+    
+    log_func("=" * 80)
+
 def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
                              ebits, mbits, max_norm, axes=None, block_size=0):
     """
@@ -458,7 +562,13 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     A = A / scale_factor
     
     # Quantize element-wise
-    from mxfp import _quantize_elemwise_core
+    from mxfp import _quantize_elemwise_core,_analyze_underflow_before_quantization
+    
+    # Analyze underflow without printing (collect results)
+    underflow_analysis = _analyze_underflow_before_quantization(
+        A, elem_format, mbits, ebits, max_norm, verbose=False
+    )
+    
     A = _quantize_elemwise_core(
         A, mbits, ebits, max_norm, round='nearest',
         allow_denorm=True, saturate_normals=True
@@ -467,7 +577,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     # Undo scaling
     A = A * scale_factor
     
-    return A
+    return A, underflow_analysis
 
 def plot_scaling_results(results, output_path):
     """
@@ -765,6 +875,9 @@ def main():
     
     # Perform detailed analysis
     analysis_results = analyze_scaling_results(results, logger)
+    
+    # Analyze underflow results
+    analyze_underflow_results(results, logger)
     
     # Print summary
     logger.info("\n" + "=" * 60)

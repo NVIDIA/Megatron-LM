@@ -39,7 +39,7 @@ def _get_min_norm(ebits):
     return 0 if ebits == 0 else 2 ** emin
 
 
-def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm):
+def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm, verbose=True):
     """
     Analyze tensor for underflow conditions before quantization.
     This function is called right before element-wise quantization to detect
@@ -51,7 +51,26 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
         mbits (int): Number of mantissa bits
         ebits (int): Number of exponent bits
         max_norm (float): Maximum normal value for the format
+        verbose (bool): Whether to print analysis results immediately
+        
+    Returns:
+        dict: Analysis results containing underflow statistics
     """
+    analysis_result = {
+        'elem_format': elem_format,
+        'total_elements': 0,
+        'underflow_count': 0,
+        'underflow_percent': 0.0,
+        'flush_count': 0,
+        'flush_percent': 0.0,
+        'min_denormal': 0.0,
+        'min_norm': 0.0,
+        'tensor_range': [0.0, 0.0],
+        'has_significant_underflow': False,
+        'severity': 'none',  # 'none', 'moderate', 'high'
+        'error': None
+    }
+    
     try:
         # Calculate minimum representable values
         min_norm = _get_min_norm(ebits)
@@ -70,7 +89,8 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
         
         # Handle empty tensors
         if A_np.size == 0:
-            return
+            analysis_result['total_elements'] = 0
+            return analysis_result
         
         # Count underflow conditions
         total_elements = A_np.size
@@ -87,8 +107,29 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
         flush_count = np.sum(flush_mask)
         flush_percent = (flush_count / total_elements) * 100
         
-        # Only print analysis if there are significant underflow issues
-        if underflow_percent > 0.1 or flush_percent > 0.1:
+        # Store analysis results
+        analysis_result.update({
+            'total_elements': total_elements,
+            'underflow_count': int(underflow_count),
+            'underflow_percent': float(underflow_percent),
+            'flush_count': int(flush_count),
+            'flush_percent': float(flush_percent),
+            'min_denormal': float(min_denormal),
+            'min_norm': float(min_norm),
+            'tensor_range': [float(np.min(A_np)), float(np.max(A_np))],
+            'has_significant_underflow': underflow_percent > 0.1 or flush_percent > 0.1
+        })
+        
+        # Determine severity
+        if underflow_percent > 1.0:
+            analysis_result['severity'] = 'high'
+        elif underflow_percent > 0.1:
+            analysis_result['severity'] = 'moderate'
+        else:
+            analysis_result['severity'] = 'none'
+        
+        # Print analysis if verbose and significant underflow detected
+        if verbose and analysis_result['has_significant_underflow']:
             print(f"\n⚠️  UNDERFLOW ANALYSIS ({elem_format}):")
             print(f"    Total elements: {total_elements:,}")
             print(f"    Min denormal: {min_denormal:.2e}")
@@ -105,7 +146,11 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
             
     except Exception as e:
         # Don't let analysis errors break the quantization process
-        print(f"Warning: Underflow analysis failed: {str(e)}")
+        analysis_result['error'] = str(e)
+        if verbose:
+            print(f"Warning: Underflow analysis failed: {str(e)}")
+    
+    return analysis_result
 
 
 def _get_max_norm(ebits, mbits):
@@ -481,7 +526,7 @@ def _quantize_mx(
     A = A / (2**shared_exp)
 
     # Add underflow analysis before quantization
-    _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm)
+    # _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm)
     
     A = _quantize_elemwise_core(
             A, mbits, ebits, max_norm, round=round,
@@ -494,6 +539,7 @@ def _quantize_mx(
         A = _undo_reshape_to_blocks(A, padded_shape, orig_shape, axes)
 
     return A
+
 
 import torch
 from torch.autograd import Function

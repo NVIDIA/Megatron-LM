@@ -119,6 +119,56 @@ draw/scaling_analysis/
 - 自动识别性能稳定性和关键选择点
 - 提供基于数据特征的个性化建议
 
+### 智能溢出分析功能
+
+工具会自动分析每个缩放级别的溢出情况并提供详细报告：
+
+**溢出分析内容：**
+- **严重程度分类**: 高严重程度(>1%)、中等严重程度(0.1-1%)、无显著溢出(<0.1%)
+- **详细统计**: 每个缩放级别的溢出数量、百分比和刷新到零的统计
+- **张量范围分析**: 显示量化前后的张量数值范围
+- **最优范围推荐**: 基于溢出分析推荐最佳的缩放范围
+
+**溢出分析输出示例：**
+```
+================================================================================
+UNDERFLOW ANALYSIS SUMMARY
+================================================================================
+Format: fp8_e4m3
+Analyzed 7 scaling levels
+Significant underflow detected in 7 levels
+--------------------------------------------------------------------------------
+🔴 HIGH UNDERFLOW SEVERITY:
+----------------------------------------
+  Scale Exp: 2.00 (Factor: 4.000000)
+    Underflow: 100 (50.00%)
+    Flush to Zero: 100 (50.00%)
+    Tensor Range: [-6.20e+02, 5.06e+02]
+
+🟡 MODERATE UNDERFLOW SEVERITY:
+----------------------------------------
+  Scale Exp: -18.83 (Factor: 0.000002)
+    Underflow: 1 (0.50%)
+    Flush to Zero: 2 (1.00%)
+
+UNDERFLOW EXTREMES:
+----------------------------------------
+Worst Underflow: Scale Exp 2.00
+  50.00% underflow, 50.00% flushed to zero
+Best Underflow: Scale Exp -23.00
+  0.00% underflow, 0.50% flushed to zero
+--------------------------------------------------------------------------------
+UNDERFLOW RECOMMENDATIONS:
+----------------------------------------
+⚠️  AVOID scaling factors with HIGH underflow severity
+   These factors cause significant precision loss
+💡 Consider MODERATE underflow levels for specific use cases
+   Balance between underflow and overflow risks
+✅ RECOMMENDED scaling range: -18.00 to -14.25
+   This range minimizes underflow issues
+================================================================================
+```
+
 **日志文件命名规则：**
 ```
 mxfp_scaling_test_{tensor_name}_{format}.log
