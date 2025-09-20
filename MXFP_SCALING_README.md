@@ -46,8 +46,8 @@ python quant/mxfp_scaling_test.py input_tensor.pt --output-dir ./results/ --elem
 - `--output-dir`: 输出结果目录（默认：./draw/scaling_analysis/{tensor_name}/）
 - `--elem-format`: 量化格式（fp8_e4m3, fp8_e5m2, fp4_e2m1等）
 - `--scale-bits`: 缩放位数（默认：8）
-- `--max-scale-exp`: 最大缩放指数（默认：10）
-- `--min-scale-exp`: 最小缩放指数（默认：-10）
+- `--max-scale-exp`: 最大缩放指数（默认：自动计算，基于tensor最大值对齐）
+- `--min-scale-exp`: 最小缩放指数（默认：自动计算，基于tensor最小值对齐）
 - `--num-levels`: 测试的缩放级别数量（默认：21）
 - `--no-plots`: 跳过生成图表
 
@@ -147,9 +147,15 @@ python quant/mxfp_scaling_test.py your_tensor.pt --elem-format fp4_e2m1 --num-le
 
 工具测试从最大值对齐（maximum alignment）到最小值对齐（minimum alignment）的不同缩放策略：
 
-1. **最大值对齐**: 缩放使张量的最大值刚好在格式的可表示范围内
-2. **最小值对齐**: 缩放使张量的最小值刚好在格式的可表示范围内
+1. **最大值对齐**: 缩放使张量的绝对值最大值刚好在格式的最大可表示值范围内，避免上溢出
+2. **最小值对齐**: 缩放使张量的绝对值最小值刚好在格式的最小可表示值范围内，避免下溢出
 3. **中间级别**: 在这两个极端之间均匀分布的缩放级别
+
+**对齐计算逻辑：**
+- **最大对齐指数**: `floor(log2(tensor.abs().max() / format.max_norm))`
+- **最小对齐指数**: `ceil(log2(tensor.abs().min() / format.min_norm))`
+
+其中`tensor.abs().min()`只考虑非零值，确保下溢出分析的正确性。
 
 ### 下溢出分析
 
