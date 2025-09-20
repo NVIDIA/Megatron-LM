@@ -495,93 +495,6 @@ def _quantize_mx(
 
     return A
 
-
-
-def optimized_mxfp8_e4m3_matmul(A:torch.Tensor,B:torch.Tensor,block_size:int=32)->torch.Tensor:
-    scale_bits = 8
-    elem_format = 'fp8_e4m3'
-    A = _quantize_mx(
-        A,
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-    )
-
-    B = _quantize_mx(
-        B,
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-2,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-    )
-
-    C = torch.matmul(A, B)
-    return C
-
-
-
-def optimized_mxfp8_e5m2_matmul(A:torch.Tensor,B:torch.Tensor,block_size:int=32)->torch.Tensor:
-    scale_bits = 8
-    elem_format = 'fp8_e5m2'
-    A = _quantize_mx(
-        A,
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-    )
-
-    B = _quantize_mx(
-        B,
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-2,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-    )
-    C = torch.matmul(A, B)
-    return C
-
-def optimized_mxfp4_e2m1_matmul(A:torch.Tensor,B:torch.Tensor,block_size:int=32)->torch.Tensor:
-    scale_bits = 8
-    elem_format = 'fp4_e2m1'
-    A = _quantize_mx(
-        A,
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-1,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-    )
-
-    B = _quantize_mx(
-        B,
-        scale_bits,
-        elem_format,
-        shared_exp_method="max",
-        axes=-2,
-        block_size=16,
-        round="nearest",
-        flush_fp32_subnorms=False,
-    )
-
-    C = torch.matmul(A, B)
-    return C
-
 import torch
 from torch.autograd import Function
 
@@ -648,41 +561,6 @@ def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32):
 def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
                  elem_format='fp8_e5m2', block_size=32):
     return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size)
-
-# def mxfp_matmul(A:torch.Tensor,B:torch.Tensor,elem_format:str='fp8_e5m2',block_size:int=32)->torch.Tensor:
-#     scale_bits = 8
-#     # elem_format = 'fp8_e5m2'
-#     A = _quantize_mx(
-#         A,
-#         scale_bits,
-#         elem_format,
-#         shared_exp_method="max",
-#         axes=-1,
-#         block_size=block_size,
-#         round="nearest",
-#         flush_fp32_subnorms=False,
-#     )
-
-#     B = _quantize_mx(
-#         B,
-#         scale_bits,
-#         elem_format,
-#         shared_exp_method="max",
-#         axes=-2,
-#         block_size=block_size,
-#         round="nearest",
-#         flush_fp32_subnorms=False,
-#     )
-#     C = torch.matmul(A, B)
-#     return C
-
-# def mxfp_baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *, beta: float=1.0, alpha: float=1.0,elem_format:str='fp8_e5m2',block_size:int=32 ) -> torch.Tensor: 
-#     """
-#     out=beta * input + alpha * batch1 @ batch2
-#     """
-#     mm_out = mxfp_matmul(A=batch1,B=batch2,elem_format=elem_format,block_size=block_size)
-#     out = beta * input + alpha * mm_out
-#     return out
 
 if __name__ == '__main__':
     A = torch.load("grad_output.pt", map_location='cpu').cuda()
