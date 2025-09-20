@@ -64,19 +64,50 @@ python quant/mxfp_scaling_test.py input_tensor.pt --output-dir ./results/ --elem
 3. **摘要图表**: `mxfp_scaling_summary_<format>.png`
    - 关键指标（MSE、余弦相似度、PSNR）的汇总图
 
+4. **日志文件**: `mxfp_scaling_test_{tensor_name}_{format}.log`
+   - 完整的测试过程日志，包含所有输出信息
+   - 同时显示在控制台和保存到文件中
+
 **输出目录结构示例：**
 ```
 draw/scaling_analysis/
 ├── tensor1/
 │   ├── mxfp_scaling_results_fp8_e4m3.txt
 │   ├── mxfp_scaling_test_fp8_e4m3.png
-│   └── mxfp_scaling_summary_fp8_e4m3.png
+│   ├── mxfp_scaling_summary_fp8_e4m3.png
+│   └── mxfp_scaling_test_tensor1_fp8_e4m3.log
 ├── tensor2/
 │   ├── mxfp_scaling_results_fp8_e5m2.txt
 │   ├── mxfp_scaling_test_fp8_e5m2.png
-│   └── mxfp_scaling_summary_fp8_e5m2.png
+│   ├── mxfp_scaling_summary_fp8_e5m2.png
+│   └── mxfp_scaling_test_tensor2_fp8_e5m2.log
 └── ...
 ```
+
+### 日志功能
+
+工具会自动生成详细的日志文件，记录完整的测试过程：
+
+**日志特点：**
+- **双重输出**: 同时显示在控制台和保存到日志文件
+- **时间戳**: 每条日志都包含精确的时间戳
+- **完整记录**: 记录从测试开始到结束的所有信息
+- **结构化格式**: 清晰的日志格式，便于分析和调试
+
+**日志内容包含：**
+- 测试开始和结束时间
+- 输入张量信息（形状、数据类型、数值范围）
+- 测试参数（格式、缩放位数、指数范围等）
+- 每个缩放级别的测试进度和结果
+- 最终的最佳结果汇总
+- 文件保存位置信息
+
+**日志文件命名规则：**
+```
+mxfp_scaling_test_{tensor_name}_{format}.log
+```
+
+例如：`mxfp_scaling_test_my_tensor_fp8_e4m3.log`
 
 ### 计算的指标
 

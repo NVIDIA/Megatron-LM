@@ -11,11 +11,65 @@ import argparse
 from pathlib import Path
 import sys
 import os
+import logging
+from datetime import datetime
 
 # Add the parent directory to path to import mxfp module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from quant.mxfp import _quantize_mx, _get_format_params, ElemFormat
+
+def setup_logging(output_dir, tensor_name, elem_format):
+    """
+    Setup logging to both console and file.
+    
+    Args:
+        output_dir (Path): Output directory for log file
+        tensor_name (str): Name of the input tensor
+        elem_format (str): Element format being tested
+        
+    Returns:
+        logging.Logger: Configured logger
+    """
+    # Create logger
+    logger = logging.getLogger('mxfp_scaling_test')
+    logger.setLevel(logging.INFO)
+    
+    # Clear any existing handlers
+    logger.handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler
+    log_filename = f"mxfp_scaling_test_{tensor_name}_{elem_format}.log"
+    log_path = output_dir / log_filename
+    
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # Log initial information
+    logger.info("=" * 80)
+    logger.info("MXFP SCALING TEST LOG")
+    logger.info("=" * 80)
+    logger.info(f"Test started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Input tensor: {tensor_name}")
+    logger.info(f"Element format: {elem_format}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info("=" * 80)
+    
+    return logger
 
 def calculate_metrics(original_tensor, quantized_tensor):
     """
@@ -81,7 +135,7 @@ def calculate_metrics(original_tensor, quantized_tensor):
     }
 
 def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8, 
-                       max_scale_exp=10, min_scale_exp=-10, num_levels=21):
+                       max_scale_exp=10, min_scale_exp=-10, num_levels=21, logger=None):
     """
     Test different scaling levels for MXFP quantization.
     
@@ -116,13 +170,14 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         }
     }
     
-    print(f"Testing {num_levels} scaling levels from {max_scale_exp} to {min_scale_exp}")
-    print(f"Element format: {elem_format} (e{ebits}m{mbits})")
-    print(f"Scale bits: {scale_bits}")
-    print("-" * 60)
+    log_func = logger.info if logger else print
+    log_func(f"Testing {num_levels} scaling levels from {max_scale_exp} to {min_scale_exp}")
+    log_func(f"Element format: {elem_format} (e{ebits}m{mbits})")
+    log_func(f"Scale bits: {scale_bits}")
+    log_func("-" * 60)
     
     for i, scale_exp in enumerate(scale_exponents):
-        print(f"Testing scale exponent {scale_exp:.2f} ({i+1}/{num_levels})...")
+        log_func(f"Testing scale exponent {scale_exp:.2f} ({i+1}/{num_levels})...")
         
         # Create a custom quantize function with fixed scale exponent
         quantized_tensor = quantize_with_fixed_scale(
@@ -140,9 +195,9 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         }
         
         # Print current metrics
-        print(f"  MSE: {metrics['mse']:.6e}, "
-              f"Cosine Sim: {metrics['cosine_similarity']:.6f}, "
-              f"PSNR: {metrics['psnr']:.2f} dB")
+        log_func(f"  MSE: {metrics['mse']:.6e}, "
+                 f"Cosine Sim: {metrics['cosine_similarity']:.6f}, "
+                 f"PSNR: {metrics['psnr']:.2f} dB")
     
     return results
 
@@ -279,7 +334,8 @@ def plot_scaling_results(results, output_path):
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
     
-    print(f"Scaling test plots saved to: {plot_path}")
+    # This will be logged by the caller
+    pass
     
     # Create summary plot with key metrics
     create_summary_plot(results, output_path)
@@ -348,7 +404,8 @@ def create_summary_plot(results, output_path):
     plt.savefig(summary_path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
     
-    print(f"Summary plot saved to: {summary_path}")
+    # This will be logged by the caller
+    pass
 
 def save_results_to_file(results, output_path):
     """Save detailed results to a text file."""
@@ -378,7 +435,8 @@ def save_results_to_file(results, output_path):
                 f.write(f"  Max Absolute Error: {metrics['max_abs_error']:.6e}\n")
                 f.write(f"  Relative Error: {metrics['relative_error']:.2f}%\n\n")
     
-    print(f"Detailed results saved to: {results_path}")
+    # This will be logged by the caller
+    pass
 
 def main():
     """Main function for MXFP scaling test."""
@@ -422,8 +480,12 @@ def main():
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"Loading input tensor: {input_path.name}")
-    print("=" * 60)
+    # Setup logging
+    tensor_name = input_path.stem
+    logger = setup_logging(output_dir, tensor_name, args.elem_format)
+    
+    logger.info(f"Loading input tensor: {input_path.name}")
+    logger.info("=" * 60)
     
     # Load input tensor
     try:
@@ -436,28 +498,28 @@ def main():
             elif isinstance(input_tensor, (list, tuple)) and len(input_tensor) > 0:
                 input_tensor = input_tensor[0]
             else:
-                print(f"Error: Loaded object is not a tensor: {input_path.name}")
+                logger.error(f"Error: Loaded object is not a tensor: {input_path.name}")
                 return 1
         
         # Convert to BF16 if needed
         if input_tensor.dtype != torch.bfloat16:
-            print(f"Converting tensor from {input_tensor.dtype} to bfloat16")
+            logger.info(f"Converting tensor from {input_tensor.dtype} to bfloat16")
             input_tensor = input_tensor.bfloat16()
         
-        print(f"Tensor shape: {input_tensor.shape}")
-        print(f"Tensor dtype: {input_tensor.dtype}")
-        print(f"Value range: [{torch.min(input_tensor):.6f}, {torch.max(input_tensor):.6f}]")
-        print(f"Mean ± Std: {torch.mean(input_tensor.float()):.6f} ± {torch.std(input_tensor.float()):.6f}")
+        logger.info(f"Tensor shape: {input_tensor.shape}")
+        logger.info(f"Tensor dtype: {input_tensor.dtype}")
+        logger.info(f"Value range: [{torch.min(input_tensor):.6f}, {torch.max(input_tensor):.6f}]")
+        logger.info(f"Mean ± Std: {torch.mean(input_tensor.float()):.6f} ± {torch.std(input_tensor.float()):.6f}")
         
     except Exception as e:
-        print(f"Error loading tensor: {str(e)}")
+        logger.error(f"Error loading tensor: {str(e)}")
         return 1
     
-    print(f"\nStarting scaling test...")
-    print(f"Element format: {args.elem_format}")
-    print(f"Scale bits: {args.scale_bits}")
-    print(f"Scale exponent range: [{args.max_scale_exp}, {args.min_scale_exp}]")
-    print(f"Number of levels: {args.num_levels}")
+    logger.info(f"\nStarting scaling test...")
+    logger.info(f"Element format: {args.elem_format}")
+    logger.info(f"Scale bits: {args.scale_bits}")
+    logger.info(f"Scale exponent range: [{args.max_scale_exp}, {args.min_scale_exp}]")
+    logger.info(f"Number of levels: {args.num_levels}")
     
     # Run scaling test
     results = test_scaling_levels(
@@ -466,20 +528,23 @@ def main():
         scale_bits=args.scale_bits,
         max_scale_exp=args.max_scale_exp,
         min_scale_exp=args.min_scale_exp,
-        num_levels=args.num_levels
+        num_levels=args.num_levels,
+        logger=logger
     )
     
     # Save results to file
     save_results_to_file(results, output_dir)
+    logger.info(f"Detailed results saved to: {output_dir}")
     
     # Generate plots unless disabled
     if not args.no_plots:
         plot_scaling_results(results, output_dir)
+        logger.info(f"Plots saved to: {output_dir}")
     
     # Print summary
-    print("\n" + "=" * 60)
-    print("SCALING TEST SUMMARY")
-    print("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info("SCALING TEST SUMMARY")
+    logger.info("=" * 60)
     
     # Find best and worst cases
     best_cosine_idx = 0
@@ -508,12 +573,17 @@ def main():
     best_mse_scale = results['scale_exponents'][best_mse_idx]
     best_mse_metrics = results['metrics'][f'scale_{best_mse_idx}']['metrics']
     
-    print(f"Best Cosine Similarity: {best_cosine_metrics['cosine_similarity']:.6f} at scale {best_cosine_scale:.2f}")
-    print(f"Best MSE: {best_mse_metrics['mse']:.6e} at scale {best_mse_scale:.2f}")
-    print(f"Best PSNR: {best_mse_metrics['psnr']:.2f} dB at scale {best_mse_scale:.2f}")
+    logger.info(f"Best Cosine Similarity: {best_cosine_metrics['cosine_similarity']:.6f} at scale {best_cosine_scale:.2f}")
+    logger.info(f"Best MSE: {best_mse_metrics['mse']:.6e} at scale {best_mse_scale:.2f}")
+    logger.info(f"Best PSNR: {best_mse_metrics['psnr']:.2f} dB at scale {best_mse_scale:.2f}")
     
-    print(f"\nResults saved to: {output_dir}")
-    print("Test completed successfully!")
+    logger.info(f"\nResults saved to: {output_dir}")
+    logger.info("Test completed successfully!")
+    
+    # Log completion time
+    logger.info("=" * 80)
+    logger.info(f"Test completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 80)
     
     return 0
 
