@@ -41,6 +41,11 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.pipeline_parallel.cpu_offload import (
+    PipelineOffloadManager,
+    group_prefetch_offload_start,
+    group_prefetch_offload_commit,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -805,6 +810,16 @@ class TEGroupedMLP(MegatronModule):
             tp_group=pg_collection.expt_tp,
         )
 
+        self.offload_router_fc1 = (
+            self.config.offload_activation
+            and "router_fc1" in self.config.offload_modules
+        )
+
+        self.offload_router_fc2 = (
+            self.config.offload_activation
+            and "router_fc2" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -858,9 +873,24 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        intermediate_parallel, bias_parallel = self.linear_fc1(
-            permuted_local_hidden_states, tokens_per_expert
-        )
+        if self.offload_router_fc1:
+            if not permuted_local_hidden_states.is_contiguous():
+                permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+            permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states)
+            permuted_local_hidden_states.offloading_activation = True
+            with PipelineOffloadManager.get_instance():
+                intermediate_parallel, bias_parallel = self.linear_fc1(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+            intermediate_parallel, bias_parallel = group_prefetch_offload_commit(
+                intermediate_parallel,
+                bias_parallel,
+                release_tensors=[permuted_local_hidden_states]
+            )
+        else:
+            intermediate_parallel, bias_parallel = self.linear_fc1(
+                permuted_local_hidden_states, tokens_per_expert
+            )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
