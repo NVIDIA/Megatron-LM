@@ -221,6 +221,214 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     
     return results
 
+def analyze_scaling_results(results, logger=None):
+    """
+    Analyze scaling test results and recommend optimal scaling factors.
+    
+    Args:
+        results (dict): Results from test_scaling_levels
+        logger: Logger instance for output
+        
+    Returns:
+        dict: Analysis results with recommendations
+    """
+    log_func = logger.info if logger else print
+    
+    scale_exponents = results['scale_exponents']
+    elem_format = results['elem_format']
+    format_params = results['format_params']
+    
+    # Extract metrics for analysis
+    metrics_data = {}
+    for metric_name in ['mse', 'cosine_similarity', 'psnr', 'mae', 'relative_error']:
+        metrics_data[metric_name] = []
+        for i in range(len(scale_exponents)):
+            scale_key = f'scale_{i}'
+            if scale_key in results['metrics']:
+                metrics_data[metric_name].append(results['metrics'][scale_key]['metrics'][metric_name])
+    
+    # Find best indices for different metrics
+    best_mse_idx = np.argmin(metrics_data['mse'])
+    best_cosine_idx = np.argmax(metrics_data['cosine_similarity'])
+    best_psnr_idx = np.argmax(metrics_data['psnr'])
+    best_mae_idx = np.argmin(metrics_data['mae'])
+    best_relative_error_idx = np.argmin(metrics_data['relative_error'])
+    
+    # Calculate composite scores
+    # Normalize metrics to [0, 1] range for comparison
+    mse_normalized = 1 - (np.array(metrics_data['mse']) - np.min(metrics_data['mse'])) / (np.max(metrics_data['mse']) - np.min(metrics_data['mse']) + 1e-10)
+    cosine_normalized = np.array(metrics_data['cosine_similarity'])
+    psnr_normalized = (np.array(metrics_data['psnr']) - np.min(metrics_data['psnr'])) / (np.max(metrics_data['psnr']) - np.min(metrics_data['psnr']) + 1e-10)
+    mae_normalized = 1 - (np.array(metrics_data['mae']) - np.min(metrics_data['mae'])) / (np.max(metrics_data['mae']) - np.min(metrics_data['mae']) + 1e-10)
+    relative_error_normalized = 1 - (np.array(metrics_data['relative_error']) - np.min(metrics_data['relative_error'])) / (np.max(metrics_data['relative_error']) - np.min(metrics_data['relative_error']) + 1e-10)
+    
+    # Weighted composite score (can be adjusted based on priorities)
+    composite_scores = (
+        0.3 * mse_normalized +           # Lower MSE is better
+        0.3 * cosine_normalized +        # Higher cosine similarity is better
+        0.2 * psnr_normalized +          # Higher PSNR is better
+        0.1 * mae_normalized +           # Lower MAE is better
+        0.1 * relative_error_normalized  # Lower relative error is better
+    )
+    
+    best_composite_idx = np.argmax(composite_scores)
+    
+    # Calculate scaling factor from scale exponent
+    def exp_to_factor(exp):
+        return 2 ** exp
+    
+    # Analysis results
+    analysis = {
+        'best_mse': {
+            'index': best_mse_idx,
+            'scale_exp': scale_exponents[best_mse_idx],
+            'scale_factor': exp_to_factor(scale_exponents[best_mse_idx]),
+            'metrics': {
+                'mse': metrics_data['mse'][best_mse_idx],
+                'cosine_similarity': metrics_data['cosine_similarity'][best_mse_idx],
+                'psnr': metrics_data['psnr'][best_mse_idx],
+                'mae': metrics_data['mae'][best_mse_idx],
+                'relative_error': metrics_data['relative_error'][best_mse_idx]
+            }
+        },
+        'best_cosine': {
+            'index': best_cosine_idx,
+            'scale_exp': scale_exponents[best_cosine_idx],
+            'scale_factor': exp_to_factor(scale_exponents[best_cosine_idx]),
+            'metrics': {
+                'mse': metrics_data['mse'][best_cosine_idx],
+                'cosine_similarity': metrics_data['cosine_similarity'][best_cosine_idx],
+                'psnr': metrics_data['psnr'][best_cosine_idx],
+                'mae': metrics_data['mae'][best_cosine_idx],
+                'relative_error': metrics_data['relative_error'][best_cosine_idx]
+            }
+        },
+        'best_psnr': {
+            'index': best_psnr_idx,
+            'scale_exp': scale_exponents[best_psnr_idx],
+            'scale_factor': exp_to_factor(scale_exponents[best_psnr_idx]),
+            'metrics': {
+                'mse': metrics_data['mse'][best_psnr_idx],
+                'cosine_similarity': metrics_data['cosine_similarity'][best_psnr_idx],
+                'psnr': metrics_data['psnr'][best_psnr_idx],
+                'mae': metrics_data['mae'][best_psnr_idx],
+                'relative_error': metrics_data['relative_error'][best_psnr_idx]
+            }
+        },
+        'best_composite': {
+            'index': best_composite_idx,
+            'scale_exp': scale_exponents[best_composite_idx],
+            'scale_factor': exp_to_factor(scale_exponents[best_composite_idx]),
+            'composite_score': composite_scores[best_composite_idx],
+            'metrics': {
+                'mse': metrics_data['mse'][best_composite_idx],
+                'cosine_similarity': metrics_data['cosine_similarity'][best_composite_idx],
+                'psnr': metrics_data['psnr'][best_composite_idx],
+                'mae': metrics_data['mae'][best_composite_idx],
+                'relative_error': metrics_data['relative_error'][best_composite_idx]
+            }
+        }
+    }
+    
+    # Log detailed analysis
+    log_func("\n" + "=" * 80)
+    log_func("SCALING FACTOR ANALYSIS & RECOMMENDATIONS")
+    log_func("=" * 80)
+    
+    log_func(f"Format: {elem_format} (e{format_params['ebits']}m{format_params['mbits']})")
+    log_func(f"Tested {len(scale_exponents)} scaling levels from {scale_exponents[0]:.2f} to {scale_exponents[-1]:.2f}")
+    log_func("-" * 80)
+    
+    # Best results for individual metrics
+    log_func("INDIVIDUAL METRIC OPTIMA:")
+    log_func("-" * 40)
+    
+    log_func(f"🏆 Best MSE: Scale Exp = {analysis['best_mse']['scale_exp']:.2f}, Factor = {analysis['best_mse']['scale_factor']:.6f}")
+    log_func(f"    MSE: {analysis['best_mse']['metrics']['mse']:.6e}, Cosine: {analysis['best_mse']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_mse']['metrics']['psnr']:.2f} dB")
+    
+    log_func(f"🎯 Best Cosine Similarity: Scale Exp = {analysis['best_cosine']['scale_exp']:.2f}, Factor = {analysis['best_cosine']['scale_factor']:.6f}")
+    log_func(f"    MSE: {analysis['best_cosine']['metrics']['mse']:.6e}, Cosine: {analysis['best_cosine']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_cosine']['metrics']['psnr']:.2f} dB")
+    
+    log_func(f"📊 Best PSNR: Scale Exp = {analysis['best_psnr']['scale_exp']:.2f}, Factor = {analysis['best_psnr']['scale_factor']:.6f}")
+    log_func(f"    MSE: {analysis['best_psnr']['metrics']['mse']:.6e}, Cosine: {analysis['best_psnr']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_psnr']['metrics']['psnr']:.2f} dB")
+    
+    # Composite recommendation
+    log_func("-" * 80)
+    log_func("COMPOSITE RECOMMENDATION:")
+    log_func("-" * 40)
+    
+    log_func(f"⭐ RECOMMENDED Scaling Factor: {analysis['best_composite']['scale_factor']:.6f}")
+    log_func(f"   Scale Exponent: {analysis['best_composite']['scale_exp']:.2f}")
+    log_func(f"   Composite Score: {analysis['best_composite']['composite_score']:.4f}")
+    log_func(f"   Balanced Performance:")
+    log_func(f"     - MSE: {analysis['best_composite']['metrics']['mse']:.6e}")
+    log_func(f"     - Cosine Similarity: {analysis['best_composite']['metrics']['cosine_similarity']:.6f}")
+    log_func(f"     - PSNR: {analysis['best_composite']['metrics']['psnr']:.2f} dB")
+    log_func(f"     - MAE: {analysis['best_composite']['metrics']['mae']:.6e}")
+    log_func(f"     - Relative Error: {analysis['best_composite']['metrics']['relative_error']:.2f}%")
+    
+    # Performance analysis
+    log_func("-" * 80)
+    log_func("PERFORMANCE ANALYSIS:")
+    log_func("-" * 40)
+    
+    # Calculate performance ranges
+    mse_range = np.max(metrics_data['mse']) - np.min(metrics_data['mse'])
+    cosine_range = np.max(metrics_data['cosine_similarity']) - np.min(metrics_data['cosine_similarity'])
+    psnr_range = np.max(metrics_data['psnr']) - np.min(metrics_data['psnr'])
+    
+    log_func(f"MSE Range: {np.min(metrics_data['mse']):.6e} to {np.max(metrics_data['mse']):.6e} (Δ: {mse_range:.6e})")
+    log_func(f"Cosine Range: {np.min(metrics_data['cosine_similarity']):.6f} to {np.max(metrics_data['cosine_similarity']):.6f} (Δ: {cosine_range:.6f})")
+    log_func(f"PSNR Range: {np.min(metrics_data['psnr']):.2f} to {np.max(metrics_data['psnr']):.2f} dB (Δ: {psnr_range:.2f} dB)")
+    
+    # Stability analysis
+    mse_std = np.std(metrics_data['mse'])
+    cosine_std = np.std(metrics_data['cosine_similarity'])
+    
+    log_func(f"MSE Stability (std): {mse_std:.6e}")
+    log_func(f"Cosine Stability (std): {cosine_std:.6f}")
+    
+    # Recommendations based on analysis
+    log_func("-" * 80)
+    log_func("RECOMMENDATIONS:")
+    log_func("-" * 40)
+    
+    if mse_range / np.min(metrics_data['mse']) < 0.1:
+        log_func("✅ MSE is relatively stable across scaling factors - any factor in the tested range should work well")
+    else:
+        log_func("⚠️  MSE varies significantly with scaling - choose the recommended factor carefully")
+    
+    if cosine_range < 0.01:
+        log_func("✅ Cosine similarity is very stable - scaling factor has minimal impact on direction preservation")
+    else:
+        log_func("⚠️  Cosine similarity varies with scaling - consider the impact on vector direction")
+    
+    if psnr_range > 20:
+        log_func("📈 Large PSNR range indicates significant quality differences - scaling factor choice is critical")
+    elif psnr_range > 10:
+        log_func("📊 Moderate PSNR range - scaling factor has noticeable impact on quality")
+    else:
+        log_func("✅ Small PSNR range - scaling factor has limited impact on quality")
+    
+    # Final recommendation
+    log_func("-" * 80)
+    log_func("FINAL RECOMMENDATION:")
+    log_func("-" * 40)
+    log_func(f"🎯 Use scaling factor: {analysis['best_composite']['scale_factor']:.6f}")
+    log_func(f"   This provides the best balance of accuracy and stability for {elem_format} quantization")
+    log_func(f"   Scale exponent: {analysis['best_composite']['scale_exp']:.2f}")
+    
+    if analysis['best_composite']['index'] == 0:
+        log_func("   📍 This is at the maximum alignment end (minimal overflow risk)")
+    elif analysis['best_composite']['index'] == len(scale_exponents) - 1:
+        log_func("   📍 This is at the minimum alignment end (minimal underflow risk)")
+    else:
+        log_func("   📍 This is a balanced middle ground between overflow and underflow")
+    
+    log_func("=" * 80)
+    
+    return analysis
+
 def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
                              ebits, mbits, max_norm, axes=None, block_size=0):
     """
@@ -555,41 +763,26 @@ def main():
         plot_scaling_results(results, output_dir)
         logger.info(f"Plots saved to: {output_dir}")
     
+    # Perform detailed analysis
+    analysis_results = analyze_scaling_results(results, logger)
+    
     # Print summary
     logger.info("\n" + "=" * 60)
     logger.info("SCALING TEST SUMMARY")
     logger.info("=" * 60)
     
-    # Find best and worst cases
-    best_cosine_idx = 0
-    worst_cosine_idx = 0
-    best_mse_idx = 0
-    worst_mse_idx = 0
+    # Use analysis results for summary
+    best_composite = analysis_results['best_composite']
+    best_mse = analysis_results['best_mse']
+    best_cosine = analysis_results['best_cosine']
     
-    for i in range(len(results['scale_exponents'])):
-        scale_key = f'scale_{i}'
-        if scale_key in results['metrics']:
-            metrics = results['metrics'][scale_key]['metrics']
-            
-            if metrics['cosine_similarity'] > results['metrics'][f'scale_{best_cosine_idx}']['metrics']['cosine_similarity']:
-                best_cosine_idx = i
-            if metrics['cosine_similarity'] < results['metrics'][f'scale_{worst_cosine_idx}']['metrics']['cosine_similarity']:
-                worst_cosine_idx = i
-                
-            if metrics['mse'] < results['metrics'][f'scale_{best_mse_idx}']['metrics']['mse']:
-                best_mse_idx = i
-            if metrics['mse'] > results['metrics'][f'scale_{worst_mse_idx}']['metrics']['mse']:
-                worst_mse_idx = i
+    logger.info(f"Best Cosine Similarity: {best_cosine['metrics']['cosine_similarity']:.6f} at scale {best_cosine['scale_exp']:.2f}")
+    logger.info(f"Best MSE: {best_mse['metrics']['mse']:.6e} at scale {best_mse['scale_exp']:.2f}")
+    logger.info(f"Best PSNR: {best_mse['metrics']['psnr']:.2f} dB at scale {best_mse['scale_exp']:.2f}")
     
-    best_cosine_scale = results['scale_exponents'][best_cosine_idx]
-    best_cosine_metrics = results['metrics'][f'scale_{best_cosine_idx}']['metrics']
-    
-    best_mse_scale = results['scale_exponents'][best_mse_idx]
-    best_mse_metrics = results['metrics'][f'scale_{best_mse_idx}']['metrics']
-    
-    logger.info(f"Best Cosine Similarity: {best_cosine_metrics['cosine_similarity']:.6f} at scale {best_cosine_scale:.2f}")
-    logger.info(f"Best MSE: {best_mse_metrics['mse']:.6e} at scale {best_mse_scale:.2f}")
-    logger.info(f"Best PSNR: {best_mse_metrics['psnr']:.2f} dB at scale {best_mse_scale:.2f}")
+    logger.info(f"\n🎯 RECOMMENDED Scaling Factor: {best_composite['scale_factor']:.6f}")
+    logger.info(f"   Scale Exponent: {best_composite['scale_exp']:.2f}")
+    logger.info(f"   Composite Score: {best_composite['composite_score']:.4f}")
     
     logger.info(f"\nResults saved to: {output_dir}")
     logger.info("Test completed successfully!")
