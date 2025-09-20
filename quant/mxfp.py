@@ -1,6 +1,7 @@
 import torch
 # import torch_npu
 from enum import Enum, IntEnum
+import numpy as np
 
 
 FP32_EXPONENT_BIAS = 127
@@ -36,6 +37,75 @@ def _get_min_norm(ebits):
     """ Valid for all float formats """
     emin = 2 - (2 ** (ebits - 1))
     return 0 if ebits == 0 else 2 ** emin
+
+
+def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm):
+    """
+    Analyze tensor for underflow conditions before quantization.
+    This function is called right before element-wise quantization to detect
+    potential underflow issues that might be caused by scaling.
+    
+    Args:
+        A (torch.Tensor): Input tensor after scaling but before quantization
+        elem_format (str): Element format identifier
+        mbits (int): Number of mantissa bits
+        ebits (int): Number of exponent bits
+        max_norm (float): Maximum normal value for the format
+    """
+    try:
+        # Calculate minimum representable values
+        min_norm = _get_min_norm(ebits)
+        min_denormal = min_norm / (2 ** (mbits - 2)) if mbits > 2 else min_norm
+        
+        # Convert to numpy for analysis (handle BFloat16)
+        if A.dtype == torch.bfloat16:
+            A_float = A.float()
+        else:
+            A_float = A
+            
+        if A_float.is_cuda:
+            A_np = A_float.cpu().numpy()
+        else:
+            A_np = A_float.numpy()
+        
+        # Handle empty tensors
+        if A_np.size == 0:
+            return
+        
+        # Count underflow conditions
+        total_elements = A_np.size
+        non_zero_mask = A_np != 0.0
+        abs_A = np.abs(A_np)
+        
+        # Underflow: non-zero values closer to zero than smallest representable
+        underflow_mask = non_zero_mask & (abs_A < min_denormal)
+        underflow_count = np.sum(underflow_mask)
+        underflow_percent = (underflow_count / total_elements) * 100
+        
+        # Also check for values that would be flushed to zero
+        flush_mask = non_zero_mask & (abs_A < min_norm)
+        flush_count = np.sum(flush_mask)
+        flush_percent = (flush_count / total_elements) * 100
+        
+        # Only print analysis if there are significant underflow issues
+        if underflow_percent > 0.1 or flush_percent > 0.1:
+            print(f"\n⚠️  UNDERFLOW ANALYSIS ({elem_format}):")
+            print(f"    Total elements: {total_elements:,}")
+            print(f"    Min denormal: {min_denormal:.2e}")
+            print(f"    Min normal: {min_norm:.2e}")
+            print(f"    Underflow count: {underflow_count:,} ({underflow_percent:.2f}%)")
+            print(f"    Flush to zero count: {flush_count:,} ({flush_percent:.2f}%)")
+            print(f"    Tensor range: [{np.min(A_np):.2e}, {np.max(A_np):.2e}]")
+            
+            if underflow_percent > 1.0:
+                print(f"    🔴 HIGH UNDERFLOW RATE: {underflow_percent:.2f}%")
+                print(f"       Consider adjusting scaling strategy!")
+            elif underflow_percent > 0.1:
+                print(f"    🟡 MODERATE UNDERFLOW: {underflow_percent:.2f}%")
+            
+    except Exception as e:
+        # Don't let analysis errors break the quantization process
+        print(f"Warning: Underflow analysis failed: {str(e)}")
 
 
 def _get_max_norm(ebits, mbits):
@@ -372,8 +442,11 @@ def _quantize_mx(
     assert(scale_bits > 0)
 
     # Make sure axes is a list of non-negative numbers
-    axes = [axes] if type(axes) == int else axes
-    axes = [x + A.ndim if x < 0 else x for x in axes]
+    if axes is None:
+        axes = []
+    else:
+        axes = [axes] if type(axes) == int else axes
+        axes = [x + A.ndim if x < 0 else x for x in axes]
 
     ebits, mbits, emax, max_norm, _ = _get_format_params(elem_format)
 
@@ -407,6 +480,9 @@ def _quantize_mx(
 
     A = A / (2**shared_exp)
 
+    # Add underflow analysis before quantization
+    _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm)
+    
     A = _quantize_elemwise_core(
             A, mbits, ebits, max_norm, round=round,
             allow_denorm=True, saturate_normals=True)
