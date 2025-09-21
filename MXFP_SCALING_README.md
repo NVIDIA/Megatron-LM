@@ -36,13 +36,16 @@
 # 测试单个张量文件的缩放效果
 python quant/mxfp_scaling_test.py input_tensor.pt
 
+# 测试多个张量文件
+python quant/mxfp_scaling_test.py tensor1.pt tensor2.pt tensor3.pt
+
 # 指定输出目录和参数
 python quant/mxfp_scaling_test.py input_tensor.pt --output-dir ./results/ --elem-format fp8_e4m3 --num-levels 31
 ```
 
 ### 参数说明
 
-- `input_tensor`: 输入的BF16张量文件路径
+- `input_tensor`: 输入的BF16张量文件路径（支持多个文件）
 - `--output-dir`: 输出结果目录（默认：./draw/scaling_analysis/{tensor_name}/）
 - `--elem-format`: 量化格式（fp8_e4m3, fp8_e5m2, fp4_e2m1等）
 - `--scale-bits`: 缩放位数（默认：8）
@@ -50,6 +53,42 @@ python quant/mxfp_scaling_test.py input_tensor.pt --output-dir ./results/ --elem
 - `--min-scale-exp`: 最小缩放指数（默认：自动计算，基于tensor最小值对齐）
 - `--num-levels`: 测试的缩放级别数量（默认：21）
 - `--no-plots`: 跳过生成图表
+
+### 多tensor处理特性
+
+当提供多个tensor文件时，工具会：
+
+1. **独立处理**: 每个tensor文件独立进行缩放测试和分析
+2. **独立输出**: 为每个tensor创建独立的输出目录和日志文件
+3. **进度显示**: 实时显示处理进度 `[1/3] Processing: tensor1.pt`
+4. **状态反馈**: 显示每个tensor的处理结果（✅成功 / ❌失败）
+5. **最终汇总**: 提供所有tensor的处理汇总统计
+
+**示例输出：**
+```
+Processing 3 tensor(s)...
+================================================================================
+
+[1/3] Processing: tensor1.pt
+------------------------------------------------------------
+✅ Successfully processed: tensor1.pt
+
+[2/3] Processing: tensor2.pt
+------------------------------------------------------------
+✅ Successfully processed: tensor2.pt
+
+[3/3] Processing: tensor3.pt
+------------------------------------------------------------
+✅ Successfully processed: tensor3.pt
+
+================================================================================
+FINAL SUMMARY
+================================================================================
+Total tensors: 3
+Successful: 3
+Failed: 0
+🎉 All tests completed successfully!
+```
 
 ### 输出结果
 
@@ -121,9 +160,11 @@ draw/scaling_analysis/
 
 ### 智能溢出分析功能
 
-工具会自动分析每个缩放级别的溢出情况并提供详细报告：
+工具会自动分析每个缩放级别的上溢出和下溢出情况并提供详细报告：
 
 **溢出分析内容：**
+- **上溢出检测**: 检测值超出格式最大表示范围的情况
+- **下溢出检测**: 检测值小于格式最小表示范围的情况
 - **严重程度分类**: 高严重程度(>1%)、中等严重程度(0.1-1%)、无显著溢出(<0.1%)
 - **详细统计**: 每个缩放级别的溢出数量、百分比和刷新到零的统计
 - **张量范围分析**: 显示量化前后的张量数值范围
@@ -132,40 +173,54 @@ draw/scaling_analysis/
 **溢出分析输出示例：**
 ```
 ================================================================================
-UNDERFLOW ANALYSIS SUMMARY
+OVERFLOW/UNDERFLOW ANALYSIS SUMMARY
 ================================================================================
 Format: fp8_e4m3
 Analyzed 7 scaling levels
-Significant underflow detected in 7 levels
+Significant overflow/underflow detected in 7 levels
 --------------------------------------------------------------------------------
-🔴 HIGH UNDERFLOW SEVERITY:
+🔴 OVERFLOW ISSUES:
 ----------------------------------------
-  Scale Exp: 2.00 (Factor: 4.000000)
+  Scale Exp: 5.00 (Factor: 32.000000)
+    Overflow: 10 (5.00%)
+    Max Normal: 4.48e+02
+    Tensor Range: [-7.76e+02, 6.32e+02]
+    Severity: HIGH
+
+🟡 UNDERFLOW ISSUES:
+----------------------------------------
+  Scale Exp: 5.00 (Factor: 32.000000)
     Underflow: 100 (50.00%)
     Flush to Zero: 100 (50.00%)
-    Tensor Range: [-6.20e+02, 5.06e+02]
+    Min Normal: 1.56e-02
+    Tensor Range: [-7.76e+02, 6.32e+02]
+    Severity: HIGH
 
-🟡 MODERATE UNDERFLOW SEVERITY:
+OVERFLOW EXTREMES:
 ----------------------------------------
-  Scale Exp: -18.83 (Factor: 0.000002)
-    Underflow: 1 (0.50%)
-    Flush to Zero: 2 (1.00%)
+Worst Overflow: Scale Exp -6.67
+  50.00% overflow
 
 UNDERFLOW EXTREMES:
 ----------------------------------------
-Worst Underflow: Scale Exp 2.00
+Worst Underflow: Scale Exp 5.00
   50.00% underflow, 50.00% flushed to zero
-Best Underflow: Scale Exp -23.00
+Best Underflow: Scale Exp -30.00
   0.00% underflow, 0.50% flushed to zero
 --------------------------------------------------------------------------------
-UNDERFLOW RECOMMENDATIONS:
+OVERFLOW/UNDERFLOW RECOMMENDATIONS:
 ----------------------------------------
-⚠️  AVOID scaling factors with HIGH underflow severity
+⚠️  AVOID scaling factors with HIGH overflow/underflow severity
    These factors cause significant precision loss
-💡 Consider MODERATE underflow levels for specific use cases
+🔴 OVERFLOW WARNING:
+   Avoid scaling factors that cause overflow
+   These values will be saturated to max representable value
+🟡 UNDERFLOW CONSIDERATIONS:
+   Moderate underflow may be acceptable depending on use case
    Balance between underflow and overflow risks
-✅ RECOMMENDED scaling range: -18.00 to -14.25
-   This range minimizes underflow issues
+⚠️  All scaling levels have some overflow/underflow - choose least problematic
+💡 Least problematic scaling: 5.00
+   Overflow: 5.00%, Underflow: 50.00%
 ================================================================================
 ```
 

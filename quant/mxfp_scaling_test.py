@@ -200,7 +200,7 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         log_func(f"Testing scale exponent {scale_exp:.2f} ({i+1}/{num_levels})...")
         
         # Create a custom quantize function with fixed scale exponent
-        quantized_tensor, underflow_analysis = quantize_with_fixed_scale(
+        quantized_tensor, overflow_underflow_analysis = quantize_with_fixed_scale(
             input_tensor, elem_format, scale_bits, scale_exp, 
             ebits, mbits, max_norm
         )
@@ -212,7 +212,7 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         results['metrics'][f'scale_{i}'] = {
             'scale_exponent': float(scale_exp),
             'metrics': metrics,
-            'underflow_analysis': underflow_analysis
+            'overflow_underflow_analysis': overflow_underflow_analysis
         }
         
         # Print current metrics
@@ -430,9 +430,9 @@ def analyze_scaling_results(results, logger=None):
     
     return analysis
 
-def analyze_underflow_results(results, logger=None):
+def analyze_overflow_underflow_results(results, logger=None):
     """
-    Analyze and display underflow results from scaling tests.
+    Analyze and display overflow and underflow results from scaling tests.
     
     Args:
         results (dict): Results from test_scaling_levels
@@ -443,64 +443,80 @@ def analyze_underflow_results(results, logger=None):
     scale_exponents = results['scale_exponents']
     elem_format = results['elem_format']
     
-    # Collect all underflow analyses
-    underflow_results = []
-    significant_underflows = []
+    # Collect all overflow/underflow analyses
+    overflow_underflow_results = []
+    significant_issues = []
     
     for i in range(len(scale_exponents)):
         scale_key = f'scale_{i}'
         if scale_key in results['metrics']:
-            underflow_analysis = results['metrics'][scale_key]['underflow_analysis']
-            underflow_analysis['scale_exp'] = scale_exponents[i]
-            underflow_analysis['scale_factor'] = 2 ** scale_exponents[i]
-            underflow_results.append(underflow_analysis)
+            analysis = results['metrics'][scale_key]['overflow_underflow_analysis']
+            analysis['scale_exp'] = scale_exponents[i]
+            analysis['scale_factor'] = 2 ** scale_exponents[i]
+            overflow_underflow_results.append(analysis)
             
-            if underflow_analysis['has_significant_underflow']:
-                significant_underflows.append(underflow_analysis)
+            if analysis['has_significant_underflow'] or analysis['has_significant_overflow']:
+                significant_issues.append(analysis)
     
-    # Only display analysis if there are significant underflows
-    if not significant_underflows:
-        log_func("\n✅ No significant underflow issues detected across all scaling levels")
+    # Only display analysis if there are significant issues
+    if not significant_issues:
+        log_func("\n✅ No significant overflow or underflow issues detected across all scaling levels")
         return
     
-    # Display comprehensive underflow analysis
+    # Display comprehensive overflow/underflow analysis
     log_func("\n" + "=" * 80)
-    log_func("UNDERFLOW ANALYSIS SUMMARY")
+    log_func("OVERFLOW/UNDERFLOW ANALYSIS SUMMARY")
     log_func("=" * 80)
     
     log_func(f"Format: {elem_format}")
     log_func(f"Analyzed {len(scale_exponents)} scaling levels")
-    log_func(f"Significant underflow detected in {len(significant_underflows)} levels")
+    log_func(f"Significant overflow/underflow detected in {len(significant_issues)} levels")
     log_func("-" * 80)
     
     # Group by severity
-    high_severity = [u for u in significant_underflows if u['severity'] == 'high']
-    moderate_severity = [u for u in significant_underflows if u['severity'] == 'moderate']
+    high_severity = [u for u in significant_issues if u['severity'] == 'high']
+    moderate_severity = [u for u in significant_issues if u['severity'] == 'moderate']
     
-    if high_severity:
-        log_func("🔴 HIGH UNDERFLOW SEVERITY:")
+    # Separate overflow and underflow issues
+    overflow_issues = [u for u in significant_issues if u['has_significant_overflow']]
+    underflow_issues = [u for u in significant_issues if u['has_significant_underflow']]
+    
+    # Display overflow issues
+    if overflow_issues:
+        log_func("🔴 OVERFLOW ISSUES:")
         log_func("-" * 40)
-        for uf in high_severity:
+        for uf in overflow_issues:
             log_func(f"  Scale Exp: {uf['scale_exp']:.2f} (Factor: {uf['scale_factor']:.6f})")
-            log_func(f"    Underflow: {uf['underflow_count']:,} ({uf['underflow_percent']:.2f}%)")
-            log_func(f"    Flush to Zero: {uf['flush_count']:,} ({uf['flush_percent']:.2f}%)")
+            log_func(f"    Overflow: {uf['overflow_count']:,} ({uf['overflow_percent']:.2f}%)")
+            log_func(f"    Max Normal: {uf['max_norm']:.2e}")
             log_func(f"    Tensor Range: [{uf['tensor_range'][0]:.2e}, {uf['tensor_range'][1]:.2e}]")
+            log_func(f"    Severity: {uf['severity'].upper()}")
             log_func("")
     
-    if moderate_severity:
-        log_func("🟡 MODERATE UNDERFLOW SEVERITY:")
+    # Display underflow issues
+    if underflow_issues:
+        log_func("🟡 UNDERFLOW ISSUES:")
         log_func("-" * 40)
-        for uf in moderate_severity:
+        for uf in underflow_issues:
             log_func(f"  Scale Exp: {uf['scale_exp']:.2f} (Factor: {uf['scale_factor']:.6f})")
             log_func(f"    Underflow: {uf['underflow_count']:,} ({uf['underflow_percent']:.2f}%)")
             log_func(f"    Flush to Zero: {uf['flush_count']:,} ({uf['flush_percent']:.2f}%)")
+            log_func(f"    Min Normal: {uf['min_norm']:.2e}")
+            log_func(f"    Tensor Range: [{uf['tensor_range'][0]:.2e}, {uf['tensor_range'][1]:.2e}]")
+            log_func(f"    Severity: {uf['severity'].upper()}")
             log_func("")
     
     # Find best and worst cases
-    if significant_underflows:
-        worst_underflow = max(significant_underflows, key=lambda x: x['underflow_percent'])
-        best_underflow = min(significant_underflows, key=lambda x: x['underflow_percent'])
-        
+    if overflow_issues:
+        worst_overflow = max(overflow_issues, key=lambda x: x['overflow_percent'])
+        log_func("OVERFLOW EXTREMES:")
+        log_func("-" * 40)
+        log_func(f"Worst Overflow: Scale Exp {worst_overflow['scale_exp']:.2f}")
+        log_func(f"  {worst_overflow['overflow_percent']:.2f}% overflow")
+    
+    if underflow_issues:
+        worst_underflow = max(underflow_issues, key=lambda x: x['underflow_percent'])
+        best_underflow = min(underflow_issues, key=lambda x: x['underflow_percent'])
         log_func("UNDERFLOW EXTREMES:")
         log_func("-" * 40)
         log_func(f"Worst Underflow: Scale Exp {worst_underflow['scale_exp']:.2f}")
@@ -510,26 +526,36 @@ def analyze_underflow_results(results, logger=None):
     
     # Recommendations
     log_func("-" * 80)
-    log_func("UNDERFLOW RECOMMENDATIONS:")
+    log_func("OVERFLOW/UNDERFLOW RECOMMENDATIONS:")
     log_func("-" * 40)
     
     if high_severity:
-        log_func("⚠️  AVOID scaling factors with HIGH underflow severity")
+        log_func("⚠️  AVOID scaling factors with HIGH overflow/underflow severity")
         log_func("   These factors cause significant precision loss")
     
-    if moderate_severity:
-        log_func("💡 Consider MODERATE underflow levels for specific use cases")
+    if overflow_issues:
+        log_func("🔴 OVERFLOW WARNING:")
+        log_func("   Avoid scaling factors that cause overflow")
+        log_func("   These values will be saturated to max representable value")
+    
+    if underflow_issues:
+        log_func("🟡 UNDERFLOW CONSIDERATIONS:")
+        log_func("   Moderate underflow may be acceptable depending on use case")
         log_func("   Balance between underflow and overflow risks")
     
     # Find optimal range
-    no_underflow_levels = [u for u in underflow_results if not u['has_significant_underflow']]
-    if no_underflow_levels:
-        optimal_range = [min(u['scale_exp'] for u in no_underflow_levels),
-                        max(u['scale_exp'] for u in no_underflow_levels)]
+    no_issue_levels = [u for u in overflow_underflow_results if not u['has_significant_underflow'] and not u['has_significant_overflow']]
+    if no_issue_levels:
+        optimal_range = [min(u['scale_exp'] for u in no_issue_levels),
+                        max(u['scale_exp'] for u in no_issue_levels)]
         log_func(f"✅ RECOMMENDED scaling range: {optimal_range[0]:.2f} to {optimal_range[1]:.2f}")
-        log_func("   This range minimizes underflow issues")
+        log_func("   This range minimizes both overflow and underflow issues")
     else:
-        log_func("⚠️  All scaling levels have some underflow - choose least problematic")
+        log_func("⚠️  All scaling levels have some overflow/underflow - choose least problematic")
+        # Find least problematic range
+        least_problematic = min(overflow_underflow_results, key=lambda x: max(x['overflow_percent'], x['underflow_percent']))
+        log_func(f"💡 Least problematic scaling: {least_problematic['scale_exp']:.2f}")
+        log_func(f"   Overflow: {least_problematic['overflow_percent']:.2f}%, Underflow: {least_problematic['underflow_percent']:.2f}%")
     
     log_func("=" * 80)
 
@@ -562,10 +588,10 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     A = A / scale_factor
     
     # Quantize element-wise
-    from mxfp import _quantize_elemwise_core,_analyze_underflow_before_quantization
+    from mxfp import _quantize_elemwise_core,_analyze_overflow_underflow_before_quantization
     
-    # Analyze underflow without printing (collect results)
-    underflow_analysis = _analyze_underflow_before_quantization(
+    # Analyze overflow/underflow without printing (collect results)
+    overflow_underflow_analysis = _analyze_overflow_underflow_before_quantization(
         A, elem_format, mbits, ebits, max_norm, verbose=False
     )
     
@@ -577,7 +603,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     # Undo scaling
     A = A * scale_factor
     
-    return A, underflow_analysis
+    return A, overflow_underflow_analysis
 
 def plot_scaling_results(results, output_path):
     """
@@ -758,42 +784,41 @@ def save_results_to_file(results, output_path):
             scale_key = f'scale_{i}'
             if scale_key in results['metrics']:
                 metrics = results['metrics'][scale_key]['metrics']
-                f.write(f"Scale Exponent {scale_exp:.2f}:\n")
-                f.write(f"  MSE: {metrics['mse']:.6e}\n")
-                f.write(f"  RMSE: {metrics['rmse']:.6e}\n")
-                f.write(f"  Cosine Similarity: {metrics['cosine_similarity']:.6f}\n")
-                f.write(f"  PSNR: {metrics['psnr']:.2f} dB\n")
-                f.write(f"  MAE: {metrics['mae']:.6e}\n")
-                f.write(f"  Max Absolute Error: {metrics['max_abs_error']:.6e}\n")
-                f.write(f"  Relative Error: {metrics['relative_error']:.2f}%\n\n")
+                overflow_underflow_analysis = results['metrics'][scale_key]['overflow_underflow_analysis']
+                
+                f.write(f"Scale Exponent {scale_exp:.2f} (Factor: {2**scale_exp:.6f}):\n")
+                f.write("  Performance Metrics:\n")
+                f.write(f"    MSE: {metrics['mse']:.6e}\n")
+                f.write(f"    RMSE: {metrics['rmse']:.6e}\n")
+                f.write(f"    Cosine Similarity: {metrics['cosine_similarity']:.6f}\n")
+                f.write(f"    PSNR: {metrics['psnr']:.2f} dB\n")
+                f.write(f"    MAE: {metrics['mae']:.6e}\n")
+                f.write(f"    Max Absolute Error: {metrics['max_abs_error']:.6e}\n")
+                f.write(f"    Relative Error: {metrics['relative_error']:.2f}%\n")
+                
+                f.write("  Overflow/Underflow Analysis:\n")
+                f.write(f"    Total Elements: {overflow_underflow_analysis['total_elements']:,}\n")
+                f.write(f"    Underflow Count: {overflow_underflow_analysis['underflow_count']:,} ({overflow_underflow_analysis['underflow_percent']:.2f}%)\n")
+                f.write(f"    Flush to Zero Count: {overflow_underflow_analysis['flush_count']:,} ({overflow_underflow_analysis['flush_percent']:.2f}%)\n")
+                f.write(f"    Overflow Count: {overflow_underflow_analysis['overflow_count']:,} ({overflow_underflow_analysis['overflow_percent']:.2f}%)\n")
+                f.write(f"    Min Denormal: {overflow_underflow_analysis['min_denormal']:.2e}\n")
+                f.write(f"    Min Normal: {overflow_underflow_analysis['min_norm']:.2e}\n")
+                f.write(f"    Max Normal: {overflow_underflow_analysis['max_norm']:.2e}\n")
+                f.write(f"    Tensor Range: [{overflow_underflow_analysis['tensor_range'][0]:.2e}, {overflow_underflow_analysis['tensor_range'][1]:.2e}]\n")
+                f.write(f"    Severity: {overflow_underflow_analysis['severity'].upper()}\n")
+                f.write(f"    Has Significant Underflow: {'Yes' if overflow_underflow_analysis['has_significant_underflow'] else 'No'}\n")
+                f.write(f"    Has Significant Overflow: {'Yes' if overflow_underflow_analysis['has_significant_overflow'] else 'No'}\n")
+                if overflow_underflow_analysis['error']:
+                    f.write(f"    Analysis Error: {overflow_underflow_analysis['error']}\n")
+                f.write("\n")
     
     # This will be logged by the caller
     pass
 
-def main():
-    """Main function for MXFP scaling test."""
-    parser = argparse.ArgumentParser(description='Test different scaling strategies for MXFP quantization')
-    parser.add_argument('input_tensor', help='Path to input BF16 tensor file (.pt)')
-    parser.add_argument('--output-dir', default=None, 
-                        help='Output directory for results (default: ./draw/scaling_analysis/{tensor_name}/)')
-    parser.add_argument('--elem-format', default='fp8_e4m3', 
-                        choices=['fp8_e4m3', 'fp8_e5m2', 'fp4_e2m1', 'fp6_e3m2', 'fp6_e2m3'],
-                        help='Element format for quantization (default: fp8_e4m3)')
-    parser.add_argument('--scale-bits', type=int, default=8,
-                        help='Number of scale bits (default: 8)')
-    parser.add_argument('--max-scale-exp', type=int, default=10,
-                        help='Maximum scale exponent (default: auto-calculated from tensor max)')
-    parser.add_argument('--min-scale-exp', type=int, default=-10,
-                        help='Minimum scale exponent (default: auto-calculated from tensor min)')
-    parser.add_argument('--num-levels', type=int, default=21,
-                        help='Number of scaling levels to test (default: 21)')
-    parser.add_argument('--no-plots', action='store_true',
-                        help='Skip generating plots')
-    
-    args = parser.parse_args()
+def process_single_tensor(input_path, args, logger=None):
+    """Process a single tensor file."""
     
     # Validate input file
-    input_path = Path(args.input_tensor)
     if not input_path.exists():
         print(f"Error: Input file does not exist: {input_path}")
         return 1
@@ -812,12 +837,12 @@ def main():
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Setup logging
+    # Setup logging for this tensor
     tensor_name = input_path.stem
-    logger = setup_logging(output_dir, tensor_name, args.elem_format)
+    tensor_logger = setup_logging(output_dir, tensor_name, args.elem_format)
     
-    logger.info(f"Loading input tensor: {input_path.name}")
-    logger.info("=" * 60)
+    tensor_logger.info(f"Loading input tensor: {input_path.name}")
+    tensor_logger.info("=" * 60)
     
     # Load input tensor
     try:
@@ -830,82 +855,133 @@ def main():
             elif isinstance(input_tensor, (list, tuple)) and len(input_tensor) > 0:
                 input_tensor = input_tensor[0]
             else:
-                logger.error(f"Error: Loaded object is not a tensor: {input_path.name}")
+                tensor_logger.error(f"Error: Loaded object is not a tensor: {input_path.name}")
                 return 1
         
         # Convert to BF16 if needed
         if input_tensor.dtype != torch.bfloat16:
-            logger.info(f"Converting tensor from {input_tensor.dtype} to bfloat16")
+            tensor_logger.info(f"Converting tensor from {input_tensor.dtype} to bfloat16")
             input_tensor = input_tensor.bfloat16()
         
-        logger.info(f"Tensor shape: {input_tensor.shape}")
-        logger.info(f"Tensor dtype: {input_tensor.dtype}")
-        logger.info(f"Value range: [{torch.min(input_tensor):.6f}, {torch.max(input_tensor):.6f}]")
-        logger.info(f"Mean ± Std: {torch.mean(input_tensor.float()):.6f} ± {torch.std(input_tensor.float()):.6f}")
+        tensor_logger.info(f"Tensor shape: {input_tensor.shape}")
+        tensor_logger.info(f"Tensor dtype: {input_tensor.dtype}")
+        tensor_logger.info(f"Value range: [{torch.min(input_tensor):.6f}, {torch.max(input_tensor):.6f}]")
+        tensor_logger.info(f"Mean ± Std: {torch.mean(input_tensor):.6f} ± {torch.std(input_tensor):.6f}")
         
     except Exception as e:
-        logger.error(f"Error loading tensor: {str(e)}")
+        tensor_logger.error(f"Error loading tensor {input_path.name}: {str(e)}")
         return 1
-    
-    logger.info(f"\nStarting scaling test...")
-    logger.info(f"Element format: {args.elem_format}")
-    logger.info(f"Scale bits: {args.scale_bits}")
-    logger.info(f"Scale exponent range: [{args.max_scale_exp}, {args.min_scale_exp}]")
-    logger.info(f"Number of levels: {args.num_levels}")
     
     # Run scaling test
     results = test_scaling_levels(
         input_tensor, 
-        elem_format=args.elem_format,
-        scale_bits=args.scale_bits,
+        args.elem_format, 
+        args.scale_bits,
         max_scale_exp=args.max_scale_exp,
         min_scale_exp=args.min_scale_exp,
         num_levels=args.num_levels,
-        logger=logger
+        logger=tensor_logger
     )
     
     # Save results to file
     save_results_to_file(results, output_dir)
-    logger.info(f"Detailed results saved to: {output_dir}")
+    tensor_logger.info(f"Detailed results saved to: {output_dir}")
     
     # Generate plots unless disabled
     if not args.no_plots:
         plot_scaling_results(results, output_dir)
-        logger.info(f"Plots saved to: {output_dir}")
+        tensor_logger.info(f"Plots saved to: {output_dir}")
     
     # Perform detailed analysis
-    analysis_results = analyze_scaling_results(results, logger)
+    analysis_results = analyze_scaling_results(results, tensor_logger)
     
-    # Analyze underflow results
-    analyze_underflow_results(results, logger)
+    # Analyze overflow/underflow results
+    analyze_overflow_underflow_results(results, tensor_logger)
     
     # Print summary
-    logger.info("\n" + "=" * 60)
-    logger.info("SCALING TEST SUMMARY")
-    logger.info("=" * 60)
+    tensor_logger.info("\n" + "=" * 60)
+    tensor_logger.info("SCALING TEST SUMMARY")
+    tensor_logger.info("=" * 60)
     
     # Use analysis results for summary
     best_composite = analysis_results['best_composite']
     best_mse = analysis_results['best_mse']
     best_cosine = analysis_results['best_cosine']
     
-    logger.info(f"Best Cosine Similarity: {best_cosine['metrics']['cosine_similarity']:.6f} at scale {best_cosine['scale_exp']:.2f}")
-    logger.info(f"Best MSE: {best_mse['metrics']['mse']:.6e} at scale {best_mse['scale_exp']:.2f}")
-    logger.info(f"Best PSNR: {best_mse['metrics']['psnr']:.2f} dB at scale {best_mse['scale_exp']:.2f}")
+    tensor_logger.info(f"Best Cosine Similarity: {best_cosine['metrics']['cosine_similarity']:.6f} at scale {best_cosine['scale_exp']:.2f}")
+    tensor_logger.info(f"Best MSE: {best_mse['metrics']['mse']:.6e} at scale {best_mse['scale_exp']:.2f}")
+    tensor_logger.info(f"Best PSNR: {best_mse['metrics']['psnr']:.2f} dB at scale {best_mse['scale_exp']:.2f}")
     
-    logger.info(f"\n🎯 RECOMMENDED Scaling Factor: {best_composite['scale_factor']:.6f}")
-    logger.info(f"   Scale Exponent: {best_composite['scale_exp']:.2f}")
-    logger.info(f"   Composite Score: {best_composite['composite_score']:.4f}")
+    tensor_logger.info(f"\n🎯 RECOMMENDED Scaling Factor: {best_composite['scale_factor']:.6f}")
+    tensor_logger.info(f"   Scale Exponent: {best_composite['scale_exp']:.2f}")
+    tensor_logger.info(f"   Composite Score: {best_composite['composite_score']:.4f}")
     
-    logger.info(f"\nResults saved to: {output_dir}")
-    logger.info("Test completed successfully!")
+    tensor_logger.info(f"\nResults saved to: {output_dir}")
+    tensor_logger.info("Test completed successfully!")
     
     # Log completion time
-    logger.info("=" * 80)
-    logger.info(f"Test completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 80)
+    tensor_logger.info("=" * 80)
+    tensor_logger.info(f"Test completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    tensor_logger.info("=" * 80)
     
     return 0
 
-if __name__ == "__main__":
+def main():
+    """Main function for MXFP scaling test."""
+    parser = argparse.ArgumentParser(description='Test different scaling strategies for MXFP quantization')
+    parser.add_argument('input_tensors', nargs='+', help='Path(s) to input BF16 tensor file(s) (.pt)')
+    parser.add_argument('--output-dir', default=None, 
+                        help='Output directory for results (default: ./draw/scaling_analysis/{tensor_name}/)')
+    parser.add_argument('--elem-format', default='fp8_e4m3', 
+                        choices=['fp8_e4m3', 'fp8_e5m2', 'fp4_e2m1', 'fp6_e3m2', 'fp6_e2m3'],
+                        help='Element format for quantization (default: fp8_e4m3)')
+    parser.add_argument('--scale-bits', type=int, default=8,
+                        help='Number of scale bits (default: 8)')
+    parser.add_argument('--max-scale-exp', type=int, default=10,
+                        help='Maximum scale exponent (default: auto-calculated from tensor max)')
+    parser.add_argument('--min-scale-exp', type=int, default=-10,
+                        help='Minimum scale exponent (default: auto-calculated from tensor min)')
+    parser.add_argument('--num-levels', type=int, default=21,
+                        help='Number of scaling levels to test (default: 21)')
+    parser.add_argument('--no-plots', action='store_true',
+                        help='Skip generating plots')
+    
+    args = parser.parse_args()
+    
+    # Process multiple tensors
+    total_tensors = len(args.input_tensors)
+    successful_tests = 0
+    
+    print(f"Processing {total_tensors} tensor(s)...")
+    print("=" * 80)
+    
+    for i, tensor_path in enumerate(args.input_tensors, 1):
+        print(f"\n[{i}/{total_tensors}] Processing: {tensor_path}")
+        print("-" * 60)
+        
+        input_path = Path(tensor_path)
+        result = process_single_tensor(input_path, args)
+        
+        if result == 0:
+            successful_tests += 1
+            print(f"✅ Successfully processed: {tensor_path}")
+        else:
+            print(f"❌ Failed to process: {tensor_path}")
+    
+    # Final summary
+    print("\n" + "=" * 80)
+    print("FINAL SUMMARY")
+    print("=" * 80)
+    print(f"Total tensors: {total_tensors}")
+    print(f"Successful: {successful_tests}")
+    print(f"Failed: {total_tensors - successful_tests}")
+    
+    if successful_tests == total_tensors:
+        print("🎉 All tests completed successfully!")
+        return 0
+    else:
+        print("⚠️  Some tests failed. Check individual logs for details.")
+        return 1
+
+if __name__ == '__main__':
     exit(main())
