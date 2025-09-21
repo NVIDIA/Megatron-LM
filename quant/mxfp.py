@@ -39,11 +39,11 @@ def _get_min_norm(ebits):
     return 0 if ebits == 0 else 2 ** emin
 
 
-def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm, verbose=True):
+def _analyze_overflow_underflow_before_quantization(A, elem_format, mbits, ebits, max_norm, verbose=True):
     """
-    Analyze tensor for underflow conditions before quantization.
+    Analyze tensor for overflow and underflow conditions before quantization.
     This function is called right before element-wise quantization to detect
-    potential underflow issues that might be caused by scaling.
+    potential overflow and underflow issues that might be caused by scaling.
     
     Args:
         A (torch.Tensor): Input tensor after scaling but before quantization
@@ -54,7 +54,7 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
         verbose (bool): Whether to print analysis results immediately
         
     Returns:
-        dict: Analysis results containing underflow statistics
+        dict: Analysis results containing overflow and underflow statistics
     """
     analysis_result = {
         'elem_format': elem_format,
@@ -63,10 +63,14 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
         'underflow_percent': 0.0,
         'flush_count': 0,
         'flush_percent': 0.0,
+        'overflow_count': 0,
+        'overflow_percent': 0.0,
         'min_denormal': 0.0,
         'min_norm': 0.0,
+        'max_norm': max_norm,
         'tensor_range': [0.0, 0.0],
         'has_significant_underflow': False,
+        'has_significant_overflow': False,
         'severity': 'none',  # 'none', 'moderate', 'high'
         'error': None
     }
@@ -107,6 +111,11 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
         flush_count = np.sum(flush_mask)
         flush_percent = (flush_count / total_elements) * 100
         
+        # Check for overflow: values larger than maximum representable
+        overflow_mask = abs_A > max_norm
+        overflow_count = np.sum(overflow_mask)
+        overflow_percent = (overflow_count / total_elements) * 100
+        
         # Store analysis results
         analysis_result.update({
             'total_elements': total_elements,
@@ -114,35 +123,48 @@ def _analyze_underflow_before_quantization(A, elem_format, mbits, ebits, max_nor
             'underflow_percent': float(underflow_percent),
             'flush_count': int(flush_count),
             'flush_percent': float(flush_percent),
+            'overflow_count': int(overflow_count),
+            'overflow_percent': float(overflow_percent),
             'min_denormal': float(min_denormal),
             'min_norm': float(min_norm),
+            'max_norm': float(max_norm),
             'tensor_range': [float(np.min(A_np)), float(np.max(A_np))],
-            'has_significant_underflow': underflow_percent > 0.1 or flush_percent > 0.1
+            'has_significant_underflow': underflow_percent > 0.1 or flush_percent > 0.1,
+            'has_significant_overflow': overflow_percent > 0.1
         })
         
-        # Determine severity
-        if underflow_percent > 1.0:
+        # Determine severity based on both overflow and underflow
+        max_issue_percent = max(underflow_percent, overflow_percent)
+        if max_issue_percent > 1.0:
             analysis_result['severity'] = 'high'
-        elif underflow_percent > 0.1:
+        elif max_issue_percent > 0.1:
             analysis_result['severity'] = 'moderate'
         else:
             analysis_result['severity'] = 'none'
         
-        # Print analysis if verbose and significant underflow detected
-        if verbose and analysis_result['has_significant_underflow']:
-            print(f"\n⚠️  UNDERFLOW ANALYSIS ({elem_format}):")
+        # Print analysis if verbose and significant issues detected
+        if verbose and (analysis_result['has_significant_underflow'] or analysis_result['has_significant_overflow']):
+            print(f"\n⚠️  OVERFLOW/UNDERFLOW ANALYSIS ({elem_format}):")
             print(f"    Total elements: {total_elements:,}")
             print(f"    Min denormal: {min_denormal:.2e}")
             print(f"    Min normal: {min_norm:.2e}")
+            print(f"    Max normal: {max_norm:.2e}")
             print(f"    Underflow count: {underflow_count:,} ({underflow_percent:.2f}%)")
             print(f"    Flush to zero count: {flush_count:,} ({flush_percent:.2f}%)")
+            print(f"    Overflow count: {overflow_count:,} ({overflow_percent:.2f}%)")
             print(f"    Tensor range: [{np.min(A_np):.2e}, {np.max(A_np):.2e}]")
             
-            if underflow_percent > 1.0:
-                print(f"    🔴 HIGH UNDERFLOW RATE: {underflow_percent:.2f}%")
+            if max_issue_percent > 1.0:
+                if underflow_percent > overflow_percent:
+                    print(f"    🔴 HIGH UNDERFLOW RATE: {underflow_percent:.2f}%")
+                else:
+                    print(f"    🔴 HIGH OVERFLOW RATE: {overflow_percent:.2f}%")
                 print(f"       Consider adjusting scaling strategy!")
-            elif underflow_percent > 0.1:
-                print(f"    🟡 MODERATE UNDERFLOW: {underflow_percent:.2f}%")
+            elif max_issue_percent > 0.1:
+                if underflow_percent > overflow_percent:
+                    print(f"    🟡 MODERATE UNDERFLOW: {underflow_percent:.2f}%")
+                else:
+                    print(f"    🟡 MODERATE OVERFLOW: {overflow_percent:.2f}%")
             
     except Exception as e:
         # Don't let analysis errors break the quantization process
