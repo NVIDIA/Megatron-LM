@@ -75,7 +75,7 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig, get_megatron_muon_optimizer
-from megatron.core.optimizer.layer_wise_optimizer import get_shower_optimizer_for_mcore
+from megatron.core.optimizer.layer_wise_optimizer import get_layer_wise_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1101,7 +1101,7 @@ def setup_model_and_optimizer(
         )
     else:
         if "dist" in config.optimizer:
-            optimizer = get_shower_optimizer_for_mcore(
+            optimizer = get_layer_wise_optimizer(
                 model, config,
                 pg_collection={
                     "dp_cp": mpu.get_data_parallel_group(True),

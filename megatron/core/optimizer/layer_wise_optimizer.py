@@ -113,7 +113,8 @@ def group_params_layer_wise(
     linear_optimizer_cls: type[torch.optim.Optimizer],
     linear_opt_kwargs: dict,
     wrapper_args: list[Any],
-    group: torch.distributed.ProcessGroup,
+    dp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
 ) -> tuple[torch.optim.Optimizer, list[list[torch.nn.Parameter]]]:
     """Group parameters layer-wise and distribute to different ranks.
 
@@ -123,27 +124,35 @@ def group_params_layer_wise(
         linear_optimizer_cls: Linear optimizer class.
         linear_opt_kwargs: Keyword arguments for linear optimizer.
         wrapper_args: Arguments for optimizer wrapper.
-        group: Process group.
+        dp_group: Data parallel process group.
+        tp_group: Tensor parallel process group.
 
     Returns:
         A tuple of the layer-wise optimizer and the list of broadcast parameters.
     """
     layer_wise_optimizer = None
     broadcast_params_list = []
-    num_linear_params_per_rank = math.ceil(len(linear_params_list) / group.size())
+    num_linear_params_per_rank = math.ceil(len(linear_params_list) / dp_group.size())
+    tp_args = {}
+
+    # TODO(boxiangw): Wait for TP Muon in emerging optimizers
+    # if linear_optimizer_cls is tp_muon.TensorParallelMuon:
+    #     # TODO(skyw): Find a cleaner way to pass tp_group to the optimizer.
+    #     tp_args = {"tp_group": tp_group}
     for i, offset in enumerate(range(0, len(linear_params_list), num_linear_params_per_rank)):
         local_linear_params_list = linear_params_list[offset : offset + num_linear_params_per_rank]
         broadcast_params_list.append(local_linear_params_list)
-        if group.rank() == i:
+        if dp_group.rank() == i:
             layer_wise_optimizer = optimizer_wrapper(
-                linear_optimizer_cls(local_linear_params_list, **linear_opt_kwargs), *wrapper_args
+                linear_optimizer_cls(local_linear_params_list, **linear_opt_kwargs, **tp_args),
+                *wrapper_args,
             )
-            logging.info(f"Rank {group.rank()} has {num_linear_params_per_rank} layers")
+            logging.info(f"Rank {dp_group.rank()} has {num_linear_params_per_rank} layers")
 
     assert (
         l := len(broadcast_params_list)
-    ) <= group.size(), (
-        f"Broadcast params list ({l}) should be smaller than world size ({group.size()})"
+    ) <= dp_group.size(), (
+        f"Broadcast params list ({l}) should be smaller than world size ({dp_group.size()})"
     )
 
     return layer_wise_optimizer, broadcast_params_list
@@ -197,6 +206,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         ), f"dp_cp group is required for {self.__class__.__name__}"
         logging.debug(f"dp_cp_group : {self.dp_cp_group}, expt_dp_group: {self.expt_dp_group}")
 
+        self.tp_group = pg_collection.get("tp", None)
+        self.expt_tp_group = pg_collection.get("expt_tp", None)
+        logging.debug(f"tp_group : {self.tp_group}, expt_tp_group: {self.expt_tp_group}")
+        assert (
+            utils.get_pg_size(self.tp_group) == module.config.tensor_model_parallel_size
+        ), f"tp group size ({utils.get_pg_size(self.tp_group)}) should be equal to tensor model \
+            parallel size ({module.config.tensor_model_parallel_size})"
+
         if params_group_func is None:
             params_group_func = default_params_group_func
         linear_param_groups, norm_params_list, embed_params_list = params_group_func(module)
@@ -221,7 +238,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         non_moe_linear_params_list = []
         moe_linear_params_list = []
         # If MoE is used, attention and MLP layers will have different DP groups.
-        if self.is_moe:
+        if not self.is_moe:
             non_moe_linear_params_list = (
                 linear_param_groups[0]["params"] + linear_param_groups[1]["params"]
             )
@@ -236,6 +253,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             linear_opt_kwargs,
             wrapper_args,
             self.dp_cp_group,
+            self.tp_group,
         )
         if self.is_moe and moe_linear_params_list:
             moe_layer_wise_optimizer, self.moe_broadcast_params_list = group_params_layer_wise(
@@ -245,6 +263,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 linear_opt_kwargs,
                 wrapper_args,
                 self.expt_dp_group,
+                self.expt_tp_group,
             )
         else:
             moe_layer_wise_optimizer = None
@@ -375,7 +394,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         super().load_state_dict(torch.load(filename))
 
 
-def get_shower_optimizer_for_mcore(
+def get_layer_wise_optimizer(
     model: torch.nn.Module,
     config: OptimizerConfig,
     linear_optimizer: str = "muon",
@@ -429,6 +448,10 @@ def get_shower_optimizer_for_mcore(
             """
             return x.shape == fused_qkv_shape
 
+        # TODO(boxiangw): Wait for TP Muon in emerging optimizers
+        # if transformer_config.tensor_model_parallel_size > 1:
+        #     linear_optimizer_cls = tp_muon.TensorParallelMuon
+        # else:
         linear_optimizer_cls = Muon
         linear_opt_kwargs = dict(
             lr=config.lr,
