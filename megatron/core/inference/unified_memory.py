@@ -5,6 +5,7 @@ import warnings
 from pathlib import Path
 
 from torch.cuda.memory import CUDAPluggableAllocator
+from torch.distributed import get_rank
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
 from megatron.core.utils import is_torch_min_version
@@ -14,9 +15,9 @@ try:
         from torch.cuda.memory import MemPool
     else:
         from torch.cuda import MemPool
-    has_mem_pool = True
+    _has_mem_pool = True
 except ImportError:
-    has_mem_pool = False
+    _has_mem_pool = False
 
 _mempool_c_src = r"""
 #include <cuda_runtime_api.h>
@@ -62,9 +63,12 @@ EXPORT void managed_free(void* ptr, size_t size, int device, void* stream) {
 }
 """
 
-unified_memory_mempool = None
+# Avoid linting errors.
+has_unified_memory = False
+_alloc = None
 
-if has_mem_pool:
+# Build the .so upon import; this avoids issues.
+if _has_mem_pool:
     _extra_ldflags = ["-lcudart"]
     if CUDA_HOME:
         _cuda_lib = os.path.join(CUDA_HOME, "lib64")
@@ -81,15 +85,13 @@ if has_mem_pool:
         )
         _so_path = Path(_mod.__file__).as_posix()
         _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
-        unified_memory_mempool = MemPool(allocator=_alloc)
+        has_unified_memory = True
     except (RuntimeError, ImportError):
-        warnings.warn("Unified memory mempool is not available.")
+        if get_rank() == 0:
+            warnings.warn("Failed to create unified memory mempool.")
 
 
-# >>>
-def delete_mempool():
-    global unified_memory_mempool
-    del unified_memory_mempool
-
-
-# <<<
+def create_unified_mempool():
+    """Create a unified memory mempool using CUDA managed memory."""
+    assert has_unified_memory
+    return MemPool(allocator=_alloc)

@@ -12,7 +12,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
-from megatron.core.inference.unified_memory import unified_memory_mempool
+from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
@@ -253,12 +253,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
         self.unified_memory_level = unified_memory_level
-        if unified_memory_level > 0 and unified_memory_mempool is None:
-            if torch.distributed.get_rank() == 0:
+        if unified_memory_level > 0:
+            if not has_unified_memory and torch.distributed.get_rank() == 0:
                 warnings.warn(
                     "Unified memory requested but not available; defaulting to GPU memory."
                 )
-            self.unified_memory_level = 0
+                self.unified_memory_level = 0
+            else:
+                self.unified_memory_mempool = create_unified_mempool()
 
         self.total_request_count = 0
         self.active_token_count = 0
@@ -300,7 +302,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Memory buffer.
         ctx_manager = (
-            torch.cuda.use_mem_pool(unified_memory_mempool)
+            torch.cuda.use_mem_pool(self.unified_memory_mempool)
             if self.unified_memory_level > 0
             else nullcontext()
         )
