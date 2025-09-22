@@ -779,8 +779,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         else:
             total_input = input
         
-        # 保存forward输入tensor (pre-linear)
-        from megatron.core.tensor_saver import save_linear_tensors
+        # 使用集成了tensor保存功能的量化算子
         import os
         import inspect
         
@@ -805,40 +804,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             except:
                 pass
         
-        save_linear_tensors(
-            input_tensor=total_input,
-            weight=weight,
-            quant_type=custom_quant_type,
-            operation="forward",
-            layer_idx=layer_idx,
-            phase="pre",
-            component="linear",
-            metadata={
-                "sequence_parallel": sequence_parallel,
-                "use_bias": ctx.use_bias,
-                "tp_group_size": tp_group.size() if tp_group else None,
-            }
-        )
-        
-        from quant.mxfp import mxfp_matmul
-        from quant.hifp import hifp_matmul
-        if custom_quant_type == 'mxfp4':
-            output = mxfp_matmul(total_input,weight.t(),'fp4_e2m1').to(torch.bfloat16)
-        elif custom_quant_type == 'mxfp8':
-            output = mxfp_matmul(total_input,weight.t(),'fp8_e4m3').to(torch.bfloat16)
-        elif custom_quant_type == 'hifp8':
-            output = hifp_matmul(total_input,weight.t()).to(torch.bfloat16)
-        else:
-            output = torch.matmul(total_input, weight.t()) 
-        if bias is not None:
-            output = output + bias
-        
-        # 保存forward输出tensor (post-linear)
-        from megatron.core.tensor_saver import save_tensor
-        import os
-        import inspect
-        
-        # 尝试获取rank信息
+        # 获取rank信息
         rank = None
         try:
             import torch.distributed as dist
@@ -850,44 +816,95 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         if rank is None:
             rank = int(os.environ.get("LOCAL_RANK", 0))
         
-        # Sample information is no longer used in tensor saving
+        # 使用集成了tensor保存功能的算子，避免重复保存
+        from quant.mxfp import MXFPMatMul
+        from quant.hifp import HIFPMatMul
+        from quant.bf16_operators import BF16MatMul
         
-        # 尝试从调用栈获取layer_idx
-        layer_idx = getattr(ctx, 'layer_idx', None)
-        if layer_idx is None:
-            # 尝试从调用栈中获取layer信息
-            try:
-                frame = inspect.currentframe()
-                while frame:
-                    frame = frame.f_back
-                    if frame and 'self' in frame.f_locals:
-                        self_obj = frame.f_locals['self']
-                        if hasattr(self_obj, 'layer_number'):
-                            layer_idx = self_obj.layer_number
-                            break
-                        elif hasattr(self_obj, 'layer_idx'):
-                            layer_idx = self_obj.layer_idx
-                            break
-            except:
-                pass
-        
-        save_tensor(
-            tensor=output,
-            layer_type="linear",
-            operation="forward",
-            quant_type=custom_quant_type,
-            tensor_name="output",
-            layer_idx=layer_idx,
-            phase="post",
-            component="linear",
-            rank=rank,  # 直接获取
-            metadata={
-                "sequence_parallel": sequence_parallel,
-                "use_bias": ctx.use_bias,
-                "tp_group_size": tp_group.size() if tp_group else None,
-                "output_shape": list(output.shape),
-            }
-        )
+        if custom_quant_type == 'mxfp4':
+            output = MXFPMatMul.apply(
+                total_input, weight.t(),
+                elem_format='fp4_e2m1',
+                block_size=32,
+                layer_type="linear",
+                layer_idx=layer_idx,
+                operation="forward",
+                phase="pre",
+                component="linear",
+                rank=rank,
+                metadata={
+                    "sequence_parallel": sequence_parallel,
+                    "use_bias": ctx.use_bias,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            )
+        elif custom_quant_type == 'mxfp8':
+            output = MXFPMatMul.apply(
+                total_input, weight.t(),
+                elem_format='fp8_e4m3',
+                block_size=32,
+                layer_type="linear",
+                layer_idx=layer_idx,
+                operation="forward",
+                phase="pre",
+                component="linear",
+                rank=rank,
+                metadata={
+                    "sequence_parallel": sequence_parallel,
+                    "use_bias": ctx.use_bias,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            )
+        elif custom_quant_type == 'hifp8':
+            output = HIFPMatMul.apply(
+                total_input, weight.t(),
+                elem_format='fp8_e5m2',
+                block_size=32,
+                layer_type="linear",
+                layer_idx=layer_idx,
+                operation="forward",
+                phase="pre",
+                component="linear",
+                rank=rank,
+                metadata={
+                    "sequence_parallel": sequence_parallel,
+                    "use_bias": ctx.use_bias,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            )
+        elif custom_quant_type == 'bf16':
+            output = BF16MatMul.apply(
+                total_input, weight.t(),
+                layer_type="linear",
+                layer_idx=layer_idx,
+                operation="forward",
+                phase="pre",
+                component="linear",
+                rank=rank,
+                metadata={
+                    "sequence_parallel": sequence_parallel,
+                    "use_bias": ctx.use_bias,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            )
+        else:
+            # 对于其他类型，使用BF16算子
+            output = BF16MatMul.apply(
+                total_input, weight.t(),
+                layer_type="linear",
+                layer_idx=layer_idx,
+                operation="forward",
+                phase="pre",
+                component="linear",
+                rank=rank,
+                metadata={
+                    "sequence_parallel": sequence_parallel,
+                    "use_bias": ctx.use_bias,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            ) 
+        if bias is not None:
+            output = output + bias
         
         return output
 
@@ -1048,53 +1065,38 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             else:
                 grad_weight = None
         else:
-            grad_weight = None
-            from quant.mxfp import mxfp_matmul
-            from quant.hifp import hifp_matmul
-            custom_quant_type = 'hifp8'
-            if custom_quant_type == 'mxfp4':
-                grad_weight = mxfp_matmul(grad_output.t(),total_input,'fp4_e2m1').to(torch.bfloat16)
-            elif custom_quant_type == 'mxfp8':
-                grad_weight = mxfp_matmul(grad_output.t(),total_input,'fp8_e5m2').to(torch.bfloat16)
-            elif custom_quant_type == 'hifp8':
-                grad_weight = hifp_matmul(grad_output.t(),total_input).to(torch.bfloat16)
-            else:
-                grad_weight = grad_output.t().matmul(total_input)
+            # 对于梯度计算，通常使用BF16算子来保存梯度tensor
+            from quant.bf16_operators import BF16MatMul
+            import os
+            
+            # 获取rank信息
+            rank = None
+            try:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    rank = dist.get_rank()
+            except:
+                pass
+            
+            if rank is None:
+                rank = int(os.environ.get("LOCAL_RANK", 0))
+            
+            # 使用BF16算子计算梯度并自动保存
+            grad_weight = BF16MatMul.apply(
+                grad_output.t(), total_input,
+                layer_type="linear",
+                layer_idx=getattr(ctx, 'layer_idx', None),
+                operation="backward",
+                phase="post",
+                component="linear",
+                rank=rank,
+                metadata={
+                    "sequence_parallel": ctx.sequence_parallel,
+                    "wgrad_compute": wgrad_compute,
+                    "tp_group_size": tp_group.size() if tp_group else None,
+                }
+            )
         grad_bias = grad_output.sum(dim=0) if use_bias else None
-
-        # 保存backward输出tensor (post-linear)
-        from megatron.core.tensor_saver import save_tensor
-        import os
-        
-        # 尝试获取rank信息
-        rank = None
-        try:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                rank = dist.get_rank()
-        except:
-            pass
-        
-        if rank is None:
-            rank = int(os.environ.get("LOCAL_RANK", 0))
-        
-        save_tensor(
-            tensor=grad_input,
-            layer_type="linear",
-            operation="backward",
-            quant_type=custom_quant_type,
-            tensor_name="output",
-            layer_idx=getattr(ctx, 'layer_idx', None),
-            phase="post",
-            component="linear",
-            rank=rank,  # 直接获取
-            metadata={
-                "sequence_parallel": ctx.sequence_parallel,
-                "wgrad_compute": wgrad_compute,
-                "tp_group_size": tp_group.size() if tp_group else None,
-                "output_shape": list(grad_input.shape),
-            }
-        )
 
         if ctx.sequence_parallel:
             handle.wait()
