@@ -1278,8 +1278,10 @@ class TransformerConfig(ModelParallelConfig):
                 multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
-        if self.num_moe_experts is not None:
-            assert not self.add_bias_linear, "Bias is not supported for MoE"
+        if self.num_moe_experts is not None and self.add_bias_linear:
+            assert (
+                self.expert_tensor_parallel_size == 1
+            ), "Bias in Moe is only supported when ETP==1"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
