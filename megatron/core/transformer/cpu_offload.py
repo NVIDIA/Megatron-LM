@@ -357,7 +357,7 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
                 cur_stream = torch.cuda.current_stream()
                 for release_tensor in release_tensors:
                     release_tensor.record_stream(cur_stream)
-                    # release_tensor.untyped_storage().resize_(0)
+                    release_tensor.untyped_storage().resize_(0)
         print_rank("exit bulk_offload")
 
     def on_group_commit_forward(self, release_tensors):
