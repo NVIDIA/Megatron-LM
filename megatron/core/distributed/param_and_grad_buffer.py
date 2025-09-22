@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 
 try:
     if is_torch_min_version("1.13.0"):
-        dist_all_gather_func = torch.distributed._all_gather_base
-        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-    else:
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
         dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
