@@ -12,6 +12,7 @@ import shutil
 import struct
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from enum import Enum
 from functools import lru_cache
 from itertools import accumulate
@@ -172,9 +173,9 @@ class _IndexWriter(object):
 
     def write(
         self,
-        sequence_lengths: List[int],
-        sequence_modes: Optional[List[int]],
-        document_indices: List[int],
+        sequence_lengths: Iterable[Union[int, numpy.integer]],
+        sequence_modes: Optional[Iterable[Union[int, numpy.integer]]],
+        document_indices: Iterable[Union[int, numpy.integer]],
     ) -> None:
         """Write the index (.idx) file
 
@@ -208,7 +209,9 @@ class _IndexWriter(object):
         if sequence_modes is not None:
             self.idx_writer.write(numpy.array(sequence_modes, dtype=numpy.int8).tobytes(order="C"))
 
-    def _sequence_pointers(self, sequence_lengths: List[int]) -> List[int]:
+    def _sequence_pointers(
+        self, sequence_lengths: Iterable[Union[int, numpy.integer]]
+    ) -> List[int]:
         """Build the sequence pointers per the sequence lengths and dtype size
 
         Args:
@@ -217,11 +220,11 @@ class _IndexWriter(object):
         Returns:
             List[int]: The pointer to the beginning of each sequence
         """
-        itemsize = DType.size(self.dtype)
-        curr_ptr = 0
+        itemsize = numpy.int64(DType.size(self.dtype))
+        curr_ptr = numpy.int64(0)
         list_ptr = []
         for length in sequence_lengths:
-            list_ptr.append(curr_ptr)
+            list_ptr.append(curr_ptr.item())
             curr_ptr += length * itemsize
         return list_ptr
 

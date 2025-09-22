@@ -1,20 +1,22 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT."""
+
 import functools
 import os
 import sys
 import warnings
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
-
-import modelopt
-import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
-from packaging.version import Version
 from tqdm import tqdm
 
+import modelopt.torch.quantization as mtq
+from modelopt.torch.export import import_mcore_gpt_from_hf
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
@@ -24,7 +26,7 @@ from megatron.training import get_args, get_model, get_tokenizer, initialize_meg
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 
 QUANT_CFG_CHOICES = {
@@ -39,7 +41,7 @@ QUANT_CFG_CHOICES = {
 
 def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
-    group = parser.add_argument_group(title='ModelOpt text generation ptq')
+    group = parser.add_argument_group(title="ModelOpt text generation ptq")
     group.add_argument(
         "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
     )
@@ -89,7 +91,7 @@ def check_arguments():
         print_rank_0("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
 
-    if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
+    if hasattr(args, "moe_grouped_gemm") and args.moe_grouped_gemm == True:
         print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
         args.moe_grouped_gemm = False
 
@@ -107,7 +109,7 @@ def get_modelopt_torch_quantization_config():
     }
     # Disable mamba-mixer quantization for now.
     mtq_config["quant_cfg"]["*mixer.*"] = {"enable": False}
-    if "fp8" == args.export_quant_cfg:
+    if args.export_quant_cfg == "fp8":
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
     if "fp4" in args.export_quant_cfg:
@@ -118,7 +120,7 @@ def get_modelopt_torch_quantization_config():
         if isinstance(weight_quantizer, list):
             weight_quantizer = weight_quantizer[0]
         weight_quantizer["block_sizes"][-1] = 128
-   
+
     # Customization
     if args.disable_qkv_quant:
         mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
@@ -144,9 +146,9 @@ if __name__ == "__main__":
     initialize_megatron(
         extra_args_provider=add_text_generate_ptq_args,
         args_defaults={
-            'tokenizer_type': 'HuggingFaceTokenizer',
-            'no_load_rng': True,
-            'no_load_optim': True,
+            "tokenizer_type": "HuggingFaceTokenizer",
+            "no_load_rng": True,
+            "no_load_optim": True,
         },
     )
 
@@ -164,8 +166,6 @@ if __name__ == "__main__":
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
-        from modelopt.torch.export import import_mcore_gpt_from_hf
-
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         import_mcore_gpt_from_hf(unwrapped_model, args.pretrained_model_path, workspace_dir)
@@ -185,11 +185,9 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    from megatron.core.transformer.moe.router import TopKRouter
-
     def _hf_dataset_forword_loop_func(model):
         dataloader = get_calib_dataloader(args.calib_size)
-    
+
         if args.force_all_expert_routing:
             for name, module in model.named_modules():
                 if isinstance(module, TopKRouter):

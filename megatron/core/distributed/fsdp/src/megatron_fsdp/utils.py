@@ -176,7 +176,9 @@ def get_mesh_names(device_mesh: Optional[DeviceMesh] = None) -> list[str]:
     return mesh_dim_names
 
 
-def contains_submesh(device_mesh: Optional[DeviceMesh], submesh_names: str | Sequence[str]) -> bool:
+def contains_submesh(
+    device_mesh: Optional[DeviceMesh], submesh_names: Optional[str | Sequence[str]]
+) -> bool:
     """
     Check if a sub-mesh exists in the device mesh by name.
     """
@@ -668,36 +670,36 @@ class FSDPDistributedIndex:
     def __init__(
         self,
         device_mesh: DeviceMesh,
-        use_hybrid_fsdp: bool = False,
-        hsdp_outer_dp_shard: bool = False,
         dp_shard_dim: Optional[str] = None,
-        dp_inter_dim: Optional[str] = None,
+        dp_outer_dim: Optional[str] = None,
         tp_dim: Optional[str] = None,
         hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+        hsdp_outer_dp_shard: bool = False,
     ):
         """
         Args:
             device_mesh (DeviceMesh): The DeviceMesh to use for the DistributedIndex.
-            use_hybrid_fsdp (bool): Whether to use hybrid FSDP, i.e. a combination
-                of replicate and sharded data parallel groups.
-            hsdp_outer_dp_shard (bool): Whether to have dp inter group sharding
-                in hybrid FSDP. This is used to enable the hybrid FSDP process group
-                to be used for communication in the inter-FSDP sub-mesh.
             dp_shard_dim (Optional[str]): The dimension name of the data parallel
-                (include context parallel) sharding sub-mesh.
-            dp_inter_dim (Optional[str]): The dimension name of the data parallel
-                "inter-FSDP" sub-mesh.
+                (and context parallel) sharding sub-mesh.
+            dp_outer_dim (Optional[str]): The dimension name of the "outer" data parallel
+                sub-mesh for replication or sharding when using HSDP.
             tp_dim (Optional[str]): The dimension name of the tensor parallel sub-mesh.
             hybrid_fsdp_group (Optional[torch.distributed.ProcessGroup]): The
                 process group for hybrid FSDP communication, which is the flattened
-                combination of the inter-FSDP and FSDP process groups.
+                combination of the dp_outer and dp_shard process groups.
+            hsdp_outer_dp_shard (bool): Whether to have outer DP group sharding
+                in hybrid FSDP. Specifying outer sharding will lift the bucket sharding
+                coordinate system to flattened ranks of (dp_shard, dp_outer) instead of
+                just sharding across dp_shard ranks and replicating across dp_outer ranks.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
         self.dp_shard_dim = dp_shard_dim
-        self.dp_inter_dim = dp_inter_dim
+        self.dp_outer_dim = dp_outer_dim
         self.tp_dim = tp_dim
-        self.use_hybrid_fsdp = use_hybrid_fsdp
+        # Helper flag to denote if we are using hybrid FSDP.
+        self.use_hybrid_fsdp = dp_outer_dim is not None
+        # Helper flag to denote if we are outer-sharding in hybrid FSDP.
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
 
         # Hybrid FSDP Process Groups
@@ -707,14 +709,14 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
-        # Retrieve the inter-FSDP process group from the DeviceMesh.
-        self.inter_fsdp_group = (
-            self.device_mesh[self.dp_inter_dim].get_group()
-            if contains_submesh(self.device_mesh, self.dp_inter_dim)
+        # Retrieve the outer-FSDP process group from the DeviceMesh.
+        self.outer_fsdp_group = (
+            self.device_mesh[self.dp_outer_dim].get_group()
+            if contains_submesh(self.device_mesh, self.dp_outer_dim)
             else None
         )
         # Save a reference to the overall HSDP process group, which is the flattened
-        # combination of the inter-FSDP and FSDP process groups.
+        # combination of the outer-FSDP and FSDP process groups.
         self.hybrid_fsdp_group = hybrid_fsdp_group
 
         """
@@ -735,7 +737,7 @@ class FSDPDistributedIndex:
         if contains_submesh(self.device_mesh, tp_submesh):
             self.mesh_library[tp_submesh] = self.device_mesh[tp_submesh]
         # HSDP-TP Mesh
-        hsdp_tp_submesh = (self.dp_inter_dim, self.dp_shard_dim, self.tp_dim)
+        hsdp_tp_submesh = (self.dp_outer_dim, self.dp_shard_dim, self.tp_dim)
         if contains_submesh(self.device_mesh, hsdp_tp_submesh):
             self.mesh_library[hsdp_tp_submesh] = self.device_mesh[hsdp_tp_submesh]
         # FSDP-TP Mesh
@@ -743,7 +745,7 @@ class FSDPDistributedIndex:
         if contains_submesh(self.device_mesh, fsdp_tp_submesh):
             self.mesh_library[fsdp_tp_submesh] = self.device_mesh[fsdp_tp_submesh]
         # HSDP Mesh
-        hsdp_submesh = (self.dp_inter_dim, self.dp_shard_dim)
+        hsdp_submesh = (self.dp_outer_dim, self.dp_shard_dim)
         if contains_submesh(self.device_mesh, hsdp_submesh):
             self.mesh_library[hsdp_submesh] = self.device_mesh[hsdp_submesh]
         # FSDP Mesh
@@ -760,17 +762,17 @@ class FSDPDistributedIndex:
 
         # Validate HSDP arguments.
         if self.use_hybrid_fsdp:
-            if self.inter_fsdp_group is None:
+            if self.outer_fsdp_group is None:
                 raise ValueError(
                     "[FSDPDistributedIndex][use_hybrid_fsdp=True] Hybrid FSDP requires "
-                    "an inter-FSDP process group (dp_inter_dim, inter_fsdp_group)."
+                    "an outer-DP process group (dp_outer_dim, outer_fsdp_group)."
                 )
             if self.hybrid_fsdp_group is None:
                 raise ValueError(
                     "[FSDPDistributedIndex][use_hybrid_fsdp=True] Hybrid FSDP requires "
                     "a hybrid FSDP process group (hybrid_fsdp_group). "
-                    "This group can be manufactured by flattening the inter-FSDP "
-                    "(dp_inter_dim, inter_fsdp_group) and FSDP (dp_shard_dim, fsdp_group) "
+                    "This group can be manufactured by flattening the outer-DP "
+                    "(dp_outer_dim, outer_fsdp_group) and FSDP (dp_shard_dim, fsdp_group) "
                     "process groups or sub-meshes."
                 )
 
@@ -783,6 +785,16 @@ class FSDPDistributedIndex:
         # Search for the sub-mesh in the mesh library.
         device_submesh = self.mesh_library.get(tuple(mesh_dim_names), None)
         if device_submesh is None:
+            if self.tp_dim is None:
+                # Warn about not specifying tp_dim for
+                # layers or frameworks that depend on this.
+                logger.warning(
+                    "[FSDPDistributedIndex] Note: For TransformerEngine, or other machine learning "
+                    "frameworks like Megatron that assume TP=1, you must specify tp_dim to use "
+                    "Megatron-FSDP. Create a trivial TP dimension by setting the TP dimension size "
+                    "to 1 in the DeviceMesh.\n"
+                    f"DeviceMesh: {self.device_mesh}"
+                )
             raise ValueError(
                 f"[FSDPDistributedIndex][get_submesh] No sub-mesh with "
                 f"mesh_dim_names={mesh_dim_names} has been registered with Megatron-FSDP."
@@ -805,11 +817,11 @@ class FSDPDistributedIndex:
             return None
         return self.fsdp_group
 
-    def get_inter_fsdp_group(self) -> ProcessGroup:
-        """Get the inter-FSDP process group."""
+    def get_outer_fsdp_group(self) -> ProcessGroup:
+        """Get the outer-FSDP process group."""
         if not self.use_hybrid_fsdp:
             return None
-        return self.inter_fsdp_group
+        return self.outer_fsdp_group
 
     def get_root_mesh(self, is_expert_parallel: bool = False) -> DeviceMesh:
         """Get the device mesh."""
@@ -844,7 +856,7 @@ class FSDPDistributedIndex:
             mesh = einops.rearrange(
                 torch.arange(dp_world_size),
                 "(outer_dp inner_dp) -> (inner_dp outer_dp)",
-                outer_dp=self.inter_fsdp_group.size(),
+                outer_dp=self.outer_fsdp_group.size(),
                 inner_dp=self.fsdp_group.size(),
             )
             self._hybrid_fsdp_group_ranks = mesh.tolist()

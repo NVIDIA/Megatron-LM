@@ -709,6 +709,13 @@ class _CudaGraphRunner(torch.nn.Module):
         if freeze_gc:
             gc.unfreeze()
 
+            # gc.collect() drops references to unreachable tensors created during capture,
+            # returning their storage to the allocator to avoid a slowdown during replay. However,
+            # it forces expensive global garbage collection, so must be done only on the last layer
+            # per-device to avoid slowing down graph creation.
+            if self.is_last_layer:
+                gc.collect()
+
     def create_bwd_graph(self, static_grad_outputs=None):
         """Create a bwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -777,6 +784,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # Unfreeze GC.
         if freeze_gc:
             gc.unfreeze()
+
+            if self.is_first_layer:
+                gc.collect()
 
     def get_input_grads_with_dummy_flags(self):
         """Get the inputs grads that are returned by the bwd cudagraph call. If using grad accum

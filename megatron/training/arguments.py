@@ -332,6 +332,17 @@ def moe_freq_type(x):
         # it's a single int but in str
         return int(x)
 
+def tuple_type(x):
+    """
+    Convert a string to a tuple of integers.
+    Examples:
+        "1,2,3" -> (1, 2, 3)
+        "(1,2,3)" -> (1, 2, 3)
+    """
+    if x is None or isinstance(x, tuple):
+        return x
+    assert isinstance(x, str)
+    return tuple(int(i) for i in x.strip('()').split(','))
 
 def validate_args(args, defaults={}):
 
@@ -375,6 +386,12 @@ def validate_args(args, defaults={}):
 
     # Batch size checks if running RL.
     if args.perform_rl_step:
+        assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
+            "Cannot use both remove-kv-cache-during-training and offload-kv-cache-during-training"
+
+        assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
+            "Cannot use both partial-rollouts and remove-kv-cache-during-training"
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -1412,6 +1429,11 @@ def _add_inference_args(parser):
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
                        'number of cuda graphs may not equal this argument.')
+    group.add_argument('--inference-dynamic-batching-track-paused-request-events',
+                       action='store_true',
+                       help='Track paused request ids by adding \'paused\' events '
+                       'to each request\'s event history. This has a very minor '
+                       'impact on latency.')
     group.add_argument('--symmetric-ar-type', type=str, default=None,
                        choices=['two_shot', "one_shot", "multimem_all_reduce", None],
                        help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')
@@ -1505,6 +1527,16 @@ def _add_network_size_args(parser):
                        choices=['learnable', 'vanilla', 'off-by-one'],
                        help='Type of softmax to use for the attention. Supports both a fixed offset and '
                        'learnable offset.')
+    group.add_argument('--window-size', type=tuple_type, default=None,
+                       help='Window size for window attention. If not provided, '
+                            'window attention will be disabled.')
+    group.add_argument('--window-attn-skip-freq', type=moe_freq_type, default=None,
+                       help='Frequency of layers to skip window attention. Accepts either: '
+                            '- An integer N: Represents a (N-1):1 ratio, meaning one full attention layer '
+                            'after (N-1) SWA layers. '
+                            '- A string containing a Python list expression that defines a custom pattern, '
+                            'e.g.: "[1,1,1,0]*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates SWA and 0 indicates full attention. ')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -1865,6 +1897,20 @@ def _add_rl_args(parser):
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
+    group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
+                       help='Offload KV cache to CPU during training to save GPU memory')
+    group.add_argument('--rl-remove-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
+                       help='Remove KV cache during training to save GPU memory')
+    group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, use partial rollouts.')
+    group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='If set, use inference logprobs in importance sampling correction of the loss.')
+    group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
+                       help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, calculate the intra-group similarity of rollouts.')
     return parser
 
 def _add_training_args(parser):
