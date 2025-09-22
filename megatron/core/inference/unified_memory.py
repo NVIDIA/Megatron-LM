@@ -85,8 +85,11 @@ if has_mem_pool:
     except (RuntimeError, ImportError):
         warnings.warn("Unified memory mempool is not available.")
 
+
 # >>>
 def delete_mempool():
     global unified_memory_mempool
     del unified_memory_mempool
+
+
 # <<<
