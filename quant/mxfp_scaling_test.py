@@ -175,18 +175,22 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     # - Min alignment: Find scale_exp such that tensor_abs_min / (2^scale_exp) >= min_norm
     #   So scale_exp <= log2(tensor_abs_min / min_norm)
     
-    # Calculate the scale exponent that mxfp.py would use (max alignment)
+    # Calculate the scale exponent that mxfp.py would use (for reference)
     tensor_shared_exp = np.floor(np.log2(tensor_abs_max)) if tensor_abs_max > 0 else 0
     max_align_exp = tensor_shared_exp - emax  # This is what mxfp.py actually uses
     
     # Calculate min alignment: find scale_exp such that scaled min >= min_norm
     min_align_exp = np.floor(np.log2(tensor_abs_min / min_norm)) if tensor_abs_min > 0 and min_norm > 0 else max_align_exp
     
-    # Use calculated alignment if not overridden by user parameters
+    # Use user-specified parameters directly, with calculated values as fallback for default parameters
     if max_scale_exp == 10:  # Default value, use calculated
         max_scale_exp = max_align_exp
     if min_scale_exp == -10:  # Default value, use calculated
         min_scale_exp = min_align_exp
+    
+    # Ensure max_scale_exp >= min_scale_exp
+    if max_scale_exp < min_scale_exp:
+        max_scale_exp, min_scale_exp = min_scale_exp, max_scale_exp
     
     # Generate scale exponents from max to min
     scale_exponents = np.linspace(max_scale_exp, min_scale_exp, num_levels)
@@ -208,7 +212,7 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     log_func = logger.info if logger else print
     log_func(f"Tensor absolute value range: [{tensor_abs_min:.6e}, {tensor_abs_max:.6e}]")
     log_func(f"Format range: max_norm={max_norm:.6e}, min_norm={min_norm:.6e}")
-    log_func(f"Calculated alignment: max_align={max_align_exp:.2f}, min_align={min_align_exp:.2f}")
+    log_func(f"Calculated alignment (reference): max_align={max_align_exp:.2f}, min_align={min_align_exp:.2f}")
     log_func(f"Testing {num_levels} scaling levels from {max_scale_exp:.2f} to {min_scale_exp:.2f}")
     log_func(f"Element format: {elem_format} (e{ebits}m{mbits})")
     log_func(f"Scale bits: {scale_bits}")
@@ -954,9 +958,9 @@ def main():
     parser.add_argument('--scale-bits', type=int, default=8,
                         help='Number of scale bits (default: 8)')
     parser.add_argument('--max-scale-exp', type=int, default=10,
-                        help='Maximum scale exponent (default: auto-calculated from tensor max)')
+                        help='Maximum scale exponent (default: auto-calculated from tensor max if using default value)')
     parser.add_argument('--min-scale-exp', type=int, default=-10,
-                        help='Minimum scale exponent (default: auto-calculated from tensor min)')
+                        help='Minimum scale exponent (default: auto-calculated from tensor min if using default value)')
     parser.add_argument('--num-levels', type=int, default=21,
                         help='Number of scaling levels to test (default: 21)')
     parser.add_argument('--no-plots', action='store_true',
