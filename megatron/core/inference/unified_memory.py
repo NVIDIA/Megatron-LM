@@ -25,9 +25,6 @@ _mempool_c_src = r"""
 #define EXPORT extern "C"
 
 EXPORT void* managed_malloc(size_t size, int device, void* stream) {
-  // >>>
-  printf("******************************* inside managed_malloc.\n");
-  // <<<
   (void)stream;
   int cur = -1;
   cudaGetDevice(&cur);
@@ -53,9 +50,6 @@ EXPORT void* managed_malloc(size_t size, int device, void* stream) {
 }
 
 EXPORT void managed_free(void* ptr, size_t size, int device, void* stream) {
-  // >>>
-  printf("******************************* inside managed_free.\n");
-  // <<<
   // Memory allocated with cudaMallocManaged should be released with cudaFree.
   (void)size; (void)device; (void)stream;
   if (ptr) cudaFree(ptr);
