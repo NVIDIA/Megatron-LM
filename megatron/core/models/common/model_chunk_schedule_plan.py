@@ -14,7 +14,6 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
 
 
 class ModelChunkState:
@@ -314,7 +313,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # build preprocess
         self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
-        
+
         # build layer schedule plan for each layer
         self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
         self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
@@ -335,7 +334,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 "is_last_layer": layer_idx == num_layers - 1,
             }
             layer_plan = TransformerLayerSchedulePlan(
-                module.layers[layer_idx], self.event, self.state, comp_stream, comm_stream, extra_args
+                module.layers[layer_idx],
+                self.event,
+                self.state,
+                comp_stream,
+                comm_stream,
+                extra_args,
             )
             self._transformer_layers.append(layer_plan)
 

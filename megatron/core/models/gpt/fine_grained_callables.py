@@ -444,14 +444,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         # release tensor reference after use
         node.layer_state.residual = None
-        
+
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm
         if not node.is_mtp and final_layernorm and node.is_last_layer:
             output = final_layernorm(output)
-            output = make_viewless_tensor(
-                inp=output, requires_grad=True, keep_graph=True
-            )
+            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
         return output
 
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
