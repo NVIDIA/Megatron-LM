@@ -1,7 +1,7 @@
 .publish_common_freeze:
   stage: publish
   rules:
-    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH) && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
+    - if: ($CI_COMMIT_BRANCH == "main") && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
 
@@ -530,7 +530,7 @@ publish:docs:
 
     - git push
   rules:
-    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
       allow_failure: true
     - when: never
 
@@ -603,14 +603,14 @@ publish:code_freeze:
     - purpose/utility
     - team/megatron
   script:
-    - git fetch origin $CI_DEFAULT_BRANCH
+    - git fetch origin main
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
     - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = ''" megatron/core/package_info.py
     - VERSION=$(python -c "from megatron import core; print(core.__version__)")
     - RELEASE_BRANCH=core_r$VERSION
-    - git switch --force-create $RELEASE_BRANCH origin/$CI_DEFAULT_BRANCH
+    - git switch --force-create $RELEASE_BRANCH origin/main
     - git push -u origin $RELEASE_BRANCH
     - |
       MESSAGE='{
