@@ -110,6 +110,7 @@ test = [
     "pydantic",
     "tensorboard",
     "pyyaml",
+    "nemo-run",
 ]
 docs = [
     "sphinx",
