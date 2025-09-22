@@ -5,7 +5,6 @@ import warnings
 from pathlib import Path
 
 from torch.cuda.memory import CUDAPluggableAllocator
-from torch.distributed import get_rank
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
 from megatron.core.utils import is_torch_min_version
