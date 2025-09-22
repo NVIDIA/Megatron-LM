@@ -23,11 +23,10 @@ Fine-grained Activation Offloading
 * Support FP8
 * Support MTP
 ## Known issues
-* `--offload-modules expert_fc1` doesn't work with TP>1
 
 ## WIP items
 * Code refactor
-* Support MTP
+* Support mixed dense & moe layer
 * Benchmark
 
 # Methodology
