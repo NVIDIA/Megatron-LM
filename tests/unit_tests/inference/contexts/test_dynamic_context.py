@@ -836,9 +836,9 @@ class TestDynamicContext:
                 current_global_token_offset += expected_len
 
     def test_unified_memory(self):
-        from megatron.core.inference.unified_memory import unified_memory_mempool
+        from megatron.core.inference.unified_memory import has_unified_memory
 
-        if unified_memory_mempool is None:
+        if not has_unified_memory:
             pytest.skip("Unified memory not available due to bad environment.")
 
         self._setup_model_parallel_group(1, 1)
