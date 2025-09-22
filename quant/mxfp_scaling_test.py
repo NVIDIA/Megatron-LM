@@ -158,11 +158,29 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     tensor_abs_max = torch.max(torch.abs(input_tensor)).item()
     tensor_abs_min = torch.min(torch.abs(input_tensor[input_tensor != 0])).item() if torch.any(input_tensor != 0) else tensor_abs_max
     
-    # Calculate scale exponents for alignment
-    # Scale to align with max_norm (no overflow)
-    max_align_exp = np.floor(np.log2(tensor_abs_max / max_norm)) if tensor_abs_max > 0 else 0
-    # Scale to align with min_norm (no underflow for non-zero values)
-    min_align_exp = np.ceil(np.log2(tensor_abs_min / min_norm)) if tensor_abs_min > 0 else 0
+    # Calculate emax for the format (following mxfp.py logic)
+    emax = 2**(ebits - 1) - 1 if ebits > 0 else 0
+    
+    # Calculate scale exponents following mxfp.py _quantize_mx logic:
+    # In mxfp.py:
+    # 1. shared_exp = floor(log2(max_abs_value))  (from _shared_exponents with method="max")
+    # 2. shared_exp = shared_exp - emax           (offset by emax)
+    # 3. A = A / (2^shared_exp)                   (apply scaling)
+    #
+    # So the actual scaling factor used by mxfp.py is: 2^(floor(log2(max)) - emax)
+    #
+    # For alignment calculations:
+    # - Max alignment: Use the same logic as mxfp.py (global max alignment)
+    #   This gives: scale_exp = floor(log2(tensor_abs_max)) - emax
+    # - Min alignment: Find scale_exp such that tensor_abs_min / (2^scale_exp) >= min_norm
+    #   So scale_exp <= log2(tensor_abs_min / min_norm)
+    
+    # Calculate the scale exponent that mxfp.py would use (max alignment)
+    tensor_shared_exp = np.floor(np.log2(tensor_abs_max)) if tensor_abs_max > 0 else 0
+    max_align_exp = tensor_shared_exp - emax  # This is what mxfp.py actually uses
+    
+    # Calculate min alignment: find scale_exp such that scaled min >= min_norm
+    min_align_exp = np.floor(np.log2(tensor_abs_min / min_norm)) if tensor_abs_min > 0 and min_norm > 0 else max_align_exp
     
     # Use calculated alignment if not overridden by user parameters
     if max_scale_exp == 10:  # Default value, use calculated
@@ -563,6 +581,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
                              ebits, mbits, max_norm, axes=None, block_size=0):
     """
     Custom quantization function with fixed scale exponent.
+    This function simulates the exact behavior of mxfp.py _quantize_mx function.
     
     Args:
         input_tensor (torch.Tensor): Input tensor
@@ -576,19 +595,16 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
         block_size (int): Block size for tiling
         
     Returns:
-        torch.Tensor: Quantized tensor
+        tuple: (quantized_tensor, overflow_underflow_analysis)
     """
     A = input_tensor.clone()
     
-    # Convert scale_exp to actual scaling factor
-    # scale_exp is log2(scale_factor), so scale_factor = 2^scale_exp
+    # Apply scaling directly (this simulates the A = A / (2**shared_exp) step in mxfp.py)
     scale_factor = 2 ** scale_exp
-    
-    # Apply scaling to input tensor
     A = A / scale_factor
     
     # Quantize element-wise
-    from mxfp import _quantize_elemwise_core,_analyze_overflow_underflow_before_quantization
+    from quant.mxfp import _quantize_elemwise_core,_analyze_overflow_underflow_before_quantization
     
     # Analyze overflow/underflow without printing (collect results)
     overflow_underflow_analysis = _analyze_overflow_underflow_before_quantization(
