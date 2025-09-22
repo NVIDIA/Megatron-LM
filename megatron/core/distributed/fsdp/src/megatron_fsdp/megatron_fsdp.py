@@ -112,11 +112,13 @@ class MegatronFSDP(torch.nn.Module):
         init_model_with_meta_device (bool): Whether to initialize model parameters
             in shards across all devices of the fsdp_group. Utilized to initialize
             large models that do not fit on a single device.
-        sync_grads_each_step (bool): Whether to synchronize and install optimizer gradients on each
-            training step. When disabled, Megatron-FSDP will overlap reduce-scatter calls with
-            subsequent compute, which improves performance and throughput when utilizing delayed
-            optimization techniques such as gradient accumulation. Defaults to True for the
-            fully_shard API.
+        sync_model_each_microbatch (bool): Whether to sync parameters and install gradients on
+            each training step. When disabled, Megatron-FSDP will overlap reduce-scatter with
+            subsequent compute and delay HSDP gather and reduce operations per optimization cycle,
+            which improves performance and throughput when using delayed optimization strategies
+            such as gradient accumulation. Defaults to True, can be modified before the model
+            forward / backward pass via MegatronFSDP.set_model_auto_sync(bool) or controlled
+            with the (no_)sync context managers or microbatch_count and is_last_microbatch.
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket.
@@ -143,7 +145,6 @@ class MegatronFSDP(torch.nn.Module):
         ...     fsdp_unit_modules = [TransformerLayer, LanguageModelEmbedding],
         ...     device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         ...     init_model_with_meta_device=False,
-        ...     sync_grads_each_step=True,
         ...     disable_bucketing=False,
         ...     keep_fp8_transpose_cache=False,
         ...     nccl_ub=False,
@@ -162,18 +163,38 @@ class MegatronFSDP(torch.nn.Module):
         device: Optional[torch.device] = None,
         calculate_per_token_loss: bool = False,
         init_model_with_meta_device: bool = False,
-        sync_grads_each_step: bool = False,
+        sync_model_each_microbatch: bool = False,
         keep_fp8_transpose_cache: bool = False,
         nccl_ub: bool = False,
         fsdp_double_buffer: bool = False,
         disable_symmetric_registration: bool = False,
     ):
         super().__init__()
-        self.device = device if device else torch.device(f"cuda:{torch.cuda.current_device()}")
-        # FIXME(@jianbinc, @cspades): Conflicts with init_model_with_meta_device,
-        # which avoids initializing large models on every rank. Temporary guard here.
-        # Utilized to align all parameters in the model to the same device.
-        self.module = module.to(self.device) if not init_model_with_meta_device else module
+        # If device is not specified, use the current device.
+        self.device = (
+            device if device is not None else torch.device(f"cuda:{torch.cuda.current_device()}")
+        )
+        if self.device != torch.device(f"cuda:{torch.cuda.current_device()}"):
+            logger.warning(
+                f"[Rank {torch.distributed.get_rank()}] Megatron-FSDP is "
+                f"using device {self.device} instead of the current device "
+                f"{torch.device(f'cuda:{torch.cuda.current_device()}')}, "
+                "which may cause process-to-device mapping issues or "
+                "cross-device Tensor operation errors. If necessary, "
+                "send all Tensors in the module to the Megatron-FSDP "
+                f"device ({self.device}) during initialization or to "
+                "the device used by corresponding Tensors during "
+                "operations of the module forward pass."
+            )
+        # Only map the module to the device if the original device argument is not None,
+        # otherwise Megatron-FSDP will proceed with the existing module and send the model
+        # weights to the current device via copy during initialization.
+        self.module = (
+            # Send module to user-specified device.
+            module.to(self.device)
+            if device is not None and not init_model_with_meta_device
+            else module
+        )
 
         # if ddp_config is not provided, use the default config
         # "optim_grads_params" is the default strategy
@@ -181,6 +202,7 @@ class MegatronFSDP(torch.nn.Module):
             self.ddp_config = DistributedDataParallelConfig(
                 check_for_nan_in_grad=True,
                 data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="no_shard",
                 grad_reduce_in_fp32=True,
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
@@ -195,7 +217,14 @@ class MegatronFSDP(torch.nn.Module):
 
         self.calculate_per_token_loss = calculate_per_token_loss
         self.init_model_with_meta_device = init_model_with_meta_device
-        self.sync_grads_each_step = sync_grads_each_step
+
+        # Whether to constantly synchronize the model every training iteration,
+        # which defaults to False to overlap communication with computation
+        # across training steps for performance. When enabled, the next training
+        # step of the model will reduce all gradients and gather all parameters
+        # for synchronized operations such as distributed optimization and
+        # distributed checkpointing particularly sharding with HSDP / DP-Outer.
+        self.model_auto_sync = self.set_model_auto_sync(sync_model_each_microbatch)
 
         # Check if the module contains (Megatron-Core) expert parallel parameters or DTensors.
         has_expert_parameters = self._check_module_parameter_types()
@@ -374,14 +403,22 @@ class MegatronFSDP(torch.nn.Module):
             return
 
         ag_pipeline = self.all_gather_pipeline
+        # Only all-gather HSDP buffer parameters in the beginning of a new optimization
+        # step cycle, or on every step if model_auto_sync is enabled, i.e. update
+        # the model training weights to reflect the reduced gradient descent step.
         ag_pipeline.all_gather_params(
             params=params,
             prefetch=prefetch,
             prefetch_order=prefetch_order,
             suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-            inter_fsdp_group_param_gather=(
-                self.microbatch_count == 0
+            outer_fsdp_group_param_gather=(
+                # All-gather the (DP-Outer, DP-Shard) weight shards from the DP-backed
+                # main weight buffer into the (DP-Shard)-backed hybrid weight buffer.
+                # This is performed at the beginning of a new optimization step cycle,
+                # and only necessary when at least the optimizer state is sharded.
+                self.dist_index.use_hybrid_fsdp
                 and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+                and (self.microbatch_count == 0 or self.model_auto_sync)
             ),
         )
         if wait_bucket_ready:
@@ -522,15 +559,20 @@ class MegatronFSDP(torch.nn.Module):
                 "optim_grads",
                 "optim_grads_params",
             ]
+            # Only reduce if we are sharding gradients, or are on the final microbatch.
+            # If is_last_microbatch is not specified, then we should reduce gradients
+            # if model_auto_sync is enabled, otherwise wait until is_last_microbatch
+            # is actually specified by the user, context manager, or FW before reduction.
             is_last_microbatch = getattr(self, "is_last_microbatch", False)
-            if grad_reduce_every_bprop or is_last_microbatch:
+            if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
                 # Reduce-scatter the gradients asynchronously before the optimizer step.
                 # Requires calling finish_grad_sync() to wait for the reduce-scatter to complete.
                 self.grad_reduce_pipeline.reduce_gradients(
                     param_list,
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
-                    inter_fsdp_group_grad_reduce=(
-                        self.dist_index.use_hybrid_fsdp and is_last_microbatch
+                    outer_fsdp_group_grad_reduce=(
+                        self.dist_index.use_hybrid_fsdp
+                        and (is_last_microbatch or self.model_auto_sync)
                     ),
                 )
 
@@ -623,24 +665,35 @@ class MegatronFSDP(torch.nn.Module):
                 "optim_grads",
                 "optim_grads_params",
             ]
-            if grad_reduce_every_bprop or getattr(self, "is_last_microbatch", False):
+            # Only reduce if we are sharding gradients, or are on the final microbatch.
+            # If is_last_microbatch is not specified, then we should reduce gradients
+            # if model_auto_sync is enabled, otherwise wait until is_last_microbatch
+            # is actually specified by the user, context manager, or FW before reduction.
+            is_last_microbatch = getattr(self, "is_last_microbatch", False)
+            if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
                 self.grad_reduce_pipeline.reduce_gradients(
                     list(self._params_require_handle_grad),
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
+                    outer_fsdp_group_grad_reduce=(
+                        self.dist_index.use_hybrid_fsdp
+                        and (is_last_microbatch or self.model_auto_sync)
+                    ),
                 )
                 self.grad_reduce_pipeline.reset()
-
-            # If sync_grads_each_step is enabled, we automatically synchronize gradients
-            # so the user does not have to call finish_grad_sync() manually. However,
-            # this will reduce training performance when using delayed optimization
-            # techniques such as gradient accumulation, because asynchronous gradient
-            # reduce-scatter calls can be overlapped with subsequent compute.
-            if self.sync_grads_each_step:
-                self.finish_grad_sync()
 
             # Reset root_pre_backward_hook_issued flag.
             self._root_pre_backward_hook_issued = False
             self.microbatch_count += 1
+
+            # If model_auto_sync is enabled, we automatically synchronize gradients
+            # so the user does not have to call finish_grad_sync() manually. However,
+            # this will reduce training performance when using delayed optimization
+            # techniques such as gradient accumulation, because asynchronous gradient
+            # reduce-scatter calls can be overlapped with subsequent compute.
+            # This will also reset the microbatch counter to 0, to trigger initial
+            # microbatch operations on the next iteration of the training loop.
+            if self.model_auto_sync:
+                self.finish_grad_sync()
 
         def _pre_backward(module: nn.Module, *unused):
             """
@@ -826,7 +879,7 @@ class MegatronFSDP(torch.nn.Module):
 
         # Register pre state_dict hook to ensure that the module parameters are
         # distributed before saving the state_dict.
-        self._state_dict_pre_hook = self.register_state_dict_pre_hook(
+        self._state_dict_pre_hook = self.module.register_state_dict_pre_hook(
             lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
         )
 
@@ -843,6 +896,44 @@ class MegatronFSDP(torch.nn.Module):
             yield
         finally:
             self.is_last_microbatch = True
+
+    @contextmanager
+    def sync(self):
+        """
+        Context manager that synchronizes the MegatronFSDP model parameters and gradients
+        every training step as opposed to every optimization cycle.
+        """
+        self.set_model_auto_sync(True)
+        try:
+            yield
+        finally:
+            self.set_model_auto_sync(False)
+
+    def set_model_auto_sync(self, sync_model: bool = True):
+        """
+        Activate or deactivate flag that controls Megatron-FSDP model synchronization.
+        When activated, the model parameters and gradients will be synchronized EVERY
+        training step, i.e. gradient reduction will be waited upon instead of overlapped
+        with subsequent compute, and all-gather + reduce operations across the DP-Outer
+        ProcessGroup will be executed when sharding on DP-Outer during HSDP / HFSDP.
+        Otherwise, MegatronFSDP will perform such synchronizations every optimization
+        cycle depending on is_last_microbatch = True or microbatch_count = 0, which
+        are more flexible but difficult to manage, e.g. microbatch_count and
+        is_last_microbatch can be modified elsewhere for custom training strategies.
+
+        Will commonly be called on the final microbatch of a training step before the
+        model forward pass and gradient backward pass to ensure that the model gradients
+        (prior to optimizer.step()) and model parameters (prior to dist. checkpointing)
+        are synchronized and representative of the model trained at that particular
+        training step. Otherwise, model training performance will slightly degrade when
+        MegatronFSDP.model_auto_sync = True.
+
+        Args:
+            sync_model (bool, optional): Whether to synchronize the model every training step.
+                MegatronFSDP.model_auto_sync will be set to the value of sync_model.
+                Defaults to True. MegatronFSDP.model_auto_sync defaults to False.
+        """
+        self.model_auto_sync = sync_model
 
     def get_distributed_index(self) -> FSDPDistributedIndex:
         """
