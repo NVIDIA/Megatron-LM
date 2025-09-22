@@ -5,7 +5,6 @@ import warnings
 from pathlib import Path
 
 from torch.cuda.memory import CUDAPluggableAllocator
-from torch.distributed import get_rank
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
 from megatron.core.utils import is_torch_min_version
@@ -87,8 +86,7 @@ if _has_mem_pool:
         _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
         has_unified_memory = True
     except (RuntimeError, ImportError):
-        if get_rank() == 0:
-            warnings.warn("Failed to create unified memory mempool.")
+        warnings.warn("Failed to create unified memory mempool.")
 
 
 def create_unified_mempool():
