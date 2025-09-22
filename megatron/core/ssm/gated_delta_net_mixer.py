@@ -30,7 +30,12 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import (
+    deprecate_inference_params,
+    log_single_rank,
+    nvtx_range_push,
+    nvtx_range_pop,
+)
 
 # TODO: Implement GatedDeltaNetContextParallel
 # from .gated_delta_net_context_parallel import GatedDeltaNetContextParallel
@@ -285,7 +290,9 @@ class GatedDeltaNetMixer(MegatronModule):
             raise NotImplementedError("GDN does not support inference for now.")
 
         # Input projection
+        nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
 
         # transpose: s b x --> b s x
         qkvzba = qkvzba.transpose(0, 1)
@@ -303,6 +310,7 @@ class GatedDeltaNetMixer(MegatronModule):
 
         # Convolution on qkv
         qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+        nvtx_range_push(suffix="conv1d")
         if causal_conv1d_fn is None:
             qkv = self.act_fn(self.conv1d(qkv)[..., :seq_len])
         else:
@@ -313,6 +321,7 @@ class GatedDeltaNetMixer(MegatronModule):
                 bias=self.conv1d.bias,
                 activation=self.activation,
             )
+        nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
         qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         query, key, value = torch.split(qkv, [
@@ -336,9 +345,12 @@ class GatedDeltaNetMixer(MegatronModule):
         alpha = alpha.contiguous()
 
         # Calculate g and beta
+        nvtx_range_push(suffix="g_and_beta")
         g = -self.A_log.exp() * F.softplus(alpha.float() + self.dt_bias) # In fp32
         beta = beta.sigmoid()
+        nvtx_range_pop(suffix="g_and_beta")
 
+        nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             query,
             key,
@@ -349,8 +361,10 @@ class GatedDeltaNetMixer(MegatronModule):
             output_final_state=False,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,
         )
+        nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
         core_attn_out_dtype = core_attn_out.dtype
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         norm_out = self.out_norm(core_attn_out)
@@ -358,12 +372,15 @@ class GatedDeltaNetMixer(MegatronModule):
         gate = gate.reshape(-1, gate.shape[-1])
         norm_out = norm_out * self.act_fn(gate.float())
         norm_out = norm_out.to(core_attn_out_dtype)
+        nvtx_range_pop(suffix="gated_norm")
 
         # Output projection
+        nvtx_range_push(suffix="out_proj")
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()  # b, s, x -> s, b, x
         out, out_bias = self.out_proj(norm_out)
-
+        nvtx_range_pop(suffix="out_proj")
+        
         return out, out_bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
