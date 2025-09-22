@@ -181,6 +181,11 @@ class TransformerConfig(ModelParallelConfig):
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
 
+    window_attn_skip_freq: Optional[Union[int, List[int]]] = None
+    """Frequency of full attention layers among sliding window attention layers. Accepts either:
+    - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
+    - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
+
     normalization: str = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
@@ -283,6 +288,9 @@ class TransformerConfig(ModelParallelConfig):
 
     use_fused_weighted_squared_relu: bool = False
     """If True, uses fused weighted squared relu kernel when using MoE."""
+
+    fused_single_qkv_rope: bool = False
+    """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
     ####################
     # activation recomputation

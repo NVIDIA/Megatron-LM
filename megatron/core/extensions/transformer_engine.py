@@ -39,7 +39,10 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    is_layer_window_attention,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -939,7 +942,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     f"Currently set to: {os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', 'not set')}."
                 )
 
-        if config.window_size is not None:
+        if is_layer_window_attention(
+            config.window_size, config.window_attn_skip_freq, layer_number
+        ):
             # Check version
             assert is_te_min_version("1.2.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
@@ -1027,6 +1032,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 core_attention_bias_type="post_scale_bias", core_attention_bias=attention_bias
             )
 
+        if attn_mask_type == AttnMaskType.no_mask and self.config.window_size is not None:
+            if (qkv_format == "bshd" and query.size(1) == 1) or (
+                qkv_format == "sbhd" and query.size(0) == 1
+            ):
+                #  need to change mask type for SWA inference decode stage.
+                attn_mask_type = AttnMaskType.causal_bottom_right
         if self.te_forward_mask_type:
             if qkv_format == "thd" and is_te_min_version("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
@@ -1580,13 +1591,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
                 userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
             op = te.pytorch.ops.BasicLinear(
-                weight.size(1) * tp_world_size,
+                weight.size(1),
                 weight.size(0),
                 device="meta",
                 dtype=weight.dtype,
-                tensor_parallel_mode="row" if tp_world_size > 1 else None,
-                tensor_parallel_group=tp_group,
-                sequence_parallel=self.linear_fc2.sequence_parallel,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
                 userbuffers_options=userbuffers_options,
@@ -1605,6 +1613,33 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
                     op.bias = bias
                     fused_impl.append(op)
+
+            # Get submodule forward hooks
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            for submodule in self.modules():
+                for hook in submodule._forward_pre_hooks.values():
+                    forward_pre_hooks.append((submodule, hook))
+                for hook in submodule._forward_hooks.values():
+                    forward_post_hooks.append((submodule, hook))
+
+            # Attempt to emulate submodule forward hooks if needed
+            # Note: Assume hooks do not interact with submodule inputs
+            # or outputs since they are internal to the op fuser.
+            if forward_pre_hooks:
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook in forward_pre_hooks:
+                        # Assume that hook does not interact with
+                        # input
+                        hook(submodule, None)
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
+            if forward_post_hooks:
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook in forward_post_hooks:
+                        # Assume that hook does not interact with
+                        # input or output
+                        hook(submodule, None, None)
+                fused_impl.register_forward_hook(forward_post_hook)
 
             return fused_impl
 
