@@ -133,14 +133,17 @@ class PipelineParallelLayerLayout:
         ## Detect MTP standalone usage.
         mtp_standalone = False
         for pp_rank in range(self.pipeline_model_parallel_size):
-            if LayerType.mtp in self.layout[pp_rank][-1] and pp_rank != self.pipeline_model_parallel_size - 1:
+            if (
+                LayerType.mtp in self.layout[pp_rank][-1]
+                and pp_rank != self.pipeline_model_parallel_size - 1
+            ):
                 mtp_standalone = True
                 break
 
         # TODO: remove them in the future once they are supported
         if self.flatten_layout.count(LayerType.encoder) > 0:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")
-        
+
         return mtp_standalone
 
     def get_num_layers_to_build(

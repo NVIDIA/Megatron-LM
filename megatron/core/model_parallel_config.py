@@ -315,13 +315,6 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
-   #  mtp_standalone: bool = False
-   #  """If True, the MTP is in a standalone stage. In which case, MTP layers are in a separate stage.
-   #     However, the computation of MTP loss will use the same way as lm_loss in the last stage. 
-   #     This will cause the p2p shapes change in the MTP stage, where we need to pass the decoder 
-   #     hidden states as well as the mtp hidden states to the next stage.
-   #  """
-
     ###################
     # CPU Offloading
     ###################
