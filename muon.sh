@@ -67,7 +67,7 @@ options=(
     --tensor-model-parallel-size 1
     --context-parallel-size 1
     --pipeline-model-parallel-size 1
-    # --expert-model-parallel-size 8
+    --expert-model-parallel-size 8
 
     --num-layers 30
     --hidden-size 4096
@@ -131,7 +131,7 @@ options=(
 
     ${OPTIMIZER_ARGS[@]}
 
-    # ${MOE_ARGS[@]}
+    ${MOE_ARGS[@]}
 )
 
 
