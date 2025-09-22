@@ -906,6 +906,12 @@ class TestDynamicContext:
                         unified_memory_level=unified_memory_level,
                     )
                 )
+            # >>>
+            # for context in contexts:
+            #     print("++++ me, context.")
+            #     del context.memory_buffer
+            #     del context
+            # <<<
 
         # Pure GPU memory test should OOM.
         try:
@@ -917,3 +923,24 @@ class TestDynamicContext:
 
         # Unified memory test should succeed.
         init_contexts(unified_memory_level=1)
+
+        # >>>
+        # # Destroy process group (otherwise, segfault will occur).
+        # torch.distributed.destroy_process_group()
+        # <<<
+
+        # >>>
+        # torch.cuda.empty_cache()
+        # <<<
+
+        # >>>
+        # from megatron.core.inference.unified_memory import delete_mempool
+        # delete_mempool()
+        # <<<
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+if __name__ == "__main__":
+    test = TestDynamicContext()
+    test.test_unified_memory()
+    print("~~~\nsuccess.")
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
