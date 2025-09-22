@@ -565,15 +565,28 @@ def _quantize_mx(
 
 import torch
 from torch.autograd import Function
+from typing import Optional, Dict, Any
 
 class MXFPMatMul(Function):
     @staticmethod
     def forward(ctx, A: torch.Tensor, B: torch.Tensor,
-                elem_format: str = 'fp8_e5m2', block_size: int = 32):
+                elem_format: str = 'fp8_e5m2', block_size: int = 32,
+                layer_type: Optional[str] = None, layer_idx: Optional[int] = None,
+                operation: str = "forward", phase: str = "pre", component: str = "linear",
+                rank: Optional[int] = None, metadata: Optional[Dict[str, Any]] = None):
+        # 保存tensor和参数到ctx
         ctx.save_for_backward(A, B)
         ctx.elem_format = elem_format
         ctx.block_size = block_size
+        ctx.layer_type = layer_type
+        ctx.layer_idx = layer_idx
+        ctx.operation = operation
+        ctx.phase = phase
+        ctx.component = component
+        ctx.rank = rank
+        ctx.metadata = metadata
         
+        # 量化tensor
         A_q = _quantize_mx(
             A, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-1, block_size=block_size,
@@ -584,17 +597,158 @@ class MXFPMatMul(Function):
             shared_exp_method="max", axes=-2, block_size=block_size,
             round="nearest", flush_fp32_subnorms=False
         )
-        return torch.matmul(A_q, B_q)
+        
+        # 执行矩阵乘法
+        output = torch.matmul(A_q, B_q)
+        
+        # 自动保存forward阶段的tensor
+        if layer_type is not None:
+            try:
+                from megatron.core.tensor_saver import save_tensor
+                
+                # 保存输入tensor A
+                save_tensor(
+                    tensor=A,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type=f"mxfp_{elem_format}",
+                    tensor_name="input_A",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存输入tensor B
+                save_tensor(
+                    tensor=B,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type=f"mxfp_{elem_format}",
+                    tensor_name="input_B",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存量化后的tensor A_q
+                save_tensor(
+                    tensor=A_q,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type=f"mxfp_{elem_format}_quantized",
+                    tensor_name="input_A_quantized",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存量化后的tensor B_q
+                save_tensor(
+                    tensor=B_q,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type=f"mxfp_{elem_format}_quantized",
+                    tensor_name="input_B_quantized",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存输出tensor
+                save_tensor(
+                    tensor=output,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type=f"mxfp_{elem_format}",
+                    tensor_name="output",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+            except ImportError:
+                pass  # 如果tensor_saver不可用，静默跳过
+            except Exception as e:
+                print(f"[MXFPMatMul] 保存tensor时出错: {e}")
+        
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
         A, B = ctx.saved_tensors
         grad_A = grad_B = None
+        
+        # 计算梯度
         if ctx.needs_input_grad[0]:
             grad_A = torch.matmul(grad_output, B.transpose(-2, -1))
         if ctx.needs_input_grad[1]:
             grad_B = torch.matmul(A.transpose(-2, -1), grad_output)
-        return grad_A, grad_B, None, None  # None对应elem_format和block_size
+        
+        # 自动保存backward阶段的tensor
+        if ctx.layer_type is not None:
+            try:
+                from megatron.core.tensor_saver import save_tensor
+                
+                # 保存梯度输出
+                save_tensor(
+                    tensor=grad_output,
+                    layer_type=ctx.layer_type,
+                    operation="backward",
+                    quant_type=f"mxfp_{ctx.elem_format}",
+                    tensor_name="grad_output",
+                    layer_idx=ctx.layer_idx,
+                    phase="post",
+                    component=ctx.component,
+                    rank=ctx.rank,
+                    metadata=ctx.metadata
+                )
+                
+                # 保存梯度A
+                if grad_A is not None:
+                    save_tensor(
+                        tensor=grad_A,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type=f"mxfp_{ctx.elem_format}",
+                        tensor_name="grad_input_A",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                
+                # 保存梯度B
+                if grad_B is not None:
+                    save_tensor(
+                        tensor=grad_B,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type=f"mxfp_{ctx.elem_format}",
+                        tensor_name="grad_input_B",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                    
+            except ImportError:
+                pass  # 如果tensor_saver不可用，静默跳过
+            except Exception as e:
+                print(f"[MXFPMatMul] 保存backward tensor时出错: {e}")
+        
+        return grad_A, grad_B, None, None, None, None, None, None, None, None, None  # None对应所有额外参数
 
 class MXFPBAddBmm(Function):
     @staticmethod
