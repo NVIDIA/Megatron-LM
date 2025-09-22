@@ -34,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.inference.utils import Counter
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop
 
 try:
@@ -103,14 +104,8 @@ class DynamicInferenceEngine(AbstractEngine):
         random_seed: Optional[int] = None,
         *,
         track_paused_request_events: bool = False,
+        unified_memory_level: int = 0,
     ):
-
-        if enable_cuda_graph is not None:
-            warnings.warn(
-                "The `enable_cuda_graph` argument is deprecated and will be "
-                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
-                "read directly from the transformer config object."
-            )
 
         assert isinstance(controller, SimpleTextGenerationController)
         assert isinstance(context, DynamicInferenceContext)
@@ -122,6 +117,22 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
         self.termination_id = termination_id
         self.random_seed = random_seed
+        self.unified_memory_level = unified_memory_level
+        self.capture_stats = None
+
+        # Deprecate `enable_cuda_graph`.
+        if enable_cuda_graph is not None:
+            warnings.warn(
+                "The `enable_cuda_graph` argument is deprecated and will be "
+                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
+                "read directly from the transformer config object."
+            )
+            self.enable_cuda_graph = enable_cuda_graph
+        else:
+            self.enable_cuda_graph = (
+                controller.inference_wrapped_model.model.config.enable_cuda_graph
+            )
+
         self.track_paused_request_events = track_paused_request_events
         self.step_count = 0
         self.finished_request_count = 0

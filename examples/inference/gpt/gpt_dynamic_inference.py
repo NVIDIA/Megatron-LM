@@ -268,6 +268,14 @@ def run_inference(
         result = engine.step_modern(sampling_params, verbose=True)
         step_id += 1
 
+        # Test suspending and resuming engine.
+        if engine.step_count % SUSPEND_RESUME_INTERVAL == 0:
+            active_token_count_0 = engine.context.active_token_count
+            engine.suspend()
+            engine.resume()
+            active_token_count_1 = engine.context.active_token_count
+            print("**** suspend + resume [ active tokens %d -> %d ]." % (active_token_count_0, active_token_count_1))
+
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
         if args.enable_cuda_graph and cuda_graph_request_count is not None:
@@ -377,6 +385,7 @@ def main():
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
 
     # >>>
@@ -423,20 +432,30 @@ def main():
         # Print unique prompts + outputs.
         text_hashes = []
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
+
             request_idx = request_idxs[0]
             request = requests[request_idx]
+
             prompt_text_escaped = escape_str(prompt_text)
             num_prompt_tokens = len(requests[request_idx].prompt_tokens)
             if request.output_text is not None:
-                output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
+                # Use hash of prompt + generated text in case engine was suspended
+                # and resumed, which misaligns boundary between prompt and
+                # generated tokens.
+                text_hash = hashlib.sha256(
+                    (request.prompt_text + str(request.output_text)).encode()
+                ).hexdigest()[:6]
                 output_text_escaped = escape_str(request.output_text)
                 num_output_tokens = len(requests[request_idx].output_tokens)
             else:
-                output_text_hash = "--"
+                text_hash = "--"
                 output_text_escaped = "--"
                 num_output_tokens = 0
+            text_hashes.append(text_hash)
+
             print(
-                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {text_hash}]. "
+                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, "
+                f"hash {text_hash}]. "
                 f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
                 f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
             )
@@ -481,30 +500,30 @@ def main():
         p_mean = p_total / p_count
         d_mean = d_total / d_count if d_count != 0 else 0.
 
-    # Commented out for now as the step/add/output times are not calculated correctly.
-    # print(
-    #     f"{setup_prefix} … "
-    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-    #     f"total time: {step_total:.3f}s … "
-    #     f"step time: total {step_total:.3f}s "
-    #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
-    #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
-    #     f"count [ p {p_count}, d {d_count} ]."
-    # )
-    capture_str = (
-        f"{engine.capture_stats["time"]:.2f} sec"
-        if engine.capture_stats else
-        "--"
-    )
-    print(
-        f"{setup_prefix} … "
-        f"capture {capture_str} … "
-        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        f"total time: {total_time:.3f}s … "
-        f"steps: {engine.step_count:d} … "
-        f"throughput: {throughput:.3f} tok/s"
-    )
-    print("~~~")
+        # Commented out for now as the step/add/output times are not calculated correctly.
+        # print(
+        #     f"{setup_prefix} … "
+        #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        #     f"total time: {step_total:.3f}s … "
+        #     f"step time: total {step_total:.3f}s "
+        #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+        #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+        #     f"count [ p {p_count}, d {d_count} ]."
+        # )
+        capture_str = (
+            f"{engine.capture_stats["time"]:.2f} sec"
+            if engine.capture_stats else
+            "--"
+        )
+        print(
+            f"{setup_prefix} … "
+            f"capture {capture_str} … "
+            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+            f"total time: {total_time:.3f}s … "
+            f"steps: {engine.step_count:d} … "
+            f"throughput: {throughput:.3f} tok/s"
+        )
+        print("~~~")
 
     # Stop Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):

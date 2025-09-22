@@ -92,31 +92,6 @@ class WarmupEngineMode(Enum):
     NON_DECODE = "non_decode"
 
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-def time_dummy_alloc():
-    import time
-    import torch
-    def alloc():
-        t = time.time()
-        _tensor = torch.empty(
-            # (2, 36, 9102, 256, 1, 128),
-            (2, 27, 9102, 256, 1, 128),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        t = time.time() - t
-        return _tensor, t
-    tensor, t0 = alloc()
-    del tensor
-    tensor, t1 = alloc()
-    del tensor
-    tensor, t2 = alloc()
-    print("~~~")
-    print("m-lm | ctx-dummy ... %f, %f, %f." % (t0, t1, t2))
-    exit()
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
@@ -221,8 +196,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.chunk_size_tokens = chunk_size_tokens
@@ -239,20 +214,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.chunk_size_tokens
-                * self.num_attention_heads_per_partition
-                * self.hidden_size_per_attention_head
+                * num_attention_heads_per_partition
+                * hidden_size_per_attention_head
             )
 
         # Adjust buffer to be a multiple of chunk size.
         self.buffer_size_bytes = int(buffer_size_gb * 1024**3)
-        self.buffer_size_bytes_rem = self.buffer_size_bytes % self.chunk_size_bytes
-        self.buffer_size_bytes = self.buffer_size_bytes - self.buffer_size_bytes_rem
+        self.buffer_size_bytes_rem = buffer_size_bytes % self.chunk_size_bytes
+        self.buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
 
         # Calculate the total number of chunks available in the buffer
-        self.chunk_count_total = self.buffer_size_bytes // self.chunk_size_bytes
+        self.chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
 
-        # Max number of chunks per request.
-        self.max_kv_chunk_count = math.ceil(max_sequence_length / self.chunk_size_tokens)
+        # Chunk ids.
+        self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
 
         # Compute max_requets, max_tokens from buffer size and overflow factor.
         def bytes_to_max_requests_and_tokens(n_bytes):
@@ -262,9 +237,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 int(n_tokens), tp_size=tp_size
             )
 
-        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(
-            self.buffer_size_bytes
-        )
+        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
         if buffer_overflow_factor is not None:
             self.max_requests = self.round_up_requests(
                 int(self.max_requests * buffer_overflow_factor), tp_size=tp_size
@@ -299,64 +272,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = None
         self.padded_active_request_count = None
         self.paused_tokens = None
-
-        # Per-request state.
-        self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_query_lengths = torch.empty_like(self.request_ids)
-        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
-        self.request_output_lengths = torch.empty_like(self.request_ids)
-        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
-        self.request_kv_chunk_counts = torch.empty_like(self.request_ids)
-        self.request_last_kv_chunk_id = torch.empty_like(self.request_ids)
-        # request_last_kv_chunk_offset represents number of tokens in the last kv chunk
-        self.request_last_kv_chunk_offset = torch.empty_like(self.request_ids)
-
-        with timing_ctx(time_map, "requests"):
-
-        # Calculate the total number of chunks available in the buffer
-        chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
-
-        # Memory buffer.
-        ctx_manager = (
-            torch.cuda.use_mem_pool(unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
-        with ctx_manager:
-            if cache_mla_latent:
-                self.memory_buffer = torch.full(
-                    (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                self.memory_buffer = torch.full(
-                    (
-                        2,  # key and value
-                        self.num_layers,
-                        chunk_count_total,
-                        self.chunk_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
-                    ),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
-        # Chunk ids.
-        self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
-        self.request_to_kv_chunk_ids = torch.full(
-            (self.max_requests, self.max_kv_chunk_count),
-            -1,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
 
         # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
         self.cuda_graph_token_counts = None
@@ -397,6 +312,116 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_cuda_graphs is not None
         )
 
+        # Guaranteed active requests.
+        # * See details in the class docstring above. `gtd_request_fraction` is
+        #   the fraction of chunks in the memory buffer that are reserved for
+        #   guaranteeing that some number of active requests can always proceed
+        #   with their generations. The number of chunks defined by
+        #   `buffer_guaranteed_fraction * chunk_count_total` is converted to a
+        #   number of requests that this reserved space can safely handle
+        #   (`gtd_request_count`).
+        # * Note: computing the size of this guaranteed space from chunks rather
+        #   than bytes is safer due to the non-linear impacts of a large
+        #   `chunk_size_tokens` or `max_kv_chunk_count`. When computing from
+        #   chunks, this space will always be less than `chunk_count_total`. When
+        #   computing from bytes, this space can unexpectedly be much larger than
+        #   `chunk_count_total`, resulting in stalled generations.
+        gtd_chunk_count = int(buffer_guaranteed_fraction * chunk_count_total)
+        gtd_chunk_count = min(gtd_chunk_count, chunk_count_total)
+        self.gtd_request_count = max(1, gtd_chunk_count // self.max_kv_chunk_count)
+        self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
+
+        # Initialize chunk allocator
+        self.chunk_allocator = ChunkAllocator(
+            chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
+        )
+
+        # Store the dummy chunk idx reference for convenience
+        self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
+
+        # Allocate GPU state.
+        self.allocate_all_tensors(is_init=True)
+
+    def allocate_all_tensors(self, *, is_init: bool) -> None:
+        """Allocate GPU state.
+
+        This method is used for both 1) initial allocation, and 2) resuming the
+        GPU state after a suspend.
+
+        Args:
+            is_init (bool): True if this is being called from `__init__()`.
+        """
+
+        # Only allocate tensors when not using unified memory at all (level 0),
+        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
+        # not perform any explicit allocations or deallocations after the initial
+        # call to `__init__()`.
+        if self.unified_memory_level != 0 and not is_init:
+            return
+
+        # Per-request state.
+        self.request_ids = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_query_lengths = torch.empty_like(self.request_ids)
+        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
+        self.request_output_lengths = torch.empty_like(self.request_ids)
+        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
+        self.request_kv_chunk_counts = torch.empty_like(self.request_ids)
+        self.request_last_kv_chunk_id = torch.empty_like(self.request_ids)
+        # request_last_kv_chunk_offset represents number of tokens in the last kv chunk
+        self.request_last_kv_chunk_offset = torch.empty_like(self.request_ids)
+        self.request_to_kv_chunk_ids = torch.full(
+            (self.max_requests, self.max_kv_chunk_count),
+            -1,
+            dtype=torch.int,
+            device=torch.cuda.current_device(),
+        )
+
+        # Per-token state.
+        self.token_to_input_ids = torch.full(
+            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
+        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
+        self.token_to_chunk_idx = torch.empty_like(self.token_to_input_ids)
+        # i.e For a set of tokens A B C D E F ..  and chunk_size 4:
+        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
+        # token_to_local_position_within_kv_chunk is [0 , 1, 2, 3, 0, 1, 2]
+        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
+        self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
+
+        # Memory buffer.
+        ctx_manager = (
+            torch.cuda.use_mem_pool(unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
+        with ctx_manager:
+            if cache_mla_latent:
+                self.memory_buffer = torch.full(
+                    (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.full(
+                    (
+                        2,  # key and value
+                        self.num_layers,
+                        chunk_count_total,
+                        self.chunk_size_tokens,
+                        num_attention_heads_per_partition,
+                        hidden_size_per_attention_head,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
         # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
         # consistent input shapes, which is required to use cuda graphs.
         # During these steps, the `*_cudagraph_only`
@@ -423,92 +448,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-            # Memory buffer.
-            self.memory_buffer = torch.full(
-                (
-                    2,  # key and value
-                    self.num_layers,
-                    self.chunk_count_total,
-                    self.chunk_size_tokens,
-                    self.num_attention_heads_per_partition,
-                    self.hidden_size_per_attention_head,
-                ),
-                -1,
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
-
-        with timing_ctx(time_map, "decode_only"):
-
-            # `*_decode_only` tensors are for use with cuda graphs to maintain
-            # consistent input shapes, which is required to use cuda graphs. Cuda
-            # graphs are used only during decode-only steps (i.e., no requests are in
-            # the prefill phases). During these decode-only steps, the `*_decode_only`
-            # tensors are used, otherwise their same-name but un-suffixed
-            # corresponding tensors are used.
-            # TODO: @lmcafee, only use `_decode_only` tensors when both of the
-            # following conditions are met: 1) decode-only step, and 2) cuda graphs
-            # are enabled.
-
-            self.query_seq_lengths_decode_only = torch.full(
-                (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.cu_query_seq_lengths_decode_only = torch.full(
-                (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.kv_seq_lengths_decode_only = torch.full(
-                (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.cu_kv_seq_lengths_decode_only = torch.full(
-                (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-
-            self.request_to_kv_chunk_ids_decode_only = torch.full(
-                (self.max_requests, self.max_kv_chunk_count),
-                0,
-                dtype=torch.int,
-                device=torch.cuda.current_device(),
-            )
-
-        with timing_ctx(time_map, "reset_attention_state"):
-
-            # Reset attention state.
-            # TODO(@lmcafee): move to __init__()?
-            self.reset_attention_state()
-
-        return time_map
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def allocate_all_tensors(self):
-    #     time_map = {}
-    #     with timing_ctx(time_map, "memory_buffer"):
-    #         # self.memory_buffer = torch.full(
-    #         #     (
-    #         #         2,  # key and value
-    #         #         self.num_layers,
-    #         #         self.chunk_count_total,
-    #         #         self.chunk_size_tokens,
-    #         #         self.num_attention_heads_per_partition,
-    #         #         self.hidden_size_per_attention_head,
-    #         #     ),
-    #         #     -1,
-    #         #     dtype=self.params_dtype,
-    #         #     device=torch.cuda.current_device(),
-    #         # )
-    #         if 0:
-    #             self.memory_buffer = torch.full(
-    #                 (2, 36, 9102, 256, 1, 128),
-    #                 -1,
-    #                 dtype=torch.bfloat16,
-    #                 device="cuda",
-    #             )
-    #         else:
-    #             self.memory_buffer = torch.empty(
-    #                 (2, 36, 9102, 256, 1, 128),
-    #                 dtype=torch.bfloat16,
-    #                 device="cuda",
-    #             )
-    #     return time_map
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # Reset attention state.
+        self.reset_attention_state()
 
     def deallocate_all_tensors(self):
         """Deallocate GPU state.
