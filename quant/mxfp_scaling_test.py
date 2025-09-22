@@ -135,7 +135,7 @@ def calculate_metrics(original_tensor, quantized_tensor):
     }
 
 def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8, 
-                       max_scale_exp=10, min_scale_exp=-10, num_levels=21, logger=None):
+                       max_scale_exp=10, min_scale_exp=-10, logger=None):
     """
     Test different scaling levels for MXFP quantization.
     
@@ -145,11 +145,10 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
         scale_bits (int): Number of scale bits
         max_scale_exp (int): Maximum scale exponent (aligned with max value)
         min_scale_exp (int): Minimum scale exponent (aligned with min value)
-        num_levels (int): Number of scaling levels to test
         logger: Logger instance for output
         
     Returns:
-        dict: Results for each scaling level
+        dict: Results for each scaling level (all integers in range)
     """
     # Get format parameters
     ebits, mbits, emax, max_norm, min_norm = _get_format_params(elem_format)
@@ -192,8 +191,16 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     if max_scale_exp < min_scale_exp:
         max_scale_exp, min_scale_exp = min_scale_exp, max_scale_exp
     
-    # Generate scale exponents from max to min
-    scale_exponents = np.linspace(max_scale_exp, min_scale_exp, num_levels)
+    # Generate integer scale exponents from max to min (inclusive)
+    max_exp_int = int(max_scale_exp)
+    min_exp_int = int(min_scale_exp)
+    
+    if max_exp_int == min_exp_int:
+        # Single point range - use the same integer value
+        scale_exponents = np.array([max_exp_int])
+    else:
+        # Create integer range from max to min (inclusive)
+        scale_exponents = np.arange(max_exp_int, min_exp_int - 1, -1, dtype=int)
     
     results = {
         'scale_exponents': scale_exponents.tolist(),
@@ -213,13 +220,13 @@ def test_scaling_levels(input_tensor, elem_format='fp8_e4m3', scale_bits=8,
     log_func(f"Tensor absolute value range: [{tensor_abs_min:.6e}, {tensor_abs_max:.6e}]")
     log_func(f"Format range: max_norm={max_norm:.6e}, min_norm={min_norm:.6e}")
     log_func(f"Calculated alignment (reference): max_align={max_align_exp:.2f}, min_align={min_align_exp:.2f}")
-    log_func(f"Testing {num_levels} scaling levels from {max_scale_exp:.2f} to {min_scale_exp:.2f}")
+    log_func(f"Testing integer scaling levels from {max_scale_exp:.2f} to {min_scale_exp:.2f}")
     log_func(f"Element format: {elem_format} (e{ebits}m{mbits})")
     log_func(f"Scale bits: {scale_bits}")
     log_func("-" * 60)
     
     for i, scale_exp in enumerate(scale_exponents):
-        log_func(f"Testing scale exponent {scale_exp:.2f} ({i+1}/{num_levels})...")
+        log_func(f"Testing scale exponent {scale_exp} ({i+1}/{len(scale_exponents)})...")
         
         # Create a custom quantize function with fixed scale exponent
         quantized_tensor, overflow_underflow_analysis = quantize_with_fixed_scale(
@@ -604,7 +611,7 @@ def quantize_with_fixed_scale(input_tensor, elem_format, scale_bits, scale_exp,
     A = input_tensor.clone()
     
     # Apply scaling directly (this simulates the A = A / (2**shared_exp) step in mxfp.py)
-    scale_factor = 2 ** scale_exp
+    scale_factor = 2.0 ** scale_exp  # Use float to handle negative exponents
     A = A / scale_factor
     
     # Quantize element-wise
@@ -899,7 +906,6 @@ def process_single_tensor(input_path, args, logger=None):
         args.scale_bits,
         max_scale_exp=args.max_scale_exp,
         min_scale_exp=args.min_scale_exp,
-        num_levels=args.num_levels,
         logger=tensor_logger
     )
     
@@ -961,8 +967,6 @@ def main():
                         help='Maximum scale exponent (default: auto-calculated from tensor max if using default value)')
     parser.add_argument('--min-scale-exp', type=int, default=-10,
                         help='Minimum scale exponent (default: auto-calculated from tensor min if using default value)')
-    parser.add_argument('--num-levels', type=int, default=21,
-                        help='Number of scaling levels to test (default: 21)')
     parser.add_argument('--no-plots', action='store_true',
                         help='Skip generating plots')
     
