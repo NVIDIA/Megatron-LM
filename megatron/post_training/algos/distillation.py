@@ -19,7 +19,7 @@ from torch.nn.modules.loss import _Loss
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_rank,
+    get_context_parallel_group,
     get_pipeline_model_parallel_world_size,
     get_tensor_and_context_parallel_rank,
     get_tensor_model_parallel_group,
@@ -28,11 +28,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
 from megatron.core.transformer import MegatronModule, TransformerConfig, TransformerLayer
-from megatron.core.utils import (
-    get_model_config,
-    get_model_type,
-    get_model_xattn,
-)
+from megatron.core.utils import get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -533,25 +529,25 @@ def get_tensor_shapes_adjust_fn_for_distillation(
         return None
 
     def adjust_tensor_shapes(recv_tensor_shapes: List[Tuple[int, ...]], send_tensor_shapes: List[Tuple[int, ...]]):
-        rank = get_pipeline_model_parallel_rank()
         teacher_config = get_model_config(model.teacher_model)
-        teacher_model_type = get_model_type(model.teacher_model)
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
 
         teacher_recv_tensor_shapes = get_tensor_shapes(
-            rank=rank - 1,
-            model_type=teacher_model_type,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=teacher_config,
+            tp_group=tp_group,
+            cp_group=cp_group,
         )
         teacher_send_tensor_shapes = get_tensor_shapes(
-            rank=rank,
-            model_type=teacher_model_type,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=teacher_config,
+            tp_group=tp_group,
+            cp_group=cp_group,
         )
         model.set_student_input_tensor_shape(recv_tensor_shapes)
 
