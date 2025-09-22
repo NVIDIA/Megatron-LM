@@ -278,11 +278,29 @@ def analyze_scaling_results(results, logger=None):
                 metrics_data[metric_name].append(results['metrics'][scale_key]['metrics'][metric_name])
     
     # Find best indices for different metrics
-    best_mse_idx = np.argmin(metrics_data['mse'])
-    best_cosine_idx = np.argmax(metrics_data['cosine_similarity'])
-    best_psnr_idx = np.argmax(metrics_data['psnr'])
-    best_mae_idx = np.argmin(metrics_data['mae'])
-    best_relative_error_idx = np.argmin(metrics_data['relative_error'])
+    # Use tolerance to handle numerical precision issues
+    tolerance = 1e-10
+    
+    def find_best_indices(values, is_better_func):
+        """Find all indices with the best value, return the one with the largest scale exponent when tied"""
+        best_value = is_better_func(values)
+        if is_better_func == min:
+            best_indices = [i for i, v in enumerate(values) if abs(v - best_value) < tolerance]
+        else:  # max
+            best_indices = [i for i, v in enumerate(values) if abs(v - best_value) < tolerance]
+        
+        if best_indices:
+            # When there are ties, choose the one with the largest scale exponent (closest to 0)
+            # Since scale_exponents are in descending order, the first index has the largest value
+            return best_indices[0]
+        else:
+            return 0
+    
+    best_mse_idx = find_best_indices(metrics_data['mse'], min)
+    best_cosine_idx = find_best_indices(metrics_data['cosine_similarity'], max)
+    best_psnr_idx = find_best_indices(metrics_data['psnr'], max)
+    best_mae_idx = find_best_indices(metrics_data['mae'], min)
+    best_relative_error_idx = find_best_indices(metrics_data['relative_error'], min)
     
     # Calculate composite scores
     # Normalize metrics to [0, 1] range for comparison
@@ -301,7 +319,11 @@ def analyze_scaling_results(results, logger=None):
         0.1 * relative_error_normalized  # Lower relative error is better
     )
     
-    best_composite_idx = np.argmax(composite_scores)
+    # Find best composite index, handling ties by choosing larger scale exponent
+    best_composite_score = np.max(composite_scores)
+    best_composite_indices = [i for i, score in enumerate(composite_scores) if abs(score - best_composite_score) < tolerance]
+    # When there are ties, choose the one with the largest scale exponent (first index)
+    best_composite_idx = best_composite_indices[0] if best_composite_indices else 0
     
     # Calculate scaling factor from scale exponent
     def exp_to_factor(exp):
@@ -369,23 +391,65 @@ def analyze_scaling_results(results, logger=None):
     log_func(f"Tested {len(scale_exponents)} scaling levels from {scale_exponents[0]:.2f} to {scale_exponents[-1]:.2f}")
     log_func("-" * 80)
     
-    # Best results for individual metrics
-    log_func("INDIVIDUAL METRIC OPTIMA:")
-    log_func("-" * 40)
+    # Check for ties in individual metrics
+    individual_indices = [best_mse_idx, best_cosine_idx, best_psnr_idx, best_mae_idx, best_relative_error_idx]
+    individual_names = ['MSE', 'Cosine Similarity', 'PSNR', 'MAE', 'Relative Error']
     
-    log_func(f"🏆 Best MSE: Scale Exp = {analysis['best_mse']['scale_exp']:.2f}, Factor = {analysis['best_mse']['scale_factor']:.6f}")
-    log_func(f"    MSE: {analysis['best_mse']['metrics']['mse']:.6e}, Cosine: {analysis['best_mse']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_mse']['metrics']['psnr']:.2f} dB")
-    
-    log_func(f"🎯 Best Cosine Similarity: Scale Exp = {analysis['best_cosine']['scale_exp']:.2f}, Factor = {analysis['best_cosine']['scale_factor']:.6f}")
-    log_func(f"    MSE: {analysis['best_cosine']['metrics']['mse']:.6e}, Cosine: {analysis['best_cosine']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_cosine']['metrics']['psnr']:.2f} dB")
-    
-    log_func(f"📊 Best PSNR: Scale Exp = {analysis['best_psnr']['scale_exp']:.2f}, Factor = {analysis['best_psnr']['scale_factor']:.6f}")
-    log_func(f"    MSE: {analysis['best_psnr']['metrics']['mse']:.6e}, Cosine: {analysis['best_psnr']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_psnr']['metrics']['psnr']:.2f} dB")
+    # Find if all individual metrics point to the same scale exponent
+    if len(set(individual_indices)) == 1:
+        log_func("🎯 ALL INDIVIDUAL METRICS AGREE:")
+        log_func("-" * 40)
+        log_func(f"   All metrics recommend Scale Exp = {scale_exponents[individual_indices[0]]:.2f}")
+        log_func(f"   Scale Factor = {analysis['best_mse']['scale_factor']:.6f}")
+        
+        # Check if there were ties and we chose the larger scale exponent
+        scale_exp = scale_exponents[individual_indices[0]]
+        all_same_values = []
+        for i, (name, idx) in enumerate(zip(['MSE', 'Cosine', 'PSNR', 'MAE', 'Relative'], individual_indices)):
+            metric_values = [metrics_data[metric_name][idx] for metric_name in ['mse', 'cosine_similarity', 'psnr', 'mae', 'relative_error']]
+            all_same_values.extend([(name, metrics_data['mse'][idx]), (name, metrics_data['cosine_similarity'][idx])])
+        
+        # Check for ties in the range
+        tied_indices = []
+        for i in range(len(scale_exponents)):
+            if abs(scale_exponents[i] - scale_exp) < 0.1:  # Check for nearby scale exponents
+                tied_indices.append(i)
+        
+        if len(tied_indices) > 1:
+            log_func(f"   Note: Multiple scale exponents ({', '.join([f'{scale_exponents[i]:.2f}' for i in tied_indices])})")
+            log_func(f"         produced identical performance. Selected largest: {scale_exp:.2f}")
+    else:
+        # Best results for individual metrics
+        log_func("INDIVIDUAL METRIC OPTIMA:")
+        log_func("-" * 40)
+        
+        log_func(f"🏆 Best MSE: Scale Exp = {analysis['best_mse']['scale_exp']:.2f}, Factor = {analysis['best_mse']['scale_factor']:.6f}")
+        log_func(f"    MSE: {analysis['best_mse']['metrics']['mse']:.6e}, Cosine: {analysis['best_mse']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_mse']['metrics']['psnr']:.2f} dB")
+        
+        log_func(f"🎯 Best Cosine Similarity: Scale Exp = {analysis['best_cosine']['scale_exp']:.2f}, Factor = {analysis['best_cosine']['scale_factor']:.6f}")
+        log_func(f"    MSE: {analysis['best_cosine']['metrics']['mse']:.6e}, Cosine: {analysis['best_cosine']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_cosine']['metrics']['psnr']:.2f} dB")
+        
+        log_func(f"📊 Best PSNR: Scale Exp = {analysis['best_psnr']['scale_exp']:.2f}, Factor = {analysis['best_psnr']['scale_factor']:.6f}")
+        log_func(f"    MSE: {analysis['best_psnr']['metrics']['mse']:.6e}, Cosine: {analysis['best_psnr']['metrics']['cosine_similarity']:.6f}, PSNR: {analysis['best_psnr']['metrics']['psnr']:.2f} dB")
     
     # Composite recommendation
     log_func("-" * 80)
     log_func("COMPOSITE RECOMMENDATION:")
     log_func("-" * 40)
+    
+    # Check if composite recommendation agrees with individual metrics
+    if len(set(individual_indices)) == 1 and individual_indices[0] == best_composite_idx:
+        log_func("🎯 UNANIMOUS RECOMMENDATION:")
+        log_func("-" * 40)
+        log_func(f"   All individual metrics AND composite score agree!")
+    elif best_composite_idx in individual_indices:
+        log_func("📊 BALANCED RECOMMENDATION:")
+        log_func("-" * 40)
+        log_func(f"   Composite score matches some individual metrics")
+    else:
+        log_func("⚖️  COMPOSITE RECOMMENDATION:")
+        log_func("-" * 40)
+        log_func(f"   Composite score provides balanced recommendation")
     
     log_func(f"⭐ RECOMMENDED Scaling Factor: {analysis['best_composite']['scale_factor']:.6f}")
     log_func(f"   Scale Exponent: {analysis['best_composite']['scale_exp']:.2f}")
