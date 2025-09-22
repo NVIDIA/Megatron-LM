@@ -375,7 +375,6 @@ class GPTModel(LanguageModule):
             self.vp_stage,
             self.config.fine_grained_activation_offloading,
             0,
-            self.config.offload_module_count_per_layer,
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)

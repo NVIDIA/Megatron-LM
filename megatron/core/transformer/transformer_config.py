@@ -979,10 +979,6 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
-            if "expert_fc1" in self.offload_modules and self.tensor_model_parallel_size > 1:
-                raise ValueError(
-                    "(Bug) expert_fc1 cannot be set to offload_modules when tensor_model_parallel_size > 1."
-                )
 
 
         if (

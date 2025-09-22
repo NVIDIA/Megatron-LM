@@ -865,7 +865,7 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
         if self.offload_core_attention and self.training:
-            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[query, key, value])
+            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[])
             offload_context = contextlib.nullcontext()
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -888,7 +888,7 @@ class Attention(MegatronModule, ABC):
         with offload_context:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
+            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[])
             offload_context = contextlib.nullcontext()
         nvtx_range_pop(suffix="linear_proj")
 

@@ -882,7 +882,7 @@ class TEGroupedMLP(MegatronModule):
                 permuted_local_hidden_states, tokens_per_expert
         )
         if self.offload_expert_fc1:
-            fc1_output, bias_parallel = group_prefetch_offload_commit(fc1_output, bias_parallel, release_tensors=[permuted_local_hidden_states])
+            fc1_output, bias_parallel = group_prefetch_offload_commit(fc1_output, bias_parallel)
             offload_context = contextlib.nullcontext()
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
