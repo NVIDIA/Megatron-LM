@@ -777,8 +777,30 @@ class MXFPBAddBmm(Function):
         
         return grad_input, grad_batch1, grad_batch2, None, None, None, None
 
-def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32):
-    return MXFPMatMul.apply(A, B, elem_format, block_size)
+def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwargs):
+    """
+    MXFP矩阵乘法函数，支持tensor保存
+    
+    Args:
+        A, B: 输入tensor
+        elem_format: 元素格式
+        block_size: 块大小
+        **tensor_save_kwargs: tensor保存相关参数
+            - layer_type: 层类型
+            - layer_idx: 层索引
+            - operation: 操作类型
+            - phase: 阶段
+            - component: 组件类型
+            - rank: GPU rank
+            - metadata: 元数据
+    """
+    # 如果有tensor保存参数，使用集成算子
+    if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
+                                 ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
+        return MXFPMatMul.apply(A, B, elem_format, block_size, **tensor_save_kwargs)
+    else:
+        # 否则使用原始调用方式
+        return MXFPMatMul.apply(A, B, elem_format, block_size)
 
 def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
                  elem_format='fp8_e5m2', block_size=32):

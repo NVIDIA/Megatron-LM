@@ -358,8 +358,28 @@ class HIFPBAddBmm(Function):
         
         return grad_input, grad_batch1, grad_batch2, None, None, None, None
 
-def hifp_matmul(A, B):
-    return HIFPMatMul.apply(A, B)
+def hifp_matmul(A, B, **tensor_save_kwargs):
+    """
+    HIFP矩阵乘法函数，支持tensor保存
+    
+    Args:
+        A, B: 输入tensor
+        **tensor_save_kwargs: tensor保存相关参数
+            - layer_type: 层类型
+            - layer_idx: 层索引
+            - operation: 操作类型
+            - phase: 阶段
+            - component: 组件类型
+            - rank: GPU rank
+            - metadata: 元数据
+    """
+    # 如果有tensor保存参数，使用集成算子
+    if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
+                                 ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
+        return HIFPMatMul.apply(A, B, **tensor_save_kwargs)
+    else:
+        # 否则使用原始调用方式
+        return HIFPMatMul.apply(A, B)
 
 def hifp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0):
     return HIFPBAddBmm.apply(input, batch1, batch2, beta, alpha)
