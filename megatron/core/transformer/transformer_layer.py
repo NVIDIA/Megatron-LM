@@ -35,6 +35,7 @@ from megatron.core.transformer.cpu_offload import (
     PipelineOffloadManager,
     group_prefetch_offload_start,
     group_prefetch_offload_commit,
+    mark_layer_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -473,6 +474,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        kwargs["hidden_states"] = mark_layer_start(kwargs["hidden_states"])
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context

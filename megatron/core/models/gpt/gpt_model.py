@@ -367,8 +367,11 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+        num_layers = self.decoder.num_layers_per_pipeline_rank
+        if self.mtp_process:
+            num_layers = num_layers + self.config.mtp_num_layers
         PipelineOffloadManager.get_instance().reset_chunk_handler(
-            self.decoder.num_layers_per_pipeline_rank,
+            num_layers,
             self.vp_stage,
             self.config.fine_grained_activation_offloading,
             0,

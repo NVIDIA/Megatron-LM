@@ -20,13 +20,14 @@ Fine-grained Activation Offloading
 ## Features
 * Support PP=1/PP/Interleaved PP
 * Compatible with fine-grained recomputation
-
+* Support FP8
+* Support MTP
 ## Known issues
 * `--offload-modules expert_fc1` doesn't work with TP>1
 
 ## WIP items
-* FP8 support
 * Code refactor
+* Support MTP
 * Benchmark
 
 # Methodology
