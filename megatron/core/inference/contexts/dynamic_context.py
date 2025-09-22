@@ -155,31 +155,6 @@ class WarmupEngineMode(Enum):
     NON_DECODE = "non_decode"
 
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-def time_dummy_alloc():
-    import time
-    import torch
-    def alloc():
-        t = time.time()
-        _tensor = torch.empty(
-            # (2, 36, 9102, 256, 1, 128),
-            (2, 27, 9102, 256, 1, 128),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        t = time.time() - t
-        return _tensor, t
-    tensor, t0 = alloc()
-    del tensor
-    tensor, t1 = alloc()
-    del tensor
-    tensor, t2 = alloc()
-    print("~~~")
-    print("m-lm | ctx-dummy ... %f, %f, %f." % (t0, t1, t2))
-    exit()
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
@@ -322,9 +297,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 int(n_tokens), tp_size=tp_size
             )
 
-        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(
-            self.buffer_size_bytes
-        )
+        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
         if buffer_overflow_factor is not None:
             self.max_requests = self.round_up_requests(
                 int(self.max_requests * buffer_overflow_factor), tp_size=tp_size
@@ -473,6 +446,116 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.non_decode_cuda_graphs = use_cuda_graphs_for_non_decode_steps and (
             num_cuda_graphs is not None
         )
+
+        # Guaranteed active requests.
+        # * See details in the class docstring above. `gtd_request_fraction` is
+        #   the fraction of chunks in the memory buffer that are reserved for
+        #   guaranteeing that some number of active requests can always proceed
+        #   with their generations. The number of chunks defined by
+        #   `buffer_guaranteed_fraction * chunk_count_total` is converted to a
+        #   number of requests that this reserved space can safely handle
+        #   (`gtd_request_count`).
+        # * Note: computing the size of this guaranteed space from chunks rather
+        #   than bytes is safer due to the non-linear impacts of a large
+        #   `chunk_size_tokens` or `max_kv_chunk_count`. When computing from
+        #   chunks, this space will always be less than `chunk_count_total`. When
+        #   computing from bytes, this space can unexpectedly be much larger than
+        #   `chunk_count_total`, resulting in stalled generations.
+        gtd_chunk_count = int(buffer_guaranteed_fraction * chunk_count_total)
+        gtd_chunk_count = min(gtd_chunk_count, chunk_count_total)
+        self.gtd_request_count = max(1, gtd_chunk_count // self.max_kv_chunk_count)
+        self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
+
+        # Initialize chunk allocator
+        self.chunk_allocator = ChunkAllocator(
+            chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
+        )
+
+        # Store the dummy chunk idx reference for convenience
+        self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
+
+        # Allocate GPU state.
+        self.allocate_all_tensors(is_init=True)
+
+    def allocate_all_tensors(self, *, is_init: bool) -> None:
+        """Allocate GPU state.
+
+        This method is used for both 1) initial allocation, and 2) resuming the
+        GPU state after a suspend.
+
+        Args:
+            is_init (bool): True if this is being called from `__init__()`.
+        """
+
+        # Only allocate tensors when not using unified memory at all (level 0),
+        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
+        # not perform any explicit allocations or deallocations after the initial
+        # call to `__init__()`.
+        if self.unified_memory_level != 0 and not is_init:
+            return
+
+        # Per-request state.
+        self.request_ids = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_query_lengths = torch.empty_like(self.request_ids)
+        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
+        self.request_output_lengths = torch.empty_like(self.request_ids)
+        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
+        self.request_kv_chunk_counts = torch.empty_like(self.request_ids)
+        self.request_last_kv_chunk_id = torch.empty_like(self.request_ids)
+        # request_last_kv_chunk_offset represents number of tokens in the last kv chunk
+        self.request_last_kv_chunk_offset = torch.empty_like(self.request_ids)
+        self.request_to_kv_chunk_ids = torch.full(
+            (self.max_requests, self.max_kv_chunk_count),
+            -1,
+            dtype=torch.int,
+            device=torch.cuda.current_device(),
+        )
+
+        # Per-token state.
+        self.token_to_input_ids = torch.full(
+            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
+        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
+        self.token_to_chunk_idx = torch.empty_like(self.token_to_input_ids)
+        # i.e For a set of tokens A B C D E F ..  and chunk_size 4:
+        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
+        # token_to_local_position_within_kv_chunk is [0 , 1, 2, 3, 0, 1, 2]
+        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
+        self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
+
+        # Memory buffer.
+        ctx_manager = (
+            torch.cuda.use_mem_pool(unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
+        with ctx_manager:
+            if cache_mla_latent:
+                self.memory_buffer = torch.full(
+                    (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.full(
+                    (
+                        2,  # key and value
+                        self.num_layers,
+                        chunk_count_total,
+                        self.chunk_size_tokens,
+                        num_attention_heads_per_partition,
+                        hidden_size_per_attention_head,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
 
         # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
         # consistent input shapes, which is required to use cuda graphs.

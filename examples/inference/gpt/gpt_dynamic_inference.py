@@ -278,6 +278,14 @@ def run_inference(
         is_decode_only = engine.is_decode_only 
         step_id += 1
 
+        # Test suspending and resuming engine.
+        if engine.step_count % SUSPEND_RESUME_INTERVAL == 0:
+            active_token_count_0 = engine.context.active_token_count
+            engine.suspend()
+            engine.resume()
+            active_token_count_1 = engine.context.active_token_count
+            print("**** suspend + resume [ active tokens %d -> %d ]." % (active_token_count_0, active_token_count_1))
+
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
         if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
@@ -508,30 +516,30 @@ def main():
         p_mean = p_total / p_count
         d_mean = d_total / d_count if d_count != 0 else 0.
 
-    # Commented out for now as the step/add/output times are not calculated correctly.
-    # print(
-    #     f"{setup_prefix} … "
-    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-    #     f"total time: {step_total:.3f}s … "
-    #     f"step time: total {step_total:.3f}s "
-    #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
-    #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
-    #     f"count [ p {p_count}, d {d_count} ]."
-    # )
-    capture_str = (
-        f"{engine.capture_stats["time"]:.2f} sec"
-        if engine.capture_stats else
-        "--"
-    )
-    print(
-        f"{setup_prefix} … "
-        f"capture {capture_str} … "
-        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        f"total time: {total_time:.3f}s … "
-        f"steps: {engine.step_count:d} … "
-        f"throughput: {throughput:.3f} tok/s"
-    )
-    print("~~~")
+        # Commented out for now as the step/add/output times are not calculated correctly.
+        # print(
+        #     f"{setup_prefix} … "
+        #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        #     f"total time: {step_total:.3f}s … "
+        #     f"step time: total {step_total:.3f}s "
+        #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+        #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+        #     f"count [ p {p_count}, d {d_count} ]."
+        # )
+        capture_str = (
+            f"{engine.capture_stats["time"]:.2f} sec"
+            if engine.capture_stats else
+            "--"
+        )
+        print(
+            f"{setup_prefix} … "
+            f"capture {capture_str} … "
+            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+            f"total time: {total_time:.3f}s … "
+            f"steps: {engine.step_count:d} … "
+            f"throughput: {throughput:.3f} tok/s"
+        )
+        print("~~~")
 
     # Stop Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
