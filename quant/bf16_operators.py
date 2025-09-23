@@ -39,7 +39,8 @@ class BF16MatMul(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        # 使用私有属性名保存metadata，避免属性冲突
+        ctx._metadata = metadata
         
         # 确保tensor是BF16格式
         if A.dtype != torch.bfloat16:
@@ -134,7 +135,7 @@ class BF16MatMul(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存梯度A
@@ -149,7 +150,7 @@ class BF16MatMul(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度B
@@ -164,7 +165,7 @@ class BF16MatMul(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:
@@ -211,7 +212,7 @@ class BF16BAddBmm(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        ctx._metadata = metadata
         
         # 确保tensor是BF16格式
         if input.dtype != torch.bfloat16:
@@ -338,7 +339,7 @@ class BF16BAddBmm(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存梯度input
@@ -353,7 +354,7 @@ class BF16BAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度batch1
@@ -368,7 +369,7 @@ class BF16BAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度batch2
@@ -383,7 +384,7 @@ class BF16BAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:
@@ -426,7 +427,7 @@ class BF16Linear(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        ctx._metadata = metadata
         
         # 确保tensor是BF16格式
         if input_tensor.dtype != torch.bfloat16:
@@ -540,7 +541,7 @@ class BF16Linear(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存输入梯度
@@ -555,7 +556,7 @@ class BF16Linear(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存权重梯度
@@ -570,7 +571,7 @@ class BF16Linear(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存偏置梯度
@@ -585,7 +586,7 @@ class BF16Linear(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:

@@ -584,7 +584,7 @@ class MXFPMatMul(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        ctx._metadata = metadata
         
         # 量化tensor
         A_q = _quantize_mx(
@@ -710,7 +710,7 @@ class MXFPMatMul(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存梯度A
@@ -725,7 +725,7 @@ class MXFPMatMul(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度B
@@ -740,7 +740,7 @@ class MXFPMatMul(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:
@@ -766,7 +766,7 @@ class MXFPBAddBmm(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        ctx._metadata = metadata
         
         # 使用集成了tensor保存的MXFPMatMul
         mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size,
@@ -842,7 +842,7 @@ class MXFPBAddBmm(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存梯度input
@@ -857,7 +857,7 @@ class MXFPBAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度batch1
@@ -872,7 +872,7 @@ class MXFPBAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度batch2
@@ -887,7 +887,7 @@ class MXFPBAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:

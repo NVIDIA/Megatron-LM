@@ -176,7 +176,7 @@ class HIFPMatMul(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        ctx._metadata = metadata
         
         # 量化tensor
         A_q = quant_hif8(A)
@@ -294,7 +294,7 @@ class HIFPMatMul(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存梯度A
@@ -309,7 +309,7 @@ class HIFPMatMul(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度B
@@ -324,7 +324,7 @@ class HIFPMatMul(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:
@@ -347,7 +347,7 @@ class HIFPBAddBmm(Function):
         ctx.phase = phase
         ctx.component = component
         ctx.rank = rank
-        ctx.metadata = metadata
+        ctx._metadata = metadata
         
         # 使用集成了tensor保存的HIFPMatMul
         mm_out = HIFPMatMul.apply(batch1, batch2, 'fp8_e5m2', 32,
@@ -423,7 +423,7 @@ class HIFPBAddBmm(Function):
                     phase="post",
                     component=ctx.component,
                     rank=ctx.rank,
-                    metadata=ctx.metadata
+                    metadata=ctx._metadata
                 )
                 
                 # 保存梯度input
@@ -438,7 +438,7 @@ class HIFPBAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度batch1
@@ -453,7 +453,7 @@ class HIFPBAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                 
                 # 保存梯度batch2
@@ -468,7 +468,7 @@ class HIFPBAddBmm(Function):
                         phase="post",
                         component=ctx.component,
                         rank=ctx.rank,
-                        metadata=ctx.metadata
+                        metadata=ctx._metadata
                     )
                     
             except ImportError:
