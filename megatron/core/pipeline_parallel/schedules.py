@@ -615,10 +615,8 @@ def forward_backward_no_pipelining(
                 try:
                     from megatron.core.tensor_saver import get_tensor_saver
                     tensor_saver = get_tensor_saver()
-                    print(f"[Pipeline DEBUG] No-pipelining阶段检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
                     if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
                         # 在no-pipelining模式下，第一个microbatch就收集tensor
-                        print(f"[Pipeline DEBUG] 在no-pipelining模式标记tensor收集")
                         tensor_saver.mark_warmup_collection()
                     if tensor_saver.should_exit_after_forward():
                         print(f"[Pipeline] 已完成tensor收集，退出no_pipelining训练循环")
@@ -654,10 +652,8 @@ def forward_backward_no_pipelining(
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            print(f"[Pipeline DEBUG] No-pipelining最后microbatch检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
             if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
                 # 在no-pipelining模式下，第一个microbatch就收集tensor
-                print(f"[Pipeline DEBUG] 在no-pipelining模式最后microbatch标记tensor收集")
                 tensor_saver.mark_warmup_collection()
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
@@ -2193,15 +2189,12 @@ def forward_backward_pipelining_without_interleaving(
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            print(f"[Pipeline DEBUG] Warmup阶段检查 - enabled: {tensor_saver.enabled}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
             if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
                 # 在warmup阶段收集tensor
-                print(f"[Pipeline DEBUG] 在warmup阶段标记tensor收集")
                 tensor_saver.mark_warmup_collection()
                 # 注意：这里不立即标记collection_completed，让tensor实际保存后再标记
                 print(f"[Pipeline] 已在warmup阶段开始收集tensor，继续运行以完成收集")
             else:
-                print(f"[Pipeline DEBUG] Warmup阶段跳过tensor收集 - enabled: {tensor_saver.enabled}, already_collected: {tensor_saver.tensor_collected_in_warmup}")
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
@@ -2254,12 +2247,10 @@ def forward_backward_pipelining_without_interleaving(
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
-            print(f"[Pipeline DEBUG] Steady state阶段检查 - enabled: {tensor_saver.enabled}, collection_completed: {tensor_saver.collection_completed}, tensor_collected_in_warmup: {tensor_saver.tensor_collected_in_warmup}")
             if tensor_saver.should_exit_after_forward():
                 print(f"[Pipeline] Tensor收集已完成，退出训练循环")
                 break
             else:
-                print(f"[Pipeline DEBUG] Steady state阶段继续运行 - should_exit: {tensor_saver.should_exit_after_forward()}")
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
