@@ -24,27 +24,22 @@ class TensorCollectionState:
     def set_rank(self, rank: int):
         """设置当前rank"""
         self.current_rank = rank
-        print(f"[TensorCollectionState] 设置rank: {rank}")
     
     def set_sample_idx(self, sample_idx: int):
         """设置当前sample索引"""
         self.current_sample_idx = sample_idx
-        print(f"[TensorCollectionState] 设置sample_idx: {sample_idx}")
     
     def set_iteration(self, iteration: int):
         """设置当前iteration"""
         self.current_iteration = iteration
-        print(f"[TensorCollectionState] 设置iteration: {iteration}")
     
     def set_batch_idx(self, batch_idx: int):
         """设置当前batch索引"""
         self.batch_idx = batch_idx
-        print(f"[TensorCollectionState] 设置batch_idx: {batch_idx}")
     
     def set_sequence_idx(self, sequence_idx: int):
         """设置当前sequence索引"""
         self.sequence_idx = sequence_idx
-        print(f"[TensorCollectionState] 设置sequence_idx: {sequence_idx}")
     
     def get_rank(self) -> Optional[int]:
         """获取当前rank"""
@@ -139,14 +134,12 @@ class TensorIndexManager:
         layer_key = self.get_layer_key(layer_type, layer_idx, operation)
         if layer_key in self.layer_tensor_counters:
             self.layer_tensor_counters[layer_key] += 1
-            print(f"[TensorIndexManager] 层 {layer_key} 索引递增到 {self.layer_tensor_counters[layer_key]}")
     
     def reset_layer_counter(self, layer_type: str, layer_idx: Optional[int], operation: str):
         """重置层计数器"""
         layer_key = self.get_layer_key(layer_type, layer_idx, operation)
         if layer_key in self.layer_tensor_counters:
             self.layer_tensor_counters[layer_key] = 0
-            print(f"[TensorIndexManager] 层 {layer_key} 索引重置为 0")
 
 # 全局tensor索引管理器实例
 _global_tensor_index_manager = TensorIndexManager()
@@ -251,7 +244,6 @@ def initialize_tensor_collection(rank: Optional[int] = None,
     state.set_batch_idx(batch_idx)
     state.set_sequence_idx(sequence_idx)
     
-    print(f"[TensorCollection] 初始化完成 - Rank: {state.get_rank()}, Sample: {state.get_sample_idx()}, Iteration: {state.get_iteration()}")
 
 
 class TensorSaver:
@@ -284,7 +276,6 @@ class TensorSaver:
         self.micro_batch_count = 0  # 重置micro_batch计数
         # 同时更新全局状态
         set_global_iteration(iteration)
-        print(f"[TensorSaver] 设置当前iteration: {iteration}")
     
     def mark_collection_completed(self):
         """标记tensor收集已完成"""
