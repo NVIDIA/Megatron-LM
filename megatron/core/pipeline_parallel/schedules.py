@@ -626,6 +626,16 @@ def forward_backward_no_pipelining(
                     backward_step(
                         input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
+                    
+                    # 检查是否应该在backward完成后退出
+                    try:
+                        from megatron.core.tensor_saver import get_tensor_saver
+                        tensor_saver = get_tensor_saver()
+                        if tensor_saver.should_exit_after_backward():
+                            print(f"[Pipeline] 已完成backward tensor收集，退出no_pipelining训练循环")
+                            break
+                    except Exception as e:
+                        print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -658,16 +668,6 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-            
-            # 检查是否应该在backward完成后退出
-            try:
-                from megatron.core.tensor_saver import get_tensor_saver
-                tensor_saver = get_tensor_saver()
-                if tensor_saver.should_exit_after_backward():
-                    print(f"[Pipeline] 已完成backward tensor收集，退出no_pipelining训练循环")
-                    break
-            except Exception as e:
-                print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
