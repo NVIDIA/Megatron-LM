@@ -4,8 +4,7 @@ import logging
 import warnings
 from typing import Any, Dict, Optional
 
-import torch
-import torch.distributed as dist
+import torch  # type: ignore[import-not-found]
 
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
@@ -72,14 +71,13 @@ class MimoModel(MegatronModule):
         if max_seq_len is None:
             max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
 
+        self.partition_adapter: Optional[PartitionAdapter] = None
         # Create partition adapter only if parallelism is enabled
         if language_config.context_parallel_size > 1 or language_config.sequence_parallel:
             partition_config = PartitionConfig.from_mp_config(
                 mp=language_config, max_seq_len=max_seq_len, kv_format=mimo_config.kv_format
             )
             self.partition_adapter = PartitionAdapter(partition_config)
-        else:
-            self.partition_adapter = None
 
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
@@ -96,10 +94,12 @@ class MimoModel(MegatronModule):
 
         Args:
             modality_embeddings: Dictionary mapping modality names to their embeddings.
-                For all modalities: tensor of shape (N, H). Shape: (num_tokens_for_modality, hidden_dim)
+                For all modalities: tensor of shape (N, H).
+                Shape: (num_tokens_for_modality, hidden_dim)
             input_ids: Input token IDs. Shape: (B, S) or (S,)
-                Contains special tokens that mark where each modality's embeddings should go. The number of special tokens
-                for each modality should exactly match the number of embeddings for that modality.
+                Contains special tokens that mark where each modality's embeddings should go.
+                The number of special tokens for each modality should exactly match the number
+                of embeddings for that modality.
             special_token_ids: Dictionary mapping modality names to their special token IDs
 
         Returns:
@@ -209,7 +209,8 @@ class MimoModel(MegatronModule):
                 Used to identify non-text tokens in the input_ids.
 
         Returns:
-            torch.Tensor: Embeddings for text tokens. Shape: (N, H), where N is the number of text tokens.
+            torch.Tensor: Embeddings for text tokens.
+            Shape: (N, H), where N is the number of text tokens.
         """
         text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
         for special_token_id in special_token_ids.values():
@@ -267,10 +268,12 @@ class MimoModel(MegatronModule):
                         "whisper_encoder": {"input_features": whisper_features}
                     }
                 }
-            packed_seq_params: Optional packed sequence parameters for context/sequence parallelism
-            special_token_ids: Optional dictionary mapping modality names to their special token IDs.
-                If provided, these will override the model's configured special_token_ids.
-            packing_kwargs: Optional dictionary of kwargs to construct PackedSeqParams if packed_seq_params is not provided.
+            packed_seq_params: Optional packed sequence parameters for context parallelism
+            special_token_ids: Optional dictionary mapping modality names to their
+                               special token IDs. If provided, these will override the
+                               model's configured special_token_ids.
+            packing_kwargs: Optional dictionary of kwargs to construct PackedSeqParams
+                            if packed_seq_params is not provided.
 
         Returns:
             tuple: Tuple containing model outputs and loss mask
@@ -343,7 +346,8 @@ class MimoModel(MegatronModule):
                     post=self.post_process,
                 )
             )
-            # After processing, combined_embeddings is [S, B, H], which is what the language model expects.
+            # After processing, combined_embeddings is [S, B, H],
+            # which is what the language model expects.
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
