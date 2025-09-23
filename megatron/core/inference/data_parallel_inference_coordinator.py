@@ -1,11 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from collections import deque
 from itertools import cycle, repeat
 from typing import List, Tuple
 
 import torch
-import logging
 
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest
