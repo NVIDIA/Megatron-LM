@@ -196,8 +196,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.chunk_size_tokens = chunk_size_tokens
@@ -214,8 +214,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.chunk_size_tokens
-                * num_attention_heads_per_partition
-                * hidden_size_per_attention_head
+                * self.num_attention_heads_per_partition
+                * self.hidden_size_per_attention_head
             )
 
         # Adjust buffer to be a multiple of chunk size.
@@ -341,6 +341,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Store the dummy chunk idx reference for convenience
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
 
+        # Allocate GPU state.
+        self.allocate_all_tensors(is_init=True)
+
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
 
@@ -399,7 +402,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             else nullcontext()
         )
         with ctx_manager:
-            if cache_mla_latent:
+            if self.cache_mla_latent:
                 self.memory_buffer = torch.full(
                     (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
                     -1,
@@ -411,10 +414,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         2,  # key and value
                         self.num_layers,
-                        chunk_count_total,
+                        self.chunk_allocator.chunk_count_total,
                         self.chunk_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
                     ),
                     -1,
                     dtype=self.params_dtype,

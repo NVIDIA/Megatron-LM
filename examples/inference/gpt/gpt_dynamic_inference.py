@@ -266,7 +266,6 @@ def run_inference(
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
         result = engine.step_modern(sampling_params, verbose=True)
-        step_id += 1
 
         # Test suspending and resuming engine.
         if engine.step_count % SUSPEND_RESUME_INTERVAL == 0:

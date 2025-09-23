@@ -117,6 +117,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
         self.termination_id = termination_id
         self.random_seed = random_seed
+        self.track_paused_request_events = track_paused_request_events
         self.unified_memory_level = unified_memory_level
         self.capture_stats = None
 
@@ -133,7 +134,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 controller.inference_wrapped_model.model.config.enable_cuda_graph
             )
 
-        self.track_paused_request_events = track_paused_request_events
+        # Initialize engine.
+        self.reset()
+
+        # Create cuda graphs.
+        self.create_cuda_graphs()
+
+    def reset(self) -> None:
+        """Reset by removing all requests and reset all state."""
+
+        self.context.reset()
+
         self.step_count = 0
         self.finished_request_count = 0
         self.waiting_request_ids = deque()
@@ -159,13 +170,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         # Capture cuda graph.
-        if enable_cuda_graph is not None:
-            self.enable_cuda_graph = enable_cuda_graph
-        else:
-            self.enable_cuda_graph = (
-                controller.inference_wrapped_model.model.config.enable_cuda_graph
-            )
-        self.capture_stats = None
         if self.enable_cuda_graph:
 
             time_start = time.time()
@@ -173,7 +177,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
+                % (
+                    len(context.cuda_graph_token_counts),
+                    context.cuda_graph_token_counts,
+                )
             )
             for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
                 # Iterate cuda graph dims.
@@ -539,13 +546,6 @@ class DynamicInferenceEngine(AbstractEngine):
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
-
-    def reset(self) -> None:
-        """Reset by removing all requests and reset all state."""
-        self.context.reset()
-        self.waiting_request_ids.clear()
-        self.step_count = 0
-        self.finished_request_count = 0
 
     def _add_request(
         self, request: DynamicInferenceRequest
