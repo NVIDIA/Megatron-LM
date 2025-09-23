@@ -12,6 +12,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
@@ -933,13 +934,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
-        request_satisfied = self.total_request_count < self.max_requests
-        token_satisfied = self.active_token_count + req.prompt_length <= self.max_tokens
+        request_can_be_added = self.total_request_count < self.max_requests
+        request_tokens_can_be_added = (
+            self.active_token_count + req.remaining_prompt_length <= self.max_tokens
+        )
         chunks = math.ceil(
-            (req.prompt_length + req.finished_chunk_token_count) / self.chunk_size_tokens
+            (req.remaining_prompt_length + req.finished_chunk_token_count) / self.chunk_size_tokens
         ) - math.ceil(req.finished_chunk_token_count / self.chunk_size_tokens)
         kv_cache_available = self.chunk_allocator.is_memory_available(chunks, safe=safe)
-        return request_satisfied, token_satisfied, kv_cache_available
+        return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
@@ -952,14 +955,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             None
         """
         if chunk_length is None:
-            chunk_length = req.prompt_length
+            chunk_length = req.remaining_prompt_length
+
+        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
+        is_chunked_prefill = req.finished_chunk_token_count > 0
 
         assert chunk_length > 0, "Chunk length is 0"
-        assert chunk_length <= req.prompt_length, "Chunk length is greater than prompt length"
+        assert (
+            chunk_length <= req.remaining_prompt_length
+        ), "Chunk length is greater than remaining prompt length"
         if self.active_token_count + chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
-        this_round_tokens = req.prompt_tokens[:chunk_length]
+        # Use the remaining prompt tokens for this chunk
+        this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
 
         # only allocate new chunks
         already_allocated_chunks = (
@@ -973,15 +982,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if num_chunks_needed > 0:
             new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(
-                num_chunks_needed, safe=True
+                num_chunks_needed, safe=not is_chunked_prefill
             )
             if new_chunk_ids is None or len(new_chunk_ids) != num_chunks_needed:
                 raise ChunkOverflowError(req.request_id)
 
-        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
-        # in this case, it is exactly the last request in the current system (see dynamic_engine.py, schedule_chunked_prefill invariants)
+        # when a request already starts chunked prefill, it is exactly the last request in the current system
+        # (see dynamic_engine.py, schedule_chunked_prefill invariants)
         # no need to update count, as it is already here
-        if req.finished_chunk_token_count > 0:
+        if is_chunked_prefill:
             current_id = self.total_request_count - 1
             self.active_token_count -= (
                 1  # Overwrite the last token, which is the useless token from chunked prefill
@@ -1059,25 +1068,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_id[dst_idxs] = self.request_last_kv_chunk_id[src_idxs]
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
 
-    def tensor_swap(self, x, src_idxs, dst_idxs):
-        """
-        Swap x[src_idxs] and x[dst_idxs]
-        """
-        x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
-
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
-        self.tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_ids, src_idxs, dst_idxs)
-        self.tensor_swap(next_tokens, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_to_kv_chunk_ids, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_kv_chunk_counts, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_last_kv_chunk_id, src_idxs, dst_idxs)
-        self.tensor_swap(self.request_last_kv_chunk_offset, src_idxs, dst_idxs)
+        tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
+        tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_ids, src_idxs, dst_idxs)
+        tensor_swap(next_tokens, src_idxs, dst_idxs)
+        tensor_swap(self.request_to_kv_chunk_ids, src_idxs, dst_idxs)
+        tensor_swap(self.request_kv_chunk_counts, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_kv_chunk_id, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_kv_chunk_offset, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:

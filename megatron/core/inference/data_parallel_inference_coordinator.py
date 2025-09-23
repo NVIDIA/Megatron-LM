@@ -149,6 +149,7 @@ class DataParallelInferenceCoordinator:
         generated_tokens: List[int],
         log_probs: List[int],
         chunked_prefill_request_id: int = -1,
+        materialize_only_last_token_logits: bool = True,
     ):
         """
         Processes replies from the engine, appending tokens and handling finished requests.
@@ -188,14 +189,33 @@ class DataParallelInferenceCoordinator:
                     if len(request_log_probs) > 1:
                         request.prompt_log_probs.extend(request_log_probs)
                     else:
-                        request.generated_log_probs.extend(request_log_probs)
+                        if (
+                            # If it is a chunked prefill request
+                            len(request.prompt_log_probs) > 0
+                            # And we are missing the last token for prefill
+                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
+                            # And we need to track full prefill
+                            and not materialize_only_last_token_logits
+                        ):
+                            assert (
+                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
+                            request.prompt_log_probs.extend(request_log_probs)
+                        else:
+                            request.generated_log_probs.extend(request_log_probs)
             else:
                 # This is the chunked prefill request, handle log probs but don't append tokens
                 if request_log_probs is not None:
-                    if not request.prompt_log_probs:
+                    if materialize_only_last_token_logits:
+                        # Here we discard intermediate log probs,
+                        # as we only materialize the last token log probs
                         request.prompt_log_probs = []
-                    request.prompt_log_probs.extend(request_log_probs)
-                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
+                    else:
+                        # Otherwise, we gather log probs for all tokens
+                        if not request.prompt_log_probs:
+                            request.prompt_log_probs = []
+                        request.prompt_log_probs.extend(request_log_probs)
                         request.generated_log_probs = []
 
         if finished_request_ids:
@@ -309,6 +329,7 @@ class DataParallelInferenceCoordinator:
                     generated_tokens,
                     logprobs,
                     chunked_prefill_request_id,
+                    materialize_only_last_token_logits,
                 ) = deserialized_payload[1:]
                 self.postprocess(
                     request_ids,
@@ -316,6 +337,7 @@ class DataParallelInferenceCoordinator:
                     generated_tokens,
                     logprobs,
                     chunked_prefill_request_id,
+                    materialize_only_last_token_logits,
                 )
 
     @classmethod

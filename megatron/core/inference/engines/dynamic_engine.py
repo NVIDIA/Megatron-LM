@@ -387,7 +387,8 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
             )
-        elif (
+
+        if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ):
@@ -501,7 +502,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     if len(request_log_probs) > 1:
                         request.prompt_log_probs.extend(request_log_probs)
                     else:
-                        request.generated_log_probs.extend(request_log_probs)
+                        if (
+                            # If it is a chunked prefill request
+                            len(request.prompt_log_probs) > 0
+                            # And we are missing the last token for prefill
+                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
+                            # And we need to track full prefill
+                            and not self.context.materialize_only_last_token_logits
+                        ):
+                            assert (
+                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
+                            request.prompt_log_probs.extend(request_log_probs)
+                        else:
+                            request.generated_log_probs.extend(request_log_probs)
 
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
@@ -521,9 +535,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 # However, the log probs are still needed.
                 if request_log_probs is not None:
-                    request.prompt_log_probs.extend(request_log_probs)
-                    request.generated_log_probs = []
-                active_requests.append(request)
+                    if self.context.materialize_only_last_token_logits:
+                        # Here we discard intermediate log probs
+                        # as we only materialize the last token log probs
+                        request.prompt_log_probs = []
+                        request.generated_log_probs = []
+                    else:
+                        # Otherwise, we gather log probs for all tokens
+                        if not request.prompt_log_probs:
+                            request.prompt_log_probs = []
+                        request.prompt_log_probs.extend(request_log_probs)
+                        request.generated_log_probs = []
+                    active_requests.append(request)
 
         return active_requests, finished_requests
 
@@ -540,15 +563,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         while self.waiting_request_ids:
             req = self.requests[self.waiting_request_ids[0]]
-            request_satisfied, token_satisfied, kv_cache_available = (
+            request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req, safe=True)
             )
-            if request_satisfied and token_satisfied and kv_cache_available:
+            if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     asyncio.create_task, self._notify_cond_for_new_request()
                 )
-
+                req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add()
                 self.waiting_request_ids.popleft()
             else:
@@ -567,53 +590,53 @@ class DynamicInferenceEngine(AbstractEngine):
             - For each request, finished_chunk_token_count is the number of tokens
                 that have been prefilled for this request, non-zero means
                 it is during a chunked prefill
-            - For each request, prompt_tokens is the ** unprefilled ** prompt tokens,
-                having length of prompt_length - finished_chunk_token_count
+            - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
-        while self.waiting_request_ids:
-
+        can_schedule = True
+        while self.waiting_request_ids and can_schedule:
+            can_schedule = False
             req = self.requests[self.waiting_request_ids[0]]
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
 
-            token_fully_satisfied = (
-                self.context.active_token_count + req.prompt_length <= self.context.max_tokens
+            # Use remaining prompt tokens for scheduling decisions
+            remaining_len = len(req.remaining_prompt_tokens)
+            token_fully_can_be_added = (
+                self.context.active_token_count + remaining_len <= self.context.max_tokens
             )
-            token_partially_satisfied = self.context.active_token_count < self.context.max_tokens
-            request_satisfied, _, kv_cache_available = self.context.check_availability(
+            token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
+            request_can_be_added, _, kv_cache_available = self.context.check_availability(
                 req, safe=not is_continuing_chunked_prefill
             )
-            request_satisfied = is_continuing_chunked_prefill or request_satisfied
+            request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
-            if request_satisfied and kv_cache_available:
-                if token_fully_satisfied:
+            if request_can_be_added and kv_cache_available:
+                if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         asyncio.create_task, self._notify_cond_for_new_request()
                     )
+                    req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
-                elif token_partially_satisfied:
+                    # Only this case we keep checking the rest of the waiting queue
+                    can_schedule = True
+                elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         asyncio.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
-                    req.prompt_tokens = req.prompt_tokens[chunk_length:]
+                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                     req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
-                    # chunked prefill request at the head of the waiting pool
+                    # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
-                    break
-                else:
-                    break
-            else:
-                break
 
     async def async_step(
         self,
@@ -650,6 +673,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Generate tokens.
         is_decode_only = self.context.is_decode_only()
+        # save the is_decode_only AFTER scheduling, BEFORE update
+        self.is_decode_only = is_decode_only
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch(
             sampling_params, self.termination_id
@@ -739,7 +764,7 @@ class DynamicInferenceEngine(AbstractEngine):
             print(output_str)
 
         self.step_count += 1
-        self.is_decode_only = is_decode_only
+
         range_pop()
         return {
             "active_requests": active_requests,
@@ -950,6 +975,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     request_ids, finished_request_ids, sample, logprobs = engine_output
                     # Include chunked prefill request id, use -1 if None
                     chunked_prefill_id = self.context.chunked_prefill_request_id
+                    materialize_only_last_token_logits = (
+                        self.context.materialize_only_last_token_logits
+                    )
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
@@ -958,6 +986,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             sample.tolist(),
                             logprobs,
                             chunked_prefill_id,
+                            materialize_only_last_token_logits,
                         ],
                         use_bin_type=True,
                     )

@@ -6,9 +6,8 @@ import random
 import time
 import torch
 from argparse import ArgumentParser, Namespace
-from typing import Any
-import itertools
 from tqdm import tqdm
+from typing import Any, List, Optional
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext

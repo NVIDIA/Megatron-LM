@@ -132,15 +132,20 @@ class DynamicInferenceRequest(InferenceRequest):
     generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     finished_chunk_token_count = 0
 
+    def __post_init__(self):
+        if self.prompt_tokens is not None:
+            self.remaining_prompt_tokens = self.prompt_tokens.clone()
+
     @property
-    def prompt_length(self):
+    def remaining_prompt_length(self):
         """
-        Get the length of the prompt tokens.
+        Get the length of the remaining prompt tokens.
         """
-        return len(self.prompt_tokens)
+        return len(self.remaining_prompt_tokens)
 
     events: List[DynamicInferenceEvent] = field(default_factory=list)
 
