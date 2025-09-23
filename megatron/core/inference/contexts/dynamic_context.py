@@ -12,7 +12,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
-from megatron.core.inference.unified_memory import unified_memory_mempool
+from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
@@ -219,15 +219,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Adjust buffer to be a multiple of chunk size.
-        self.buffer_size_bytes = int(buffer_size_gb * 1024**3)
-        self.buffer_size_bytes_rem = buffer_size_bytes % self.chunk_size_bytes
-        self.buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
-
-        # Calculate the total number of chunks available in the buffer
-        self.chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
-
-        # Chunk ids.
-        self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
+        buffer_size_bytes = int(buffer_size_gb * 1024**3)
+        buffer_size_bytes_rem = buffer_size_bytes % self.chunk_size_bytes
+        buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
 
         # Compute max_requets, max_tokens from buffer size and overflow factor.
         def bytes_to_max_requests_and_tokens(n_bytes):
@@ -259,12 +253,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
         self.unified_memory_level = unified_memory_level
-        if unified_memory_level > 0 and unified_memory_mempool is None:
-            if torch.distributed.get_rank() == 0:
+        if unified_memory_level > 0:
+            if not has_unified_memory and torch.distributed.get_rank() == 0:
                 warnings.warn(
                     "Unified memory requested but not available; defaulting to GPU memory."
                 )
-            self.unified_memory_level = 0
+                self.unified_memory_level = 0
+            else:
+                self.unified_memory_mempool = create_unified_mempool()
 
         self.total_request_count = 0
         self.active_token_count = 0
@@ -272,6 +268,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = None
         self.padded_active_request_count = None
         self.paused_tokens = None
+
+        # Calculate the total number of chunks available in the buffer
+        chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
+
+        # Chunk ids.
+        self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
 
         # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
         self.cuda_graph_token_counts = None
@@ -339,9 +341,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Store the dummy chunk idx reference for convenience
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
 
-        # Allocate GPU state.
-        self.allocate_all_tensors(is_init=True)
-
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
 
@@ -395,7 +394,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Memory buffer.
         ctx_manager = (
-            torch.cuda.use_mem_pool(unified_memory_mempool)
+            torch.cuda.use_mem_pool(self.unified_memory_mempool)
             if self.unified_memory_level > 0
             else nullcontext()
         )
@@ -427,7 +426,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # During these steps, the `*_cudagraph_only`
         # tensors are used, otherwise their same-name but un-suffixed
         # corresponding tensors are used.
-
         self.query_seq_lengths_cudagraph_only = torch.full(
             (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
