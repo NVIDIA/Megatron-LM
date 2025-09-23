@@ -120,6 +120,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     torch.distributed.broadcast(has_data, src, group=group)
 
     if has_data.item() == 0:
+        # iterator exhausted on all ranks
+        # we need this to avoid race condition when first tp rank hits StopIteration
         return None
 
     # MiMo forward pass expects 

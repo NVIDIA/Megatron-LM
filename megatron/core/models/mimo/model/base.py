@@ -122,6 +122,10 @@ class MimoModel(MegatronModule):
         dtype = reference_embeddings.dtype
         
         batch_size, seq_length = input_ids.size()
+        logger.debug(
+            f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
+        )
+
         combined_embeddings = torch.zeros(
             (batch_size, seq_length, hidden_dim), dtype=dtype, device=device
         )

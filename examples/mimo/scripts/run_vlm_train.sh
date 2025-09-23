@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=8
+GPUS_PER_NODE=2
 NUM_NODES=1
 DEBUG_MODE=false    # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678     # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
@@ -53,7 +53,6 @@ DISTRIBUTED_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
-    --context-parallel-size 2
 )
 
 TRAINING_ARGS=(
@@ -64,9 +63,9 @@ TRAINING_ARGS=(
     --adam-beta2 0.95 
     --lr 1e-2
     --lr-decay-style cosine 
-    --min-lr 2e-4
-    --lr-warmup-iters 100
-    --lr-decay-iters 1000 
+    --min-lr 2.0e-5
+    --lr-warmup-iters 150
+    --lr-decay-iters 2200 
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
     --model-provider llava_vlm
@@ -102,8 +101,8 @@ DATASET_ARGS=(
     --dataloader-type external
     --dataset-provider llava_vlm
     --data-path $DATASET_PATH
-    --packing-buffer-size 24
-    --total-seq-length 16384
+    #--packing-buffer-size 24
+    --total-seq-length 2048
 )
 
 # GPT Model args
