@@ -71,7 +71,45 @@ Before the model.forward() start, the `PipelineOffloadManager.get_instance().res
 
 ## A special case: attn_norm/mlp_norm
 
-# Performance (WIP)
+# Performance
+
+## H100
+### DeepSeek-V3-Proxy
+#### Model structure
+* Layer parameters are same as DeepSeek-V3 model
+* Layer number is cut off to 14 layers
+* Replace the fisrt 3 dense layers with 3 moe layers
+
+#### Key Hyper-parameters
+* TP1PP4EP16VPP1CP1-MBS1GBS512
+* bf16 training
+* DeepEP dispatcher
+* `--cross-entropy-loss-fusion` and `--cross-entropy-fusion-impl te`
+* `--moe-permute-fusion`
+* `--moe-router-fusion`
+* `--enable-experimental`
+
+#### Throughput and correctness
+
+#### Memory consumption
+
+Baseline (no offloading)
+```
+[Rank 0] (after 10 iterations) memory (MB) | allocated: 24761.02978515625 | max allocated: 65203.93359375 | reserved: 64438.0 | max reserved: 74306.0
+[Rank 16] (after 10 iterations) memory (MB) | allocated: 18907.728515625 | max allocated: 52228.1533203125 | reserved: 58770.0 | max reserved: 58770.0
+[Rank 32] (after 10 iterations) memory (MB) | allocated: 18907.7529296875 | max allocated: 45200.8349609375 | reserved: 51772.0 | max reserved: 51772.0
+[Rank 48] (after 10 iterations) memory (MB) | allocated: 29006.82275390625 | max allocated: 48166.263671875 | reserved: 56328.0 | max reserved: 56328.0
+```
+With offloading expert_fc1, moe_act, act_norm and mlp_norm
+```
+[Rank 0] (after 10 iterations) memory (MB) | allocated: 24705.02978515625 | max allocated: 48544.70849609375 | reserved: 61046.0 | max reserved: 61046.0
+[Rank 16] (after 10 iterations) memory (MB) | allocated: 18795.728515625 | max allocated: 38760.3876953125 | reserved: 46330.0 | max reserved: 46330.0
+[Rank 32] (after 10 iterations) memory (MB) | allocated: 18795.7529296875 | max allocated: 34950.2509765625 | reserved: 42452.0 | max reserved: 42452.0
+[Rank 48] (after 10 iterations) memory (MB) | allocated: 28950.82275390625 | max allocated: 41310.798828125 | reserved: 50408.0 | max reserved: 50408.0
+```
+
+
+## GB200
 
 # Acknowledgement
 

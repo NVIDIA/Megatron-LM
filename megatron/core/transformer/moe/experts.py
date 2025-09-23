@@ -828,6 +828,11 @@ class TEGroupedMLP(MegatronModule):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
+        
+        # This is to avoid the CPU overhead of multiple d2h copies
+        if self.offload_expert_fc1:
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+            set_save_original_input(self.linear_fc1)
 
         if self.config.fp8:
             assert HAVE_TE, "FP8 requires TE."
@@ -875,8 +880,8 @@ class TEGroupedMLP(MegatronModule):
 
         offload_context = contextlib.nullcontext()
         if self.offload_expert_fc1:
-                permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, name="expert_fc1")
-                offload_context = PipelineOffloadManager.get_instance()
+            permuted_local_hidden_states = group_prefetch_offload_start(permuted_local_hidden_states, name="expert_fc1")
+            offload_context = PipelineOffloadManager.get_instance()
         with offload_context:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert

@@ -525,7 +525,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         offload_context = contextlib.nullcontext()
-        if self.offload_attn_norm:
+        if self.offload_attn_norm and not isinstance(self.input_layernorm, IdentityOp):
             hidden_states = group_prefetch_offload_start(hidden_states, name="attn_norm")
             offload_context = PipelineOffloadManager.get_instance()
         # Optional Input Layer norm
@@ -578,7 +578,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attn_bda")
 
-        if self.offload_attn_norm:
+        if self.offload_attn_norm and not isinstance(self.input_layernorm, IdentityOp):
             hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
             offload_context = contextlib.nullcontext()
 
@@ -623,7 +623,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         offload_context = contextlib.nullcontext()
-        if self.offload_mlp_norm:
+        if self.offload_mlp_norm and not isinstance(self.pre_mlp_layernorm, IdentityOp):
             hidden_states = group_prefetch_offload_start(hidden_states, name="mlp_norm")
             offload_context = PipelineOffloadManager.get_instance()
         # Optional Layer norm post the cross-attention.
@@ -695,7 +695,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
-        if self.offload_mlp_norm:
+        if self.offload_mlp_norm and not isinstance(self.pre_mlp_layernorm, IdentityOp):
             hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
             offload_context = contextlib.nullcontext()
 

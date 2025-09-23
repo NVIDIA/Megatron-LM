@@ -263,13 +263,13 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
             for tensor_tag, state in self._tensor_tag_to_state.items():
                 group_id, _ = tensor_tag
                 if group_id == group_id_to_offload:
-                    print_rank(f"tensor_tag {tensor_tag}")
-                    print_rank(f"group_to_offload {group_to_offload}")
+                    # print_rank(f"tensor_tag {tensor_tag}")
+                    # print_rank(f"group_to_offload {group_to_offload}")
                     assert not isinstance(state, tuple)
                     tensor_on_device = state
                     # if offload, return the reference to cpu copy
-                    print_rank(f"tensor_need_offloading_checker {self.tensor_need_offloading_checker(tensor_on_device)}")
-                    print_rank(f"tensor_on_device {tensor_on_device.shape}")
+                    # print_rank(f"tensor_need_offloading_checker {self.tensor_need_offloading_checker(tensor_on_device)}")
+                    # print_rank(f"tensor_on_device {tensor_on_device.shape}")
                     if self.tensor_need_offloading_checker(tensor_on_device):
                         state = self.offload(tensor_on_device)
                         tensor_on_device.record_stream(self.d2h_stream)
