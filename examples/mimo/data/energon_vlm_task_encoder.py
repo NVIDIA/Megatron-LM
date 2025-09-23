@@ -125,7 +125,7 @@ class VLMTaskEncoder(
 ):
     def __init__(
         self,
-        model_type,
+        model_type: ModelType,
         processor,
         conversation_template_config: Optional[ConversationTemplateConfig] = None,
         max_seq_length: Optional[int] = None,
@@ -357,8 +357,6 @@ class VLMTaskEncoder(
         for k, v in inputs.items():
             inputs[k] = v.squeeze(0)
 
-        #if "pixel_values" in inputs:
-        #    inputs["images"] = inputs.pop("pixel_values")
 
         answers = sample.answers
         if answers:
@@ -401,37 +399,6 @@ class VLMTaskEncoder(
         for key in keys:
             values = [s[key] for s in samples if key in s and s[key] is not None]
 
-            # if key == "pixel_values":
-            #     if values[0].dim() == 3:
-            #         batched[key] = torch.stack(values, dim=0) # (B , C , H , W)
-            #     else:
-            #         # Concatenate already-batched image tensors along the batch dimension.
-            #         batched[key] = torch.cat(values, dim=0)  # (B , C , H , W)
-            # elif key in ("input_ids", "attention_mask", "loss_mask"):
-            #     pad_val = 0
-            #     if is_packed_sample:
-            #         batched[key] = rnn_utils.pad_sequence(values, batch_first=True, padding_value=pad_val)
-            #     else:
-            #         batched[key] = self._pad_and_stack(values, self.group_size, pad_val)
-            # elif key == "labels":
-            #     pad_val = -100
-            #     if is_packed_sample:
-            #         batched[key] = rnn_utils.pad_sequence(values, batch_first=True, padding_value=pad_val)
-            #     else:
-            #         batched[key] = self._pad_and_stack(values, self.group_size, pad_val)
-            # elif key == "packing_kwargs":
-            #     # Only keep if all are the same, or just take the first (if only one packed sample per batch)
-            #     if len(values) == 1:
-            #         batched[key] = values[0]
-            #     else:
-            #         # Optionally, check if all are the same, or raise an error
-            #         raise ValueError("Multiple packing_kwargs found in batch; expected only one per batch.")
-            # else:
-            #     # Generic stacking for other tensor fields
-            #     if isinstance(values[0], torch.Tensor):
-            #         batched[key] = torch.stack(values, dim=0)
-            #     else:
-            #         batched[key] = values
             processor = KEY_PROCESSORS.get(key)
             if processor is not None:
                batched[key] = processor(values, max_len=self.group_size, is_packed_sample=is_packed_sample) 
@@ -586,7 +553,7 @@ if __name__ == "__main__":
             shuffle_buffer_size=None,
             max_samples_per_sequence=None,
             task_encoder=VLMTaskEncoder(
-                model_name="llava_vlm",
+                model_type=ModelType.LLAVA_VLM,
                 processor=processor,
                 conversation_template_config=LlavaConversationTemplateConfig(),
                 max_seq_length=max_seq_length,  # Use calculated max_seq_length

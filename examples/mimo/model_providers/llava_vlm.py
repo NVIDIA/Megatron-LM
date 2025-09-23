@@ -75,7 +75,7 @@ def model_provider_llava_vlm(
             current_kv_format = "thd"
 
     except (ModuleNotFoundError, AssertionError):
-        _args = None # Args not available (e.g. not in Megatron training context)
+        pass # Args not available (e.g. not in Megatron training context)
 
     # HF encoder
     vision_encoder = ModuleSpec(
