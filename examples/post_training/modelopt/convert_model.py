@@ -165,7 +165,6 @@ if __name__ == "__main__":
 
         # Add mask tokens for parallel draft
         if unwrapped_model.eagle_config.parallel_draft_step > 1:
-            assert unwrapped_model.eagle_config.parallel_draft_step <= 4, "Parallel draft only supports steps less than or equal to 4."
             tokenizer = get_tokenizer()
             for i in range(unwrapped_model.eagle_config.parallel_draft_step - 1):
                 mask_token = "[MASK_{}]".format(i)
