@@ -618,9 +618,7 @@ def forward_backward_no_pipelining(
                     if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
                         # 在no-pipelining模式下，第一个microbatch就收集tensor
                         tensor_saver.mark_warmup_collection()
-                    if tensor_saver.should_exit_after_forward():
-                        print(f"[Pipeline] 已完成tensor收集，退出no_pipelining训练循环")
-                        break
+                    # 不再在forward后退出，等待backward完成
                 except Exception as e:
                     print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
                 
@@ -660,6 +658,16 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            
+            # 检查是否应该在backward完成后退出
+            try:
+                from megatron.core.tensor_saver import get_tensor_saver
+                tensor_saver = get_tensor_saver()
+                if tensor_saver.should_exit_after_backward():
+                    print(f"[Pipeline] 已完成backward tensor收集，退出no_pipelining训练循环")
+                    break
+            except Exception as e:
+                print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for

@@ -292,13 +292,18 @@ class TensorSaver:
     
     def should_exit_after_forward(self) -> bool:
         """检查是否应该在forward后退出"""
+        # 在forward后不立即退出，等待backward完成后再退出
+        return False
+    
+    def should_exit_after_backward(self) -> bool:
+        """检查是否应该在backward后退出"""
         # 只有在启用tensor保存且已完成收集时才退出
         return self.enabled and self.collection_completed
     
     def should_collect_tensor(self) -> bool:
         """检查是否应该收集tensor"""
-        # 只有在启用tensor保存且未在warmup阶段收集过时才收集
-        return self.enabled and not self.tensor_collected_in_warmup
+        # 只有在启用tensor保存且未完成收集时才收集（包括forward和backward）
+        return self.enabled and not self.collection_completed
     
     def mark_warmup_collection(self):
         """标记已在warmup阶段收集过tensor"""
