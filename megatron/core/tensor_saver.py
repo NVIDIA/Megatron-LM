@@ -477,8 +477,7 @@ class TensorSaver:
         # 自动获取rank信息（如果未提供）
         if rank is None:
             rank = get_current_rank()
-            if rank not in [0, 1]:
-                return None
+            
         
         # 如果仍然无法获取rank，尝试从tensor设备信息推断
         if rank is None:
@@ -494,6 +493,9 @@ class TensorSaver:
             rank = 0  # 默认rank为0
             print(f"[TensorSaver] 警告: 无法获取rank信息，使用默认值 {rank}")
         
+        # 如果rank不是0或1，则不保存
+        if rank not in [0, 1]:
+            return None
         # 获取tensor组索引（同一层的不同tensor使用相同索引）
         index_manager = get_tensor_index_manager()
         tensor_group_idx = index_manager.get_tensor_index(layer_type, layer_idx, operation)
