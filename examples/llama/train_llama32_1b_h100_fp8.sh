@@ -111,9 +111,9 @@ MODEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-samples 47340000
-    --lr-decay-samples 47245280
-    --lr-warmup-samples 94720
+    --train-iters 369844  # 47340000 / 128 (global_batch_size) = 369844 iterations
+    --lr-decay-iters 369103  # 47245280 / 128 = 369103 iterations  
+    --lr-warmup-iters 740  # 94720 / 128 = 740 iterations
     --lr 0.00015
     --min-lr 0.00001
     --decoupled-lr 5.0e-4      # Specific to decoupled AdamW, ensure optimizer is compatible
