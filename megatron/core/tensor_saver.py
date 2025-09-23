@@ -472,6 +472,8 @@ class TensorSaver:
         # 自动获取rank信息（如果未提供）
         if rank is None:
             rank = get_current_rank()
+            if rank not in [0, 1]:
+                return None
         
         # 如果仍然无法获取rank，尝试从tensor设备信息推断
         if rank is None:
