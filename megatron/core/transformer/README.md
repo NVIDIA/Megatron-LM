@@ -91,6 +91,10 @@ Before the model.forward() start, the `PipelineOffloadManager.get_instance().res
 
 #### Throughput and correctness
 
+<img width="1245" height="845" alt="image" src="https://github.com/user-attachments/assets/51e8e0d1-b03a-4723-a90e-4cbd5c661550" />
+<img width="1291" height="832" alt="image" src="https://github.com/user-attachments/assets/73eb5c86-bd69-4dcd-a477-b0194225aa1e" />
+
+
 #### Memory consumption
 
 Baseline (no offloading)
