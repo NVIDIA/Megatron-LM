@@ -350,7 +350,7 @@ class HIFPBAddBmm(Function):
         ctx.metadata = metadata
         
         # 使用集成了tensor保存的HIFPMatMul
-        mm_out = HIFPMatMul.apply(batch1, batch2, elem_format='fp8_e5m2', block_size=32,
+        mm_out = HIFPMatMul.apply(batch1, batch2, 'fp8_e5m2', 32,
                                   layer_type, layer_idx, operation, phase, component, rank, metadata)
         output = beta * input + alpha * mm_out
         
