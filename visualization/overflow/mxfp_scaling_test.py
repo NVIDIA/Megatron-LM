@@ -922,7 +922,7 @@ def process_single_tensor(input_path, args, logger=None):
     if args.output_dir is None:
         # Generate output directory based on tensor name
         tensor_name = input_path.stem  # Get filename without extension
-        output_dir = Path(f"./draw/scaling_analysis/{args.elem-format}/{tensor_name}")
+        output_dir = Path(f"./draw/scaling_analysis/{args.elem-format}{args.elem-format}/{tensor_name}")
     else:
         output_dir = Path(args.output_dir)
     
@@ -1021,7 +1021,7 @@ def main():
     parser = argparse.ArgumentParser(description='Test different scaling strategies for MXFP quantization')
     parser.add_argument('input_tensors', nargs='+', help='Path(s) to input BF16 tensor file(s) (.pt)')
     parser.add_argument('--output-dir', default=None, 
-                        help='Output directory for results (default: ./draw/scaling_analysis/{args.elem-format}/{tensor_name}/)')
+                        help='Output directory for results (default: ./draw/scaling_analysis/{args.elem-format}{args.elem-format}/{tensor_name}/)')
     parser.add_argument('--elem-format', default='fp8_e4m3', 
                         choices=['fp8_e4m3', 'fp8_e5m2', 'fp4_e2m1', 'fp6_e3m2', 'fp6_e2m3'],
                         help='Element format for quantization (default: fp8_e4m3)')
