@@ -2194,7 +2194,6 @@ def forward_backward_pipelining_without_interleaving(
                 tensor_saver.mark_warmup_collection()
                 # 注意：这里不立即标记collection_completed，让tensor实际保存后再标记
                 print(f"[Pipeline] 已在warmup阶段开始收集tensor，继续运行以完成收集")
-            else:
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
@@ -2250,7 +2249,6 @@ def forward_backward_pipelining_without_interleaving(
             if tensor_saver.should_exit_after_forward():
                 print(f"[Pipeline] Tensor收集已完成，退出训练循环")
                 break
-            else:
         except Exception as e:
             print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
 
