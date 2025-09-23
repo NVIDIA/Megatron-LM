@@ -125,24 +125,7 @@ class DotProductAttention(MegatronModule):
         )
         assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
-        # 保存forward输入tensor (pre-FA)
-        from megatron.core.tensor_saver import save_attention_tensors
-        import os
-        custom_quant_type = 'hifp8'
-        save_attention_tensors(
-            query=query,
-            key=key, 
-            value=value,
-            quant_type=custom_quant_type,
-            operation="forward",
-            layer_idx=getattr(self, 'layer_number', None),
-            phase="pre",
-            component="FA",
-            metadata={
-                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
-                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
-            }
-        )
+        # attention输入tensor现在通过量化算子自动保存，无需重复保存
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]

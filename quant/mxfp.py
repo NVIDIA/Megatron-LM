@@ -606,13 +606,23 @@ class MXFPMatMul(Function):
             try:
                 from megatron.core.tensor_saver import save_tensor
                 
+                # 根据component类型确定tensor名称
+                if component == "FA" or component == "attention":
+                    # attention操作：A是attention_probs，B是value
+                    tensor_name_A = "attention_probs"
+                    tensor_name_B = "value"
+                else:
+                    # linear操作：使用通用名称
+                    tensor_name_A = "input_A"
+                    tensor_name_B = "input_B"
+                
                 # 保存输入tensor A
                 save_tensor(
                     tensor=A,
                     layer_type=layer_type,
                     operation=operation,
                     quant_type=f"mxfp_{elem_format}",
-                    tensor_name="input_A",
+                    tensor_name=tensor_name_A,
                     layer_idx=layer_idx,
                     phase=phase,
                     component=component,
@@ -626,7 +636,7 @@ class MXFPMatMul(Function):
                     layer_type=layer_type,
                     operation=operation,
                     quant_type=f"mxfp_{elem_format}",
-                    tensor_name="input_B",
+                    tensor_name=tensor_name_B,
                     layer_idx=layer_idx,
                     phase=phase,
                     component=component,
@@ -713,6 +723,16 @@ class MXFPMatMul(Function):
                     metadata=ctx._metadata
                 )
                 
+                # 根据component类型确定backward tensor名称
+                if ctx.component == "FA" or ctx.component == "attention":
+                    # attention操作：grad_A是grad_attention_probs，grad_B是grad_value
+                    grad_tensor_name_A = "grad_attention_probs"
+                    grad_tensor_name_B = "grad_value"
+                else:
+                    # linear操作：使用通用名称
+                    grad_tensor_name_A = "grad_input_A"
+                    grad_tensor_name_B = "grad_input_B"
+                
                 # 保存梯度A
                 if grad_A is not None:
                     save_tensor(
@@ -720,7 +740,7 @@ class MXFPMatMul(Function):
                         layer_type=ctx.layer_type,
                         operation="backward",
                         quant_type=f"mxfp_{ctx.elem_format}",
-                        tensor_name="grad_input_A",
+                        tensor_name=grad_tensor_name_A,
                         layer_idx=ctx.layer_idx,
                         phase="post",
                         component=ctx.component,
@@ -735,7 +755,7 @@ class MXFPMatMul(Function):
                         layer_type=ctx.layer_type,
                         operation="backward",
                         quant_type=f"mxfp_{ctx.elem_format}",
-                        tensor_name="grad_input_B",
+                        tensor_name=grad_tensor_name_B,
                         layer_idx=ctx.layer_idx,
                         phase="post",
                         component=ctx.component,
@@ -778,13 +798,53 @@ class MXFPBAddBmm(Function):
             try:
                 from megatron.core.tensor_saver import save_tensor
                 
+                # 根据component类型确定tensor名称
+                if component == "FA" or component == "attention":
+                    # attention操作：input是matmul_input_buffer，batch1是query，batch2是key
+                    tensor_name_input = "matmul_input_buffer"
+                    tensor_name_batch1 = "query"
+                    tensor_name_batch2 = "key"
+                else:
+                    # 其他操作：使用通用名称
+                    tensor_name_input = "input"
+                    tensor_name_batch1 = "batch1"
+                    tensor_name_batch2 = "batch2"
+                
                 # 保存输入tensor
                 save_tensor(
                     tensor=input,
                     layer_type=layer_type,
                     operation=operation,
                     quant_type="mxfp",
-                    tensor_name="input",
+                    tensor_name=tensor_name_input,
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存batch1 tensor
+                save_tensor(
+                    tensor=batch1,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="mxfp",
+                    tensor_name=tensor_name_batch1,
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存batch2 tensor
+                save_tensor(
+                    tensor=batch2,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="mxfp",
+                    tensor_name=tensor_name_batch2,
                     layer_idx=layer_idx,
                     phase=phase,
                     component=component,
@@ -845,6 +905,18 @@ class MXFPBAddBmm(Function):
                     metadata=ctx._metadata
                 )
                 
+                # 根据component类型确定backward tensor名称
+                if ctx.component == "FA" or ctx.component == "attention":
+                    # attention操作：grad_input是grad_matmul_input_buffer，grad_batch1是grad_query，grad_batch2是grad_key
+                    grad_tensor_name_input = "grad_matmul_input_buffer"
+                    grad_tensor_name_batch1 = "grad_query"
+                    grad_tensor_name_batch2 = "grad_key"
+                else:
+                    # 其他操作：使用通用名称
+                    grad_tensor_name_input = "grad_input"
+                    grad_tensor_name_batch1 = "grad_batch1"
+                    grad_tensor_name_batch2 = "grad_batch2"
+                
                 # 保存梯度input
                 if grad_input is not None:
                     save_tensor(
@@ -852,7 +924,7 @@ class MXFPBAddBmm(Function):
                         layer_type=ctx.layer_type,
                         operation="backward",
                         quant_type="mxfp",
-                        tensor_name="grad_input",
+                        tensor_name=grad_tensor_name_input,
                         layer_idx=ctx.layer_idx,
                         phase="post",
                         component=ctx.component,
@@ -867,7 +939,7 @@ class MXFPBAddBmm(Function):
                         layer_type=ctx.layer_type,
                         operation="backward",
                         quant_type="mxfp",
-                        tensor_name="grad_batch1",
+                        tensor_name=grad_tensor_name_batch1,
                         layer_idx=ctx.layer_idx,
                         phase="post",
                         component=ctx.component,
@@ -882,7 +954,7 @@ class MXFPBAddBmm(Function):
                         layer_type=ctx.layer_type,
                         operation="backward",
                         quant_type="mxfp",
-                        tensor_name="grad_batch2",
+                        tensor_name=grad_tensor_name_batch2,
                         layer_idx=ctx.layer_idx,
                         phase="post",
                         component=ctx.component,
