@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -109,6 +110,18 @@ class GPTDataset(MegatronDataset):
             self._pad_token_id = self.config.tokenizer.pad
         except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
+
+        try:
+            _eos_id = self.config.tokenizer.eos_id
+        except Exception:
+            _eos_id = None
+
+        if self._pad_token_id == _eos_id:
+            warnings.warn(
+                "The provided tokenizer uses the same token id for the pad and eos tokens. "
+                "This may cause instability and lack of covergence during training. "
+                "Please provide a tokenizer with separate token ids for the pad and eos tokens."
+            )
 
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()
