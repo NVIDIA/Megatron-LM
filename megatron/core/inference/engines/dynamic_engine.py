@@ -222,7 +222,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 ),
             }
             logging.info(
-                "> built cuda graph(s) in %.2f sec, with total memory usage: allocated %s, reserved %s.",
+                "> built cuda graph(s) in %.2f sec, with total memory usage: "
+                "allocated %s, reserved %s.",
                 capture_stats["time"],
                 format_mem_bytes(capture_stats["allocated_bytes"]),
                 format_mem_bytes(capture_stats["reserved_bytes"]),
