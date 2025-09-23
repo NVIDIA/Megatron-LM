@@ -797,7 +797,16 @@ def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwarg
     # 如果有tensor保存参数，使用集成算子
     if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
                                  ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
-        return MXFPMatMul.apply(A, B, elem_format, block_size, **tensor_save_kwargs)
+        return MXFPMatMul.apply(
+            A, B, elem_format, block_size,
+            tensor_save_kwargs.get('layer_type'),
+            tensor_save_kwargs.get('layer_idx'),
+            tensor_save_kwargs.get('operation', 'forward'),
+            tensor_save_kwargs.get('phase', 'pre'),
+            tensor_save_kwargs.get('component', 'linear'),
+            tensor_save_kwargs.get('rank'),
+            tensor_save_kwargs.get('metadata')
+        )
     else:
         # 否则使用原始调用方式
         return MXFPMatMul.apply(A, B, elem_format, block_size)

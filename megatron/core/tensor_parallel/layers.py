@@ -858,13 +858,25 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         elif custom_quant_type == 'bf16':
             output = BF16MatMul.apply(
                 total_input, weight.t(),
-                **tensor_save_params
+                tensor_save_params["layer_type"],
+                tensor_save_params["layer_idx"],
+                tensor_save_params["operation"],
+                tensor_save_params["phase"],
+                tensor_save_params["component"],
+                tensor_save_params["rank"],
+                tensor_save_params["metadata"]
             )
         else:
             # 对于其他类型，使用BF16算子
             output = BF16MatMul.apply(
                 total_input, weight.t(),
-                **tensor_save_params
+                tensor_save_params["layer_type"],
+                tensor_save_params["layer_idx"],
+                tensor_save_params["operation"],
+                tensor_save_params["phase"],
+                tensor_save_params["component"],
+                tensor_save_params["rank"],
+                tensor_save_params["metadata"]
             ) 
         if bias is not None:
             output = output + bias
@@ -1062,7 +1074,13 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             from quant.bf16_operators import BF16MatMul
             grad_weight = BF16MatMul.apply(
                 grad_output.t(), total_input,
-                **tensor_save_params
+                tensor_save_params["layer_type"],
+                tensor_save_params["layer_idx"],
+                tensor_save_params["operation"],
+                tensor_save_params["phase"],
+                tensor_save_params["component"],
+                tensor_save_params["rank"],
+                tensor_save_params["metadata"]
             )
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
