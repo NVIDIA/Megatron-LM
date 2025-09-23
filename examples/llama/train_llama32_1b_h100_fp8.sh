@@ -114,7 +114,7 @@ TRAINING_ARGS=(
     --train-iters 369844  # 47340000 / 128 (global_batch_size) = 369844 iterations
     --lr-decay-iters 369103  # 47245280 / 128 = 369103 iterations
     --lr-warmup-iters 740  # 94720 / 128 = 740 iterations
-    --use-checkpoint-opt-param-scheduler  # Use optimizer parameters from checkpoint
+    --use-checkpoint-opt_param-scheduler  # Use optimizer parameters from checkpoint
     --lr 0.00015
     --min-lr 0.00001
     --decoupled-lr 5.0e-4      # Specific to decoupled AdamW, ensure optimizer is compatible
