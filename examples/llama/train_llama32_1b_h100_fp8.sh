@@ -203,9 +203,16 @@ EVAL_AND_LOGGING_ARGS=(
     --ckpt-format torch_dist 
     --distributed-timeout-minutes 120
     --save "$CHECKPOINT_PATH"
-    --load "$CHECKPOINT_PATH" 
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
 )
+
+# Only load checkpoint if it exists
+if [ -d "$CHECKPOINT_PATH" ] || [ -f "${CHECKPOINT_PATH}_iter_*.pt" ] 2>/dev/null; then
+    EVAL_AND_LOGGING_ARGS+=(--load "$CHECKPOINT_PATH")
+    echo "Loading existing checkpoint from: $CHECKPOINT_PATH"
+else
+    echo "Starting fresh training (no checkpoint found at: $CHECKPOINT_PATH)"
+fi
 
 # Ensure pretrain_gpt.py is found
 if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
