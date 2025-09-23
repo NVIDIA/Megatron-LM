@@ -104,7 +104,7 @@ def simple_speculative_generate(
     input_ids: torch.Tensor,
     images: Optional[torch.Tensor] = None,
     osl: int = 32,
-    draft_length: int = 0,
+    steps: int = 0,
     eos_token_id: List[int] = [],
     disable_tqdm: bool = False,
 ):
@@ -127,7 +127,7 @@ def simple_speculative_generate(
 
         # Speculative decoding forward
         # NOTE: PP is not yet supported.
-        new_token, draft_tokens = model.pseudo_speculative_generate(input_ids, steps=draft_length)
+        new_token, draft_tokens = model.pseudo_speculative_generate(input_ids, steps=steps)
 
         # Always accept the first token.
         input_ids = output_ids[:, : offset]
