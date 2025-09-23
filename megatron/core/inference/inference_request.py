@@ -138,7 +138,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
     def __post_init__(self):
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = self.prompt_tokens.clone()
+            self.remaining_prompt_tokens = torch.tensor(self.prompt_tokens)
 
     @property
     def remaining_prompt_length(self):
