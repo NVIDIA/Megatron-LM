@@ -728,7 +728,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
                 )
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
-    return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+    return CustomLinearWithGradAccumulationAndAsyncCommunication.apply(*args)
 
 
 linear_with_grad_accumulation_and_async_allreduce.warned = False
