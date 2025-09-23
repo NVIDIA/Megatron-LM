@@ -426,6 +426,14 @@ class MegatronFSDP(torch.nn.Module):
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 ag_pipeline.wait_bucket_ready(bucket_id)
 
+        for param in params:
+            # This setting is needed to make FSDP store the weight object when used
+            # with TE's activation offloading for the first global batch.
+            param.grad_added_to_main_grad = False
+            # This setting is needed to have this attribute present after every
+            # un-shard of the FSDP params.
+            param.__fsdp_param__ = True
+
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
 
