@@ -535,7 +535,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             else nullcontext()
         )
         with ctx_manager:
-            if cache_mla_latent:
+            if self.cache_mla_latent:
                 self.memory_buffer = torch.full(
                     (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
                     -1,
@@ -547,10 +547,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         2,  # key and value
                         self.num_layers,
-                        chunk_count_total,
+                        self.chunk_allocator.chunk_count_total,
                         self.chunk_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
                     ),
                     -1,
                     dtype=self.params_dtype,
