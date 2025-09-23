@@ -15,7 +15,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    attention_mask_func,
+    is_layer_window_attention,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.utils import divide
 
 
@@ -54,10 +58,6 @@ class DotProductAttention(MegatronModule):
             self.config.context_parallel_size == 1
         ), "Context parallelism is only supported by TEDotProductAttention!"
 
-        assert (
-            self.config.window_size is None
-        ), "Sliding Window Attention is only supported by TEDotProductAttention!"
-
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type  # unused for now
@@ -88,6 +88,13 @@ class DotProductAttention(MegatronModule):
             coeff = self.layer_number
             self.softmax_scale /= coeff
 
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, layer_number
+        ):
+            window_size = self.config.window_size
+        else:
+            window_size = None
+
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
             input_in_bf16=self.config.bf16,
@@ -96,6 +103,7 @@ class DotProductAttention(MegatronModule):
             mask_func=attention_mask_func,
             softmax_in_fp32=self.config.attention_softmax_in_fp32,
             scale=coeff,
+            window_size=window_size,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate

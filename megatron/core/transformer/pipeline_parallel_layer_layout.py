@@ -1,14 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import logging
 import re
 from functools import lru_cache
 from typing import Optional
 
-import torch
-
 from megatron.core import parallel_state
 from megatron.core.transformer.enums import LayerType
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineParallelLayerLayout:
@@ -247,10 +248,13 @@ class PipelineParallelLayerLayout:
         """Parse the pipeline model parallel layout from a string."""
         parsed_layout = PipelineParallelLayerLayout(layout, pipeline_model_parallel_size)
         # Pretty print the layout distribution.
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"Parse pipeline model parallel layout {layout} to:\n" + parsed_layout.pretty_repr()
-            )
+        from megatron.core.utils import log_single_rank
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Parse pipeline model parallel layout {layout} to:\n" + parsed_layout.pretty_repr(),
+        )
         return parsed_layout
 
     @staticmethod

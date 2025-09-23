@@ -150,22 +150,8 @@ class TestSpecCustomization:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            window_size=[10, 0],
+            window_size=(10, 0),
         )
-        # Make sure DotProductAttention throws (swa unsupported).
-        threw = False
-        try:
-            attn = DotProductAttention(
-                config,
-                layer_number=1,
-                attn_mask_type=AttnMaskType.causal,
-                attention_type='self',
-                pg_collection=self.pg_collection,
-            )
-        except:
-            threw = True
-        finally:
-            assert threw, 'Expected DotProductAttention to throw exception for SWA'
 
         # Test TEDotProductAttention
         attn = TEDotProductAttention(

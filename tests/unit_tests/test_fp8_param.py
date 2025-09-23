@@ -68,7 +68,7 @@ class TestFP8Param:
         )
 
     def create_test_args(
-        self, tp, recipe, sequence_length, micro_batch_size, inference=False, **kwargs
+        self, tp, recipe, sequence_length, micro_batch_size, inference, fp8_param_gather, **kwargs
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -95,10 +95,11 @@ class TestFP8Param:
         args.use_distributed_optimizer = not inference
         args.fp8 = "e4m3"
         args.fp8_recipe = recipe
-        args.fp8_param_gather = True
+        args.fp8_param_gather = fp8_param_gather
+        args.ddp_bucket_size = 1024  # Create more buckets to test the rs/ag overlap.
 
         # MXFP8 test settings
-        if recipe == "mxfp8":
+        if recipe == "mxfp8" and fp8_param_gather:
             args.reuse_grad_buf_for_mxfp8_param_ag = True
 
         for key, value in kwargs.items():
@@ -120,10 +121,18 @@ class TestFP8Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _run_test_helper(self, tp_size, recipe, inference: bool = False, **kwargs):
+    def _run_test_helper(
+        self, tp_size, recipe, inference: bool = False, fp8_param_gather: bool = True, **kwargs
+    ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
-            tp_size, recipe, self.seq_length, self.micro_batch_size, inference=inference, **kwargs
+            tp_size,
+            recipe,
+            self.seq_length,
+            self.micro_batch_size,
+            inference,
+            fp8_param_gather,
+            **kwargs,
         )
 
         if recipe == "blockwise" and args.sequence_parallel:
@@ -163,12 +172,23 @@ class TestFP8Param:
             fp8_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp8_layers -= kwargs["num_layers_at_end_in_bf16"]
         # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
-        assert num_fp8_params == 4 * fp8_layers
+        if fp8_param_gather:
+            assert num_fp8_params == 4 * fp8_layers
+
+        loss_list = []
 
         for i in range(100):
             if not inference:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
+
+            # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+            # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+            # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                for optim_instance in optimizer.chained_optimizers:
+                    if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
+                        optim_instance._copy_main_params_to_param_buffer()
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -189,38 +209,60 @@ class TestFP8Param:
             # Verify gradients
             loss = output.mean()
             loss.backward()
+
+            if args.overlap_grad_reduce:
+                gpt_model[0].finish_grad_sync()
+
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
 
             update_successful, _, _ = optimizer.step()
             assert update_successful
 
+            loss_list.append(loss.item())
+
+        return torch.tensor(loss_list)
+
     def run_test(self, tp_size, recipe, inference: bool = False, **kwargs):
         """Test fp8_param with gpt_model."""
-        ctx = torch.inference_mode if inference else contextlib.nullcontext
-        with ctx():
-            self._run_test_helper(tp_size, recipe, inference=inference, **kwargs)
+        if inference:
+            with torch.inference_mode():
+                self._run_test_helper(tp_size, recipe, inference=True, **kwargs)
+        else:
+            loss_list = self._run_test_helper(tp_size, recipe, fp8_param_gather=True, **kwargs)
+
+            # Before TE 2.2.0, we cannot guarantee that the main params are the same with/without
+            # fp8-param-gather, so skip the checking of tensor values.
+            if is_te_min_version("2.2.0"):
+                loss_list_ref = self._run_test_helper(
+                    tp_size, recipe, fp8_param_gather=False, **kwargs
+                )
+                torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
-    @pytest.mark.parametrize("tp_size", [4])
-    def test_delayed_scaling(self, tp_size):
-        self.run_test(tp_size=tp_size, recipe="delayed")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    def test_delayed_scaling(self, tp_size, dp_overlap):
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test(tp_size=tp_size, recipe="delayed", **kwargs)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
-    @pytest.mark.parametrize("tp_size", [4])
-    def test_tensorwise_scaling(self, tp_size):
-        self.run_test(tp_size=tp_size, recipe="tensorwise")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    def test_tensorwise_scaling(self, tp_size, dp_overlap):
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test(tp_size=tp_size, recipe="tensorwise", **kwargs)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
-    @pytest.mark.parametrize("tp_size", [4])
+    @pytest.mark.parametrize("tp_size", [2])
     def test_tensorwise_scaling_inference(self, tp_size):
         self.run_test(tp_size=tp_size, recipe="tensorwise", inference=True)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
-    @pytest.mark.parametrize("tp_size", [4])
+    @pytest.mark.parametrize("tp_size", [2])
     def test_tensorwise_scaling_with_first_last_layers_bf16(self, tp_size):
         kwargs = {
             "first_last_layers_bf16": True,
@@ -229,10 +271,15 @@ class TestFP8Param:
         }
         self.run_test(tp_size=tp_size, recipe="tensorwise", **kwargs)
 
+    @pytest.mark.skipif(
+        get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
+    )
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
-    @pytest.mark.parametrize("tp_size", [4])
-    def test_blockwise_scaling(self, tp_size):
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(True, True)])
+    def test_blockwise_scaling(self, tp_size, dp_overlap):
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="blockwise")
 
     @pytest.mark.skipif(
@@ -249,9 +296,12 @@ class TestFP8Param:
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
+    @pytest.mark.skipif(
+        get_device_arch_version() != 9, reason="blockwise is only supported on Hopper architecture"
+    )
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")
-    @pytest.mark.parametrize("tp_size", [4])
+    @pytest.mark.parametrize("tp_size", [2])
     def test_blockwise_scaling_with_first_last_layers_bf16(self, tp_size):
         kwargs = {
             "first_last_layers_bf16": True,

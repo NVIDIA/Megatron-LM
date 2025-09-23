@@ -313,8 +313,11 @@ class _ParamAndGradBucketGroup:
                         param_slice = bucket.param_data.view(-1)[param_start:param_end]
                         param.data.copy_(param_slice.view(param.data.shape))
                     # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
-                    bucket.grad_data.zero_()
+                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                    # We cannot zero out the entire grad buffer because one grad buffer may
+                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                    # it would clear the data of those param buffers that have not yet completed AG.
+                    bucket.param_data.zero_()
 
     def start_grad_sync(self):
         """

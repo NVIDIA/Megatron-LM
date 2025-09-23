@@ -76,9 +76,12 @@ class StaticBufferLoader:
 
             for k in inputs.keys():
                 if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                        inputs[k]
-                    ).cuda()
+                    if isinstance(inputs[k], torch.Tensor):
+                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
+                            inputs[k], device="cuda"
+                        )
+                    else:
+                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(

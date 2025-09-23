@@ -4,6 +4,7 @@
 from typing import Dict, List, Union
 import numpy as np
 
+nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
 
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
@@ -46,6 +47,14 @@ class SFTTokenizer(MegatronLegacyTokenizer):
                 assistant_prefix_len=3,
                 pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
                 custom_chat_template=nemotron_nano_v2_custom_template,
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "nemotron-h-aligned":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
+                custom_chat_template=nemotron_h_aligned_custom_template,
                 has_bos=False,
                 has_system_role=True,
             )
@@ -150,6 +159,11 @@ class SFTTokenizer(MegatronLegacyTokenizer):
     def get_special_tokens(self):
         """Get special tokens."""
         return self._tokenizer.get_added_vocab()
+
+    @property
+    def force_eod(self):
+        """To force an EOD at the end of every data sample in SFT."""
+        return self._prompt_format == "nemotron-h-aligned"
 
     @property
     def pad(self):
