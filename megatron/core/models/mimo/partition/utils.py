@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
 """Token- and weight-partitioning helper (CP, TP, SP).
@@ -8,18 +9,18 @@ enabled.
 """
 import dataclasses
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, Protocol, runtime_checkable
+from typing import Any, Dict, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
-from torch.nn import functional as F
 from torch.distributed import ProcessGroup
-from megatron.core.utils import is_te_min_version
+from torch.nn import functional as F
+
 from megatron.core import tensor_parallel
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.utils import get_batch_on_this_cp_rank
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version
 
 try:
     import transformer_engine_torch as tex  # type: ignore
@@ -156,13 +157,7 @@ class PartitionAdapter:
         *,
         pre: bool,
         post: bool,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[PackedSeqParams],
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[PackedSeqParams]]:
         """
         Apply context parallel (CP) and sequence parallel (SP) sharding to input tensors.
 
@@ -213,24 +208,22 @@ class PartitionAdapter:
                 packed_seq_params is None
                 or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd'
             ):
-                assert (
-                    embeddings.shape[seq_dim] % shard_factor == 0
-                ), (
+                assert embeddings.shape[seq_dim] % shard_factor == 0, (
                     f"Sequence length should be divisible by {shard_factor} "
                     "for Sequence/Context parallelism"
                 )
 
                 if self.cfg.seq_parallel and self.cfg.tp_comm_overlap:
-                    assert (
-                        embeddings.shape[seq_dim] == self.cfg.max_seq_len
-                    ), (
+                    assert embeddings.shape[seq_dim] == self.cfg.max_seq_len, (
                         "TP Comm overlap requires Vision+Text token length "
                         "== language_max_sequence_length"
                     )
 
         if self.cfg.use_cp:
-            embeddings, labels, loss_mask, attention_mask, packed_seq_params = self._apply_context_parallel(
-                embeddings, labels, loss_mask, attention_mask, packed_seq_params, pre, post
+            embeddings, labels, loss_mask, attention_mask, packed_seq_params = (
+                self._apply_context_parallel(
+                    embeddings, labels, loss_mask, attention_mask, packed_seq_params, pre, post
+                )
             )
 
         if self.cfg.seq_parallel and pre and embeddings is not None:
@@ -248,7 +241,13 @@ class PartitionAdapter:
         packed_seq_params: Optional[PackedSeqParams],
         pre: bool,
         post: bool,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[PackedSeqParams]]:
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[PackedSeqParams],
+    ]:
         """
         Apply context parallel (CP) sharding to input tensors.
 
@@ -291,10 +290,7 @@ class PartitionAdapter:
             if attention_mask is not None:
                 batch["attention_mask"] = attention_mask
 
-        if (
-            packed_seq_params is None
-            or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd'
-        ):
+        if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
             batch = get_batch_on_this_cp_rank(batch)
         else:
             assert _HAVE_TEX and is_te_min_version(

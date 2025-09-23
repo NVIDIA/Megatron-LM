@@ -73,11 +73,9 @@ class MimoModel(MegatronModule):
             max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
 
         # Create partition adapter only if parallelism is enabled
-        if (language_config.context_parallel_size > 1 or language_config.sequence_parallel):
+        if language_config.context_parallel_size > 1 or language_config.sequence_parallel:
             partition_config = PartitionConfig.from_mp_config(
-                mp=language_config,
-                max_seq_len=max_seq_len,
-                kv_format=mimo_config.kv_format
+                mp=language_config, max_seq_len=max_seq_len, kv_format=mimo_config.kv_format
             )
             self.partition_adapter = PartitionAdapter(partition_config)
         else:
@@ -91,7 +89,7 @@ class MimoModel(MegatronModule):
     def align_embeddings_by_token_positions(
         self,
         modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
-        input_ids: torch.Tensor,  # [bs, seq_len] 
+        input_ids: torch.Tensor,  # [bs, seq_len]
         special_token_ids: Dict[str, int],
     ) -> torch.Tensor:
         """Align embeddings from different modalities based on special token positions in input_ids.
@@ -120,7 +118,7 @@ class MimoModel(MegatronModule):
         hidden_dim = reference_embeddings.size(-1)
         device = reference_embeddings.device
         dtype = reference_embeddings.dtype
-        
+
         batch_size, seq_length = input_ids.size()
         logger.debug(
             f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
@@ -135,10 +133,10 @@ class MimoModel(MegatronModule):
             if modality_name == "text":
                 mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
                 for token_id in special_token_ids.values():
-                    mask &= (input_ids != token_id)
+                    mask &= input_ids != token_id
             elif modality_name in special_token_ids:
                 token_id = special_token_ids[modality_name]
-                mask = (input_ids == token_id)
+                mask = input_ids == token_id
             else:
                 raise ValueError(f"No special token ID defined for modality {modality_name}")
 
@@ -280,7 +278,9 @@ class MimoModel(MegatronModule):
                 - loss_mask: Loss mask. Shape: (B, S)
         """
         # Use provided special_token_ids or fall back to model's configured ones
-        token_ids_to_use = special_token_ids if special_token_ids is not None else self.special_token_ids
+        token_ids_to_use = (
+            special_token_ids if special_token_ids is not None else self.special_token_ids
+        )
 
         # If packing_kwargs is provided, construct PackedSeqParams
         packed_seq_params = None
@@ -327,25 +327,24 @@ class MimoModel(MegatronModule):
             special_token_ids=token_ids_to_use,
         )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
-        
 
         # 3. If sharding is needed, apply PartitionAdapter
         if self.partition_adapter is not None:
             # Transpose from [S, B, H] to [B, S, H] before the forward pass.
             combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-            combined_embeddings, labels, loss_mask, _, packed_seq_params = self.partition_adapter.shard(
-                embeddings=combined_embeddings,
-                labels=labels,
-                loss_mask=loss_mask,
-                attention_mask=None,
-                packed_seq_params=packed_seq_params,
-                pre=self.pre_process,
-                post=self.post_process,
+            combined_embeddings, labels, loss_mask, _, packed_seq_params = (
+                self.partition_adapter.shard(
+                    embeddings=combined_embeddings,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    attention_mask=None,
+                    packed_seq_params=packed_seq_params,
+                    pre=self.pre_process,
+                    post=self.post_process,
+                )
             )
             # After processing, combined_embeddings is [S, B, H], which is what the language model expects.
-        
-        
-        
+
         # 5. Forward pass through language model
         lm_output = self.language_model(
             input_ids=None,
