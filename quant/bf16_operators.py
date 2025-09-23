@@ -392,7 +392,7 @@ class BF16BAddBmm(Function):
             except Exception as e:
                 print(f"[BF16BAddBmm] 保存backward tensor时出错: {e}")
         
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None  # None对应所有额外参数（12个）
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None  # None对应所有额外参数（12个）
 
 
 class BF16Linear(Function):
