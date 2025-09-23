@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 import multiprocessing
 import os
 import struct
@@ -148,9 +149,10 @@ class DynamicInferenceEngine(AbstractEngine):
             time_start = time.time()
             mem_stats_start = torch.cuda.memory_stats()
 
-            print(
-                "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
+            logging.info(
+                "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
+                len(context.cuda_graph_token_counts),
+                context.cuda_graph_token_counts,
             )
             for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
                 # Iterate cuda graph dims.
@@ -185,7 +187,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     if HAVE_TQDM:
                         tbar.set_description(tbar_str)
                     else:
-                        print(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
+                        logging.info(
+                            f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}"
+                        )
 
                     # Get flat tokens, position ids.
                     input_ids, position_ids = context.current_input_and_position_ids(
@@ -217,14 +221,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     - mem_stats_start["reserved_bytes.all.current"]
                 ),
             }
-            print(
-                "> built cuda graph(s) in %.2f sec, with total memory usage: "
-                "allocated %s, reserved %s."
-                % (
-                    capture_stats["time"],
-                    format_mem_bytes(capture_stats["allocated_bytes"]),
-                    format_mem_bytes(capture_stats["reserved_bytes"]),
-                )
+            logging.info(
+                "> built cuda graph(s) in %.2f sec, with total memory usage: allocated %s, reserved %s.",
+                capture_stats["time"],
+                format_mem_bytes(capture_stats["allocated_bytes"]),
+                format_mem_bytes(capture_stats["reserved_bytes"]),
             )
 
             self.capture_stats = capture_stats
@@ -351,7 +352,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
             coordinator_ready_event.wait()
-            print("Inference co-ordinator is ready to receive requests!")
+            logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
         self.engine_loop_task = asyncio.create_task(
@@ -761,7 +762,7 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if prev_is_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
-            print(output_str)
+            logging.info(output_str)
 
         self.step_count += 1
 

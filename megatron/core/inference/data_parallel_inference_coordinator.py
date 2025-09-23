@@ -5,6 +5,7 @@ from itertools import cycle, repeat
 from typing import List, Tuple
 
 import torch
+import logging
 
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -98,7 +99,7 @@ class DataParallelInferenceCoordinator:
         self.router_socket.bind(f"tcp://0.0.0.0:{inference_coordinator_port}")
         self.data_parallel_size = data_parallel_size
 
-        print("Inference Coordinator: waiting for connections from data parallel ranks...")
+        logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
@@ -106,7 +107,7 @@ class DataParallelInferenceCoordinator:
             identity, _ = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
-        print("Inference Coordinator: Connected with data parallel ranks...")
+        logging.info("Inference Coordinator: Connected with data parallel ranks...")
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
 
         self.request_id_to_client_id = {}
@@ -258,7 +259,9 @@ class DataParallelInferenceCoordinator:
 
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:
-                    print(f"Client {sender_identity} sent a duplicate connect request. Ignoring ..")
+                    logging.info(
+                        f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
+                    )
                     continue
 
                 # print(f"New client connected: {sender_identity}")
@@ -274,7 +277,9 @@ class DataParallelInferenceCoordinator:
 
                 # Message from a known client
                 if sender_identity not in known_clients:
-                    print(f"Received message from unknown client {sender_identity}. Ignoring.")
+                    logging.info(
+                        f"Received message from unknown client {sender_identity}. Ignoring."
+                    )
                     continue
                 # this is a message from a client.
                 # route it to a data parallel rank
@@ -363,7 +368,7 @@ class DataParallelInferenceCoordinator:
         try:
             coordinator.start()
         except KeyboardInterrupt:
-            print("Coordinator process interrupted. Exiting...")
+            logging.info("Coordinator process interrupted. Exiting...")
             coordinator.stop()
 
     def stop(self):
