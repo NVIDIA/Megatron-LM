@@ -120,7 +120,7 @@ class GPTDataset(MegatronDataset):
             warnings.warn(
                 "The provided tokenizer uses the same token id for the pad and eos tokens. "
                 "This may cause instability and lack of covergence during training. "
-                "Please provide a tokenizer with separate token ids for the pad and eos tokens."
+                "Please provide a tokenizer with separate token ids for pad and eos tokens."
             )
 
         (self.document_index, self.sample_index, self.shuffle_index) = (
