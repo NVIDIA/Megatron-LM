@@ -865,11 +865,11 @@ def initialize_model_parallel(
             del os.environ["NCCL_COLLNET_ENABLE"]
 
     if hybrid_context_parallel:
-        assert (
-            len(ranks_with_cp) % 2 == 0
-        ), "Hybrid context parallel requires an even number of ranks"
         global _HYBRID_DP_CP_GROUPS
-        if rank in ranks_with_cp:
+        for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+            assert (
+                len(ranks_with_cp) % 2 == 0
+            ), "Hybrid context parallel requires an even number of ranks"
             _HYBRID_DP_CP_GROUPS.update(
                 create_hybrid_dp_cp_groups(
                     rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)

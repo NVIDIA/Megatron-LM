@@ -503,6 +503,7 @@ def get_blend_and_blend_per_split(args):
 def get_batch_on_this_tp_rank(data_iterator):
 
     args = get_args()
+    assert not (args.pipeline_model_parallel_size > 1 and args.hybrid_context_parallel), "Context parallelism not supported with pipeline parallelism now"
 
     def _broadcast(item):
         if item is not None:
@@ -545,7 +546,7 @@ def get_batch_on_this_tp_rank(data_iterator):
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
-
+            # when enabling hybrid context parallel, cu_seqlens is always None
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
             n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
             _broadcast(n_tensor)
@@ -559,7 +560,10 @@ def get_batch_on_this_tp_rank(data_iterator):
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
-
+        if args.hybrid_context_parallel:
+            seq_len = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
+            _broadcast(seq_len)
+            
         if args.pipeline_model_parallel_size == 1:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
@@ -591,32 +595,39 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(batch['attention_mask'])
 
     else:
-
+        if args.hybrid_context_parallel:
+            seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
+            _broadcast(seq_len)
+            shape = (seq_len.item())
+        else:
+            shape = (args.micro_batch_size, args.seq_length)
+            
         tokens = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            shape,
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         labels = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            shape,
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         loss_mask = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            shape,
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
         if args.create_attention_mask_in_dataloader:
+            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
             attention_mask = torch.empty(
-                (args.micro_batch_size, 1, args.seq_length, args.seq_length),
+                shape_attention_mask,
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
         else:
             attention_mask = None
         position_ids = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            shape,
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
@@ -626,12 +637,12 @@ def get_batch_on_this_tp_rank(data_iterator):
             1,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
-        )
+        ) if not args.hybrid_context_parallel else None
         local_cp_size = torch.empty(
             1,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
-        )
+        ) if args.hybrid_context_parallel else None
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
