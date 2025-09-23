@@ -267,10 +267,6 @@ class DotProductAttention(MegatronModule):
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
 
-        # 保存attention权重（P分布）用于分析
-        from megatron.core.tensor_saver import save_tensor
-        import os
-        
         # attention权重现在通过量化算子自动保存，无需重复保存
 
         # This is actually dropping out entire tokens to attend to, which might
@@ -340,10 +336,6 @@ class DotProductAttention(MegatronModule):
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
 
-        # 保存forward输出tensor (post-FA)
-        from megatron.core.tensor_saver import save_tensor
-        import os
-        
         # context tensor现在通过量化算子自动保存，无需重复保存
 
         return context
