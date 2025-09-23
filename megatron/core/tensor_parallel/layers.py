@@ -816,6 +816,9 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         if rank is None:
             rank = int(os.environ.get("LOCAL_RANK", 0))
         
+        # 保存layer_idx到ctx中，供backward阶段使用
+        ctx.layer_idx = layer_idx
+        
         # 准备tensor保存参数
         tensor_save_params = {
             "layer_type": "linear",
