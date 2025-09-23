@@ -834,7 +834,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         # 使用集成了tensor保存功能的算子
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
-        from quant.bf16_operators import BF16MatMul
+        from quant.bf16_operators import bf16_matmul
         
         if custom_quant_type == 'mxfp4':
             output = mxfp_matmul(
@@ -856,27 +856,15 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
                 **tensor_save_params
             )
         elif custom_quant_type == 'bf16':
-            output = BF16MatMul.apply(
+            output = bf16_matmul(
                 total_input, weight.t(),
-                tensor_save_params["layer_type"],
-                tensor_save_params["layer_idx"],
-                tensor_save_params["operation"],
-                tensor_save_params["phase"],
-                tensor_save_params["component"],
-                tensor_save_params["rank"],
-                tensor_save_params["metadata"]
+                **tensor_save_params
             )
         else:
             # 对于其他类型，使用BF16算子
-            output = BF16MatMul.apply(
+            output = bf16_matmul(
                 total_input, weight.t(),
-                tensor_save_params["layer_type"],
-                tensor_save_params["layer_idx"],
-                tensor_save_params["operation"],
-                tensor_save_params["phase"],
-                tensor_save_params["component"],
-                tensor_save_params["rank"],
-                tensor_save_params["metadata"]
+                **tensor_save_params
             ) 
         if bias is not None:
             output = output + bias
@@ -1071,16 +1059,10 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
             }
             
             # 使用BF16算子计算梯度并自动保存
-            from quant.bf16_operators import BF16MatMul
-            grad_weight = BF16MatMul.apply(
+            from quant.bf16_operators import bf16_matmul
+            grad_weight = bf16_matmul(
                 grad_output.t(), total_input,
-                tensor_save_params["layer_type"],
-                tensor_save_params["layer_idx"],
-                tensor_save_params["operation"],
-                tensor_save_params["phase"],
-                tensor_save_params["component"],
-                tensor_save_params["rank"],
-                tensor_save_params["metadata"]
+                **tensor_save_params
             )
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 

@@ -378,11 +378,69 @@ class BF16Linear(Function):
 
 
 # 便捷函数
-def bf16_matmul(A: torch.Tensor, B: torch.Tensor, **kwargs) -> torch.Tensor:
-    """BF16矩阵乘法便捷函数"""
-    return BF16MatMul.apply(A, B, **kwargs)
+def bf16_matmul(A: torch.Tensor, B: torch.Tensor, **tensor_save_kwargs) -> torch.Tensor:
+    """
+    BF16矩阵乘法便捷函数，支持tensor保存
+    
+    Args:
+        A, B: 输入tensor
+        **tensor_save_kwargs: tensor保存相关参数
+            - layer_type: 层类型
+            - layer_idx: 层索引
+            - operation: 操作类型
+            - phase: 阶段
+            - component: 组件类型
+            - rank: GPU rank
+            - metadata: 元数据
+    """
+    # 如果有tensor保存参数，使用集成算子
+    if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
+                                 ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
+        return BF16MatMul.apply(
+            A, B,
+            tensor_save_kwargs.get('layer_type'),
+            tensor_save_kwargs.get('layer_idx'),
+            tensor_save_kwargs.get('operation', 'forward'),
+            tensor_save_kwargs.get('phase', 'pre'),
+            tensor_save_kwargs.get('component', 'linear'),
+            tensor_save_kwargs.get('rank'),
+            tensor_save_kwargs.get('metadata')
+        )
+    else:
+        # 否则使用原始调用方式
+        return BF16MatMul.apply(A, B)
 
 
-def bf16_linear(input_tensor: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
-    """BF16线性层便捷函数"""
-    return BF16Linear.apply(input_tensor, weight, bias, **kwargs)
+def bf16_linear(input_tensor: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None, **tensor_save_kwargs) -> torch.Tensor:
+    """
+    BF16线性层便捷函数，支持tensor保存
+    
+    Args:
+        input_tensor: 输入tensor
+        weight: 权重tensor
+        bias: 偏置tensor (可选)
+        **tensor_save_kwargs: tensor保存相关参数
+            - layer_type: 层类型
+            - layer_idx: 层索引
+            - operation: 操作类型
+            - phase: 阶段
+            - component: 组件类型
+            - rank: GPU rank
+            - metadata: 元数据
+    """
+    # 如果有tensor保存参数，使用集成算子
+    if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
+                                 ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
+        return BF16Linear.apply(
+            input_tensor, weight, bias,
+            tensor_save_kwargs.get('layer_type'),
+            tensor_save_kwargs.get('layer_idx'),
+            tensor_save_kwargs.get('operation', 'forward'),
+            tensor_save_kwargs.get('phase', 'pre'),
+            tensor_save_kwargs.get('component', 'linear'),
+            tensor_save_kwargs.get('rank'),
+            tensor_save_kwargs.get('metadata')
+        )
+    else:
+        # 否则使用原始调用方式
+        return BF16Linear.apply(input_tensor, weight, bias)
