@@ -175,6 +175,225 @@ class BF16MatMul(Function):
         return grad_A, grad_B, None, None, None, None, None, None  # None对应所有额外参数
 
 
+class BF16BAddBmm(Function):
+    """BF16 Batch Add Batch Matrix Multiplication算子，集成tensor保存功能"""
+    
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor,
+                beta: float = 1.0, alpha: float = 1.0,
+                layer_type: Optional[str] = None, layer_idx: Optional[int] = None,
+                operation: str = "forward", phase: str = "pre", component: str = "attention",
+                rank: Optional[int] = None, metadata: Optional[Dict[str, Any]] = None):
+        """
+        BF16 Batch Add Batch Matrix Multiplication前向传播
+        
+        Args:
+            input: 输入tensor
+            batch1: 第一个batch tensor
+            batch2: 第二个batch tensor
+            beta: beta参数
+            alpha: alpha参数
+            layer_type: 层类型 ("attention", "linear", etc.)
+            layer_idx: 层索引
+            operation: 操作类型 ("forward", "backward")
+            phase: 阶段 ("pre", "post")
+            component: 组件类型 ("attention", "linear", etc.)
+            rank: GPU rank信息
+            metadata: 额外的元数据
+        """
+        # 保存tensor和参数到ctx
+        ctx.save_for_backward(input, batch1, batch2)
+        ctx.beta = beta
+        ctx.alpha = alpha
+        ctx.layer_type = layer_type
+        ctx.layer_idx = layer_idx
+        ctx.operation = operation
+        ctx.phase = phase
+        ctx.component = component
+        ctx.rank = rank
+        ctx.metadata = metadata
+        
+        # 确保tensor是BF16格式
+        if input.dtype != torch.bfloat16:
+            input = input.to(torch.bfloat16)
+        if batch1.dtype != torch.bfloat16:
+            batch1 = batch1.to(torch.bfloat16)
+        if batch2.dtype != torch.bfloat16:
+            batch2 = batch2.to(torch.bfloat16)
+        
+        # 执行batch matrix multiplication
+        mm_out = torch.bmm(batch1, batch2)
+        output = beta * input + alpha * mm_out
+        
+        # 自动保存forward阶段的tensor
+        if layer_type is not None:
+            try:
+                from megatron.core.tensor_saver import save_tensor
+                
+                # 保存输入tensor
+                save_tensor(
+                    tensor=input,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="bf16",
+                    tensor_name="input",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存batch1 tensor
+                save_tensor(
+                    tensor=batch1,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="bf16",
+                    tensor_name="batch1",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存batch2 tensor
+                save_tensor(
+                    tensor=batch2,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="bf16",
+                    tensor_name="batch2",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存矩阵乘法结果
+                save_tensor(
+                    tensor=mm_out,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="bf16",
+                    tensor_name="mm_output",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存最终输出
+                save_tensor(
+                    tensor=output,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="bf16",
+                    tensor_name="output",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+            except ImportError:
+                pass  # 如果tensor_saver不可用，静默跳过
+            except Exception as e:
+                print(f"[BF16BAddBmm] 保存tensor时出错: {e}")
+        
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, batch1, batch2 = ctx.saved_tensors
+        beta, alpha = ctx.beta, ctx.alpha
+        
+        grad_input = grad_batch1 = grad_batch2 = None
+        
+        # 计算梯度
+        if ctx.needs_input_grad[0]:
+            grad_input = beta * grad_output
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            mm_grad = alpha * grad_output
+            grad_batch1 = torch.bmm(mm_grad, batch2.transpose(-2, -1))
+            grad_batch2 = torch.bmm(batch1.transpose(-2, -1), mm_grad)
+        
+        # 自动保存backward阶段的tensor
+        if ctx.layer_type is not None:
+            try:
+                from megatron.core.tensor_saver import save_tensor
+                
+                # 保存梯度输出
+                save_tensor(
+                    tensor=grad_output,
+                    layer_type=ctx.layer_type,
+                    operation="backward",
+                    quant_type="bf16",
+                    tensor_name="grad_output",
+                    layer_idx=ctx.layer_idx,
+                    phase="post",
+                    component=ctx.component,
+                    rank=ctx.rank,
+                    metadata=ctx.metadata
+                )
+                
+                # 保存梯度input
+                if grad_input is not None:
+                    save_tensor(
+                        tensor=grad_input,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type="bf16",
+                        tensor_name="grad_input",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                
+                # 保存梯度batch1
+                if grad_batch1 is not None:
+                    save_tensor(
+                        tensor=grad_batch1,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type="bf16",
+                        tensor_name="grad_batch1",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                
+                # 保存梯度batch2
+                if grad_batch2 is not None:
+                    save_tensor(
+                        tensor=grad_batch2,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type="bf16",
+                        tensor_name="grad_batch2",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                    
+            except ImportError:
+                pass  # 如果tensor_saver不可用，静默跳过
+            except Exception as e:
+                print(f"[BF16BAddBmm] 保存backward tensor时出错: {e}")
+        
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None  # None对应所有额外参数
+
+
 class BF16Linear(Function):
     """BF16线性层算子，集成tensor保存功能"""
     
@@ -409,6 +628,44 @@ def bf16_matmul(A: torch.Tensor, B: torch.Tensor, **tensor_save_kwargs) -> torch
     else:
         # 否则使用原始调用方式
         return BF16MatMul.apply(A, B)
+
+
+def bf16_baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, 
+                 beta: float = 1.0, alpha: float = 1.0, **tensor_save_kwargs) -> torch.Tensor:
+    """
+    BF16 Batch Add Batch Matrix Multiplication便捷函数，支持tensor保存
+    
+    Args:
+        input: 输入tensor
+        batch1: 第一个batch tensor
+        batch2: 第二个batch tensor
+        beta: beta参数
+        alpha: alpha参数
+        **tensor_save_kwargs: tensor保存相关参数
+            - layer_type: 层类型
+            - layer_idx: 层索引
+            - operation: 操作类型
+            - phase: 阶段
+            - component: 组件类型
+            - rank: GPU rank
+            - metadata: 元数据
+    """
+    # 如果有tensor保存参数，使用集成算子
+    if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
+                                 ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
+        return BF16BAddBmm.apply(
+            input, batch1, batch2, beta, alpha,
+            tensor_save_kwargs.get('layer_type'),
+            tensor_save_kwargs.get('layer_idx'),
+            tensor_save_kwargs.get('operation', 'forward'),
+            tensor_save_kwargs.get('phase', 'pre'),
+            tensor_save_kwargs.get('component', 'attention'),
+            tensor_save_kwargs.get('rank'),
+            tensor_save_kwargs.get('metadata')
+        )
+    else:
+        # 否则使用原始调用方式
+        return BF16BAddBmm.apply(input, batch1, batch2, beta, alpha)
 
 
 def bf16_linear(input_tensor: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None, **tensor_save_kwargs) -> torch.Tensor:

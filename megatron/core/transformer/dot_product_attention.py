@@ -182,9 +182,36 @@ class DotProductAttention(MegatronModule):
         # import pdb;pdb.set_trace()
         from quant.mxfp import mxfp_baddbmm
         from quant.hifp import hifp_baddbmm
+        from quant.bf16_operators import bf16_baddbmm
         # 从环境变量获取量化类型，默认为hifp8
         import os
         custom_quant_type = 'hifp8'
+        
+        # 准备tensor保存参数
+        tensor_save_params = {
+            "layer_type": "attention",
+            "layer_idx": getattr(self, 'layer_number', None),
+            "operation": "forward",
+            "phase": "pre",
+            "component": "attention",
+            "rank": None,  # 稍后设置
+            "metadata": {
+                "softmax_scale": self.softmax_scale,
+                "attention_scores": True,
+            }
+        }
+        
+        # 获取rank信息
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                tensor_save_params["rank"] = dist.get_rank()
+        except:
+            pass
+        
+        if tensor_save_params["rank"] is None:
+            tensor_save_params["rank"] = int(os.environ.get("LOCAL_RANK", 0))
+        
         if custom_quant_type == 'mxfp4':
             matmul_result = mxfp_baddbmm(
                 matmul_input_buffer,
@@ -192,6 +219,7 @@ class DotProductAttention(MegatronModule):
                 key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
                 beta=0.0,
                 alpha=self.softmax_scale,
+                **tensor_save_params
             )
         elif custom_quant_type == 'mxfp8':
             matmul_result = mxfp_baddbmm(
@@ -200,6 +228,7 @@ class DotProductAttention(MegatronModule):
                 key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
                 beta=0.0,
                 alpha=self.softmax_scale,
+                **tensor_save_params
             )
         elif custom_quant_type == 'hifp8':
             matmul_result = hifp_baddbmm(
@@ -208,6 +237,16 @@ class DotProductAttention(MegatronModule):
                 key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
                 beta=0.0,
                 alpha=self.softmax_scale,
+                **tensor_save_params
+            )
+        elif custom_quant_type == 'bf16':
+            matmul_result = bf16_baddbmm(
+                matmul_input_buffer,
+                query.transpose(0, 1),  # [b * np, sq, hn]
+                key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=0.0,
+                alpha=self.softmax_scale,
+                **tensor_save_params
             )
         else:
             matmul_result = torch.baddbmm(
@@ -232,38 +271,7 @@ class DotProductAttention(MegatronModule):
         from megatron.core.tensor_saver import save_tensor
         import os
         
-        # 尝试获取rank信息
-        rank = None
-        try:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                rank = dist.get_rank()
-        except:
-            pass
-        
-        if rank is None:
-            rank = int(os.environ.get("LOCAL_RANK", 0))
-        
-        # Sample information is no longer used in tensor saving
-        
-        # 保存attention权重（P分布）
-        save_tensor(
-            tensor=attention_probs.detach(),
-            layer_type="attention",
-            operation="forward",
-            quant_type=custom_quant_type,
-            tensor_name="attention_weights",
-            layer_idx=getattr(self, 'layer_number', None),
-            phase="post",
-            component="FA",
-            rank=rank,
-            metadata={
-                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
-                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
-                "attention_weights_shape": list(attention_probs.shape),
-                "softmax_scale": self.softmax_scale,
-            }
-        )
+        # attention权重现在通过量化算子自动保存，无需重复保存
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -293,14 +301,33 @@ class DotProductAttention(MegatronModule):
         # matmul: [b * np, sq, hn]
         from quant.mxfp import mxfp_matmul
         from quant.hifp import hifp_matmul
+        from quant.bf16_operators import bf16_matmul
         # 使用相同的量化类型
         # custom_quant_type 已在上面定义
+        
+        # 准备tensor保存参数（用于context计算）
+        context_tensor_save_params = {
+            "layer_type": "attention",
+            "layer_idx": getattr(self, 'layer_number', None),
+            "operation": "forward",
+            "phase": "post",
+            "component": "FA",
+            "rank": tensor_save_params["rank"],  # 重用之前的rank
+            "metadata": {
+                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
+                "output_shape": None,  # 稍后设置
+            }
+        }
+        
         if custom_quant_type == 'hifp8':
-            context = hifp_matmul(attention_probs, value.transpose(0, 1))
+            context = hifp_matmul(attention_probs, value.transpose(0, 1), **context_tensor_save_params)
         elif custom_quant_type == 'mxfp8':
-            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp8_e4m3')
+            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp8_e4m3', **context_tensor_save_params)
         elif custom_quant_type == 'mxfp4':
-            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp4_e2m1')
+            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp4_e2m1', **context_tensor_save_params)
+        elif custom_quant_type == 'bf16':
+            context = bf16_matmul(attention_probs, value.transpose(0, 1), **context_tensor_save_params)
         else:
             context = torch.bmm(attention_probs, value.transpose(0, 1))
         # change view [b, np, sq, hn]
@@ -317,33 +344,6 @@ class DotProductAttention(MegatronModule):
         from megatron.core.tensor_saver import save_tensor
         import os
         
-        # 尝试获取rank信息
-        rank = None
-        try:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                rank = dist.get_rank()
-        except:
-            pass
-        
-        if rank is None:
-            rank = int(os.environ.get("LOCAL_RANK", 0))
-        
-        save_tensor(
-            tensor=context,
-            layer_type="attention",
-            operation="forward",
-            quant_type=custom_quant_type,
-            tensor_name="output",
-            layer_idx=getattr(self, 'layer_number', None),
-            phase="post",
-            component="FA",
-            rank=rank,  # 直接获取
-            metadata={
-                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
-                "attn_mask_type": str(attn_mask_type) if attn_mask_type is not None else None,
-                "output_shape": list(context.shape),
-            }
-        )
+        # context tensor现在通过量化算子自动保存，无需重复保存
 
         return context

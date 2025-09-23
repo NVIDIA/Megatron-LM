@@ -753,14 +753,65 @@ class MXFPMatMul(Function):
 class MXFPBAddBmm(Function):
     @staticmethod
     def forward(ctx, input, batch1, batch2, beta=1.0, alpha=1.0,
-                elem_format='fp8_e5m2', block_size=32):
+                elem_format='fp8_e5m2', block_size=32,
+                layer_type=None, layer_idx=None, operation="forward", 
+                phase="pre", component="attention", rank=None, metadata=None):
         ctx.save_for_backward(input, batch1, batch2)
         ctx.beta, ctx.alpha = beta, alpha
         ctx.elem_format = elem_format
         ctx.block_size = block_size
+        ctx.layer_type = layer_type
+        ctx.layer_idx = layer_idx
+        ctx.operation = operation
+        ctx.phase = phase
+        ctx.component = component
+        ctx.rank = rank
+        ctx.metadata = metadata
         
-        mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size)
-        return beta * input + alpha * mm_out
+        # 使用集成了tensor保存的MXFPMatMul
+        mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size,
+                                  layer_type, layer_idx, operation, phase, component, rank, metadata)
+        output = beta * input + alpha * mm_out
+        
+        # 自动保存forward阶段的tensor
+        if layer_type is not None:
+            try:
+                from megatron.core.tensor_saver import save_tensor
+                
+                # 保存输入tensor
+                save_tensor(
+                    tensor=input,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="mxfp",
+                    tensor_name="input",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+                # 保存最终输出
+                save_tensor(
+                    tensor=output,
+                    layer_type=layer_type,
+                    operation=operation,
+                    quant_type="mxfp",
+                    tensor_name="output",
+                    layer_idx=layer_idx,
+                    phase=phase,
+                    component=component,
+                    rank=rank,
+                    metadata=metadata
+                )
+                
+            except ImportError:
+                pass  # 如果tensor_saver不可用，静默跳过
+            except Exception as e:
+                print(f"[MXFPBAddBmm] 保存tensor时出错: {e}")
+        
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -775,7 +826,76 @@ class MXFPBAddBmm(Function):
             grad_batch1 = torch.matmul(mm_grad, batch2.transpose(-2, -1))
             grad_batch2 = torch.matmul(batch1.transpose(-2, -1), mm_grad)
         
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None
+        # 自动保存backward阶段的tensor
+        if ctx.layer_type is not None:
+            try:
+                from megatron.core.tensor_saver import save_tensor
+                
+                # 保存梯度输出
+                save_tensor(
+                    tensor=grad_output,
+                    layer_type=ctx.layer_type,
+                    operation="backward",
+                    quant_type="mxfp",
+                    tensor_name="grad_output",
+                    layer_idx=ctx.layer_idx,
+                    phase="post",
+                    component=ctx.component,
+                    rank=ctx.rank,
+                    metadata=ctx.metadata
+                )
+                
+                # 保存梯度input
+                if grad_input is not None:
+                    save_tensor(
+                        tensor=grad_input,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type="mxfp",
+                        tensor_name="grad_input",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                
+                # 保存梯度batch1
+                if grad_batch1 is not None:
+                    save_tensor(
+                        tensor=grad_batch1,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type="mxfp",
+                        tensor_name="grad_batch1",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                
+                # 保存梯度batch2
+                if grad_batch2 is not None:
+                    save_tensor(
+                        tensor=grad_batch2,
+                        layer_type=ctx.layer_type,
+                        operation="backward",
+                        quant_type="mxfp",
+                        tensor_name="grad_batch2",
+                        layer_idx=ctx.layer_idx,
+                        phase="post",
+                        component=ctx.component,
+                        rank=ctx.rank,
+                        metadata=ctx.metadata
+                    )
+                    
+            except ImportError:
+                pass  # 如果tensor_saver不可用，静默跳过
+            except Exception as e:
+                print(f"[MXFPBAddBmm] 保存backward tensor时出错: {e}")
+        
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None  # None对应所有额外参数
 
 def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwargs):
     """
@@ -812,8 +932,33 @@ def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwarg
         return MXFPMatMul.apply(A, B, elem_format, block_size)
 
 def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
-                 elem_format='fp8_e5m2', block_size=32):
-    return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size)
+                 elem_format='fp8_e5m2', block_size=32, **tensor_save_kwargs):
+    """
+    MXFP Batch Add Batch Matrix Multiplication函数，支持tensor保存
+    
+    Args:
+        input, batch1, batch2: 输入tensor
+        beta, alpha: 参数
+        elem_format: 元素格式
+        block_size: 块大小
+        **tensor_save_kwargs: tensor保存相关参数
+    """
+    # 如果有tensor保存参数，使用集成算子
+    if tensor_save_kwargs and any(key in tensor_save_kwargs for key in 
+                                 ['layer_type', 'layer_idx', 'operation', 'phase', 'component', 'rank', 'metadata']):
+        return MXFPBAddBmm.apply(
+            input, batch1, batch2, beta, alpha, elem_format, block_size,
+            tensor_save_kwargs.get('layer_type'),
+            tensor_save_kwargs.get('layer_idx'),
+            tensor_save_kwargs.get('operation', 'forward'),
+            tensor_save_kwargs.get('phase', 'pre'),
+            tensor_save_kwargs.get('component', 'attention'),
+            tensor_save_kwargs.get('rank'),
+            tensor_save_kwargs.get('metadata')
+        )
+    else:
+        # 否则使用原始调用方式
+        return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size)
 
 if __name__ == '__main__':
     A = torch.load("grad_output.pt", map_location='cpu').cuda()
