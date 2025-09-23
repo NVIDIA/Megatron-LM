@@ -7,17 +7,14 @@ The adapter slices sequences across *context-parallel* ranks and can further
 scatter them across *sequence-parallel* ranks when sequence-parallelism is
 enabled.
 """
-import dataclasses
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol, Tuple, runtime_checkable
+from typing import Optional, Protocol, Tuple, runtime_checkable
 
-import torch
-from torch.distributed import ProcessGroup
-from torch.nn import functional as F
+import torch  # type: ignore[import-not-found]
+from torch.distributed import ProcessGroup  # type: ignore[import-not-found]
 
 from megatron.core import tensor_parallel
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.models.multimodal import context_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version
@@ -179,7 +176,8 @@ class PartitionAdapter:
 
         Returns:
             Tuple containing:
-                - embeddings (torch.Tensor): Possibly sharded embeddings. Shape: (B, S, H) or (S, B, H) after sharding.
+                - embeddings (torch.Tensor): Possibly sharded embeddings.
+                                             Shape: (B, S, H) or (S, B, H) after sharding.
                 - labels (torch.Tensor): Possibly sharded labels. Shape: (B, S)
                 - loss_mask (torch.Tensor): Possibly sharded loss mask. Shape: (B, S)
                 - attention_mask (torch.Tensor): Possibly sharded attention mask. Shape: (B, S)
@@ -269,10 +267,12 @@ class PartitionAdapter:
 
         Returns:
             Tuple containing:
-                - embeddings (Optional[torch.Tensor]): Possibly sharded embeddings. Shape: (S, B, H) after sharding.
+                - embeddings (Optional[torch.Tensor]): Possibly sharded embeddings.
+                                                       Shape: (S, B, H) after sharding.
                 - labels (Optional[torch.Tensor]): Possibly sharded labels. Shape: (B, S)
                 - loss_mask (Optional[torch.Tensor]): Possibly sharded loss mask. Shape: (B, S)
-                - attention_mask (Optional[torch.Tensor]): Possibly sharded attention mask. Shape: (B, S)
+                - attention_mask (Optional[torch.Tensor]): Possibly sharded attention mask.
+                                                           Shape: (B, S)
                 - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
         """
         if not self.cfg.use_cp:
@@ -293,9 +293,11 @@ class PartitionAdapter:
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
             batch = get_batch_on_this_cp_rank(batch)
         else:
-            assert _HAVE_TEX and is_te_min_version(
-                "1.10.0"
-            ), "Please update Transformer Engine to >= 1.10 to use Context Parallel with THD format data"
+            assert _HAVE_TEX and is_te_min_version("1.10.0"), (
+                "Please update Transformer Engine to >= 1.10 "
+                "to use Context Parallel with THD format data"
+            )
+            assert self.cfg.cp_group is not None
             cp_size = self.cfg.cp_group.size()
             cp_rank = self.cfg.cp_group.rank()
             for key, data in batch.items():
