@@ -173,7 +173,7 @@ class BF16MatMul(Function):
             except Exception as e:
                 print(f"[BF16MatMul] 保存backward tensor时出错: {e}")
         
-        return grad_A, grad_B, None, None, None, None, None, None  # None对应所有额外参数
+        return grad_A, grad_B, None, None, None, None, None, None, None  # None对应所有额外参数（9个）
 
 
 class BF16BAddBmm(Function):
@@ -392,7 +392,7 @@ class BF16BAddBmm(Function):
             except Exception as e:
                 print(f"[BF16BAddBmm] 保存backward tensor时出错: {e}")
         
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None  # None对应所有额外参数
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None  # None对应所有额外参数（12个）
 
 
 class BF16Linear(Function):
@@ -594,7 +594,7 @@ class BF16Linear(Function):
             except Exception as e:
                 print(f"[BF16Linear] 保存backward tensor时出错: {e}")
         
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None  # None对应所有额外参数
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None  # None对应所有额外参数（10个）
 
 
 # 便捷函数
