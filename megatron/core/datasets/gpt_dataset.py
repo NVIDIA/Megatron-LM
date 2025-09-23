@@ -58,6 +58,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     data_parallel_size: int = 1
     """Option to enable data parallelism"""
 
+    tensor_model_parallel_size: int = 1
+    """Option to enable tensor model parallelism"""
+
+    hybrid_context_parallel: bool = False
+    """Option to enable hybrid context parallelism"""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()

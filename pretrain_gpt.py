@@ -285,6 +285,8 @@ def core_gpt_dataset_config_from_args(args):
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        hybrid_context_parallel=args.hybrid_context_parallel,
     )
 
 
