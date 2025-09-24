@@ -689,7 +689,7 @@ class MXFPMatMul(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[MXFPMatMul] 保存tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return output
 
@@ -766,7 +766,7 @@ class MXFPMatMul(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[MXFPMatMul] 保存backward tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return grad_A, grad_B, None, None, None, None, None, None, None, None, None  # None对应所有额外参数
 
@@ -869,7 +869,7 @@ class MXFPBAddBmm(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[MXFPBAddBmm] 保存tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return output
 
@@ -965,7 +965,7 @@ class MXFPBAddBmm(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[MXFPBAddBmm] 保存backward tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None, None, None # None对应所有额外参数（14个）
 

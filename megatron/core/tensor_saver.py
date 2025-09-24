@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tensor保存工具模块
-用于保存attention和linear层的forward/backward输入tensor
+Tensor saving utility module
+For saving forward/backward input tensors of attention and linear layers
 """
 
 import os
@@ -11,9 +11,9 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 
 
-# 全局状态管理
+# Global state management
 class TensorCollectionState:
-    """Tensor收集状态管理器"""
+    """Tensor collection state manager"""
     def __init__(self):
         self.current_rank = None
         self.current_sample_idx = None
@@ -197,11 +197,9 @@ def get_current_rank() -> Optional[int]:
             import torch.distributed as dist
             if dist.is_initialized():
                 rank = dist.get_rank()
-                # 更新全局状态
+                # Update global state
                 state.set_rank(rank)
-                print(f"[TensorSaver] 从分布式环境获取rank: {rank}")
         except Exception as e:
-            print(f"[TensorSaver] 无法从分布式环境获取rank: {e}")
     
     # 如果仍然没有，尝试从环境变量获取
     if rank is None:
@@ -210,7 +208,6 @@ def get_current_rank() -> Optional[int]:
             try:
                 rank = int(rank_env)
                 state.set_rank(rank)
-                print(f"[TensorSaver] 从环境变量获取rank: {rank}")
             except ValueError:
                 pass
     
@@ -227,7 +224,7 @@ def initialize_tensor_collection(rank: Optional[int] = None,
     if rank is not None:
         state.set_rank(rank)
     else:
-        # 尝试自动检测rank
+        # Try to auto-detect rank
         auto_rank = state.get_rank()
         if auto_rank is None:
             state.set_rank(0)  # 默认值
@@ -235,7 +232,7 @@ def initialize_tensor_collection(rank: Optional[int] = None,
     if sample_idx is not None:
         state.set_sample_idx(sample_idx)
     else:
-        # 尝试自动检测sample_idx
+        # Try to auto-detect sample_idx
         auto_sample_idx = state.get_sample_idx()
         if auto_sample_idx is None:
             state.set_sample_idx(0)  # 默认值
@@ -268,7 +265,6 @@ class TensorSaver:
         
         if self.enabled:
             self.save_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[TensorSaver] 保存目录: {self.save_dir}")
     
     def set_iteration(self, iteration: int):
         """设置当前iteration"""
@@ -474,15 +470,13 @@ class TensorSaver:
         if rank is None:
             rank = get_rank_from_tensor_device(tensor)
             if rank is not None:
-                print(f"[TensorSaver] 从tensor设备信息推断rank: {rank}")
-                # 更新全局状态
+                # Update global state
                 state = get_tensor_collection_state()
                 state.set_rank(rank)
         
         # 如果仍然无法获取，使用默认值并打印警告
         if rank is None:
             rank = 0  # 默认rank为0
-            print(f"[TensorSaver] 警告: 无法获取rank信息，使用默认值 {rank}")
         
         # 如果rank不是0或1，则不保存
         if rank not in [0, 1]:

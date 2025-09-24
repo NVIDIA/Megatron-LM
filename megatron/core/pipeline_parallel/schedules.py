@@ -611,31 +611,29 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 
-                # 检查是否应该退出（在完成一个完整forward pass后）
+                # Check if should exit after completing a full forward pass
                 try:
                     from megatron.core.tensor_saver import get_tensor_saver
                     tensor_saver = get_tensor_saver()
                     if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
-                        # 在no-pipelining模式下，第一个microbatch就收集tensor
+                        # In no-pipelining mode, collect tensor in first microbatch
                         tensor_saver.mark_warmup_collection()
-                    # 不再在forward后退出，等待backward完成
                 except Exception as e:
-                    print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
+                    pass  # Silently ignore tensor saver errors
                 
                 if not forward_only:
                     backward_step(
                         input_tensor, output_tensor, output_tensor_grad, model_type, config
                     )
                     
-                    # 检查是否应该在backward完成后退出
+                    # Check if should exit after backward completion
                     try:
                         from megatron.core.tensor_saver import get_tensor_saver
                         tensor_saver = get_tensor_saver()
                         if tensor_saver.should_exit_after_backward():
-                            print(f"[Pipeline] 已完成backward tensor收集，退出no_pipelining训练循环")
                             break
                     except Exception as e:
-                        print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
+                        pass  # Silently ignore tensor saver errors
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -656,15 +654,15 @@ def forward_backward_no_pipelining(
 
         total_num_tokens += num_tokens
         
-        # 检查最后一个microbatch的tensor收集
+        # Check tensor collection for last microbatch
         try:
             from megatron.core.tensor_saver import get_tensor_saver
             tensor_saver = get_tensor_saver()
             if tensor_saver.enabled and not tensor_saver.tensor_collected_in_warmup:
-                # 在no-pipelining模式下，第一个microbatch就收集tensor
+                # In no-pipelining mode, collect tensor in first microbatch
                 tensor_saver.mark_warmup_collection()
         except Exception as e:
-            print(f"[Pipeline] Warning: 无法检查tensor saver状态: {e}")
+            pass  # Silently ignore tensor saver errors
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)

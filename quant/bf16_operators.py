@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BF16算子模块
-提供带有tensor保存功能的BF16矩阵乘法算子
+BF16 operators module
+Provides BF16 matrix multiplication operators with tensor saving functionality
 """
 
 import torch
@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any
 
 
 class BF16MatMul(Function):
-    """BF16矩阵乘法算子，集成tensor保存功能"""
+    """BF16 matrix multiplication operator with integrated tensor saving functionality"""
     
     @staticmethod
     def forward(ctx, A: torch.Tensor, B: torch.Tensor,
@@ -111,7 +111,7 @@ class BF16MatMul(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[BF16MatMul] 保存tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return output
 
@@ -191,13 +191,13 @@ class BF16MatMul(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[BF16MatMul] 保存backward tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return grad_A, grad_B, None, None, None, None, None, None, None  # None对应所有额外参数（9个）
 
 
 class BF16BAddBmm(Function):
-    """BF16 Batch Add Batch Matrix Multiplication算子，集成tensor保存功能"""
+    """BF16 Batch Add Batch Matrix Multiplication operator with integrated tensor saving functionality"""
     
     @staticmethod
     def forward(ctx, input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor,
@@ -336,7 +336,7 @@ class BF16BAddBmm(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[BF16BAddBmm] 保存tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return output
 
@@ -434,7 +434,7 @@ class BF16BAddBmm(Function):
             except ImportError:
                 pass  # 如果tensor_saver不可用，静默跳过
             except Exception as e:
-                print(f"[BF16BAddBmm] 保存backward tensor时出错: {e}")
+                pass  # Silently ignore tensor saving errors
         
         return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None  # None对应所有额外参数（12个）
 
