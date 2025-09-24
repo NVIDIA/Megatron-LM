@@ -344,7 +344,7 @@ class Attention(MegatronModule, ABC):
                     inference_context.key_value_memory_dict[self.layer_number]
                 )
 
-        if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
+        if not self.training and (not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0):
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
             attn_mask_type = AttnMaskType.no_mask
