@@ -76,7 +76,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         except Exception:
             self._pad_token_id = _PAD_TOKEN_ID
 
-        # Check if pad token id ovelaps with any other special tokens
+        # Check if pad token id collides with any other special tokens
         try:
             _special_tokens_list = [
                 v for k, v in self.config.tokenizer.special_tokens_dict.items() if k != "pad_token"
@@ -94,39 +94,24 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             except AttributeError:
                 pass
 
-        self._error_if_pad_in_dataset = False
-        if self.config.ignore_pad_in_dataset:
-            if self._pad_token_id in _special_tokens_list:
+        if self._pad_token_id in _special_tokens_list:
+            if self.config.ignore_pad_collision_in_dataset:
+                # Reset the pad token id to a value which is guaranteed not to be in the dataset
+                self._pad_token_id = _PAD_TOKEN_ID
                 warnings.warn(
-                    "The pad token id in the tokenizer overlaps with another special token id. "
+                    "The pad token id in the tokenizer collides with another special token id. "
                     "This may cause instability and lack of covergence during training. "
                     "As such, the training flow will automatically ignore any pad tokens already "
                     "present in the dataset. If you would like to disable this behavior, "
-                    "please provide a tokenizer with separate token ids for pad and eos tokens "
-                    "and set `ignore_pad_in_dataset` to False in the dataset config."
+                    "please provide a tokenizer with a uniquely-defined pad token id."
                 )
             else:
-                warnings.warn(
-                    "This model uses a tokenizer that uniquely defines the pad token, and this "
-                    "dataset intentionally contains such uniquely-defined pad tokens. However, "
-                    "the `ignore_pad_in_dataset` flag is set to True. This flag is designed to "
-                    "avoid errors stemming from tokenizers which fail to uniquely define the pad "
-                    "token, and it does so by ignoring any pad tokens present in the dataset. "
-                    "Given your situation, the `ignore_pad_in_dataset` flag should be set to False."
-                )
-            # Reset the pad token id to a value which is guaranteed not to be in the dataset
-            self._pad_token_id = _PAD_TOKEN_ID
-        else:
-            if self._pad_token_id in _special_tokens_list:
                 raise ValueError(
-                    "The pad token id in the tokenizer overlaps with another special token id. "
+                    "The pad token id in the tokenizer collides with another special token id. "
                     "This may cause instability and lack of covergence during training. "
                     "As such, please provide a tokenizer with a uniquely-defined pad token id "
-                    "or set `ignore_pad_in_dataset` to True in the dataset config."
+                    "or set `ignore_pad_collision_in_dataset` to True in the dataset config."
                 )
-            else:
-                # This represents a correct tokenizer and correct training flow.
-                pass
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:

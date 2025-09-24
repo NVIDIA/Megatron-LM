@@ -210,7 +210,7 @@ def train_valid_test_datasets_provider(train_valid_test_num_samples):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        ignore_pad_in_dataset=args.ignore_pad_in_dataset,
+        ignore_pad_collision_in_dataset=args.ignore_pad_collision_in_dataset,
     )
 
     # GPT datasets.

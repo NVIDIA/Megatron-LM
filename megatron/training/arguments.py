@@ -2825,14 +2825,12 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 or msc dataloader')
     group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
                        help='The sample surplus to build for the mid-level datasets(s)')
-    group.add_argument('--ignore-pad-in-dataset', type=bool, default=True,
-                       help='Whether to ignore pad tokens already present in the dataset. '
-                       'This option is useful when the tokenizer incorrectly reuses the same '
-                       'token id for the pad token as it does for other tokens, most notably eos. '
+    group.add_argument('--ignore-pad-collision-in-dataset', type=bool, default=True,
+                       help='Whether to ignore pad tokens already present in the dataset when '
+                       'the pad token id is also used for other special tokens in the tokenizer. '
                        'Treating such tokens as pad tokens results in training instability. '
                        'Such a scenario should be resolved by fixing the tokenizer; setting this '
-                       'option to True provides a workaround. This should be set to False if the '
-                       'tokenizer is correct and the dataset intentionally contains pad tokens.')
+                       'option to True provides a workaround.')
     return parser
 
 
