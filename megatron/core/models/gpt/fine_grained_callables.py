@@ -505,7 +505,7 @@ def build_mtp_layer_callables(layer):
     def submodule_mtp_attn_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
-            offset = get_mtp_layer_offset(layer.config)
+            offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
