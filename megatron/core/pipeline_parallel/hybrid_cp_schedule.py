@@ -853,10 +853,23 @@ def hybrid_context_parallel_forward_backward(
         _broadcast(num_samples_this_group_broadcast)
         return num_samples_this_group_broadcast
 
+    def _get_new_data_iterator(sample_id_in_group, group_id):
+        if is_first_tp_rank:
+            sub_sample_id = sample_ids_this_group[sample_id_in_group]
+            sample = batch[sub_sample_id]
+            partner_cp_size = len(
+                [True for sample_ids in sample_id_groups[group_id] if sub_sample_id in sample_ids]
+            )
+            sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
+            new_data_iterator = RerunDataIterator(iter([sample]))
+            return new_data_iterator
+        else:
+            return None
+
     cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=config.max_seqlen_per_cp_rank)
     # We get data once per global batch and schedule the sub-samples.
     # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
-    dpcp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
     is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
 
     if is_first_tp_rank:
@@ -869,7 +882,7 @@ def hybrid_context_parallel_forward_backward(
     num_samples_this_group = None
     if is_first_tp_rank:
         num_samples_this_group = torch.tensor(
-            [len(group[dpcp_rank]) for group in sample_id_groups], dtype=torch.int32, device='cuda'
+            [len(group[hdp_rank]) for group in sample_id_groups], dtype=torch.int32, device='cuda'
         )
 
     num_samples_this_group = _broadcast_num_samples_this_group(num_samples_this_group)
@@ -882,19 +895,10 @@ def hybrid_context_parallel_forward_backward(
     # Upto last group, we don't need any sync.
     with no_sync_func():
         for j in range(num_total_groups - 1):
-            sample_ids_this_group = sample_id_groups[j][dpcp_rank] if is_first_tp_rank else None
+            sample_ids_this_group = sample_id_groups[j][hdp_rank] if is_first_tp_rank else None
             for i in range(num_samples_this_group[j]):
                 # Call forward step for each sub-sample
-                if is_first_tp_rank:
-                    sub_sample_id = sample_ids_this_group[i]
-                    sample = batch[sub_sample_id]
-                    partner_cp_size = len(
-                        [True for sample_ids in sample_id_groups[j] if sub_sample_id in sample_ids]
-                    )
-                    sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-                    new_data_iterator = RerunDataIterator(iter([sample]))
-                else:
-                    new_data_iterator = None
+                new_data_iterator = _get_new_data_iterator(i, j)
                 # TODO: Find the usage of current_microbatch and is_first_microbatch and
                 # how that may affect my usage.
                 output_tensor, num_tokens = forward_step(
@@ -926,18 +930,9 @@ def hybrid_context_parallel_forward_backward(
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():
-        sample_ids_this_group = sample_id_groups[-1][dpcp_rank] if is_first_tp_rank else None
+        sample_ids_this_group = sample_id_groups[-1][hdp_rank] if is_first_tp_rank else None
         for k in range(num_samples_this_group[-1] - 1):
-            if is_first_tp_rank:
-                sub_sample_id = sample_ids_this_group[k]
-                sample = batch[sub_sample_id]
-                partner_cp_size = len(
-                    [True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids]
-                )
-                sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-                new_data_iterator = RerunDataIterator(iter([sample]))
-            else:
-                new_data_iterator = None
+            new_data_iterator = _get_new_data_iterator(k, -1)
             # Call forward step for each sub-sample
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -959,16 +954,7 @@ def hybrid_context_parallel_forward_backward(
 
     # The last sub-sample of the last group of the last microbatch is
     # run out of the context handler.
-    if is_first_tp_rank:
-        sub_sample_id = sample_ids_this_group[-1]
-        sample = batch[sub_sample_id]
-        partner_cp_size = len(
-            [True for sample_ids in sample_id_groups[-1] if sub_sample_id in sample_ids]
-        )
-        sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-        new_data_iterator = RerunDataIterator(iter([sample]))
-    else:
-        new_data_iterator = None
+    new_data_iterator = _get_new_data_iterator(-1, -1)
     # Call forward step for each sub-sample
     output_tensor, num_tokens = forward_step(
         forward_step_func,

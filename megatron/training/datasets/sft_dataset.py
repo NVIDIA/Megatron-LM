@@ -123,10 +123,10 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            if self.config.context_parallel_size > 1 or self.config.tensor_model_parallel_size > 1:
+            if self.config.context_parallel_size > 1 or self.config.sequence_parallel_size > 1:
                 cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
                 cp_pad = cp_pad * self.config.data_parallel_size if self.config.hybrid_context_parallel else cp_pad
-                tp_pad = self.config.tensor_model_parallel_size
+                tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
                 pad_granularity = cp_pad * tp_pad
                 mod_token_count = len(pack_tokens) % pad_granularity
                 if mod_token_count != 0:

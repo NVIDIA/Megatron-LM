@@ -503,7 +503,6 @@ def get_blend_and_blend_per_split(args):
 def get_batch_on_this_tp_rank(data_iterator):
 
     args = get_args()
-    assert not (args.pipeline_model_parallel_size > 1 and args.hybrid_context_parallel), "Context parallelism not supported with pipeline parallelism now"
 
     def _broadcast(item):
         if item is not None:
