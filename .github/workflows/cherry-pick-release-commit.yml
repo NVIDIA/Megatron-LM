@@ -11,16 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Community Bot
+name: Create PR to main with cherry-pick from release
 
 on:
-  issues:
-    types: [opened, edited, reopened, closed, deleted]
-  issue_comment:
-    types: [created, edited, deleted]
+  push:
+    branches:
+      - main
 
 jobs:
-  community-bot:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_bot.yml@v0.49.1
+  cherry-pick:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@v0.31.0
     secrets:
-      GH_TOKEN: ${{ secrets.PAT }}
+      PAT: ${{ secrets.PAT }}
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

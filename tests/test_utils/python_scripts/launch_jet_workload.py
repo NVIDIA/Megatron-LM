@@ -68,18 +68,21 @@ def launch_and_wait_for_completion(
             pipeline = jetclient.JETClient(
                 customer="mcore", gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
             ).workloads.submit(
-                workloads=common.load_workloads(
-                    test_case=test_case,
-                    n_repeat=n_repeat,
-                    time_limit=(1200 if enable_lightweight_mode else time_limit),
-                    tag=tag,
-                    scope=scope,
-                    container_image=container_image,
-                    container_tag=container_tag,
-                    platform=platform,
-                    environment=environment,
-                    record_checkpoints=record_checkpoints,
-                ),
+                workloads=[
+                    jetclient.JETWorkloadManifest(**workload)
+                    for workload in common.load_workloads(
+                        test_case=test_case,
+                        n_repeat=n_repeat,
+                        time_limit=(1200 if enable_lightweight_mode else time_limit),
+                        tag=tag,
+                        scope=scope,
+                        container_image=container_image,
+                        container_tag=container_tag,
+                        platform=platform,
+                        environment=environment,
+                        record_checkpoints=record_checkpoints,
+                    )
+                ],
                 config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
                 custom_config={
                     "launchers": {cluster: cluster_config},

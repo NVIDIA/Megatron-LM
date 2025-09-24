@@ -110,8 +110,16 @@ test = [
     "pydantic",
     "tensorboard",
     "pyyaml",
+    "nemo-run",
 ]
-
+docs = [
+    "sphinx",
+    "sphinx-autobuild",    # For live doc serving while editing docs
+    "sphinx-autodoc2",     # For documenting Python API
+    "sphinx-copybutton",   # Adds a copy button for code blocks
+    "myst_parser",         # For our markdown docs
+    "nvidia-sphinx-theme", # Our NVIDIA theme
+]
 build = [
     "setuptools<80.0.0",
     "packaging>=24.2",
@@ -142,8 +150,9 @@ no-build-isolation-package = [
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton
-# because they are already installed in the base image.
+# We don't define override-dependencies globally but rather locally where we need it.
+# For instance, when installing into a PyTorch base image, we don't want to install torch, 
+# torchvision, and triton.
 override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
@@ -193,17 +202,22 @@ markers = [
 ]
 
 [tool.coverage.run]
-data_file = ".coverage_$LOCAL_RANK"
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
-relative_files = true
+parallel = true
+sigterm = false
 
 [tool.coverage.paths]
-source = ["/opt/megatron-lm/"]
+source = [
+    ".",
+    "/opt/megatron-lm/",
+    "/opt/megatron-lm-legacy/",
+    "/home/runner/work/Megatron-LM/Megatron-LM/",
+]
 
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the

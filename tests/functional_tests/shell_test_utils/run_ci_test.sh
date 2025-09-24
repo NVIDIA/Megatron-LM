@@ -237,7 +237,7 @@ for i in $(seq 1 $N_REPEAT); do
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
         if [[ "$MODE" == "pretraining" ]]; then
-            uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
@@ -271,9 +271,9 @@ for i in $(seq 1 $N_REPEAT); do
         if [[ "$MODE" == "pretraining" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
             if [[ "$TEST_TYPE" == "checkpoint-consistency" ]]; then
                 echo "Running checkpoint consistency check"
-                uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/test_optimizer_grads_match.py "${ITER_CHECKPOINT_DIRS[@]}"
+                uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/test_optimizer_grads_match.py "${ITER_CHECKPOINT_DIRS[@]}"
             else
-                uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
+                uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
                     --actual-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                     --train-iters $TRAIN_ITERS \
@@ -281,14 +281,14 @@ for i in $(seq 1 $N_REPEAT); do
                     $ALLOW_NONDETERMINISTIC_ALGO_ARG
 
                 if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
-                    uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                    uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                         --logs-dir $TENSORBOARD_PATH \
                         --train-iters $TRAIN_ITERS \
                         --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                         --is-second-run
                             
                     echo "Running pytest 1st vs 2nd run comparison"
-                    uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
+                    uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
                         --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                         --actual-values-second-run-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                         --train-iters $TRAIN_ITERS \
@@ -300,7 +300,7 @@ for i in $(seq 1 $N_REPEAT); do
             # For inference jobs
             if [[ "$MODE" == "inference" ]]; then
                 if [[ "$TEST_TYPE" == "frozen-start" ]]; then
-                    uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
+                    uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                         --golden-values-path $GOLDEN_VALUES_PATH \
                         --test-values-path $TENSORBOARD_PATH \
                         --model-config-path ${TRAINING_PARAMS_PATH} \
@@ -316,3 +316,5 @@ for i in $(seq 1 $N_REPEAT); do
         fi
     fi
 done
+
+coverage combine -q
