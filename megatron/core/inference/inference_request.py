@@ -133,6 +133,7 @@ class DynamicInferenceRequest(InferenceRequest):
     generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     finished_chunk_token_count = 0
