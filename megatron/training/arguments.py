@@ -2831,7 +2831,14 @@ def _add_data_args(parser):
                        'with other special tokens in the tokenizer. '
                        'Masking out such ambiguous pad tokens results in training instability. '
                        'Such a scenario should be resolved by fixing the tokenizer; setting this '
-                       'option to True provides a workaround.')
+                       'option to True provides a workaround. '
+                       'If left to the default of True, and the token id of the pad collides with '
+                       'other token ids in the provided tokenizer, tokens in the dataset that '
+                       'correspond to this ambiguous id will not be masked out of the loss '
+                       'calculation, as it is impossible to determine whether they are truly pad. '
+                       'If set to False, the training flow will error out if the tokenizer '
+                       'contains pad token id collisions. If not, the training flow will work as '
+                       'expected, masking out the loss of all pad tokens.')
     return parser
 
 
