@@ -200,8 +200,9 @@ def get_current_rank() -> Optional[int]:
                 # Update global state
                 state.set_rank(rank)
         except Exception as e:
+            pass  # Silently ignore distributed errors
     
-    # 如果仍然没有，尝试从环境变量获取
+    # If still None, try to get from environment variables
     if rank is None:
         rank_env = os.environ.get("LOCAL_RANK") or os.environ.get("RANK")
         if rank_env is not None:
