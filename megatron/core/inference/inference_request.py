@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -138,7 +139,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
     def __post_init__(self):
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = torch.tensor(self.prompt_tokens)
+            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
     @property
     def remaining_prompt_length(self):
