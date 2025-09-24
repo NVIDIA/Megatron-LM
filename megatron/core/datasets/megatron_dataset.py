@@ -96,8 +96,6 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
 
         self._error_if_pad_in_dataset = False
         if self.config.ignore_pad_in_dataset:
-            # Reset the pad token id to a value which is guaranteed not to be in the dataset
-            self._pad_token_id = _PAD_TOKEN_ID
             if self._pad_token_id in _special_tokens_list:
                 warnings.warn(
                     "The pad token id in the tokenizer overlaps with another special token id. "
@@ -116,6 +114,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                     "token, and it does so by ignoring any pad tokens present in the dataset. "
                     "Given your situation, the `ignore_pad_in_dataset` flag should be set to False."
                 )
+            # Reset the pad token id to a value which is guaranteed not to be in the dataset
+            self._pad_token_id = _PAD_TOKEN_ID
         else:
             if self._pad_token_id in _special_tokens_list:
                 raise ValueError(
