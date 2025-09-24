@@ -256,6 +256,8 @@ def loss_func(
         )
 
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    # Protect against division by zero when all tokens are masked.
+    num_tokens = torch.clamp(num_tokens, min=1)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
     return (loss, num_tokens, {'lm loss': reporting_loss})
