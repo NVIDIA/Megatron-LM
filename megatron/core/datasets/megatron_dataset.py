@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Union
@@ -80,7 +81,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             _special_tokens_list = [
                 v for k, v in self.config.tokenizer.special_tokens_dict.items() if k != "pad_token"
             ]
-        except AttributeError, IndexError, ValueError:
+        except (AttributeError, IndexError, ValueError):
             _special_tokens_list = []
         # If the tokenizer does not have a special_tokens_dict attribute, at least check eos and eod
         if not _special_tokens_list:
@@ -94,8 +95,10 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                 pass
 
         self._error_if_pad_in_dataset = False
-        if self._pad_token_id in _special_tokens_list:
-            if self.config.ignore_pad_in_dataset:
+        if self.config.ignore_pad_in_dataset:
+            # Reset the pad token id to a value which is guaranteed not to be in the dataset
+            self._pad_token_id = _PAD_TOKEN_ID
+            if self._pad_token_id in _special_tokens_list:
                 warnings.warn(
                     "The pad token id in the tokenizer overlaps with another special token id. "
                     "This may cause instability and lack of covergence during training. "
@@ -105,14 +108,6 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                     "and set `ignore_pad_in_dataset` to False in the dataset config."
                 )
             else:
-                raise ValueError(
-                    "The pad token id in the tokenizer overlaps with another special token id. "
-                    "This may cause instability and lack of covergence during training. "
-                    "As such, please provide a tokenizer with a uniquely-defined pad token id "
-                    "or set `ignore_pad_in_dataset` to True in the dataset config."
-                )
-        else:
-            if self.config.ignore_pad_in_dataset:
                 warnings.warn(
                     "This model uses a tokenizer that uniquely defines the pad token, and this "
                     "dataset intentionally contains such uniquely-defined pad tokens. However, "
@@ -121,9 +116,17 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                     "token, and it does so by ignoring any pad tokens present in the dataset. "
                     "Given your situation, the `ignore_pad_in_dataset` flag should be set to False."
                 )
-                else:
-                    # This represents a correct tokenizer and correct training flow.
-                    pass
+        else:
+            if self._pad_token_id in _special_tokens_list:
+                raise ValueError(
+                    "The pad token id in the tokenizer overlaps with another special token id. "
+                    "This may cause instability and lack of covergence during training. "
+                    "As such, please provide a tokenizer with a uniquely-defined pad token id "
+                    "or set `ignore_pad_in_dataset` to True in the dataset config."
+                )
+            else:
+                # This represents a correct tokenizer and correct training flow.
+                pass
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
