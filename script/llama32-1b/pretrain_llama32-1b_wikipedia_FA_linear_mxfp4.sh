@@ -50,11 +50,11 @@ mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Modifying quantization types to mxfp4..."
 
 # Modify linear layer quantization
-sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/'mxfp4'/" \
+sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'mxfp4'/" \
     megatron/core/tensor_parallel/layers.py
 
 # Modify attention quantization
-sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/'mxfp4'/" \
+sed -i "s/^\([[:space:]]*custom_quant_type[[:space:]]*=[[:space:]]*\)'[^']*'/\1'mxfp4'/" \
     megatron/core/transformer/dot_product_attention.py
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] Quantization type modifications completed"
