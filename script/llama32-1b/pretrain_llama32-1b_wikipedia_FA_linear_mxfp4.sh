@@ -17,7 +17,8 @@ START_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 # =============================================================================
 
 # Parse command line arguments
-SCALING_CONTROL=${6:-"max"}
+# SCALING_CONTROL=${6:-"max"}
+SCALING_CONTROL=${6:-"max_minus_1"}
 CHECKPOINT_PATH=${1:-"checkpoints/llama32_1b/pretrain_llama32-1b_wikipedia_FA_linear_mxfp4_${SCALING_CONTROL}"}
 TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama32_1b_mxfp4_${SCALING_CONTROL}"}
 TOKENIZER_ARG=${3:-"model/llama3.2-1b"}
