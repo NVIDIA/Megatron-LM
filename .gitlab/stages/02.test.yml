@@ -36,7 +36,7 @@ wait_for_resources:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export NUM_CONCURRENT_JOBS
-    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
+    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID --target-branch $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
   rules:
     - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       when: never
