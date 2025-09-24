@@ -967,7 +967,7 @@ class MXFPBAddBmm(Function):
             except Exception as e:
                 print(f"[MXFPBAddBmm] 保存backward tensor时出错: {e}")
         
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None, None  # None对应所有额外参数（14个）
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None, None, None # None对应所有额外参数（14个）
 
 def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwargs):
     """
