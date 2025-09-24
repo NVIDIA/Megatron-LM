@@ -143,15 +143,24 @@ class AdaptiveQuantizationManager:
                 # Save checkpoint with timestamp
                 checkpoint_name = f"{checkpoint_info['tag']}_iter{checkpoint_info['iteration']}_{checkpoint_info['precision']}"
                 
+                # Temporarily modify args.save to include checkpoint name
+                original_save = getattr(self.args, 'save', None)
+                
+                # Create a unique checkpoint directory for this save
+                if original_save:
+                    checkpoint_dir = f"{original_save}_{checkpoint_info['tag']}_iter{checkpoint_info['iteration']}_{checkpoint_info['precision']}"
+                    self.args.save = checkpoint_dir
+                
                 save_checkpoint(
                     iteration=checkpoint_info['iteration'],
                     model=self.model,
                     optimizer=self.optimizer,
                     opt_param_scheduler=self.opt_param_scheduler,
-                    num_floating_point_operations_so_far=self.num_floating_point_operations_so_far,
-                    tag=checkpoint_name,
-                    args=self.args
+                    num_floating_point_operations_so_far=self.num_floating_point_operations_so_far
                 )
+                
+                # Restore original save path
+                self.args.save = original_save
                 
                 if parallel_state.get_tensor_model_parallel_rank() == 0:
                     print(f"[AdaptiveQuantization] Checkpoint saved: {checkpoint_name}")
@@ -193,14 +202,25 @@ class AdaptiveQuantizationManager:
         try:
             checkpoint_name = f"{best_checkpoint['tag']}_iter{best_checkpoint['iteration']}_{best_checkpoint['precision']}"
             
+            # Temporarily modify args.load to point to the checkpoint directory
+            original_load = getattr(self.args, 'load', None)
+            
+            # Set the load path to the specific checkpoint directory
+            if hasattr(self.args, 'save') and self.args.save:
+                # Construct the checkpoint directory path
+                checkpoint_dir = f"{self.args.save}_{checkpoint_name}"
+                self.args.load = checkpoint_dir
+            
             # Load checkpoint
             iteration, num_floating_point_operations_so_far = load_checkpoint(
                 model=self.model,
                 optimizer=self.optimizer,
                 opt_param_scheduler=self.opt_param_scheduler,
-                tag=checkpoint_name,
-                args=self.args
+                load_arg='load'
             )
+            
+            # Restore original load path
+            self.args.load = original_load
             
             # Update state
             self.iteration = iteration
