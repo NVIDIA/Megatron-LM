@@ -17,8 +17,9 @@ START_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 # =============================================================================
 
 # Parse command line arguments
-CHECKPOINT_PATH=${1:-"checkpoints/llama32_1b/pretrain_llama32-1b_wikipedia_FA_linear_mxfp4"}
-TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama32_1b_mxfp4"}
+SCALING_CONTROL=${6:-"max"}
+CHECKPOINT_PATH=${1:-"checkpoints/llama32_1b/pretrain_llama32-1b_wikipedia_FA_linear_mxfp4_${SCALING_CONTROL}"}
+TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama32_1b_mxfp4_${SCALING_CONTROL}"}
 TOKENIZER_ARG=${3:-"model/llama3.2-1b"}
 DATA_ARG=${4:-"dataset/wikipedia_processed/wikipedia_processed_text_document"}
 DTYPE=${5:-"bf16"}
@@ -70,7 +71,8 @@ bash examples/llama/train_llama32_1b_h100_fp8.sh \
     "$TOKENIZER_ARG" \
     "$DATA_ARG" \
     "$DTYPE" \
-    2>&1 | tee "${HOST_TENSORBOARD_LOGS_PATH}/training_pretrain_llama32-1b_wikipedia_FA_linear_mxfp4_$(date +'%y-%m-%d_%H-%M-%S').log"
+    --scaling-control "$SCALING_CONTROL" \
+    2>&1 | tee "${HOST_TENSORBOARD_LOGS_PATH}/training_pretrain_llama32-1b_wikipedia_FA_linear_mxfp4_${SCALING_CONTROL}_$(date +'%y-%m-%d_%H-%M-%S').log"
 
 TRAINING_EXIT_CODE=${PIPESTATUS[0]}
 

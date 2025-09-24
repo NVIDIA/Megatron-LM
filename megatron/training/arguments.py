@@ -1746,6 +1746,8 @@ def _add_logging_args(parser):
                        help='Directory to save tensor logs (default: ./enhanced_tensor_logs)')
     group.add_argument('--control-iter', type=int, default=None,
                        help='Number of iterations to collect tensors before stopping (default: None, no limit)')
+    group.add_argument('--scaling-control', type=str, default='max', choices=['max', 'max_minus_1'],
+                       help='Scaling control strategy for MX quantization: max (default) or max_minus_1')
     return parser
 
 

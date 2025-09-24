@@ -369,7 +369,7 @@ def _quantize_elemwise_core(A, bits, exp_bits, max_norm, round='nearest',
     return out
 
 
-def _shared_exponents(A, method="max", axes=None, ebits=0):
+def _shared_exponents(A, method="max", axes=None, ebits=0, scaling_control="max"):
     """
     Get shared exponents for the passed matrix A.
     Args:
@@ -385,11 +385,19 @@ def _shared_exponents(A, method="max", axes=None, ebits=0):
 
     if method == "max":
         if axes is None:
-            shared_exp = torch.max(torch.abs(A))
+            max_val = torch.max(torch.abs(A))
+            if scaling_control == "max_minus_1":
+                # Use max - 1 strategy to avoid potential overflow
+                shared_exp = max_val - 1.0
+            else:  # default "max"
+                shared_exp = max_val
         else:
             shared_exp = A
             for axis in axes:
                 shared_exp, _ = torch.max(torch.abs(shared_exp), dim=axis, keepdim=True)
+            if scaling_control == "max_minus_1":
+                # Use max - 1 strategy to avoid potential overflow
+                shared_exp = shared_exp - 1.0
     elif method == "none":
         shared_exp = torch.abs(A)
     else:
@@ -499,6 +507,7 @@ def _quantize_mx(
     block_size=0,
     round="nearest",
     flush_fp32_subnorms=False,
+    scaling_control="max",
 ):
     """Function used for MX* quantization
     """
@@ -530,7 +539,7 @@ def _quantize_mx(
 
     # Get shared exponents
     shared_exp = _shared_exponents(
-        A, method=shared_exp_method, axes=shared_exp_axes, ebits=0,
+        A, method=shared_exp_method, axes=shared_exp_axes, ebits=0, scaling_control=scaling_control,
     )
 
     # Flush subnormal FP32 inputs to zero
@@ -573,7 +582,8 @@ class MXFPMatMul(Function):
                 elem_format: str = 'fp8_e5m2', block_size: int = 32,
                 layer_type: Optional[str] = None, layer_idx: Optional[int] = None,
                 operation: str = "forward", phase: str = "pre", component: str = "linear",
-                rank: Optional[int] = None, metadata: Optional[Dict[str, Any]] = None):
+                rank: Optional[int] = None, metadata: Optional[Dict[str, Any]] = None,
+                scaling_control: str = "max"):
         # 保存tensor和参数到ctx
         ctx.save_for_backward(A, B)
         ctx.elem_format = elem_format
@@ -585,17 +595,18 @@ class MXFPMatMul(Function):
         ctx.component = component
         ctx.rank = rank
         ctx._metadata = metadata
+        ctx.scaling_control = scaling_control
         
         # 量化tensor
         A_q = _quantize_mx(
             A, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-1, block_size=block_size,
-            round="nearest", flush_fp32_subnorms=False
+            round="nearest", flush_fp32_subnorms=False, scaling_control=scaling_control
         )
         B_q = _quantize_mx(
             B, scale_bits=8, elem_format=elem_format,
             shared_exp_method="max", axes=-2, block_size=block_size,
-            round="nearest", flush_fp32_subnorms=False
+            round="nearest", flush_fp32_subnorms=False, scaling_control=scaling_control
         )
         
         # 执行矩阵乘法
@@ -768,14 +779,15 @@ class MXFPMatMul(Function):
             except Exception as e:
                 pass  # Silently ignore tensor saving errors
         
-        return grad_A, grad_B, None, None, None, None, None, None, None, None, None  # None对应所有额外参数
+        return grad_A, grad_B, None, None, None, None, None, None, None, None, None, None  # None对应所有额外参数（12个）
 
 class MXFPBAddBmm(Function):
     @staticmethod
     def forward(ctx, input, batch1, batch2, beta=1.0, alpha=1.0,
                 elem_format='fp8_e5m2', block_size=32,
                 layer_type=None, layer_idx=None, operation="forward", 
-                phase="pre", component="attention", rank=None, metadata=None):
+                phase="pre", component="attention", rank=None, metadata=None,
+                scaling_control="max"):
         ctx.save_for_backward(input, batch1, batch2)
         ctx.beta, ctx.alpha = beta, alpha
         ctx.elem_format = elem_format
@@ -787,10 +799,11 @@ class MXFPBAddBmm(Function):
         ctx.component = component
         ctx.rank = rank
         ctx._metadata = metadata
+        ctx.scaling_control = scaling_control
         
         # 使用集成了tensor保存的MXFPMatMul
         mm_out = MXFPMatMul.apply(batch1, batch2, elem_format, block_size,
-                                  layer_type, layer_idx, operation, phase, component, rank, metadata)
+                                  layer_type, layer_idx, operation, phase, component, rank, metadata, scaling_control)
         output = beta * input + alpha * mm_out
         
         # 自动保存forward阶段的tensor
@@ -967,9 +980,9 @@ class MXFPBAddBmm(Function):
             except Exception as e:
                 pass  # Silently ignore tensor saving errors
         
-        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None, None, None # None对应所有额外参数（14个）
+        return grad_input, grad_batch1, grad_batch2, None, None, None, None, None, None, None, None, None, None, None, None # None对应所有额外参数（15个）
 
-def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwargs):
+def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, scaling_control='max', **tensor_save_kwargs):
     """
     MXFP矩阵乘法函数，支持tensor保存
     
@@ -997,14 +1010,15 @@ def mxfp_matmul(A, B, elem_format='fp8_e5m2', block_size=32, **tensor_save_kwarg
             tensor_save_kwargs.get('phase', 'pre'),
             tensor_save_kwargs.get('component', 'linear'),
             tensor_save_kwargs.get('rank'),
-            tensor_save_kwargs.get('metadata')
+            tensor_save_kwargs.get('metadata'),
+            scaling_control
         )
     else:
         # 否则使用原始调用方式
-        return MXFPMatMul.apply(A, B, elem_format, block_size)
+        return MXFPMatMul.apply(A, B, elem_format, block_size, None, None, "forward", "pre", "linear", None, None, scaling_control)
 
 def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
-                 elem_format='fp8_e5m2', block_size=32, **tensor_save_kwargs):
+                 elem_format='fp8_e5m2', block_size=32, scaling_control='max', **tensor_save_kwargs):
     """
     MXFP Batch Add Batch Matrix Multiplication函数，支持tensor保存
     
@@ -1026,11 +1040,12 @@ def mxfp_baddbmm(input, batch1, batch2, beta=1.0, alpha=1.0,
             tensor_save_kwargs.get('phase', 'pre'),
             tensor_save_kwargs.get('component', 'attention'),
             tensor_save_kwargs.get('rank'),
-            tensor_save_kwargs.get('metadata')
+            tensor_save_kwargs.get('metadata'),
+            scaling_control
         )
     else:
         # 否则使用原始调用方式
-        return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size)
+        return MXFPBAddBmm.apply(input, batch1, batch2, beta, alpha, elem_format, block_size, None, None, "forward", "pre", "attention", None, None, scaling_control)
 
 if __name__ == '__main__':
     A = torch.load("grad_output.pt", map_location='cpu').cuda()

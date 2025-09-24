@@ -170,6 +170,9 @@ class DotProductAttention(MegatronModule):
         import os
         custom_quant_type = 'hifp8'
         
+        # 获取scaling_control参数
+        scaling_control = 'max'  # 默认值，后续可以从args获取
+        
         # 准备tensor保存参数
         tensor_save_params = {
             "layer_type": "attention",
@@ -202,6 +205,7 @@ class DotProductAttention(MegatronModule):
                 key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
                 beta=0.0,
                 alpha=self.softmax_scale,
+                scaling_control=scaling_control,
                 **tensor_save_params
             )
         elif custom_quant_type == 'mxfp8':
@@ -211,6 +215,7 @@ class DotProductAttention(MegatronModule):
                 key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
                 beta=0.0,
                 alpha=self.softmax_scale,
+                scaling_control=scaling_control,
                 **tensor_save_params
             )
         elif custom_quant_type == 'hifp8':
@@ -302,9 +307,9 @@ class DotProductAttention(MegatronModule):
         if custom_quant_type == 'hifp8':
             context = hifp_matmul(attention_probs, value.transpose(0, 1), **context_tensor_save_params)
         elif custom_quant_type == 'mxfp8':
-            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp8_e4m3', **context_tensor_save_params)
+            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp8_e4m3', scaling_control=scaling_control, **context_tensor_save_params)
         elif custom_quant_type == 'mxfp4':
-            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp4_e2m1', **context_tensor_save_params)
+            context = mxfp_matmul(attention_probs, value.transpose(0, 1), 'fp4_e2m1', scaling_control=scaling_control, **context_tensor_save_params)
         elif custom_quant_type == 'bf16':
             context = bf16_matmul(attention_probs, value.transpose(0, 1), **context_tensor_save_params)
         else:

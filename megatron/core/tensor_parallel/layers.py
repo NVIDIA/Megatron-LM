@@ -785,6 +785,9 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         
         custom_quant_type = 'hifp8'
         
+        # 获取scaling_control参数
+        scaling_control = getattr(ctx, 'scaling_control', 'max')
+        
         # 尝试从调用栈获取layer_idx
         layer_idx = getattr(ctx, 'layer_idx', None)
         if layer_idx is None:
@@ -844,6 +847,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
                 total_input, weight.t(),
                 elem_format='fp4_e2m1',
                 block_size=32,
+                scaling_control=scaling_control,
                 **tensor_save_params
             )
         elif custom_quant_type == 'mxfp8':
@@ -851,6 +855,7 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
                 total_input, weight.t(),
                 elem_format='fp8_e4m3',
                 block_size=32,
+                scaling_control=scaling_control,
                 **tensor_save_params
             )
         elif custom_quant_type == 'hifp8':
