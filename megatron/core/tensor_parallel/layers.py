@@ -783,7 +783,10 @@ class CustomLinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Funct
         import os
         import inspect
         
+        # 获取量化类型（支持time-resume自适应量化）
         custom_quant_type = 'hifp8'
+        if hasattr(ctx, '_adaptive_quantization_manager'):
+            custom_quant_type = ctx._adaptive_quantization_manager.get_current_quantization_type()
         
         # 获取scaling_control参数
         scaling_control = getattr(ctx, 'scaling_control', 'max')

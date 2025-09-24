@@ -1748,6 +1748,20 @@ def _add_logging_args(parser):
                        help='Number of iterations to collect tensors before stopping (default: None, no limit)')
     group.add_argument('--scaling-control', type=str, default='max', choices=['max', 'max_minus_1'],
                        help='Scaling control strategy for MX quantization: max (default) or max_minus_1')
+    
+    # Time-resume adaptive quantization parameters
+    group.add_argument('--time-resume', action='store_true',
+                       help='Enable time-resume adaptive quantization training')
+    group.add_argument('--quant-loss-threshold', type=float, default=0.1,
+                       help='Loss threshold for switching from quantized to BF16 training')
+    group.add_argument('--quant-window-size', type=int, default=5,
+                       help='Number of iterations per training window')
+    group.add_argument('--quant-checkpoint-interval', type=int, default=1,
+                       help='Checkpoint save interval within windows (in iterations)')
+    group.add_argument('--quant-fallback-strategy', type=str, default='bf16', choices=['bf16', 'fp16'],
+                       help='Fallback precision when quantized training fails')
+    group.add_argument('--quant-recovery-buffer', type=int, default=2,
+                       help='Number of checkpoints to keep for recovery')
     return parser
 
 

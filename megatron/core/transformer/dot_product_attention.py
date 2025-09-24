@@ -170,6 +170,15 @@ class DotProductAttention(MegatronModule):
         import os
         custom_quant_type = 'hifp8'
         
+        # 支持time-resume自适应量化
+        try:
+            from megatron.core.adaptive_quantization import get_adaptive_quantization_manager
+            # 尝试从全局状态获取量化管理器
+            if hasattr(self, '_adaptive_quantization_manager'):
+                custom_quant_type = self._adaptive_quantization_manager.get_current_quantization_type()
+        except ImportError:
+            pass
+        
         # 获取scaling_control参数
         scaling_control = 'max'  # 默认值，后续可以从args获取
         

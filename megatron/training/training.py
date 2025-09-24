@@ -2139,6 +2139,20 @@ def train(
         )
         cuda_graph_helper.create_cudagraphs()
 
+    # Initialize adaptive quantization manager if time-resume is enabled
+    adaptive_quantization_manager = None
+    if getattr(args, 'time_resume', False):
+        try:
+            from megatron.core.adaptive_quantization import get_adaptive_quantization_manager
+            adaptive_quantization_manager = get_adaptive_quantization_manager(
+                args, model, optimizer, opt_param_scheduler, 
+                iteration, num_floating_point_operations_so_far
+            )
+            print_rank_0("[TimeResume] Adaptive quantization training enabled")
+        except ImportError as e:
+            print_rank_0(f"[TimeResume] Failed to import adaptive quantization: {e}")
+            adaptive_quantization_manager = None
+
     # Run training iterations till done.
     buffered_rollouts = None
     ref_state_dict = None
@@ -2331,6 +2345,35 @@ def train(
             params_norm,
             num_zeros_in_grad,
         )
+        
+        # Handle adaptive quantization if time-resume is enabled
+        if adaptive_quantization_manager is not None and not skipped_iter:
+            # Get current loss for adaptive quantization
+            current_loss = None
+            for key in loss_dict:
+                if 'loss' in key.lower():
+                    current_loss = loss_dict[key].item()
+                    break
+            
+            if current_loss is not None:
+                # Check if we should switch precision
+                should_switch, new_precision = adaptive_quantization_manager.should_switch_precision(current_loss)
+                
+                if should_switch:
+                    # Save checkpoint before switching
+                    adaptive_quantization_manager.save_checkpoint_async(iteration, f"switch_to_{new_precision}")
+                    
+                    # Update precision
+                    adaptive_quantization_manager.current_precision = new_precision
+                    
+                    print_rank_0(f"[TimeResume] Switched to {new_precision} training at iteration {iteration}")
+                
+                # Check if we should save checkpoint within window
+                if adaptive_quantization_manager.should_save_checkpoint(iteration):
+                    adaptive_quantization_manager.save_checkpoint_async(iteration)
+                
+                # Update window state
+                adaptive_quantization_manager.update_window_state(iteration)
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
@@ -2420,6 +2463,10 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
         energy_monitor.shutdown()
+
+    # Finalize adaptive quantization manager if enabled
+    if adaptive_quantization_manager is not None:
+        adaptive_quantization_manager.finalize()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
