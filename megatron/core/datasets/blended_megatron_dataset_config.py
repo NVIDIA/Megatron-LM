@@ -77,15 +77,14 @@ class BlendedMegatronDatasetConfig:
        datasets(s).
     """
 
-    ignore_pad_in_dataset: Optional[bool] = True
-    """Whether to ignore pad tokens that may already be present in the dataset.
-       This option is useful when the tokenizer incorrectly reuses the same token id for the
-       pad token as it does for other tokens, most notably eos.
+    mask_ambiguous_pad_tokens: Optional[bool] = False
+    """Whether to prevent pad tokens alrady present in the dataset from being masked out 
+       when the pad token incorrectly shares the same id with other special tokens.
        Treating such tokens as pad tokens results in training instability and divergence.
-       Such a scenario should be resolved by fixing the tokenizer, but setting this option to True
+       Such a scenario should be resolved by fixing the tokenizer, but setting this option to False
        provides a workaround.
-       This option should be set to False if the tokenizer is correct and the dataset intentionally
-       contains pad tokens.
+       This option should be changed to True if the tokenizer is correct and the dataset
+       intentionally contains pad tokens.
     """
 
     def __post_init__(self) -> None:
