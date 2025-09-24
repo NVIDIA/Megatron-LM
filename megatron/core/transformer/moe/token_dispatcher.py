@@ -932,7 +932,6 @@ class _DeepepManager(_DispatchManager):
         router_topk: int,
         num_experts: int,
         config: TransformerConfig,
-        offload_activation: bool = False,
     ):
         """
         Initialize the DeepEP dispatcher.
@@ -954,7 +953,6 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = config.moe_router_dtype
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
-        self.offload_activation = offload_activation
 
         # Metadata
         self.token_indices: Optional[torch.Tensor] = None
@@ -1022,9 +1020,6 @@ class _DeepepManager(_DispatchManager):
             A tuple of (routing_map, probs), where routing_map is the multihot vector
             and probs is the multihot probabilities.
         """
-        if self.offload_activation:
-            routing_map_vectorized, probs_map_vectorized = self._indices_to_multihot_vectorized(indices, probs)
-            return routing_map_vectorized, probs_map_vectorized
         batch_size = indices.shape[0]
         multihot_routing_map = torch.zeros(
             (batch_size, self.num_local_experts), dtype=torch.long, device=indices.device
@@ -1042,47 +1037,6 @@ class _DeepepManager(_DispatchManager):
         multihot_routing_map[row_indices, valid_indices] = 1
         multihot_probs[row_indices, valid_indices] = probs[mask]
         return multihot_routing_map.bool(), multihot_probs
-
-    def _indices_to_multihot_vectorized(self, indices, probs):
-        """
-        Converts a tensor of indices to a multihot vector efficiently in PyTorch when enabling
-            offload_activation.
-
-        Args:
-            indices (torch.Tensor): [num_tokens, topk] token indices, where -1 means masked out.
-                                    The max value of indices is local_num_experts - 1.
-            probs (torch.Tensor): [num_tokens, topk] token probabilities.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - routing_map: Multihot vector.
-                - probs: Multihot probabilities.
-        """
-        batch_size, topk = indices.shape
-
-        # Create mask for valid indices
-        mask = indices != -1
-
-        # Replace -1 with a valid index (will be masked out anyway)
-        safe_indices = torch.where(mask, indices, 0)
-
-        # Create one-hot encoding for all positions
-        # Shape: [batch_size, topk, num_local_experts]
-        one_hot = torch.nn.functional.one_hot(safe_indices, num_classes=self.num_local_experts).float()
-
-        # Apply mask to zero out invalid positions
-        # Expand mask to match one_hot dimensions
-        mask_expanded = mask.unsqueeze(-1).float()
-        one_hot = one_hot * mask_expanded
-
-        # Sum along topk dimension to get multihot representation
-        multihot_routing_map = (one_hot.sum(dim=1) > 0).bool()
-
-        # For probabilities, multiply by probs and sum
-        probs_expanded = probs.unsqueeze(-1)
-        multihot_probs = (one_hot * probs_expanded).sum(dim=1)
-
-        return multihot_routing_map, multihot_probs
 
     def get_dispached_metadata(self) -> torch.Tensor:
         return self.dispatched_indices, self.dispatched_probs
@@ -1219,7 +1173,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             router_topk=self.tp_size * self.config.moe_router_topk,
             num_experts=self.tp_size * self.config.num_moe_experts,
             config=self.config,
-            offload_activation=self.config.offload_activation,
         )
 
     def set_shared_experts(self, shared_experts):

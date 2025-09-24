@@ -6,6 +6,7 @@ from typing import NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+import contextlib
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -37,7 +38,7 @@ from megatron.core.utils import (
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
-from megatron.core.pipeline_parallel.cpu_offload import (
+from megatron.core.transformer.cpu_offload import (
     PipelineOffloadManager,
     group_prefetch_offload_start,
     group_prefetch_offload_commit,
@@ -185,18 +186,18 @@ class Attention(MegatronModule, ABC):
         )
 
         self.offload_qkv_linear = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "qkv_linear" in self.config.offload_modules
         )
 
         self.offload_core_attention = (
-            self.config.offload_activation
+            self.config.fine_grained_activation_offloading
             and "core_attn" in self.config.offload_modules
         )
 
-        self.offload_attn_linear = (
-            self.config.offload_activation
-            and "attn_linear" in self.config.offload_modules
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -266,58 +267,6 @@ class Attention(MegatronModule, ABC):
         )
 
         return hidden_states
-
-    def _offload_core_attention_forward(
-        self,
-        query,
-        key,
-        value,
-        attention_mask,
-        rotary_pos_emb=None,
-        attn_mask_type=None,
-        attention_bias=None,
-        packed_seq_params=None,
-    ):
-        """Forward method with attention activation offloading."""
-
-        def custom_forward(*inputs):
-            query = inputs[0]
-            key = inputs[1]
-            value = inputs[2]
-            attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
-            attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-            return output_
-
-        if attn_mask_type is None:
-            attn_mask_type = self.attn_mask_type
-        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        value = value.contiguous()
-
-        query = group_prefetch_offload_start(query)
-        key = group_prefetch_offload_start(key)
-        value = group_prefetch_offload_start(value)
-
-        handler = PipelineOffloadManager.get_instance().cur_forward_chunk()
-        handler.register_offload_tensor([query, key, value])
-        query.offloading_activation = True
-        key.offloading_activation = True
-        value.offloading_activation = True
-        with PipelineOffloadManager.get_instance():
-            hidden_states = custom_forward(
-                query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
-            )
-        hidden_states = group_prefetch_offload_commit(hidden_states, release_tensors=[query, key, value])
-        return hidden_states[0]
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -879,30 +828,23 @@ class Attention(MegatronModule, ABC):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
-        elif self.offload_core_attention and self.training:
-
-
-            core_attn_out = self._offload_core_attention_forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
         else:
+            offload_context = contextlib.nullcontext()
+            if self.offload_core_attention and self.training:
+                query = group_prefetch_offload_start(query, name="core_attn")
+                offload_context = PipelineOffloadManager.get_instance()
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                with offload_context:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
@@ -922,6 +864,9 @@ class Attention(MegatronModule, ABC):
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+        if self.offload_core_attention and self.training:
+            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[])
+            offload_context = contextlib.nullcontext()
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -936,16 +881,15 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        if self.offload_attn_linear:
-            if not core_attn_out.is_contiguous():
-                core_attn_out = core_attn_out.contiguous()
-            core_attn_out = group_prefetch_offload_start(core_attn_out)
-            core_attn_out.offloading_activation = True
-            with PipelineOffloadManager.get_instance():
-                output, bias = self.linear_proj(core_attn_out)
-            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
-        else:
+        offload_context = contextlib.nullcontext()
+        if self.offload_attn_proj:
+            core_attn_out = group_prefetch_offload_start(core_attn_out, name="attn_proj")
+            offload_context = PipelineOffloadManager.get_instance()
+        with offload_context:
             output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[])
+            offload_context = contextlib.nullcontext()
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias

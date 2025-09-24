@@ -666,6 +666,26 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    #####################################
+    # Fine-grained Activation Offloading
+    #####################################
+    fine_grained_activation_offloading: bool = False
+    """If True, offload the activation to the CPU."""
+
+    offload_modules: Optional[list[str]] = None
+    """The submodules to offload.
+    choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
+    default: ["core_attn"].
+    "attn_norm": offload the input of the normalization in the attention part.
+    "core_attn": offload the input of the core attention part.
+    "mlp_norm": offload the input of the normalization in the mlp part.
+    "attn_proj": offload the input of the attn linear projection part.
+    "expert_fc1": offload the input of the expert fc1 part.
+    "moe_act": offload the input of the moe act part.
+    """
+    offload_module_count_per_layer: Optional[int] = 0
+    """The number of modules to offload per layer. default: 0."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -939,37 +959,27 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
-        if self.offload_modules is None:
-            self.offload_modules = ["core_attn"]
+        # if self.offload_modules is None:
+        #     self.offload_modules = ["core_attn"]
 
         if len(self.offload_modules) > 0:
+            self.offload_modules = list(set(self.offload_modules))
             allowed_modules = {
-                "self_attn", "qkv_linear", "core_attn", "attn_linear", "router_fc1"
+                "core_attn", "attn_proj", "expert_fc1", "moe_act", "attn_norm", "mlp_norm"
             }
-            if self.multi_latent_attention:
-                flag = "self_attn" in self.offload_modules or "qkv_linear" in self.offload_modules or "core_attn" in self.offload_modules or "attn_linear" in self.offload_modules
-                assert not flag, "(Temporary) self_attn, qkv_linear, core_attn, attn_linear must not be in offload_modules when multi_latent_attention is True"
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            self.offload_module_count_per_layer = len(self.offload_modules)
+            if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
+                raise ValueError(
+                    "attn_proj cannot be set to offload_modules alone without core_attn "
+                    "because the input of attn_proj is the output of core_attn, "
+                    "which is needed in core_attn.backward()."
+                )
 
-        if "self_attn" in self.offload_modules:
-            if "qkv_linear" in self.offload_modules:
-                self.offload_modules.remove("qkv_linear")
-            if "core_attn" in self.offload_modules:
-                self.offload_modules.remove("core_attn")
-            if "attn_linear" in self.offload_modules:
-                self.offload_modules.remove("attn_linear")
-
-        if "core_attn" in self.offload_modules:
-            warnings.warn(
-                "If you are using transformer_engine as the transformer implementation, "
-                "the core_attn is from transformer_engine and may be the fused version. "
-                "For fused attention, you have no need to set 'core_attn' to offload. "
-                "Please check that the core_attn offload is really needed."
-            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
