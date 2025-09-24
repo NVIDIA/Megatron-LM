@@ -94,9 +94,6 @@ class SingleEncoderModel(torch.nn.Module):
         self.encoder_input_tensor = None
         self.llm_input_tensor = None
 
-        self.pre_process = False
-        self.post_process = False
-        self.share_embeddings_and_output_weights = False
 
     def finish_grad_sync(self):
         """Finish gradient synchronization for all active modules on this rank."""
@@ -293,7 +290,7 @@ class DualEncoderModel(SingleEncoderModel):
     def finalize_model_grads(self, module=None, num_tokens=None, pg_collection=None):
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
-                finalize_model_grads([self], num_tokens=None, pg_collection=_get_pg_collection_with_embedding_groups(grid))
+                finalize_model_grads([module], num_tokens=None, pg_collection=_get_pg_collection_with_embedding_groups(grid))
                
 
     def forward(self, hidden_states):
@@ -424,6 +421,11 @@ def get_transformer_block_and_grid(
         block = DistributedDataParallel(
             config=block.config, ddp_config=ddp_config, module=block, pg_collection=pg_collection
         )
+        block.pre_process = False
+        block.post_process = False
+        block.share_embeddings_and_output_weights = False
+
+
     else:
         block = None
 
@@ -693,7 +695,7 @@ if __name__ == "__main__":
     mock_mocker = Mock()
 
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
-    test_forward_backward_pipelining_without_interleaving_multi_module_dual_encoder(
+    test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
         mock_mocker, 
         encoder_tp=2, 
         encoder_pp=2, 
