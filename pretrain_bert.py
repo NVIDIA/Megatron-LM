@@ -172,6 +172,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         masking_use_geometric_distribution=False,
         classification_head=args.bert_binary_head,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        ignore_pad_in_dataset=args.ignore_pad_in_dataset,
     )
 
     print_rank_0('> building train, validation, and test datasets '
