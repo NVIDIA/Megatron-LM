@@ -95,13 +95,13 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                 pass
 
         if self._pad_token_id in _special_tokens_list:
-            if self.config.ignore_pad_collision_in_dataset:
+            if self.config.prevent_masking_of_ambiguous_pad_tokens:
                 # Reset the pad token id to a value which is guaranteed not to be in the dataset
                 self._pad_token_id = _PAD_TOKEN_ID
                 warnings.warn(
                     "The pad token id in the tokenizer collides with another special token id. "
                     "This may cause instability and lack of covergence during training. "
-                    "As such, the training flow will automatically ignore any pad tokens already "
+                    "As such, the training flow will avoid masking out any pad tokens already "
                     "present in the dataset. If you would like to disable this behavior, "
                     "please provide a tokenizer with a uniquely-defined pad token id."
                 )
@@ -109,8 +109,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
                 raise ValueError(
                     "The pad token id in the tokenizer collides with another special token id. "
                     "This may cause instability and lack of covergence during training. "
-                    "As such, please provide a tokenizer with a uniquely-defined pad token id "
-                    "or set `ignore_pad_collision_in_dataset` to True in the dataset config."
+                    "As such, please provide a tokenizer with a uniquely-defined pad token id or "
+                    "set `prevent_masking_of_ambiguous_pad_tokens` to True in the dataset config."
                 )
 
     @staticmethod
