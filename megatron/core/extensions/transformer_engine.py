@@ -982,6 +982,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
+        #TODO: add is_te_min_version("2.9.0") before merge
+        if config.qk_clip:
+            # TE 2.9.0 introduces return_max_score for qk-clip getting the max attention score
+            extra_kwargs["return_max_score"] = True
+        print(f"extra_kwargs: {extra_kwargs["return_max_score"]}")
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,
@@ -1045,6 +1051,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )
+            assert False, f"core_attn_out: {core_attn_out} {len(core_attn_out)}"
         else:
             core_attn_out = super().forward(
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
