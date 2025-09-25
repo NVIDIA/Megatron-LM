@@ -216,12 +216,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Iterate cuda graph dims.
                 if (
                     warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    and not context.non_decode_cuda_graphs
+                    and not self.context.non_decode_cuda_graphs
                 ):
                     continue
-                tbar = enumerate(context.cuda_graph_token_counts)
+                tbar = enumerate(self.context.cuda_graph_token_counts)
                 if HAVE_TQDM:
-                    tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+                    tbar = tqdm(tbar, total=len(self.context.cuda_graph_token_counts))
                 for tbar_idx, cuda_graph_token_count in tbar:
                     if (
                         cuda_graph_token_count == 1
@@ -231,13 +231,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         # tokens for a non-decode engine step.
                         continue
                     # Initialize attention state.
-                    context.initialize_attention_state(
+                    self.context.initialize_attention_state(
                         num_warmup_tokens=cuda_graph_token_count,
                         warmup_engine_mode=warmup_engine_mode,
                     )
                     assert (
-                        cuda_graph_token_count == context.padded_active_token_count
-                    ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+                        cuda_graph_token_count == self.context.padded_active_token_count
+                    ), f"{cuda_graph_token_count} vs. {self.context.padded_active_token_count}."
 
                     # Progress.
                     mode_str = warmup_engine_mode.name.lower()
@@ -250,20 +250,26 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
 
                     # Get flat tokens, position ids.
-                    input_ids, position_ids = context.current_input_and_position_ids(
+                    input_ids, position_ids = self.context.current_input_and_position_ids(
                         num_warmup_tokens=cuda_graph_token_count
                     )
 
                     # Forward pass -> logits.
                     with torch.inference_mode():
-                        controller.inference_wrapped_model.run_one_forward_step(
+                        # >>>
+                        # ldebug()
+                        # <<<
+                        self.controller.inference_wrapped_model.run_one_forward_step(
                             {
                                 "tokens": input_ids,
                                 "position_ids": position_ids,
                                 "attention_mask": None,
                             }
                         )
-                        context.reset()  # todo: @lmcafee, remove if unnecessary.
+                        self.context.reset()  # todo: @lmcafee, remove if unnecessary.
+                    # >>>
+                    torch.cuda.synchronize()
+                    # <<<
 
             # Memory usage.
             time_end = time.time()
@@ -417,7 +423,75 @@ class DynamicInferenceEngine(AbstractEngine):
             self.run_engine_with_coordinator(sampling_params)
         )
 
-    @contextmanager
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # @contextmanager
+    # @staticmethod
+    # def suspend_resume_ctx(
+    #     key: str,
+    #     *,
+    #     unified_memory_level: int,
+    #     newline: bool = True,
+    # ) -> None:
+    #     """Context manager for of suspending and resuming the engine.
+
+    #     This context manager records the time and memory usage when suspending
+    #     and resuming the context. TODO(@lmcafee): add argument to optionally
+    #     return nullcontext, to avoid overhead.
+
+    #     Args:
+    #         key (str): Key that identifies caller (e.g., 'suspend' or 'resume').
+    #         newline (bool): Print newline at end of printout below.
+
+    #     Return:
+    #         None.
+    #     """
+
+    #     try:
+
+    #         # >>>
+    #         torch.cuda.synchronize()
+    #         # <<<
+    #         start_mem = torch.cuda.memory_stats()
+    #         start_time = time.time()
+    #         torch.cuda.synchronize()
+
+    #         yield
+
+    #     finally:
+
+    #         # >>>
+    #         torch.cuda.synchronize()
+    #         # <<<
+    #         end_time = time.time()
+
+    #         end_mem = torch.cuda.memory_stats()
+    #         start_mem_alloc = start_mem["allocated_bytes.all.current"]
+    #         end_mem_alloc = end_mem["allocated_bytes.all.current"]
+    #         start_mem_res = start_mem["reserved_bytes.all.current"]
+    #         end_mem_res = end_mem["reserved_bytes.all.current"]
+
+    #         rank_str = torch.distributed.get_rank()
+    #         dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
+    #         relative_time_str = f"{end_time - start_time:.3f} sec"
+    #         relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+
+    #         process = psutil.Process()
+    #         mem_info = process.memory_info()
+    #         total_mem_str = (
+    #             f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
+    #         )
+    #         print(
+    #             f"[rank {rank_str}] dynamic engine {key}, "
+    #             f"unified {unified_memory_level}, "
+    #             f"{dir_str} "
+    #             f"{relative_mem_str} in {relative_time_str} ... "
+    #             f"abs mem usage: {total_mem_str}",
+    #             end=".\n" if newline else "",
+    #         )
+    #         # >>>
+    #         torch.cuda.synchronize()
+    #         # <<<
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     @staticmethod
     def suspend_resume_ctx(
         key: str,
@@ -439,47 +513,13 @@ class DynamicInferenceEngine(AbstractEngine):
             None.
         """
 
-        try:
-
-            # >>>
-            torch.cuda.synchronize()
-            # <<<
-            start_mem = torch.cuda.memory_stats()
-
-            start_time = time.time()
-            torch.cuda.synchronize()
-
-            yield
-
-        finally:
-
-            torch.cuda.synchronize()
-            end_time = time.time()
-
-            end_mem = torch.cuda.memory_stats()
-            start_mem_alloc = start_mem["allocated_bytes.all.current"]
-            end_mem_alloc = end_mem["allocated_bytes.all.current"]
-            start_mem_res = start_mem["reserved_bytes.all.current"]
-            end_mem_res = end_mem["reserved_bytes.all.current"]
-
-            rank_str = torch.distributed.get_rank()
-            dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
-            relative_time_str = f"{end_time - start_time:.3f} sec"
-            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
-
-            process = psutil.Process()
-            mem_info = process.memory_info()
-            total_mem_str = (
-                f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
-            )
-            print(
-                f"[rank {rank_str}] dynamic engine {key}, "
-                f"unified {unified_memory_level}, "
-                f"{dir_str} "
-                f"{relative_mem_str} in {relative_time_str} ... "
-                f"abs mem usage: {total_mem_str}",
-                end=".\n" if newline else "",
-            )
+        print(
+            f"+++++++++++++ dynamic engine {key}, unified {unified_memory_level}",
+            end=".\n" if newline else "",
+        )
+        from contextlib import nullcontext
+        return nullcontext()
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
@@ -497,9 +537,30 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.unified_memory_level == 0:
             delete_cuda_graphs()
 
+        # >>>
+        model = self.controller.inference_wrapped_model.model.module
+        # from lutil import pax
+        # pax("model", {"runn": model.decoder.layers[0].)
+        if 0:
+            for l in model.decoder.layers:
+                for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                    # >>>
+                    # from lutil import pax
+                    # pax("runner")
+                    # <<<
+                    # Safely delete both graphs if present
+                    if hasattr(runner, "fwd_graph"):
+                        del runner.fwd_graph
+                    if hasattr(runner, "bwd_graph"):
+                        del runner.bwd_graph
+        # <<<
+
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
+        # >>>
+        torch.cuda.synchronize()
+        # <<<
         with self.__class__.suspend_resume_ctx(
             "resumed",
             unified_memory_level=self.unified_memory_level,
@@ -529,8 +590,14 @@ class DynamicInferenceEngine(AbstractEngine):
             # Only create cuda graphs when not using unified memory at all (level
             # 0). For levels 1 and 2, the context's tensors maintain static
             # memory addresses, so the cuda graphs are re-used.
+            # >>>
+            torch.cuda.synchronize()
+            # <<<
             if self.unified_memory_level == 0:
                 self.create_cuda_graphs()
+            # >>>
+            torch.cuda.synchronize()
+            # <<<
 
             # Add requests.
             futures = {}

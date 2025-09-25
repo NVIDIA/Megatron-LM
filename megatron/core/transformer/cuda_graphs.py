@@ -355,9 +355,40 @@ def create_cudagraphs():
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # Reset runners.
+    for record in [
+        *_CudagraphGlobalRecord.cudagraph_record,
+        *_CudagraphGlobalRecord.cudagraph_inference_record,
+    ]:
+        runner = record[0]
+        assert isinstance(runner, _CudaGraphRunner)
+
+        runner.cudagraph_created = False
+        runner.fwd_graph_recorded = False
+        runner.bwd_graph_recorded = False
+        runner.fwd_graph = None
+        runner.bwd_graph = None
+        # >>>
+        # [x] runner.training = True
+        # <<<
+
+        # >>>
+        # from lutil import pax
+        # pax("record, runner")
+        # <<<
+
+    # >>>
+    # raise Exception("reset runners.")
+    # <<<
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
+    # >>>
+    _CudagraphGlobalRecord.cudagraph_inference_record = []
+    # <<<
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -415,6 +446,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
     def forward(ctx, runner, is_first_microbatch, *inputs):
         """Replay the forward graph of the passed runner."""
 
+        # >>>
+        # from lutil import pax
+        # pax("runner")
+        # <<<
         assert (
             runner.fwd_graph is not None
         ), "Tried replaying fwd cudagraph before calling 'create_fwd_cudagraph!"
@@ -526,6 +561,9 @@ class _CudaGraphRunner(torch.nn.Module):
         is a boolean flag to indicate whether to reuse the cudagraph input and output buffers for
         transformer layer specific optimizations that reduce memory usage and tensor copies."""
 
+        # >>>
+        # raise Exception("hi.")
+        # <<<
         super().__init__()
 
         self.base_module = base_module
@@ -615,6 +653,12 @@ class _CudaGraphRunner(torch.nn.Module):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
+        # >>>
+        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ create_fwd_graph().")
+        # ldebug()
+        # from lutil import pax
+        # pax()
+        # <<<
         # Freeze GC, to speed up capture time ~15-20x.
         freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
         if freeze_gc:
@@ -1181,6 +1225,10 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.share_cudagraph_io_buffers,
                     )
+                    # >>>
+                    # from lutil import pax
+                    # pax("runner")
+                    # <<<
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
                         # Cache the newly created runner in the inference lookup table.
@@ -1244,6 +1292,14 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 runner.eval()
 
+                # >>>
+                # from lutil import pax
+                # pax({
+                # ldebug({
+                #     "cudagraph_created" : _CudagraphGlobalRecord.cudagraph_created,
+                #     "fwd_graph_recorded" : runner.fwd_graph_recorded,
+                # })
+                # <<<
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
                     local_args, local_kwargs = args, kwargs
@@ -1271,6 +1327,9 @@ class CudaGraphManager(torch.nn.Module):
                     clone_inputs = not (
                         runner.reuse_input_output_buffer and not runner.is_first_layer
                     )
+                    # >>>
+                    # ldebug()
+                    # <<<
                     runner.create_fwd_graph(local_args, local_kwargs, clone_inputs=clone_inputs)
                     runner.fwd_graph_recorded = True
                     runner.cudagraph_created = True
