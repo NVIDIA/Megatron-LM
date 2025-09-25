@@ -289,15 +289,15 @@ class GatedDeltaNetMixer(MegatronModule):
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
-        
-        # Transpose: s b x --> b s x
-        # Transform from sbhd to bshd format
-        hidden_states = hidden_states.transpose(0, 1)
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
+
+        # Transpose: s b x --> b s x
+        # From sbhd to bshd format
+        qkvzba = qkvzba.transpose(0, 1)
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
         qkv, gate, beta, alpha = torch.split(qkvzba, [
@@ -374,15 +374,15 @@ class GatedDeltaNetMixer(MegatronModule):
         norm_out = self._torch_compiled_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
 
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+
         # Output projection
         nvtx_range_push(suffix="out_proj")
-        norm_out = norm_out.reshape(batch, seq_len, -1)
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
-
-        # Transpose: b s x --> s b x
-        # Transform from bshd back to sbhd format
-        out = out.transpose(0, 1).contiguous()
         
         return out, out_bias
 
