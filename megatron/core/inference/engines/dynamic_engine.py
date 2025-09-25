@@ -224,9 +224,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     # Forward pass -> logits.
                     with torch.inference_mode():
-                        # >>>
-                        # ldebug()
-                        # <<<
                         self.controller.inference_wrapped_model.run_one_forward_step(
                             {
                                 "tokens": input_ids,
@@ -507,24 +504,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # so the cuda graphs are re-used.
         if self.unified_memory_level == 0:
             delete_cuda_graphs()
-
-        # >>>
-        model = self.controller.inference_wrapped_model.model.module
-        # from lutil import pax
-        # pax("model", {"runn": model.decoder.layers[0].)
-        if 0:
-            for l in model.decoder.layers:
-                for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-                    # >>>
-                    # from lutil import pax
-                    # pax("runner")
-                    # <<<
-                    # Safely delete both graphs if present
-                    if hasattr(runner, "fwd_graph"):
-                        del runner.fwd_graph
-                    if hasattr(runner, "bwd_graph"):
-                        del runner.bwd_graph
-        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""

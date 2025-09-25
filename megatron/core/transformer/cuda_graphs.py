@@ -372,15 +372,6 @@ def delete_cuda_graphs():
         # >>>
         # [x] runner.training = True
         # <<<
-
-        # >>>
-        # from lutil import pax
-        # pax("record, runner")
-        # <<<
-
-    # >>>
-    # raise Exception("reset runners.")
-    # <<<
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Reset global tracking state
@@ -446,10 +437,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
     def forward(ctx, runner, is_first_microbatch, *inputs):
         """Replay the forward graph of the passed runner."""
 
-        # >>>
-        # from lutil import pax
-        # pax("runner")
-        # <<<
         assert (
             runner.fwd_graph is not None
         ), "Tried replaying fwd cudagraph before calling 'create_fwd_cudagraph!"
@@ -561,9 +548,6 @@ class _CudaGraphRunner(torch.nn.Module):
         is a boolean flag to indicate whether to reuse the cudagraph input and output buffers for
         transformer layer specific optimizations that reduce memory usage and tensor copies."""
 
-        # >>>
-        # raise Exception("hi.")
-        # <<<
         super().__init__()
 
         self.base_module = base_module
@@ -653,12 +637,6 @@ class _CudaGraphRunner(torch.nn.Module):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
-        # >>>
-        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ create_fwd_graph().")
-        # ldebug()
-        # from lutil import pax
-        # pax()
-        # <<<
         # Freeze GC, to speed up capture time ~15-20x.
         freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
         if freeze_gc:
@@ -1212,16 +1190,7 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.share_cudagraph_io_buffers,
                     )
-                    # >>>
-                    # from lutil import pax
-                    # pax("runner")
-                    # <<<
                     self.cudagraph_runners.append(runner)
-            # >>>
-            # else:
-            #     from lutil import pax
-            #     pax("runner")
-            # <<<
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1279,14 +1248,6 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 runner.eval()
 
-                # >>>
-                # from lutil import pax
-                # pax({
-                # ldebug({
-                #     "cudagraph_created" : _CudagraphGlobalRecord.cudagraph_created,
-                #     "fwd_graph_recorded" : runner.fwd_graph_recorded,
-                # })
-                # <<<
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
                     local_args, local_kwargs = args, kwargs
@@ -1314,9 +1275,6 @@ class CudaGraphManager(torch.nn.Module):
                     clone_inputs = not (
                         runner.reuse_input_output_buffer and not runner.is_first_layer
                     )
-                    # >>>
-                    # ldebug()
-                    # <<<
                     runner.create_fwd_graph(local_args, local_kwargs, clone_inputs=clone_inputs)
                     runner.fwd_graph_recorded = True
                     runner.cudagraph_created = True
