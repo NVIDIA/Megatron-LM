@@ -14,6 +14,7 @@ from torch import Tensor
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -94,6 +95,7 @@ class MambaLayer(GraphableMegatronModule):
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -124,7 +126,9 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = self.norm(hidden_states)
 
-        mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
+        mixer_out_with_bias = self.mixer(
+            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
+        )
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(

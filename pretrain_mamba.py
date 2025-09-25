@@ -12,10 +12,15 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
+)
 from megatron.core.models.mamba import MambaModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
@@ -33,6 +38,16 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
+
 stimer = StragglerDetector()
 
 
@@ -46,8 +61,50 @@ def get_batch(data_iterator, vp_stage=None):
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
 
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
+    cu_seqlens = batch['cu_seqlens']
+    if cu_seqlens is None:
+        # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+    else:  # Packed THD format
+        assert (
+            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
+        ), "micro-batch-size must be 1 for packing"
+        cu_seqlens = cu_seqlens[0]
+        batch['cu_seqlens'] = cu_seqlens
+
+        max_seqlen = batch['max_seqlen']
+        assert max_seqlen.dim() == 1
+        # TODO(duncan): can this be kept as a 0-D tensor?
+        batch['max_seqlen'] = int(max_seqlen[0].item())
+
+        cp_size = get_context_parallel_world_size()
+        if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+            assert tex is not None and is_te_min_version("1.10.0"), (
+                "Please update Transformer Engine to >= 1.10 to use "
+                "Context Parallel with THD format data"
+            )
+            cp_rank = get_context_parallel_rank()
+            index = tex.thd_get_partitioned_indices(
+                cu_seqlens,
+                batch['tokens'].size(1),
+                cp_size,
+                cp_rank,
+            )
+            for key, data in batch.items():
+                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+                    continue
+                batch[key] = data.index_select(1, index)
+
+        # Reshape from [B,S] to [T,1]
+        # I don't think this is needed
+        # for key, data in batch.items():
+        #     if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+        #         continue
+        #     batch[key] = (
+        #         batch[key].contiguous()
+        #         .view(batch[key].shape[0] * batch[key].shape[1])
+        #         .unsqueeze(0)
+        #     )
 
     return batch.values()
 
@@ -124,15 +181,45 @@ def forward_step(data_iterator, model: MambaModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
+
     global stimer
+
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            cu_seqlens,
+            max_seqlen,
+        ) = get_batch(data_iterator, vp_stage)
+
+    if cu_seqlens is None:
+        packed_seq_params = None
+    else:
+        # TODO(duncan): This class seems overly complex for what needs to be conveyed
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        output_tensor = model(
+            tokens,
+            position_ids,
+            attention_mask,
+            labels=labels,
+            packed_seq_params=packed_seq_params,
+        )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
@@ -178,6 +265,7 @@ def core_gpt_dataset_config_from_args(args):
         fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        context_parallel_size=args.context_parallel_size,
     )
 
 

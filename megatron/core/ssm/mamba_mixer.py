@@ -24,6 +24,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
     tensor_merge,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -399,6 +400,7 @@ class MambaMixer(MegatronModule):
         self,
         hidden_states,
         inference_context=None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -428,14 +430,14 @@ class MambaMixer(MegatronModule):
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
+        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
         if in_inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
             y = self.ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self.ssm_training(zxBCdt)
+            y = self.ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
@@ -620,7 +622,11 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def ssm_training(self, zxBCdt: torch.Tensor) -> torch.Tensor:
+    def ssm_training(
+        self,
+        zxBCdt: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
 
@@ -639,6 +645,10 @@ class MambaMixer(MegatronModule):
         if self.conv1d.bias is not None:
             self.conv1d.bias.data_ptr()
 
+        seq_idx = None
+        if packed_seq_params is not None:
+            seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
+
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -655,15 +665,46 @@ class MambaMixer(MegatronModule):
             headdim=None if self.D_has_hdim else self.headdim,
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
+            seq_idx=seq_idx,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
-        y = self.cp.post_conv_ssm(y)
+        y = self.cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
             y = self.norm(y)
 
         return y
+
+    def _create_packed_seq_idx(self, packed_seq_params: PackedSeqParams, total_tokens: int):
+        """
+        If total_tokens is 16 (for example), this method takes packed_seq_params.cu_seqlens_q_padded
+        (or cu_seqlens_q) which is of the form [0, 5, 7, 11] and returns a tensor of the form
+        [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3],
+        which is [0]*(5-0) + [1]*(7-5) + [2]*(11-7) + [3]*(16-11)
+        In the above example, there are three sequences in the pack.
+        In general, the output has an additional sequence index (e.g. 0, 1, 2, 3) so that any tokens
+        beyond the last padded input sequence are accounted for as an extra sequence. However, If
+        cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
+        included.
+        """
+        # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
+        if packed_seq_params.cu_seqlens_q_padded is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        else:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+        total_tokens_tensor = torch.tensor(
+            [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
+        )
+        cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
+        # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
+        seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
+        # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
+        seq_idx = torch.repeat_interleave(
+            torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+        )
+        seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
+        return seq_idx
 
     def ssm_prefill(
         self,
@@ -1073,7 +1114,7 @@ class MambaMixer(MegatronModule):
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
                     module_sd,
                     f"{prefix}{name}.",
-                    {f"weight": 0, f"bias": 0},
+                    {"weight": 0, "bias": 0},
                     sharded_offsets,
                     tp_group=self.tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
