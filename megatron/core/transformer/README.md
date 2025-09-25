@@ -22,11 +22,13 @@ Fine-grained Activation Offloading
 * Compatible with fine-grained recomputation
 * Support FP8
 * Support MTP
+* Support mixed dense & moe layer
+* Support A2A Overlap
+
 ## Known issues
 
 ## WIP items
 * Code refactor
-* Support mixed dense & moe layer
 * Benchmark
 
 # Methodology
@@ -74,6 +76,7 @@ Before the model.forward() start, the `PipelineOffloadManager.get_instance().res
 # Performance
 
 ## H100
+ 
 ### DeepSeek-V3-Proxy
 #### Model structure
 * Layer parameters are same as DeepSeek-V3 model
@@ -111,6 +114,19 @@ With offloading expert_fc1, moe_act, act_norm and mlp_norm
 [Rank 32] (after 10 iterations) memory (MB) | allocated: 18795.7529296875 | max allocated: 34950.2509765625 | reserved: 42452.0 | max reserved: 42452.0
 [Rank 48] (after 10 iterations) memory (MB) | allocated: 28950.82275390625 | max allocated: 41310.798828125 | reserved: 50408.0 | max reserved: 50408.0
 ```
+
+### Qwen3-30B-A3B
+#### Model structure
+* Same as Qwen-30B model structure
+
+#### Results
+
+| Model         | Mapping                  | Sequence length | Recompute | Offload    | Throughput (tflops) | Memory (MB) |
+|---------------|--------------------------|-----------------|-----------|------------|---------------------|-------------|
+| Qwen3-30B-A3B | TP1PP1EP8VPP1_MBS1GBS256 | 4096            | /         | /          | 194                 | 65308       |
+|               | TP1PP1EP8VPP1_MBS1GBS256 | 8192            | full      | /          | 230                 | 59566       |
+|               | TP1PP2EP8VPP4_MBS1GBS256 | 8192            | layernorm | expert_fc1 | 255                 | 64962       |
+
 
 
 ## GB200

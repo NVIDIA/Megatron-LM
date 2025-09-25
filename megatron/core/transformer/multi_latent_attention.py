@@ -306,7 +306,7 @@ class MultiLatentAttention(Attention):
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
         if self.offload_core_attention and self.training:
-            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[])
+            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[query, key, value])
             offload_context = contextlib.nullcontext()
 
         # We are doing absorption with cache mla latents and decode mode.
@@ -340,7 +340,7 @@ class MultiLatentAttention(Attention):
         with offload_context:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[])
+            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
             offload_context = contextlib.nullcontext()
 
         return output, bias
