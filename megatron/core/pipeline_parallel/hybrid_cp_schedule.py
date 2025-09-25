@@ -931,8 +931,8 @@ def hybrid_context_parallel_forward_backward(
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():
         sample_ids_this_group = sample_id_groups[-1][hdp_rank] if is_first_tp_rank else None
-        for k in range(num_samples_this_group[-1] - 1):
-            new_data_iterator = _get_new_data_iterator(k, -1)
+        for i in range(num_samples_this_group[-1] - 1):
+            new_data_iterator = _get_new_data_iterator(i, -1)
             # Call forward step for each sub-sample
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
