@@ -163,16 +163,6 @@ class PostProcessNode(ScheduleNode):
         Returns:
             The logits or loss depending on whether labels are provided.
         """
-        # Final layer norm from Decoder
-        if self.gpt_model.decoder.final_layernorm and not self.gpt_model.mtp_process:
-            hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
             hidden_states=hidden_states,
