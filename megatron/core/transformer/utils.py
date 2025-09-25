@@ -229,8 +229,12 @@ def sharded_state_dict_default(
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
         module_sharded_sd = make_sharded_tensors_for_checkpoint(
-            module_sd, prefix, {}, sharded_offsets,
-            tp_group=tp_group, dp_cp_group=metadata['dp_cp_group'],
+            module_sd,
+            prefix,
+            {},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
     return module_sharded_sd
 

@@ -754,8 +754,11 @@ class TransformerBlock(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata,
-                        self.model_comm_pgs.tp
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        self.model_comm_pgs.tp,
                     )
                 )
 

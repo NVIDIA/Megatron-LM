@@ -25,8 +25,8 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    is_te_min_version,
     get_tensor_model_parallel_group_if_none,
+    is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
 
