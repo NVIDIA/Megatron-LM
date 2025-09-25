@@ -378,7 +378,7 @@ class MambaMixer(MegatronModule):
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
         )
-        self.tp_group = model_comm_pgs.tp
+        self.tp_group = pg_collection.tp
 
     def forward(
         self,
@@ -786,7 +786,8 @@ class MambaMixer(MegatronModule):
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata
+                    module, f"{prefix}{name}.", sharded_offsets, metadata,
+                    tp_group=self.tp_group,
                 )
 
             sharded_state_dict.update(module_sharded_sd)
