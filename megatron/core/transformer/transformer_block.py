@@ -312,6 +312,12 @@ class TransformerBlock(MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
+        self.num_dense_layer = 0
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+        for layer in self.layers:
+            if not isinstance(layer.mlp, MoELayer):
+                self.num_dense_layer += 1
+
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?

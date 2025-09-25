@@ -683,8 +683,6 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     """
-    offload_module_count_per_layer: Optional[int] = 0
-    """The number of modules to offload per layer. default: 0."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -963,7 +961,6 @@ class TransformerConfig(ModelParallelConfig):
         #     self.offload_modules = ["core_attn"]
 
         if len(self.offload_modules) > 0:
-            self.offload_modules = list(set(self.offload_modules))
             allowed_modules = {
                 "core_attn", "attn_proj", "expert_fc1", "moe_act", "attn_norm", "mlp_norm"
             }
@@ -972,13 +969,22 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
-            self.offload_module_count_per_layer = len(self.offload_modules)
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            
+            if isinstance(self.moe_layer_freq, int):
+                raise ValueError(
+                    "moe_layer_freq cannot be an integer when offload_modules is set."
+                )
+            elif isinstance(self.moe_layer_freq, list):
+                if 0 in self.moe_layer_freq:
+                    warnings.warn(
+                        "Activation of dense layer won't be offloaded at all for mixed dense and moe layer."
+                    )
 
 
         if (
