@@ -138,6 +138,11 @@ class SingleEncoderModel(torch.nn.Module):
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
         return grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size)
+    
+    def finalize_model_grads(self, module=None, num_tokens=None, pg_collection=None):
+        for module, grid in self.modules_and_grids:
+            if module is not None and self.is_current_rank_in_grid(grid):
+                finalize_model_grads([module], num_tokens=None, pg_collection=_get_pg_collection_with_embedding_groups(grid))
 
     @contextmanager
     def no_sync(self):
@@ -287,12 +292,6 @@ class DualEncoderModel(SingleEncoderModel):
             else:
                 raise ValueError(f"Rank {dist.get_rank()} is not valid")
     
-    def finalize_model_grads(self, module=None, num_tokens=None, pg_collection=None):
-        for module, grid in self.modules_and_grids:
-            if module is not None and self.is_current_rank_in_grid(grid):
-                finalize_model_grads([module], num_tokens=None, pg_collection=_get_pg_collection_with_embedding_groups(grid))
-               
-
     def forward(self, hidden_states):
         current_rank = dist.get_rank()
         output_dict = {}
@@ -526,6 +525,8 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
     config.moe_router_load_balancing_type = "aux_loss"
     config.variable_seq_lengths = True
     config.no_sync_func = model.no_sync
+    config.finalize_model_grads_func = model.finalize_model_grads
+    
 
     # Add grad scale function to convert float losses to tensors
     def grad_scale_func(loss):
