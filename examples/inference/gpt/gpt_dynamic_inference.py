@@ -153,6 +153,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        # >>>
+        use_cuda_graphs_for_non_decode_steps=False,
+        # <<<
     )
 
     return context
@@ -376,6 +379,16 @@ def main():
         ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
     )
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def ldebug(d = None):
+        import os
+        from lutil import pax
+        if os.getenv("LDEBUG"):
+            pax(d or {})
+    import builtins
+    builtins.ldebug = ldebug
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     # Inference engine.
     engine = DynamicInferenceEngine(
         controller,
@@ -387,12 +400,47 @@ def main():
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
 
-    # >>>
-    # engine.suspend()
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+    # from lutil import pax
+
+    # num_record_runners = len(_CudagraphGlobalRecord.cudagraph_inference_record)
+    # num_manager_runners = sum(len(layer.cudagraph_manager.cudagraph_runners) for layer in model.module.decoder.layers)
+
+    # pax({
+    #     "_CudagraphGlobalRecord" : _CudagraphGlobalRecord,
+    #     "manager" : model.module.decoder.layers[0].cudagraph_manager,
+    #     "runner" : model.module.decoder.layers[0].cudagraph_manager.cudagraph_runners[0],
+    # }, "num_record_runners, num_manager_runners")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # from lutil import pax
+    # pax("model")
+
+    engine.suspend()
     # torch.cuda.synchronize()
-    # engine.resume()
-    # raise Exception("hi.")
-    # <<<
+
+    if 1:
+        for l in model.module.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # >>>
+                # from lutil import pax
+                # pax("runner")
+                # <<<
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    # del runner.fwd_graph
+                    runner.fwd_graph = None
+                if hasattr(runner, "bwd_graph"):
+                    # del runner.bwd_graph
+                    runner.bwd_graph = None
+
+    os.environ["LDEBUG"] = "1"
+
+    engine.resume()
+    raise Exception("hi.")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
@@ -421,7 +469,15 @@ def main():
         def escape_str(s):
             return s.replace("\n", "\\n")
 
-        print("~~~~ Unique prompts + outputs. ~~~~")
+        # >>>
+        # print("~~~~ Unique prompts + outputs. ~~~~")
+        # +++
+        print("~~~~ Unique prompts + outputs [ s %d, u %d, g %d ]. ~~~~" % (
+            SUSPEND_RESUME_INTERVAL,
+            args.inference_dynamic_batching_unified_memory_level,
+            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else 0,
+        ))
+        # <<<
 
         # Map requests by their prompt.
         unique_prompt_map = defaultdict(list)
