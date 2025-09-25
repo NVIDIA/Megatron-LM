@@ -267,18 +267,13 @@ def _allreduce_position_embedding_grads(
     )
 
 
-def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.nn.Module]):
+def _reset_global_aux_loss_tracker(model: List[torch.nn.Module]):
     """
-    Reset the temporary tensors of the model.
+    Reset the global aux loss tracker.
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
-                module.local_tokens_per_expert.zero_()
-            if (
-                config.moe_router_load_balancing_type == "global_aux_loss"
-                or "global_aux_loss" in config.moe_router_load_balancing_type
-            ) and hasattr(module, 'reset_global_aux_loss_tracker'):
+            if hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
 
 
@@ -303,7 +298,10 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
     )
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
+    for tokens_per_expert, expert_bias, updated_expert_bias in zip(
+        tokens_per_expert_list, expert_bias_list, stacked_updated_expert_bias
+    ):
+        tokens_per_expert.zero_()
         expert_bias.copy_(updated_expert_bias)
 
 
@@ -467,7 +465,11 @@ def finalize_model_grads(
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
 
-    reset_model_temporary_tensors(config, model)
+    if (
+        config.moe_router_load_balancing_type == "global_aux_loss"
+        or "global_aux_loss" in config.moe_router_load_balancing_type
+    ):
+        _reset_global_aux_loss_tracker(model)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

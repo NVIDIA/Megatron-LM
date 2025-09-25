@@ -406,25 +406,6 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
     _correct_amax_history_if_needed_impl(model)
 
 
-def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
-    """Check if the layer is in bf16."""
-    num_bf16_layers_at_start = (
-        config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
-    )
-    num_bf16_layers_at_end = (
-        config.num_layers_at_end_in_bf16 if config.first_last_layers_bf16 else 0
-    )
-    # Since layer_no is a global layer index, additional checks on whether
-    # we are in the first or last pipeline-parallel rank are not needed.
-    is_first_layer = layer_no < num_bf16_layers_at_start
-    is_last_layer = layer_no >= config.num_layers - num_bf16_layers_at_end
-
-    if layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer):
-        return True
-    else:
-        return False
-
-
 if HAVE_TE:
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
@@ -502,10 +483,24 @@ if HAVE_TE:
             that needs to be trained in bf16.
         """
 
+        num_bf16_layers_at_start = (
+            config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
+        )
+        num_bf16_layers_at_end = (
+            config.num_layers_at_end_in_bf16 if config.first_last_layers_bf16 else 0
+        )
+        # Since layer_no is a global layer index, additional checks on whether
+        # we are in the first or last pipeline-parallel rank are not needed.
+        is_first_layer = layer_no < num_bf16_layers_at_start
+        is_last_layer = layer_no >= config.num_layers - num_bf16_layers_at_end
+
         need_fp8_context = config.fp8 if not is_init else config.fp8_param
 
-        if not need_fp8_context or is_first_last_bf16_layer(config, layer_no):
-            # bf16 training or bf16 layer in fp8 training
+        if not need_fp8_context:
+            # bf16 training
+            fp8_context = nullcontext()
+        elif layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer):
+            # fp8 training but this layer_no should be bf16
             fp8_context = nullcontext()
         else:
             # fp8 training and this layer_no is in fp8

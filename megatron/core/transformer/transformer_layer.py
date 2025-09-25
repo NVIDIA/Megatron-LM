@@ -15,10 +15,11 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, is_graph_capturing
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -251,7 +252,7 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+class TransformerLayer(MegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -267,17 +268,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
-        super().__init__(config=config, vp_stage=vp_stage)
+        super().__init__(config=config)
 
+        # Enable cuda graphs.
         if (
-            config.enable_cuda_graph
-            and config.cuda_graph_scope != "full_iteration"
-            and not self.training
-        ):
-            # Cudagraphs for inference are only enabled with the flash decoding kernel
-            assert (
-                self.config.flash_decode
-            ), "--flash-decode is required to use CUDA graphs during inference"
+            config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration"
+        ) or config.external_cuda_graph:
+            assert not (
+                config.enable_cuda_graph and config.external_cuda_graph
+            ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
+            if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
+                if not self.training:
+                    # Cudagraphs for inference are only enabled with the flash decoding kernel
+                    assert (
+                        self.config.flash_decode
+                    ), "--flash-decode is required to use CUDA graphs during inference"
+                self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
+            else:
+                # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
+                # the number of microbatches. Multiple CUDA graphs per layer is required to support
+                # pipelining which requires running FWD graph of multiple microbatches before BWD
+                # graph. To enable CUDA graph, this list should be populated in the model training
+                # script with the graphs returned by make_graphed_callables API before the first
+                # training step.
+                self.cuda_graphs = []
+                # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
+                # graphs. Those hooks and args are collected in this list and should be manually
+                # triggered before CUDA Graph running. This is required to ensure the correct param
+                # all-gather overlap with forward compute.
+                self.cuda_graph_manual_hooks = []
+                self.current_microbatch = -1
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -675,46 +695,72 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
-        Get the static inputs for the transformer layer. Besides the hidden_states that is
-        generated in GraphableMegatronModule, we also add the attention_mask.
+        Get the static inputs for the transformer layer.
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
-        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        # Calculate data shape related values.
+        context_parallel_size = self.config.context_parallel_size
+        slen_per_cp = seq_length // context_parallel_size
+        sequence_parallel = self.config.sequence_parallel
+        tensor_model_parallel_size = self.config.tensor_model_parallel_size
+        slen_per_cptp = (
+            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
+        )
 
-        if not isinstance(self.self_attention, IdentityOp):
-            slen_per_cp = seq_length // self.config.context_parallel_size
-            static_inputs["attention_mask"] = (
-                ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-                .to(torch.cuda.current_device())
-                .reshape(1, 1, slen_per_cp, seq_length)
-                .tile(micro_batch_size, 1, 1, 1)
-            )
+        static_inputs = {}
+        static_inputs["hidden_states"] = torch.ones(
+            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+            device=torch.cuda.current_device(),
+        )
+        static_inputs["attention_mask"] = (
+            ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
+            .to(torch.cuda.current_device())
+            .reshape(1, 1, slen_per_cp, seq_length)
+            .tile(micro_batch_size, 1, 1, 1)
+        )
         return static_inputs
 
-    def _get_submodules_under_cudagraphs(self):
+    def setup_manual_hooks(self, make_hook_func):
         """
-        Get the submodules that are covered by cudagraphs.
+        Set CUDA Graph manual hooks for the modules that contain direct parameters and are
+        covered by cudagraphs.
         """
+        self.cuda_graph_manual_hooks = []
+
+        # Select the modules who contain direct parameters and are covered by cudagraphs.
+        # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
+        # be automatically triggered when they go through the CUDA Graph path.
         if self.config.cuda_graph_scope == 'full':
-            submodules = [self]
+            high_level_modules = [self]
         else:
             assert (
                 self.config.cuda_graph_scope == 'attn'
-            ), f"Invalid cuda_graph_scope {self.config.cuda_graph_scope}"
-            submodules = [
+            ), "Invalid cuda_graph_scope ${self.config.cuda_graph_scope}"
+            high_level_modules = [
                 self.input_layernorm,
                 self.self_attention,
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
             ]
-        return submodules
 
-    def _te_cuda_graph_capture(self, *args, **kwargs):
+        param_modules = []
+        for module in high_level_modules:
+            for submodule in module.modules():
+                if next(submodule.parameters(recurse=False), None) is not None:
+                    # Module contains direct parameters.
+                    param_modules.append(submodule)
+                    continue
+        if len(param_modules) > 0:
+            for module in param_modules:
+                self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
+
+    def _cuda_graph_capture(self, *args, **kwargs):
         """
-        CUDA Graph capture for this layer using TE interface.
-        There are some differences from the normal pass:
+        CUDA Graph capture for this layer. There are some differences from the normal pass:
         1. In some conditions CUDA graph cannot cover the entire layer. The `cuda_graph_scope`
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
@@ -729,25 +775,83 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
 
-    def _te_cuda_graph_replay(self, *args, **kwargs):
+    def _cuda_graph_replay(self, *args, **kwargs):
         """
-        CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
-        interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
-        However, CUDA graph accepts only Tensor inputs.
-        Hence, `inference_context` and `packed_seq_params` are excluded from input list.
+        CUDA graph replay for this layer and microbatch
+        `self.current_microbatch`. TransformerEngine versions>=1.10
+        allow keyword arguments with CUDA graph. However, CUDA graph
+        acccepts only Tensor inputs and Tensor outputs. Hence,
+        `inference_context` and `packed_seq_params` are excluded from
+        input list while output is limited to `hidden_states`.
         """
 
-        assert (kwargs.get('inference_context') is None) and (
-            kwargs.get('packed_seq_params') is None
-        ), (
-            "CUDA graph accepts only Tensor inputs. "
-            "inference_context and packed_seq_params are excluded from input list. "
-            "For inference cuda graph, please use enable_cuda_graph instead."
-        )
+        def _check_cuda_graph_replay_args(*args, **kwargs):
+            """Helper function to get optional tensor arguments for CUDA graph."""
 
-        cuda_graph_output = super()._te_cuda_graph_replay(*args, **kwargs)
+            assert len(args) <= 1, "At most one positional argument `hidden_states` is expected."
+            if len(args) == 1:
+                hidden_states = args[0]
+            else:
+                hidden_states = kwargs.pop("hidden_states")
+            cudagraph_args = [hidden_states]
 
-        if kwargs.get('context') is not None:
+            optional_inputs = kwargs.copy()
+            optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
+            try:
+                import transformer_engine.pytorch as te  # pylint: disable=unused-import
+
+                def get_zero_attention_mask(slen_per_tpcp, micro_batch_size):
+                    sequence_parallel = self.config.sequence_parallel
+                    tensor_model_parallel_size = self.config.tensor_model_parallel_size
+                    slen_per_cp = (
+                        slen_per_tpcp * tensor_model_parallel_size
+                        if sequence_parallel
+                        else slen_per_tpcp
+                    )
+                    slen = slen_per_cp * self.config.context_parallel_size
+                    return torch.zeros(
+                        (micro_batch_size, 1, slen_per_cp, slen),
+                        dtype=torch.bool,
+                        device=torch.cuda.current_device(),
+                    )
+
+                if not is_te_min_version("1.10.0"):
+                    # TE version < 1.10.0 does not support keyword arguments with CUDA graph.
+                    for k, v in kwargs.items():
+                        if k == "attention_mask":
+                            if v is not None:
+                                cudagraph_args.append(v)
+                                optional_inputs[k] = None
+                            else:
+                                cudagraph_args.append(
+                                    get_zero_attention_mask(
+                                        hidden_states.size(0), hidden_states.size(1)
+                                    )
+                                )
+                        else:
+                            assert v is None, "Keyword Arguments not supported with CUDA graph."
+                elif optional_inputs['attention_mask'] is None:
+                    # The attention_mask can be None when there is no padding to the input sequence.
+                    # However, an attention_mask Tensor must be passed into cudagraph for replay, so
+                    # we create an equivalent zero Tensor as the attention_mask.
+                    optional_inputs["attention_mask"] = get_zero_attention_mask(
+                        hidden_states.size(0), hidden_states.size(1)
+                    )
+            except ImportError:
+                raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
+            return tuple(cudagraph_args), optional_inputs
+
+        cg_index = self.current_microbatch % len(self.cuda_graphs)
+        assert ('inference_context' not in kwargs or kwargs['inference_context'] is None) and (
+            'packed_seq_params' not in kwargs or kwargs['packed_seq_params'] is None
+        ), "CUDA graph accepts only Tensor inputs."
+        cudagraph_args, cudagraph_kwargs = _check_cuda_graph_replay_args(*args, **kwargs)
+
+        for hook, hook_args in self.cuda_graph_manual_hooks:
+            hook(*hook_args)
+        cuda_graph_output = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+
+        if cudagraph_kwargs.get('context') is not None:
             context = cuda_graph_output[-1]
             cuda_graph_output = cuda_graph_output[:-1]
         else:
@@ -760,68 +864,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output = cuda_graph_output[0]
         return output, context
 
-    def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
-        """Helper function to get tensor arguments for TE CUDA graph."""
-        cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(*args, **kwargs)
-
-        assert (
-            len(cudagraph_args) == 1
-        ), "Exactly one positional argument `hidden_states` is expected."
-        hidden_states = cudagraph_args[0]
-
-        try:
-            import transformer_engine.pytorch as te  # pylint: disable=unused-import
-
-            def get_zero_attention_mask(slen_per_tpcp, micro_batch_size):
-                sequence_parallel = self.config.sequence_parallel
-                tensor_model_parallel_size = self.config.tensor_model_parallel_size
-                slen_per_cp = (
-                    slen_per_tpcp * tensor_model_parallel_size
-                    if sequence_parallel
-                    else slen_per_tpcp
-                )
-                slen = slen_per_cp * self.config.context_parallel_size
-                return torch.zeros(
-                    (micro_batch_size, 1, slen_per_cp, slen),
-                    dtype=torch.bool,
-                    device=torch.cuda.current_device(),
-                )
-
-            if not is_te_min_version("1.10.0"):
-                # TE version < 1.10.0 does not support keyword arguments with CUDA graph.
-                for k, v in cudagraph_kwargs.items():
-                    if k == "attention_mask":
-                        if v is not None:
-                            cudagraph_args.append(v)
-                            cudagraph_kwargs[k] = None
-                        else:
-                            cudagraph_args.append(
-                                get_zero_attention_mask(
-                                    hidden_states.size(0), hidden_states.size(1)
-                                )
-                            )
-                    elif k != 'is_first_microbatch':
-                        assert v is None, "Keyword Arguments not supported with CUDA graph."
-            elif (
-                'attention_mask' in cudagraph_kwargs and cudagraph_kwargs['attention_mask'] is None
-            ):
-                # The attention_mask can be None when there is no padding to the input sequence.
-                # However, an attention_mask Tensor must be passed into cudagraph for replay, so
-                # we create an equivalent zero Tensor as the attention_mask.
-                cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
-                    hidden_states.size(0), hidden_states.size(1)
-                )
-        except ImportError:
-            raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
-        return tuple(cudagraph_args), cudagraph_kwargs
-
-    def _should_call_local_cudagraph(self, *args, **kwargs):
-        """
-        Check if we should call the local cudagraph path.
-        """
+    def __call__(self, *args, **kwargs):
         # Training and validation mode CUDA graphs
         if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
-            return True
+            # Set the is_first_microbatch flag for weight caching
+            current_microbatch = getattr(self, 'current_microbatch', 0)
+            self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
+            return self.cudagraph_manager(self, args, kwargs)
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif not self.training and (
             hasattr(self, 'cudagraph_manager')
@@ -843,17 +892,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else:
                 using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             if using_cuda_graph:
-                return True
-        return False
-
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            # Inference mode.
-            if kwargs.get('inference_context') is not None:
                 # dynamic_inference_decode_only is not a real argument to forward, it is only used
                 # to differentiate the cuda graph used for decode from the one used for non-decode
                 # inference.
                 kwargs["dynamic_inference_decode_only"] = kwargs[
                     'inference_context'
                 ].is_decode_only()
-        return super().__call__(*args, **kwargs)
+                # Set the is_first_microbatch flag for weight caching
+                current_microbatch = getattr(self, 'current_microbatch', 0)
+                self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
+                return self.cudagraph_manager(self, args, kwargs)
+        elif (
+            self.config.external_cuda_graph
+            and self.training
+            and (is_graph_capturing() or self.cuda_graphs)
+        ):
+            if not self.cuda_graphs:
+                # Do CUDA Graphs capture.
+                cuda_graph_func = self._cuda_graph_capture
+            else:
+                # Do CUDA Graphs replay.
+                cuda_graph_func = self._cuda_graph_replay
+            return cuda_graph_func(*args, **kwargs)
+        return super(MegatronModule, self).__call__(*args, **kwargs)
