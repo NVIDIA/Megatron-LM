@@ -10,7 +10,7 @@ import json
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 import modelopt
-from modelopt.torch.speculative.plugins.megatron import MegatronARValidation
+from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -22,6 +22,7 @@ from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_para
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_provider import model_provider
+from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import get_ltor_masks_and_position_ids, print_rank_0, unwrap_model
@@ -39,8 +40,8 @@ def add_ar_validation_args(parser):
     parser.add_argument(
         "--prompts-path",
         type=str,
-        required=True,
-        help="Path to the prompts json file",
+        default=None,
+        help="Path to the prompts json file. If not provided, MTBench will be used.",
     )
     parser.add_argument(
         "--ground-truth-path",
@@ -107,8 +108,12 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    with open(args.prompts_path, "r") as f:
-        prompts = [json.loads(line) for line in f]
+    if not args.prompts_path:
+        dataset = get_mtbench_chat_data()
+        prompts = [[sample["conversations"][0]] for sample in dataset]
+    else:
+        with open(args.prompts_path, "r") as f:
+            prompts = [json.loads(line) for line in f]
 
     if args.ground_truth_path is not None:
         ground_truth = torch.load(args.ground_truth_path)

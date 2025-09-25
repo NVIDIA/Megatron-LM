@@ -12,7 +12,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -222,20 +222,21 @@ class TestPipelineParallelTransformerBlock:
             )
             total_build_layers = 0
             for i in range(pipeline_model_parallel_size):
-                parallel_state.set_pipeline_model_parallel_rank(i)
                 if virtual_pipeline_model_parallel_size is not None:
                     for j in range(virtual_pipeline_model_parallel_size):
-                        num_layers_to_build = get_num_layers_to_build(transformer_config, j)
+                        num_layers_to_build = get_num_layers_to_build(
+                            transformer_config, vp_stage=j, pp_rank=i
+                        )
+
                         total_build_layers += num_layers_to_build
                 else:
-                    num_layers_to_build = get_num_layers_to_build(transformer_config)
+                    num_layers_to_build = get_num_layers_to_build(transformer_config, pp_rank=i)
                     total_build_layers += num_layers_to_build
         if not should_assert_error:
             assert (
                 total_build_layers == num_layers
             ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
-        parallel_state.set_pipeline_model_parallel_world_size(None)
-        parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+        Utils.destroy_model_parallel()
 
 
 class TestProcessGroupTransformerBlock:
@@ -267,17 +268,18 @@ class TestProcessGroupTransformerBlock:
                 torch.distributed.init_process_group(backend='nccl')
 
             # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
-            grid = HyperCommGrid([cp_size, tp_size, dp_size], ["cp", "tp", "dp"])
+            grid = HyperCommGrid([cp_size, tp_size, dp_size, 1], ["cp", "tp", "dp", "pp"])
 
             # Get process groups from HyperCommGrid
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
 
-            # Create ModelCommProcessGroups with custom process groups
-            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+            # Create ProcessGroupCollection with custom process groups
+            pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group)
         else:
             # Rely on TransformerBlock to create default process groups
-            model_comm_pgs = None
+            pg_collection = None
 
         self.transformer_config = TransformerConfig(
             num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
@@ -285,7 +287,7 @@ class TestProcessGroupTransformerBlock:
         self.transformer_block = TransformerBlock(
             self.transformer_config,
             get_gpt_layer_with_transformer_engine_spec(),
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         self.transformer_block.cuda()
 
@@ -332,22 +334,22 @@ class TestMixedProcessGroups:
                 fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
                 if layer_number % 4 == 0:
                     config = self.local_attn_config
-                    model_comm_pgs = self.local_pgs
+                    pg_collection = self.local_pgs
                 else:
                     config = self.config
-                    model_comm_pgs = self.model_comm_pgs
+                    pg_collection = self.pg_collection
                 with fp8_init_context:
                     module = build_module(
                         layer_spec,
                         config=config,
                         layer_number=layer_number,
-                        model_comm_pgs=model_comm_pgs,
+                        pg_collection=pg_collection,
                     )
                 return module
 
-            # Modify TransformerConfig and ModelCommProcessGroups for local attention
+            # Modify TransformerConfig and ProcessGroupCollection for local attention
             self.local_attn_config = copy.deepcopy(self.config)
-            self.local_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+            self.local_pgs = ProcessGroupCollection.use_mpu_process_groups()
             self.local_attn_config.context_parallel_size = 1
             self.local_pgs.cp = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
 

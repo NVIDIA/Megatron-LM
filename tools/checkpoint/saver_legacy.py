@@ -4,6 +4,8 @@ import os
 import sys
 import torch
 
+from functools import partial
+
 from tools.checkpoint.utils import _ConverterFakeProcessGroup
 
 
@@ -193,7 +195,9 @@ def save_checkpoint(queue, args):
 
     # Determine how to make our models
     if md.model_type == 'GPT':
-        from pretrain_gpt import model_provider
+        from model_provider import model_provider as common_model_provider
+        from gpt_builders import gpt_builder
+        model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif md.model_type == 'BERT':
         from pretrain_bert import model_provider

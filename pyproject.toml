@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy<2.0.0", "packaging"]
+dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -63,25 +63,25 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
+mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
-    "transformers~=4.53",
-    "multi-storage-client~=0.20",
+    "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
-    "transformer-engine[pytorch]>=2.5.0a0,<2.7.0",
+    "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
     "flashinfer-python",
+    "wget",
     "onnxscript",
 ]
 
@@ -93,6 +93,7 @@ lts = [
     "transformers",
     "zarr",
     "setuptools<80.0.0",
+    "wget",
 ]
 
 [dependency-groups]
@@ -106,11 +107,22 @@ test = [
     "pytest-random-order",
     "pytest-asyncio",
     "pygithub",
+    "pydantic",
+    "tensorboard",
+    "pyyaml",
+    "nemo-run",
 ]
-
+docs = [
+    "sphinx",
+    "sphinx-autobuild",    # For live doc serving while editing docs
+    "sphinx-autodoc2",     # For documenting Python API
+    "sphinx-copybutton",   # Adds a copy button for code blocks
+    "myst_parser",         # For our markdown docs
+    "nvidia-sphinx-theme", # Our NVIDIA theme
+]
 build = [
     "setuptools<80.0.0",
-    "packaging",
+    "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
@@ -138,8 +150,9 @@ no-build-isolation-package = [
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton
-# because they are already installed in the base image.
+# We don't define override-dependencies globally but rather locally where we need it.
+# For instance, when installing into a PyTorch base image, we don't want to install torch, 
+# torchvision, and triton.
 override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
@@ -150,7 +163,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "c90a720765bc01ebb5ba1f70a7ce2d16b2e46d77" } # on `release_v2.6`
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
@@ -189,17 +202,22 @@ markers = [
 ]
 
 [tool.coverage.run]
-data_file = ".coverage_$LOCAL_RANK"
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
-relative_files = true
+parallel = true
+sigterm = false
 
 [tool.coverage.paths]
-source = ["/opt/megatron-lm/"]
+source = [
+    ".",
+    "/opt/megatron-lm/",
+    "/opt/megatron-lm-legacy/",
+    "/home/runner/work/Megatron-LM/Megatron-LM/",
+]
 
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the
