@@ -2,6 +2,7 @@
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
+import importlib
 import weakref
 from contextlib import nullcontext
 from functools import wraps
@@ -102,6 +103,38 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.dequantize()
     else:
         return fp8_tensor.from_float8()
+
+
+def _resolve_callable_from_python_import_path(dotted_path: str):
+    """Resolve a Python import path like 'pkg.mod.func' to a callable.
+
+    Raises ValueError with clear message on failure.
+    """
+    if not isinstance(dotted_path, str) or not dotted_path:
+        raise ValueError("fp8_custom_factory must be a non-empty string with format 'pkg.mod.func'.")
+
+    parts = dotted_path.rsplit(".", 1)
+    if len(parts) == 1:
+        raise ValueError(
+            f"Invalid fp8_custom_factory '{dotted_path}'. Expected 'pkg.mod.func'."
+        )
+    module_path, attr = parts[0], parts[1]
+
+    try:
+        mod = importlib.import_module(module_path)
+    except Exception as exc:
+        raise ValueError(f"Failed to import module '{module_path}' for fp8_custom_factory: {exc}") from exc
+
+    fn = getattr(mod, attr, None)
+    if fn is None:
+        raise ValueError(
+            f"Attribute '{attr}' not found in module '{module_path}' for fp8_custom_factory."
+        )
+    if not callable(fn):
+        raise ValueError(
+            f"Resolved attribute '{module_path}.{attr}' is not callable for fp8_custom_factory."
+        )
+    return fn
 
 
 def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
@@ -476,6 +509,16 @@ if HAVE_TE:
                 elif config.fp8_recipe == Fp8Recipe.mxfp8:
                     fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
                         fp8_format=fp8_format
+                    )
+                elif config.fp8_recipe == Fp8Recipe.custom:
+                    if not config.fp8_custom_factory:
+                        raise ValueError(
+                            "Python import path, e.g. package.module.quantizer_factory, must be provided "
+                            "via --fp8-custom-factory when --fp8-recipe custom is selected."
+                        )
+                    quantizer_factory = _resolve_callable_from_python_import_path(config.fp8_custom_factory)
+                    fp8_recipe = transformer_engine.common.recipe.CustomRecipe(
+                        qfactory=quantizer_factory
                     )
                 else:
                     raise ValueError(
