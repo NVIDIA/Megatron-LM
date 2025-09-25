@@ -42,6 +42,7 @@ from megatron.core.utils import (
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+    from fla.modules.l2norm import l2norm
 
     HAVE_FLA = True
 except ImportError:
@@ -288,14 +289,15 @@ class GatedDeltaNetMixer(MegatronModule):
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
+        
+        # Transpose: s b x --> b s x
+        # Transform from sbhd to bshd format
+        hidden_states = hidden_states.transpose(0, 1)
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
-
-        # transpose: s b x --> b s x
-        qkvzba = qkvzba.transpose(0, 1)
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
         qkv, gate, beta, alpha = torch.split(qkvzba, [
@@ -332,6 +334,10 @@ class GatedDeltaNetMixer(MegatronModule):
         query = query.reshape(batch, seq_len, -1, self.qk_head_dim)
         key = key.reshape(batch, seq_len, -1, self.qk_head_dim)
         value = value.reshape(batch, seq_len, -1, self.v_head_dim)
+        # Apply L2 norm to query and key
+        if self.use_qk_l2norm:
+            query = l2norm(query.contiguous())
+            key = l2norm(key.contiguous())
         if self.num_v_heads // self.num_qk_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
@@ -359,29 +365,38 @@ class GatedDeltaNetMixer(MegatronModule):
             beta=beta,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
+            use_qk_l2norm_in_kernel=False,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
         nvtx_range_push(suffix="gated_norm")
-        core_attn_out_dtype = core_attn_out.dtype
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        norm_out = self.out_norm(core_attn_out)
-        # Output gate
-        gate = gate.reshape(-1, gate.shape[-1])
-        norm_out = norm_out * self.act_fn(gate.float())
-        norm_out = norm_out.to(core_attn_out_dtype)
+        norm_out = self._torch_compiled_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
         norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()  # b, s, x -> s, b, x
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+
+        # Transpose: b s x --> s b x
+        # Transform from bshd back to sbhd format
+        out = out.transpose(0, 1).contiguous()
         
         return out, out_bias
+
+    @torch.compile
+    def _torch_compiled_gated_norm(self, x, gate):
+        # Output Norm
+        x_dtype = x.dtype
+        x = x.reshape(-1, x.shape[-1])
+        y = self.out_norm(x)
+        # Output gate
+        gate = gate.reshape(-1, gate.shape[-1])
+        y = y * self.act_fn(gate.float())
+        y = y.to(x_dtype)
+        return y
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

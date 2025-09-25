@@ -843,10 +843,7 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out_dtype = core_attn_out.dtype
-            gate = gate.view(*core_attn_out.shape)
-            core_attn_out = core_attn_out * torch.sigmoid(gate.float())
-            core_attn_out = core_attn_out.to(core_attn_out_dtype)
+            core_attn_out = self._torch_compiled_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -858,6 +855,15 @@ class Attention(MegatronModule, ABC):
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
+    
+    @torch.compile
+    def _torch_compiled_output_gate(self, x, gate):
+        x_dtype = x.dtype
+        gate = gate.contiguous()
+        gate = gate.view(*x.shape)
+        x = x * torch.sigmoid(gate.float())
+        x = x.to(x_dtype)
+        return x
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
