@@ -697,6 +697,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with self.get_quantization_context():
             torch.cuda.synchronize()
+            # >>>
+            # ldebug({"runner": self}) # , True)
+            # <<<
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):

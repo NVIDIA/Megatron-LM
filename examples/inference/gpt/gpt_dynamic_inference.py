@@ -380,10 +380,10 @@ def main():
     )
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    def ldebug(d = None):
+    def ldebug(d = None, force = False):
         import os
         from lutil import pax
-        if os.getenv("LDEBUG"):
+        if os.getenv("LDEBUG") or force:
             pax(d or {})
     import builtins
     builtins.ldebug = ldebug
@@ -399,6 +399,11 @@ def main():
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
+
+    # >>>
+    # from lutil import pax
+    # pax({"manager": model.module.decoder.layers[0].cudagraph_manager})
+    # <<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
