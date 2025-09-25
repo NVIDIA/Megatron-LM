@@ -11,7 +11,7 @@ import logging
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.pipeline_parallel.multi_module_communicator import (
+from megatron.core.pipeline_parallel.multimodule_communicator import (
     MultiModulePipelineCommunicator,
 )
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator

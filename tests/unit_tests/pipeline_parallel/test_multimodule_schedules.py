@@ -16,7 +16,7 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_rank
-from megatron.core.pipeline_parallel.multi_module_communicator import (
+from megatron.core.pipeline_parallel.multimodule_communicator import (
     MultiModulePipelineCommunicator,
 )
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -539,7 +539,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
     model.config = config
     config.hidden_size = hidden_size
 
-    multi_module_communicator = MultiModulePipelineCommunicator(
+    multimodule_communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
     )
 
@@ -569,7 +569,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
         raise ValueError(f"Rank {dist.get_rank()} is not valid")
 
     losses_reduced_explicit = schedule.forward_backward_pipelining_without_interleaving(
-        p2p_communicator=multi_module_communicator, pg_collection=pg_collection, **common_args
+        p2p_communicator=multimodule_communicator, pg_collection=pg_collection, **common_args
     )
     logging.info(f"Losses reduced explicit: {losses_reduced_explicit}")
 
@@ -648,7 +648,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_dual_enco
     model.config = config
     config.hidden_size = hidden_size
 
-    multi_module_communicator = MultiModulePipelineCommunicator(
+    multimodule_communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
     )
 
@@ -681,7 +681,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_dual_enco
         raise ValueError(f"Rank {dist.get_rank()} is not valid")
 
     losses_reduced_explicit = schedule.forward_backward_pipelining_without_interleaving(
-        p2p_communicator=multi_module_communicator, pg_collection=pg_collection, **common_args
+        p2p_communicator=multimodule_communicator, pg_collection=pg_collection, **common_args
     )
     logging.info(f"Losses reduced explicit: {losses_reduced_explicit}")
 

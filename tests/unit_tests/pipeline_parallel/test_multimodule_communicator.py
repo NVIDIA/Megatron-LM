@@ -10,7 +10,7 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_rank
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
-from megatron.core.pipeline_parallel.multi_module_communicator import (
+from megatron.core.pipeline_parallel.multimodule_communicator import (
     MultiModulePipelineCommunicator,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
