@@ -535,9 +535,9 @@ class DynamicInferenceEngine(AbstractEngine):
             delete_cuda_graphs()
 
         # >>>
-        layers = self.controller.inference_wrapped_model.model.module.decoder.layers
-        for layer in layers:
-            layer.cudagraph_manager.cudagraph_runners.clear()
+        # layers = self.controller.inference_wrapped_model.model.module.decoder.layers
+        # for layer in layers:
+        #     layer.cudagraph_manager.cudagraph_runners.clear()
 
         # from lutil import pax
         # pax({"manager": layers[0].cudagraph_manager})
