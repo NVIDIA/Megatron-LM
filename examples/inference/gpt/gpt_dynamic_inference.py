@@ -413,48 +413,11 @@ def main():
         enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
-    # >>>
-    # from lutil import pax
-    # pax({"manager": model.module.decoder.layers[0].cudagraph_manager})
-    # <<<
-
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-    # from lutil import pax
-
-    # num_record_runners = len(_CudagraphGlobalRecord.cudagraph_inference_record)
-    # num_manager_runners = sum(len(layer.cudagraph_manager.cudagraph_runners) for layer in model.module.decoder.layers)
-
-    # pax({
-    #     "_CudagraphGlobalRecord" : _CudagraphGlobalRecord,
-    #     "manager" : model.module.decoder.layers[0].cudagraph_manager,
-    #     "runner" : model.module.decoder.layers[0].cudagraph_manager.cudagraph_runners[0],
-    # }, "num_record_runners, num_manager_runners")
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    engine.suspend()
-    # torch.cuda.synchronize()
-
-    # if 1:
-    #     for l in model.module.decoder.layers:
-    #         for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-    #             # >>>
-    #             # from lutil import pax
-    #             # pax("runner")
-    #             # <<<
-    #             # Safely delete both graphs if present
-    #             if hasattr(runner, "fwd_graph"):
-    #                 # del runner.fwd_graph
-    #                 runner.fwd_graph = None
-    #             if hasattr(runner, "bwd_graph"):
-    #                 # del runner.bwd_graph
-    #                 runner.bwd_graph = None
-
-    os.environ["LDEBUG"] = "1"
-
-    engine.resume()
-    raise Exception("hi.")
+    # engine.suspend()
+    # os.environ["LDEBUG"] = "1"
+    # engine.resume()
+    # raise Exception("hi.")
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)

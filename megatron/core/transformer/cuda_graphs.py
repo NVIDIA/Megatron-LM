@@ -355,7 +355,6 @@ def create_cudagraphs():
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # Reset runners.
     for record in [
         *_CudagraphGlobalRecord.cudagraph_record,
@@ -364,30 +363,18 @@ def delete_cuda_graphs():
         runner = record[0]
         assert isinstance(runner, _CudaGraphRunner)
 
-        # >>>
-        # from lutil import pax
-        # pax("runner")
-
-        runner.fwd_mempool = None
-        runner.bwd_mempool = None
-        # <<<
-
         runner.cudagraph_created = False
         runner.fwd_graph_recorded = False
         runner.bwd_graph_recorded = False
         runner.fwd_graph = None
         runner.bwd_graph = None
-        # >>>
-        # [x] runner.training = True
-        # <<<
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        runner.fwd_mempool = None
+        runner.bwd_mempool = None
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
-    # >>>
     _CudagraphGlobalRecord.cudagraph_inference_record = []
-    # <<<
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -705,9 +692,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
         with self.get_quantization_context():
             torch.cuda.synchronize()
-            # >>>
-            # ldebug({"runner": self}) # , True)
-            # <<<
             with torch.cuda.graph(
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):
@@ -1253,9 +1237,6 @@ class CudaGraphManager(torch.nn.Module):
         if self.is_first_microbatch and hasattr(megatron_module, 'set_is_first_microbatch'):
             megatron_module.set_is_first_microbatch()
 
-        # >>>
-        # ldebug({"_CudagraphGlobalRecord.cudagraph_created": _CudagraphGlobalRecord.cudagraph_created})
-        # <<<
         if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
                 # param.data_ptr() below is used to trigger any hooks that have attached to the
@@ -1280,9 +1261,6 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 runner.eval()
 
-                # >>>
-                # ldebug({"runner": runner})
-                # <<<
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
                     local_args, local_kwargs = args, kwargs

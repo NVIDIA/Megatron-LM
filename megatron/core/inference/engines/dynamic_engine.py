@@ -265,7 +265,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                         self.context.reset()  # todo: @lmcafee, remove if unnecessary.
                     # >>>
-                    torch.cuda.synchronize()
+                    # torch.cuda.synchronize()
                     # <<<
 
             # Memory usage.
@@ -534,20 +534,11 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.unified_memory_level == 0:
             delete_cuda_graphs()
 
-        # >>>
-        # layers = self.controller.inference_wrapped_model.model.module.decoder.layers
-        # for layer in layers:
-        #     layer.cudagraph_manager.cudagraph_runners.clear()
-
-        # from lutil import pax
-        # pax({"manager": layers[0].cudagraph_manager})
-        # <<<
-
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
         # >>>
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         # <<<
         with self.__class__.suspend_resume_ctx(
             "resumed",
@@ -579,12 +570,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # 0). For levels 1 and 2, the context's tensors maintain static
             # memory addresses, so the cuda graphs are re-used.
             # >>>
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             # <<<
             if self.unified_memory_level == 0:
                 self.create_cuda_graphs()
             # >>>
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             # <<<
 
             # Add requests.
