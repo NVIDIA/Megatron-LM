@@ -16,8 +16,9 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
 fi
 
 if [ -z ${PROMPTS_PATH} ]; then
-    printf "${MLM_ERROR} Variable ${PURPLE}PROMPTS_PATH${WHITE} must be set!\n"
-    exit 1
+    PROMPT_ARGS=""
+else
+    PROMPT_ARGS="--prompts-path ${PROMPTS_PATH}"
 fi
 
 if [ -z ${STEPS} ]; then
@@ -49,9 +50,9 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/validate.py \
     --pipeline-model-parallel-size ${PP} \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --load ${MLM_MODEL_CKPT} \
-    --prompts-path ${PROMPTS_PATH} \
     --steps ${STEPS} \
     --osl ${OSL} \
+    ${PROMPT_ARGS} \
     ${GT_ARGS} \
     ${SAVE_ARGS} \
     ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
