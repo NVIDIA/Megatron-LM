@@ -31,7 +31,8 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.parametrize(("tp_size", "sp", "cp_size"), [
     (1, False, 1),
-    (2, True, 1),  # GDN only support TP w/ SP for now. Leave TP w/o SP for future work.
+    (2, False, 1),
+    (2, True, 1),
     # GDN does not support CP for now. Leave it for future work.
 ])
 @pytest.mark.internal
@@ -130,9 +131,9 @@ class TestGatedDeltaNetMixer:
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
     [
+        (4, False, 1),  # TP w/o SP
         (4, True, 1),  # TP w/ SP
         # CP does not support GDN for now. Add it once it is supported.
-        # TP w/o SP does not support GDN for now. Add it once it is supported.
     ],
 )
 def test_parallel_gated_delta_net_mixer_correctness(

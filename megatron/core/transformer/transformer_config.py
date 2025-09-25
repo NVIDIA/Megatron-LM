@@ -824,7 +824,7 @@ class TransformerConfig(ModelParallelConfig):
                     f" but got {self.context_parallel_size=}."
                 )
             elif self.linear_attention_type == "mamba":
-                raise NotImplementedError("Mamba is not supported yet. Coming soon.")
+                raise NotImplementedError("Mamba is not supported yet.")
 
 
 

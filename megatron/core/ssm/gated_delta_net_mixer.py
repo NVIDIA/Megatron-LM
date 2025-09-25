@@ -135,12 +135,6 @@ class GatedDeltaNetMixer(MegatronModule):
         self.qk_dim = self.qk_head_dim * self.num_qk_heads
         self.v_dim = self.v_head_dim * self.num_v_heads
 
-        # TODO: support TP w/o SP
-        if config.tensor_model_parallel_size > 1:
-            assert config.sequence_parallel, (
-                "GDN forces sequence parallelism if TP > 1."
-            )
-
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
         # We may remove this restriction in the future.
@@ -150,7 +144,6 @@ class GatedDeltaNetMixer(MegatronModule):
                 "For FP8, the innermost dimension of the GDN layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        # Assume sequence parallelism: input is already partitioned along the sequence dimension
         self.in_proj = build_module(
             submodules.in_proj,
             self.hidden_size,
@@ -214,8 +207,6 @@ class GatedDeltaNetMixer(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
 
-        # Assume sequence parallelism: input is partitioned along d_inner and
-        # output is partitioned along the sequence dimension
         self.out_proj = build_module(
             submodules.out_proj,
             self.v_dim,
@@ -289,6 +280,10 @@ class GatedDeltaNetMixer(MegatronModule):
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
+        
+        if packed_seq_params is not None:
+            # TODO: support packed sequence
+            raise NotImplementedError("GDN does not support packed sequence for now.")
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -301,10 +296,10 @@ class GatedDeltaNetMixer(MegatronModule):
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
         qkv, gate, beta, alpha = torch.split(qkvzba, [
-            (self.qk_dim * 2 + self.v_dim) // self.sp_size,
-            self.v_dim // self.sp_size,
-            self.num_v_heads // self.sp_size,
-            self.num_v_heads // self.sp_size,
+            (self.qk_dim * 2 + self.v_dim) // self.tp_size,
+            self.v_dim // self.tp_size,
+            self.num_v_heads // self.tp_size,
+            self.num_v_heads // self.tp_size,
         ], dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.v_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
@@ -327,9 +322,9 @@ class GatedDeltaNetMixer(MegatronModule):
         # Split qkv into query, key, and value
         qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         query, key, value = torch.split(qkv, [
-            self.qk_dim // self.sp_size,
-            self.qk_dim // self.sp_size,
-            self.v_dim // self.sp_size,
+            self.qk_dim // self.tp_size,
+            self.qk_dim // self.tp_size,
+            self.v_dim // self.tp_size,
         ], dim=-1)
         query = query.reshape(batch, seq_len, -1, self.qk_head_dim)
         key = key.reshape(batch, seq_len, -1, self.qk_head_dim)
