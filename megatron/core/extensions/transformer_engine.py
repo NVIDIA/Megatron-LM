@@ -441,14 +441,7 @@ class TELinear(te.pytorch.Linear):
             self.parallel_mode is None
         ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            None,
-            sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
-        )
+        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
@@ -611,7 +604,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
-        self.tp_group_for_sharded_sd = tp_group
 
     def forward(self, x):
         """Forward."""
@@ -632,12 +624,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            {"weight": 0, "bias": 0},
-            sharded_offsets,
-            tp_group=self.tp_group_for_sharded_sd,
-            dp_cp_group=metadata['dp_cp_group'],
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
         )
 
     def __repr__(self):
@@ -725,18 +712,12 @@ class TEColumnParallelLinear(TELinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
-        self.tp_group_for_sharded_sd = tp_group
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            {"weight": 0, "bias": 0},
-            sharded_offsets,
-            tp_group=self.tp_group_for_sharded_sd,
-            dp_cp_group=metadata['dp_cp_group'],
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
         )
 
     def __repr__(self):
@@ -825,18 +806,12 @@ class TERowParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
-        self.tp_group_for_sharded_sd = tp_group
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            {"weight": 1},
-            sharded_offsets,
-            tp_group=self.tp_group_for_sharded_sd,
-            dp_cp_group=metadata['dp_cp_group'],
+            state_dict, prefix, {"weight": 1}, sharded_offsets
         )
 
     def __repr__(self):
@@ -1268,7 +1243,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
-            self.tp_group_for_sharded_sd = tp_group
 
         def forward(self, x, m_splits):
             """Forward."""
@@ -1380,12 +1354,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict,
-                    '',
-                    tp_axis_map,
-                    new_sharded_offsets,
-                    tp_group=self.tp_group_for_sharded_sd,
-                    dp_cp_group=metadata['dp_cp_group'],
+                    state_dict, '', tp_axis_map, new_sharded_offsets
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
@@ -1453,7 +1422,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
             )
-            self.tp_group_for_sharded_sd = tp_group
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
             """
@@ -1500,7 +1468,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
             )
-            self.tp_group_for_sharded_sd = tp_group
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
             """
@@ -1715,12 +1682,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             """Sharding along axis 0, bias sharded"""
             state_dict = self.state_dict(prefix="", keep_vars=True)
             return make_sharded_tensors_for_checkpoint(
-                state_dict,
-                prefix,
-                {"weight": 0, "bias": 0},
-                sharded_offsets,
-                tp_group=self.tp_group_for_sharded_sd,
-                dp_cp_group=metadata['dp_cp_group'],
+                state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
             )
 
 else:

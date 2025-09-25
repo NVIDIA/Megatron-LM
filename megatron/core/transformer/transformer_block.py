@@ -281,6 +281,7 @@ class TransformerBlock(MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
@@ -754,11 +755,8 @@ class TransformerBlock(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module,
-                        f'{prefix}{name}.',
-                        sharded_offsets,
-                        metadata,
-                        self.model_comm_pgs.tp,
+                        module, f'{prefix}{name}.', sharded_offsets, metadata,
+                        tp_group=self.tp_group, dp_cp_group=metadata['dp_cp_group']
                     )
                 )
 

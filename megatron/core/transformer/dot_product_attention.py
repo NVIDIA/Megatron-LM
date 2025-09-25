@@ -71,6 +71,7 @@ class DotProductAttention(MegatronModule):
             assert hasattr(
                 pg_collection, 'tp'
             ), "DotProductAttention pg_collection must have tp process group"
+        self.pg_collection = pg_collection
 
         world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
@@ -252,5 +253,7 @@ class DotProductAttention(MegatronModule):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets,
+            tp_group=self.pg_collection.tp,
+            dp_cp_group=metadata['dp_cp_group'],
         )
