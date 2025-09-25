@@ -437,7 +437,7 @@ if HAVE_TE:
                 )
             elif config.fp8_recipe == Fp8Recipe.tensorwise and is_te_min_version("2.2.0.dev0"):
                 fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
-                    fp8_format=fp8_format
+                    fp8_format=fp8_format, fp8_dpa=config.fp8_dot_product_attention
                 )
             elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
                 fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
