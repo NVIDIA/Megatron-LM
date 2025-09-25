@@ -86,7 +86,6 @@ class MegatronModule(torch.nn.Module):
         )
         # Recurse into submodules
         for name, module in self.named_children():
-            assert self.tp_group is not None, self
             sharded_state_dict.update(
                 sharded_state_dict_default(
                     module,
