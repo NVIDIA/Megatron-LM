@@ -428,26 +428,23 @@ def main():
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # from lutil import pax
-    # pax("model")
-
     engine.suspend()
     # torch.cuda.synchronize()
 
-    if 1:
-        for l in model.module.decoder.layers:
-            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-                # >>>
-                # from lutil import pax
-                # pax("runner")
-                # <<<
-                # Safely delete both graphs if present
-                if hasattr(runner, "fwd_graph"):
-                    # del runner.fwd_graph
-                    runner.fwd_graph = None
-                if hasattr(runner, "bwd_graph"):
-                    # del runner.bwd_graph
-                    runner.bwd_graph = None
+    # if 1:
+    #     for l in model.module.decoder.layers:
+    #         for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+    #             # >>>
+    #             # from lutil import pax
+    #             # pax("runner")
+    #             # <<<
+    #             # Safely delete both graphs if present
+    #             if hasattr(runner, "fwd_graph"):
+    #                 # del runner.fwd_graph
+    #                 runner.fwd_graph = None
+    #             if hasattr(runner, "bwd_graph"):
+    #                 # del runner.bwd_graph
+    #                 runner.bwd_graph = None
 
     os.environ["LDEBUG"] = "1"
 
