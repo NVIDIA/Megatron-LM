@@ -253,7 +253,10 @@ class DotProductAttention(MegatronModule):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets,
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
             tp_group=self.pg_collection.tp,
             dp_cp_group=metadata['dp_cp_group'],
         )
