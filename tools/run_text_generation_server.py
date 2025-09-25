@@ -154,7 +154,7 @@ def main(model_provider: str = "gpt"):
             raise ValueError(f"Invalid model provider {model_provider}")
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
