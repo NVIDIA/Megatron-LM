@@ -337,7 +337,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         Performs same attnention forward logic as GPT Model.
         """
-        hidden_states = mark_layer_start(hidden_states)
+        if layer.config.fine_grained_activation_offloading:
+            hidden_states = mark_layer_start(hidden_states)
         hidden_states, _ = layer._forward_attention(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
