@@ -986,7 +986,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if config.qk_clip:
             # TE 2.9.0 introduces return_max_score for qk-clip getting the max attention score
             extra_kwargs["return_max_score"] = True
-        print(f"extra_kwargs: {extra_kwargs["return_max_score"]}")
+            self.qk_clip_balancing_eta = None
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
@@ -1042,16 +1042,38 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
-            core_attn_out = super().forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type.name,
-                **attention_bias_kwargs,
-                **packed_seq_kwargs,
-            )
-            assert False, f"core_attn_out: {core_attn_out} {len(core_attn_out)}"
+
+            # TODO: add is_te_min_version("2.9.0") before merge
+            if self.config.qk_clip:
+                if self.qk_clip_balancing_eta:
+                    # Apply QK_Clip
+                    query = pow(self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha) * query
+                    key = pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha) * key
+
+                # Forward pass and get max attention score
+                core_attn_out, max_attention_score = super().forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type.name,
+                    **attention_bias_kwargs,
+                    **packed_seq_kwargs,
+                )
+
+                # Update QK_Clip balancing eta
+                max_attention_score = float(max_attention_score)
+                self.qk_clip_balancing_eta = min(self.config.qk_clip_balancing_threshold / max_attention_score, 1.0)
+            else:
+                core_attn_out = super().forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type.name,
+                    **attention_bias_kwargs,
+                    **packed_seq_kwargs,
+                )
         else:
             core_attn_out = super().forward(
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs

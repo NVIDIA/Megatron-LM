@@ -928,6 +928,15 @@ def validate_args(args, defaults={}):
     # Keep the 'add bias' args in sync; add_qkv_bias is more targeted.
     if args.add_bias_linear:
         args.add_qkv_bias = True
+    
+    if args.qk_clip:
+        # TODO: add is_te_min_version("2.9.0") before merge
+        # assert is_te_min_version("2.9.0"), \
+        #     '--qk-clip is only supported with TE >= 2.9.0.'
+        # assert 0.0 < args.qk_clip_balancing_alpha < 1.0, \
+        #     '--qk-clip-balancing-alpha must be between 0.0 and 1.0 when using --qk-clip.'
+        assert args.qk_clip_balancing_threshold > 0, \
+            '--qk-clip-balancing-threshold must be greater than 0 when using --qk-clip.'
 
     # Retro checks.
     if args.retro_add_retriever:
@@ -2100,6 +2109,10 @@ def _add_training_args(parser):
                        dest='add_qkv_bias')
     group.add_argument('--qk-clip', action='store_true',
                        help='Whether to use qk-clip for training stabilization, strongly recommended for Muon.')
+    group.add_argument('--qk-clip-balancing-alpha', type=float, default=0.5,
+                       help='The balancing alpha for qk-clip.')
+    group.add_argument('--qk-clip-balancing-threshold', type=float, default=100,
+                       help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
