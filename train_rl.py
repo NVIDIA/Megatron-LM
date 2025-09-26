@@ -8,7 +8,6 @@ from functools import partial
 
 import torch
 
-from model_provider import model_provider
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core import mpu
@@ -16,9 +15,10 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
+from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.rl_utils import calculate_grpo_loss, get_logprobs
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 
@@ -67,6 +67,8 @@ def loss_func(
     kl_term: torch.Tensor,
     ratios: torch.Tensor,
     entropy_term: torch.Tensor,
+    truncated_from_above: torch.Tensor,
+    truncated_from_below: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
     """Loss function.
@@ -76,6 +78,8 @@ def loss_func(
         kl_term (torch.Tensor): KL term of the loss. Used for logging.
         ratios (torch.Tensor): pi/pi_{old} ratios. Used for logging.
         entropy (torch.Tensor): Current policy entropy on the trajectories. Used for logging.
+        truncated_from_above(torch.Tensor): A boolean mask that tells whether the ratios were truncated from above. Used for logging.
+        truncated_from_below(torch.Tensor): A boolean mask that tells whether the ratios were truncated from below. Used for logging.
         output_tensor (torch.Tensor): The tensor with the losses
 
     Returns:
@@ -95,6 +99,12 @@ def loss_func(
     masked_kl = torch.sum(loss_mask * kl_term.view(-1).cuda())
     masked_ratios = torch.sum(loss_mask * ratios.view(-1).cuda())
     masked_entropy = torch.sum(loss_mask * entropy_term.view(-1).cuda())
+    masked_truncated_from_above = torch.sum(
+        loss_mask * truncated_from_above.float().view(-1).cuda()
+    )
+    masked_truncated_from_below = torch.sum(
+        loss_mask * truncated_from_below.float().view(-1).cuda()
+    )
 
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
@@ -122,6 +132,12 @@ def loss_func(
     reporting_kl = torch.cat([masked_kl.clone().detach().view(1), total_tokens.view(1)])
     reporting_ratios = torch.cat([masked_ratios.clone().detach().view(1), total_tokens.view(1)])
     reporting_entropy = torch.cat([masked_entropy.clone().detach().view(1), total_tokens.view(1)])
+    reporting_truncated_from_above = torch.cat(
+        [masked_truncated_from_above.clone().detach().view(1), total_tokens.view(1)]
+    )
+    reporting_truncated_from_below = torch.cat(
+        [masked_truncated_from_below.clone().detach().view(1), total_tokens.view(1)]
+    )
 
     return (
         loss[0] * args.context_parallel_size,
@@ -131,6 +147,8 @@ def loss_func(
             'rl/kl_term': reporting_kl,
             'rl/pi_over_pi_old': reporting_ratios,
             'rl/entropy_term': reporting_entropy,
+            'rl/truncated_from_above': reporting_truncated_from_above,
+            'rl/truncated_from_below': reporting_truncated_from_below,
         },
     )
 
@@ -148,9 +166,15 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (tokens, advantages, old_logprobs, loss_mask, position_ids, ref_logprobs) = next(
-            data_iterator
-        )
+        (
+            tokens,
+            advantages,
+            old_logprobs,
+            loss_mask,
+            position_ids,
+            ref_logprobs,
+            inference_logprobs,
+        ) = next(data_iterator)
     timers('batch-generator').stop()
 
     tokens = tokens.cuda()
@@ -158,22 +182,37 @@ def forward_step(data_iterator, model: GPTModel):
     old_logprobs = old_logprobs.cuda()
     ref_logprobs = ref_logprobs.cuda()
     advantages = advantages.cuda()
+    inference_logprobs = (
+        inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
+    )
 
     with stimer:
         current_logprobs = get_logprobs(model, tokens, position_ids, None, no_grad=False)
-        loss, kl_term, ratios, entropy_term = calculate_grpo_loss(
-            current_logprobs=current_logprobs,
-            old_logprobs=old_logprobs,
-            ref_logprobs=ref_logprobs,
-            advantages=advantages,
-            clamp_eps_lower=args.grpo_clamp_eps_lower,
-            clamp_eps_upper=args.grpo_clamp_eps_upper,
-            kl_beta=args.grpo_kl_beta,
-            entropy_weight=args.grpo_entropy_term_weight,
+        loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+            calculate_grpo_loss(
+                current_logprobs=current_logprobs,
+                old_logprobs=old_logprobs,
+                ref_logprobs=ref_logprobs,
+                advantages=advantages,
+                clamp_eps_lower=args.grpo_clamp_eps_lower,
+                clamp_eps_upper=args.grpo_clamp_eps_upper,
+                kl_beta=args.grpo_kl_beta,
+                entropy_weight=args.grpo_entropy_term_weight,
+                inference_logprobs=inference_logprobs,
+                is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+            )
         )
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
-    return loss, partial(loss_func, loss_mask[:, 1:].contiguous(), kl_term, ratios, entropy_term)
+    return loss, partial(
+        loss_func,
+        loss_mask[:, 1:].contiguous(),
+        kl_term,
+        ratios,
+        entropy_term,
+        truncated_from_above,
+        truncated_from_below,
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

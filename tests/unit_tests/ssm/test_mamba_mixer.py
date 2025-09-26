@@ -5,7 +5,7 @@ import torch
 
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -37,14 +37,14 @@ class TestMambaMixer:
             use_cpu_initialization=True,
         )
         modules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
-        model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             transformer_config,
             modules,
             transformer_config.hidden_size,
             layer_number=1,
             use_mem_eff_path=use_mem_eff_path,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         mixer.cuda()
         return mixer
@@ -120,12 +120,12 @@ class TestMambaMixerErrorChecks:
             mamba_num_groups=ngroups,
         )
         submodules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
-        model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         with pytest.raises(AssertionError, match=expected_error_message):
             MambaMixer(
                 transformer_config,
                 submodules,
                 transformer_config.hidden_size,
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
         Utils.destroy_model_parallel()

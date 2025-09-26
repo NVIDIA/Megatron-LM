@@ -805,6 +805,12 @@ class FSDPDistributedIndex:
             return None
         return self.fsdp_group
 
+    def get_inter_fsdp_group(self) -> ProcessGroup:
+        """Get the inter-FSDP process group."""
+        if not self.use_hybrid_fsdp:
+            return None
+        return self.inter_fsdp_group
+
     def get_root_mesh(self, is_expert_parallel: bool = False) -> DeviceMesh:
         """Get the device mesh."""
         if is_expert_parallel:

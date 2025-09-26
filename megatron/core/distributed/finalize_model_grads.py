@@ -18,7 +18,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
 )
-from megatron.core.process_groups_config import GradFinalizeProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
@@ -31,7 +31,7 @@ from ..utils import (
 )
 
 
-def _get_main_grad_attr(param: torch.nn.Parameter, use_megatron_fsdp: bool = False):
+def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
         return "main_grad"
     return "grad"
@@ -239,7 +239,7 @@ def _allreduce_embedding_grad(
         if weight is None and skip_if_none:
             return
 
-        grad_attr = _get_main_grad_attr(weight, ddp_config.use_megatron_fsdp)
+        grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
             orig_grad = orig_grad._local_tensor if orig_grad is not None else None
@@ -265,6 +265,16 @@ def _allreduce_position_embedding_grads(
     _allreduce_embedding_grad(
         model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
     )
+
+
+def _reset_global_aux_loss_tracker(model: List[torch.nn.Module]):
+    """
+    Reset the global aux loss tracker.
+    """
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'reset_global_aux_loss_tracker'):
+                module.reset_global_aux_loss_tracker()
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
@@ -320,7 +330,7 @@ def _allreduce_non_tensor_model_parallel_grads(
             if param.requires_grad:
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
                 if getattr(param, "average_gradients_across_tp_domain", False):
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
+                    grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
                     if grad is None:
                         continue
@@ -334,7 +344,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                 elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
                     config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
                 ):
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
+                    grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
                     if grad is None:
                         continue
@@ -358,7 +368,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
+                grad_attr = _get_main_grad_attr(param)
                 orig_grad = getattr(param, grad_attr)
                 if ddp_config.use_megatron_fsdp:
                     setattr(param, grad_attr, orig_grad)
@@ -376,7 +386,7 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
-    grad_finalize_pgs: Optional[GradFinalizeProcessGroups] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
@@ -385,29 +395,29 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
-    if grad_finalize_pgs is not None:
-        assert hasattr(grad_finalize_pgs, 'tp')
-        assert hasattr(grad_finalize_pgs, 'pp')
-        assert hasattr(grad_finalize_pgs, 'embd'), (
-            "grad_finalize_pgs must have a embd. In previous version, it is used default "
+    if pg_collection is not None:
+        assert hasattr(pg_collection, 'tp')
+        assert hasattr(pg_collection, 'pp')
+        assert hasattr(pg_collection, 'embd'), (
+            "pg_collection must have a embd. In previous version, it is used default "
             "`parallel_state.default_embedding_ranks` to create the process group."
             " If you are using the default process group, please use"
             " `parallel_state.get_embedding_group()` "
             "If you don't need embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(grad_finalize_pgs, 'pos_embd'), (
-            "grad_finalize_pgs must have a pos_embd. In previous version, it is used default "
+        assert hasattr(pg_collection, 'pos_embd'), (
+            "pg_collection must have a pos_embd. In previous version, it is used default "
             "`parallel_state.default_position_embedding_ranks` to create the process group."
             " If you are using the default process group, please use "
             " `parallel_state.get_position_embedding_group()` "
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
-        assert hasattr(grad_finalize_pgs, 'dp_cp')
-        tp_group = grad_finalize_pgs.tp
-        pp_group = grad_finalize_pgs.pp
-        embd_group = grad_finalize_pgs.embd
-        pos_emb_group = grad_finalize_pgs.pos_embd
-        dp_cp_group = grad_finalize_pgs.dp_cp
+        assert hasattr(pg_collection, 'dp_cp')
+        tp_group = pg_collection.tp
+        pp_group = pg_collection.pp
+        embd_group = pg_collection.embd
+        pos_emb_group = pg_collection.pos_embd
+        dp_cp_group = pg_collection.dp_cp
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -454,6 +464,12 @@ def finalize_model_grads(
 
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
+
+    if (
+        config.moe_router_load_balancing_type == "global_aux_loss"
+        or "global_aux_loss" in config.moe_router_load_balancing_type
+    ):
+        _reset_global_aux_loss_tracker(model)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

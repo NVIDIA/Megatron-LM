@@ -187,7 +187,7 @@ publish:test_release_pypi_test_wheel:
       var=EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}
       EXPECTED_RELEASE_NUMBER=$(echo "${!var}")
       test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
-    - echo "RELEASE_NUMBER=$RELEASE_NUMBER" | tee -a build.env
+    - echo "$var=$RELEASE_NUMBER" | tee -a build.env
   artifacts:
     reports:
       dotenv: build.env
@@ -264,6 +264,7 @@ publish:test_release_version_bump:
           git fetch origin $PUBLISH_VERSION_BUMP_BRANCH && \
           git switch $PUBLISH_VERSION_BUMP_BRANCH && \
           git add megatron/core/package_info.py && \
+          git add megatron/core/distributed/fsdp/src/megatron_fsdp/package_info.py && \
           git commit -m "chore: Version bump" && \
           git push origin $PUBLISH_VERSION_BUMP_BRANCH
       EOF
@@ -343,10 +344,20 @@ publish:test_release_github:
   variables:
     PUBLISH_DRYRUN: "yes"
   script:
-    - echo $PUBLISH_DRYRUN
-    - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
-    - IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
+    - set -x
+    - env
+    - apk add --no-cache bash
     - |
+      bash <<'EOF'
+      set -x
+      echo $PUBLISH_DRYRUN
+      PLATFORM=amd64
+      PACKAGE=megatron-core
+      var=EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}
+      RELEASE_NUMBER=$(echo "${!var}")
+      NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
+      IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
+
       if [[ "$IS_PRERELEASE" == "true" ]]; then
         DATE=$(date +"%Y-%m-%d")
         CHANGELOG="Prerelease: $NAME ($DATE)"
@@ -355,7 +366,7 @@ publish:test_release_github:
         CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
       fi
 
-    - |
+
       PAYLOAD=$(jq -nc \
                   --arg TAG_NAME "core_v${RELEASE_NUMBER}" \
                   --arg CI_COMMIT_SHA "$PUBLISH_COMMIT" \
@@ -374,8 +385,8 @@ publish:test_release_github:
               )
       echo -E "$PAYLOAD" | tee -a payload.txt
 
-    - cat payload.txt
-    - |
+      cat payload.txt
+
       CMD=$(echo -E 'curl -L \
         -X POST \
         -H "Accept: application/vnd.github+json" \
@@ -385,12 +396,12 @@ publish:test_release_github:
         -d @payload.txt
       ')
 
-    - |
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo -E "$CMD"
       else
         eval "$CMD"
       fi
+      EOF
 
 publish:test_release_notify:
   needs: [publish:test_release_pypi_test_wheel, publish:test_release_pypi_push_wheel, publish:test_release_github]
@@ -407,10 +418,20 @@ publish:test_release_notify:
   variables:
     PUBLISH_DRYRUN: "yes"
   script:
-    - echo $PUBLISH_DRYRUN
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
+    - set -x
+    - env
+    - apk add --no-cache bash
     - |
-      cat << EOF > message.json
+      bash <<'EOF'
+      set -x
+      echo $PUBLISH_DRYRUN
+      PLATFORM=amd64
+      PACKAGE=megatron-core
+      var=EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}
+      RELEASE_NUMBER=$(echo "${!var}")
+      URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
+
+      cat <<MSG > message.json
       {
           "blocks": [
             {
@@ -422,11 +443,10 @@ publish:test_release_notify:
             }
           ]
       }
-      EOF
+      MSG
 
-    - cat message.json
+      cat message.json
 
-    - |
       CMD=$(echo curl \
         -X POST \
         -H "Content-type: application/json" \
@@ -438,6 +458,7 @@ publish:test_release_notify:
       else
         eval "$CMD"
       fi
+      EOF
 
 publish:release_pypi_build_wheel:
   extends: [publish:test_release_pypi_build_wheel, .publish_common_release]

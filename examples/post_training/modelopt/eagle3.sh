@@ -18,8 +18,7 @@ MLM_DEFAULT_ARGS=" \
 "
 
 EAGLE3_CONVERT_ARGS=" \
-    --export-num-eagle-layers 1 \
-    --export-eagle-algorithm eagle3 \
+    --algorithm eagle3 \
 "
 
 if [ -z ${MLM_MODEL_SAVE} ]; then
@@ -79,7 +78,7 @@ if [[ ! -d ${MLM_MODEL_SAVE} ]]; then
         --tensor-model-parallel-size ${TP} \
         --expert-tensor-parallel-size ${ETP} \
         --pipeline-model-parallel-size ${PP} \
-	--expert-model-parallel-size ${EP} \
+        --expert-model-parallel-size ${EP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \

@@ -81,10 +81,16 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "total number of requests. Set to -1 to add all requests together.",
     )
     group.add_argument(
-        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+        "--model-provider",
+        choices=["mamba", "gpt"],
+        default="gpt",
+        help="Model provider",
     )
     group.add_argument(
-        "--output-path", type=str, default=None, help="Path to save generations as JSON"
+        "--output-path",
+        type=str,
+        default=None,
+        help="Path to save generations as JSON",
     )
     group.add_argument(
         "--output-every-n-results",
@@ -226,7 +232,7 @@ def get_synthetic_requests(args: Namespace, tokenizer: Any) -> list[Request]:
         args.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
-        args.incoming_requests_per_sec * args.incoming_requests_duration,
+        int(args.incoming_requests_per_sec * args.incoming_requests_duration),
     )
 
     # Init requests.
@@ -315,8 +321,8 @@ def build_dynamic_engine_setup_prefix(
     # CUDA graph config
     if args.enable_cuda_graph:
         cg_str = (
-            f"graphs {context.cuda_graph_request_counts[0]}:"
-            f"{context.cuda_graph_request_counts[-1]}"
+            f"graphs {context.cuda_graph_token_counts[0]}:"
+            f"{context.cuda_graph_token_counts[-1]}"
         )
     else:
         cg_str = "--"
