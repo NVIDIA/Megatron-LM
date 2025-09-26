@@ -6,8 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-import math
-import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -32,17 +30,16 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import (
     deprecate_inference_params,
-    log_single_rank,
-    nvtx_range_push,
     nvtx_range_pop,
+    nvtx_range_push,
 )
 
 # TODO: Implement GatedDeltaNetContextParallel
 # from .gated_delta_net_context_parallel import GatedDeltaNetContextParallel
 
 try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
     from fla.modules.l2norm import l2norm
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
@@ -103,9 +100,7 @@ class GatedDeltaNetMixer(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_FLA:
-            raise ImportError(
-                "FLA is not installed. Please install it with `pip install fla`."
-            )
+            raise ImportError("FLA is not installed. Please install it with `pip install fla`.")
 
         super().__init__(config)
 
@@ -161,7 +156,7 @@ class GatedDeltaNetMixer(MegatronModule):
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
-        
+
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
         self.conv1d = nn.Conv1d(
@@ -177,28 +172,28 @@ class GatedDeltaNetMixer(MegatronModule):
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
         if conv_bias:
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
-        
+
         # Time step projection (discretization)
         self.num_v_heads_local_tp = self.num_v_heads // self.tp_size
         # dt_bias parameter
-        self.dt_bias = nn.Parameter(torch.empty(
-            self.num_v_heads_local_tp,
-            dtype=config.params_dtype,
-            device=torch.cuda.current_device()))
-        # Just to be explicit. Without this we already don't
-        # put wd on dt_bias because of the check
-        # name.endswith("bias") in param_grouping.py
-        self.dt_bias._no_weight_decay = True
+        self.dt_bias = nn.Parameter(
+            torch.empty(
+                self.num_v_heads_local_tp,
+                dtype=config.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        )
         setattr(self.dt_bias, "tensor_model_parallel", True)
         # A_log parameter
-        self.A_log = nn.Parameter(torch.empty(
-            self.num_v_heads_local_tp,
-            dtype=config.params_dtype,
-            device=torch.cuda.current_device()
-        ))
-        self.A_log._no_weight_decay = True
+        self.A_log = nn.Parameter(
+            torch.empty(
+                self.num_v_heads_local_tp,
+                dtype=config.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        )
         setattr(self.A_log, "tensor_model_parallel", True)
-        
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
@@ -224,7 +219,7 @@ class GatedDeltaNetMixer(MegatronModule):
         # TODO: support CP
 
         self.reset_parameters()
-    
+
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
@@ -280,7 +275,7 @@ class GatedDeltaNetMixer(MegatronModule):
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
-        
+
         if packed_seq_params is not None:
             # TODO: support packed sequence
             raise NotImplementedError("GDN does not support packed sequence for now.")
@@ -295,12 +290,16 @@ class GatedDeltaNetMixer(MegatronModule):
         qkvzba = qkvzba.transpose(0, 1)
 
         # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        qkv, gate, beta, alpha = torch.split(qkvzba, [
-            (self.qk_dim * 2 + self.v_dim) // self.tp_size,
-            self.v_dim // self.tp_size,
-            self.num_v_heads // self.tp_size,
-            self.num_v_heads // self.tp_size,
-        ], dim=-1)
+        qkv, gate, beta, alpha = torch.split(
+            qkvzba,
+            [
+                (self.qk_dim * 2 + self.v_dim) // self.tp_size,
+                self.v_dim // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+            ],
+            dim=-1,
+        )
         gate = gate.reshape(batch, seq_len, -1, self.v_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
         alpha = alpha.reshape(batch, seq_len, -1)
@@ -321,11 +320,11 @@ class GatedDeltaNetMixer(MegatronModule):
         nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
         qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        query, key, value = torch.split(qkv, [
-            self.qk_dim // self.tp_size,
-            self.qk_dim // self.tp_size,
-            self.v_dim // self.tp_size,
-        ], dim=-1)
+        query, key, value = torch.split(
+            qkv,
+            [self.qk_dim // self.tp_size, self.qk_dim // self.tp_size, self.v_dim // self.tp_size],
+            dim=-1,
+        )
         query = query.reshape(batch, seq_len, -1, self.qk_head_dim)
         key = key.reshape(batch, seq_len, -1, self.qk_head_dim)
         value = value.reshape(batch, seq_len, -1, self.v_head_dim)
@@ -336,7 +335,7 @@ class GatedDeltaNetMixer(MegatronModule):
         if self.num_v_heads // self.num_qk_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
-        
+
         # Make contiguous
         query = query.contiguous()
         key = key.contiguous()
@@ -347,7 +346,7 @@ class GatedDeltaNetMixer(MegatronModule):
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        g = -self.A_log.exp() * F.softplus(alpha.float() + self.dt_bias) # In fp32
+        g = -self.A_log.exp() * F.softplus(alpha.float() + self.dt_bias)  # In fp32
         beta = beta.sigmoid()
         nvtx_range_pop(suffix="g_and_beta")
 
@@ -378,7 +377,7 @@ class GatedDeltaNetMixer(MegatronModule):
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
-        
+
         return out, out_bias
 
     @torch.compile
@@ -448,16 +447,14 @@ class GatedDeltaNetMixer(MegatronModule):
         )
 
         conv_layer_name_list = ["conv1d.weight"]
-        assert sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == self.conv_dim_local_tp, (
-            self.conv_dim_local_tp,
-            sharded_state_dict[f"{prefix}conv1d.weight"],
-        )
+        assert (
+            sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == self.conv_dim_local_tp
+        ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}conv1d.weight"])
         if self.conv_bias:
             conv_layer_name_list.append("conv1d.bias")
-            assert sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == self.conv_dim_local_tp, (
-                self.conv_dim_local_tp,
-                sharded_state_dict[f"{prefix}conv1d.bias"],
-            )
+            assert (
+                sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == self.conv_dim_local_tp
+            ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}conv1d.bias"])
         for conv_layer_name in conv_layer_name_list:
             sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
                 sharded_state_dict[f"{prefix}{conv_layer_name}"],

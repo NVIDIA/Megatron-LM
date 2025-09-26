@@ -191,7 +191,7 @@ def get_gpt_layer_local_spec(
             'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
             " and will be removed soon. Please update your code accordingly."
         )
-    
+
     if linear_attention_type is not None:
         raise NotImplementedError("Linear attention is not supported with local spec yet.")
 
@@ -231,6 +231,8 @@ def get_transformer_layer_spec_for_backend(
     sharded_state_dict_keys_map: Optional[dict] = None,
     normalization: Optional[str] = None,
 ) -> ModuleSpec:
+    """Helper function to get module spec for TransformerLayer"""
+
     rms_norm = normalization == "RMSNorm"
 
     input_layernorm = (
@@ -350,20 +352,24 @@ def get_attention_module_spec_for_backend(
             metainfo={"fuse_input_layernorm": backend.fuse_layernorm_and_linear()},
         )
         if backend.fuse_layernorm_and_linear():
-            sharded_state_dict_keys_map.update({
-                "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
-                "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
-                "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
-                "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
-                "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
-                "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
-            })
+            sharded_state_dict_keys_map.update(
+                {
+                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+                }
+            )
         else:
-            sharded_state_dict_keys_map.update({
-                "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
-                "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
-            })
-    
+            sharded_state_dict_keys_map.update(
+                {
+                    "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                    "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+                }
+            )
+
     return attention
 
 
@@ -486,7 +492,7 @@ def get_gpt_decoder_block_spec(
     else:
         layer_norm_impl = LNImpl
         get_layer_spec_fn = get_gpt_layer_local_spec
-    
+
     layer_spec_dict = {}
     for moe in [0, 1]:
         for la in [0, 1]:
@@ -494,7 +500,7 @@ def get_gpt_decoder_block_spec(
                 continue
             if la and config.linear_attention_type is None:
                 continue
-            
+
             if moe:
                 num_experts = config.num_moe_experts
                 moe_grouped_gemm = config.moe_grouped_gemm
@@ -536,7 +542,7 @@ def get_gpt_decoder_block_spec(
         raise ValueError(
             f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
         )
-    
+
     # Parse config.linear_attention_freq to determine the pattern of expert/dense layers.
     # 0 stands for SDPA layers, 1 stands for LA layers.
     # For integer N: Creates a pattern with (N-1) LA layers and 1 SDPA layer every N layers.
@@ -544,8 +550,8 @@ def get_gpt_decoder_block_spec(
     if isinstance(config.linear_attention_freq, int):
         linear_attention_pattern = [
             # [1,1,...,1,0,1,1,...,1,0,...]
-            0 if ((i + 1) % config.linear_attention_freq == 0)
-            else 1 for i in range(config.num_layers)
+            0 if ((i + 1) % config.linear_attention_freq == 0) else 1
+            for i in range(config.num_layers)
         ]
     elif isinstance(config.linear_attention_freq, list):
         linear_attention_pattern = config.linear_attention_freq

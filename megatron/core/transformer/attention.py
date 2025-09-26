@@ -669,7 +669,9 @@ class Attention(MegatronModule, ABC):
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
         if self.config.attention_output_gate:
-            query, key, value, gate = self.get_query_key_value_tensors(hidden_states, key_value_states)
+            query, key, value, gate = self.get_query_key_value_tensors(
+                hidden_states, key_value_states
+            )
         else:
             query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
             gate = None
@@ -855,7 +857,7 @@ class Attention(MegatronModule, ABC):
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
-    
+
     @torch.compile
     def _torch_compiled_output_gate(self, x, gate):
         x_dtype = x.dtype
@@ -1015,7 +1017,7 @@ class SelfAttention(Attention):
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
-            
+
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
