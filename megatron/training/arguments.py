@@ -496,9 +496,9 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
-    if args.hybrid_override_pattern is not None or args.is_hybrid_model is not None:
+    if args.hybrid_override_pattern is not None or args.is_hybrid_model:
         assert args.hybrid_override_pattern is not None, "--hybrid-override-pattern must be set for hybrid models"
-        assert args.is_hybrid_model is not None, "--is-hybrid-model must be set for hybrid models"
+        assert args.is_hybrid_model, "--is-hybrid-model must be set for hybrid models"
 
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_override_pattern)
         if args.num_layers is not None:
