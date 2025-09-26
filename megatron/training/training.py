@@ -584,6 +584,30 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_decay):
+    """Get the no weight decay condition function."""
+
+    # Default case: no_wd_decay_cond_type is None
+    no_wd_decay_cond_fn = None
+
+    if no_wd_decay_cond_type == 'qwen3_next':
+        # Qwen3-Next applies weight decay to qk layernorm as a special case
+        def qwen3_next_no_wd_decay_cond(name, param):
+            if "q_layernorm" in name or "k_layernorm" in name:
+                no_wd = False
+            else:
+                no_wd = (
+                    name.endswith(".bias")
+                    or len(param.shape) == 1
+                    or (default_skip_embedding_weight_decay and "embedding" in name)
+                )
+            return no_wd
+        no_wd_decay_cond_fn = qwen3_next_no_wd_decay_cond
+    elif no_wd_decay_cond_type is not None:
+        raise ValueError(f"Invalid no_wd_decay_cond_type: {no_wd_decay_cond_type}")
+
+    return no_wd_decay_cond_fn
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -720,8 +744,15 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    no_wd_decay_cond = get_no_wd_decay_cond(
+        args.no_weight_decay_cond_type,
+        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+    )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider,
+        model_type,
+        checkpointing_context=checkpointing_context,
+        no_wd_decay_cond=no_wd_decay_cond,
     )
 
     timers('model-and-optimizer-setup').stop()
