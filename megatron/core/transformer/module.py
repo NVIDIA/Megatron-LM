@@ -91,11 +91,7 @@ class MegatronModule(torch.nn.Module):
         for name, module in self.named_children():
             sharded_state_dict.update(
                 sharded_state_dict_default(
-                    module,
-                    f'{prefix}{name}.',
-                    sharded_offsets,
-                    metadata,
-                    tp_group=self.tp_group,
+                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=self.tp_group
                 )
             )
         return sharded_state_dict

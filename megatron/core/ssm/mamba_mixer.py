@@ -786,8 +786,7 @@ class MambaMixer(MegatronModule):
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata,
-                    tp_group=self.tp_group,
+                    module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=self.tp_group
                 )
 
             sharded_state_dict.update(module_sharded_sd)

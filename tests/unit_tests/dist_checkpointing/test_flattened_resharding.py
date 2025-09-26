@@ -235,7 +235,7 @@ class TestFlattenedResharding:
                 local_ten_shape,
                 *((0, max(0, Utils.rank - 2), 6),) if Utils.world_size == 8 else (),
                 flattened_range=local_dp_slice,
-                replica_id=0
+                replica_id=0,
             )
         }
         validate_sharding_integrity(determine_global_metadata(state_dict)[1])
