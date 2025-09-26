@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from megatron.training.activations import fast_gelu, quick_gelu, squared_relu
+from megatron.core.activations import fast_gelu, quick_gelu, squared_relu
 
 
 def get_language_model_config(config):
@@ -332,6 +332,11 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
 
 
 def get_vision_projection_config(config, hidden_size):
+    # If using FP8, then keep the whole vision projection in FP8.
+    config.first_last_layers_bf16 = False
+    config.num_layers_at_start_in_bf16 = 0
+    config.num_layers_at_end_in_bf16 = 0
+
     config.gated_linear_unit = False
     config.bias_activation_fusion = False
     config.add_bias_linear = False

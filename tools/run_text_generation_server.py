@@ -4,6 +4,7 @@
 import os
 import sys
 import warnings
+from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
@@ -21,8 +22,9 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 import torch
 
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -122,8 +124,8 @@ def add_text_generate_args(parser):
 
 
 @torch.inference_mode()
-def main(model_provider: str = "gpt"):
-    """Runs the text generation server with the specified model provider."""
+def main(model_type: str = "gpt"):
+    """Runs the text generation server with the specified model type."""
     initialize_megatron(
         extra_args_provider=add_text_generate_args,
         args_defaults={
@@ -146,12 +148,12 @@ def main(model_provider: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        if model_provider == "gpt":
-            model = get_model(gpt_model_provider, wrap_with_ddp=False)
-        elif model_provider == "mamba":
-            model = get_model(mamba_model_provider, wrap_with_ddp=False)
+        if model_type == "gpt":
+            model = get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
+        elif model_type == "mamba":
+            model = get_model(partial(model_provider, mamba_builder), wrap_with_ddp=False)
         else:
-            raise ValueError(f"Invalid model provider {model_provider}")
+            raise ValueError(f"Invalid model type {model_type}")
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)
@@ -202,4 +204,4 @@ def main(model_provider: str = "gpt"):
 
 
 if __name__ == "__main__":
-    main(model_provider="gpt")
+    main(model_type="gpt")

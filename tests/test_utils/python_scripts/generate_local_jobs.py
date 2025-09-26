@@ -9,7 +9,6 @@ import pathlib
 from typing import Optional
 
 import click
-import jetclient
 import yaml
 
 from tests.test_utils.python_scripts import common
@@ -18,7 +17,7 @@ from tests.test_utils.python_scripts import common
 def load_script(config_path: str) -> str:
     with open(config_path) as stream:
         try:
-            return jetclient.JETWorkloadManifest(**yaml.safe_load(stream)).spec.script
+            return yaml.safe_load(stream)["spec"]["script"]
         except yaml.YAMLError as exc:
             raise exc
 
@@ -70,12 +69,12 @@ def main(
     record_checkpoints: bool = False,
 ):
     workloads = common.load_workloads(
-        container_image='none',
+        container_image="none",
         scope=scope,
         model=model,
         test_case=test_case,
         environment=environment,
-        container_tag='none',
+        container_tag="none",
     )
 
     for workload in workloads:
@@ -85,14 +84,14 @@ def main(
         magic_values["assets_dir"] = "$OUTPUT_PATH"
         magic_values["artifacts_dir"] = "$OUTPUT_PATH"
         magic_values["environment"] = environment
-        magic_values["test_case"] = workload.spec.test_case
-        magic_values["name"] = workload.spec.name.format(**magic_values)
+        magic_values["test_case"] = workload.spec["test_case"]
+        magic_values["name"] = workload.spec["name"].format(**magic_values)
 
         file_path = (
             pathlib.Path.cwd()
             / "test_cases"
-            / workload.spec.model
-            / f"{workload.spec.test_case}.sh"
+            / workload.spec["model"]
+            / f"{workload.spec["test_case"]}.sh"
         )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as fh:
@@ -101,7 +100,7 @@ def main(
             fh.write(
                 f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
             )
-            fh.write(workload.spec.script.format(**magic_values))
+            fh.write(workload.spec["script"].format(**magic_values))
 
 
 if __name__ == "__main__":

@@ -49,11 +49,12 @@ def run_mcore_engine(
     logprobs=True,
     tokens_to_generate=0,
     top_n_logprobs=0,
+    random_seed=-1,
 ):
     """Server-compatible version of the MCore Engine, used in
     tools/run_text_generation_server.py."""
 
-    values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs]
+    values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs, random_seed]
     values_float_tensor = broadcast_float_list(len(values), float_list=values, data_parallel=False)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
@@ -61,6 +62,10 @@ def run_mcore_engine(
     top_p = values_float_tensor[3].item()
     temperature = values_float_tensor[4].item()
     top_n_logprobs = int(values_float_tensor[5].item())
+    random_seed = int(values_float_tensor[6].item())
+
+    if random_seed > 0:
+        engine.text_generation_controller.sampling_rng.manual_seed(random_seed)
 
     sampling_params = SamplingParams(
         temperature=temperature,

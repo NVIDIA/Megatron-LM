@@ -115,6 +115,11 @@ class OptimizerConfig:
     adam_eps: float = 1e-08
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
+    decoupled_weight_decay: bool = True
+    """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
+    original Adam update rule will be used. Defaults to True.
+    """
+
     # SGD.
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""

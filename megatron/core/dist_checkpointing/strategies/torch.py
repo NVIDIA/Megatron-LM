@@ -57,6 +57,7 @@ from .base import (
     register_default_strategy,
 )
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
+from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -240,14 +241,18 @@ def sharded_tensor_to_torch_sharded_tensor(
             placement = f"rank:{rank}/cuda"
             for sh_ten in local_global_offsets[offset]:
                 if has_flattened_range:
-                    assert offset == sh_ten.local_chunk_offset_in_global()
+                    assert offset == sh_ten.local_chunk_offset_in_global(), (
+                        offset,
+                        sh_ten.local_chunk_offset_in_global(),
+                    )
                     # This is not an actual offset, but an offset of the whole shard
                     # This is needed for a PyT Dist internal integrity check
-                    offset = sh_ten.local_chunk_offset_in_global() + (0,)
+                    _shard_offset = sh_ten.local_chunk_offset_in_global() + (0,)
                     size = (1,) * len(offsets_shape) + global_shape[-1:]
                 else:
                     size = sh_ten.data.shape
-                shard_metadata.append(ShardMetadata(offset, size, placement))
+                    _shard_offset = offset
+                shard_metadata.append(ShardMetadata(_shard_offset, size, placement))
 
         else:
             # pylint: disable=line-too-long
@@ -312,7 +317,7 @@ def mcore_to_pyt_state_dict(
     rank = torch.distributed.get_rank()
     pyt_state_dict = {}
 
-    def _mcore_to_torch_sharded_tensor(sh_tens: List[ShardedTensor]) -> TorchShardedTensor:
+    def _mcore_to_dcp_compatible_tensor(sh_tens: List[ShardedTensor]) -> TorchShardedTensor:
         """Build a PyT ShardedTensor from given shards.
 
         During loading:
@@ -335,11 +340,29 @@ def mcore_to_pyt_state_dict(
                 if sh_ten.allow_shape_mismatch and is_loading:
                     sh_ten.data.zero_()
 
-        torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(
-            sh_tens, rank, load_legacy_1d_flatten_tensors
+        is_pre_mcore_014_sh_ten = (
+            sh_tens[0].prepend_axis_num or sh_tens[0].flattened_range is not None
         )
-        torch_sh_ten.key = sh_tens[0].key
-        return torch_sh_ten
+        if (
+            not is_pre_mcore_014_sh_ten or not sh_tens[0].has_regular_grid
+        ) and is_torch_min_version("2.6a0"):
+            assert sh_tens[0].flattened_range is None
+            if len(sh_tens) > 1:
+                return LocalShardsContainer(
+                    [CheckpointableShardedTensor.from_sh_ten(sh_ten) for sh_ten in sh_tens]
+                )
+            else:
+                return CheckpointableShardedTensor.from_sh_ten(sh_tens[0])
+        else:
+            if not sh_tens[0].has_regular_grid and not is_torch_min_version("2.6a0"):
+                raise CheckpointingException(
+                    f"Uneven sharding not supported for PyTorch version {get_torch_version()}"
+                )
+            torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(
+                sh_tens, rank, load_legacy_1d_flatten_tensors
+            )
+            torch_sh_ten.key = sh_tens[0].key
+            return torch_sh_ten
 
     def _mcore_to_torch_sharded_object(sh_objs: List[ShardedObject]) -> io.BytesIO:
         """Build io.BytesIO from given sharded objects data."""
@@ -351,7 +374,7 @@ def mcore_to_pyt_state_dict(
     for k, v in state_dict.items():
         if isinstance(v[0], ShardedTensor):
             v = cast(List[ShardedTensor], v)
-            pyt_state_dict[k] = _mcore_to_torch_sharded_tensor(v)
+            pyt_state_dict[k] = _mcore_to_dcp_compatible_tensor(v)
         else:
             v = cast(List[ShardedObject], v)
             pyt_state_dict[k] = _mcore_to_torch_sharded_object(v)
@@ -359,12 +382,20 @@ def mcore_to_pyt_state_dict(
     return pyt_state_dict
 
 
-def _unwrap_pyt_sharded_tensor(sh_ten: TorchShardedTensor) -> List[torch.Tensor]:
+def _unwrap_pyt_sharded_tensor(
+    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any]
+) -> Union[List[torch.Tensor], Any]:
     """Unwrap tensor from PyT ShardedTensor instance.
 
     If `prepend_axis_num` was non-zero (which is specific to MCore ShardedTensor)
     then the tensor has additional singleton dimensions which should be squeezed.
     """
+    if isinstance(sh_ten, CheckpointableShardedTensor):
+        return [sh_ten._sh_ten.data]
+    if isinstance(sh_ten, LocalShardsContainer):
+        return [local_shard._sh_ten.data for local_shard in sh_ten._local_shards]
+    if not isinstance(sh_ten, TorchShardedTensor):
+        return sh_ten
     mcore_sh_ten = sh_ten.mcore_sh_ten
     ret_tensors = []
     for sh in sh_ten.local_shards():
@@ -930,10 +961,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict
         )
         # Unwrap ShardedTensors and return to original state dict
-        mcore_state_dict = {
-            k: v if not isinstance(v, TorchShardedTensor) else _unwrap_pyt_sharded_tensor(v)
-            for k, v in pyt_state_dict.items()
-        }
+        mcore_state_dict = {k: _unwrap_pyt_sharded_tensor(v) for k, v in pyt_state_dict.items()}
         mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
             mcore_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
         )

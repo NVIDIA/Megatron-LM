@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import weakref
+from contextlib import nullcontext
+from functools import partial
 from typing import Optional
 
 import torch
@@ -9,6 +11,10 @@ from megatron.core import tensor_parallel
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionLayer,
+    get_mtp_layer_offset,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 
 
@@ -91,7 +97,7 @@ class PreProcessNode(ScheduleNode):
         self.chunk_state = chunk_state
 
     def forward_impl(self):
-        """Implements the forward pass for preprocessing.
+        """forward pass for pre-processing.
 
         This method handles:
         1. Decoder embedding computation
@@ -104,7 +110,7 @@ class PreProcessNode(ScheduleNode):
         # Get decoder input
         if not self.gpt_model.pre_process:
             self.chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
-        # Run GPTModle._preprocess
+        # Run GPTModel._preprocess
         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
             self.gpt_model._preprocess(
                 input_ids=self.chunk_state.input_ids,
@@ -157,9 +163,8 @@ class PostProcessNode(ScheduleNode):
         Returns:
             The logits or loss depending on whether labels are provided.
         """
-        labels = self.chunk_state.labels
         # Final layer norm from Decoder
-        if self.gpt_model.decoder.final_layernorm is not None:
+        if self.gpt_model.decoder.final_layernorm and not self.gpt_model.mtp_process:
             hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
@@ -173,7 +178,7 @@ class PostProcessNode(ScheduleNode):
             hidden_states=hidden_states,
             input_ids=self.chunk_state.input_ids,
             position_ids=self.chunk_state.position_ids,
-            labels=labels,
+            labels=self.chunk_state.labels,
             decoder_input=self.chunk_state.decoder_input,
             rotary_pos_emb=self.chunk_state.rotary_pos_emb,
             rotary_pos_cos=self.chunk_state.rotary_pos_cos,
@@ -241,6 +246,10 @@ class TransformerLayerNode(ScheduleNode):
         self.submodule = submodule
         self.detached = tuple()
         self.before_detached = tuple()
+
+        # Create flags to indicate first and last layer
+        self.is_first_layer = extra_args.get("is_first_layer", False)
+        self.is_last_layer = extra_args.get("is_last_layer", False)
 
         # Initialize list to store registered dw callables
         self.bwd_dw_callables = []
@@ -394,7 +403,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
-
         # release tensor reference after use
         node.layer_state.dispatched_probs = None
         node.layer_state.pre_mlp_layernorm_output = None
@@ -456,10 +464,110 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     return forward_funcs, backward_dw
 
 
+def build_mtp_layer_callables(layer):
+    """Callables for multi-token prediction layer nodes.
+
+    This class contains the callable functions for different types of
+    multi-token prediction layer nodes (attention, MLP, etc.)
+    """
+
+    forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
+    attn_forward, post_attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = (
+        forward_funcs
+    )
+    is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
+    assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
+
+    def submodule_mtp_attn_forward(node, hidden_states):
+        # MTP Block Preprocess
+        if node.is_first_layer:
+            # Final layer norm from Decoder
+            final_layernorm = node.chunk_state.model.decoder.final_layernorm
+            if final_layernorm:
+                hidden_states = final_layernorm(hidden_states)
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=True, keep_graph=True
+                )
+                hidden_states = node.detach(hidden_states)
+            offset = get_mtp_layer_offset(layer.config)
+            node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
+            hidden_states = node.chunk_state.mtp_hidden_states[offset]
+
+        input_ids, position_ids, decoder_input, hidden_states = layer._get_embeddings(
+            input_ids=node.chunk_state.input_ids,
+            position_ids=node.chunk_state.position_ids,
+            embedding=node.chunk_state.model.embedding,
+            hidden_states=hidden_states,
+        )
+        node.chunk_state.input_ids = input_ids
+        node.chunk_state.position_ids = position_ids
+
+        # MTP Layer Preprocess
+        # norm, linear projection and transformer
+        assert (
+            node.chunk_state.context is None
+        ), f"multi token prediction + cross attention is not yet supported."
+        assert (
+            node.chunk_state.packed_seq_params is None
+        ), f"multi token prediction + sequence packing is not yet supported."
+
+        if layer.config.sequence_parallel:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+
+        # fp8 context is added in 1f1b schedule, so we don't need to add it here
+        with rng_context:
+            hidden_states = layer._concat_embeddings(hidden_states, decoder_input)
+            return attn_forward(node, hidden_states)
+
+    def submodule_mtp_postprocess_forward(node, hidden_states):
+        hidden_states = layer._postprocess(hidden_states)
+        node.chunk_state.mtp_hidden_states.append(hidden_states)
+        if node.is_last_layer:
+            hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
+            node.chunk_state.mtp_hidden_states = None
+        return hidden_states
+
+    def rng_context_wrapper(func, *args, **kwargs):
+        """
+        Wrapper to add rng context to submodule callables
+        """
+        if layer.config.sequence_parallel:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+        with rng_context:
+            return func(*args, **kwargs)
+
+    # Build forward and backward callable functions
+    # attn_forward already has rng context, no need to wrap
+    attn_func = submodule_mtp_attn_forward
+    post_attn_func = partial(rng_context_wrapper, post_attn_forward)
+    dispatch_func = partial(rng_context_wrapper, dispatch_forward)
+    mlp_func = partial(rng_context_wrapper, mlp_forward)
+    combine_func = partial(rng_context_wrapper, combine_forward)
+    mtp_post_process_func = submodule_mtp_postprocess_forward
+
+    forward_funcs = [
+        attn_func,
+        post_attn_func,
+        dispatch_func,
+        mlp_func,
+        combine_func,
+        mtp_post_process_func,
+    ]
+    backward_dw = {
+        "attn": [layer.transformer_layer.self_attention, layer.eh_proj],
+        "mlp": layer.transformer_layer.mlp,
+    }
+    return forward_funcs, backward_dw
+
+
 def build_layer_callables(layer):
     """
     Builds the callable functions(forward and dw) for the given layer.
-    For now, 1f1b overlap only support TransformerLayer.
+    For now, 1f1b overlap only support TransformerLayer and MultiTokenPredictionLayer.
 
     Args:
         layer: The layer to build callables for.
@@ -470,5 +578,7 @@ def build_layer_callables(layer):
     """
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
+    elif isinstance(layer, MultiTokenPredictionLayer):
+        return build_mtp_layer_callables(layer)
 
     raise ValueError(f"Unsupported layer type: {type(layer)}")

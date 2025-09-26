@@ -14,10 +14,9 @@ from torch import Tensor
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.process_groups_config import ModelCommProcessGroups
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params
@@ -47,7 +46,7 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(MegatronModule):
+class MambaLayer(GraphableMegatronModule):
     """
     A single Mamba layer.
 
@@ -61,14 +60,11 @@ class MambaLayer(MegatronModule):
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
         residual_in_fp32=False,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)
-        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaLayer"
-
-        if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
-            self.cudagraph_manager = CudaGraphManager(config)
+        assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
 
         self.config = config
         self.submodules_config = submodules
@@ -80,7 +76,7 @@ class MambaLayer(MegatronModule):
             self.config,
             d_model=self.config.hidden_size,
             layer_number=layer_number,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
@@ -89,7 +85,7 @@ class MambaLayer(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,  # Not used in MambaLayer
+        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
@@ -135,20 +131,6 @@ class MambaLayer(MegatronModule):
         """Allocate the inference cache."""
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
 
-    def __call__(self, *args, **kwargs):
-
-        # Training and validation mode CUDA graphs
-        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
-            return self.cudagraph_manager(self, args, kwargs)
-        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif not self.training and (
-            hasattr(self, 'cudagraph_manager')
-            and kwargs.get('attention_mask') is None
-            and kwargs['inference_context'].is_decode_only()
-        ):
-            return self.cudagraph_manager(self, args, kwargs)
-        return super(MegatronModule, self).__call__(*args, **kwargs)
-
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -171,3 +153,32 @@ class MambaLayer(MegatronModule):
         if prefixed_map:
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """
+        CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
+        interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
+        However, CUDA graph accepts only Tensor inputs.
+        Hence, `inference_context` is excluded from input list.
+        """
+        assert kwargs.get('inference_context') is None, (
+            "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
+            "For inference cuda graph, please use enable_cuda_graph instead."
+        )
+        return super()._te_cuda_graph_replay(*args, **kwargs)
+
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        # Training and validation mode CUDA graphs
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
+            return True
+        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs.get('attention_mask') is None
+            and kwargs['inference_context'].is_decode_only()
+        ):
+            return True
+        return False

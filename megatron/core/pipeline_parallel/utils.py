@@ -7,7 +7,6 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core import parallel_state
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
 
 
@@ -24,6 +23,10 @@ def is_pp_last_stage(pp_group: torch.distributed.ProcessGroup):
 def is_vp_first_stage(vp_stage: int, vp_size: int | None):
     """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
     if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
         return True
     return vp_stage == 0
 
@@ -31,6 +34,10 @@ def is_vp_first_stage(vp_stage: int, vp_size: int | None):
 def is_vp_last_stage(vp_stage: int, vp_size: int | None):
     """Return True if in the last virtual pipeline model-parallel stage, False otherwise."""
     if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
         return True
     return vp_stage == (vp_size - 1)
 
@@ -219,8 +226,10 @@ class ScheduleNode:
             torch.cuda.nvtx.range_pop()
 
         # output_grad maybe from another stream
-        for g in output_grad:
-            g.record_stream(self.stream)
+        if output_grad:
+            for g in output_grad:
+                if g is not None:
+                    g.record_stream(self.stream)
 
         grads = self.get_grad()
         self._release_state()
@@ -296,18 +305,3 @@ def get_comm_stream():
     """Get the stream for communication"""
     global _COMM_STREAM
     return _COMM_STREAM
-
-
-class VppContextManager:
-    """A reusable context manager for switch vpp stage"""
-
-    def __init__(self, vpp_rank):
-        self.vpp_rank = vpp_rank
-
-    def __enter__(self):
-        self.origin_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-        parallel_state.set_virtual_pipeline_model_parallel_rank(self.vpp_rank)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)

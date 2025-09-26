@@ -108,6 +108,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 25
+  --dist-ckpt-save-pre-mcore-014: true
   # Add initialization args
   --init-method-std: 0.02
   # Add logging args
@@ -125,7 +126,7 @@ MODEL_ARGS:
   --fp8-format: hybrid
   --fp8-recipe: tensorwise
   --exit-interval: 50
-TEST_TYPE: ckpt-resume
+TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
   - "iteration-time"
   - "lm loss"

@@ -6,13 +6,13 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.utils import is_te_min_version
-from megatron.training.full_cuda_graph import FullCudaGraphWrapper
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank

@@ -68,6 +68,14 @@ def add_modelopt_args(parser):
         default=None,
         help='Path to distillation configuration yaml file.',
     )
+
+    group.add_argument(
+        '--teacher-model-config',
+        type=str,
+        default=None,
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+    )
+
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,
@@ -100,6 +108,13 @@ def add_modelopt_args(parser):
         '--export-moe-apply-probs-on-input',
         action="store_true",
         help='Use Llama-4 expert scaling on input instead of output.',
+    )
+
+    # Speculative decoding
+    group.add_argument(
+        '--export-offline-model',
+        action="store_true",
+        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
     )
 
     return parser

@@ -27,3 +27,9 @@ class Fp8Recipe(str, enum.Enum):
     mxfp8 = "mxfp8"
     blockwise = "blockwise"
     custom = "custom"
+
+
+class Fp4Recipe(str, enum.Enum):
+    """FP4 recipe names: nvfp4."""
+
+    nvfp4 = "nvfp4"

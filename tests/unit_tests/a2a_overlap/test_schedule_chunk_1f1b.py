@@ -5,7 +5,10 @@ import pytest
 import torch
 
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
@@ -38,11 +41,13 @@ def build_model(config):
 
     # build layer spec
     transformer_layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
+    mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec.layer_specs[-1], True)
 
     # build model
     gpt_model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
+        mtp_block_spec=mtp_block_spec,
         vocab_size=100,
         pre_process=True,
         post_process=True,
@@ -72,10 +77,11 @@ class TestA2AOverlap:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("mtp_layers", [0, 1])
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
-    def test_1f1b_schedule_model_chunk(self, dispatcher_type, fp8_flag, layers):
+    def test_1f1b_schedule_model_chunk(self, mtp_layers, dispatcher_type, fp8_flag, layers):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
@@ -95,6 +101,9 @@ class TestA2AOverlap:
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
+        if mtp_layers > 0:
+            extra_kwargs["mtp_num_layers"] = mtp_layers
+            extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         with deterministic_mode():
             for layer_num in layers:
                 output_tensors = []
