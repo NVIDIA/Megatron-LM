@@ -4,7 +4,6 @@ import asyncio
 import logging
 import multiprocessing
 import os
-import psutil
 import struct
 import time
 import warnings
@@ -14,6 +13,7 @@ from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
