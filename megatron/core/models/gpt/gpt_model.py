@@ -33,6 +33,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.transformer.cpu_offload import PipelineOffloadManager
 
 
 class GPTModel(LanguageModule):
@@ -341,6 +342,18 @@ class GPTModel(LanguageModule):
 
         return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
 
+    def initialize_model_chunk_offload_handler(self):
+        num_layers = self.decoder.num_layers_per_pipeline_rank
+        if self.mtp_process:
+            num_layers = num_layers + self.config.mtp_num_layers
+        # TODO: will be an issue when dense layer is placed  across different pipeline stages
+        PipelineOffloadManager.get_instance().reset_chunk_handler(
+            num_layers,
+            self.vp_stage,
+            self.config.fine_grained_activation_offloading,
+            self.decoder.num_dense_layer,
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -366,6 +379,8 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
+        if self.config.fine_grained_activation_offloading:
+            self.initialize_model_chunk_offload_handler()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -627,6 +642,8 @@ class GPTModel(LanguageModule):
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
         """
 
+        if self.config.fine_grained_activation_offloading:
+            self.initialize_model_chunk_offload_handler()
         from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 
         return TransformerModelChunkSchedulePlan(

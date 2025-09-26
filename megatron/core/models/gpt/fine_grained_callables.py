@@ -16,6 +16,12 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.transformer.cpu_offload import (
+    PipelineOffloadManager,
+    group_prefetch_offload_start,
+    group_prefetch_offload_commit,
+    mark_layer_start,
+)
 
 
 def weak_method(method):
@@ -331,6 +337,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         Performs same attnention forward logic as GPT Model.
         """
+        if layer.config.fine_grained_activation_offloading:
+            hidden_states = mark_layer_start(hidden_states)
         hidden_states, _ = layer._forward_attention(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
@@ -347,13 +355,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Run forward pass for computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
+        offload_context = nullcontext()
+        if layer.offload_mlp_norm:
+            hidden_states = group_prefetch_offload_start(hidden_states, name="mlp_norm")
+            offload_context = PipelineOffloadManager.get_instance()
         if layer.recompute_pre_mlp_layernorm:
             layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                layer.pre_mlp_layernorm, hidden_states
-            )
+            with offload_context:
+                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                    layer.pre_mlp_layernorm, hidden_states
+                )
         else:
-            pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+            with offload_context:
+                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+        offload_context = nullcontext()
 
         local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
 
@@ -433,6 +448,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
             )
+        if layer.offload_mlp_norm:
+            hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
