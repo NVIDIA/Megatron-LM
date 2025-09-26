@@ -356,7 +356,7 @@ class TransformerConfig(ModelParallelConfig):
     primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
     determined by TE."""
 
-    fp8_custom_factory: Optional[str] = None
+    fp8_quantizer_factory: Optional[str] = None
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp8_recipe is custom."""
 
@@ -420,6 +420,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, keep the parameters in fp4 precision to save memory. This option must be used
     together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
     will be converted to fp4; for example, biases will remain unchanged."""
+
+    fp4_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp4_recipe is custom."""
 
     ####################
     # MoE related
