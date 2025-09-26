@@ -449,16 +449,16 @@ def _populate_embedding_and_position_groups(pp_group):
 
 def _get_pg_collection_with_embedding_groups(grid):
     pg_collection = _get_pg_collection_from_grid(grid)
-
-    pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pg_collection.pp)
-    pos_embd_pg = pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
-    embd_pg = (
-        embd_pg
-        if (is_pp_last_stage(pg_collection.pp) or is_pp_first_stage(pg_collection.pp))
-        else None
-    )
-    pg_collection.pos_embd = pos_embd_pg
-    pg_collection.embd = embd_pg
+    if pg_collection.pp:
+        pos_embd_pg, embd_pg = _populate_embedding_and_position_groups(pg_collection.pp)
+        pos_embd_pg = pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
+        embd_pg = (
+            embd_pg
+            if (is_pp_last_stage(pg_collection.pp) or is_pp_first_stage(pg_collection.pp))
+            else None
+        )
+        pg_collection.pos_embd = pos_embd_pg
+        pg_collection.embd = embd_pg
 
     return pg_collection
 
