@@ -1139,8 +1139,8 @@ def validate_args(args, defaults={}):
                 "when enabling delay_wgrad_compute"
             )
     
-    if args.fine_grained_activation_offloading:
-        assert not args.overlap_grad_reduce, "overlap_grad_reduce is not supported with fine_grained_activation_offloading"
+    # if args.fine_grained_activation_offloading:
+    #     assert not args.overlap_grad_reduce, "overlap_grad_reduce is not supported with fine_grained_activation_offloading"
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
