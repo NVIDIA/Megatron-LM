@@ -27,6 +27,8 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.utils import is_torch_min_version, get_torch_version
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
@@ -367,39 +369,33 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     impossible to enforce a linearly increasing versioning for this whole space.
     """
     metadata = {}
-    if args.use_distributed_optimizer:
-        if args.ckpt_format == "fsdp_dtensor":
-            metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
-        elif args.ckpt_fully_parallel_save:
-            metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
-        else:
-            metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
 
-        # TODO (v0.14): this is the intended metadata logic after fully switching to simplistic
-        #  format. For now it's disabled, will be enabled after completing the ckpt refactor
-        """
-        if args.ckpt_pre_mcore_014:
-            metadata['singleton_local_shards'] = False
-            metadata['unpadded_embeddings'] = False
-            if args.use_distributed_optimizer:
-                if args.ckpt_fully_parallel_save:
-                    metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
-                else:
-                    metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
-        else:
-            metadata['singleton_local_shards'] = True
-            metadata['unpadded_embeddings'] = True
-            if args.use_distributed_optimizer:
-                if args.ckpt_optim_fully_reshardable:
-                    metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
-                    # TODO: add a separate flag and based on this flag raise if gloo groups
-                    # are not created in arguments.py 
-                    metadata['distrib_optim_fully_reshardable_mem_efficient'] = False
-                else:
-                    metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
-        """
+    if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
+        metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
+
+    # Force pre-mcore 0.14 behavior for PyTorch versions below 2.6a0
+    force_pre_mcore_014 = not is_torch_min_version("2.6a0")
+    if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
+        logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
+                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
+
+    if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
+        metadata['singleton_local_shards'] = False
+        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+            if args.ckpt_fully_parallel_save:
+                metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
+            else:
+                metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
+    else:
+        metadata['singleton_local_shards'] = True
+        if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+            if args.dist_ckpt_optim_fully_reshardable:
+                metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+                metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
+            else:
+                metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+
     metadata['chained_optim_avoid_prefix'] = True
-    metadata['singleton_local_shards'] = False
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
@@ -590,7 +586,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     # Note: Currently full reshardabilty is not supported when local checkpoints are used.
                     raise RuntimeError(
                         f"Local checkpointing does not support optimizer sharding type '{sharded_sd_metadata['distrib_optim_sharding_type']}'. "
-                        "Use '--ckpt-fully-parallel-save' when saving local checkpoints."
+                        "Don't use '--dist-ckpt-optim-fully-reshardable' when saving local checkpoints."
                     )
                 algo = args.non_persistent_local_ckpt_algo
                 cached_metadata = None
@@ -1127,7 +1123,7 @@ def _load_base_checkpoint(
         else:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -1139,7 +1135,7 @@ def _load_base_checkpoint(
                 'megatron.legacy.fp16_deprecated.loss_scaler'
             ]
             sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
             sys.modules.pop('fp16.loss_scaler', None)
             sys.modules.pop('megatron.fp16.loss_scaler', None)
             sys.modules.pop('megatron.model', None)
@@ -1468,7 +1464,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
                     }
-                if ckpt_tp_pp != run_tp_pp and sharded_sd_metadata['distrib_optim_sharding_type'] != 'fully_sharded_model_space':
+                if (
+                    ckpt_tp_pp != run_tp_pp
+                    and sharded_sd_metadata['distrib_optim_sharding_type']
+                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                ):
                     raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
                                        f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
                                        f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
@@ -1612,9 +1612,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    assert args.consumed_train_samples == 0
-    assert args.skipped_train_samples == 0
-    assert args.consumed_valid_samples == 0
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
@@ -1816,7 +1813,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
     ret_state_dict = state_dict['model']
 
     if only_query_model:

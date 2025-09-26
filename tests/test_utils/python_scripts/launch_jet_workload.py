@@ -483,7 +483,9 @@ def main(
                 n_attempts += 1
                 continue
 
-            if ("FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
+            if (
+                "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
+            ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue
@@ -500,9 +502,10 @@ def main(
             if (
                 "StopIteration" in concat_allranks_logs
                 or "after training is done" in concat_allranks_logs
+                or "exiting program at iteration" in concat_allranks_logs
             ):
                 logger.info("Release training finished")
-                sys.exit(0)
+                sys.exit(int(not success))  # invert for exit 0
 
             if parse_failed_job(logs=mainrank_log):
                 n_attempts += 1

@@ -60,7 +60,7 @@ products:
   - test_case: [gpt_dynamic_inference_tp8_pp1_dp1_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [flaky]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq]
     products:

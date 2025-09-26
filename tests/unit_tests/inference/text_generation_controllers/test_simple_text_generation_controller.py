@@ -12,7 +12,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -31,17 +31,33 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestTextGenerationController:
 
-    def setup_model(self, dtype, symmetric_ar_type=None, fp8: bool = False):
+    def setup_model(
+        self,
+        dtype,
+        symmetric_ar_type=None,
+        fp8: bool = False,
+        tensor_model_parallel_size: int = 2,
+        pipeline_model_parallel_size: int = 1,
+        static: bool = True,
+        use_training_random_init: bool = False,
+    ):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
         )
-        model_parallel_cuda_manual_seed(123)
+        if use_training_random_init:
+            # This is necessary to induce the training behavior which permutes the random seed
+            # for every rank; otherwise, every rank will have the same seed.
+            _set_random_seed(123, inference_rng_tracker=True)
+        else:
+            model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
@@ -70,6 +86,7 @@ class TestTextGenerationController:
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
+        gpt_model.eval()
         if dtype == torch.bfloat16:
             gpt_model = Float16Module(gpt_model.config, gpt_model)
 
@@ -83,10 +100,26 @@ class TestTextGenerationController:
             padded_vocab_size=self.vocab_size,
         )
 
-        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+        if static:
+            inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+        else:
+            inference_context = DynamicInferenceContext(
+                params_dtype=dtype,
+                num_layers=transformer_config.num_layers,
+                kv_channels=transformer_config.kv_channels,
+                num_attention_heads=transformer_config.num_attention_heads,
+                max_sequence_length=2048,
+                buffer_size_gb=1,
+                buffer_guaranteed_fraction=0.1,
+                materialize_only_last_token_logits=False,
+            )
 
         inference_wrapped_model = GPTInferenceWrapper(
             gpt_model, inference_wrapper_config, inference_context
+        )
+
+        inference_wrapped_model.model_is_pipeline_parallel = not (
+            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
 
         self.mock_tokenizer = mock.Mock()
@@ -562,3 +595,149 @@ class TestTextGenerationController:
                         pytest.approx(request_batched.prompt_top_n_logprobs[i][token_str], rel=1e-6)
                         == request_single.prompt_top_n_logprobs[i][token_str]
                     )
+
+    @pytest.mark.parametrize("static", [True, False])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_sampled_tokens_match_with_parallelism(self, static, tp_size, pp_size):
+        """
+        Verify that sampled tokens match across all parallel ranks.
+        """
+        if tp_size == 1 and pp_size == 1:
+            pytest.skip(reason="Test requires model parallel size > 1.")
+
+        if not static and not is_fa_min_version("2.7.3"):
+            pytest.skip(reason="Need latest flash attn for dynamic batching")
+
+        # Ensure that we are using the training setup for random seed initialization
+        # so that every rank has a different seed
+        self.setup_model(
+            dtype=torch.bfloat16,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            static=static,
+            use_training_random_init=True,
+        )
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                for _ in range(len(x))
+            ]
+        )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
+
+        # Prepare requests.
+        active_requests: Dict[str, InferenceRequest] = OrderedDict()
+        for i in range(self.batch_size):
+            prompt = "sample" * (i + 1)
+            prompt_tokens = torch.randint(
+                low=0, high=self.vocab_size - 1, size=(len(prompt),)
+            ).tolist()
+            request_id = str(i)
+            inference_request = InferenceRequest(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params=SamplingParams(
+                    top_k=10, num_tokens_to_generate=25, return_log_probs=True
+                ),
+                arrival_time=time.time(),
+                prompt_tokens=prompt_tokens,
+                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            )
+            active_requests[request_id] = inference_request
+
+        # Generate tokens.
+        if static:
+            requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                active_requests
+            )
+            all_generated_tokens = [req.generated_tokens.tolist() for req in requests.values()]
+        else:
+            all_generated_tokens = [[] for _ in range(len(active_requests))]
+            context = self.text_generation_controller.inference_wrapped_model.inference_context
+            for request_id, request in active_requests.items():
+                context.add_request(
+                    request_id=int(request_id),
+                    tokens=torch.tensor(
+                        request.prompt_tokens, dtype=torch.long, device=torch.cuda.current_device()
+                    ),
+                    num_tokens_to_generate=25,
+                )
+            sampling_params = SamplingParams(top_k=10, return_log_probs=True)
+            while context.has_unfinished_requests():
+                result = self.text_generation_controller.generate_output_tokens_dynamic_batch(
+                    sampling_params=sampling_params, termination_id=-1
+                )
+                new_tokens = result["sample"]
+                assert len(new_tokens) == len(active_requests)
+                for i, token in enumerate(new_tokens.tolist()):
+                    all_generated_tokens[i].append(token)
+
+        # Wait for all communication to complete before proceeding.
+        torch.distributed.barrier()
+
+        # Collect all the generated tokens for each request from each rank in the
+        # model parallel group.
+        mp_group = parallel_state.get_model_parallel_group()
+        mp_ranks = torch.distributed.get_process_group_ranks(mp_group)
+        local_rank = torch.distributed.get_rank()
+        tokens_per_rank = {}
+        tokens_per_rank[local_rank] = all_generated_tokens
+
+        for i in mp_ranks:
+            # Start by communicating the batch size so each rank knows how many requests to expect.
+            if i == local_rank:
+                batch_size = torch.tensor(
+                    len(tokens_per_rank[local_rank]),
+                    dtype=torch.long,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                tokens_per_rank[i] = []
+                batch_size = torch.empty(1, dtype=torch.long, device=torch.cuda.current_device())
+            torch.distributed.broadcast(batch_size, group=mp_group, src=i)
+
+            for j in range(batch_size.item()):
+                # For each request, communicate the sequence length followed by the actual tokens.
+                if i == local_rank:
+                    sequence_length = torch.tensor(
+                        len(tokens_per_rank[local_rank][j]),
+                        dtype=torch.int32,
+                        device=torch.cuda.current_device(),
+                    )
+                else:
+                    sequence_length = torch.empty(
+                        1, dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                torch.distributed.broadcast(sequence_length, group=mp_group, src=i)
+
+                if i == local_rank:
+                    generated_tokens = torch.tensor(
+                        tokens_per_rank[local_rank][j],
+                        dtype=torch.long,
+                        device=torch.cuda.current_device(),
+                    )
+                else:
+                    generated_tokens = torch.empty(
+                        sequence_length.item(), dtype=torch.long, device=torch.cuda.current_device()
+                    )
+                torch.distributed.broadcast(generated_tokens, group=mp_group, src=i)
+
+                if i != local_rank:
+                    tokens_per_rank[i].append(generated_tokens.tolist())
+
+        # Ensure that every rank in the model parallel group produced the same tokens.
+        for i in mp_ranks:
+            if i == local_rank:
+                continue
+            for j, (expected, actual) in enumerate(
+                zip(tokens_per_rank[local_rank], tokens_per_rank[i])
+            ):
+                assert (
+                    expected == actual
+                ), f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"

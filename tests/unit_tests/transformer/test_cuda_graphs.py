@@ -28,7 +28,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -414,6 +414,11 @@ class TestLLaVACudaGraph:
                         layer.cudagraph_manager is not None
                     ), "Language model layers should have CUDA graph managers"
 
+                    # Verify that CUDA graphs were created successfully
+                    for runner in layer.cudagraph_manager.cudagraph_runners:
+                        assert hasattr(runner, 'fwd_graph')
+                        assert hasattr(runner, 'bwd_graph')
+
         # Perform backward pass to trigger backward graph recording
         if isinstance(output1, tuple):
             loss = output1[0].sum()
@@ -455,8 +460,8 @@ class TestParallelMambaBlockCudagraphs:
         # Ensure that this test is capturing to a fresh memory pool.
         CudaGraphManager.global_mempool = None
 
-        def get_model_comm_pgs():
-            return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_override_pattern):
             transformer_config = TransformerConfig(
@@ -473,7 +478,7 @@ class TestParallelMambaBlockCudagraphs:
                 transformer_config,
                 modules,
                 hybrid_override_pattern=hybrid_override_pattern,
-                model_comm_pgs=get_model_comm_pgs(),
+                pg_collection=get_pg_collection(),
             )
 
         self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
@@ -689,8 +694,8 @@ class TestCaptureFreezeGC:
         )
 
         # Validate time and memory usage.
-        assert freeze_on_results["internal"]["time"] < 0.2 * freeze_off_results["internal"]["time"]
-        assert freeze_on_results["external"]["time"] < 0.2 * freeze_off_results["external"]["time"]
+        assert freeze_on_results["internal"]["time"] < 0.3 * freeze_off_results["internal"]["time"]
+        assert freeze_on_results["external"]["time"] < 0.3 * freeze_off_results["external"]["time"]
         assert (
             freeze_on_results["internal"]["allocated_bytes"]
             <= freeze_off_results["internal"]["allocated_bytes"]

@@ -6,7 +6,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -42,7 +42,8 @@ def switch_load_balancing_loss_func(
     fused: bool = False,
 ):
     """Calculate the auxiliary loss for load balancing.
-    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961) for details.
+    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
+    and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
 
     ### Detailed explanation of the auxiliary loss #######
 
@@ -72,10 +73,10 @@ def switch_load_balancing_loss_func(
         T is the total number of tokens in the global batch B
 
     Note:
-    To calculate the auxiliary loss at different levels (micro-batch or each sequence):
+    To calculate the auxiliary loss at different levels (micro-batch or global batch):
     - probs: Should always be from the local batch being processed
     - tokens_per_expert: Should represent token counts at the desired level
-      (either micro-batch or each sequence)
+      (either micro-batch or global batch)
     - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
 
     #########################################################
@@ -94,7 +95,7 @@ def switch_load_balancing_loss_func(
     """
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
-            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.6.0.")
+            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
@@ -976,18 +977,21 @@ def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
-def get_default_model_comm_pgs():
+def get_default_pg_collection():
     """Get the default process groups for MoE.
 
     Returns:
-        ModelCommProcessGroups: The default process groups for MoE.
+        ProcessGroupCollection: The default process groups for MoE.
     """
-    model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
-    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
-    model_comm_pgs.cp = parallel_state.get_context_parallel_group()
-    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
-    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
-    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
-    return model_comm_pgs
+    pg_collection = ProcessGroupCollection()
+    pg_collection.ep = parallel_state.get_expert_model_parallel_group()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
+    return pg_collection

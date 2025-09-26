@@ -4,7 +4,9 @@
 
 import dataclasses
 from datetime import datetime
+import functools
 import gc
+import inspect
 import logging
 import math
 import os
@@ -26,7 +28,7 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 try:
-    from megatron.training import rl_utils
+    from megatron.rl import rl_utils
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
@@ -671,8 +673,17 @@ def pretrain(
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
-        for i in range(len(model)):
-            iterators = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+        for vp_stage in range(len(model)):
+            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+            assert "vp_stage" in dataset_provider_parameters, \
+                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+            vp_stage_train_valid_test_dataset_provider = \
+                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                vp_stage_train_valid_test_dataset_provider.is_distributed = True
+            iterators = build_train_valid_test_data_iterators(
+                vp_stage_train_valid_test_dataset_provider
+            )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
@@ -1417,9 +1428,14 @@ def training_log(
     ]
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(['rollout-collection', 'rollout-collection-barrier',
-                              'compute-logprobs', 'compute-ref-logprobs',
-                              'prepare-advantages'])
+        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
+                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
+                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
+                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
+                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
+                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
+                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
+                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -1505,6 +1521,8 @@ def training_log(
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
+        if "global_aux_loss" in args.moe_router_load_balancing_type:
+            track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_moe_metrics(
@@ -1911,10 +1929,43 @@ def train(
     timers = get_timers()
 
     if getattr(args, 'perform_rl_step', False):
-        assert has_rl_utils, "RL cannot run without the lang_rl package"
+        assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
     # Additional variable initialization for RL training
-    ref_state_dict = None
+    if getattr(args, 'perform_rl_step', False):
+        print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
+        load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
+        args.no_load_optim = True
+
+        # Load pretrained checkpoint
+        args.load = None
+        args.finetune = True
+        load_checkpoint(
+                model,
+                None,  # Don't load optimizer state
+                None,  # Don't load scheduler state
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
+        ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+
+        # Reload RL training checkpoint weights
+        args.load = load
+        args.finetune = finetune
+        print_rank_0("> Reloading RL training checkpoint...")
+        load_checkpoint(
+                model,
+                None,
+                None,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
+
+        args.no_load_optim = no_load_optim
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if getattr(args, 'perform_rl_step', False):
@@ -2121,7 +2172,6 @@ def train(
 
     # Run training iterations till done.
     buffered_rollouts = None
-    ref_state_dict = None
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
@@ -2175,9 +2225,6 @@ def train(
 
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
-                if not ref_state_dict:
-                    ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
-                
                 # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
                 if iteration % (args.grpo_iterations * ((args.grpo_samples_per_iteration) // args.global_batch_size)) == 0:
                     buffered_rollouts = rl_utils.get_rollout_data_iterator(
@@ -2576,6 +2623,10 @@ def evaluate_and_print_results(
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
         args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
+    elif not args.multiple_validation_sets:
+        eval_iters = [args.eval_iters]
+    else:
+        eval_iters = args.eval_iters
     
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
@@ -2767,32 +2818,35 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     else:
         train_data_iterator = None
 
-    # when using full validation, we need to override eval iters with the correct
-    # number of iterations on tp rank 0 so that it can be distributed to the other 
-    # ranks later
-    if args.full_validation:
+    if valid_dataloaders is not None:
+        # when using full validation, we need to override eval iters with the correct
+        # number of iterations on tp rank 0 so that it can be distributed to the other 
+        # ranks later
+        if args.full_validation:
+            if args.multiple_validation_sets:
+                if valid_dataloaders[0] is None:
+                    args.eval_iters = [None]*len(valid_dataloaders)
+                else:
+                    args.eval_iters = [len(dl) for dl in valid_dataloaders]
+            else:
+                args.eval_iters = len(valid_dataloaders[0])
+
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:
-                args.eval_iters = [None]*len(valid_dataloaders)
+                valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                args.eval_iters = [len(dl) for dl in valid_dataloaders]
+                valid_dl_type = "cyclic" if args.full_validation else dl_type
+                print(
+                    f"[VALID DATA LOADER LENGTHS] "
+                    ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
+                )
+                valid_data_iterators = [
+                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                ]
+        elif valid_dataloaders[0] is not None:
+            valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
         else:
-            args.eval_iters = len(valid_dataloaders[0])
-
-    if args.multiple_validation_sets:
-        if valid_dataloaders[0] is None:
-            valid_data_iterators = [None] * len(valid_dataloaders)
-        else:
-            valid_dl_type = "cyclic" if args.full_validation else dl_type
-            print(
-                f"[VALID DATA LOADER LENGTHS] "
-                ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
-            )
-            valid_data_iterators = [
-                _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
-            ]
-    elif valid_dataloaders[0] is not None:
-        valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
+            valid_data_iterators = None
     else:
         valid_data_iterators = None
 

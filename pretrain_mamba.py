@@ -10,38 +10,41 @@ from model_provider import model_provider
 from mamba_builders import mamba_builder
 
 from megatron.training import get_args
+from megatron.training import get_tokenizer
 from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
 from megatron.training import get_timers
-from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
 )
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tokenizers import MegatronTokenizer
 
 from megatron.training.datasets.sft_dataset import SFTDataset
 
 stimer = StragglerDetector()
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+    if not is_first_or_last_pipeline_stage(vp_stage):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
@@ -83,14 +86,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
@@ -103,7 +106,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=False,
         )
 
@@ -128,8 +131,8 @@ def forward_step(data_iterator, model: MambaModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+        vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -139,14 +142,15 @@ def forward_step(data_iterator, model: MambaModel):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def is_dataset_built_on_rank():
-    return (
-        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
-    ) and mpu.get_tensor_model_parallel_rank() == 0
+def is_dataset_built_on_rank(vp_stage=None):
+    return is_first_or_last_pipeline_stage(vp_stage) and mpu.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -172,7 +176,7 @@ def core_gpt_dataset_config_from_args(args):
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
 
     Args:
@@ -195,7 +199,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        is_dataset_built_on_rank,
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage),
         config
     ).build()
 

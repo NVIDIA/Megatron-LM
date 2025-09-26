@@ -6,7 +6,7 @@ ENV_VARS:
   NVTE_BWD_LAYERNORM_SM_MARGIN: 16
   NCCL_P2P_NET_CHUNKSIZE: 2097152
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
-  SKIP_PYTEST: 1
+  NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
@@ -87,3 +87,8 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 13000
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

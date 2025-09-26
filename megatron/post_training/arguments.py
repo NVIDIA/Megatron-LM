@@ -102,6 +102,13 @@ def add_modelopt_args(parser):
         help='Use Llama-4 expert scaling on input instead of output.',
     )
 
+    # Speculative decoding
+    group.add_argument(
+        '--export-offline-model',
+        action="store_true",
+        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
+    )
+
     return parser
 
 

@@ -4,6 +4,7 @@ import asyncio
 import multiprocessing
 import os
 import struct
+import time
 import warnings
 from collections import deque
 from datetime import datetime
@@ -18,6 +19,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
+    WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -30,7 +32,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.inference.utils import Counter
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -52,6 +54,15 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+
+def format_mem_bytes(mem_bytes):
+    """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
+    for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
+        suffix_bytes = 1024**power
+        if mem_bytes >= suffix_bytes:
+            return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
+    return "%d bytes" % mem_bytes
 
 
 class DynamicInferenceEngine(AbstractEngine):
@@ -82,6 +93,8 @@ class DynamicInferenceEngine(AbstractEngine):
         termination_id: int,
         enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
+        *,
+        track_paused_request_events: bool = False,
     ):
 
         if enable_cuda_graph is not None:
@@ -101,9 +114,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context = context
         self.termination_id = termination_id
         self.random_seed = random_seed
+        self.track_paused_request_events = track_paused_request_events
         self.step_count = 0
         self.finished_request_count = 0
         self.waiting_request_ids = deque()
+        self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
         self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
@@ -114,12 +129,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        self._loop = loop
+        self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
@@ -132,46 +142,89 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = None
         if self.enable_cuda_graph:
 
+            time_start = time.time()
+            mem_stats_start = torch.cuda.memory_stats()
+
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (len(context.cuda_graph_request_counts), context.cuda_graph_request_counts)
+                % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
+            )
+            for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
+                # Iterate cuda graph dims.
+                if (
+                    warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                    and not context.non_decode_cuda_graphs
+                ):
+                    continue
+                tbar = enumerate(context.cuda_graph_token_counts)
+                if HAVE_TQDM:
+                    tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+                for tbar_idx, cuda_graph_token_count in tbar:
+                    if (
+                        cuda_graph_token_count == 1
+                        and warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                    ):
+                        # This case is not supported`` as we require atleast two
+                        # tokens for a non-decode engine step.
+                        continue
+                    # Initialize attention state.
+                    context.initialize_attention_state(
+                        num_warmup_tokens=cuda_graph_token_count,
+                        warmup_engine_mode=warmup_engine_mode,
+                    )
+                    assert (
+                        cuda_graph_token_count == context.padded_active_token_count
+                    ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+
+                    # Progress.
+                    mode_str = warmup_engine_mode.name.lower()
+                    tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
+                    if HAVE_TQDM:
+                        tbar.set_description(tbar_str)
+                    else:
+                        print(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
+
+                    # Get flat tokens, position ids.
+                    input_ids, position_ids = context.current_input_and_position_ids(
+                        num_warmup_tokens=cuda_graph_token_count
+                    )
+
+                    # Forward pass -> logits.
+                    with torch.inference_mode():
+                        controller.inference_wrapped_model.run_one_forward_step(
+                            {
+                                "tokens": input_ids,
+                                "position_ids": position_ids,
+                                "attention_mask": None,
+                            }
+                        )
+                        context.reset()  # todo: @lmcafee, remove if unnecessary.
+
+            # Memory usage.
+            time_end = time.time()
+            mem_stats_end = torch.cuda.memory_stats()
+            capture_stats = {
+                "time": time_end - time_start,
+                "allocated_bytes": (
+                    mem_stats_end["allocated_bytes.all.current"]
+                    - mem_stats_start["allocated_bytes.all.current"]
+                ),
+                "reserved_bytes": (
+                    mem_stats_end["reserved_bytes.all.current"]
+                    - mem_stats_start["reserved_bytes.all.current"]
+                ),
+            }
+            print(
+                "> built cuda graph(s) in %.2f sec, with total memory usage: "
+                "allocated %s, reserved %s."
+                % (
+                    capture_stats["time"],
+                    format_mem_bytes(capture_stats["allocated_bytes"]),
+                    format_mem_bytes(capture_stats["reserved_bytes"]),
+                )
             )
 
-            # Iterate cuda graph dims.
-            tbar = enumerate(context.cuda_graph_request_counts)
-            if HAVE_TQDM:
-                tbar = tqdm(tbar, total=len(context.cuda_graph_request_counts))
-            for tbar_idx, cuda_graph_request_count in tbar:
-
-                # Initialize attention state.
-                context.initialize_attention_state(num_warmup_requests=cuda_graph_request_count)
-                assert (
-                    cuda_graph_request_count == context.padded_active_token_count
-                ), f"{cuda_graph_request_count} vs. {context.padded_active_token_count}."
-                assert context.is_decode_only(), "Decode-only required for cuda graph capture."
-
-                # Progress.
-                tbar_str = f"cuda graph warmup, d {cuda_graph_request_count}"
-                if HAVE_TQDM:
-                    tbar.set_description(tbar_str)
-                else:
-                    print(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
-
-                # Get flat tokens, position ids.
-                input_ids, position_ids = context.current_input_and_position_ids(
-                    num_warmup_tokens=cuda_graph_request_count
-                )
-
-                # Forward pass -> logits.
-                with torch.inference_mode():
-                    logits = controller.inference_wrapped_model.run_one_forward_step(
-                        {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
-                    )
-                    context.reset()  # todo: @lmcafee, remove if unnecessary.
-
-            # Create cuda graphs.
-            with torch.inference_mode():
-                self.capture_stats = create_cudagraphs()
+            self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
         self,
@@ -318,6 +371,38 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_count = 0
         self.finished_request_count = 0
 
+    def _add_request(
+        self, request: DynamicInferenceRequest
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+
+        request_id = request.request_id
+        self.requests[request_id] = request
+        if request.status is None:
+            request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+
+        try:
+            # Add request to context.
+            self.context.add_request(
+                request_id, request.prompt_tokens, request.sampling_params.num_tokens_to_generate
+            )
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task, self._notify_cond_for_new_request()
+            )
+            request.add_event_add()
+        except ContextOverflowError as e:
+            if e.is_transient:
+                request.status = Status.WAITING_IN_QUEUE
+                self.waiting_request_ids.append(request_id)
+                request.add_event_error_transient(e)
+            else:
+                request.status = Status.FAILED
+                self.failed_request_ids.append(request_id)
+                request.add_event_error_nontransient(e)
+
+        # Create a new asyncio Future to notify the user when the request has completed.
+        self.request_completion_futures[request_id] = asyncio.Future()
+        return self.request_completion_futures[request_id]
+
     def add_request(
         self,
         request_id: int,
@@ -357,26 +442,15 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        self.requests[request_id] = DynamicInferenceRequest(
+        # Initialize request.
+        request = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),
         )
-        try:
-            # Add request to context.
-            self.context.add_request(request_id, tokens, num_tokens_to_generate)
-            self._loop.call_soon_threadsafe(
-                asyncio.create_task, self._notify_cond_for_new_request()
-            )
-        except ContextOverflowError as e:
-            if e.is_transient:
-                self.waiting_request_ids.append(request_id)
-            else:
-                raise e
 
-        # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
-        return self.request_completion_futures[request_id]
+        # Add request.
+        return self._add_request(request)
 
     def post_process_requests(
         self,
@@ -451,6 +525,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     waiting_request.prompt_tokens,
                     waiting_request.sampling_params.num_tokens_to_generate,
                 )
+                waiting_request.add_event_add()
                 self.waiting_request_ids.popleft()
             except Exception as e:
                 break
@@ -482,6 +557,7 @@ class DynamicInferenceEngine(AbstractEngine):
         prev_is_decode_only = self.context.is_decode_only()
         prev_total_request_count = self.context.total_request_count
         prev_paused_request_count = self.context.paused_request_count
+        prev_active_token_count = self.context.active_token_count
 
         range_push("Prefill" if not prev_is_decode_only else "Decode")
 
@@ -495,19 +571,34 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
 
+        # Increment finished_request_count.
+        cuda_graph_request_count = None
         if result is not None:
-            request_ids, finished_request_ids, sample, log_probs = result
+            active_request_ids = result["active_request_ids"]
+            newly_paused_request_ids = result["newly_paused_request_ids"]
+            finished_request_ids = result["finished_request_ids"]
+            sample = result["sample"]
+            log_probs = result["log_probs"]
+            cuda_graph_request_count = result["cuda_graph_request_count"]
+
+            # Add paused events.
+            if newly_paused_request_ids is not None and self.track_paused_request_events:
+                newly_paused_request_ids = newly_paused_request_ids.tolist()
+                [self.requests[i].add_event_pause() for i in newly_paused_request_ids]
 
             # TODO: Move this to a background thread?
             self.schedule_waiting_requests()
 
-            # TODO: Move this to a background thread?
+            # Mark requests finished.
+            [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
+
+            # Add finished events.
             if post_process_requests_locally:
                 (active_requests, finished_requests) = self.post_process_requests(
-                    request_ids, finished_request_ids, step_time, sample, log_probs
+                    active_request_ids, finished_request_ids, step_time, sample, log_probs
                 )
             else:
-                return request_ids, finished_request_ids, sample, log_probs
+                return active_request_ids, finished_request_ids, sample, log_probs
 
         else:
             if not post_process_requests_locally:
@@ -515,10 +606,20 @@ class DynamicInferenceEngine(AbstractEngine):
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
 
+        # Failed requests.
+        for failed_request_id in self.failed_request_ids:
+            failed_request = self.requests.pop(failed_request_id)
+            failed_request.status = Status.FAILED
+            failed_request.add_event_fail()
+            finished_requests.append(failed_request)
+            self.request_completion_futures[failed_request_id].set_result(failed_request)
+        self.failed_request_ids.clear()
+
         # Print context state.
         if verbose:
             context = self.context
             mem = torch.cuda.memory_stats()
+            step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
                 "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
@@ -528,20 +629,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
-                        (
-                            " [decode + cuda graph %s]"
-                            % (
+                        " [%s + cuda graph %s]"
+                        % (
+                            step_type,
+                            (
                                 "DIM %d:%d"
-                                % (
-                                    context.padded_active_request_count,
-                                    prev_total_request_count - prev_paused_request_count,
-                                )
-                                if self.enable_cuda_graph
+                                % (context.padded_active_token_count, prev_active_token_count)
+                                if self.context.using_cuda_graph_this_step()
                                 else "OFF"
-                            )
+                            ),
                         )
-                        if prev_is_decode_only
-                        else "[prefill]"
                     ),
                     prev_total_request_count,
                     context.gtd_request_count,
@@ -559,15 +656,38 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_count += 1
         range_pop()
-        return active_requests, finished_requests, step_time
+        return {
+            "active_requests": active_requests,
+            "finished_requests": finished_requests,
+            "step_time": step_time,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
 
-    def step(
+    def step_modern(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         return self._loop.run_until_complete(
             self.async_step(sampling_params=sampling_params, verbose=verbose)
         )
+
+    def step_legacy(
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """Synchronous wrapper for `self.async_step`."""
+        warnings.warn(
+            "`step_legacy()` is deprecated and will be removed in `megatron-core` "
+            "0.16. Please use `step_modern()` going forward, which will eventually "
+            "be renamed to `step()`."
+        )
+        result = self._loop.run_until_complete(
+            self.async_step(sampling_params=sampling_params, verbose=verbose)
+        )
+        return (result["active_requests"], result["finished_requests"], result["step_time"])
+
+    # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
+    # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
+    step = step_legacy
 
     def generate(
         self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
@@ -580,8 +700,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         finished_requests_list = []
         while self.has_unfinished_requests():
-            active_requests, finished_requests, step_time = self.step(sampling_params)
-            finished_requests_list.extend(finished_requests)
+            result = self.step_modern(sampling_params)
+            finished_requests_list.extend(result["finished_requests"])
 
         return finished_requests_list
 
