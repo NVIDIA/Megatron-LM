@@ -8,6 +8,7 @@ import random
 import shutil
 import sys
 import threading
+import types
 from argparse import Namespace
 from enum import Enum, auto
 from logging import getLogger
@@ -1412,14 +1413,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         else:
             raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
 
-    state_dict_args = state_dict.get('args', {}) if state_dict is not None else {}
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
     if ckpt_format == "torch_dist":
-        if 'tensor_model_parallel_size' not in state_dict_args:
+        state_dict_args = (
+            state_dict.get('args', types.SimpleNamespace())
+            if state_dict is not None
+            else types.SimpleNamespace()
+        )
+        if not hasattr(state_dict_args, 'tensor_model_parallel_size'):
             print_rank_0('WARNING: does not find TP size in checkpoint args, using 1 as default.')
-        if 'pipeline_model_parallel_size' not in state_dict_args:
+        if not hasattr(state_dict_args, 'pipeline_model_parallel_size'):
             print_rank_0('WARNING: does not find PP size in checkpoint args, using 1 as default.')
         ckpt_tp_pp = (
             getattr(state_dict_args, 'tensor_model_parallel_size', 1),

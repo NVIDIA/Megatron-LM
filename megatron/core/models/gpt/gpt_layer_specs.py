@@ -560,6 +560,15 @@ def get_gpt_decoder_block_spec(
             f"expected {config.num_layers}, "
             f"current linear attention pattern: {config.linear_attention_freq}"
         )
+    elif config.linear_attention_freq is None:
+        if config.linear_attention_type is None:
+            linear_attention_pattern = [0] * config.num_layers
+        else:
+            linear_attention_pattern = [1] * config.num_layers
+            warnings.warn(
+                "Linear attention type is specified but linear_attention_freq is None. "
+                "Setting linear_attention_pattern to [1] * config.num_layers as default."
+            )
     else:
         raise ValueError(
             f"Invalid linear_attention_freq: {type(config.linear_attention_freq)},"

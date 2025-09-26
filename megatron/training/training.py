@@ -383,6 +383,8 @@ def num_floating_point_operations(args, batch_size):
                     f"expected {num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
+            elif args.linear_attention_freq is None:
+                linear_attention_pattern = [1] * num_layers
             else:
                 raise ValueError(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
@@ -412,7 +414,7 @@ def num_floating_point_operations(args, batch_size):
                         ## gated delta rule
                         + num_v_heads
                         * (v_head_dim ** 2)
-                        * 3  # KK^T, VK^T, and S(a(I-bKK^T))
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
                         ## out proj
                         + args.hidden_size
                         * v_dim

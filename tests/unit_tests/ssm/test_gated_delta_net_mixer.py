@@ -29,6 +29,13 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import fla
+
+    HAVE_FLA = True
+except ImportError:
+    HAVE_FLA = False
+
 
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
@@ -39,6 +46,7 @@ from tests.unit_tests.test_utilities import Utils
         # GDN does not support CP for now. Leave it for future work.
     ],
 )
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
 class TestGatedDeltaNetMixer:
 
@@ -141,6 +149,7 @@ class TestGatedDeltaNetMixer:
         # CP does not support GDN for now. Add it once it is supported.
     ],
 )
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_mixer_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     # Constants
     seed = 123

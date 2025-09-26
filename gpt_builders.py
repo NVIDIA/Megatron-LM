@@ -41,7 +41,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            if args.num_experts:
+            if args.num_experts or (args.linear_attention_type is not None):
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,

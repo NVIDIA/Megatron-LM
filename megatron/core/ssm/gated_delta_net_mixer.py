@@ -28,11 +28,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import (
-    deprecate_inference_params,
-    nvtx_range_pop,
-    nvtx_range_push,
-)
+from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 # TODO: Implement GatedDeltaNetContextParallel
 # from .gated_delta_net_context_parallel import GatedDeltaNetContextParallel
