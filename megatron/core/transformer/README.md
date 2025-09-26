@@ -26,6 +26,7 @@ Fine-grained Activation Offloading
 * Support A2A Overlap
 
 ## Known issues
+* We explicitly resize some tensors to 0 to release the memory space immediately, which sometimes leads to illegal memory access. Please remove the released tensors in `group_prefetch_offload_commit` if you run into the issue.
 
 ## WIP items
 * Code refactor

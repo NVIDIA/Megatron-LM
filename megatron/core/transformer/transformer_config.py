@@ -1028,9 +1028,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
             
             if isinstance(self.moe_layer_freq, int):
-                raise ValueError(
-                    "moe_layer_freq cannot be an integer when offload_modules is set."
-                )
+                assert self.moe_layer_freq == 1, "moe_layer_freq cannot be an integer other than 1 when offload_modules is set."
             elif isinstance(self.moe_layer_freq, list):
                 if 0 in self.moe_layer_freq:
                     warnings.warn(

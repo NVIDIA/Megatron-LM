@@ -980,7 +980,7 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
-            output, = group_prefetch_offload_commit(output, release_tensors=[fc1_output])
+            output, = group_prefetch_offload_commit(output, release_tensors=[])
             offload_context = contextlib.nullcontext()
 
 
