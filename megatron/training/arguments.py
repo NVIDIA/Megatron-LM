@@ -1002,7 +1002,7 @@ def validate_args(args, defaults={}):
     # Keep the 'add bias' args in sync; add_qkv_bias is more targeted.
     if args.add_bias_linear:
         args.add_qkv_bias = True
-    
+
     if args.qk_clip:
         # TODO: add is_te_min_version("2.9.0") before merge
         # assert is_te_min_version("2.9.0"), \

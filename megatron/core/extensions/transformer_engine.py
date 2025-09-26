@@ -990,7 +990,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        #TODO: add is_te_min_version("2.9.0") before merge
+        # TODO: add is_te_min_version("2.9.0") before merge
         if config.qk_clip:
             # TE 2.9.0 introduces return_max_score for qk-clip getting the max attention score
             extra_kwargs["return_max_score"] = True
@@ -1061,8 +1061,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if self.config.qk_clip:
                 if self.qk_clip_balancing_eta:
                     # Apply QK_Clip
-                    query = pow(self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha) * query
-                    key = pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha) * key
+                    query = (
+                        pow(self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha) * query
+                    )
+                    key = (
+                        pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha)
+                        * key
+                    )
 
                 # Forward pass and get max attention score
                 core_attn_out, max_attention_score = super().forward(
@@ -1077,7 +1082,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
                 # Update QK_Clip balancing eta
                 max_attention_score = float(max_attention_score)
-                self.qk_clip_balancing_eta = min(self.config.qk_clip_balancing_threshold / max_attention_score, 1.0)
+                self.qk_clip_balancing_eta = min(
+                    self.config.qk_clip_balancing_threshold / max_attention_score, 1.0
+                )
             else:
                 core_attn_out = super().forward(
                     query,
