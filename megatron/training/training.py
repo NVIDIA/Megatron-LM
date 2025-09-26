@@ -2159,7 +2159,7 @@ def train(
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
-    # Capture CUDA Graphs.
+    # Initialize CUDA Graphs helper.
     if args.external_cuda_graph:
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
@@ -2168,7 +2168,6 @@ def train(
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
         )
-        cuda_graph_helper.create_cudagraphs()
 
     # Run training iterations till done.
     buffered_rollouts = None
@@ -2207,10 +2206,21 @@ def train(
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+        # Capture CUDA Graphs.
+        if args.external_cuda_graph and iteration == args.cuda_graph_warmup_steps:
+            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+                disable_forward_pre_hook(model, param_sync=False)
+            cuda_graph_helper.create_cudagraphs()
+            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+                enable_forward_pre_hook(model)
+                cuda_graph_helper.cuda_graph_set_manual_hooks()
+
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
+            if iteration == start_iteration:
+                start_iteration = iteration + 1
             iteration += 1
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
@@ -2275,8 +2285,8 @@ def train(
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
-                    # Set the manual hooks when CUDA Graphs are used.
-                    if args.external_cuda_graph:
+                    # Set the manual hooks here since it's not set right after the capturing.
+                    if args.external_cuda_graph and iteration == args.cuda_graph_warmup_steps:
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
