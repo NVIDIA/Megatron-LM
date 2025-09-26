@@ -153,9 +153,6 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        # >>>
-        use_cuda_graphs_for_non_decode_steps=False,
-        # <<<
     )
 
     return context
@@ -379,16 +376,6 @@ def main():
         ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
     )
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    def ldebug(d = None, force = False):
-        import os
-        from lutil import pax
-        if os.getenv("LDEBUG") or force:
-            pax(d or {})
-    import builtins
-    builtins.ldebug = ldebug
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
     # Inference engine.
     engine = DynamicInferenceEngine(
         controller,
@@ -399,13 +386,6 @@ def main():
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
-
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # engine.suspend()
-    # os.environ["LDEBUG"] = "1"
-    # engine.resume()
-    # raise Exception("hi.")
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
