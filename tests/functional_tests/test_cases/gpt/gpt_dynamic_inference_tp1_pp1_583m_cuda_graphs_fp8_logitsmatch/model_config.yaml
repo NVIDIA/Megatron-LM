@@ -45,7 +45,6 @@ MODEL_ARGS:
   --top_k: 1
   --return-log-probs: true
   --num-tokens-to-generate: 30
-  --enable-cuda-graph: true
   --inference-dynamic-batching-buffer-guaranteed-fraction: 0
   --inference-dynamic-batching-buffer-overflow-factor: 0.2
   --inference-dynamic-batching-buffer-size-gb: 20

@@ -149,7 +149,6 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-        use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs
     )
 
     return context
@@ -379,8 +378,6 @@ def main():
     total_output_tokens = result["total_output_tokens"]
     torch.cuda.synchronize()
     total_time = get_curr_time() - t
-    stats = torch.cuda.memory_stats()
-    throughput = total_output_tokens / total_time
 
     # Validate all requests finished.
     for request in requests:
@@ -439,14 +436,12 @@ def main():
                     response_logprobs = req.log_probs
                     result_dict["logprobs"] = response_logprobs
                 json_results[req.request_id] = result_dict
-
-            # Track system-level throughput as a test / debug metric
-            json_results["throughput"] = throughput
-
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
     # Timing results.
+    stats = torch.cuda.memory_stats()
+    throughput = total_output_tokens / total_time
     print("~~~")
     peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
     peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3

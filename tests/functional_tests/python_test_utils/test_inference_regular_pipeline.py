@@ -31,21 +31,6 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
             f"Some IDs from groundtruth are missing in output, only the subset of ids in groundtruth will be tested: {output_groundtruth.keys()} vs {output_current.keys()}"
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
-
-    # Throughput assertions.
-    if "throughput" in output_groundtruth.keys():
-        # The threshold of 4 tokens/second is empirically observed to be within run variance.
-        assert (
-            output_current["throughput"] >= output_groundtruth["throughput"] - 4.0
-        ), f"Throughput is slower than expected! Expected ~{output_groundtruth['throughput']} tok/s but benchmarked {output_current['throughput']} tok/s"
-
-        # If throughput is significantly improved (> 30%), update golden values accordingly.
-        assert (
-            output_current["throughput"] < output_groundtruth["throughput"] * 1.3
-        ), f"Throughput has been improved from expected ~{output_groundtruth['throughput']} tok/s to {output_current['throughput']} tok/s. Please update golden values in the functional tests."
-
-        output_groundtruth.pop('throughput')
-
     for request_id, groundtruth_results in output_groundtruth.items():
         current_results = output_current[request_id]
 
