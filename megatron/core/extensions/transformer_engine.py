@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import inspect
 import io
 import os
 import pickle
@@ -1591,21 +1592,21 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
                 userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
             op = te.pytorch.ops.BasicLinear(
-                weight.size(1) * tp_world_size,
+                weight.size(1),
                 weight.size(0),
                 device="meta",
                 dtype=weight.dtype,
-                tensor_parallel_mode="row" if tp_world_size > 1 else None,
-                tensor_parallel_group=tp_group,
-                sequence_parallel=self.linear_fc2.sequence_parallel,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
                 userbuffers_options=userbuffers_options,
             )
             op.weight = weight
             fused_impl.append(op)
-            if tp_world_size > 1 and self.linear_fc2.sequence_parallel:
-                fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+            if tp_world_size > 1:
+                if self.linear_fc2.sequence_parallel:
+                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+                else:
+                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
 
             # FC2 bias op
             if not self.linear_fc2.te_return_bias:
@@ -1616,6 +1617,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
                     op.bias = bias
                     fused_impl.append(op)
+
+            # Emulate submodule forward hooks if needed
+            self._register_hooks_on_fused_impl(fused_impl)
 
             return fused_impl
 
@@ -1654,6 +1658,92 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             if is_te_min_version("2.3"):
                 kwargs["cache_quantized_input"] = cache_quantized_input
             return op_type(**kwargs)
+
+        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
+            """Attempt to emulate submodule callback hooks.
+
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
+
+            """
+
+            # Get submodule hooks
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            backward_pre_hooks = []
+            backward_post_hooks = []
+            for submodule in self.modules():
+                for hook in submodule._forward_pre_hooks.values():
+                    forward_pre_hooks.append((submodule, hook))
+                for hook in submodule._forward_hooks.values():
+                    forward_post_hooks.append((submodule, hook))
+                for hook in submodule._backward_pre_hooks.values():
+                    backward_pre_hooks.append((submodule, hook))
+                for hook in submodule._backward_hooks.values():
+                    backward_post_hooks.append((submodule, hook))
+
+            # Pre-forward hooks
+            # Note: DDP pre-forward hooks are safe since they do not
+            # interact with input tensor.
+            if forward_pre_hooks:
+                from megatron.core.distributed import distributed_data_parallel
+
+                if any(
+                    inspect.getmodule(hook) != distributed_data_parallel
+                    for _, hook in forward_pre_hooks
+                ):
+                    warnings.warn(
+                        "TEFusedMLP module has a submodule with a pre-forward hook. "
+                        "TEFusedMLP module does not expose intermediate tensors, "
+                        "so the hook may have incorrect behavior if it attempts to "
+                        "access the input tensor."
+                    )
+
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook in forward_pre_hooks:
+                        # Assume that hook does not interact with input
+                        ret = hook(submodule, None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                "TEFusedMLP module does not expose intermediate tensors, but "
+                                "submodule has pre-forward hook that modifies input tensor."
+                            )
+
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
+
+            # Post-forward hooks
+            if forward_post_hooks:
+                warnings.warn(
+                    "TEFusedMLP module has a submodule with a post-forward hook. "
+                    "TEFusedMLP module does not expose intermediate tensors, "
+                    "so the hook may have incorrect behavior if it attempts to "
+                    "access the input or output tensors."
+                )
+
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook in forward_post_hooks:
+                        # Assume that hook does not interact with input or output
+                        ret = hook(submodule, None, None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                "TEFusedMLP module does not expose intermediate tensors, but "
+                                "submodule has post-forward hook that modifies output tensor."
+                            )
+
+                fused_impl.register_forward_hook(forward_post_hook)
+
+            # Backward hooks
+            if backward_pre_hooks:
+                raise RuntimeError(
+                    "TEFusedMLP module does not support submodules with pre-backward hooks"
+                )
+            if backward_post_hooks:
+                raise RuntimeError(
+                    "TEFusedMLP module does not support submodules with post-backward hooks"
+                )
 
         def forward(self, hidden_states: torch.Tensor) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
