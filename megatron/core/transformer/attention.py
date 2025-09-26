@@ -44,7 +44,9 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+    from flashattn_hopper.flash_attn_interface import (
+        _flash_attn_forward,
+    )
     from flashattn_hopper.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -490,7 +492,7 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            block_table (Tensor): KV cache chunk ids for all samples.
+            block_table (Tensor): KV cache block ids for all samples.
         Return:
             (Tensor) Attention output.
         """
