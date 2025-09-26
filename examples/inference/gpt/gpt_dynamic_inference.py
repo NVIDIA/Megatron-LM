@@ -433,10 +433,6 @@ def main():
             return s.replace("\n", "\\n")
 
         print("~~~~ Unique prompts + outputs. ~~~~")
-            SUSPEND_RESUME_INTERVAL,
-            args.inference_dynamic_batching_unified_memory_level,
-            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else 0,
-        ))
 
         # Map requests by their prompt.
         unique_prompt_map = defaultdict(list)
