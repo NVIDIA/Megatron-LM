@@ -3,14 +3,36 @@
 import logging
 import warnings
 from typing import Any, Dict, Optional
+import dataclasses
 
 import torch
+import torch.distributed as dist
 
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
 
 logger = logging.getLogger(__name__)
+
+
+def _find_pg_collection_in_submodules(submodules) -> Optional[object]:
+    """Recursively search for pg_collection in nested submodules."""
+    if isinstance(submodules, dict):
+        for nested_spec in submodules.values():
+            if isinstance(nested_spec, dict):
+                # Handle {"clip_encoder": spec}
+                for spec in nested_spec.values():
+                    if hasattr(spec, 'params') and spec.params and 'pg_collection' in spec.params:
+                        return spec.params['pg_collection']
+            elif isinstance(nested_spec, list):
+                # Handle [spec1, spec2, ...]
+                for spec in nested_spec:
+                    if hasattr(spec, 'params') and spec.params and 'pg_collection' in spec.params:
+                        return spec.params['pg_collection']
+            elif hasattr(nested_spec, 'params') and nested_spec.params and 'pg_collection' in nested_spec.params:
+                # Handle direct ModuleSpec
+                return nested_spec.params['pg_collection']
+    return None
 
 
 class MimoModel(MegatronModule):
@@ -63,76 +85,28 @@ class MimoModel(MegatronModule):
         self._initialize_submodules()
         self._initialize_language_model()
 
-    def align_embeddings_by_token_positions(
-        self,
-        modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
-        input_ids: torch.Tensor,  # [bs, seq_len]
-        special_token_ids: Dict[str, int],
-    ) -> torch.Tensor:
-        """Align embeddings from different modalities based on special token positions in input_ids.
-
-        Args:
-            modality_embeddings: Dictionary mapping modality names to their embeddings.
-                For all modalities: tensor of shape [num_tokens_for_modality, hidden_dim]
-            input_ids: Input token IDs of shape [batch_size, seq_len] containing special tokens
-                that mark where each modality's embeddings should go. The number of special tokens
-                for each modality should exactly match the number of embeddings for that modality.
-            special_token_ids: Dictionary mapping modality names to their special token IDs
-
-        Returns:
-            Combined embeddings tensor of shape [seq_len, batch_size, hidden_dim]
-        """
-        # Ensure we have at least one modality
-        if not modality_embeddings:
-            raise ValueError("No modality embeddings provided. At least one modality is required.")
-
-        logger.debug(f"Merging embeddings for modalities: {list(modality_embeddings.keys())}")
-
-        # Use text embeddings if available, otherwise use any modality
-        reference_embeddings = modality_embeddings.get(
-            "text", next(iter(modality_embeddings.values()))
+    def _should_initialize_module(self, module_spec) -> bool:
+        """Determine if the current rank should initialize a module based on its process groups."""
+        params = module_spec.params or {}
+        
+        # Find pg_collection in params or nested submodules
+        pg_collection = params.get('pg_collection') or (
+            _find_pg_collection_in_submodules(module_spec.submodules) 
+            if hasattr(module_spec, 'submodules') and module_spec.submodules else None
         )
-        hidden_dim = reference_embeddings.size(-1)
-        device = reference_embeddings.device
-        dtype = reference_embeddings.dtype
-
-        batch_size, seq_length = input_ids.size()  # input_ids is [b, s]
-
-        logger.debug(
-            f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
-        )
-
-        combined_embeddings = torch.zeros(
-            (batch_size, seq_length, hidden_dim), dtype=dtype, device=device
-        )
-
-        # Process each modality in modality_embeddings
-        for modality_name, modality_emb in modality_embeddings.items():
-            if modality_name == "text":
-                # Text tokens: positions that are not any special token.
-                mask = torch.ones_like(input_ids, dtype=torch.bool)
-                for token_id in special_token_ids.values():
-                    mask &= input_ids != token_id
-            elif modality_name in special_token_ids:
-                token_id = special_token_ids[modality_name]
-                mask = input_ids == token_id
-            else:
-                raise ValueError(f"No special token ID defined for modality {modality_name}")
-
-            num_tokens = mask.sum().item()
-            if num_tokens != modality_emb.size(0):
-                raise ValueError(
-                    f"Number of {modality_name} tokens ({num_tokens}) does not match "
-                    f"number of {modality_name} embeddings ({modality_emb.size(0)})"
-                )
-
-            expanded_mask = (
-                mask.unsqueeze(-1).expand_as(combined_embeddings).to(combined_embeddings.device)
-            )
-            combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
-        return combined_embeddings.transpose(
-            0, 1
-        ).contiguous()  # Shape: [seq_length, batch_size, hidden_dim]
+        
+        # No pg_collection means initialize on all ranks
+        if not pg_collection:
+            return True
+            
+        # Check if current rank is in any process group
+        current_rank = dist.get_rank()
+        for field in dataclasses.fields(pg_collection):
+            pg = getattr(pg_collection, field.name, None)
+            if pg and current_rank in dist.get_process_group_ranks(pg):
+                return True
+        
+        return False
 
     def _initialize_submodules(self) -> None:
         """Initialize modality submodules from the ModuleSpec configurations.
@@ -142,9 +116,15 @@ class MimoModel(MegatronModule):
         """
 
         for modality_name, submodule_spec in self.mimo_config.modality_submodules_spec.items():
+            # Check if current rank should initialize this submodule
+            if not self._should_initialize_module(submodule_spec):
+                logger.debug(f"Rank {dist.get_rank()} skipping {modality_name} submodule initialization")
+                self.modality_submodules[modality_name] = None
+                continue
+                
             # Get the submodule class
             submodule_class = submodule_spec.module
-            logger.debug(f"Building {modality_name} submodule using {submodule_class.__name__}")
+            logger.debug(f"[Rank - {dist.get_rank()}] Building {modality_name} submodule using {submodule_class.__name__}")
 
             # Use from_spec to instantiate the submodule
             submodule = submodule_class.from_spec(submodule_spec)
@@ -152,8 +132,14 @@ class MimoModel(MegatronModule):
 
     def _initialize_language_model(self) -> None:
         """Initialize the language model."""
+        # Check if current rank should initialize the language model
+        if not self._should_initialize_module(self.mimo_config.language_model_spec):
+            logger.debug(f"Rank {dist.get_rank()} skipping language model initialization")
+            self.language_model = None
+            return
+            
         logger.debug(
-            f"Building language model using {self.mimo_config.language_model_spec.module.__name__}"
+            f"[Rank - {dist.get_rank()} Building language model using {self.mimo_config.language_model_spec.module.__name__}"
         )
         self.language_model = build_module(self.mimo_config.language_model_spec)
 
@@ -193,6 +179,9 @@ class MimoModel(MegatronModule):
         Returns:
             torch.Tensor: Embeddings for text tokens, shape [num_text_tokens, hidden_dim].
         """
+        if self.language_model is None:
+            raise RuntimeError(f"Language model not initialized on rank {dist.get_rank()}")
+            
         text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
         for special_token_id in special_token_ids.values():
             text_mask &= input_ids != special_token_id
@@ -246,6 +235,10 @@ class MimoModel(MegatronModule):
         modality_embeddings = {}
 
         for modality_name, submodule in self.modality_submodules.items():
+            # Skip if submodule is None (not initialized on this rank)
+            if submodule is None:
+                continue
+                
             # Process the modality through its submodule
             if (
                 modality_inputs
@@ -261,6 +254,11 @@ class MimoModel(MegatronModule):
                     logger.debug(
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
                     )
+
+        # Only process if language model is available on this rank
+        if self.language_model is None:
+            logger.debug(f"Rank {dist.get_rank()} has no language model, returning modality embeddings")
+            return modality_embeddings, loss_mask
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
