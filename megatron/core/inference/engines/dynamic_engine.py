@@ -3,7 +3,6 @@
 import asyncio
 import multiprocessing
 import os
-import psutil
 import struct
 import time
 import warnings
@@ -13,6 +12,7 @@ from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
@@ -177,10 +177,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (
-                    len(self.context.cuda_graph_token_counts),
-                    self.context.cuda_graph_token_counts,
-                )
+                % (len(self.context.cuda_graph_token_counts), self.context.cuda_graph_token_counts)
             )
             for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
                 # Iterate cuda graph dims.
