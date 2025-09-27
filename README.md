@@ -239,7 +239,7 @@ cd Megatron-LM
 # Optional: checkout specific release
 git checkout core_r0.13.0
 
-bash docker/common/install.sh --environment {dev,lts}
+bash docker/common/install_source_wheels.sh --environment {dev,lts}
 ```
 
 ## System Requirements
