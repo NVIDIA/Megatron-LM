@@ -240,7 +240,7 @@ runs:
         echo "::group::Check result"
 
         docker exec test_container_${{ github.run_id }} /opt/venv/bin/coverage xml
-        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/logs ./
+        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/outputs/logs ./
         docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/.coverage .coverage
         docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/coverage.xml coverage.xml
 
