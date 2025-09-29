@@ -120,7 +120,7 @@ runs:
           bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
             --tag ${{ inputs.tag }} \
             --environment dev \
-            --bucket '\''${{ inputs.test_case }}'\''
+            --bucket '\''${{ inputs.test_case }}'\'' \
             --log-dir /opt/megatron-lm/outputs/logs
         '
 
