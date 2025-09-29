@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from typing import Callable, List, Optional
 
 import torch
-import logging
 
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
