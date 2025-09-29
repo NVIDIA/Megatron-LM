@@ -138,15 +138,19 @@ runs:
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
-        if [[ "$MODEL" == "bert" ]]; then
-          TRAINING_SCRIPT_PATH=pretrain_bert.py
-        elif [[ "$MODEL" == "gpt" ]] || [[ "$MODEL" == "moe" ]]; then
-          TRAINING_SCRIPT_PATH=pretrain_gpt.py
-        fi
 
-        docker exec -t test_container_${{ github.run_id }} -e TRAINING_SCRIPT_PATH bash -c '
+
+        docker exec -t test_container_${{ github.run_id }} bash -c '
+
           set -e
           ls -al /workspace/data
+          
+          if [[ "${{ inputs.model }}" == "bert" ]]; then
+            TRAINING_SCRIPT_PATH=pretrain_bert.py
+          elif [[ "${{ inputs.model }}" == "gpt" ]] || [[ "${{ inputs.model }}" == "moe" ]]; then
+            TRAINING_SCRIPT_PATH=pretrain_gpt.py
+          fi
+          
           ARGUMENTS=(
             "DATA_PATH=/workspace/data"
             "DATA_CACHE_PATH=/workspace/data/cache" 
