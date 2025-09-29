@@ -14,7 +14,11 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    InferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -664,11 +668,17 @@ class TestTextGenerationController:
             context = self.text_generation_controller.inference_wrapped_model.inference_context
             for request_id, request in active_requests.items():
                 context.add_request(
-                    request_id=int(request_id),
-                    tokens=torch.tensor(
-                        request.prompt_tokens, dtype=torch.long, device=torch.cuda.current_device()
-                    ),
-                    num_tokens_to_generate=25,
+                    DynamicInferenceRequest(
+                        request_id=int(request_id),
+                        prompt_tokens=torch.tensor(
+                            request.prompt_tokens,
+                            dtype=torch.long,
+                            device=torch.cuda.current_device(),
+                        ),
+                        sampling_params=SamplingParams(
+                            top_k=10, return_log_probs=True, num_tokens_to_generate=25
+                        ),
+                    )
                 )
             sampling_params = SamplingParams(top_k=10, return_log_probs=True)
             while context.has_unfinished_requests():

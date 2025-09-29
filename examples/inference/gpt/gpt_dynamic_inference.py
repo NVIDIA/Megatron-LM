@@ -36,8 +36,11 @@ sys.path.append(
 )
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
+
+from megatron.core.utils import configure_nvtx_profiling
 from model_provider import model_provider
 from gpt_builders import gpt_builder
+
 import json
 
 from examples.inference.gpt.utils import (
@@ -262,8 +265,10 @@ def run_inference(
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
-        is_decode_only = engine.context.is_decode_only()
+        # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         result = engine.step_modern(sampling_params, verbose=True)
+        # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
+        is_decode_only = engine.is_decode_only 
         step_id += 1
 
         # Record cuda_graph_request_count.
@@ -323,6 +328,8 @@ def main():
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
+    
+    configure_nvtx_profiling(True)
 
     args = get_args()
     if args.legacy_tokenizer:
@@ -363,6 +370,7 @@ def main():
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -401,23 +409,29 @@ def main():
 
         # Print unique prompts + outputs.
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-            request_idx = request_idxs[0]
-            request = requests[request_idx]
-            prompt_text_escaped = escape_str(prompt_text)
-            num_prompt_tokens = len(requests[request_idx].prompt_tokens)
-            if request.output_text is not None:
-                output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
-                output_text_escaped = escape_str(request.output_text)
-                num_output_tokens = len(requests[request_idx].output_tokens)
-            else:
-                output_text_hash = "--"
-                output_text_escaped = "--"
-                num_output_tokens = 0
-            print(
-                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
-                f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
-                f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
-            )
+            # ---- Prompt summary line ----
+            prompt_len = len(requests[request_idxs[0]].prompt_tokens)
+            escaped_prompt_text = escape_str(prompt_text)
+            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+
+            # ---- Group all outputs for this prompt ----
+            output_map = defaultdict(list)
+            for idx in request_idxs:
+                req = requests[idx]
+                output_map[req.output_text].append(idx)
+
+            # ---- Print each unique output ----
+            for output_text, output_request_idxs in output_map.items():
+                if output_text is not None:
+                    o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                    o_len = len(requests[output_request_idxs[0]].output_tokens)
+                    escaped_output_text = escape_str(output_text)
+                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
+                else:
+                    o_hash = "--"
+                    o_len = 0
+                    escaped_output_text = "--"
+                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:

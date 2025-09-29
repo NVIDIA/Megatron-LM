@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -132,7 +133,22 @@ class DynamicInferenceRequest(InferenceRequest):
     generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    # remaining prompt tokens are used for chunked prefill
+    remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
+    finished_chunk_token_count = 0
+
+    def __post_init__(self):
+        if self.prompt_tokens is not None:
+            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+
+    @property
+    def remaining_prompt_length(self):
+        """
+        Get the length of the remaining prompt tokens.
+        """
+        return len(self.remaining_prompt_tokens)
+
     events: List[DynamicInferenceEvent] = field(default_factory=list)
 
     def __str__(self):

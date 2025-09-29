@@ -1446,7 +1446,8 @@ def _add_inference_args(parser):
     group.add_argument('--initialize-socket-comms',
                        action='store_true', default=False,
                        help='Initialize socket communication for dynamic engine coordinator.')
-
+    group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
     return parser
 
 
