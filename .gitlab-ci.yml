@@ -31,7 +31,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev")
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"

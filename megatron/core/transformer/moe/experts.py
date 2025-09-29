@@ -759,9 +759,9 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
-        assert (
-            config.add_bias_linear == False
-        ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
+        assert not (
+            self.config.add_bias_linear and config.bias_dropout_fusion
+        ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = pg_collection.ep
 
@@ -779,7 +779,7 @@ class TEGroupedMLP(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True,
+            skip_bias_add=False,
             is_expert=True,
             tp_comm_buffer_name='fc1',
             tp_group=pg_collection.expt_tp,
@@ -818,6 +818,26 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+
+    @staticmethod
+    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
+        if bias_parallel is None:
+            return intermediate_parallel
+        shape = intermediate_parallel.shape
+        return (
+            torch.cat(
+                [
+                    t + b * p
+                    for t, b, p in zip(
+                        torch.split(intermediate_parallel.view(-1, shape[-1]), tokens_per_expert),
+                        bias_parallel,
+                        torch.split(permuted_probs, tokens_per_expert),
+                    )
+                ]
+            )
+            .view(shape)
+            .to(intermediate_parallel.dtype)
+        )
 
     def forward(
         self,
@@ -890,7 +910,9 @@ class TEGroupedMLP(MegatronModule):
                         self.config.activation_func_clamp_value,
                     )
                 else:
-                    raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
+                    raise ValueError(
+                        "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
+                    )
             elif (
                 self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
             ):
@@ -899,19 +921,6 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel, permuted_probs
                 )
             else:
-                if bias_parallel is not None:
-                    shape = intermediate_parallel.shape
-                    intermediate_parallel = torch.cat(
-                        [
-                            t + b
-                            for t, b in zip(
-                                torch.split(
-                                    intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
-                                ),
-                                bias_parallel,
-                            )
-                        ]
-                    ).view(shape)
                 if self.config.gated_linear_unit:
 
                     def glu(x):
@@ -947,6 +956,9 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if self.config.fp8:
             output = self.fp8_unpadding(output, actual_tokens_per_expert)
+
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        output_bias = None
 
         return output, output_bias
 
@@ -1022,7 +1034,6 @@ class SequentialMLP(MegatronModule):
             sequential_mlp_config.ffn_hidden_size = config.moe_ffn_hidden_size
             super().__init__(config=sequential_mlp_config)
 
-        self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         self.ep_group = pg_collection.ep
@@ -1093,7 +1104,6 @@ class SequentialMLP(MegatronModule):
             probs_list = torch.split(permuted_probs, tokens_per_expert)
 
             output_local_list = []
-            output_bias_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
                 if self.config.fp8:
@@ -1103,15 +1113,10 @@ class SequentialMLP(MegatronModule):
                 else:
                     output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
-                if self.add_bias:
-                    output_bias_list.append(output_bias.expand_as(output))
 
             output_local = torch.cat(output_local_list, dim=0)
-            if self.add_bias:
-                output_bias_local = torch.cat(output_bias_list, dim=0)
-            else:
-                output_bias_local = None
-
+            output_bias_local = None
+            # Note: if bias is enabled on experts, it is already added to the output at this point
             return output_local, output_bias_local
 
     def backward_dw(self):

@@ -29,7 +29,8 @@ ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
-RUN bash -ex <<"EOF"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    bash -ex <<"EOF"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --extra dev --extra mlm --link-mode copy --locked \
         --no-install-package torch \
@@ -49,6 +50,7 @@ RUN bash -ex <<"EOF"
         --no-install-package nvidia-nccl-cu12
 EOF
 COPY assets/ /opt/data/
+ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ##### For NVIDIANS only #####
 FROM main as jet

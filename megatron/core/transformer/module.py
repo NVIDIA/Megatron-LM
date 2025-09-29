@@ -139,6 +139,178 @@ class MegatronModule(torch.nn.Module):
             module._symmetric_ar_cache = set_to
 
 
+class GraphableMegatronModule(MegatronModule):
+    """Megatron module that can be used to capture and replay CUDA graphs.
+    Now only TransformerLayer and MambaLayer are graphable.
+
+    Args:
+        config (TransformerConfig): Transformer config
+    """
+
+    def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
+        super().__init__(config)
+
+        assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
+
+        # Enable cuda graphs.
+        if (
+            config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration"
+        ) or config.external_cuda_graph:
+            assert not (
+                config.enable_cuda_graph and config.external_cuda_graph
+            ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
+            if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
+                from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+                self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
+            else:
+                # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
+                # the number of microbatches. Multiple CUDA graphs per layer is required to support
+                # pipelining which requires running FWD graph of multiple microbatches before BWD
+                # graph. To enable CUDA graph, this list should be populated in the model training
+                # script with the graphs returned by make_graphed_callables API before the first
+                # training step.
+                self.cuda_graphs = []
+                # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
+                # graphs. Those hooks and args are collected in this list and should be manually
+                # triggered before CUDA Graph running. This is required to ensure the correct param
+                # all-gather overlap with forward compute.
+                self.cuda_graph_manual_hooks = []
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """
+        Get the static inputs for the layer.
+        We assume that the module has one hidden_states input, whose shape is inferred
+        from the seq_length, micro_batch_size, and parallel config.
+        Override this method if the module has other inputs.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
+        """
+        # Calculate data shape related values.
+        context_parallel_size = self.config.context_parallel_size
+        slen_per_cp = seq_length // context_parallel_size
+        sequence_parallel = self.config.sequence_parallel
+        tensor_model_parallel_size = self.config.tensor_model_parallel_size
+        slen_per_cptp = (
+            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
+        )
+
+        static_inputs = {}
+        static_inputs["hidden_states"] = torch.ones(
+            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+            device=torch.cuda.current_device(),
+        )
+        return static_inputs
+
+    def setup_manual_hooks(self, make_hook_func):
+        """
+        Set CUDA Graph manual hooks for the submodules that contain direct parameters and are
+        covered by cudagraphs.
+        """
+        self.cuda_graph_manual_hooks = []
+
+        # Select the modules who contain direct parameters and are covered by cudagraphs.
+        # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
+        # be automatically triggered when they go through the CUDA Graph path.
+        param_modules = {}
+        for submodule in self._get_submodules_under_cudagraphs():
+            for module in submodule.modules():
+                if next(module.parameters(recurse=False), None) is not None:
+                    # Module contains direct parameters.
+                    param_modules[id(module)] = module
+        for module in param_modules.values():
+            self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
+
+    def _get_submodules_under_cudagraphs(self):
+        """
+        Get the submodules that are covered by cudagraphs. Return a list that only contains the
+        module itself if the whole layer is covered by cudagraphs.
+        """
+        return [self]
+
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        """
+        CUDA Graph capture for this layer using TE interface.
+        Normally it's just a forward pass if we're capturing the entire layer.
+        """
+        return self.forward(*args, **kwargs)
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """
+        CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
+        interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
+        However, CUDA graph accepts only Tensor inputs.
+        Hence, check if the arguments are all tensors.
+        """
+        for arg in args:
+            assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
+        for _, v in kwargs.items():
+            assert v is None or isinstance(
+                v, torch.Tensor
+            ), "CUDA graph accepts only Tensor inputs."
+
+        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
+        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+
+        for hook, hook_args in self.cuda_graph_manual_hooks:
+            hook(*hook_args)
+        return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+
+    def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
+        """Helper function to get tensor arguments for TE CUDA graph."""
+        if len(args) == 0:
+            assert 'hidden_states' in kwargs, "hidden_states is required."
+            hidden_states = kwargs.pop('hidden_states')
+            cudagraph_args = (hidden_states,)
+        else:
+            assert (
+                'hidden_states' not in kwargs
+            ), "hidden_states should only be passed as either a positional or keyword argument."
+            cudagraph_args = tuple(args)
+
+        cudagraph_kwargs = kwargs.copy()
+        cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+        return cudagraph_args, cudagraph_kwargs
+
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        return hasattr(self, 'cudagraph_manager')
+
+    def _should_call_te_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the TE cudagraph path.
+        """
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        return (
+            self.config.external_cuda_graph
+            and self.training
+            and (is_graph_capturing() or self.cuda_graphs)
+        )
+
+    def __call__(self, *args, **kwargs):
+
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            # Set the is_first_microbatch flag for weight caching
+            current_microbatch = getattr(self, 'current_microbatch', 0)
+            self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
+            return self.cudagraph_manager(self, args, kwargs)
+        elif self._should_call_te_cudagraph(*args, **kwargs):
+            if not self.cuda_graphs:
+                # Do CUDA Graphs capture.
+                cuda_graph_func = self._te_cuda_graph_capture
+            else:
+                # Do CUDA Graphs replay.
+                cuda_graph_func = self._te_cuda_graph_replay
+            return cuda_graph_func(*args, **kwargs)
+        return super().__call__(*args, **kwargs)
+
+
 def conversion_helper(val, conversion):
     """Recursively applies a conversion function to values in nested data structures.
 
