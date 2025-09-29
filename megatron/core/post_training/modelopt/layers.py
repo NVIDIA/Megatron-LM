@@ -3,12 +3,15 @@
 from typing import Callable, List, Optional
 
 import torch
+import logging
 
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+
+logger = logging.getLogger(__name__)
 
 try:
     import transformer_engine as te
@@ -234,7 +237,7 @@ class RealQuantTransformerLayer(TransformerLayer):
                 if not isinstance(v, torch.Tensor):
                     continue
                 original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
-                print(
+                logger.info(
                     "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
                         k, original_dtype, original_shape, str(v.dtype), str(v.shape)
                     )
