@@ -1491,6 +1491,7 @@ def training_log(
     grad_norm,
     params_norm,
     num_zeros_in_grad,
+    max_attention_score,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1648,6 +1649,10 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+        if args.log_max_attention_score:
+            writer.add_scalar('max_attention_score', max_attention_score, iteration)
+            if wandb_writer:
+                wandb_writer.log({'max_attention_score': max_attention_score}, iteration)
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2502,6 +2507,9 @@ def train(
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
+        if args.log_max_attention_score and args.qk_clip:
+            # Get max attention score from model, only when qk_clip is enabled
+            max_attention_score = model[0].module.module.decoder.layers[0].self_attention.core_attention.max_attention_score
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
@@ -2514,6 +2522,7 @@ def train(
             grad_norm,
             params_norm,
             num_zeros_in_grad,
+            max_attention_score,
         )
 
         # Evaluation.

@@ -894,6 +894,13 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        # For qk_clip
+        if self.config.qk_clip and self.core_attention.qk_clip_balancing_eta is not None and self.core_attention.qk_clip_balancing_eta > 1.0:
+            # qk_clip_balancing_alpha is 0.5 by default which makes the query and key scaled by the 
+            # same amount
+            query = query * (self.core_attention.qk_clip_balancing_eta ** self.config.qk_clip_balancing_alpha)
+            key = key * (self.core_attention.qk_clip_balancing_eta ** (1 - self.config.qk_clip_balancing_alpha))
+
         # ==================================
         # core attention computation
         # ==================================

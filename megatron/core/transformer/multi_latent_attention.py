@@ -783,6 +783,15 @@ class MLASelfAttention(MultiLatentAttention):
                     cp_group=self.pg_collection.cp,
                 )
 
+                # For qk_clip
+                if self.config.qk_clip and self.core_attention.qk_clip_balancing_eta is not None and self.core_attention.qk_clip_balancing_eta > 1.0:
+                    # qk_clip_balancing_alpha is 0.5 by default which makes the query and key scaled
+                    # by the same amount
+                    # k_pos_emb left untouched to avoid effect across heads
+                    q_no_pe = q_no_pe * (self.core_attention.qk_clip_balancing_eta ** self.config.qk_clip_balancing_alpha)
+                    k_no_pe = k_no_pe * (self.core_attention.qk_clip_balancing_eta ** (1 - self.config.qk_clip_balancing_alpha))
+                    q_pos_emb = q_pos_emb * self.core_attention.qk_clip_balancing_eta
+
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 

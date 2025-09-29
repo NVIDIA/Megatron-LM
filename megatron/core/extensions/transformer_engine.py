@@ -1059,15 +1059,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
             # TODO: add is_te_min_version("2.9.0") before merge
             if self.config.qk_clip:
-                if self.qk_clip_balancing_eta:
-                    # Apply QK_Clip
-                    query = (
-                        pow(self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha) * query
-                    )
-                    key = (
-                        pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha)
-                        * key
-                    )
+                # Update Q K outside of TE Attention API
 
                 # Forward pass and get max attention score
                 core_attn_out, max_attention_score = super().forward(
@@ -1081,9 +1073,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 )
 
                 # Update QK_Clip balancing eta
-                max_attention_score = float(max_attention_score)
+                self.max_attention_score = max_attention_score.item()
                 self.qk_clip_balancing_eta = min(
-                    self.config.qk_clip_balancing_threshold / max_attention_score, 1.0
+                    self.config.qk_clip_balancing_threshold / self.max_attention_score, 1.0)
                 )
             else:
                 core_attn_out = super().forward(
