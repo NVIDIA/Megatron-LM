@@ -52,9 +52,16 @@ runs:
       env:
         SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
         TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
+        MODEL: ${{ inputs.model }}
       run: |
-        mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
-        cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/the_pile/bert_shard00/
+        mkdir -p $TARGET_DIR/text/data/
+
+        if [[ "$MODEL" == "bert" ]]; then
+          mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
+          cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/data/
+        elif [[ "$MODEL" == "gpt" ]] || [[ "$MODEL" == "moe" ]]; then
+          cp -a $SOURCE_DIR/text/the_pile/shard00/. $TARGET_DIR/text/data/
+        fi
 
     - name: Install curl, sudo
       shell: bash
@@ -125,40 +132,6 @@ runs:
         echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
 
-    - name: Create run-script (e2e test)
-      shell: bash
-      if: inputs.is_unit_test == 'false'
-      run: |
-        echo "::group::Create run-script"
-        cmd=$(cat <<'RUN_TEST_EOF'
-        #!/bin/bash
-
-        docker exec -t test_container_${{ github.run_id }} bash -c '
-          set -e
-          ls -al /workspace/data/bert_data
-          ARGUMENTS=(
-            "DATA_PATH=/workspace/data/bert_data"
-            "DATA_CACHE_PATH=/workspace/data/cache" 
-            "OUTPUT_PATH=$(pwd)/outputs/"
-            "TENSORBOARD_PATH=$(pwd)/tensorboard"
-            "CHECKPOINT_SAVE_PATH=$(pwd)/checkpoints"
-            "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
-            "TRAINING_SCRIPT_PATH=pretrain_bert.py"
-            "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/model_config.yaml"
-            "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dev_dgx_h100.json"
-            "N_REPEAT=5"
-            "ENABLE_LIGHTWEIGHT_MODE=false"
-            "RECORD_CHECKPOINTS=false"
-          )
-
-          bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]}
-        '
-
-        RUN_TEST_EOF
-        )
-        echo "$cmd" | tee "job.sh"        
-        echo "::endgroup::"
-
     - name: Build container
       shell: bash
       env:
@@ -187,7 +160,7 @@ runs:
           -e NCCL_IB_DISABLE=1 \
           -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
-          -v /home/runner/_work/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/:/workspace/data/bert_data \
+          -v /home/runner/_work/TestData/megatron-lm/artifacts/text/data/:/workspace/data \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
           megatron-core \
@@ -197,6 +170,40 @@ runs:
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
+        echo "::endgroup::"
+
+    - name: Create run-script (e2e test)
+      shell: bash
+      if: inputs.is_unit_test == 'false'
+      run: |
+        echo "::group::Create run-script"
+        cmd=$(cat <<'RUN_TEST_EOF'
+        #!/bin/bash
+
+        docker exec -t test_container_${{ github.run_id }} bash -c '
+          set -e
+          ls -al /workspace/data
+          ARGUMENTS=(
+            "DATA_PATH=/workspace/data"
+            "DATA_CACHE_PATH=/workspace/data/cache" 
+            "OUTPUT_PATH=$(pwd)/outputs/"
+            "TENSORBOARD_PATH=$(pwd)/tensorboard"
+            "CHECKPOINT_SAVE_PATH=$(pwd)/checkpoints"
+            "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
+            "TRAINING_SCRIPT_PATH=pretrain_bert.py"
+            "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/model_config.yaml"
+            "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dev_dgx_h100.json"
+            "N_REPEAT=5"
+            "ENABLE_LIGHTWEIGHT_MODE=false"
+            "RECORD_CHECKPOINTS=false"
+          )
+
+          bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]}
+        '
+
+        RUN_TEST_EOF
+        )
+        echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
 
     - name: Set timeout
