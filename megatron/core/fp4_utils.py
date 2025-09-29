@@ -63,7 +63,9 @@ if HAVE_TE:
         if is_te_min_version("2.7.0.dev0"):
             if config.fp4_recipe == Fp4Recipe.nvfp4:
                 try:
-                    fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling()
+                    fp4_recipe = transformer_engine.common.recipe.NVFP4BlockScaling(
+                        fp8_dpa=config.fp8_dot_product_attention,
+                    )
                 except AttributeError:
                     raise ValueError(
                         """NVFP4BlockScaling recipe is not available in this version of 
