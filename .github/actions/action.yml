@@ -56,15 +56,15 @@ runs:
       run: |
         ls -al /mnt/datadrive/TestData/megatron-lm/
 
-    # - name: Copy data
-    #   shell: bash
-    #   if: inputs.is_unit_test == 'false'
-    #   env:
-    #     SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
-    #     TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
-    #   run: |
-    #     mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
-    #     cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/the_pile/bert_shard00/
+    - name: Copy data
+      shell: bash
+      if: inputs.is_unit_test == 'false'
+      env:
+        SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
+        TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
+      run: |
+        mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
+        cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/the_pile/bert_shard00/
 
     - name: Install curl, sudo
       shell: bash
@@ -93,6 +93,11 @@ runs:
         dockerfile: docker/Dockerfile.ci.dev
         skip-extraction: ${{ steps.cache.outputs.cache-hit }}
 
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
     - name: Download test data
       shell: bash
       env:
@@ -100,21 +105,8 @@ runs:
         TIMEOUT: ${{ inputs.timeout }}
       run: |
         echo "::group::Download test data"
-        docker run \
-          --rm \
-          -d \
-          --name test-data-container \
-          -v $(pwd):/workdir \
-          -w /workdir \
-          -e GH_TOKEN=$GH_TOKEN \
-          python:3.10-slim \
-          bash -c "sleep $(( $TIMEOUT * 60 + 60 ))"
-
-        docker exec -t test-data-container pip install --no-cache-dir pygithub click
-        docker exec -t test-data-container python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
-
-        docker cp test-data-container:/workdir/assets ./assets
-        docker container rm -f test-data-container || true
+        pip install --no-cache-dir pygithub click
+        python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
         echo "::endgroup::"
 
     - name: Create run-script (unit test)
