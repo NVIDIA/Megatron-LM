@@ -10,6 +10,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -90,7 +91,7 @@ class GPTModel(LanguageModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
-            'learned_absolute', 'rope', 'mrope', 'none'
+            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
         ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
@@ -161,6 +162,26 @@ class GPTModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
@@ -324,13 +345,24 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
+        elif self.position_embedding_type == 'yarn':
+            if self.training or not self.config.flash_decode:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len)
+            else:
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "YarnRotaryEmbedding yet."
+                )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
                 raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implmented in "
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
                     "MultimodalRotaryEmbedding yet."
                 )
 
