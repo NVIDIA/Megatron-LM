@@ -185,6 +185,8 @@ class TestDynamicInferenceEngine:
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+            # this is for compatibility with the LTS environment
         )
 
         return context

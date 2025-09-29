@@ -266,6 +266,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Tensor,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -283,6 +284,8 @@ class Attention(MegatronModule, ABC):
                 embedding tensor(s).
             rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
 
@@ -393,11 +396,16 @@ class Attention(MegatronModule, ABC):
             value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
         else:
             # Apply rotary embeddings before appending KV cache.
-            if rotary_pos_emb is not None:
+            if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
+                query, key = inference_context.apply_fused_qk_rotary_emb(
+                    query, key, rotary_pos_cos_sin, self.config
+                )
+            elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
                     key, k_pos_emb, self.config, self.pg_collection.cp
                 )
+
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
@@ -609,6 +617,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
@@ -628,6 +637,8 @@ class Attention(MegatronModule, ABC):
                 embedding tensor(s).
             rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Optional[Tensor]): Attention bias.
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
@@ -653,7 +664,17 @@ class Attention(MegatronModule, ABC):
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode and not self.training and inference_context is not None:
+        is_inference_mode = inference_context is not None and not self.training
+        # is_using_flash_decode - True is we are using the static inference engine with flash decode
+        is_using_flash_decode = is_inference_mode and self.config.flash_decode
+        # is_using_flashinfer_rope - True if we are using the dynamic inference engine
+        # with flashinfer fused rope
+        is_using_flashinfer_rope = is_inference_mode and (
+            not inference_context.is_static_batching()
+            and inference_context.use_flashinfer_fused_rope
+        )
+        if is_using_flash_decode or is_using_flashinfer_rope:
+            # flash decode and flash-infer fused rope use rotary_pos_cos and rotary_pos_sin
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -723,6 +744,7 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_emb,
                 rotary_pos_cos,
                 rotary_pos_sin,
+                rotary_pos_cos_sin,
                 sequence_len_offset,
             )
         )

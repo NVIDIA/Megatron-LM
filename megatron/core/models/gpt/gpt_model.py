@@ -286,16 +286,35 @@ class GPTModel(LanguageModule):
         rotary_pos_emb = None
         rotary_pos_cos = None
         rotary_pos_sin = None
+        # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
+        rotary_pos_cos_sin = None
+
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            if in_inference_mode and self.config.flash_decode:
+            use_flash_infer_fused_rope = (
+                hasattr(inference_context, 'use_flashinfer_fused_rope')
+                and inference_context.use_flashinfer_fused_rope
+            )
+            if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
                 assert (
-                    inference_context.is_static_batching()
-                ), "GPTModel currently only supports static inference batching."
-                # Flash decoding uses precomputed cos and sin for RoPE
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                    inference_context.max_sequence_length,
-                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                    not self.config.flash_decode
+                ) or inference_context.is_static_batching(), (
+                    "Flash decode is only applicable to static batching."
                 )
+                # Flash decoding uses precomputed cos and sin for RoPE
+                if self.config.flash_decode:
+                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
+                        inference_context.max_sequence_length,
+                        self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                    )
+                elif use_flash_infer_fused_rope:
+                    assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
+                    rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
+                        inference_context.max_sequence_length,
+                        torch.cat(
+                            self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                            -1,
+                        ),
+                    )
             else:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -339,7 +358,22 @@ class GPTModel(LanguageModule):
         if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
 
-        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+        preproc_output = (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+        )
+        if rotary_pos_cos_sin is not None:
+            # only in the case of flashinfer fused rope will we
+            # return this extra tensor
+            # this is for backwards compatibility with
+            # legacy unit tests, which break if you
+            # return a 6 tuple instead of 5.
+            preproc_output += (rotary_pos_cos_sin,)
+
+        return preproc_output
 
     def forward(
         self,
@@ -357,7 +391,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
+        through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
@@ -369,15 +403,19 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
-            self._preprocess(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                decoder_input=decoder_input,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-            )
+        preproc_output = self._preprocess(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            decoder_input=decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
         )
+
+        (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = (
+            preproc_output[:5]
+        )
+
+        rotary_pos_cos_sin = preproc_output[5] if len(preproc_output) == 6 else None
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -387,6 +425,7 @@ class GPTModel(LanguageModule):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
