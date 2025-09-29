@@ -93,11 +93,15 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.PAT }}
         TIMEOUT: ${{ inputs.timeout }}
-      if: inputs.is_unit_test == 'true'
+        IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
         echo "::group::Download test data"
-        pip install --no-cache-dir pygithub click
-        python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+        if [[ "$IS_UNIT_TEST" == "true" ]]; then
+          pip install --no-cache-dir pygithub click
+          python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+        else
+          mkdir assets/
+        fi
         echo "::endgroup::"
 
     - name: Create run-script (unit test)
