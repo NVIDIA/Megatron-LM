@@ -42,7 +42,6 @@ class MegatronCompletions(Resource):
         self.engine = engine
         self.args = args
 
-    @torch.inference_mode()
     def post(self):
         req = request.get_json()
         tokenizer = get_tokenizer()
@@ -103,19 +102,17 @@ class MegatronCompletions(Resource):
             logprobs = local_kwargs["return_output_log_probs"]
             top_n_logprobs = local_kwargs["return_topk_logprobs"]
             random_seed = local_kwargs["random_seed"]
-            
             response_dict = run_mcore_engine(
-                engine=self.engine,
-                prompts=prompts,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                logprobs=logprobs,
-                tokens_to_generate=tokens_to_generate,
+                self.engine,
+                prompts,
+                temperature,
+                top_k,
+                top_p,
+                logprobs,
+                tokens_to_generate,
                 top_n_logprobs=top_n_logprobs,
-                random_seed=random_seed,
+                random_seed=random_seed
             )
-
             result = [
                 response_dict["text"],
                 response_dict["segments"],
@@ -192,15 +189,9 @@ class MegatronCompletions(Resource):
                             tokenizer.detokenize([tk]) for tk in truncated_generation_tokens
                         ],
                         "text_offset": truncated_generation_tok_offsets,
-                        "top_logprobs": (
-                            [None] + truncated_generation_topk_logprobs
-                            if truncated_generation_topk_logprobs is not None
-                            else None
-                        ),
+                        "top_logprobs": [None] + truncated_generation_topk_logprobs if truncated_generation_topk_logprobs is not None else None,
                     },
                 }
             )
-
-        print(f"Rank {torch.distributed.get_rank()} returning response with {len(results)} prompts")
 
         return jsonify({"choices": results})
