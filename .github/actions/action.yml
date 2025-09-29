@@ -46,16 +46,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Nvidia driver check
-      shell: bash
-      run: |
-        docker run --rm --ipc=host --runtime=nvidia --gpus all ubuntu nvidia-smi  # Check driver version
-
-    - name: FS check
-      shell: bash
-      run: |
-        ls -al /mnt/datadrive/TestData/megatron-lm/
-
     - name: Copy data
       shell: bash
       if: inputs.is_unit_test == 'false'
