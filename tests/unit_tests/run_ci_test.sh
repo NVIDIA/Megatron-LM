@@ -139,15 +139,15 @@ done <<<"$IGNORE_TEST_CASES"
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
-    --node_rank $SLURM_NODEID
+    --node_rank $NODE_RANK
     --log-dir $LOG_DIR
     --tee "0:3"
     --redirects "3"
@@ -160,18 +160,18 @@ export ONE_LOGGER_JOB_CATEGORY=test
 
 for i in $(seq $UNIT_TEST_REPEAT); do
     echo "Running prod test suite."
-    CMD=$(echo uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+    CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        -m coverage run \
+        --data-file=.coverage.unit_tests \
+        --source=megatron/core \
         -m pytest \
         -xvs \
-        --cov-report=term \
-        --cov=megatron/core \
-        --cov-report xml:coverage.xml \
-        --no-cov-on-fail ${IGNORE_ARGS[@]} \
+        ${IGNORE_ARGS[@]} \
         -m "'not experimental and ${MARKER_ARG}'" $BUCKET)
     eval "$CMD"
 
     if [[ "$TAG" == "latest" ]]; then
-        CMD=$(echo uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
+        CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
             -xvs \
             --experimental \
              ${IGNORE_ARGS[@]} \
@@ -181,3 +181,5 @@ for i in $(seq $UNIT_TEST_REPEAT); do
     fi
 
 done
+
+coverage combine -q

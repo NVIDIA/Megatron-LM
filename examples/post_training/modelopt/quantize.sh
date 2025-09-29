@@ -20,9 +20,9 @@ if [ -z ${QUANT_CFG} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}QUANT_CFG${WHITE} is not set (default: ${QUANT_CFG})!\n"
 fi
 
-if [ -z ${MLM_QUANT_CKPT} ]; then
-    MLM_QUANT_CKPT=${MLM_WORK_DIR}/${MLM_MODEL_CFG}_quant
-    printf "${MLM_WARNING} Variable ${PURPLE}MLM_QUANT_CKPT${WHITE} is not set (default: ${MLM_QUANT_CKPT})!\n"
+if [ -z ${MLM_MODEL_SAVE} ]; then
+    MLM_MODEL_SAVE=${MLM_WORK_DIR}/${MLM_MODEL_CFG}_quant
+    printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_SAVE})!\n"
 fi
 
 if [ -z ${MLM_MODEL_CKPT} ]; then
@@ -34,7 +34,7 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --pipeline-model-parallel-size ${PP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
-        --save ${MLM_QUANT_CKPT} \
+        --save ${MLM_MODEL_SAVE} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
         ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
@@ -47,7 +47,7 @@ else
         --pipeline-model-parallel-size ${PP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --load ${MLM_MODEL_CKPT} \
-        --save ${MLM_QUANT_CKPT} \
+        --save ${MLM_MODEL_SAVE} \
         --export-quant-cfg ${QUANT_CFG} \
         --references "${MLM_REF_LABEL}" \
         ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}

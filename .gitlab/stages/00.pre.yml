@@ -3,9 +3,6 @@ include:
 
 .pre_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'main'
-      allow_failure: true
-      when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
@@ -25,7 +22,7 @@ include:
 
 pre:mirror_to_github:
   rules:
-    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
       allow_failure: true
     - when: never
   tags:
@@ -48,7 +45,7 @@ pre:mirror_to_github:
 
 pre:create_ci_branches:
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
       allow_failure: true
     - when: never
   parallel:
@@ -61,6 +58,36 @@ pre:create_ci_branches:
       - branch: ci-pre-release
       - branch: ci-review-reminder
       - branch: ci-upgrade-dependencies
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: python:3.10
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
+    - git switch --force-create $branch
+    - git push --force -u origin $branch
+  retry:
+    max: 2
+
+pre:create_ci_branches_dev:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev" && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
+    - when: never
+  parallel:
+    matrix:
+      - branch: ci-dev-unit-test-extended
+      - branch: ci-dev-rebuild-mcore-nemo-image
+      - branch: ci-dev-mr
+      - branch: ci-dev-nightly
+      - branch: ci-dev-upgrade-dependencies
   tags:
     - arch/amd64
     - env/prod
@@ -116,7 +143,7 @@ pre:label_merge_request:
 
 pre:maybe_cherry_pick_commit:
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
     - when: never
   tags:
     - arch/amd64
@@ -166,7 +193,7 @@ pre:maybe_cherry_pick_commit:
           git switch --force-create cherry-pick-$MR_ID-$RELEASE_BRANCH $RELEASE_BRANCH
           git cherry-pick $SHA
           git push -u origin --force cherry-pick-$MR_ID-$RELEASE_BRANCH
-          git checkout ${CI_DEFAULT_BRANCH:-main}
+          git checkout main
         )
 
         CHERRYPICK_SUCCESSFUL=$?

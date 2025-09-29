@@ -956,6 +956,9 @@ def drain_embedding_wgrad_compute(
             grad_output, all_gathered_input
         )
 
+        if hasattr(weight, "__fsdp_param__"):
+            weight.main_grad = weight.get_main_grad()
+
         if config.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
                 fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
