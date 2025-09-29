@@ -78,7 +78,7 @@ class PipelineOffloadManager:
                 self._stages[i] = []
 
     def push(self, handler):
-        print_rank("pushing handler")
+        print_rank(f"pushing handler {handler}")
         self._queue.append(handler)
 
     def pop(self):
@@ -100,11 +100,22 @@ class PipelineOffloadManager:
     def size(self):
         return len(self._queue)
 
-    def reset_chunk_handler(self, num_layer, vp_stage, offload=True, num_dense_layer=0):
+    def reset_chunk_handler(self, num_layer, vp_stage, offload=True, num_dense_layer=0, last_stage_is_loss=False):
         if vp_stage is None:
             cur_vpp_rank = 0
         else:
             cur_vpp_rank = vp_stage
+
+        if last_stage_is_loss:
+            from megatron.core import parallel_state
+            vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+            # skip the last stage
+            if cur_vpp_rank == vpp_size - 1:
+                return
+            # reduce the vpp size
+            if self._vpp == vpp_size:
+                self._vpp -= 1
+                self._stages = self._stages[:-1]
 
         first_last_vpp_rank = self._first_last_vpp_rank
         # rewind
@@ -302,6 +313,7 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
             for tensor_label, state in self._tensor_tag_to_state.items():
                 group_id, _ = tensor_label
                 if group_id == group_id_to_reload:
+                    print_rank(f"tensor_label {tensor_label}")
                     found_reload_group = True
                     event = self._offload_events[-1]
                     if isinstance(state, tuple):
@@ -375,6 +387,7 @@ class ChunkOffloadHandler(AsyncDoubleBufferGroupOffloadHandler):
         if len(self._groups_to_reload) > 0 and self._layer_index > self.num_dense_layer:
             # load next layer
             if self.bulk_reload_group(self._groups_to_reload[-1]):
+                print_rank(f"bulk_reload_group {self._groups_to_reload}")
                 self._groups_to_reload.pop()
         else:
             # load the last layer of one backward chunk in advance
