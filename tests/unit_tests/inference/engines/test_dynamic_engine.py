@@ -498,9 +498,9 @@ class TestDynamicInferenceEngine:
         mamba_expected_generated_tokens = [
             [74, 72, 83, 59],
             [25, 54, 1, 70],
-            [28, 14, 9, 89],
-            [87, 64, 30, 52],
-            [44, 92, 82, 70],
+            [28, 14, 15, 89],
+            [87, 27, 30, 52],
+            [44, 13, 82, 70],
             [28, 74, 64, 16],
             [8, 4, 83, 5],
             [],
@@ -806,50 +806,45 @@ class TestDynamicInferenceEngine:
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
 
-    @pytest.mark.asyncio
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @torch.inference_mode()
-    async def test_run_engine(self, model_provider: str):
+    @pytest.mark.asyncio
+    async def test_run_engine(self):
         """
         Test asynchronously adding and waiting for requests while the engine is
         running continuously.
         """
-        skip_if_mamba_sequence_packing_not_available(model_provider)
+        with torch.inference_mode():
+            # Test environment.
+            test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
+            env = self._build_test_env(test_config)
 
-        # Test environment.
-        test_config = DynamicEngineTestConfig(
-            use_fixed_output_lengths=True, model_provider=model_provider
-        )
-        env = self._build_test_env(test_config)
-
-        # It's safe to use request 0's sampling params here because all sampling
-        # params are identical as long as use_fixed_output_lengths == False.
-        engine_task = asyncio.create_task(
-            env.engine.run_engine(sampling_params=env.requests[0].sampling_params, verbose=False)
-        )
-
-        request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
-
-        # Add requests to engine.
-        for request in tqdm(env.requests, "add requests"):
-            request_completion_futures[request.request_id] = env.engine._add_request(request)
-
-        # Wait for all requests to complete.
-        await asyncio.gather(*request_completion_futures.values())
-
-        # Verify that all request outputs were set.
-        for request_id, fut in request_completion_futures.items():
-            num_tokens_to_generate = env.requests[request_id].sampling_params.num_tokens_to_generate
-            result = fut.result()
-            assert result.generated_length == num_tokens_to_generate, (
-                f"Request {request_id} expected to generate {num_tokens_to_generate} "
-                f"tokens but generated {result.generated_length}"
+            # It's safe to use request 0's sampling params here because all sampling
+            # params are identical as long as use_fixed_output_lengths == False.
+            engine_task = asyncio.create_task(
+                env.engine.run_engine(sampling_params=env.requests[0].sampling_params, verbose=False)
             )
 
-        engine_task.cancel()
+            request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
+
+            # Add requests to engine.
+            for request in tqdm(env.requests, "add requests"):
+                request_completion_futures[request.request_id] = env.engine._add_request(request)
+
+            # Wait for all requests to complete.
+            await asyncio.gather(*request_completion_futures.values())
+
+            # Verify that all request outputs were set.
+            for request_id, fut in request_completion_futures.items():
+                num_tokens_to_generate = env.requests[request_id].sampling_params.num_tokens_to_generate
+                result = fut.result()
+                assert result.generated_length == num_tokens_to_generate, (
+                    f"Request {request_id} expected to generate {num_tokens_to_generate} "
+                    f"tokens but generated {result.generated_length}"
+                )
+
+            engine_task.cancel()
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

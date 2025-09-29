@@ -445,6 +445,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialize request.
         request = DynamicInferenceRequest(
             request_id=request_id,
+            prompt=prompt if isinstance(prompt, str) else None,
             prompt_tokens=tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),
         )
