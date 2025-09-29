@@ -186,7 +186,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        mask_ambiguous_pad_tokens=args.mask_ambiguous_pad_tokens,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
 

@@ -2825,20 +2825,20 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 or msc dataloader')
     group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
                        help='The sample surplus to build for the mid-level datasets(s)')
-    group.add_argument('--mask-ambiguous-pad-tokens', type=bool, default=False,
+    group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
                        help='Whether to prevent pad tokens already present in the dataset '
                        'from being masked out when the pad token incorrectly shares the same id '
-                       'with other special tokens in the tokenizer. '
+                       'with other special tokens in the tokenizer. Note that this argument has '
+                       'no effect when the tokenizer correctly provides a unique id for the pad. '
                        'Masking out such ambiguous pad tokens results in training instability. '
-                       'Such a scenario should be resolved by fixing the tokenizer; setting this '
-                       'option to True provides a workaround. '
-                       'If left to the default of False, and the token id of the pad collides with '
-                       'other token ids in the provided tokenizer, tokens in the dataset that '
-                       'correspond to this ambiguous id will not be masked out of the loss '
-                       'calculation, as it is impossible to determine whether they are truly pad. '
-                       'If set to True, the training flow will error out if the tokenizer '
-                       'contains pad token id collisions. If not, the training flow will work as '
-                       'expected, masking out the loss of all pad tokens.')
+                       'Such a scenario is best resolved by fixing the tokenizer; leaving this '
+                       'option as False provides a workaround. '
+                       'When left to the default of False, any token ids that collide with the '
+                       'pad token id - as provided by the tokenizer - will not be masked out of '
+                       'the loss calculation: it cannot be determined whether they are truly pad. '
+                       'If instead this argument is set, the training flow will treat all tokens '
+                       'that share the same id as the pad token as true pad tokens, potentially '
+                       'causing severe training instability.')
     return parser
 
 
