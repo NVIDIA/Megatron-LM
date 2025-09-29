@@ -517,7 +517,6 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
         'llm': [],  # llm is the last stage here
     }
     config = ModelParallelConfig(pipeline_dtype=torch.bfloat16)
-    config.finalize_model_grads_func = finalize_model_grads
     config.calculate_per_token_loss = False
     config.qk_layernorm = False
     config.sequence_parallel = False
