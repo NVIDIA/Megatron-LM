@@ -121,6 +121,7 @@ runs:
             --tag ${{ inputs.tag }} \
             --environment dev \
             --bucket '\''${{ inputs.test_case }}'\''
+            --log-dir /opt/megatron-lm/outputs/logs
         '
 
         RUN_TEST_EOF
