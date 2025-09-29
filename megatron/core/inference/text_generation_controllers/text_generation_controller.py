@@ -1053,9 +1053,7 @@ class TextGenerationController:
             request.text = text  # Inference server returns prompts & generations together
             if sampling_params.return_segments:
                 request.segments = segments[0]
-            request.generated_text = self._detokenize(
-                request.generated_tokens.tolist()
-            )  # text[len(request.prompt) :]
+            request.generated_text = text[len(request.prompt) :]
         return active_requests
 
     def prep_inference_input(
