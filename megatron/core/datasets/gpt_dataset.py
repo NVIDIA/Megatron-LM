@@ -58,8 +58,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     data_parallel_size: int = 1
     """Option to enable data parallelism"""
 
-    sequence_parallel_size: int = 1
-    """Option to enable sequence parallelism"""
+    sequence_parallel_size: int = 0
+    """Option to indicate the sequence parallelism size when using TP"""
 
     hybrid_context_parallel: bool = False
     """Option to enable hybrid context parallelism"""

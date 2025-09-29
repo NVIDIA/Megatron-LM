@@ -85,16 +85,8 @@ def get_batch(data_iterator, vp_stage=None):
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
     elif local_cp_size is None:  # Packed THD format
-        # assert (
-        #     cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-        # ), "micro-batch-size must be 1 for packing"
         cu_seqlens = cu_seqlens[0]
-        # batch['cu_seqlens'] = cu_seqlens
-
-        # max_seqlen = batch['max_seqlen']
         assert max_seqlen.dim() == 1
-        # TODO(duncan): can this be kept as a 0-D tensor?
-        # batch['max_seqlen'] = int(max_seqlen[0].item())
 
         cp_size = get_context_parallel_world_size()
         if cp_size > 1:  # slice batch along sequence dimension for context parallelism
@@ -110,7 +102,7 @@ def get_batch(data_iterator, vp_stage=None):
                 cp_rank,
             )
             for key, data in batch.items():
-                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+                if key in {'attention_mask'}:
                     continue
                 batch[key] = data.index_select(1, index)
     else: # Hybrid CP format
@@ -140,6 +132,8 @@ def get_batch(data_iterator, vp_stage=None):
         )
 
         if cp_group is not None and cp_group.size() > 1:
+            # Each sub-sample of a packed sample is required to be divisible by CP*DP*2 
+            # or CP*DP*TP*2 (if using sequence parallel)
             batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
     
     return (*batch.values(), packed_seq_params)
