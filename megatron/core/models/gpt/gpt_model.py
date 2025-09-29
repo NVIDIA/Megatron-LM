@@ -346,12 +346,16 @@ class GPTModel(LanguageModule):
         num_layers = self.decoder.num_layers_per_pipeline_rank
         if self.mtp_process:
             num_layers = num_layers + self.config.mtp_num_layers
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        last_stage_is_loss = (pp_rank == pp_size - 1) and self.config.last_vp_stage_is_loss
         # TODO: will be an issue when dense layer is placed  across different pipeline stages
         PipelineOffloadManager.get_instance().reset_chunk_handler(
             num_layers,
             self.vp_stage,
             self.config.fine_grained_activation_offloading,
             self.decoder.num_dense_layer,
+            last_stage_is_loss,
         )
 
     def forward(

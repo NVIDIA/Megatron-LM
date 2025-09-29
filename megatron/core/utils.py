@@ -136,7 +136,7 @@ def experimental_fn(introduced_with_version: str):
             if config.is_experimental_enabled() is not True:
                 raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
 
-            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+            # logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
 
             return func(*args, **kwargs)
 
@@ -213,7 +213,7 @@ def experimental_cls(introduced_with_version: str):
                         f"Flag config.ENABLE_EXPERIMENTAL not enabled."
                     )
 
-                logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+                # logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
                 return super.__getattribute__(attr)
 
             class ClassInterceptor(type):
