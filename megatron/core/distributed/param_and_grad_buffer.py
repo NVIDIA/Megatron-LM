@@ -34,6 +34,57 @@ else:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
+def reduce_scatter_with_fp32_accumulation(
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    op: torch.distributed.ReduceOp,
+    group: torch.distributed.ProcessGroup,
+    async_op: bool,
+):
+    """Reduce-scatter with FP32 accumulation.
+
+    Collects input_tensor in lower precision using an all-to-all, then locally accumulates in FP32
+    precision, then downcasts final sum back into right location in input_tensor.
+
+
+    Args:
+        output_tensor (torch.Tensor): Output tensor with reduce-scattered output (only the shard).
+        input_tensor (torch.Tensor): Input tensor that needs to be reduce-scattered.
+        op (torch.distributed.ReduceOp): Only torch.distributed.ReduceOp.SUM is supported.
+        group (torch.distributed.ProcessGroup): Process group to use for reduce-scatter.
+        async_op (bool): Only False is supported right now.
+    """
+    # Make sure arguments conform to the implementation.
+    assert op == torch.distributed.ReduceOp.SUM
+    assert (
+        not async_op
+    ), "async_op=True is not supported yet in reduce_scatter_with_fp32_accumulation"
+
+    # Get world_size.
+    if group is None:
+        world_size = torch.distributed.get_world_size()
+    else:
+        world_size = group.size()
+
+    # Call all_to_all (every rank should have their respective gradient shards collected from
+    # all ranks). We also create a tensor for the all-to-all output (the all-to-all collective
+    # cannot be performed in-place).
+    all_to_all_output_tensor = torch.empty_like(input_tensor)
+    all_to_all_handle = torch.distributed.all_to_all_single(
+        output=all_to_all_output_tensor, input=input_tensor, group=group, async_op=async_op
+    )
+    assert all_to_all_handle is None  # Since async_op is False.
+
+    # Accumulate into a fp32 sum.
+    output_tensor_in_fp32 = torch.sum(
+        all_to_all_output_tensor.view((world_size, -1)), dim=0, dtype=torch.float32
+    )
+    assert output_tensor_in_fp32.dtype == torch.float32
+
+    # Copy downcasted sum into output_tensor.
+    output_tensor.copy_(output_tensor_in_fp32)
+
+
 class BufferType(Enum):
     """
     Enumeration for buffer type.
@@ -148,6 +199,13 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
+            assert (
+                not self.ddp_config.reduce_scatter_with_fp32_accumulation
+            ), "RS with FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
+
+        global dist_reduce_scatter_func
+        if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
 
         self.reset()
         self.param_gather_handle = None
@@ -351,6 +409,9 @@ class _ParamAndGradBucketGroup:
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for bucket in self.buckets:
                 if self.ddp_config.use_distributed_optimizer:
+                    assert (
+                        communication_group.size() == self.intra_distributed_optimizer_instance_size
+                    )
                     local_data_view = shard_buffer(
                         bucket.grad_data, self.intra_distributed_optimizer_instance_size
                     )[self.intra_distributed_optimizer_instance_rank]
@@ -374,9 +435,12 @@ class _ParamAndGradBucketGroup:
 
             assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
-            with stream_context, _coalescing_manager(
-                self.inter_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
+            with (
+                stream_context,
+                _coalescing_manager(
+                    self.inter_distributed_optimizer_instance_group, async_ops=async_op
+                ) as cm,
+            ):
                 for bucket in self.buckets:
                     local_data_view = shard_buffer(
                         bucket.grad_data, self.intra_distributed_optimizer_instance_size
