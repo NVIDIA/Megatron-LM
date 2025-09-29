@@ -418,7 +418,7 @@ class MambaMixer(MegatronModule):
             assert not self.config.sequence_parallel
             assert inference_context.is_static_batching()
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-            if inference_context.sequence_len_offset > 0:
+            if inference_context.seqlen_offset > 0:
                 # The states are updated inplace
                 out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
@@ -660,9 +660,7 @@ class MambaMixer(MegatronModule):
     def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
         """
         Executes dynamic inference by separating decode and prefill requests and
-        running them independently, with prefill microbatched so that any varlen
-        pack contains at most `self.chunk_size` tokens total. Requests whose length
-        exceeds `self.chunk_size` are run as non-varlen prefill.
+        running them independently.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
             check_mamba_sequence_packing_support()

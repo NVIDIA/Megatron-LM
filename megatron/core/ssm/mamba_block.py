@@ -344,8 +344,6 @@ class MambaStack(MegatronModule):
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
 
-                # assert not torch.isnan(hidden_states).any()
-
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)
