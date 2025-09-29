@@ -44,7 +44,6 @@ JET_API_VERSION=$(curl -s -u "$ARTIFACTORY_USER:$ARTIFACTORY_TOKEN" "https://sc-
 DOCKER_BUILDKIT=1 docker build \
     --secret id=JET_INDEX_URLS \
     --secret id=LOGGER_INDEX_URL \
-    --secret id=EXPERIMENTAL_FLASH_ATTN \
     --target $STAGE \
     -f docker/$FILE \
     -t ${IMAGE}:${CI_PIPELINE_ID} \
