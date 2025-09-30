@@ -33,7 +33,7 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --micro-batch-size: 1
   --global-batch-size: 512
-  --train-samples: 585937500
+  --train-samples: 24414062
   --exit-duration-in-mins: 220
   --no-check-for-nan-in-loss-and-grad: true
   --cross-entropy-loss-fusion: true
