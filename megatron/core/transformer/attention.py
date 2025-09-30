@@ -762,7 +762,9 @@ class Attention(MegatronModule, ABC):
         # relative positional embedding (rotary embedding)
         # ================================================
         nvtx_range_push(suffix="rotary_pos_emb")
-        if rotary_pos_emb is not None and not self.config.flash_decode:
+        if rotary_pos_emb is not None and (
+            not self.config.flash_decode or inference_context is None
+        ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None:
