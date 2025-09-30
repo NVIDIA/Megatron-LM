@@ -237,7 +237,7 @@ test:unit_tests_notify:
     paths:
       - scripts
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || "ci-dev-unit-test-extended")
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
       when: always
     - when: never
 
