@@ -228,9 +228,7 @@ def sharded_state_dict_default(
             'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)
         }
     elif 'dp_cp_group' not in metadata:
-        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(
-            with_context_parallel=True
-        )
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
