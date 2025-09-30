@@ -39,9 +39,9 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
-    ensure_metadata_has_dp_cp_group,
 )
 
 try:
