@@ -4,10 +4,19 @@ import unittest.mock
 import numpy as np
 import pytest
 import torch
+from packaging.version import Version as PkgVersion
 
-from megatron.inference.text_generation_server import MegatronServer
+try:
+    from megatron.inference.text_generation_server import MegatronServer
+
+    HAS_LEGACY_INFERENCE = True
+except ImportError as e:
+    from megatron.core.inference.text_generation_server import MegatronServer
+
+    HAS_LEGACY_INFERENCE = False
+
 from megatron.training import tokenizer
-from tests.unit_tests.inference.engines.test_static_engine import TestStaticInferenceEngine
+from tests.unit_tests.inference.engines.test_static_engine import StaticInferenceEngineTestHarness
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
@@ -19,7 +28,7 @@ def gpt2_tiktoken_tokenizer(gpt2_tiktok_vocab):
 
 @pytest.fixture(scope="module")
 def static_inference_engine(gpt2_tiktoken_tokenizer):
-    engine_wrapper = TestStaticInferenceEngine()
+    engine_wrapper = StaticInferenceEngineTestHarness()
     engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size)
 
     controller = engine_wrapper.static_engine.text_generation_controller
@@ -50,9 +59,25 @@ def client(app):
     return app.test_client()
 
 
-@unittest.mock.patch('megatron.inference.endpoints.completions.send_do_generate')
-@unittest.mock.patch("megatron.inference.text_generation.tokenization.get_tokenizer")
-@unittest.mock.patch("megatron.inference.endpoints.completions.get_tokenizer")
+def patch(legacy_func, core_func):
+    if HAS_LEGACY_INFERENCE:
+        return unittest.mock.patch(legacy_func)
+    else:
+        return unittest.mock.patch(core_func)
+
+
+@patch(
+    'megatron.inference.endpoints.completions.send_do_generate',
+    'megatron.core.inference.text_generation_server.endpoints.completions.send_do_generate',
+)
+@patch(
+    "megatron.inference.text_generation.tokenization.get_tokenizer",
+    "megatron.core.inference.text_generation_server.tokenization.get_tokenizer",
+)
+@patch(
+    "megatron.inference.endpoints.completions.get_tokenizer",
+    "megatron.core.inference.text_generation_server.endpoints.completions.get_tokenizer",
+)
 def test_completions_endpoint(
     mock_get_tokenizer1, mock_get_tokenizer2, mock_send_do_generate, client, gpt2_tiktoken_tokenizer
 ):
