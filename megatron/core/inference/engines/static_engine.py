@@ -69,7 +69,7 @@ class StaticInferenceEngine(AbstractEngine):
         self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
-    def get_new_request_id(self) -> str:
+    def get_new_request_id(self) -> int:
         """Gets a new request id from the scheduler"""
         return self.scheduler.get_new_request_id()
 
@@ -83,7 +83,7 @@ class StaticInferenceEngine(AbstractEngine):
         inference_request: Optional[InferenceRequest] = None,
         *,
         inference_parameters: Optional[SamplingParams] = None,
-    ) -> str:
+    ) -> int:
         """
         Adds a request to the scheduler and returns the request ID.
 
@@ -128,7 +128,7 @@ class StaticInferenceEngine(AbstractEngine):
         )
 
     def get_stream_generator(
-        self, request_id: str
+        self, request_id: int
     ) -> Union[AsyncGenerator[InferenceRequest, None], None]:
         """Returns the stream generator for the given request ID if it exists."""
         stream = self.scheduler.streams.get(request_id, None)
@@ -166,7 +166,7 @@ class StaticInferenceEngine(AbstractEngine):
         """
         # TODO :M core- get rng state tracker
 
-        request_ids: List[str] = []
+        request_ids: List[int] = []
 
         if self.random_seed:
             torch.random.manual_seed(self.random_seed)

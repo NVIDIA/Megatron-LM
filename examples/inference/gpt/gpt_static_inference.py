@@ -118,7 +118,7 @@ async def generate(
             prev_idx = len(output.generated_text)
         print()
 
-    request_ids: List[str] = [
+    request_ids: List[int] = [
         inference_engine.add_request(prompt=prompt, sampling_params=sampling_params, streaming=True)
         for prompt in prompts
     ]

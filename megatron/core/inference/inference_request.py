@@ -31,7 +31,7 @@ class InferenceRequest:
 
     """
 
-    request_id: str
+    request_id: int
     prompt: str
     sampling_params: Optional[SamplingParams] = None
     inference_parameters: Optional[SamplingParams] = None
