@@ -564,7 +564,9 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).
-        print(f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f} capture {capture_time:.3f}.")
+        print(
+            f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f} capture {capture_time:.3f}."
+        )
 
         return futures
 
