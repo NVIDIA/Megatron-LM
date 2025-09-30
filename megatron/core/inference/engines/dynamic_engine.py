@@ -482,8 +482,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Only create cuda graphs when not using unified memory at all (level
             # 0). For levels 1 and 2, the context's tensors maintain static
             # memory addresses, so the cuda graphs are re-used.
+            capture_time = time.time()
             if self.unified_memory_level == 0:
                 self.create_cuda_graphs()
+            capture_time = time.time() - capture_time
 
             # Add requests.
             futures = {}
@@ -516,7 +518,7 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).
-        print(f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f}.")
+        print(f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f} capture {capture_time:.3f}.")
 
         return futures
 
