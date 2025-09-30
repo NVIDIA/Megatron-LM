@@ -45,7 +45,6 @@ jobs:
       python-version: "3.10"
       packaging: uv
       no-publish: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
-      custom-container: nvcr.io/nvidia/pytorch:25.05-py3
       no-build-isolation: true
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
