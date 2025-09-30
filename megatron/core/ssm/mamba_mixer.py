@@ -25,9 +25,9 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
-    ensure_metadata_has_dp_cp_group,
 )
 from megatron.core.utils import deprecate_inference_params, log_single_rank
 

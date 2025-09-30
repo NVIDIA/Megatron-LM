@@ -205,14 +205,10 @@ def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
     Otherwise, asserts that `dp_cp_group` exists.
     """
     if metadata is None:
-        return {
-            'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)
-        }
+        return {'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)}
     assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
     if 'dp_cp_group' not in metadata:
-        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(
-            with_context_parallel=True
-        )
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
     return metadata
 
 
@@ -248,7 +244,9 @@ def sharded_state_dict_default(
     metadata = ensure_metadata_has_dp_cp_group(metadata)
     # DEBUG ASSERT REMOVE LATER
     assert tp_group == parallel_state.get_tensor_model_parallel_group()
-    assert metadata['dp_cp_group'] == parallel_state.get_data_parallel_group(with_context_parallel=True)
+    assert metadata['dp_cp_group'] == parallel_state.get_data_parallel_group(
+        with_context_parallel=True
+    )
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
