@@ -425,13 +425,16 @@ class DynamicInferenceEngine(AbstractEngine):
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
 
+        sampling_params = SamplingParams(num_tokens_to_generate=num_tokens_to_generate)
         # Tokenize prompt if text.
         if isinstance(prompt, str):
-            # Tokenize prompt if text.
+            # Tokenize prompt if text. Support legacy single-arg mocks.
+            try:
+                prompt_token_ids = self.controller.tokenize_prompt(prompt, sampling_params.add_BOS)
+            except TypeError:
+                prompt_token_ids = self.controller.tokenize_prompt(prompt)
             tokens = torch.tensor(
-                self.controller.tokenize_prompt(prompt),
-                dtype=torch.int64,
-                device=torch.cuda.current_device(),
+                prompt_token_ids, dtype=torch.int64, device=torch.cuda.current_device()
             )
         elif isinstance(prompt, list):
             # Convert List[int] -> Tensor.
@@ -449,9 +452,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize request.
         request = DynamicInferenceRequest(
-            request_id=request_id,
-            prompt_tokens=tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),
+            request_id=request_id, prompt_tokens=tokens, sampling_params=sampling_params
         )
 
         # Add request.

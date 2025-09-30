@@ -500,6 +500,57 @@ class TestTextGenerationController:
                 active_requests
             )
 
+    def test_add_bos_token(self):
+        self.setup_model(torch.float32)
+
+        prompt = "sample prompt"
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(1, len(prompt))))
+                for _ in range(len(x))
+            ]
+        )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
+        self.mock_tokenizer.tokenize.return_value = [
+            random.randint(0, self.vocab_size - 1) for _ in range(len(prompt))
+        ]
+
+        # Test on a tokenizer that does not add BOS by default
+        no_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
+        assert no_bos_to_no_bos[0] != self.mock_tokenizer.bos
+        no_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+        assert no_bos_to_yes_bos[0] == self.mock_tokenizer.bos
+        assert no_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+
+        # Force the first token to be BOS to emulate a tokenizer that does add BOS by default
+        self.mock_tokenizer.tokenize.return_value[0] = self.mock_tokenizer.bos
+
+        yes_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
+        assert yes_bos_to_no_bos[0] != self.mock_tokenizer.bos
+        yes_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+        assert yes_bos_to_yes_bos[0] == self.mock_tokenizer.bos
+        assert yes_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+
+        # Test on an input that has had multiple BOS added
+        self.mock_tokenizer.tokenize.return_value[1] = self.mock_tokenizer.bos
+
+        many_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
+        assert many_bos_to_no_bos[0] != self.mock_tokenizer.bos
+        many_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+        assert many_bos_to_yes_bos[0] == self.mock_tokenizer.bos
+        assert many_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+
+        # Test the assert triggered when the tokenizer has no bos
+        self.mock_tokenizer.bos = None
+        with pytest.raises(AssertionError):
+            self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+
     def test_zero_tokens_generated_batch_vs_single(self):
         """
         Verifies that when `num_tokens_to_generate=0`, the outputs from batched inference

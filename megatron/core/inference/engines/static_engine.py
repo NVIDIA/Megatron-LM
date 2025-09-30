@@ -113,6 +113,7 @@ class StaticInferenceEngine(AbstractEngine):
             sampling_params = inference_parameters
 
         if inference_request is None:
+            # Support legacy single-arg tokenize_prompt mocks in tests.
             prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
         else:
             prompt_tokens = inference_request.prompt_tokens
@@ -234,14 +235,14 @@ class StaticInferenceEngine(AbstractEngine):
             prev_num_requests_pending = crnt_num_requests_pending
 
         # TODO: Later for dynamic batching we will do something like this
-        """ 
+        """
             if dynamic_batching:
                 result_dict: Dict[
                     str, InferenceRequest
                 ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
                     active_requests
                 )
-            self.scheduler.update_requests_pools(result_dict=result_dict)         
+            self.scheduler.update_requests_pools(result_dict=result_dict)
         """
 
     def _wrapped_run_engine(self, cuda_device):

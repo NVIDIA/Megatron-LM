@@ -71,25 +71,30 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
-    def tokenize_prompt(
-        self, prompt: str, add_BOS: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Utility to tokenize the input prompts
+    def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
+        """Utility to tokenize the input prompts.
 
         Args:
-            prompt (str): The input prompt
+            prompt (str): The input prompt.
 
         Returns:
-            torch.Tensor: Returns the tokenized prompt
+            List[int]: Returns the tokenized prompt.
         """
+
         prompt_tokens = self.tokenizer.tokenize(prompt)
+
+        if add_BOS:
+            assert self.tokenizer.bos is not None
+
+        while prompt_tokens and prompt_tokens[0] == self.tokenizer.bos:
+            prompt_tokens.pop(0)
 
         if add_BOS:
             prompt_tokens = [self.tokenizer.bos] + prompt_tokens
 
         return prompt_tokens
 
-    def _detokenize(self, tokens: list[int], skip_special_tokens: bool = True) -> str:
+    def _detokenize(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
         """
         Detokenize a sequence of token IDs, handling skip_special_tokens for
         different tokenizer APIs.

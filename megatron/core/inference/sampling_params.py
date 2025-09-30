@@ -23,6 +23,7 @@ class SamplingParams:
     num_tokens_to_generate: int = 30
     top_n_logprobs: int = 0
     return_prompt_top_n_logprobs: bool = False
+    add_BOS: bool = False
 
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params

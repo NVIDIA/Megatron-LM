@@ -643,7 +643,7 @@ class TestDynamicInferenceEngine:
         prompts = ["prompt1", "prompt2", "prompt3", "prompt4"]
 
         # Mock the tokenize_prompt method to return predictable token sequences
-        def mock_tokenize_prompt(prompt):
+        def mock_tokenize_prompt(prompt, add_BOS=False):
             # Return a token sequence based on the prompt number
             prompt_num = int(prompt[-1])
             return [10 + i for i in range(prompt_num + 2)]
