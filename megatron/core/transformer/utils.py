@@ -222,6 +222,16 @@ def sharded_state_dict_default(
         dict: dictionary of state dict keys mapped to ShardedTensors
     """
 
+    # Guard for cases metadata is not provided
+    if metadata is None:
+        metadata = {
+            'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)
+        }
+    elif 'dp_cp_group' not in metadata:
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        )
+
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
             prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
