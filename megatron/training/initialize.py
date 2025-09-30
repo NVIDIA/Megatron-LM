@@ -269,29 +269,48 @@ def _initialize_tp_communicators():
             args.hidden_size,
         ]
 
-    if is_te_min_version("1.9.0"):
-        # The process group with the target bootstrap backend is created in Transformer Engine.
-        te_module.base.initialize_ub(
-            shape=input_shape,
-            tp_size=args.tensor_model_parallel_size,
-            use_fp8=(args.fp8 is not None),
-            ub_cfgs=ub_cfgs,
-            bootstrap_backend=args.tp_comm_bootstrap_backend,
-        )
-    else:
-        if args.tp_comm_bootstrap_backend != 'mpi':
-            warnings.warn(
-                f"Transformer Engine v{get_te_version()} supports only MPI bootstrap backend."
-            )
-        # Create a MPI process group to help with TP communication overlap bootstrap.
-        create_group(backend='mpi', group_desc='TP_BOOTSTRAP_GROUP_MPI')
+    if is_te_min_version("2.8.0dev0"):
+        from transformer_engine.pytorch.module.base import UserBufferQuantizationMode
+        quantization_modes = []
+        if args.fp8:
+            quantization_modes.append(UserBufferQuantizationMode.FP8)
+        if not args.fp8 or args.first_last_layers_bf16:
+            quantization_modes.append(UserBufferQuantizationMode.NONE)
 
         te_module.base.initialize_ub(
             shape=input_shape,
             tp_size=args.tensor_model_parallel_size,
-            use_fp8=(args.fp8 is not None),
+            quantization_modes=quantization_modes,
             ub_cfgs=ub_cfgs,
+            bootstrap_backend=args.tp_comm_bootstrap_backend,
         )
+    else:
+        assert not args.first_last_layers_bf16, \
+            f"--first-last-layers-bf16 and --tp-comm-overlap require TransformerEngine <= v2.8dev0!"
+
+        if is_te_min_version("1.9.0"):
+            # The process group with the target bootstrap backend is created in Transformer Engine.
+            te_module.base.initialize_ub(
+                shape=input_shape,
+                tp_size=args.tensor_model_parallel_size,
+                use_fp8=(args.fp8 is not None),
+                ub_cfgs=ub_cfgs,
+                bootstrap_backend=args.tp_comm_bootstrap_backend,
+            )
+        else:
+            if args.tp_comm_bootstrap_backend != 'mpi':
+                warnings.warn(
+                    f"Transformer Engine v{get_te_version()} supports only MPI bootstrap backend."
+                )
+            # Create a MPI process group to help with TP communication overlap bootstrap.
+            create_group(backend='mpi', group_desc='TP_BOOTSTRAP_GROUP_MPI')
+
+            te_module.base.initialize_ub(
+                shape=input_shape,
+                tp_size=args.tensor_model_parallel_size,
+                use_fp8=(args.fp8 is not None),
+                ub_cfgs=ub_cfgs,
+            )
 
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):

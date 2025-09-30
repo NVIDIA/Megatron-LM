@@ -2,7 +2,6 @@
 
 """Megatron Module."""
 from typing import Optional, Tuple
-import types
 
 import torch
 from torch.autograd import Variable
@@ -39,33 +38,6 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
-
-
-    # def __init_subclass__(cls, **kwargs):
-    #     super().__init_subclass__(**kwargs)
-        
-    #     from megatron.core.transformer.cuda_graphs import CudaGraphManager
-    #     if hasattr(cls, "cudagraph_manager") or hasattr(cls, "mlp_bda"):
-    #         import pdb; pdb.set_trace()
-        
-    #     # Iterate over all attributes of the subclass `cls` (e.g., TransformerLayer)
-    #     for attr_name in dir(cls):
-    #         # Get the attribute itself
-    #         try:
-
-    #             for attr_name in cls.__dict__:
-    #                 # Get the attribute itself
-    #                 attr_value = getattr(cls, attr_name)
-                    
-    #                 # We only want to wrap regular, callable methods (not dunder methods like __init__)
-    #                 if isinstance(attr_value, types.FunctionType) and \
-    #                     attr_value.__name__ != 'wrapper' and \
-    #                     not attr_name.startswith("__"):
-    #                     # Replace the original method with the wrapped version
-    #                     setattr(cls, attr_name, method_wrapper(attr_value))
-
-    #         except:
-    #             pass
 
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the

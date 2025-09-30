@@ -315,9 +315,8 @@ def get_all_rng_states():
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
         if isinstance(_CUDA_RNG_STATE_TRACKER, TECudaRNGStatesTracker):
-            from transformer_engine.pytorch.distributed import get_all_rng_states
 
-            return get_all_rng_states()
+            return _CUDA_RNG_STATE_TRACKER.get_states()
     # no valid tracker, return an empty dict
     else:
         return {}

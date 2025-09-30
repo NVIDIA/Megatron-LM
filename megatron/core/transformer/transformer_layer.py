@@ -460,11 +460,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         need_early_return = self.is_moe_layer \
             and self.training \
             and is_graph_capturing()
-        early_return_for_external_cudagraph = self.config.external_cuda_graph and 'moe_router' in self.config.cuda_graph_scope    
-        if (
-            (need_early_return and early_return_for_external_cudagraph)
-            or (need_early_return and self.config.enable_cuda_graph)
-        ):
+        if need_early_return and self.config.enable_cuda_graph:
             return output
 
         return output, context
@@ -819,23 +815,21 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 attr = getattr(self.mlp.token_dispatcher, attr_name)
                 if isinstance(attr, torch.Tensor):
                     outputs.append(attr)
-                    print(f"TOKEN DISPATCHER APPENDING {attr_name}  outputs len={len(outputs)}")
 
             return outputs
         return None
 
 
     def cuda_graph_fwd_replay_post_hook(self, cuda_graph_outputs, extra_cuda_graph_attrs):
-        #NOOP
+        # No early return, so do nothing
         if not self.is_moe_layer:
             return cuda_graph_outputs
 
+        # Entire MoE layer was cudagraphed so no early return, so do nothing
         if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
             self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
         ):
-            # CUDA Graph captures the whole MLP/MoE part, so no early return, so do nothing
-            assert False
-    
+            assert cuda_graph_outputs
         elif self.is_moe_layer and 'moe_router' in self.config.cuda_graph_scope:
             # CUDA Graph partially captures the MoE.
             # The rest of the layer runs in eager mode.
@@ -871,6 +865,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 hidden_states, probs, residual, shared_expert_output
             )
             out = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
+
             context = None
             return out, context
 

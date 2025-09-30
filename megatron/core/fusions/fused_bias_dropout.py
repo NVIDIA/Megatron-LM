@@ -15,6 +15,7 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # transformer layer but broadcasting should automatically take care of that.
     # Also, looking at broadcasting semantics, `expand_as` and broadcasting
     # seem to be identical performance-wise (both just change the view).
+
     x, bias = x_with_bias  # unpack
 
     # Run in-place if in eval mode and inputs do not require gradients

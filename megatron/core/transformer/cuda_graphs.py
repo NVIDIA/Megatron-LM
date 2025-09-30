@@ -25,7 +25,7 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.utils import get_submodule_with_decoder, is_te_min_version
 
 try:
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.graph import make_graphed_callables
     from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tensors
     from transformer_engine.pytorch.graph import set_capture_end as te_set_capture_end
@@ -38,8 +38,6 @@ except:
     HAVE_TE_GRAPHS = False
 
 _IS_GRAPH_CAPTURING = False
-IS_WARMUP = False
-
 
 logger = logging.getLogger(__name__)
 
@@ -304,9 +302,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
         # if last transformer layer, return a clone of the cudagraph output buffer, as releasing
         # the cudagraph output buffer into the rest of the system may allow it to be corrupted
         if runner.is_last_layer:
-            out = tuple(o.clone().detach() for o in runner.fwd_graph_output_surface)
-        else:
             out = tuple(o.detach() for o in runner.fwd_graph_output_surface)
+        else:
+            out = runner.fwd_graph_output_surface
 
         return out
 
@@ -346,17 +344,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
 
-        grads, is_dummy_grad = runner.get_input_grads_with_dummy_flags()
-        if runner.is_first_layer:
-            output_grads = tuple(
-                b.clone().detach() if not (b is None or dummy) else b
-                for dummy, b in zip(is_dummy_grad, grads)
-            )
-        else:
-            output_grads = tuple(
-                b.detach() if not (b is None or dummy) else b
-                for dummy, b in zip(is_dummy_grad, grads)
-            )
+        output_grads = tuple(runner.static_grad_inputs)
         return None, None, *output_grads
 
 
@@ -456,12 +444,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
-
-        if self.fp8_enabled:
-            return fp8_autocast(
-                enabled=True, calibrating=False, fp8_recipe=self.fp8_recipe, _graph=True
-            )
-        return nullcontext()
+        from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+        
+        return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
 
     def create_fwd_graph(self, args, kwargs, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
@@ -488,10 +473,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.fwd_graph_input_args = args
         self.fwd_graph_input_kwargs = kwargs
-
-        input_tensors = self.get_tensors(args, kwargs)
-        self.fwd_graph_input_surface = input_tensors + tuple(self.base_module.parameters())
-
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
@@ -519,6 +500,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     outputs = (outputs,)
                 outputs = self.get_tensors(outputs)
                 outputs = tuple(o for o in outputs if o.requires_grad)
+                input_tensors = self.get_tensors(args, kwargs)
 
                 grad_inputs = torch.autograd.grad(
                     outputs=outputs,
@@ -588,34 +570,55 @@ class _CudaGraphRunner(torch.nn.Module):
             if torch.is_tensor(static_grad_outputs):
                 static_grad_outputs = (static_grad_outputs,)
 
+
+        input_tensors = self.get_tensors(
+            self.fwd_graph_input_args, 
+            self.fwd_graph_input_kwargs
+        )
+        fwd_graph_input_surface = input_tensors + tuple(self.base_module.parameters())
+
         torch.cuda.synchronize()
         with torch.cuda.graph(self.bwd_graph, pool=self.bwd_mempool):
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
-                inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
+                inputs=tuple(i for i in fwd_graph_input_surface if i.requires_grad),
                 grad_outputs=tuple(o for o in static_grad_outputs if o is not None),
                 retain_graph=self.backward_retain_grad,
                 only_inputs=True,
                 allow_unused=True,
             )
+        assert len(grad_inputs) == len(fwd_graph_input_surface)
+
+
+        dgrads_buffers = grad_inputs[:len(input_tensors)]
+        wgrads_buffers = grad_inputs[len(input_tensors):]
+
+        self.static_grad_outputs = static_grad_outputs
+        self.static_grad_inputs = []
+        self.params_to_backprop = []
+        self.fwd_graph_input_surface = list(input_tensors)
 
         # Constructs a tuple suitable for returning from Graphed.backward:
         # Pads out the actually-needed grads with Nones in gradient slots for inputs
-        # that don't require grad. I couldn't think of a one-liner for this pattern.
-        static_grad_inputs = []
-        grad_idx = 0
-        for arg in self.fwd_graph_input_surface:
-            has_wgrad_fusion = self.fuse_wgrad_accumulation and getattr(
-                arg, "grad_added_to_main_grad", False
-            )
-            if arg.requires_grad:
-                if has_wgrad_fusion:
-                    static_grad_inputs.append(None)
-                else:
-                    static_grad_inputs.append(grad_inputs[grad_idx])
-                grad_idx += 1
+        # that don't require grad
+        self.static_grad_inputs = []
+        for idx, input_tensor in enumerate(input_tensors):
+            if input_tensor.requires_grad:
+                self.static_grad_inputs.append(dgrads_buffers[idx])
             else:
-                static_grad_inputs.append(None)
+                self.static_grad_inputs.append(None)
+
+        # filter out params that did not return a wgrad
+        for idx, param in enumerate(self.base_module.parameters()):
+            wgrad_buffer = wgrads_buffers[idx]
+            if (wgrad_buffer is not None) and param.requires_grad:
+                self.fwd_graph_input_surface.append(param)
+                self.params_to_backprop.append(param)
+                self.static_grad_inputs.append(wgrad_buffer)
+
+        self.static_grad_inputs = tuple(self.static_grad_inputs)
+        self.params_to_backprop = tuple(self.params_to_backprop)
+        self.fwd_graph_input_surface = tuple(self.fwd_graph_input_surface)
 
         self.groundtruth_grad_added_to_main_grad = {}
         if self.fuse_wgrad_accumulation:
@@ -623,45 +626,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, "grad_added_to_main_grad"):
                     self.groundtruth_grad_added_to_main_grad[param] = param.grad_added_to_main_grad
 
-        self.static_grad_outputs = static_grad_outputs
-        self.static_grad_inputs = static_grad_inputs
-
-    def get_input_grads_with_dummy_flags(self):
-        """Get the inputs grads that are returned by the bwd cudagraph call. If using grad accum
-        fusion, wgrads have already been accumulated, so return dummy wgrads."""
-
-        is_dummy_grad = [False] * len(self.static_grad_inputs)
-        if not self.fuse_wgrad_accumulation:
-            return self.static_grad_inputs, is_dummy_grad
-        else:
-            num_dgrads = len(self.static_grad_inputs) - len(list(self.base_module.parameters()))
-            dgrads = self.static_grad_inputs[:num_dgrads]
-            wgrads = self.static_grad_inputs[num_dgrads:]
-
-            wgrads_with_placeholders = []
-            is_dummy_grad = [False] * len(dgrads)
-            for idx, param in enumerate(self.base_module.parameters()):
-                wgrad_is_dummy = getattr(param, "grad_added_to_main_grad", False)
-                if wgrad_is_dummy:
-                    if getattr(param, "zero_out_wgrad", False):
-                        wgrad = torch.zeros(
-                            param.main_grad.shape,
-                            dtype=param.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
-                    else:
-                        wgrad = torch.empty(
-                            param.main_grad.shape,
-                            dtype=param.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
-                else:
-                    wgrad = wgrads[idx]
-                wgrads_with_placeholders.append(wgrad)
-                is_dummy_grad.append(wgrad_is_dummy)
-            return tuple(dgrads + wgrads_with_placeholders), is_dummy_grad
 
     def record_graph_capture(self, args, kwargs):
         """Records the data needed to create this runner's forward cudagraph.
@@ -712,7 +676,7 @@ class _CudaGraphRunner(torch.nn.Module):
         ), "Tried replaying a cudagraph with different arguments than what if was created with!"
 
         inp_tensors = self.get_tensors(args, kwargs)
-        func_args = inp_tensors + tuple(self.parameters())
+        func_args = inp_tensors + self.params_to_backprop
 
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
 
