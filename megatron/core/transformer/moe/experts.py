@@ -41,6 +41,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
+    ensure_metadata_has_dp_cp_group,
 )
 
 try:
@@ -53,183 +54,6 @@ try:
 except ImportError:
 
     HAVE_TE = False
-
-
-# TODO(Hepteract): delete the usage of the global parallel_state.
-# Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
-# in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass pg_collection to sub-module
-# and delete the function expert_dist_ckpt_decorator.
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-
-    Usage:
-        tracked_var = TrackedValue(42, "my_variable")
-        # Any access to tracked_var will print a traceback:
-        print(tracked_var + 5)  # Prints traceback for addition
-        if tracked_var == 42:   # Prints traceback for comparison
-            pass
-
-    To disable tracking globally:
-        TrackedValue.GLOBAL_TRACKING_ENABLED = False
-    """
-
-    # Global flag to enable/disable all tracking
-    GLOBAL_TRACKING_ENABLED = True
-
-    def __init__(self, value, var_name, enable_tracking=True):
-        self._value = value
-        self._var_name = var_name
-        self._enable_tracking = enable_tracking
-
-    def _print_access(self, operation):
-        from megatron.training.utils import print_rank_0
-
-        """Print the access traceback if tracking is enabled."""
-        if not self._enable_tracking or not TrackedValue.GLOBAL_TRACKING_ENABLED:
-            return
-        print_rank_0(f"\n=== TRACKED ACCESS to {self._var_name} ===")
-        print_rank_0("".join(traceback.format_stack()[:-2]))  # Skip this method and the caller
-        print_rank_0(f"{operation} on {self._var_name} = {self._value}")
-        print_rank_0("=" * 50)
-
-    def __getattribute__(self, name):
-        if name.startswith('_') or name in ['__class__', '__dict__']:
-            return object.__getattribute__(self, name)
-
-        # Print traceback when the tracked value is accessed
-        self._print_access(f"Accessing attribute '{name}'")
-
-        # Return the attribute from the actual value
-        return getattr(self._value, name)
-
-    def __int__(self):
-        self._print_access("Converting to int")
-        return int(self._value)
-
-    def __float__(self):
-        self._print_access("Converting to float")
-        return float(self._value)
-
-    def __bool__(self):
-        self._print_access("Converting to bool")
-        return bool(self._value)
-
-    def __eq__(self, other):
-        self._print_access(f"Comparing == with {other}")
-        return self._value == other
-
-    def __ne__(self, other):
-        self._print_access(f"Comparing != with {other}")
-        return self._value != other
-
-    def __lt__(self, other):
-        self._print_access(f"Comparing < with {other}")
-        return self._value < other
-
-    def __le__(self, other):
-        self._print_access(f"Comparing <= with {other}")
-        return self._value <= other
-
-    def __gt__(self, other):
-        self._print_access(f"Comparing > with {other}")
-        return self._value > other
-
-    def __ge__(self, other):
-        self._print_access(f"Comparing >= with {other}")
-        return self._value >= other
-
-    def __str__(self):
-        self._print_access("Converting to string")
-        return str(self._value)
-
-    def __repr__(self):
-        self._print_access("Getting repr")
-        return repr(self._value)
-
-    def __add__(self, other):
-        self._print_access(f"Adding + {other}")
-        return self._value + other
-
-    def __radd__(self, other):
-        self._print_access(f"Right adding {other} +")
-        return other + self._value
-
-    def __sub__(self, other):
-        self._print_access(f"Subtracting - {other}")
-        return self._value - other
-
-    def __rsub__(self, other):
-        self._print_access(f"Right subtracting {other} -")
-        return other - self._value
-
-    def __mul__(self, other):
-        self._print_access(f"Multiplying * {other}")
-        return self._value * other
-
-    def __rmul__(self, other):
-        self._print_access(f"Right multiplying {other} *")
-        return other * self._value
-
-    def __truediv__(self, other):
-        self._print_access(f"Dividing / {other}")
-        return self._value / other
-
-    def __rtruediv__(self, other):
-        self._print_access(f"Right dividing {other} /")
-        return other / self._value
-
-    def __floordiv__(self, other):
-        self._print_access(f"Floor dividing // {other}")
-        return self._value // other
-
-    def __rfloordiv__(self, other):
-        self._print_access(f"Right floor dividing {other} //")
-        return other // self._value
-
-    def __mod__(self, other):
-        self._print_access(f"Modulo % {other}")
-        return self._value % other
-
-    def __rmod__(self, other):
-        self._print_access(f"Right modulo {other} %")
-        return other % self._value
-
-    def __pow__(self, other):
-        self._print_access(f"Power ** {other}")
-        return self._value**other
-
-    def __rpow__(self, other):
-        self._print_access(f"Right power {other} **")
-        return other**self._value
-
-    def __hash__(self):
-        self._print_access("Getting hash")
-        return hash(self._value)
-
-    def __len__(self):
-        self._print_access("Getting length")
-        return len(self._value)
-
-    def __getitem__(self, key):
-        self._print_access(f"Getting item [{key}]")
-        return self._value[key]
-
-    def __setitem__(self, key, value):
-        self._print_access(f"Setting item [{key}] = {value}")
-        self._value[key] = value
-
-    def __contains__(self, item):
-        self._print_access(f"Checking if contains {item}")
-        return item in self._value
-
-    def __iter__(self):
-        self._print_access("Getting iterator")
-        return iter(self._value)
-
-    def __call__(self, *args, **kwargs):
-        self._print_access(f"Calling with args={args}, kwargs={kwargs}")
-        return self._value(*args, **kwargs)
 
 
 class GroupedMLP(MegatronModule):
@@ -898,6 +722,7 @@ class TEGroupedMLP(MegatronModule):
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.tp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
@@ -1104,16 +929,7 @@ class TEGroupedMLP(MegatronModule):
         The sharded state dict is interchangable with SequentialMLP's.
         """
         # Guard for cases metadata is not provided
-        if metadata is None:
-            metadata = {
-                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
-            }
-        elif isinstance(metadata, dict) and "dp_cp_group" not in metadata:
-            metadata.update(
-                {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
-            )
-        else:
-            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
@@ -1273,16 +1089,7 @@ class SequentialMLP(MegatronModule):
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
         # Guard for cases metadata is not provided
-        if metadata is None:
-            metadata = {
-                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
-            }
-        elif isinstance(metadata, dict) and "dp_cp_group" not in metadata:
-            metadata.update(
-                {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
-            )
-        else:
-            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
         num_global_experts = self.ep_group.size() * self.num_local_experts

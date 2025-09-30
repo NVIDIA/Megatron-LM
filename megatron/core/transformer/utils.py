@@ -194,6 +194,25 @@ def _get_extra_state_offsets(
     return extra_state_shape, extra_state_offset
 
 
+def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
+    """Ensure `metadata` is a dict containing `dp_cp_group` entry.
+
+    If `metadata` is None, a new dict is returned with `dp_cp_group` set.
+    If `metadata` is a dict and missing `dp_cp_group`, it is updated in-place.
+    Otherwise, asserts that `dp_cp_group` exists.
+    """
+    if metadata is None:
+        return {
+            'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)
+        }
+    assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
+    if 'dp_cp_group' not in metadata:
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        )
+    return metadata
+
+
 def sharded_state_dict_default(
     module: torch.nn.Module,
     prefix: str = '',
@@ -223,12 +242,7 @@ def sharded_state_dict_default(
     """
 
     # Guard for cases metadata is not provided
-    if metadata is None:
-        metadata = {
-            'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)
-        }
-    elif 'dp_cp_group' not in metadata:
-        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    metadata = ensure_metadata_has_dp_cp_group(metadata)
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(

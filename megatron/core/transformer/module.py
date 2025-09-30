@@ -13,6 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
+    ensure_metadata_has_dp_cp_group,
 )
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
@@ -81,14 +82,7 @@ class MegatronModule(torch.nn.Module):
             # some model interface hasn't updated for m4, fallback needed
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         # Guard for cases metadata is not provided
-        if metadata is None:
-            metadata = {
-                'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)
-            }
-        elif 'dp_cp_group' not in metadata:
-            metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(
-                with_context_parallel=True
-            )
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,

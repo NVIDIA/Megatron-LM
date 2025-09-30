@@ -29,6 +29,7 @@ from megatron.core.utils import (
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 
 
 class LanguageModule(MegatronModule):
@@ -279,16 +280,7 @@ class LanguageModule(MegatronModule):
         assert not sharded_offsets, "Unexpected sharded offsets"
 
         # Guard for cases metadata is not provided
-        if metadata is None:
-            metadata = {
-                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
-            }
-        elif isinstance(metadata, dict) and "dp_cp_group" not in metadata:
-            metadata.update(
-                {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
-            )
-        else:
-            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 

@@ -27,6 +27,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
+    ensure_metadata_has_dp_cp_group,
 )
 from megatron.core.utils import deprecate_inference_params, log_single_rank
 
@@ -746,16 +747,7 @@ class MambaMixer(MegatronModule):
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         # Guard for cases metadata is not provided
-        if metadata is None:
-            metadata = {
-                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
-            }
-        elif isinstance(metadata, dict) and "dp_cp_group" not in metadata:
-            metadata.update(
-                {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
-            )
-        else:
-            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
         # Parameters
