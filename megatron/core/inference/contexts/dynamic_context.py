@@ -129,21 +129,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
-        buffer_size_gb (float): Total buffer size (GB), shared by main and
-            fallback contexts.
+        active_buffer_size_bytes (float): Buffer size reserved for active requests
+            that live on the GPU. The total buffer size (stored in unified memory)
+            is 2x this value, with the the other half of the buffer reserved for
+            paused requests that live on the CPU.
+        max_tokens (int): Max number of tokens to use for forward passes. This is
+            primarily limited by prefill activation memory usage.
+        # >>>
+        # model (torch.nn.Module): Model used for inference. This is needed for
+        #     computing `max_tokens` below.
+        # <<<
         chunk_size_tokens (int): Size of KV cache chunk size.
-        buffer_guaranteed_fraction (float): Fraction of the memory buffer that is
-            reserved to guarantee that one or more active requests are able to
-            run to completion. Without reserving this memory, paused requests are
-            able to fill the memory buffer and block execution of any requests.
-        buffer_overflow_factor (Optional[float]): Scaling factor over the buffer
-            size for auto computing `max_requests` and `max_tokens`. This scaling
-            factor is used for fitting more requests and tokens in the memory
-            buffer than it can safely hold, which in turn increases throughput.
-        max_requests_override (Optional[int]): If set, overrides value computed
-            from `buffer_overflow_factor`.
-        max_tokens_override (Optional[int]): If set, overrides value computed
-            from `buffer_overflow_factor`.
         tensor_model_parallel_size (Optional[int]): Tensor model parallel size.
         num_cuda_graphs (Optional[int]): Maximum number of cuda graphs to capture,
             where the cuda graph batch sizes range from 1 to `max_requests` (as
@@ -153,10 +149,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             are materialized in the context.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
             engine steps.
-        unified_memory_level (Optional[int]): Set unified memory usage within the
-            dynamic inference context. The levels are: 0) no unified memory, 1)
-            allocate `memory_buffer` in unified memory. Eventually, additional
-            levels will be included to control other tensors within the context.
     """
 
     def __init__(
@@ -167,12 +159,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_channels: int,
         num_attention_heads: int,
         max_sequence_length: int,
-        buffer_size_gb: float,
-        buffer_guaranteed_fraction: float,
+        active_buffer_size_bytes: float,
+        # >>>
+        # model: torch.nn.Module,
+        max_tokens: int,
+        # <<<
         chunk_size_tokens: int = 256,
-        buffer_overflow_factor: Optional[float] = None,
-        max_requests_override: Optional[int] = None,
-        max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
         cache_mla_latent: bool = False,
         kv_lora_rank: Optional[int] = None,
@@ -180,7 +172,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: bool = True,
         use_cuda_graphs_for_non_decode_steps: bool = True,
-        unified_memory_level: Optional[int] = 0,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -218,49 +209,26 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * hidden_size_per_attention_head
             )
 
-        # Adjust buffer to be a multiple of chunk size.
-        buffer_size_bytes = int(buffer_size_gb * 1024**3)
-        buffer_size_bytes_rem = buffer_size_bytes % self.chunk_size_bytes
-        buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
+        # Calculate the number of active chunks, and finalize the buffer size.
+        active_chunk_count_total = active_buffer_size_bytes // self.chunk_size_bytes
+        active_buffer_size_bytes = active_chunk_count_total * self.chunk_size_bytes
+        self.max_requests = active_chunk_count_total
+        self.max_tokens = max_tokens
 
-        # Compute max_requets, max_tokens from buffer size and overflow factor.
-        def bytes_to_max_requests_and_tokens(n_bytes):
-            n_tokens = n_bytes / self.chunk_size_bytes * self.chunk_size_tokens
-            n_requests = n_tokens / max_sequence_length
-            return self.round_up_requests(int(n_requests), tp_size=tp_size), self.round_up_tokens(
-                int(n_tokens), tp_size=tp_size
-            )
-
-        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
-        if buffer_overflow_factor is not None:
-            self.max_requests = self.round_up_requests(
-                int(self.max_requests * buffer_overflow_factor), tp_size=tp_size
-            )
-            self.max_tokens = self.round_up_tokens(
-                int(self.max_tokens * buffer_overflow_factor / 50.0), tp_size=tp_size
-            )
-
-        if max_requests_override is not None:
-            self.max_requests = self.round_up_requests(max_requests_override, tp_size=tp_size)
-
-        if max_tokens_override is not None:
-            self.max_tokens = self.round_up_tokens(max_tokens_override, tp_size=tp_size)
-
-        self.max_requests = min(self.max_requests, self.max_tokens)  # e.g., decode only.
+        # Initialize chunk allocator
+        self.chunk_allocator = ChunkAllocator(active_count_total=active_chunk_count_total)
+        # >>>
+        pax({"chunk_allocator": self.chunk_allocator})
+        # <<<
 
         # Initialize context state.
         self.params_dtype = params_dtype
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
-        self.unified_memory_level = unified_memory_level
-        if unified_memory_level > 0:
-            if not has_unified_memory and torch.distributed.get_rank() == 0:
-                warnings.warn(
-                    "Unified memory requested but not available; defaulting to GPU memory."
-                )
-                self.unified_memory_level = 0
-            else:
-                self.unified_memory_mempool = create_unified_mempool()
+        assert has_unified_memory, (
+            "CUDA unified memory must be available to use `DynamicInferenceContext`."
+        )
+        self.unified_memory_mempool = create_unified_mempool()
 
         self.total_request_count = 0
         self.active_token_count = 0
@@ -297,16 +265,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
 
-        # Calculate the total number of chunks available in the buffer
-        chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
-
         # Memory buffer.
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
-        with ctx_manager:
+        with torch.cuda.use_mem_pool(self.unified_memory_mempool):
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
                     (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
@@ -403,29 +363,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # Guaranteed active requests.
-        # * See details in the class docstring above. `gtd_request_fraction` is
-        #   the fraction of chunks in the memory buffer that are reserved for
-        #   guaranteeing that some number of active requests can always proceed
-        #   with their generations. The number of chunks defined by
-        #   `buffer_guaranteed_fraction * chunk_count_total` is converted to a
-        #   number of requests that this reserved space can safely handle
-        #   (`gtd_request_count`).
-        # * Note: computing the size of this guaranteed space from chunks rather
-        #   than bytes is safer due to the non-linear impacts of a large
-        #   `chunk_size_tokens` or `max_kv_chunk_count`. When computing from
-        #   chunks, this space will always be less than `chunk_count_total`. When
-        #   computing from bytes, this space can unexpectedly be much larger than
-        #   `chunk_count_total`, resulting in stalled generations.
-        gtd_chunk_count = int(buffer_guaranteed_fraction * chunk_count_total)
-        gtd_chunk_count = min(gtd_chunk_count, chunk_count_total)
-        self.gtd_request_count = max(1, gtd_chunk_count // self.max_kv_chunk_count)
-        self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
-
-        # Initialize chunk allocator
-        self.chunk_allocator = ChunkAllocator(
-            chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
-        )
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # # Guaranteed active requests.
+        # # * See details in the class docstring above. `gtd_request_fraction` is
+        # #   the fraction of chunks in the memory buffer that are reserved for
+        # #   guaranteeing that some number of active requests can always proceed
+        # #   with their generations. The number of chunks defined by
+        # #   `buffer_guaranteed_fraction * chunk_count_total` is converted to a
+        # #   number of requests that this reserved space can safely handle
+        # #   (`gtd_request_count`).
+        # # * Note: computing the size of this guaranteed space from chunks rather
+        # #   than bytes is safer due to the non-linear impacts of a large
+        # #   `chunk_size_tokens` or `max_kv_chunk_count`. When computing from
+        # #   chunks, this space will always be less than `chunk_count_total`. When
+        # #   computing from bytes, this space can unexpectedly be much larger than
+        # #   `chunk_count_total`, resulting in stalled generations.
+        # gtd_chunk_count = int(buffer_guaranteed_fraction * chunk_count_total)
+        # gtd_chunk_count = min(gtd_chunk_count, chunk_count_total)
+        # self.gtd_request_count = max(1, gtd_chunk_count // self.max_kv_chunk_count)
+        # self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Store the dummy chunk idx reference for convenience
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx

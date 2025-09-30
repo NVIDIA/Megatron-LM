@@ -61,6 +61,14 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+# >>>
+from lutil import pax as _pax, get_mem_stats_str
+import builtins
+builtins.pax = _pax
+
+def print_mem(key):
+    print(f"+++++++++++ {key} ........... {get_mem_stats_str()}.")
+# <<<
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -113,11 +121,120 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(requests: List[Request], sampling_params: SamplingParams, 
-                          calculate_max_sequence_length_from_requests: bool =True):
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> int:
+    """Estimate memory remaining for context's `memory_buffer`.
+
+    The following implementation is a placeholder, using only
+    `args.inference_dynamic_batching_active_buffer_size_gb`. Eventually, this will
+    be computed by first computing memory used by the model, activations, and the
+    KV cache.
+    """
+    args = get_args()
+    active_buffer_size_gb = args.inference_dynamic_batching_active_buffer_size_gb
+    active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
+    # >>>
+    # pax({
+    #     "active buffer gb" : get_args().inference_dynamic_batching_active_buffer_size_gb,
+    #     "1024**3" : 1024**3,
+    # }, "active_buffer_size_bytes")
+    # <<<
+    return active_buffer_size_bytes
+
+
+# # >>>
+# def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
+# # def get_inference_context_max_tokens(controller: torch.nn.Module) -> int:
+# # <<<
+#     """Estimate `max_tokens` for the context.
+
+#     This function performs a binary search over the number of input tokens and
+#     analyzes the latency to find the 'knee of the curve'.
+#     """
+
+#     import time
+
+#     # args = get_args()
+#     # model = GPTInferenceWrapper(model, args, inference_context="not-actually-set") # None)
+#     # pax("model")
+
+#     num_tokens_step = 1000
+#     num_tokens_min = num_tokens_step
+#     num_tokens_max = 24000 # 1000000
+#     time_map = {}
+#     tbar = tqdm(range(num_tokens_min, num_tokens_max, num_tokens_step))
+#     # tbar = tqdm((3000,))
+#     # tbar = tqdm((3072,))
+#     # tbar = tqdm((1000,))
+#     # num_tokens_list = list(
+#     for num_tokens in tbar:
+#         tbar.set_description(f"num_tokens {num_tokens}")
+#         input_ids = torch.full(
+#             (num_tokens,),
+#             0,
+#             dtype=torch.long,
+#             device=torch.cuda.current_device(),
+#         ).unsqueeze(0)
+#         # position_ids = torch.arange(
+#         #     num_tokens,
+#         position_ids = torch.zeros(
+#             (num_tokens,),
+#             dtype=torch.long,
+#             device=torch.cuda.current_device(),
+#         ).unsqueeze(0)
+#         # pax("input_ids, position_ids")
+#         # result = model.run_one_forward_step(
+#         #     {
+#         #         "tokens": input_ids,
+#         #         "position_ids": position_ids,
+#         #         "attention_mask": None,
+#         #     }
+#         # )
+#         t = time.time()
+#         for _ in range(3):
+#             result = model(
+#                 input_ids,
+#                 position_ids,
+#                 attention_mask=None,
+#                 inference_context=None,
+#                 runtime_gather_output=True,  # Inference should always gather the logits
+#             )
+#         t = time.time() - t
+#         time_map[num_tokens] = t
+#         # >>>
+#         # pax("result")
+#         # <<<
+#     print("~~ x ~~")
+#     [ print(x) for x in time_map.keys() ]
+#     print("~~ y ~~")
+#     [ print(y) for y in time_map.values() ]
+#     pax()
+#     pax("time_map")
+#     return max_tokens
+def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
+    """Estimate `max_tokens` for the context.
+
+    The following implementation is a placeholder, simply returning a hard-coded
+    value for `max_tokens`. Eventually, this will be computed by analyzing the
+    correlation between `max_tokens` and request throughput.
+    """
+    return 16384
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+def get_inference_context(
+    requests: List[Request],
+    sampling_params: SamplingParams,
+    # >>>
+    # buffer_size_bytes: int,
+    model: torch.nn.Module,
+    # <<<
+    calculate_max_sequence_length_from_requests: bool =True,
+):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
+
     # Max sequence length.
     if calculate_max_sequence_length_from_requests:
         max_gen_length = sampling_params.num_tokens_to_generate    
@@ -125,6 +242,14 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_sequence_length = max_context_length + max_gen_length
     else:
         max_sequence_length = args.inference_max_seq_length
+
+    # Active buffer size & max tokens.
+    active_buffer_size_bytes = get_inference_context_active_buffer_size_bytes(model)
+    max_tokens = get_inference_context_max_tokens(model)
+
+    # >>>
+    # pax("active_buffer_size_bytes, max_tokens")
+    # <<<
 
     # Inference context.
     context = DynamicInferenceContext(
@@ -139,17 +264,28 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
         ),
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
-        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
-        max_requests_override=args.inference_dynamic_batching_max_requests_override,
-        max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
+        # >>>
+        # buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        # buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
+        # buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
+        # max_requests_override=args.inference_dynamic_batching_max_requests_override,
+        # +++
+        # active_buffer_size_gb=active_buffer_size_gb,
+        active_buffer_size_bytes=active_buffer_size_bytes,
+        # model=model,
+        # <<<
+        # >>>
+        # max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
+        max_tokens=max_tokens,
+        # <<<
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        # >>>
+        # unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        # <<<
     )
 
     return context
@@ -320,6 +456,10 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
+    # >>>
+    print_mem("initialize_megatron()")
+    # <<<
+
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
@@ -342,7 +482,7 @@ def main():
     # Requests, context, conroller.
     model = get_model()
     requests = build_requests(args, tokenizer)
-    context = get_inference_context(requests, sampling_params)
+    context = get_inference_context(requests, sampling_params, model)
     controller = get_inference_controller(model, context)
 
     # Validate all context_length's <= max_tokens.
@@ -364,6 +504,11 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
     )
+
+    # >>>
+    print_mem("engine")
+    exit()
+    # <<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")

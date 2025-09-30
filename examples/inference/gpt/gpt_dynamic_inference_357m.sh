@@ -24,9 +24,16 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 : ${INCOMING_REQUESTS_PER_SEC=100.}
 
 # Dynamic context.
-: ${BUFFER_SIZE_GB=50.}
-: ${BUFFER_OVERFLOW_FACTOR=1.}
-: ${BUFFER_GUARANTEED_FRACTION=0.05}
+# >>>
+# : ${BUFFER_SIZE_GB=50.}
+# : ${BUFFER_OVERFLOW_FACTOR=1.}
+# : ${BUFFER_GUARANTEED_FRACTION=0.05}
+# --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
+# --inference-dynamic-batching-buffer-overflow-factor ${BUFFER_OVERFLOW_FACTOR} \
+# --inference-dynamic-batching-buffer-guaranteed-fraction ${BUFFER_GUARANTEED_FRACTION} \
+# +++
+: ${ACTIVE_BUFFER_SIZE_GB=50.}
+# <<<
 
 # Cuda graphs.
 : ${ENABLE_CUDA_GRAPHS=1}
@@ -63,9 +70,7 @@ ARGS=" \
     --inference-rng-tracker \
     \
     --inference-dynamic-batching \
-    --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
-    --inference-dynamic-batching-buffer-overflow-factor ${BUFFER_OVERFLOW_FACTOR} \
-    --inference-dynamic-batching-buffer-guaranteed-fraction ${BUFFER_GUARANTEED_FRACTION} \
+    --inference-dynamic-batching-active-buffer-size-gb ${ACTIVE_BUFFER_SIZE_GB} \
     \
     ${EXTRA_ARGS} \
 "
