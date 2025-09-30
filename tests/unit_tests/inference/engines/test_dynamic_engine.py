@@ -4,7 +4,7 @@ import asyncio
 import random
 import types
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pytest
 import torch
@@ -185,6 +185,8 @@ class TestDynamicInferenceEngine:
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+            # this is for compatibility with the LTS environment
         )
 
         return context
@@ -394,7 +396,7 @@ class TestDynamicInferenceEngine:
             [41, 56, 15, 58],
             [28, 17, 6, 37],
             [17, 2, 54, 47],
-            [],
+            [],  # this request is failed due to max sequence length overflow
         ]
 
         assert len(env.requests) == len(expected_generated_tokens_list)
@@ -441,6 +443,7 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
         env.engine._add_request(env.requests[1])
+        env.engine.schedule_waiting_requests()
         assert list(env.engine.waiting_request_ids) == [1]
 
     @pytest.mark.skipif(
@@ -614,6 +617,7 @@ class TestDynamicInferenceEngine:
         # add all requests to the context.
         for request in tqdm(env.requests, "add requests"):
             env.engine._add_request(request)
+        env.engine.schedule_waiting_requests()
 
         # we should now have more active tokens than max requests.
         context.initialize_attention_state()
