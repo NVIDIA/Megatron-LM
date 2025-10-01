@@ -36,7 +36,7 @@ class BlockAllocator:
     def is_memory_available(self, num_blocks: int, safe: bool = False) -> bool:
         """Check if memory blocks are available.
 
-        Use 'safe' to avoid all requests being blocked. A fraction of the KV cache
+        Use 'safe' to avoid all requests being deadlocked. A fraction of the KV cache
         memory buffer is reserved to guarantee that a minimum number of active
         requests can run on any given step.
 
