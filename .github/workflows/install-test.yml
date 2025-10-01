@@ -61,7 +61,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: ko3n1g/fix/import-checks
           path: FW-CI-templates
 
       - name: Check imports for megatron-core
@@ -108,7 +108,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: ko3n1g/fix/import-checks
           path: FW-CI-templates
 
       - name: Check imports for megatron-core
@@ -155,7 +155,7 @@ jobs:
       #   uses: actions/checkout@v4
       #   with:
       #     repository: NVIDIA-NeMo/FW-CI-templates
-      #     ref: v0.39.0
+      #     ref: ko3n1g/fix/import-checks
       #     path: FW-CI-templates
 
       # - name: Check imports for megatron-core
@@ -203,7 +203,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.39.0
+          ref: ko3n1g/fix/import-checks
           path: FW-CI-templates
 
       - name: Check imports for megatron-core
