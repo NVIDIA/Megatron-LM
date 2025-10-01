@@ -385,6 +385,14 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
+        assert (
+            request.sampling_params.num_tokens_to_generate is None
+            or request.sampling_params.num_tokens_total is None
+        )
+        if request.sampling_params.num_tokens_total is not None:
+            request.sampling_params.num_tokens_to_generate = (
+                request.sampling_params.num_tokens_total - len(request.prompt_tokens)
+            )
         if request.sampling_params.num_tokens_to_generate is None:
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
@@ -413,19 +421,23 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         num_tokens_to_generate: Optional[int] = None,
+        num_tokens_total: Optional[int] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
         Args:
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
-            num_tokens_to_generate (Optional[int]): Number of output tokens to generate
+            num_tokens_to_generate (Optional[int]): Number of output tokens to generate.
+            num_tokens_total (Optional[int]): Limit on total number of tokens (prompt + generated).
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
 
-        sampling_params = SamplingParams(num_tokens_to_generate=num_tokens_to_generate)
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=num_tokens_to_generate, num_tokens_total=num_tokens_total
+        )
         # Tokenize prompt if text.
         if isinstance(prompt, str):
             # Tokenize prompt if text. Support legacy single-arg mocks.
@@ -809,7 +821,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         for prompt in prompts:
             request_id = int(next(self.request_counter))
-            _ = self.add_request(request_id, prompt, sampling_params.num_tokens_to_generate)
+            _ = self.add_request(
+                request_id,
+                prompt,
+                sampling_params.num_tokens_to_generate,
+                sampling_params.num_tokens_total,
+            )
 
         finished_requests_list = []
         while self.has_unfinished_requests():
@@ -887,7 +904,12 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                self.add_request(request_id, prompt, sampling_params.num_tokens_to_generate)
+                self.add_request(
+                    request_id,
+                    prompt,
+                    sampling_params.num_tokens_to_generate,
+                    sampling_params.num_tokens_total,
+                )
             elif header == Headers.PAUSE:
                 self.paused = True
             elif header == Headers.STOP:

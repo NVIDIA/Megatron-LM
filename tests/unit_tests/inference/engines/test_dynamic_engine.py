@@ -58,7 +58,8 @@ class DynamicEngineTestConfig:
     num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
     min_prompt_length: int = 4
     max_prompt_length: int = 16
-    num_tokens_to_generate: int = 4
+    num_tokens_to_generate: Optional[int] = 4
+    num_tokens_total: Optional[int] = None
     max_sequence_length: Optional[int] = None
 
     num_gap_steps: int = 2
@@ -87,7 +88,12 @@ class DynamicEngineTestConfig:
 
         # Compute max_sequence_length.
         assert self.max_sequence_length is None
-        self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
+        assert self.num_tokens_to_generate is None or self.num_tokens_total is None
+        if self.num_tokens_to_generate is not None:
+            self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
+        else:
+            assert self.num_tokens_total is not None
+            self.max_sequence_length = self.num_tokens_total
 
         # Update overrides if not using overflow factor.
         if self.context_buffer_overflow_factor is None:
@@ -127,18 +133,29 @@ class TestDynamicInferenceEngine:
                 )
 
             # Num tokens to generate.
+            num_tokens_to_generate = test_config.num_tokens_to_generate
+            num_tokens_total = test_config.num_tokens_total
+
             if test_config.use_fixed_output_lengths:
-                num_tokens_to_generate = random.randint(
-                    1, test_config.max_sequence_length - prompt_length
-                )
-            else:
-                num_tokens_to_generate = test_config.num_tokens_to_generate
+                if num_tokens_to_generate is not None:
+                    num_tokens_to_generate = random.randint(
+                        1, test_config.max_sequence_length - prompt_length
+                    )
+                else:
+                    num_tokens_total = random.randint(
+                        prompt_length + 1, test_config.max_sequence_length
+                    )
 
             # Sampling params.
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
                 return_log_probs=test_config.return_log_probs,
             )
+            if not hasattr(sampling_params, "num_tokens_total"):
+                # Remove this if statement branch in megatron-core 0.16
+                sampling_params.add_attributes({"num_tokens_total": num_tokens_total})
+            else:
+                sampling_params.num_tokens_total = num_tokens_total
             sampling_params.add_attributes(
                 {
                     "skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs_for_dynamic_inference
@@ -351,9 +368,15 @@ class TestDynamicInferenceEngine:
             ), f"request.status == '{request.status}'."
 
             num_tokens_to_generate = request.sampling_params.num_tokens_to_generate
+            num_tokens_total = request.sampling_params.num_tokens_total
+            num_tokens_expected = (
+                num_tokens_to_generate
+                if num_tokens_total is None
+                else num_tokens_total - len(request.prompt_tokens)
+            )
             assert (
-                num_tokens_to_generate is None
-                or len(request.generated_tokens) == num_tokens_to_generate
+                (num_tokens_to_generate is None and num_tokens_total is None)
+                or len(request.generated_tokens) == num_tokens_expected
                 or request.status == Status.FAILED
             ), (
                 f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
@@ -750,6 +773,17 @@ class TestDynamicInferenceEngine:
             expert_model_parallel_size=ep_size,
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
+
+    @pytest.mark.experimental
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_num_tokens_total(self):
+        """Simple test, but using num_tokens_total instead of num_tokens_to_generate."""
+        # Run test.
+        env = self._run_test(
+            num_tokens_to_generate=None, num_tokens_total=20, use_fixed_output_lengths=True
         )
 
     @pytest.mark.skipif(
