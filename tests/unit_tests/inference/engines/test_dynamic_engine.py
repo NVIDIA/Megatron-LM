@@ -823,7 +823,9 @@ class TestDynamicInferenceEngine:
             # It's safe to use request 0's sampling params here because all sampling
             # params are identical as long as use_fixed_output_lengths == False.
             engine_task = asyncio.create_task(
-                env.engine.run_engine(sampling_params=env.requests[0].sampling_params, verbose=False)
+                env.engine.run_engine(
+                    sampling_params=env.requests[0].sampling_params, verbose=False
+                )
             )
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
@@ -837,7 +839,9 @@ class TestDynamicInferenceEngine:
 
             # Verify that all request outputs were set.
             for request_id, fut in request_completion_futures.items():
-                num_tokens_to_generate = env.requests[request_id].sampling_params.num_tokens_to_generate
+                num_tokens_to_generate = env.requests[
+                    request_id
+                ].sampling_params.num_tokens_to_generate
                 result = fut.result()
                 assert result.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "

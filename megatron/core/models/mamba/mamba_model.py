@@ -12,6 +12,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -254,7 +255,7 @@ class MambaModel(LanguageModule):
                     # because we need to slice the last token logits from the full view of the
                     # packed logits across all requests.
                     hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.model_comm_pgs.tp
+                        hidden_states, group=self.pg_collection.tp
                     )
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
