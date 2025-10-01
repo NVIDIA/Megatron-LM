@@ -986,7 +986,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if config.qk_clip:
             # TE 2.9.0 introduces return_max_score for qk-clip getting the max attention score
             extra_kwargs["return_max_score"] = True
-            self.qk_clip_balancing_eta = None
+            self.max_attention_score = None
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
@@ -1048,7 +1048,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 # Update Q K outside of TE Attention API
 
                 # Forward pass and get max attention score
-                core_attn_out, max_attention_score = super().forward(
+                core_attn_out, batch_max_attention_scores = super().forward(
                     query,
                     key,
                     value,
@@ -1058,11 +1058,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     **packed_seq_kwargs,
                 )
 
+                assert batch_max_attention_scores.shape == (1, self.config.num_attention_heads, 1), "batch_max_attention_scores shape is not (1, n, 1)"
+
                 # Update QK_Clip balancing eta
-                self.max_attention_score = max_attention_score.item()
-                self.qk_clip_balancing_eta = min(
-                    self.config.qk_clip_balancing_threshold / self.max_attention_score, 1.0)
-                )
+                if self.max_attention_score is None:
+                    self.max_attention_score = batch_max_attention_scores
+                else:
+                    self.max_attention_score = torch.max(
+                        self.max_attention_score, batch_max_attention_scores
+                    )
             else:
                 core_attn_out = super().forward(
                     query,

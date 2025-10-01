@@ -781,13 +781,6 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
-        # For qk_clip
-        if self.config.qk_clip and self.core_attention.qk_clip_balancing_eta is not None and self.core_attention.qk_clip_balancing_eta > 1.0:
-            # qk_clip_balancing_alpha is 0.5 by default which makes the query and key scaled by the 
-            # same amount
-            query = query * (self.core_attention.qk_clip_balancing_eta ** self.config.qk_clip_balancing_alpha)
-            key = key * (self.core_attention.qk_clip_balancing_eta ** (1 - self.config.qk_clip_balancing_alpha))
-
         # ==================================
         # core attention computation
         # ==================================
@@ -856,6 +849,14 @@ class Attention(MegatronModule, ABC):
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
+
+    def qk_clip(self):
+        """
+        qk_clip is a technique to clip the query and key attention scores to prevent the attention
+        scores from exploding. Per MuonClip usage, we update the weight by calling this function
+        after Muon optimizer step. It is implemented in the subclass MLASelfAttention.
+        """
+        raise NotImplementedError("qk_clip is not implemented.")
 
 
 class SelfAttention(Attention):
