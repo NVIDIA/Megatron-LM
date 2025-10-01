@@ -1,3 +1,7 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+import math
+
 import pytest
 import torch
 
@@ -868,3 +872,47 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
+
+    def test_unified_memory(self):
+        from megatron.core.inference.unified_memory import has_unified_memory
+
+        if not has_unified_memory:
+            pytest.skip("Unified memory not available due to bad environment.")
+
+        self._setup_model_parallel_group(1, 1)
+
+        # Compute number of contexts needed to fill GPU memory.
+        gpu_size_gb = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
+        )
+        buffer_size_gb = 20
+        num_contexts = math.ceil(gpu_size_gb / buffer_size_gb) + 1
+
+        # Allocate enough contexts to fill GPU memory.
+        def init_contexts(*, unified_memory_level):
+            contexts = []
+            for i in range(num_contexts):
+                contexts.append(
+                    DynamicInferenceContext(
+                        params_dtype=torch.float32,
+                        num_layers=4,
+                        kv_channels=8,
+                        num_attention_heads=2,
+                        max_sequence_length=512,
+                        buffer_size_gb=buffer_size_gb,
+                        buffer_overflow_factor=1,
+                        buffer_guaranteed_fraction=0,
+                        unified_memory_level=unified_memory_level,
+                    )
+                )
+
+        # Pure GPU memory test should OOM.
+        try:
+            init_contexts(unified_memory_level=0)
+        except torch.OutOfMemoryError:
+            pass
+        else:
+            raise Exception("expected OOM.")
+
+        # Unified memory test should succeed.
+        init_contexts(unified_memory_level=1)

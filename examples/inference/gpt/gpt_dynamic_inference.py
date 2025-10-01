@@ -153,6 +153,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
+        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
 
     return context
