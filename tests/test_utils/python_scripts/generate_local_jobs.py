@@ -91,7 +91,7 @@ def main(
             pathlib.Path.cwd()
             / "test_cases"
             / workload.spec["model"]
-            / f"{workload.spec["test_case"]}.sh"
+            / f"{workload.spec['test_case']}.sh"
         )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as fh:
