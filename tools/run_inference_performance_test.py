@@ -171,7 +171,7 @@ async def generate(
         tokenizer = get_tokenizer()
         prompts = [tokenizer.detokenize(request.prompt_tokens) for request in inference_requests]
 
-    request_ids: List[str] = [
+    request_ids: List[int] = [
         inference_engine.add_request(
             prompt=prompt,
             inference_request=inference_request,

@@ -22,11 +22,23 @@ from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
 
 try:
+    from .fused_kv_append_kernel import triton_append_key_value_cache
+except ImportError:
+    triton_append_key_value_cache = None
+
+try:
     from packaging.version import Version as PkgVersion
 
     HAVE_PACKAGING = True
 except:
     HAVE_PACKAGING = False
+
+try:
+    import flashinfer  # pylint: disable=unused-import
+
+    HAVE_FLASHINFER = True
+except ImportError:
+    HAVE_FLASHINFER = False
 
 
 class ContextOverflowError(Exception):
@@ -153,6 +165,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             are materialized in the context.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
         engine steps.
+        use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
+        If None, defaults to using flash-infer if available.
     """
 
     def __init__(
@@ -176,6 +190,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: bool = True,
         use_cuda_graphs_for_non_decode_steps: bool = True,
+        use_flashinfer_fused_rope: bool = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -236,7 +251,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         if max_requests_override is not None:
-            self.max_requests = self.round_up_requests(max_requests_override, tp_size=tp_size)
+            self.max_requests = (
+                max_requests_override
+                if max_requests_override < self.REQUEST_ROUNDER
+                else self.round_up_requests(max_requests_override, tp_size=tp_size)
+            )
 
         if max_tokens_override is not None:
             self.max_tokens = self.round_up_tokens(max_tokens_override, tp_size=tp_size)
@@ -416,6 +435,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention state.
         self.reset_attention_state()
 
+        if use_flashinfer_fused_rope is True:
+            assert HAVE_FLASHINFER, "flashinfer is not installed"
+        elif use_flashinfer_fused_rope is None:
+            use_flashinfer_fused_rope = HAVE_FLASHINFER
+        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
@@ -522,6 +547,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
+        if triton_append_key_value_cache is not None and not self.cache_mla_latent:
+            # currently does not support MLA latent cache
+            return triton_append_key_value_cache(
+                layer_number=layer_number,
+                key=key,
+                value=value,
+                memory_buffer=self.memory_buffer,
+                padded_active_token_count=self.padded_active_token_count,
+                token_to_chunk_idx=self.token_to_chunk_idx,
+                token_to_local_position_within_kv_chunk=self.token_to_local_position_within_kv_chunk,
+            )
 
         block_idx = self.token_to_block_idx[: self.padded_active_token_count]
         local_kv_seq_idx = self.token_to_local_position_within_kv_block[
@@ -568,6 +604,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.memory_buffer[1, layer_number - 1],
                 self.block_table,
             )
+
+    def apply_fused_qk_rotary_emb(
+        self, query: Tensor, key: Tensor, cos_sin_emb: Tensor, config: TransformerConfig
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Apply rotary embedding to query and key tensors using flashinfer's fused rope.
+        Args:
+            query (Tensor): Query tensor.
+            key (Tensor): Key tensor.
+            cos_sin_emb (Tensor): Rotary embeddings.
+            config (TransformerConfig): Transformer config.
+
+        Return:
+            (Tuple[Tensor, Tensor]) Query and Key tensors after applying rotary embeddings.
+        """
+        assert self.use_flashinfer_fused_rope, "flashinfer fused rope is not enabled"
+        n = self.padded_active_token_count
+        num_q_heads, head_size = query.shape[-2], query.shape[-1]
+        num_k_heads = key.shape[-2]
+
+        # use .view instead of .reshape to avoid extra transpose operations
+        query_rope, key_rope = flashinfer.rope.apply_rope_with_cos_sin_cache(
+            positions=self.token_to_pos_ids[:n],
+            query=query[:n].reshape(n, num_q_heads * head_size),
+            key=key[:n].reshape(n, num_k_heads * head_size),
+            head_size=head_size,
+            cos_sin_cache=cos_sin_emb,
+            is_neox=not config.rotary_interleaved,
+        )
+        return query_rope.reshape(n, 1, num_q_heads, head_size), key_rope.reshape(
+            n, 1, num_k_heads, head_size
+        )
 
     def apply_rotary_emb_query(
         self,
@@ -879,6 +947,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
 
+        # Reset chunked prefill state
+        self.chunked_prefill_request_id = -1
+
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -1081,6 +1152,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+
+    def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
+        """
+        Swaps all the relevent booking tensors with src idxs to dst idxs
+        """
+        tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
+        tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_ids, src_idxs, dst_idxs)
+        tensor_swap(next_tokens, src_idxs, dst_idxs)
+        tensor_swap(self.request_to_kv_chunk_ids, src_idxs, dst_idxs)
+        tensor_swap(self.request_kv_chunk_counts, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_kv_chunk_id, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_kv_chunk_offset, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:

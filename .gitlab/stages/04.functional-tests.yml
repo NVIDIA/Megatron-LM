@@ -202,12 +202,16 @@ functional:x_notify:
     - purpose/utility
     - team/megatron
   variables:
-    WEBHOOK_URL: ${MCORE_NOTIFICATION_HOOK}
     RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
     CONTEXT: $FUNCTIONAL_TEST_SCOPE
   script:
     - env
-    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "dev" ]]; then
+        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
+      else
+        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+      fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE

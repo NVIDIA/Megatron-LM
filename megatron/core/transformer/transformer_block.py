@@ -520,6 +520,7 @@ class TransformerBlock(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -543,6 +544,10 @@ class TransformerBlock(MegatronModule):
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask for cross-attention context
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Tensor): Bias tensor for Q * K.T of shape in shape broadcastable
                 to [b, num_head, sq, skv], e.g. [1, 1, sq, skv].
                 Used as an alternative to apply attention mask for TE cuDNN attention.
@@ -649,6 +654,7 @@ class TransformerBlock(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             rotary_pos_cos=rotary_pos_cos,
                             rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
