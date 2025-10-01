@@ -35,7 +35,7 @@ def get_mtbench_chat_data():
         example["conversations"] = conversations
         return example
 
-    dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ["HF_TOKEN"])
+    dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ.get("HF_TOKEN", None))
     return dataset.map(mtbench_to_oai_chat)
 
 def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=True):

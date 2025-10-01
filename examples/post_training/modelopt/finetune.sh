@@ -67,6 +67,8 @@ if [ -z ${MLM_EVAL_ARGS} ]; then
     "
 fi
 
+export HF_TOKEN=${HF_TOKEN}
+
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
