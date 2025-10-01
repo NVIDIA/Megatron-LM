@@ -120,7 +120,7 @@ jobs:
       #     python-binary: ${{ env.UV_PROJECT_ENVIRONMENT }}/bin/python
 
   install-test-summary:
-    needs: [pre-flight, pip-test-bare-metal, pip-test-pytorch, uv-test-bare-metal, uv-test-pytorch]
+    needs: [pre-flight, pip-test-pytorch, uv-test-pytorch]
     runs-on: ubuntu-latest
     name: Install test summary
     if: |
