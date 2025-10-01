@@ -251,7 +251,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         if max_requests_override is not None:
-            self.max_requests = self.round_up_requests(max_requests_override, tp_size=tp_size)
+            self.max_requests = (
+                max_requests_override
+                if max_requests_override < self.REQUEST_ROUNDER
+                else self.round_up_requests(max_requests_override, tp_size=tp_size)
+            )
 
         if max_tokens_override is not None:
             self.max_tokens = self.round_up_tokens(max_tokens_override, tp_size=tp_size)
