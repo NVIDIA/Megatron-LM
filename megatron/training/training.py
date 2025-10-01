@@ -1404,6 +1404,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    # get max attention score for logging and run qk_clip()
+    # Part of MuonClip Optimizer step
+    if args.qk_clip:
+        log_max_attention_score = 0
+        for model_chunk in model:
+            for transformer_layer in model_chunk.module.module.decoder.layers:
+                if hasattr(transformer_layer.self_attention, 'qk_clip'):
+                    log_max_attention_score = max(log_max_attention_score, torch.max(transformer_layer.self_attention.core_attention.max_attention_score).item())
+                    transformer_layer.self_attention.qk_clip()
+            
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1475,8 +1486,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             exit_code,
             grad_norm,
             num_zeros_in_grad,
+            log_max_attention_score,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_score
 
 
 def training_log(
@@ -2415,6 +2427,7 @@ def train(
             exit_code,
             grad_norm,
             num_zeros_in_grad,
+            max_attention_score,
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
@@ -2507,9 +2520,11 @@ def train(
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
-        if args.log_max_attention_score and args.qk_clip:
-            # Get max attention score from model, only when qk_clip is enabled
-            max_attention_score = model[0].module.module.decoder.layers[0].self_attention.core_attention.max_attention_score
+        # if args.log_max_attention_score and args.qk_clip:
+        #     # Get max attention score from model, only when qk_clip is enabled
+        #     max_attention_score = model[0].module.module.decoder.layers[0].self_attention.core_attention.max_attention_score
+        #     for i in range(len(model[0].module.module.decoder.layers)):
+        #         max_attention_score = max(max_attention_score, model[0].module.module.decoder.layers[i].self_attention.core_attention.max_attention_score)
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,

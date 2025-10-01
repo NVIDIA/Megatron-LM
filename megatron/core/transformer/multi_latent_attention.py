@@ -783,15 +783,6 @@ class MLASelfAttention(MultiLatentAttention):
                     cp_group=self.pg_collection.cp,
                 )
 
-                # For qk_clip
-                if self.config.qk_clip and self.core_attention.qk_clip_balancing_eta is not None and self.core_attention.qk_clip_balancing_eta > 1.0:
-                    # qk_clip_balancing_alpha is 0.5 by default which makes the query and key scaled
-                    # by the same amount
-                    # k_pos_emb left untouched to avoid effect across heads
-                    q_no_pe = q_no_pe * (self.core_attention.qk_clip_balancing_eta ** self.config.qk_clip_balancing_alpha)
-                    k_no_pe = k_no_pe * (self.core_attention.qk_clip_balancing_eta ** (1 - self.config.qk_clip_balancing_alpha))
-                    q_pos_emb = q_pos_emb * self.core_attention.qk_clip_balancing_eta
-
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
@@ -946,3 +937,78 @@ class MLASelfAttention(MultiLatentAttention):
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
+
+    def qk_clip(self):
+        """
+        qk_clip is a technique to clip the query and key attention scores to prevent the attention
+        scores from exploding. Per MuonClip usage, we update the weight by calling this function
+        after Muon optimizer step.
+        """
+
+        if self.config.qk_clip and self.core_attention.max_attention_score is not None:
+            # qk_clip_balancing_alpha is 0.5 by default which makes the query and key scaled
+            # by the same amount
+
+            # only update the weight if any head has max_attention_score > qk_clip_balancing_threshold
+            if torch.any(
+                self.core_attention.max_attention_score > self.config.qk_clip_balancing_threshold
+            ):
+
+                # qk_clip_balancing_eta (1, n, 1)
+                assert self.core_attention.max_attention_score.shape == (1, self.config.num_attention_heads, 1), "max_attention_score shape is not (1, n, 1)"
+                self.qk_clip_balancing_eta = torch.clamp(
+                    self.config.qk_clip_balancing_threshold
+                    / self.core_attention.max_attention_score,
+                    min=1.0,
+                ).view(1, self.config.num_attention_heads, 1)
+
+                if self.config.q_lora_rank is None:
+                    # Update weight tensor: shape (h, n * (a + b))
+                    # where h = hidden_size, n = num_attention_heads, a = qk_head_dim, b = qk_pos_emb_head_dim
+                    weight = self.linear_q_proj.weight
+                else:
+                    # Update weight tensor: shape (q_lora_rank, n * (a + b))
+                    weight = self.linear_q_up_proj.weight
+
+                # Reshape to (-1, n, a + b)
+                weight_reshaped = weight.view(
+                    self.config.hidden_size,
+                    self.config.num_attention_heads,
+                    self.config.qk_head_dim + self.config.qk_pos_emb_head_dim,
+                )
+
+                # Split into qk_head_dim and qk_pos_emb_head_dim parts: (-1, n, a) and (-1, n, b)
+                weight_q_nope = weight_reshaped[:, :, : self.config.qk_head_dim]
+                weight_q_pe = weight_reshaped[:, :, self.config.qk_head_dim :]
+
+                # Clipping
+                weight_q_nope = weight_q_nope * torch.pow(
+                    self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha
+                )
+                weight_q_pe = weight_q_pe * self.qk_clip_balancing_eta
+
+                # Concatenate back and reshape to original shape
+                weight_updated = torch.cat([weight_q_nope, weight_q_pe], dim=-1)
+                weight_updated = weight_updated.view(
+                    self.config.hidden_size,
+                    self.config.num_attention_heads
+                    * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim),
+                )
+
+                # Apply the original scaling
+                if self.config.q_lora_rank is None:
+                    self.linear_q_proj.weight = weight_updated
+                else:
+                    self.linear_q_up_proj.weight = weight_updated
+
+                self.linear_kv_up_proj.weight = self.linear_kv_up_proj.weight * torch.pow(
+                    self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha
+                )
+
+            # reset max_attention_score
+            self.core_attention.max_attention_score = None
+
+        else:
+            raise ValueError(
+                "qk_clip option need to be enabled and max_attention_score is not None"
+            )
