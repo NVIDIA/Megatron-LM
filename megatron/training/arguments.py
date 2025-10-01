@@ -1394,7 +1394,7 @@ def _add_inference_args(parser):
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Total buffer size (GB) allocated for the blocked KV '
+                       help='Total buffer size (GB) allocated for the block-level KV '
                        'memory.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
@@ -1405,7 +1405,7 @@ def _add_inference_args(parser):
                        help='Space is reserved within the inference context '
                        'memory buffer to guarantee that a minimum number of '
                        'active requests will always be able to run to '
-                       'completion. This is to avoid the context being blocked '
+                       'completion. This is to avoid the context being deadlocked '
                        'by paused requests.')
     group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
                        type=float, default=None,

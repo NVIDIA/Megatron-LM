@@ -110,10 +110,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     to efficiently calculate and store the KV cache during inference.
 
     The dynamic inference context manages both: 1) in-flight batching, and 2) a
-    memory buffer for the blocked KV cache. For in-flight batching, requests of
+    memory buffer for the block-level KV cache. For in-flight batching, requests of
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
-    that the context is defined to support. For the blocked KV cache, a memory
+    that the context is defined to support. For the block-level KV cache, a memory
     buffer is allocated up front (size `buffer_size_gb`), that is divided into
     blocks and dynamically assigned to requests. At any given step, any unassigned
     blocks equate to unused space.
@@ -594,7 +594,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Return:
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
-            to blocks within the blocked memory buffer.
+            to blocks within the block-level memory buffer.
         """
         if self.cache_mla_latent:
             return (self.memory_buffer[layer_number - 1], None, self.block_table)
