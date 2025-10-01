@@ -263,29 +263,19 @@ def get_inference_context(
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
         ),
-        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         # >>>
-        # buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        # buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        # buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
-        # max_requests_override=args.inference_dynamic_batching_max_requests_override,
+        # chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+        # active_buffer_size_bytes=active_buffer_size_bytes,
         # +++
-        # active_buffer_size_gb=active_buffer_size_gb,
-        active_buffer_size_bytes=active_buffer_size_bytes,
-        # model=model,
+        chunk_size_tokens=4, # 256,
+        active_buffer_size_bytes=int(2 * 1024**2),
         # <<<
-        # >>>
-        # max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         max_tokens=max_tokens,
-        # <<<
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-        # >>>
-        # unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        # <<<
     )
 
     return context

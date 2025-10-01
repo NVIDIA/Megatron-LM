@@ -42,7 +42,7 @@ class ChunkAllocator:
     def __init__(self, active_count: int):
 
         active_count -= 1 # -1 for dummy_chunk_idx (see below)
-        self.total_count = 2 * active_count + 1
+        self.total_count = 2 * active_count + 1 # +1 for dummy_chunk_idx
         self.total_avail = self.total_count - 1 # -1 for dummy_chunk_idx
         self.active_count = active_count
         self.dummy_chunk_idx = self.total_count - 1
@@ -52,6 +52,12 @@ class ChunkAllocator:
             self.total_count,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
+        )
+
+    def __str__(self):
+        return (
+            f"total avail {self.total_avail} / {self.total_count - 1}"
+            f"; active {self.active_count}"
         )
 
     def is_memory_available(self, num_chunks: int) -> bool:

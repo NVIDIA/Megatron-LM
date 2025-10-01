@@ -92,6 +92,21 @@ class WarmupEngineMode(Enum):
     NON_DECODE = "non_decode"
 
 
+def get_mem_size_str(n_bytes: int) -> str:
+    """Convert number of bytes to human-readable string."""
+    for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (3, "KB"), (0, "bytes")):
+        nquery = int(1024**exp)
+        # >>>
+        # if n_bytes >= nquery:
+        #     return "%d %s" % (n_bytes // nquery, suffix)
+        # +++
+        if round(n_bytes / nquery) >= 1:
+            # return "%d %s" % (round(n_bytes / nquery), suffix)
+            return "%.3g %s" % (n_bytes / nquery, suffix)
+        # <<<
+    raise Exception("something went wrong.")
+
+
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
@@ -160,10 +175,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads: int,
         max_sequence_length: int,
         active_buffer_size_bytes: float,
-        # >>>
-        # model: torch.nn.Module,
         max_tokens: int,
-        # <<<
         chunk_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
         cache_mla_latent: bool = False,
@@ -209,14 +221,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * hidden_size_per_attention_head
             )
 
-        # Calculate the number of active chunks, and finalize the buffer size.
+        # Initialize chunk allocator.
+        # >>>
+        # active_buffer_size_bytes_0 = active_buffer_size_bytes
+        # <<<
         active_chunk_count_total = active_buffer_size_bytes // self.chunk_size_bytes
-        active_buffer_size_bytes = active_chunk_count_total * self.chunk_size_bytes
-        self.max_requests = active_chunk_count_total
+        self.chunk_allocator = ChunkAllocator(active_count=active_chunk_count_total)
+        del active_chunk_count_total # no accidental use; use chunk_allocator
+        # >>>
+        # active_buffer_size_bytes = active_chunk_count_total * self.chunk_size_bytes
+        active_buffer_size_bytes = self.chunk_allocator.active_count * self.chunk_size_bytes
+        # <<<
+
+        # >>>
+        # active_buffer_size_bytes_1 = active_buffer_size_bytes
+        # pax("active_chunk_count_total", {
+        #     "chunk_allocator" : self.chunk_allocator,
+        # }, "active_buffer_size_bytes_0, active_buffer_size_bytes_1")
+        # <<<
+
+        # Set max_requests, max_tokens.
+        # >>>
+        # self.max_requests = active_chunk_count_total
+        self.max_requests = self.chunk_allocator.active_count
+        # <<<
+        # >>>
+        # pax({
+        #     "chunk_allocator" : self.chunk_allocator,
+        #     "max_requests" : self.max_requests,
+        # })
+        # <<<
         self.max_tokens = max_tokens
 
-        # Initialize chunk allocator
-        self.chunk_allocator = ChunkAllocator(active_count=active_chunk_count_total)
         # >>>
         # pax({"chunk_allocator": self.chunk_allocator})
         # <<<
@@ -389,10 +425,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         # self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-        # Store the dummy chunk idx reference for convenience
-        self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
+        # >>>
+        # # Store the dummy chunk idx reference for convenience
+        # self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
+        # <<<
+
         # Reset attention state.
         self.reset_attention_state()
+
+        # >>>
+        # Print info.
+        print("DynamicInferenceContext: allocated context with active buffer size %s (%d chunks)." % (
+            get_mem_size_str(active_buffer_size_bytes),
+            self.chunk_allocator.active_count,
+        ))
+        # <<<
+
+        # >>>
+        # print("~~~\nexiting ..."); exit()
+        # <<<
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
@@ -715,7 +766,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Update token position indexes.
         self.token_to_chunk_idx[self.active_token_count : self.padded_active_token_count] = (
-            self.dummy_chunk_idx
+            self.chunk_allocator.dummy_chunk_idx
         )
         self.token_to_local_position_within_kv_chunk[
             self.active_token_count : self.padded_active_token_count
@@ -998,6 +1049,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.active_token_count += context_length
 
+        # >>>
+        print(f"++++++++ chunk allocator ... {self.chunk_allocator}.")
+        # pax({"max_requests": self.max_requests})
+        # <<<
+
     def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
@@ -1223,6 +1279,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # requests are newly paused during this update.
         if newly_paused_request_ids is not None and resume_request_count > 0:
             newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
+        # >>>
+        if newly_paused_request_ids is not None and newly_paused_request_ids.numel() > 0:
+            pax("newly_paused_request_ids")
+        # <<<
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
