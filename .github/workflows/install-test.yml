@@ -76,7 +76,7 @@ jobs:
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     runs-on: linux-amd64-cpu16
-    name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC PyTorch
+    name: Pip - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
       image: nvcr.io/nvidia/pytorch:25.05-py3
     environment: nemo-ci
@@ -84,9 +84,6 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        extra-groups: ["", "recipes"]
-    env:
-      EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -100,7 +97,7 @@ jobs:
           echo "PATH=$HOME/.local/bin:$PATH:$CUDA_HOME/bin" | tee -a "$GITHUB_ENV"
           echo "TORCH_CUDA_ARCH_LIST=6.0;6.1;7.0;7.5;8.0;8.6;9.0" | tee -a "$GITHUB_ENV"
 
-      - name: Install megatron-core${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+      - name: Install megatron-core
         shell: bash -x -e -u -o pipefail {0}
         run: bash docker/common/install.sh --environment dev --base-image pytorch --python-version ${{ matrix.python-version }}
 
