@@ -949,13 +949,17 @@ class MLASelfAttention(MultiLatentAttention):
             # qk_clip_balancing_alpha is 0.5 by default which makes the query and key scaled
             # by the same amount
 
-            # only update the weight if any head has max_attention_score > qk_clip_balancing_threshold
+            # only update the weight if any head has
+            # max_attention_score > qk_clip_balancing_threshold
             if torch.any(
                 self.core_attention.max_attention_score > self.config.qk_clip_balancing_threshold
             ):
 
                 # qk_clip_balancing_eta (1, n, 1)
-                assert self.core_attention.max_attention_score.shape == (1, self.config.num_attention_heads, 1), "max_attention_score shape is not (1, n, 1)"
+                assert self.core_attention.max_attention_score.shape == (
+                    self.config.num_attention_heads,
+                ), f"max_attention_score shape is not (n, ) \
+                    but {self.core_attention.max_attention_score.shape}"
                 self.qk_clip_balancing_eta = torch.clamp(
                     self.config.qk_clip_balancing_threshold
                     / self.core_attention.max_attention_score,
@@ -964,7 +968,8 @@ class MLASelfAttention(MultiLatentAttention):
 
                 if self.config.q_lora_rank is None:
                     # Update weight tensor: shape (h, n * (a + b))
-                    # where h = hidden_size, n = num_attention_heads, a = qk_head_dim, b = qk_pos_emb_head_dim
+                    # where h = hidden_size, n = num_attention_heads, a = qk_head_dim,
+                    # b = qk_pos_emb_head_dim
                     weight = self.linear_q_proj.weight
                 else:
                     # Update weight tensor: shape (q_lora_rank, n * (a + b))
