@@ -170,12 +170,15 @@ def destroy_global_state():
     destroy_rerun_state_machine()
 
 
-def print_datetime(string):
-    """Note that this call will sync across all ranks."""
+def print_datetime(string, override_timestamp=None):
+    """Note that this call will sync across all ranks. Use override_timestamp if provided;
+       otherwise use current timestamp."""
     torch.distributed.barrier()
-    time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if override_timestamp is None:
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    else:
+        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
-
 
 def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
@@ -634,6 +637,13 @@ def pretrain(
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
 
+    timestamp_after_inprocess_setup = time.time()
+
+    # Early fault tolerance setup - must be done before initialize_megatron
+    # to enable monitoring of the initialization process
+    ft_integration.setup()
+    timestamp_after_in_job_setup = time.time()
+
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
         extra_args_provider=extra_args_provider,
@@ -643,17 +653,15 @@ def pretrain(
         store=store,
     )
 
+    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
+    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
+    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
+
     args = get_args()
     timers = get_timers()
 
     if args.log_progress:
         append_to_progress_log("Starting job")
-
-    # Initialize fault tolerance
-    # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
-    if args.enable_ft_package:
-        ft_integration.setup(args)
-        ft_integration.maybe_setup_simulated_fault()
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
