@@ -12,13 +12,17 @@ while [[ $# -gt 0 ]]; do
         PYTHON_VERSION="$2"
         shift 2
         ;;
+    --environment)
+        ENVIRONMENT="$2"
+        shift 2
+        ;;
     --use-uv)
         USE_UV="true"
         shift 1
         ;;
     *)
         echo "Unknown option: $1"
-        echo "Usage: $0 --base-image {pytorch|ubuntu} [--use-uv] [--python-version]"
+        echo "Usage: $0 --base-image {pytorch|ubuntu} [--use-uv] [--python-version] [--environment]"
         exit 1
         ;;
     esac
@@ -33,15 +37,21 @@ if [[ -z "${USE_UV:-}" ]]; then
 fi
 
 # Validate base image argument
-if [[ -z "${BASE_IMAGE:-}" ]]; then
+if [[ -z "${BASE_IMAGE:-}" || -z "${ENVIRONMENT:-}" ]]; then
     echo "Error: --base-image argument is required"
-    echo "Usage: $0 --base-image {pytorch|ubuntu}"
+    echo "Usage: $0 --base-image {pytorch|ubuntu} --environment {dev|lts}"
     exit 1
 fi
 
 if [[ "$BASE_IMAGE" != "pytorch" && "$BASE_IMAGE" != "ubuntu" ]]; then
     echo "Error: --base-image must be either 'pytorch' or 'ubuntu'"
     echo "Usage: $0 --base-image {pytorch|ubuntu}"
+    exit 1
+fi
+
+if [[ "$ENVIRONMENT" != "dev" && "$ENVIRONMENT" != "lts" ]]; then
+    echo "Error: --environment must be either 'dev' or 'lts'"
+    echo "Usage: $0 --environment {dev|lts}"
     exit 1
 fi
 
@@ -116,7 +126,7 @@ main() {
         uv sync \
             --link-mode copy \
             --locked \
-            --all-extras \
+            --extra ${ENVIRONMENT} \
             --all-groups ${UV_ARGS[@]}
 
         # Install the package

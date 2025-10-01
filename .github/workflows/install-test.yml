@@ -55,7 +55,7 @@ jobs:
           echo "TORCH_CUDA_ARCH_LIST=6.0;6.1;7.0;7.5;8.0;8.6;9.0" | tee -a "$GITHUB_ENV"
 
       - name: Install project
-        run: bash docker/common/install.sh --base-image ubuntu --python-version ${{ matrix.python-version }}
+        run: bash docker/common/install.sh --environment dev --base-image ubuntu --python-version ${{ matrix.python-version }}
 
       - name: Checkout check-imports
         uses: actions/checkout@v4
@@ -102,7 +102,7 @@ jobs:
 
       - name: Install megatron-core${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
         shell: bash -x -e -u -o pipefail {0}
-        run: bash docker/common/install.sh --base-image pytorch --python-version ${{ matrix.python-version }}
+        run: bash docker/common/install.sh --environment dev --base-image pytorch --python-version ${{ matrix.python-version }}
 
       - name: Checkout check-imports
         uses: actions/checkout@v4
@@ -148,7 +148,7 @@ jobs:
 
       - name: Install project
         shell: bash
-        run: bash docker/common/install.sh --base-image pytorch --use-uv
+        run: bash docker/common/install.sh --environment dev --base-image pytorch --use-uv
 
       # NGC PyTorch 25.05 has a version of triton that is broken on CPU only machines.
       # - name: Checkout check-imports
@@ -195,7 +195,7 @@ jobs:
       - name: Install project
         shell: bash
         run: |
-          bash docker/common/install.sh --base-image ubuntu --use-uv
+          bash docker/common/install.sh --environment dev --base-image ubuntu --use-uv
           uv run python -m ensurepip --upgrade
           ln -sf /opt/venv/bin/pip3 /opt/venv/bin/pip
 
