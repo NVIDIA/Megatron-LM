@@ -589,6 +589,11 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+        torch.cuda.memory._record_memory_history(
+            max_entries=1000000,
+        )
+
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -1625,7 +1630,7 @@ def training_log(
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
-        if report_memory_flag:
+        if report_memory_flag and iteration == 10:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
@@ -2172,6 +2177,15 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        if args.profile and torch.distributed.get_rank() in args.profile_ranks and iteration == 3:
+            try:
+                comment = os.getenv("COMMENT")
+                model_name = os.getenv("MODEL")
+                memory_snapshot_path = f"/lustre/fsw/coreai_devtech_all/hongbinl/cpu_offloading/megatron-moe-scripts/pyt_profile/{model_name}_{comment}"
+                torch.cuda.memory._dump_snapshot(f"{memory_snapshot_path}.pickle")
+                print_rank_0(f"Captured memory snapshot at {memory_snapshot_path}.pickle")
+            except Exception as e:
+                print_rank_0(f"Failed to capture memory snapshot {e}")
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
                 prof.step()
