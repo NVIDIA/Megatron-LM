@@ -2,6 +2,7 @@
 
 import math
 import warnings
+from contextlib import nullcontext
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -12,6 +13,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
@@ -164,7 +166,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         materialize_only_last_token_logits (bool): If True, only the last token logits
             are materialized in the context.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
-        engine steps.
+            engine steps.
+        unified_memory_level (Optional[int]): Set unified memory usage within the
+            dynamic inference context. The levels are: 0) no unified memory, 1)
+            allocate `memory_buffer` in unified memory. Eventually, additional
+            levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
         If None, defaults to using flash-infer if available.
     """
@@ -191,6 +197,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         materialize_only_last_token_logits: bool = True,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
+        unified_memory_level: Optional[int] = 0,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -266,6 +273,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = params_dtype
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
+        self.unified_memory_level = unified_memory_level
+        if unified_memory_level > 0:
+            if not has_unified_memory and torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    "Unified memory requested but not available; defaulting to GPU memory."
+                )
+                self.unified_memory_level = 0
+            else:
+                self.unified_memory_mempool = create_unified_mempool()
 
         self.total_request_count = 0
         self.active_token_count = 0
@@ -306,27 +322,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
 
         # Memory buffer.
-        if cache_mla_latent:
-            self.memory_buffer = torch.full(
-                (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
-                -1,
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            self.memory_buffer = torch.full(
-                (
-                    2,  # key and value
-                    self.num_layers,
-                    chunk_count_total,
-                    self.chunk_size_tokens,
-                    num_attention_heads_per_partition,
-                    hidden_size_per_attention_head,
-                ),
-                -1,
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
+        ctx_manager = (
+            torch.cuda.use_mem_pool(self.unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
+        with ctx_manager:
+            if cache_mla_latent:
+                self.memory_buffer = torch.full(
+                    (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.full(
+                    (
+                        2,  # key and value
+                        self.num_layers,
+                        chunk_count_total,
+                        self.chunk_size_tokens,
+                        num_attention_heads_per_partition,
+                        hidden_size_per_attention_head,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
