@@ -41,6 +41,7 @@ if [ -z ${OSL} ]; then
     STEPS=64
 fi
 
+export HF_TOKEN=${HF_TOKEN}
 
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/validate.py \
     ${MODEL_ARGS} \
