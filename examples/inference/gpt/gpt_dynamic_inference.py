@@ -507,7 +507,7 @@ def main():
 
     # >>>
     print_mem("engine")
-    exit()
+    # exit()
     # <<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)

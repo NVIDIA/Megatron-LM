@@ -622,7 +622,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
+                "reqs: %d [ active %d, paused %d, finished %d ] ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.step_count,
@@ -641,7 +641,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     prev_total_request_count,
-                    context.gtd_request_count,
                     prev_total_request_count - prev_paused_request_count,
                     prev_paused_request_count,
                     self.finished_request_count,

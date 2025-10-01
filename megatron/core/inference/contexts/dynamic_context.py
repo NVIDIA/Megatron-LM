@@ -216,9 +216,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_tokens = max_tokens
 
         # Initialize chunk allocator
-        self.chunk_allocator = ChunkAllocator(active_count_total=active_chunk_count_total)
+        self.chunk_allocator = ChunkAllocator(active_count=active_chunk_count_total)
         # >>>
-        pax({"chunk_allocator": self.chunk_allocator})
+        # pax({"chunk_allocator": self.chunk_allocator})
         # <<<
 
         # Initialize context state.
@@ -269,7 +269,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         with torch.cuda.use_mem_pool(self.unified_memory_mempool):
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
-                    (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
+                    (
+                        self.num_layers,
+                        self.chunk_allocator.total_count,
+                        self.chunk_size_tokens,
+                        kv_reduced_dim,
+                    ),
                     -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -279,7 +284,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         2,  # key and value
                         self.num_layers,
-                        chunk_count_total,
+                        self.chunk_allocator.total_count,
                         self.chunk_size_tokens,
                         num_attention_heads_per_partition,
                         hidden_size_per_attention_head,
@@ -943,7 +948,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Preallocate chunks.
         num_chunks_needed = math.ceil(context_length / self.chunk_size_tokens)
-        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed, safe=True)
+        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
         if new_chunk_ids is None:
             raise ChunkOverflowError(request_id)
 
@@ -1183,16 +1188,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We determine how many requests we can resume and resume them
         # Assign released chunks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        num_non_gtd_chunks = max(0, self.chunk_allocator.chunk_count_avail - self.gtd_chunk_count)
-        if num_non_gtd_chunks:
-            # if we have non-gtd chunks, use them. Do not dip into the gtd-chunk pool
-            resume_request_count = min(num_non_gtd_chunks, self.paused_request_count)
-        else:
-            # only dip into the gtd-chunk pool if we have run out of non-gtd-chunks and the active
-            # request count has fallen below a certain threshold.
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # num_non_gtd_chunks = max(0, self.chunk_allocator.chunk_count_avail - self.gtd_chunk_count)
+        # if num_non_gtd_chunks:
+        #     # if we have non-gtd chunks, use them. Do not dip into the gtd-chunk pool
+        #     resume_request_count = min(num_non_gtd_chunks, self.paused_request_count)
+        # else:
+        #     # only dip into the gtd-chunk pool if we have run out of non-gtd-chunks and the active
+        #     # request count has fallen below a certain threshold.
+        #     resume_request_count = min(
+        #         max(self.gtd_request_count - active_request_count, 0), self.paused_request_count
+        #     )
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        if active_request_count < self.chunk_allocator.active_count:
             resume_request_count = min(
-                max(self.gtd_request_count - active_request_count, 0), self.paused_request_count
+                # >>>
+                # self.chunk_allocator.active_avail,
+                # <<<
+                self.chunk_allocator.active_count - active_request_count,
+                self.paused_request_count,
             )
+        else:
+            resume_request_count = 0
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
