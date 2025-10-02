@@ -7,7 +7,7 @@ import warnings
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -34,6 +34,39 @@ else:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
+class _ReduceScatterWithFP32AccumulationWorkHandle:
+    """Work handle to return to user when using reduce_scatter_with_fp32_accumulation with
+    async_op=True."""
+
+    def __init__(
+        self,
+        all_to_all_handle: Any,
+        all_to_all_output_tensor: torch.Tensor,
+        output_tensor: torch.Tensor,
+        world_size: int,
+    ):
+        """Initialize WorkHandle object."""
+        self.all_to_all_handle = all_to_all_handle
+        self.all_to_all_output_tensor = all_to_all_output_tensor
+        self.output_tensor = output_tensor
+        self.world_size = world_size
+
+    def wait(self):
+        """Wait until communication (and associated computation) is completed."""
+        # Wait for communication to complete if needed.
+        if self.all_to_all_handle is not None:
+            self.all_to_all_handle.wait()
+
+        # Accumulate into a fp32 sum.
+        output_tensor_in_fp32 = torch.sum(
+            self.all_to_all_output_tensor.view((self.world_size, -1)), dim=0, dtype=torch.float32
+        )
+        assert output_tensor_in_fp32.dtype == torch.float32
+
+        # Copy downcasted sum into output_tensor.
+        self.output_tensor.copy_(output_tensor_in_fp32)
+
+
 def reduce_scatter_with_fp32_accumulation(
     output_tensor: torch.Tensor,
     input_tensor: torch.Tensor,
@@ -56,9 +89,6 @@ def reduce_scatter_with_fp32_accumulation(
     """
     # Make sure arguments conform to the implementation.
     assert op == torch.distributed.ReduceOp.SUM
-    assert (
-        not async_op
-    ), "async_op=True is not supported yet in reduce_scatter_with_fp32_accumulation"
 
     # Get world_size.
     if group is None:
@@ -73,16 +103,18 @@ def reduce_scatter_with_fp32_accumulation(
     all_to_all_handle = torch.distributed.all_to_all_single(
         output=all_to_all_output_tensor, input=input_tensor, group=group, async_op=async_op
     )
-    assert all_to_all_handle is None  # Since async_op is False.
 
-    # Accumulate into a fp32 sum.
-    output_tensor_in_fp32 = torch.sum(
-        all_to_all_output_tensor.view((world_size, -1)), dim=0, dtype=torch.float32
+    # Create a work handle to finish communication and reduction.
+    reduce_scatter_handle = _ReduceScatterWithFP32AccumulationWorkHandle(
+        all_to_all_handle, all_to_all_output_tensor, output_tensor, world_size
     )
-    assert output_tensor_in_fp32.dtype == torch.float32
-
-    # Copy downcasted sum into output_tensor.
-    output_tensor.copy_(output_tensor_in_fp32)
+    if async_op:
+        # Return work handle; consumers can call .wait() to ensure communication and associated
+        # reduction complete.
+        return reduce_scatter_handle
+    else:
+        # Wait on work handle.
+        reduce_scatter_handle.wait()
 
 
 class BufferType(Enum):
@@ -434,6 +466,7 @@ class _ParamAndGradBucketGroup:
             communication_group = self.data_parallel_group
 
         # Coalesce communication kernels across buckets in the bucket group.
+        grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
@@ -447,7 +480,7 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    dist_reduce_scatter_func(
+                    grad_reduce_handle = dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
@@ -486,7 +519,16 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            self.grad_reduce_handle = cm
+            if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+                assert (
+                    len(self.buckets) == 1
+                ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
+                # torch.distributed._coalescing_manager does not correctly handle calling our custom
+                # collective handle's .wait() method, so we take matters into our own hands here.
+                assert grad_reduce_handle is not None
+                self.grad_reduce_handle = grad_reduce_handle
+            else:
+                self.grad_reduce_handle = cm
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
