@@ -289,6 +289,9 @@ class TransformerConfig(ModelParallelConfig):
     use_fused_weighted_squared_relu: bool = False
     """If True, uses fused weighted squared relu kernel when using MoE."""
 
+    fused_single_qkv_rope: bool = False
+    """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
+
     ####################
     # activation recomputation
     ####################
