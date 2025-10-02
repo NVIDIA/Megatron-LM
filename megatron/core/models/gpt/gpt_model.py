@@ -387,7 +387,7 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching
             if inference_context.is_dynamic_batching():
-                decoder_input[inference_context.get_padding_slice()] = 0.0
+                decoder_input[inference_context.padding_slice] = 0.0
 
             # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
             # reference held by this caller function, enabling early garbage collection for

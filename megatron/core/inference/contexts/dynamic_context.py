@@ -539,10 +539,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count = (active_requests_mask == 1).sum().item()
         return active_request_count
 
-    def get_padding_slice(self):
-        """Returns an index slice corresponding to the current padding tokens."""
-        return slice(self.active_token_count, self.padded_active_token_count)
-
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
@@ -795,6 +791,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.padded_active_token_count = min(
                     self.padded_active_token_count, self.max_requests
                 )
+        self.padding_slice = slice(active_token_count, self.padded_active_token_count)
 
         # How are we calculating the padded active request count?
         # Case 1: Using cuda graphs:

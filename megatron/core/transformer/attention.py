@@ -858,7 +858,7 @@ class Attention(MegatronModule, ABC):
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
                 # Clear the outputs for padding tokens
-                core_attn_out[inference_context.get_padding_slice()] = 0.0
+                core_attn_out[inference_context.padding_slice] = 0.0
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
