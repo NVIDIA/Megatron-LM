@@ -32,5 +32,5 @@ MODEL_ARGS=" \
     --rotary-percent 1.0 \
     --rotary-base 500000 \
     --use-rope-scaling \
-    --export-force-local-attention \
 "
+#    --export-force-local-attention \

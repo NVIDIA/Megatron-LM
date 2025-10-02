@@ -205,7 +205,7 @@ class TestStaticInferenceEngine:
         sampling_params = SamplingParams(
             num_tokens_to_generate=num_tokens_to_generate, return_log_probs=True
         )
-        request_ids: List[str] = [
+        request_ids: List[int] = [
             self.static_engine.add_request(
                 prompt, add_BOS=True, sampling_params=sampling_params, streaming=True
             )

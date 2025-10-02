@@ -52,8 +52,11 @@ spec:
       --log-dir {assets_dir}/logs/1/
 
     ls -al 
-    cp $TEST_PATH/.coverage_0 {assets_dir}/coverage_report
-    cp $TEST_PATH/coverage.xml {assets_dir}
+
+    cd $TEST_PATH
+    /opt/venv/bin/coverage xml 
+    cp .coverage {assets_dir}/coverage_report
+    cp coverage.xml {assets_dir}
 
 products:
   - test_case: [tests/unit_tests/data/]

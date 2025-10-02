@@ -24,7 +24,6 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_provider import model_provider
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
-from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import get_ltor_masks_and_position_ids, print_rank_0, unwrap_model
 
 warnings.filterwarnings('ignore')

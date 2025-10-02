@@ -147,6 +147,7 @@ def load_modelopt_checkpoint(
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
     elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
+
         force_pre_mcore_014 = not is_torch_min_version("2.6a0")
         if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
             logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
@@ -160,6 +161,7 @@ def load_modelopt_checkpoint(
             metadata = {"singleton_local_shards": True}
 
         sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix, metadata=metadata)
+
         if additional_sharded_prefix:
             unwrapped_model[0]._register_load_state_dict_pre_hook(
                 _remove_prefix_state_dict_pre_hook

@@ -20,7 +20,7 @@ class AsyncStream:
     Adopted from https://github.com/vllm-project/vllm/blob/eb881ed006ca458b052905e33f0d16dbb428063a/vllm/v1/engine/async_stream.py # pylint: disable=line-too-long
     """
 
-    def __init__(self, request_id: str, cancel: Callable[[str], None]) -> None:
+    def __init__(self, request_id: int, cancel: Callable[[str], None]) -> None:
         self._request_id = request_id
         self._cancel = cancel
         self._queue: asyncio.Queue = asyncio.Queue()

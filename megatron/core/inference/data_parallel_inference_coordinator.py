@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from collections import deque
 from itertools import cycle, repeat
 from typing import List, Tuple
@@ -98,7 +99,7 @@ class DataParallelInferenceCoordinator:
         self.router_socket.bind(f"tcp://0.0.0.0:{inference_coordinator_port}")
         self.data_parallel_size = data_parallel_size
 
-        print("Inference Coordinator: waiting for connections from data parallel ranks...")
+        logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
@@ -106,7 +107,7 @@ class DataParallelInferenceCoordinator:
             identity, _ = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
-        print("Inference Coordinator: Connected with data parallel ranks...")
+        logging.info("Inference Coordinator: Connected with data parallel ranks...")
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
 
         self.request_id_to_client_id = {}
@@ -148,6 +149,8 @@ class DataParallelInferenceCoordinator:
         finished_request_ids: List[int],
         generated_tokens: List[int],
         log_probs: List[int],
+        chunked_prefill_request_id: int = -1,
+        materialize_only_last_token_logits: bool = True,
     ):
         """
         Processes replies from the engine, appending tokens and handling finished requests.
@@ -163,6 +166,9 @@ class DataParallelInferenceCoordinator:
                 generation in this step.
             generated_tokens (List[int]): The list of new tokens, one for each ID in
                 `request_ids`.
+            log_probs (List[int]): Log probabilities for each token.
+            chunked_prefill_request_id (int): The request ID currently undergoing chunked prefill,
+                -1 if no chunked prefill is active.
         """
         # Todo [Siddharth]: This is duplicated logic from the engine.
         # We should refactor this to avoid duplication.
@@ -171,17 +177,52 @@ class DataParallelInferenceCoordinator:
             request_ids, generated_tokens, log_probs_iter
         ):
             request: DynamicInferenceRequest = self.requests[request_id]
-            request.generated_tokens.append(token)
-            if request_log_probs is not None:
-                # If prompt log probs is None we are in prefill
-                if request.prompt_log_probs is None:
-                    request.prompt_log_probs = request_log_probs
-                    request.generated_log_probs = []
-                else:
-                    request.generated_log_probs.extend(request_log_probs)
+            # Handle chunked prefill similar to the engine logic
+            if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
+                request.generated_tokens.append(token)
+
+                if request_log_probs is not None:
+                    if not request.prompt_log_probs:
+                        request.prompt_log_probs = []
+                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
+                    # If the request log probs span > 1 token we are in prefill
+                    if len(request_log_probs) > 1:
+                        request.prompt_log_probs.extend(request_log_probs)
+                    else:
+                        if (
+                            # If it is a chunked prefill request
+                            len(request.prompt_log_probs) > 0
+                            # And we are missing the last token for prefill
+                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
+                            # And we need to track full prefill
+                            and not materialize_only_last_token_logits
+                        ):
+                            assert (
+                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
+                            request.prompt_log_probs.extend(request_log_probs)
+                        else:
+                            request.generated_log_probs.extend(request_log_probs)
+            else:
+                # This is the chunked prefill request, handle log probs but don't append tokens
+                if request_log_probs is not None:
+                    if materialize_only_last_token_logits:
+                        # Here we discard intermediate log probs,
+                        # as we only materialize the last token log probs
+                        request.prompt_log_probs = []
+                        request.generated_log_probs = []
+                    else:
+                        # Otherwise, we gather log probs for all tokens
+                        if not request.prompt_log_probs:
+                            request.prompt_log_probs = []
+                        request.prompt_log_probs.extend(request_log_probs)
+                        request.generated_log_probs = []
 
         if finished_request_ids:
             for fid in finished_request_ids:
+                if fid == chunked_prefill_request_id:
+                    continue  # skip chunked prefill request, this is not a finished request
                 request = self.requests.pop(fid)
                 request.generated_length = len(request.generated_tokens)
                 request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
@@ -218,7 +259,9 @@ class DataParallelInferenceCoordinator:
 
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:
-                    print(f"Client {sender_identity} sent a duplicate connect request. Ignoring ..")
+                    logging.info(
+                        f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
+                    )
                     continue
 
                 # print(f"New client connected: {sender_identity}")
@@ -234,7 +277,9 @@ class DataParallelInferenceCoordinator:
 
                 # Message from a known client
                 if sender_identity not in known_clients:
-                    print(f"Received message from unknown client {sender_identity}. Ignoring.")
+                    logging.info(
+                        f"Received message from unknown client {sender_identity}. Ignoring."
+                    )
                     continue
                 # this is a message from a client.
                 # route it to a data parallel rank
@@ -283,10 +328,22 @@ class DataParallelInferenceCoordinator:
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                request_ids, finished_request_ids, generated_tokens, logprobs = (
-                    deserialized_payload[1:]
+                (
+                    request_ids,
+                    finished_request_ids,
+                    generated_tokens,
+                    logprobs,
+                    chunked_prefill_request_id,
+                    materialize_only_last_token_logits,
+                ) = deserialized_payload[1:]
+                self.postprocess(
+                    request_ids,
+                    finished_request_ids,
+                    generated_tokens,
+                    logprobs,
+                    chunked_prefill_request_id,
+                    materialize_only_last_token_logits,
                 )
-                self.postprocess(request_ids, finished_request_ids, generated_tokens, logprobs)
 
     @classmethod
     def entrypoint(
@@ -311,7 +368,7 @@ class DataParallelInferenceCoordinator:
         try:
             coordinator.start()
         except KeyboardInterrupt:
-            print("Coordinator process interrupted. Exiting...")
+            logging.info("Coordinator process interrupted. Exiting...")
             coordinator.stop()
 
     def stop(self):

@@ -14,6 +14,7 @@ from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.transformer.module import MegatronModule
 
 
+
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Common inference arguments."""
 
@@ -118,6 +119,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         help="This port will be used to setup the inference co-ordinator on node-0",
         default=12346
+    )
+    group.add_argument(
+        "--use-flashinfer-fused-rope",
+        action='store_true',
+        default=False,
+        help='Use flashinfer fused rope implementation.',
     )
 
     return parser

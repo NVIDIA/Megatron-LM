@@ -140,6 +140,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _kill_engine: bool = PrivateAttr(False)
 
     async def base_generate(self, request: InferenceRequest):
+
+        tokenizer = get_tokenizer()
+
         sampling_params = SamplingParams(
             num_tokens_to_generate=request.generation_args.max_tokens or 1024,
             temperature=request.generation_args.temperature or 1.0,
@@ -148,6 +151,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._coordinator.engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs_for_dynamic_inference=True,
+            add_BOS=tokenizer.bos is not None,
         )
         request_ids = [
             self._coordinator.schedule_request(prompt=prompt, sampling_params=sampling_params)

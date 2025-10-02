@@ -55,6 +55,10 @@ megatron/core/inference/
 [ParallelState] @mcore-reviewers/core-adlr @mcore-reviewers/core-nemo
 megatron/core/parallel_state.py
 
+[Post-Training] @mcore-reviewers/post-training
+megatron/core/post_training/
+megatron/post_training
+
 [CI][1] @mcore-reviewers/ci
 .gitlab/
 .github/

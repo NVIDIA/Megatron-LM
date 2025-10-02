@@ -67,3 +67,4 @@ popd
 
 # Copy unit test script
 cp megatron-lm/tests/unit_tests/run_ci_test.sh megatron-lm-legacy/tests/unit_tests/run_ci_test.sh
+cp megatron-lm/pyproject.toml megatron-lm-legacy/pyproject.toml

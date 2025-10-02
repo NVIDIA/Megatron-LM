@@ -71,25 +71,30 @@ class TextGenerationController:
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
 
-    def tokenize_prompt(
-        self, prompt: str, add_BOS: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Utility to tokenize the input prompts
+    def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
+        """Utility to tokenize the input prompts.
 
         Args:
-            prompt (str): The input prompt
+            prompt (str): The input prompt.
 
         Returns:
-            torch.Tensor: Returns the tokenized prompt
+            List[int]: Returns the tokenized prompt.
         """
+
         prompt_tokens = self.tokenizer.tokenize(prompt)
+
+        if add_BOS:
+            assert self.tokenizer.bos is not None
+
+        while prompt_tokens and prompt_tokens[0] == self.tokenizer.bos:
+            prompt_tokens.pop(0)
 
         if add_BOS:
             prompt_tokens = [self.tokenizer.bos] + prompt_tokens
 
         return prompt_tokens
 
-    def _detokenize(self, tokens: list[int], skip_special_tokens: bool = True) -> str:
+    def _detokenize(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
         """
         Detokenize a sequence of token IDs, handling skip_special_tokens for
         different tokenizer APIs.
@@ -598,9 +603,9 @@ class TextGenerationController:
     @torch.inference_mode()
     def generate_all_output_tokens_static_batch(
         self,
-        active_requests: OrderedDict[str, InferenceRequest],
+        active_requests: OrderedDict[int, InferenceRequest],
         active_streams: Optional[OrderedDict[str, AsyncStream]] = None,
-    ) -> OrderedDict[str, InferenceRequest]:
+    ) -> OrderedDict[int, InferenceRequest]:
         """Utility to generate all the output tokens and probabilities for the prompts.
 
         This utility generates the output tokens for a static batch. It runs the forward steps till
@@ -608,10 +613,10 @@ class TextGenerationController:
         the generated result and returns these requests
 
         Args:
-            active_requests (OrderedDict[str, InferenceRequest]): The input active requests.
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests.
 
         Returns:
-            OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
+            OrderedDict[int, InferenceRequest]: The result for each of the incoming requests
         """
         assert all(request.prompt_tokens is not None for request in active_requests.values())
 
@@ -713,7 +718,7 @@ class TextGenerationController:
                 for (i, request_id) in enumerate(active_requests.keys())
                 if request_id in active_streams
             ]
-            streaming_request_ids: List[str] = list(active_streams.keys())
+            streaming_request_ids: List[int] = list(active_streams.keys())
             streams: List[AsyncStream] = list(active_streams.values())
             streaming_requests: List[InferenceRequest] = [
                 active_requests[request_id] for request_id in streaming_request_ids
@@ -1059,14 +1064,14 @@ class TextGenerationController:
     def prep_inference_input(
         self,
         prompts_tokens: torch.Tensor,
-        active_requests: OrderedDict[str, InferenceRequest],
+        active_requests: OrderedDict[int, InferenceRequest],
         use_attention_mask: bool = False,
     ) -> Dict[str, Any]:
         """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
-            active_requests (OrderedDict[str, InferenceRequest]): The input active requests
+            active_requests (OrderedDict[int, InferenceRequest]): The input active requests
             use_attention_mask (bool): Whether to use an attention mask. Should be set to True only
                 when exclusively doing prefill (no decode) with variable prompt lengths.
 
@@ -1085,7 +1090,7 @@ class TextGenerationController:
     def stream_tokens(
         self,
         sampling_params: SamplingParams,
-        request_ids: List[str],
+        request_ids: List[int],
         requests: List[InferenceRequest],
         streams: List[AsyncStream],
         generation_started: List[bool],
@@ -1099,7 +1104,7 @@ class TextGenerationController:
 
         Args:
             sampling_params (SamplingParams): The sampling parameters.
-            request_ids (List[str]): The request IDs.
+            request_ids (List[int]): The request IDs.
             request (List[InferenceRequest]): The requests.
             stream (List[AsyncStream]): The streams over which to send tokens.
             generation_started (List[bool]): Whether the decode step has started.
@@ -1111,7 +1116,7 @@ class TextGenerationController:
         """
 
         def stream_token(
-            request_id: str,
+            request_id: int,
             request: InferenceRequest,
             stream: AsyncStream,
             generation_started: bool,

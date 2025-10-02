@@ -21,6 +21,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_provider import model_provider
+from megatron.post_training.loss_func import loss_func
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import (
@@ -451,67 +452,6 @@ def get_batch(data_iterator):
     return batch
 
 
-def _mask_loss(output_tensor, loss_mask, mp_reduce=False):
-    """Apply mask to the unreduced loss tensor."""
-    args = get_args()
-
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-
-    if args.context_parallel_size > 1:
-        loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), loss_mask.sum().view(1)])
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-        loss = loss[0] / loss[1]
-    else:
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-    if mp_reduce and args.tensor_model_parallel_size > 1:
-        # KD loss requires extra all-reduce to ensure same values across MP-TP partitions.
-        loss = torch.sum(tensor_parallel.gather_from_tensor_model_parallel_region(loss.reshape(1)))
-
-    return loss
-
-
-def _allreduce_loss(loss):
-    """Reduce loss for reporting purposes."""
-    args = get_args()
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss.isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-        )
-
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
-
-    return loss * args.context_parallel_size, averaged_loss[0]
-
-
-def loss_func(loss_mask: torch.Tensor, model: GPTModel, output_tensor: torch.Tensor):
-    """Loss function (with KD Loss support).
-
-    Args:
-        loss_mask (Tensor): Used to mask out some portions of the loss
-        model (GPTModel): The model (can be wrapped)
-        output_tensor (Tensor): The tensor with the losses
-    """
-    args = get_args()
-
-    # Unwrap for both Distillation and LANA
-    model = unwrap_model(model)
-
-    # Standard lm loss
-    output_tensor = output_tensor.float()  # cache
-    loss_lm = _mask_loss(output_tensor, loss_mask)
-    loss_lm, loss_lm_avg = _allreduce_loss(loss_lm)
-    loss, report = loss_lm, {'lm loss': loss_lm_avg}
-
-    return loss, report
-
-
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
@@ -549,7 +489,7 @@ def forward_step(data_iterator, model: GPTModel):
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask, model)
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 if __name__ == "__main__":

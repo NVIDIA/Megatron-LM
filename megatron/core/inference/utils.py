@@ -32,3 +32,10 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
     attention_mask = attention_mask < 0.5
 
     return attention_mask
+
+
+def tensor_swap(x, src_idxs, dst_idxs):
+    """
+    Swap x[src_idxs] and x[dst_idxs]
+    """
+    x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]

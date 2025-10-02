@@ -311,9 +311,47 @@ class TestMegatronFsdpFullyShard:
             # Backward pass.
             loss.backward()
 
-            # Optimizer step.
-            optimizer.step()
-            optimizer.zero_grad()
+            # Validate gradients exist in the Torch Module, i.e. non-None and non-zero.
+            grads_exist = any(
+                isinstance(p.grad, torch.Tensor) and p.grad.to_local().count_nonzero().item() > 0
+                for p in model.module.parameters()
+            )
+            sharding_group = (
+                device_mesh[HSDP].get_group()
+                if dp_outer_strategy == OPTIM
+                else device_mesh[DP_SHARD_CP].get_group()
+            )
+            if dp_shard_strategy != NO_SHARD:
+                # Because of uneven sharding, we need to gather the result from all ranks
+                # to verify if any gradients exist or not at this step of training.
+                grads_exist_gathered = [None] * sharding_group.size()
+                torch.distributed.gather_object(
+                    grads_exist,
+                    object_gather_list=grads_exist_gathered if sharding_group.rank() == 0 else None,
+                    group=sharding_group,
+                    group_dst=0,
+                )
+                if sharding_group.rank() == 0:
+                    # Gradients exist on at least one of the optimizer sharding ranks.
+                    # Update grads_exist on Rank 0 only.
+                    grads_exist = any(grads_exist_gathered)
+                torch.distributed.barrier()
+
+            # Gradients do not exist until synchronization is activated.
+            # Use collected result on Rank 0 only.
+            if sharding_group.rank() == 0:
+                if step == NUM_STEPS - 1:
+                    assert grads_exist, "Root module gradients should exist on final microbatch."
+                else:
+                    assert (
+                        not grads_exist
+                    ), "Root module gradients should not exist prior to optimization step."
+            torch.distributed.barrier()
+
+            # Optimizer step. Apply accumulated gradients to the model weights.
+            if step == NUM_STEPS - 1:
+                optimizer.step()
+                optimizer.zero_grad()
 
         # Required to reset the parallelism environment.
         destroy_device_mesh(device_mesh)

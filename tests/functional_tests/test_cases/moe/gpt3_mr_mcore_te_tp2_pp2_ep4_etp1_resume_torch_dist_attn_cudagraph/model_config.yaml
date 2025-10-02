@@ -121,6 +121,7 @@ MODEL_ARGS:
   # CUDA Graph args
   --external-cuda-graph: true
   --cuda-graph-scope: attn
+  --cuda-graph-warmup-steps: 0
   --te-rng-tracker: true
   # Add mixed precision args
   --bf16: true

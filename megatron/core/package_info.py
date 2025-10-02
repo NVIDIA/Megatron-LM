@@ -4,7 +4,7 @@
 MAJOR = 0
 MINOR = 15
 PATCH = 0
-PRE_RELEASE = 'rc6'
+PRE_RELEASE = 'rc7'
 
 # Use the following formatting: (major, minor, patch, pre-release)
 VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)

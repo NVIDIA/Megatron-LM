@@ -10,10 +10,14 @@ from torch.optim import AdamW as CPUAdam
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
     from transformer_engine.pytorch.optimizers import FusedSGD as SGD
+
+    USING_PYTORCH_OPTIMIZER = False
 except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
         from apex.optimizers import FusedSGD as SGD
+
+        USING_PYTORCH_OPTIMIZER = False
     except ImportError:
         warnings.warn(
             f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
@@ -22,7 +26,10 @@ except ImportError:
         # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
         # pylint: disable-next=line-too-long.
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
-        from torch.optim import AdamW as Adam, SGD
+        from torch.optim import SGD
+        from torch.optim import AdamW as Adam
+
+        USING_PYTORCH_OPTIMIZER = True
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
@@ -305,6 +312,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
                     "untested versions below this may have convergence issues."
                 )
+            assert (
+                config.decoupled_weight_decay
+            ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
@@ -347,6 +357,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 "eps": config.adam_eps,
             }
 
+            # set Adam class and weight decay mode depending
+            # on source of optimizer (Torch or TE/Apex)
+            if USING_PYTORCH_OPTIMIZER:
+                adam_cls = torch.optim.AdamW if config.decoupled_weight_decay else torch.optim.Adam
+            else:
+                kwargs["adam_w_mode"] = config.decoupled_weight_decay
+                adam_cls = Adam
+
             if config.use_precision_aware_optimizer:
                 kwargs.update(
                     {
@@ -371,7 +389,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 if is_te_min_version("2.1.0.dev0"):
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
-            optimizer = Adam(**kwargs)
+            optimizer = adam_cls(**kwargs)
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:

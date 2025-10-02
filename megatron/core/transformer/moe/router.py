@@ -459,8 +459,8 @@ class TopKRouter(Router):
             eps = self.config.moe_input_jitter_eps
             if self.input_jitter is None:
                 self.input_jitter = torch.distributions.uniform.Uniform(
-                    torch.tensor(1.0 - eps, device=input.device),
-                    torch.tensor(1.0 + eps, device=input.device),
+                    torch.tensor(1.0 - eps, dtype=input.dtype, device=input.device),
+                    torch.tensor(1.0 + eps, dtype=input.dtype, device=input.device),
                 ).rsample
             return input * self.input_jitter(input.shape)
         else:
