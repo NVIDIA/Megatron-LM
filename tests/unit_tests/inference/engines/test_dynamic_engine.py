@@ -77,17 +77,12 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
+    actually_build_cuda_graphs: bool = (
+        False  # only test_simple requires us to actually build a cuda-graph
+    )
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
-    cuda_graph_scope: str = "full_iteration"
-    force_build_cuda_graphs: bool = False
-    # If False, do not build cuda graphs in the tests, even if
-    # num_cuda_graphs is set.
-    # For tests concerning cuda-graph warmups, we set this to False
-    # to avoid the overhead of building the graphs, which is not
-    # relevant to the test. The tests only check if the required
-    # context attributes are set correctly.
 
     def __post_init__(self):
 
@@ -239,8 +234,7 @@ class TestDynamicInferenceEngine:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None
-            and test_config.force_build_cuda_graphs,
+            enable_cuda_graph=test_config.num_cuda_graphs is not None,
             inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -254,7 +248,6 @@ class TestDynamicInferenceEngine:
             pipeline_dtype=torch.bfloat16,
             add_bias_linear=test_config.expert_model_parallel_size == 1,
             inference_sampling_seed=test_config.random_seed,
-            cuda_graph_scope=test_config.cuda_graph_scope,
         )
 
         # Requests.
@@ -317,7 +310,8 @@ class TestDynamicInferenceEngine:
                 -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
             ),
             random_seed=test_config.random_seed,
-            enable_cuda_graph=transformer_config.enable_cuda_graph,
+            enable_cuda_graph=test_config.num_cuda_graphs is not None
+            and test_config.actually_build_cuda_graphs,
         )
 
         # Test env.
@@ -395,20 +389,21 @@ class TestDynamicInferenceEngine:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
+    @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
-    def test_simple(self, num_cuda_graphs, cuda_graph_scope) -> None:
+    @pytest.mark.parametrize(
+        "num_cuda_graphs", [None, 4]
+    )  # todo: cannot run test case with multiple num_cuda_graphs like [None, 1, 4]
+    def test_simple(self, num_cuda_graphs) -> None:
         """Simple test that runs without errors, and validates output."""
 
         # Run test.
         env = self._run_test(
             num_cuda_graphs=num_cuda_graphs,
+            actually_build_cuda_graphs=num_cuda_graphs is not None,
             context_max_requests_override=32,
-            cuda_graph_scope=cuda_graph_scope,
-            force_build_cuda_graphs=True,
         )
 
         # Validate max_requests, max_tokens.

@@ -269,6 +269,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config, vp_stage=vp_stage)
 
+        if (
+            config.enable_cuda_graph
+            and config.cuda_graph_scope != "full_iteration"
+            and not self.training
+        ):
+            # Cudagraphs for inference are only enabled with the flash decoding kernel
+            assert (
+                self.config.flash_decode
+            ), "--flash-decode is required to use CUDA graphs during inference"
+
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -826,14 +836,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 (kwargs.get('inference_context') is not None)
                 or (kwargs.get('inference_params') is not None)
             )
-            and self.config.cuda_graph_scope != 'full_iteration'
         ):
+            assert (
+                kwargs.get('attention_mask') is None
+            ), f"Attention mask must not be set when using CUDA graphs with inference."
+
+            # it can happen that non-decode steps have a token count greater than the max
+            # supported cuda graph token count. In that case this flag will be set to
+            # False by initialize_attention, and we should not use cuda graphs.
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
             else:
-                # it can happen that non-decode steps have a token count greater than the max
-                # supported cuda graph token count. In that case this flag will be set to
-                # False by initialize_attention, and we should not use cuda graphs.
                 using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             if using_cuda_graph:
                 return True

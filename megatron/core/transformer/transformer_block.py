@@ -19,7 +19,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import LayerType
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -263,7 +263,7 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-class TransformerBlock(GraphableMegatronModule, MegatronModule):
+class TransformerBlock(MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -511,47 +511,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def _should_call_local_cudagraph(self, *args, **kwargs):
-        """
-        Check if we should call the local cudagraph path.
-        """
-        if not self.training and (
-            hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
-            and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
-            )
-            and self.config.cuda_graph_scope == 'full_iteration'
-        ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
-
-            if using_cuda_graph:
-                return True
-        return False
-
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            kwargs['hidden_states'] = (
-                kwargs['hidden_states'].unwrap()
-                if isinstance(kwargs['hidden_states'], WrappedTensor)
-                else kwargs['hidden_states']
-            )
-            # dynamic_inference_decode_only is not a real argument to forward, it is only used
-            # to differentiate the cuda graph used for decode from the one used for non-decode
-            # inference.
-            dynamic_inference_decode_only = kwargs['inference_context'].is_decode_only()
-            # cudagraphmanager returns a singleton tuple, whereas the
-            # normal forward returns a tensor, therefore we need
-            # to extract the tensor from the tuple
-            return super().__call__(
-                *args, dynamic_inference_decode_only=dynamic_inference_decode_only, **kwargs
-            )[0]
-        return super().__call__(*args, **kwargs)
-
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -568,7 +527,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-        dynamic_inference_decode_only: Optional[bool] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -597,9 +555,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
                 processing.
-            dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
-                inference context is for decode-only. This args is only used to uniquely
-                identify decode and non-decode cuda graph runners in the cuda graph manager.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -607,9 +562,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        # Remove 'dynamic_inference_decode_only' from kwargs if present
-        # this is only used to uniquely identify decode and non-decode cuda graph
-        # runners in the cuda graph manager
 
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
