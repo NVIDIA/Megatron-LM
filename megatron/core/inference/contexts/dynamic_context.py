@@ -1116,8 +1116,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
         # >>>
-        if finished_request_count > 0:
-            raise Exception("huh?")
+        # if finished_request_count > 0:
+        #     raise Exception("huh?")
         # <<<
         assert (
             active_request_count + finished_request_count + self.paused_request_count
@@ -1126,6 +1126,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset attention state.
         self.reset_attention_state()
+
+        # Update total_request_count.
+        self.total_request_count = active_request_count + self.paused_request_count
 
         # 2. If no paused requests are present and no active requests we release memory and reset.
         if active_request_count + self.paused_request_count == 0:
@@ -1307,14 +1310,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count > 0:
             active_chunk_count_total = self.chunk_allocator.active_count
             active_chunk_count_used = self.request_kv_chunk_counts[
+                # >>>
                 self.paused_request_count:self.total_request_count
+                # self.paused_request_count:(self.paused_request_count + active_request_count)
+                # <<<
             ].sum().item()
             active_chunk_count_avail = active_chunk_count_total - active_chunk_count_used
 
             paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
             paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
+            paused_chunk_counts += 1 # +1 for newly added chunk
             paused_chunk_counts_cumsum = paused_chunk_counts.cumsum(dim=0)
-            paused_chunk_counts_cumsum += 1 # +1 for newly added chunk
+            # >>>
+            # paused_chunk_counts_cumsum += 1 # +1 for newly added chunk
+            # <<<
             resume_request_count = torch.nonzero(
                 paused_chunk_counts_cumsum <= active_chunk_count_avail
             ).numel()
@@ -1322,16 +1331,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             # for i in range(self.paused_request_count - 1, -1, -1):
             #     current_chunk_count
             #     pax("i")
+            # if resume_request_count != 1:
+            #     pax("resume_request_count")
 
             # >>>
-            # pax("active_chunk_count_total, active_chunk_count_used, active_chunk_count_avail",
-            #     "paused_chunk_counts, paused_chunk_counts_cumsum",
-            #     "resume_request_count")
+            # if active_request_count + resume_request_count == 0:
+            # if active_request_count == 0:
+            if resume_request_count >= 2:
+                pax("active_chunk_count_total, active_chunk_count_used, active_chunk_count_avail",
+                    "paused_chunk_counts, paused_chunk_counts_cumsum",
+                    "active_request_count, resume_request_count")
             # <<<
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # >>>
-        if resume_request_count != 0 and self.chunk_allocator.total_avail == 0:
+        newly_resumed_request_ids = self.request_ids[(self.paused_request_count - resume_request_count):self.paused_request_count]
+        # <<<
+
+        # >>>
+        # if resume_request_count != 0 and self.chunk_allocator.total_avail == 0:
+        if active_request_count + resume_request_count == 0:
             pax({
                 "chunk_allocator" : self.chunk_allocator,
                 "paused_request_count" : self.paused_request_count,
@@ -1355,7 +1374,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # <<<
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        self.total_request_count = active_request_count + self.paused_request_count
         # All these active requests are in decode phase, so they need only 1 token per request
         self.active_token_count = active_request_count
         # Always the first section of token input ids are only used.
@@ -1440,9 +1458,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             for i in range(self.total_request_count)
         ]
         # pax("request_strs")
-        print("++++++++++ requests: %s --- %s ......... alloc: %d/%d [%d]" % (
+        print("++++++++++ requests: %s --- %s ..... paused: %s, resumed: %s, finished: %s ..... alloc: %d/%d [%d]" % (
             ", ".join(request_strs[:self.paused_request_count]),
             ", ".join(request_strs[self.paused_request_count:self.total_request_count]),
+            "--" if newly_paused_request_ids is None else newly_paused_request_ids.tolist(),
+            newly_resumed_request_ids.tolist(),
+            self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
             self.chunk_allocator.total_avail,
             self.chunk_allocator.total_count,
             self.chunk_allocator.active_count,

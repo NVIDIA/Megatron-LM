@@ -655,8 +655,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_count += 1
         # >>>
-        if self.step_count >= 800:
-            raise Exception("step 800.")
+        if self.step_count >= 600:
+            raise Exception(f"step {self.step_count}.")
         # <<<
         range_pop()
         return {
