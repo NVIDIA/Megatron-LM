@@ -13,7 +13,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
-from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDatasetWrapper
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -68,25 +67,23 @@ def get_batch(data_iterator, vp_stage=None):
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
-    if cu_seqlens is not None:
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens[0],
-            cu_seqlens_kv=cu_seqlens[0],
-            cu_seqlens_q_padded=cu_seqlens[0],
-            cu_seqlens_kv_padded=cu_seqlens[0],
-            max_seqlen_q=int(max_seqlen[0].item()),
-            max_seqlen_kv=int(max_seqlen[0].item()),
-        )
-    else:
-        packed_seq_params = None
-
     if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
         cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+        )
 
         cp_size = get_context_parallel_world_size()
         if cp_size > 1:  # slice batch along sequence dimension for context parallelism
@@ -113,6 +110,7 @@ def get_batch(data_iterator, vp_stage=None):
             cp_group = None
         
         # Convert [seqlen] to [1, seqlen] similar to default collate_fn
+        # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
         for key, data in batch.items():
             if key in ['attention_mask']:
                 continue
@@ -132,8 +130,8 @@ def get_batch(data_iterator, vp_stage=None):
         )
 
         if cp_group is not None and cp_group.size() > 1:
-            # Each sub-sample of a packed sample is required to be divisible by CP*DP*2 
-            # or CP*DP*TP*2 (if using sequence parallel)
+            # When using hybrid_context_parallel, each sub-sample of a packed sample is 
+            # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
             batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
     
     return (*batch.values(), packed_seq_params)
@@ -221,7 +219,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -307,8 +305,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
     ).build()
-
-    # train_ds = HybridCPDatasetWrapper(train_ds)
 
     print_rank_0("> finished creating GPT datasets ...")
 
