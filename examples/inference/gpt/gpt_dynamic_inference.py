@@ -264,11 +264,11 @@ def get_inference_context(
             args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
         ),
         # >>>
-        # chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
-        # active_buffer_size_bytes=active_buffer_size_bytes,
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+        active_buffer_size_bytes=active_buffer_size_bytes,
         # +++
-        chunk_size_tokens=4, # 256,
-        active_buffer_size_bytes=int(2 * 1024**2),
+        # chunk_size_tokens=4, # 256,
+        # active_buffer_size_bytes=int(2 * 1024**2),
         # <<<
         max_tokens=max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
