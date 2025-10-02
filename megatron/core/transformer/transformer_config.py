@@ -477,7 +477,7 @@ class TransformerConfig(ModelParallelConfig):
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
-    moe_router_padding_for_quant: Optional[bool] = False
+    moe_router_padding_for_quantization: Optional[bool] = False
     """Whether to pad the routing_map to make sure the number of tokens each expert receives
     is a multiple of 16/32 for quantized precision (e.g., FP8, FP4). This can remove the explicit
     padding in the GroupedMLP layer."""
@@ -1350,14 +1350,14 @@ class TransformerConfig(ModelParallelConfig):
                     f"but your version is {get_te_version()}."
                 )
 
-        if self.moe_router_padding_for_quant:
+        if self.moe_router_padding_for_quantization:
             if self.fp8 is None and self.fp4 is None:
-                raise ValueError("fp8/fp4 must be specified when moe_router_padding_for_quant is True.")
+                raise ValueError("fp8/fp4 must be specified when moe_router_padding_for_quantization is True.")
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
-                    "moe_router_padding_for_quant."
+                    "moe_router_padding_for_quantization."
                 )
 
         if (

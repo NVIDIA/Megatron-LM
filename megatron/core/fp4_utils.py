@@ -49,7 +49,15 @@ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
 
 
 def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
-    """Get the alignment size required for fp4 GEMM."""
+    """
+    Get the alignment size required for FP4 GEMM. 
+    FP4 GEMM requires Blackwell and later architectures.
+
+    The value 32 is a hardware requirement: TMA (Tensor Memory Accelerator) requires
+    a 16-byte aligned address for efficient memory access. Since FP4 uses 4 bits per value,
+    16 bytes (128 bits) corresponds to 32 FP4 values. Therefore, the alignment size for FP4
+    is 32. With this alignment, NVFP4 GEMM can be performed efficiently.
+    """
     # pylint: disable=unused-argument
     return 32
 
