@@ -48,6 +48,11 @@ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP4_TENSOR_CLASS and isinstance(tensor, FP4_TENSOR_CLASS)
 
 
+def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
+    """Get the alignment size required for fp4 GEMM."""
+    # pylint: disable=unused-argument
+    return 32
+
 def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
     """Dequantize a fp4 tensor to a higher precision tensor."""
     if is_te_min_version("2.7.0.dev0"):
