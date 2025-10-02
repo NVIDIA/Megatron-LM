@@ -539,6 +539,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count = (active_requests_mask == 1).sum().item()
         return active_request_count
 
+    def get_padding_slice(self):
+        """Returns an index slice corresponding to the current padding tokens."""
+        return slice(self.active_token_count, self.padded_active_token_count)
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 

@@ -200,6 +200,11 @@ class MambaModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+
+            # Clear the outputs for padding tokens when using dynamic batching
+            # TODO(ksanthanam): Add unit test once dynamic engine supports hybrid models
+            if in_inference_mode and inference_context.is_dynamic_batching():
+                decoder_input[inference_context.get_padding_slice()] = 0.0
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

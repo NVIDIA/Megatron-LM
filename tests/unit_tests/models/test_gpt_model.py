@@ -11,6 +11,9 @@ from pytest import approx
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
@@ -18,6 +21,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -333,3 +337,100 @@ class TestGPTModelWithCustomPG:
         assert logits.shape[0] == sequence_length
         assert logits.shape[1] == micro_batch_size
         assert logits.shape[2] == self.gpt_model.config.hidden_size
+
+
+class TestGPTWithDynamicInference:
+    """Tests GPTModel with dynamic inference."""
+
+    @torch.inference_mode()
+    def setup_method(self, method):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+        transformer_config = TransformerConfig(
+            num_layers=8,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+        )
+
+        self.gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+            parallel_output=True,
+        )
+        self.gpt_model = Float16Module(self.gpt_model.config, self.gpt_model)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_dynamic_inference_padding(self):
+        """
+        Tests that logits for padded tokens are zeroed out using the default rounder.
+        """
+        self.gpt_model.cuda()
+        self.gpt_model.eval()
+        config = self.gpt_model.config
+
+        inference_context = DynamicInferenceContext(
+            params_dtype=config.params_dtype,
+            num_layers=config.num_layers,
+            kv_channels=config.hidden_size // config.num_attention_heads,
+            num_attention_heads=config.num_attention_heads,
+            max_sequence_length=self.gpt_model.module.max_sequence_length,
+            buffer_size_gb=1.0,
+            chunk_size_tokens=256,
+            buffer_guaranteed_fraction=0.0,
+            materialize_only_last_token_logits=False,
+        )
+
+        # Add a request with 10 tokens. Since 10 is not a multiple of 64,
+        # this will create padding up to the padded length of 64.
+        active_token_count = 10
+        request = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.arange(0, active_token_count, dtype=torch.long, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        inference_context.add_request(request)
+
+        # Prepares the context, including calculating the padded token count.
+        inference_context.initialize_attention_state()
+
+        assert inference_context.active_token_count == active_token_count
+        assert inference_context.padded_active_token_count == DynamicInferenceContext.TOKEN_ROUNDER
+
+        # Prepare inputs for the forward pass.
+        padded_token_count = inference_context.padded_active_token_count
+        input_ids, position_ids = inference_context.current_input_and_position_ids()
+
+        # Run the forward pass with inference parameters.
+        logits = self.gpt_model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            inference_context=inference_context,
+            runtime_gather_output=True,
+        )
+
+        # Verify the output shape.
+        assert logits.shape[0] == 1
+        assert logits.shape[1] == padded_token_count
+        assert logits.shape[2] == self.gpt_model.module.vocab_size
+
+        # Extract the logits corresponding to the padding tokens (from index 10 to 63).
+        padding_start_idx = inference_context.active_token_count
+        padding_end_idx = inference_context.padded_active_token_count
+        padding_logits = logits[0, padding_start_idx:padding_end_idx, :]
+
+        # Assert that all padding logits are zero.
+        assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
