@@ -42,11 +42,11 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         self._vocab_size = len(tokenizer)
         self._tokenizer = tokenizer
 
-        if prompt_format == "nemotron-h-aligned":
+        if prompt_format == "nemotron-nano-v2":
             self._prompt_config = PromptConfig(
-                assistant_prefix_len=0,
-                pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
-                custom_chat_template=nemotron_h_aligned_custom_template,
+                assistant_prefix_len=3,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=nemotron_nano_v2_custom_template,
                 has_bos=False,
                 has_system_role=True,
             )
