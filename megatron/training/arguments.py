@@ -1684,6 +1684,10 @@ def _add_training_args(parser):
                        'train-samples should be provided.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
+    group.add_argument('--log-global-grad-norms', type=str, default=None,
+                       help='If set, append global gradient norms to the specified JSONL file.')
+    group.add_argument('--log-grad-norm-iteration', type=int, default=0,
+                       help='Iteration index at which to log the global gradient norm.')
     group.add_argument('--exit-interval', type=int, default=None,
                        help='Exit the program after the iteration is divisible '
                        'by this value.')
