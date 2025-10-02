@@ -281,6 +281,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "invalid pointer" in concat_allranks_logs
         or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
         or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
     )
 
 
