@@ -2309,13 +2309,15 @@ def _add_learning_rate_args(parser):
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--override-opt_param-scheduler', action='store_true',
+    group.add_argument('--override-opt_param-scheduler', '--override-opt-param-scheduler',
+                       action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '
                        'number of iterations, and decay style from input '
                        'arguments and ignore values from checkpoints. Note'
                        'that all the above values will be reset.')
-    group.add_argument('--use-checkpoint-opt_param-scheduler', action='store_true',
+    group.add_argument('--use-checkpoint-opt_param-scheduler', '--use-checkpoint-opt-param-scheduler',
+                       action='store_true',
                        help='Use checkpoint to set the values of the scheduler '
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '
