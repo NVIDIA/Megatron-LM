@@ -816,7 +816,7 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         if self.config.fp8 or self.config.fp4:
-            assert HAVE_TE, "FP8 requires TE."
+            assert HAVE_TE, "FP8 and FP4 requires TE."
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 

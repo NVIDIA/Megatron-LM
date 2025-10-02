@@ -481,7 +481,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         if (
             self.config.moe_expert_capacity_factor is not None
-            or self.config.moe_router_padding_for_quant
+            or self.config.moe_router_padding_for_quantization
         ):
             # When using token dropping or router padding, output size is dynamic.
             # Need to sync output size GPU->CPU before allocating output buffer
@@ -583,7 +583,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
-        if self.config.moe_router_padding_for_quant:
+        if self.config.moe_router_padding_for_quantization:
             pad_multiple = self.get_align_size_for_quantization()
             if is_experimental_enabled() and self.config.moe_permute_fusion:
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
@@ -1115,7 +1115,7 @@ class _DeepepManager(_DispatchManager):
             self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs
             )
-        if self.config.moe_router_padding_for_quant:
+        if self.config.moe_router_padding_for_quantization:
             self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
                 self.dispatched_routing_map, self.tokens_per_expert
             )
