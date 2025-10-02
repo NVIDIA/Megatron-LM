@@ -8,6 +8,7 @@ import pytest
 import torch
 from packaging import version
 from pytest import approx
+from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -23,7 +24,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -344,6 +345,10 @@ class TestGPTWithDynamicInference:
 
     @torch.inference_mode()
     def setup_method(self, method):
+        fp8_available, reason_for_no_fp8 = check_fp8_support()
+        if not fp8_available:
+            pytest.skip(reason_for_no_fp8)
+
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
@@ -352,17 +357,19 @@ class TestGPTWithDynamicInference:
 
         transformer_config = TransformerConfig(
             num_layers=8,
-            hidden_size=12,
+            hidden_size=16,
             num_attention_heads=4,
             use_cpu_initialization=True,
             params_dtype=torch.bfloat16,
             bf16=True,
+            fp8="hybrid",
+            fp8_recipe="tensorwise",
         )
 
         self.gpt_model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=100,
+            vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
             parallel_output=True,
         )
@@ -372,10 +379,13 @@ class TestGPTWithDynamicInference:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @torch.inference_mode()
-    def test_dynamic_inference_padding(self):
+    def test_dynamic_inference_padding_with_fp8(self):
         """
-        Tests that logits for padded tokens are zeroed out using the default rounder.
+        Tests that logits for padded tokens are zeroed out for fp8 inference.
         """
         self.gpt_model.cuda()
         self.gpt_model.eval()

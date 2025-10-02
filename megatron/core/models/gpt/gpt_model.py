@@ -385,8 +385,9 @@ class GPTModel(LanguageModule):
             sequence_len_offset = None
 
         if in_inference_mode:
-            # Clear the outputs for padding tokens when using dynamic batching
-            if inference_context.is_dynamic_batching():
+            # Clear the outputs for padding tokens when using dynamic batching in fp8 mode
+            # to avoid corrupting amax calculations
+            if inference_context.is_dynamic_batching() and self.config.fp8:
                 decoder_input[inference_context.padding_slice] = 0.0
 
             # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
