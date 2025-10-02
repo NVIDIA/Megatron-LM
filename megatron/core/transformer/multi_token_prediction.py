@@ -848,13 +848,16 @@ class MultiTokenPredictionBlock(MegatronModule):
 
     def _build_layers(self, pg_collection):
         def build_layer(layer_spec, layer_number):
-            return build_module(
-                layer_spec,
-                config=self.config,
-                layer_number=layer_number,
-                vp_stage=self.vp_stage,
-                pg_collection=pg_collection,
-            )
+            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            with fp8_init_context:
+                module = build_module(
+                    layer_spec,
+                    config=self.config,
+                    layer_number=layer_number,
+                    vp_stage=self.vp_stage,
+                    pg_collection=pg_collection,
+                )
+            return module
 
         self.layers = torch.nn.ModuleList(
             [
