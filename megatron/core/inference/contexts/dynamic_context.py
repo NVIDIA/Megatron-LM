@@ -1261,11 +1261,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # newly_paused_request_ids = self.request_ids[dst_idxs]
                 # <<<
                 # >>>
-                pax("active_request_ids_on_left, paused_requests_idxs_on_right")
+                # pax("active_request_ids_on_left, paused_requests_idxs_on_right")
                 # <<<
 
             self.paused_request_count += active_requests_requiring_new_chunk_count
             active_request_count -= active_requests_requiring_new_chunk_count
+
+            # >>>
+            # if active_requests_requiring_new_chunk_count > 0:
+            #     pax({
+            #         "chunk_allocator" : self.chunk_allocator,
+            #         "paused_request_count" : self.paused_request_count,
+            #     }, "active_request_count")
+            # <<<
 
         # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
@@ -1283,17 +1291,43 @@ class DynamicInferenceContext(BaseInferenceContext):
         #         max(self.gtd_request_count - active_request_count, 0), self.paused_request_count
         #     )
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        if active_request_count < self.chunk_allocator.active_count:
-            resume_request_count = min(
-                # >>>
-                # self.chunk_allocator.active_avail,
-                # <<<
-                self.chunk_allocator.total_avail,
-                self.chunk_allocator.active_count - active_request_count,
-                self.paused_request_count,
-            )
-        else:
-            resume_request_count = 0
+        # if active_request_count < self.chunk_allocator.active_count:
+        #     resume_request_count = min(
+        #         # >>>
+        #         # self.chunk_allocator.active_avail,
+        #         # <<<
+        #         self.chunk_allocator.total_avail,
+        #         self.chunk_allocator.active_count - active_request_count,
+        #         self.paused_request_count,
+        #     )
+        # else:
+        #     resume_request_count = 0
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        resume_request_count = 0
+        if self.paused_request_count > 0:
+            active_chunk_count_total = self.chunk_allocator.active_count
+            active_chunk_count_used = self.request_kv_chunk_counts[
+                self.paused_request_count:self.total_request_count
+            ].sum().item()
+            active_chunk_count_avail = active_chunk_count_total - active_chunk_count_used
+
+            paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
+            paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
+            paused_chunk_counts_cumsum = paused_chunk_counts.cumsum(dim=0)
+            paused_chunk_counts_cumsum += 1 # +1 for newly added chunk
+            resume_request_count = torch.nonzero(
+                paused_chunk_counts_cumsum <= active_chunk_count_avail
+            ).numel()
+
+            # for i in range(self.paused_request_count - 1, -1, -1):
+            #     current_chunk_count
+            #     pax("i")
+
+            # >>>
+            # pax("active_chunk_count_total, active_chunk_count_used, active_chunk_count_avail",
+            #     "paused_chunk_counts, paused_chunk_counts_cumsum",
+            #     "resume_request_count")
+            # <<<
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # >>>
