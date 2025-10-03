@@ -505,7 +505,7 @@ class MLASelfAttention(MultiLatentAttention):
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq_params=packed_seq_params
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"

@@ -182,13 +182,13 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False):
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq_params=None):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
-        self.packed_seq_cached = packed_seq
+        self.packed_seq_cached = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
 
-        emb, _mscale = self.forward(seq_len, offset, packed_seq)
+        emb, _mscale = self.forward(seq_len, offset, packed_seq_params)
         self.register_buffer(
             "cos_cached", (emb.cos() * _mscale).to(dtype).contiguous(), persistent=False
         )
@@ -197,16 +197,17 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         )
 
     def get_cached_cos_sin(
-        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False
+        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq_params=None
     ):
         """Get cached cos and sin values."""
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if (
             seq_len > self.max_seq_len_cached
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq)
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq_params)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 
