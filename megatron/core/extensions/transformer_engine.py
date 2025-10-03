@@ -1030,6 +1030,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # If cp_group is None but local_cp_size is provided,
             # Indicates to turn off CP dynamically
             elif packed_seq_params.local_cp_size is not None:
+                assert (
+                    packed_seq_params.local_cp_size == 1
+                ), "local_cp_size must be == 1 if provided without cp_group"
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
