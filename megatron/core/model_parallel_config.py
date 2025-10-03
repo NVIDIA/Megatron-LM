@@ -52,10 +52,10 @@ class ModelParallelConfig:
        type.
     """
 
-    max_seqlen_per_cp_rank: Optional[int] = None
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
     """
-    Maximum sequence length per CP rank. This is used to calculate the number and length
-    of sub-samples assigned to each CP rank when using hybrid data x context parallel.
+    Maximum sequence length per DPxCP rank. This is used to calculate the number and length
+    of sub-samples assigned to each CP rank when using hybrid_context_parallel.
     """
 
     hybrid_context_parallel: bool = False

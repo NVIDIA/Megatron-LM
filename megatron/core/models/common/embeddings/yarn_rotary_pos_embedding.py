@@ -152,7 +152,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
-    def forward(self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None) -> Tensor:
+    def forward(
+        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:

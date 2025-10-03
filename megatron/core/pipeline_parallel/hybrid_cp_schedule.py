@@ -54,14 +54,14 @@ class HybridCPDataLoaderWrapper:
 
     Args:
         data_iterator: The original data_iterator to wrap around
-        config: The config object containing the max_seqlen_per_cp_rank
+        config: The config object containing the max_seqlen_per_dp_cp_rank
     """
 
     def __init__(self, data_iterator, config):
         self.data_iterator = data_iterator
         self.config = config
         self.cp_balancing_scheduler = BalancedCPScheduler(
-            max_seq_len_per_rank=self.config.max_seqlen_per_cp_rank
+            max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank
         )
         self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(
             with_context_parallel=True
@@ -866,7 +866,6 @@ def hybrid_context_parallel_forward_backward(
         else:
             return None
 
-    cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=config.max_seqlen_per_cp_rank)
     # We get data once per global batch and schedule the sub-samples.
     # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
     hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)

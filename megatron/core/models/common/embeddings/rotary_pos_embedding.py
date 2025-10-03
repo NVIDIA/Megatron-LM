@@ -306,7 +306,12 @@ class MultimodalRotaryEmbedding(nn.Module):
             else parallel_state.get_context_parallel_group(check_initialized=False)
         )
 
-    def forward(self, position_ids: torch.Tensor, mrope_section: List[int], packed_seq_params: Optional[PackedSeqParams] = None) -> Tensor:
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        mrope_section: List[int],
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
         Args:
