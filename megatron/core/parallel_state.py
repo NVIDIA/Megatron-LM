@@ -2,8 +2,8 @@
 
 """Model and data parallel groups."""
 
-import os
 import logging
+import os
 import warnings
 from datetime import timedelta
 from math import log2

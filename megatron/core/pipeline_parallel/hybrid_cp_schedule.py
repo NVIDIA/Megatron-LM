@@ -59,7 +59,9 @@ class HybridCPDataLoaderWrapper:
         dp_cp_group: Data parallel context parallel group.
     """
 
-    def __init__(self, data_iterator, config, pg_collection: Optional[ProcessGroupCollection] = None,):
+    def __init__(
+        self, data_iterator, config, pg_collection: Optional[ProcessGroupCollection] = None
+    ):
         self.data_iterator = data_iterator
         self.config = config
         self.cp_balancing_scheduler = BalancedCPScheduler(
@@ -70,7 +72,9 @@ class HybridCPDataLoaderWrapper:
         self.dp_cp_group = pg_collection.dp_cp
         self.dp_group = pg_collection.dp
         self.tp_group = pg_collection.tp
-        assert self.dp_cp_group is not None and self.dp_group is not None, "dp_cp_group and dp_group not found in pg_collection"
+        assert (
+            self.dp_cp_group is not None and self.dp_group is not None
+        ), "dp_cp_group and dp_group not found in pg_collection"
 
         self.total_hdp_gpus = self.dp_cp_group.size()
 
@@ -89,13 +93,8 @@ class HybridCPDataLoaderWrapper:
         """
         # Collect the number of subsamples from all ranks
         local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
-        dp_subsample_count = [
-            torch.zeros_like(local_len)
-            for _ in range(self.dp_group.size())
-        ]
-        torch.distributed.all_gather(
-            dp_subsample_count, local_len, group=self.dp_group
-        )
+        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(self.dp_group.size())]
+        torch.distributed.all_gather(dp_subsample_count, local_len, group=self.dp_group)
 
         # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
         dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
@@ -114,13 +113,10 @@ class HybridCPDataLoaderWrapper:
 
         # Gather the subsample_seqlens from all ranks
         seqlens_gathered = [
-            torch.empty_like(subsample_seqlens_padded)
-            for _ in range(self.dp_group.size())
+            torch.empty_like(subsample_seqlens_padded) for _ in range(self.dp_group.size())
         ]
         torch.distributed.all_gather(
-            seqlens_gathered,
-            subsample_seqlens_padded,
-            group=self.dp_group,
+            seqlens_gathered, subsample_seqlens_padded, group=self.dp_group
         )
 
         # Trim each seqlens_gathered to the length of the correct sample
@@ -162,9 +158,7 @@ class HybridCPDataLoaderWrapper:
         # Since the torch.distributed.get_process_group_ranks
         # provides the global rank, we need to consider TP
         hdp_rank = (
-            torch.distributed.get_process_group_ranks(self.dp_group)[
-                dp_src_rank
-            ]
+            torch.distributed.get_process_group_ranks(self.dp_group)[dp_src_rank]
             // self.tp_group.size()
         )
         return hdp_rank
@@ -182,9 +176,7 @@ class HybridCPDataLoaderWrapper:
         """
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
         hdp_rank = self.dp_cp_group.rank()
-        dp_ranks = torch.distributed.get_process_group_ranks(
-            self.dp_group
-        )
+        dp_ranks = torch.distributed.get_process_group_ranks(self.dp_group)
         # Here we actually want to get the DP group's rank within the HDP group,
         # we need to consider TP
         dp_ranks = [r // self.tp_group.size() for r in dp_ranks]
