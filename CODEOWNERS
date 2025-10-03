@@ -63,11 +63,18 @@ megatron/post_training
 .gitlab/
 .github/
 .gitlab-ci.yml
-Dockerfile.ci.lts
-Dockerfile.ci.dev
-tests/
+docker/
+tests/unit_tests/run_ci_test.sh
+tests/test_utils/python_scripts/
+tests/functional_tests/python_test_utils/
+tests/functional_tests/shell_test_utils/
 megatron/core/transformer/transformer_block.py
 megatron/core/transformer/transformer_layer.py
+
+^[Tests][1] @mcore-reviewers/ci
+tests/functional_tests/test_cases/
+tests/functional_tests/recipes/
+tests/unit_tests/
 
 [RL] @mcore-reviewers/rl
 megatron/rl/
