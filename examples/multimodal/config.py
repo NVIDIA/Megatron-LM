@@ -13,9 +13,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -26,9 +24,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -39,9 +35,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -52,9 +46,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -75,9 +67,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -89,9 +79,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -103,9 +91,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -117,9 +103,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
@@ -131,9 +115,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.apply_query_key_layer_scaling = False
         config.gated_linear_unit = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 21504
@@ -144,9 +126,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.apply_query_key_layer_scaling = False
         config.gated_linear_unit = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 32768
@@ -157,9 +137,7 @@ def get_language_model_config(config):
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
+        config.layernorm_zero_centered_gamma = False
         config.bias_dropout_fusion = False
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
