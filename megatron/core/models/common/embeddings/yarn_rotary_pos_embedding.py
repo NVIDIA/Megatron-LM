@@ -186,7 +186,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
-        self.packed_seq_cached = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        self.packed_seq_cached = (
+            packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        )
 
         emb, _mscale = self.forward(seq_len, offset, packed_seq_params)
         self.register_buffer(
