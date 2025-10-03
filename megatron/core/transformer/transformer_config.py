@@ -482,6 +482,10 @@ class TransformerConfig(ModelParallelConfig):
     is a multiple of 16/32 for quantized precision (e.g., FP8, FP4). This can remove the explicit
     padding in the GroupedMLP layer."""
 
+    moe_router_padding_for_fp8: Optional[bool] = False
+    """[Compatibility alias for moe_router_padding_for_quantization]
+    Enabling this will also enable moe_router_padding_for_quantization."""
+
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -1349,6 +1353,13 @@ class TransformerConfig(ModelParallelConfig):
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
                 )
+
+        if self.moe_router_padding_for_fp8:
+            # enable moe_router_padding_for_quantization
+            warnings.warn(
+                "--moe-router-padding-for-fp8 is going to be deprecated. Use --moe-router-padding-for-quantization instead."
+            )
+            self.moe_router_padding_for_quantization = True
 
         if self.moe_router_padding_for_quantization:
             if self.fp8 is None and self.fp4 is None:
