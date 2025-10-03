@@ -906,8 +906,9 @@ def validate_args(args, defaults={}):
     assert not (args.hybrid_context_parallel
     and (args.pipeline_model_parallel_size > 1
          or args.enable_cuda_graph
-         or args.use_megatron_fsdp)
-    ), "Hybrid context parallelism not supported with pipeline parallelism, CUDA Graph and FSDP now"
+         or args.use_megatron_fsdp
+         or args.dataloader_type != 'single')
+    ), "Hybrid context parallelism not supported with pipeline parallelism, CUDA Graph, FSDP and non-single dataloader type now"
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled

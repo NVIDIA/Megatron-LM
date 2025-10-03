@@ -11,22 +11,6 @@ from megatron.training import get_args
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
 
-# class HybridCPCollator:
-#     def __init__(self):
-#         pass
-
-#     def __call__(self, batch: List[Dict[str, Any]]):
-#         # IF WE WANT TO COLLATE BEFORE SCHEDULER
-#         # We get a list of samples when pulling multiple microbatches at once for scheduling with Hybrid DPxCP.
-#         # This would require us to change the scheduler and the data loader logic to support [1, S] instead of [S].
-#         # if isinstance(batch, list):
-#         #     for idx, sample in enumerate(batch):
-#         #         collated_sample = torch.utils.data.default_collate([sample])
-#         #         batch[idx] = collated_sample
-#         # else:
-#         #     batch = torch.utils.data.default_collate(batch)
-        
-#         return batch
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
