@@ -64,3 +64,37 @@ def build_sample_idx(
             1 if add_extra_token_to_sequence else 0,
         )
     return sample_idx
+
+
+def build_sample_idx_by_nextfit(
+    sizes: numpy.ndarray,
+    document_indices: numpy.ndarray,
+    sequence_length: int,
+    num_epochs: int,
+    tokens_per_epoch: int,
+    drop_last_partial_sequence: bool = True,
+    add_extra_token_to_sequence: bool = True,
+):
+    sample_idx_max = max(document_indices.shape[0], sizes.max())
+    if sample_idx_max <= numpy.iinfo(numpy.int32).max:
+        sample_idx = build_sample_idx_nf_int32(
+            sizes,
+            document_indices,
+            sequence_length,
+            num_epochs,
+            tokens_per_epoch,
+            drop_last_partial_sequence,
+            1 if add_extra_token_to_sequence else 0,
+        )
+        assert sample_idx.min() >= 0 and sample_idx.max() <= sample_idx_max
+    else:
+        sample_idx = build_sample_idx_nf_int64(
+            sizes,
+            document_indices,
+            sequence_length,
+            num_epochs,
+            tokens_per_epoch,
+            drop_last_partial_sequence,
+            1 if add_extra_token_to_sequence else 0,
+        )
+    return sample_idx
