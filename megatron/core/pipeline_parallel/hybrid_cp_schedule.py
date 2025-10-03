@@ -8,6 +8,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
@@ -55,17 +56,23 @@ class HybridCPDataLoaderWrapper:
     Args:
         data_iterator: The original data_iterator to wrap around
         config: The config object containing the max_seqlen_per_dp_cp_rank
+        dp_cp_group: Data parallel context parallel group.
     """
 
-    def __init__(self, data_iterator, config):
+    def __init__(self, data_iterator, config, pg_collection: Optional[ProcessGroupCollection] = None,):
         self.data_iterator = data_iterator
         self.config = config
         self.cp_balancing_scheduler = BalancedCPScheduler(
             max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank
         )
-        self.total_hdp_gpus = parallel_state.get_data_parallel_world_size(
-            with_context_parallel=True
-        )
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.dp_cp_group = pg_collection.dp_cp
+        self.dp_group = pg_collection.dp
+        self.tp_group = pg_collection.tp
+        assert self.dp_cp_group is not None and self.dp_group is not None, "dp_cp_group and dp_group not found in pg_collection"
+
+        self.total_hdp_gpus = self.dp_cp_group.size()
 
     def __iter__(self):
         """Return self as an iterator."""
@@ -84,10 +91,10 @@ class HybridCPDataLoaderWrapper:
         local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
         dp_subsample_count = [
             torch.zeros_like(local_len)
-            for _ in range(parallel_state.get_data_parallel_world_size())
+            for _ in range(self.dp_group.size())
         ]
         torch.distributed.all_gather(
-            dp_subsample_count, local_len, group=parallel_state.get_data_parallel_group()
+            dp_subsample_count, local_len, group=self.dp_group
         )
 
         # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
@@ -108,12 +115,12 @@ class HybridCPDataLoaderWrapper:
         # Gather the subsample_seqlens from all ranks
         seqlens_gathered = [
             torch.empty_like(subsample_seqlens_padded)
-            for _ in range(parallel_state.get_data_parallel_world_size())
+            for _ in range(self.dp_group.size())
         ]
         torch.distributed.all_gather(
             seqlens_gathered,
             subsample_seqlens_padded,
-            group=parallel_state.get_data_parallel_group(),
+            group=self.dp_group,
         )
 
         # Trim each seqlens_gathered to the length of the correct sample
@@ -139,7 +146,7 @@ class HybridCPDataLoaderWrapper:
         global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
         global_ids_this_rank: list of global IDs locally present on this rank.
         """
-        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_rank = self.dp_group.rank()
         global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
         # Create a list of (global_id, seqlen) tuples for scheduling
         global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
@@ -155,10 +162,10 @@ class HybridCPDataLoaderWrapper:
         # Since the torch.distributed.get_process_group_ranks
         # provides the global rank, we need to consider TP
         hdp_rank = (
-            torch.distributed.get_process_group_ranks(parallel_state.get_data_parallel_group())[
+            torch.distributed.get_process_group_ranks(self.dp_group)[
                 dp_src_rank
             ]
-            // parallel_state.get_tensor_model_parallel_world_size()
+            // self.tp_group.size()
         )
         return hdp_rank
 
@@ -174,13 +181,13 @@ class HybridCPDataLoaderWrapper:
         to transfer data between matching CP ranks.
         """
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
-        hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        hdp_rank = self.dp_cp_group.rank()
         dp_ranks = torch.distributed.get_process_group_ranks(
-            parallel_state.get_data_parallel_group()
+            self.dp_group
         )
         # Here we actually want to get the DP group's rank within the HDP group,
         # we need to consider TP
-        dp_ranks = [r // parallel_state.get_tensor_model_parallel_world_size() for r in dp_ranks]
+        dp_ranks = [r // self.tp_group.size() for r in dp_ranks]
 
         data_keys = batch[0].keys()
 
@@ -264,7 +271,7 @@ class HybridCPDataLoaderWrapper:
                 input=send_tensor,
                 output_split_sizes=recv_lens_split,
                 input_split_sizes=send_lens_split,
-                group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                group=self.dp_cp_group,
             )
             _unpack_sample_by_key(key, recv_tensor)
 
@@ -357,8 +364,7 @@ class BalancedCPScheduler:
         This function is used to estimate the relative workload intensity
         of a sub-sample. This is not meant to be an accurate flops calculator.
 
-        Returns:
-        workload: workload of a sub-sample
+        Returns: workload of a sub-sample
         """
         if cp_size is None:
             cp_size = self.gpus_needed(seq_length)
@@ -370,6 +376,9 @@ class BalancedCPScheduler:
         Calculates the number of GPUs needed for a given sequence length
         and max sequence length per CP rank.
         This is used to determine the CP size of a sub-sample.
+
+        The number is rounded up to the next power of 2 to match the available
+        hybrid context parallel process group sizes.
         """
         return max(1, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
 
@@ -379,7 +388,7 @@ class BalancedCPScheduler:
         compute_estimator: Callable[[int], float],
     ) -> List[deque]:
         """
-        Modified version of make_buckets_equal_work that works with (sample_id, seq_len) tuples.
+        Makes as many buckets as unique CP sizes needed.
         This keeps sample IDs tethered to their sequence lengths throughout the bucketing process.
         """
         # Extract just the sequence lengths for determining k
@@ -388,8 +397,8 @@ class BalancedCPScheduler:
         # Determine k based on unique GPU categories needed
         k = len({self.gpus_needed(L) for L in seqlens})
 
-        # Use the existing contiguous_equal_buckets function but with sample_seqlens
-        # We need to modify it to work with tuples
+        # Create a work target for each bucket
+        # This is the total work divided by the number of buckets
         work = []
         for _, s in sample_seqlens:
             cp_size = self.gpus_needed(s)
@@ -462,7 +471,7 @@ class BalancedCPScheduler:
                 [[] for _ in range(total_gpus)],
             )
 
-        # Use the improved bucketing that works with (sample_id, seq_len) tuples
+        # Get buckets of sequences with balanced work
         buckets = self.make_buckets_equal(sample_seqlens, compute_estimator)
 
         # Initialize tracking structures
@@ -510,6 +519,7 @@ class BalancedCPScheduler:
             if sample_seq_tuple is None:
                 break
 
+            # TODO[pmannan]: PP not yet supported. Add PP scheduling.
             if strategy == "pp":
                 pp_cursor = (bucket_idx + 1) % len(buckets)
 
@@ -544,11 +554,9 @@ class BalancedCPScheduler:
                 else:
                     chosen_members = group_members[best_gid]
             else:
-                if best_gid is None:
-                    print(f"No room to form a new group")
                 chosen_members = group_members[best_gid]
 
-            # ---- Step 2b – if we decided to create a fresh group ----------------
+            # ---- Step 2 – if we decided to create a fresh group ----------------
             if best_gid is None:
                 best_gid = next_gid
                 next_gid += 1
@@ -625,6 +633,11 @@ class BalancedCPScheduler:
                 cur_min = min(exec_times)
                 cur_slack = cur_max - cur_min
                 if cur_slack <= delta * cur_max:
+                    # Slack is already within limit.
+                    break
+                if cur_min == 0:
+                    # There are empty GPUs that will be
+                    # handled in the next step.
                     break
 
                 max_r = exec_times.index(cur_max)
@@ -644,6 +657,7 @@ class BalancedCPScheduler:
 
                 proj_slack = max(proj_times) - min(proj_times)
 
+                # Check if trimming the workload helps imbalance
                 if proj_slack < cur_slack:
                     sample_id_to_remove = sample_ids_per_gpu[max_r][-1]
                     for r in members:
@@ -656,7 +670,7 @@ class BalancedCPScheduler:
 
         trim_overload()
 
-        # Track work before redistribution
+        # Track samples in this group before redistribution to empty GPUs
         total_work_before = sum(len(mb) for mb in micro_batches)
 
         # Check for empty GPUs and redistribute work
@@ -666,7 +680,8 @@ class BalancedCPScheduler:
             """
             Recursively check for empty GPUs and redistribute work by increasing
             the number of GPUs sharing samples. This ensures all GPUs have work.
-            GPUs must be allocated consecutively.
+            GPUs must be allocated consecutively so we may need to push existing
+            work to other ranks in order to expand samples.
             """
             # Find empty GPUs
             empty_gpus = [i for i in range(total_gpus) if not micro_batches[i]]
@@ -762,11 +777,11 @@ class BalancedCPScheduler:
             )
             empty_gpus = any([not micro_batches[i] for i in range(total_gpus)])
 
-        # Assert that no work has been completely removed
+        # Assert that no sample has been completely removed
         total_work_after = sum(len(mb) for mb in micro_batches)
         assert (
             total_work_after >= total_work_before
-        ), f"Work was removed: {total_work_before} -> {total_work_after}"
+        ), f"Samples were removed: {total_work_before} -> {total_work_after}"
 
         return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 

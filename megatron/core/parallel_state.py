@@ -3,6 +3,7 @@
 """Model and data parallel groups."""
 
 import os
+import logging
 import warnings
 from datetime import timedelta
 from math import log2
@@ -12,6 +13,8 @@ import numpy as np
 import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
+
+logger = logging.getLogger(__name__)
 
 try:
     import einops
@@ -843,7 +846,7 @@ def initialize_model_parallel(
     # Apply SHARP to the dp group.
     if sharp_enabled_group == "dp":
         if rank == 0:
-            print(
+            logger.info(
                 "The number of process groups to use SHARP with depends on the type "
                 "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
                 "process groups and QM2 supports up to 256 process groups. We apply "
