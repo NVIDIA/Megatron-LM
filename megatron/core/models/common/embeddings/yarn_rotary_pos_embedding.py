@@ -99,13 +99,12 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             )
 
     @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
+    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
@@ -151,10 +150,34 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
+        return emb, _mscale
+
+    def forward(self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None) -> Tensor:
+        """Forward pass of Yarn Rotary Embedding.
+
+        Args:
+            max_seq_len (int): Maximum size of sequence
+            offset (int, optional): RoPE offset. Defaults to 0.
+            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+
+        Returns:
+            Tensor: Embeddings after applying Yarn RoPE.
+        """
+        emb, _mscale = self.get_emb(max_seq_len, offset)
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            if packed_seq_params.local_cp_size > 1:
+                # Set CP group to dynamic CP group for CP slicing
+                cp_group = packed_seq_params.cp_group
+            else:
+                # Set CP group to None to avoid CP slicing
+                cp_group = None
+        else:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale
 
     def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False):

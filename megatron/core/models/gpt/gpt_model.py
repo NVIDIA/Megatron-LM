@@ -348,7 +348,9 @@ class GPTModel(LanguageModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len)
+                rotary_pos_emb, _ = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq_params=packed_seq_params
+                )
             else:
                 raise NotImplementedError(
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
