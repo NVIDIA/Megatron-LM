@@ -163,6 +163,8 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
     ENVIRONMENT: dev
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: never
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
       when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
@@ -179,6 +181,8 @@ test:unit_tests_pyt(LTS)_mcore(legacy):
     ENVIRONMENT: lts
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: never
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
       when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
@@ -217,7 +221,7 @@ test:unit_tests_notify:
   script:
     - env
     - |
-      if [[ "$CI_COMMIT_BRANCH" == "dev" ]]; then
+      if [[ "$CI_COMMIT_BRANCH" == "*dev*" ]]; then
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
       else
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
