@@ -7,6 +7,8 @@ import numpy as np
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
 
+identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
+
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
@@ -58,6 +60,15 @@ class SFTTokenizer(MegatronLegacyTokenizer):
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "identity":
+            # Identity template for prematerialized data
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,  # Adjust based on your prematerialized format if needed
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=identity_template,
+                has_bos=False,
+                has_system_role=True,
+            )
         else:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
@@ -105,7 +116,13 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx-1]["role"].lower() == "user"
+                prev_role = conversation[turn_idx-1]["role"].lower()
+                if prev_role not in ("user", "tool"):
+                    print(f"Assertion failed: previous role is '{prev_role}', expected 'user' or 'tool'")
+                    print(f"Conversation: {conversation}")
+                    print(f"Turn index: {turn_idx}")
+                    print(f"Turn: {turn}")
+                assert prev_role in ("user", "tool", "assistant")
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
@@ -118,7 +135,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             turn_len = len(turn_tokens)
 
             role = turn["role"].lower()
-            if role in ("system", "user"):
+            if role in ("system", "user", "tool"):
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
                 if self._prompt_config.assistant_prefix_len > 0:
