@@ -6,8 +6,10 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+from megatron.core.ssm.mamba_layer import MambaLayer,MambaLayerSubmodules
+from megatron.core.ssm.parallel_hybrid_layer import ParallelHybridLayer, ParallelHybridLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -62,6 +64,30 @@ mamba_stack_spec = ModuleSpec(
                     ),
                 ),
                 mlp_bda=get_bias_dropout_add,
+            ),
+        ),
+
+        parallel_hybrid_layer=ModuleSpec(
+            module=ParallelHybridLayer,
+            submodules=ParallelHybridLayerSubmodules(
+                mamba_mixer=ModuleSpec(
+                    module=MambaMixer,
+                    submodules=MambaMixerSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
+                    ),
+                ),
+                parallel_hybrid_bda=get_bias_dropout_add,
+                self_attention=ModuleSpec(
+                    module=ModuleSpec(
+                        module=SelfAttention,
+                        params={"attn_mask_type": AttnMaskType.causal},
+                        submodules=SelfAttentionSubmodules(
+                            linear_qkv=TELayerNormColumnParallelLinear,
+                            core_attention=TEDotProductAttention,
+                            linear_proj=TERowParallelLinear,
+                        ),
+                    ),
+                ),
             ),
         ),
     ),
