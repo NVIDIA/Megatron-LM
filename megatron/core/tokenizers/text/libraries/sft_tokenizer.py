@@ -154,7 +154,13 @@ class SFTTokenizer:
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
+                prev_role = conversation[turn_idx-1]["role"].lower()
+                if prev_role not in ("user", "tool"):
+                    print(f"Assertion failed: previous role is '{prev_role}', expected 'user' or 'tool'")
+                    print(f"Conversation: {conversation}")
+                    print(f"Turn index: {turn_idx}")
+                    print(f"Turn: {turn}")
+                assert prev_role in ("user", "tool", "assistant")
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
