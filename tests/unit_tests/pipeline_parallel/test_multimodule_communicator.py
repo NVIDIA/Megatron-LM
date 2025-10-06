@@ -181,7 +181,7 @@ def get_transformer_block_and_grid(
     return block, grid
 
 
-class TestBridgeCommunicator:
+class TestMultiModulePipelineCommunicator:
 
     @classmethod
     def setup_class(cls):
@@ -378,6 +378,10 @@ class TestBridgeCommunicator:
             received_grad = mllm_comm.recv_backward()
             assert received_grad['audio_encoder'].shape == (2, 16, 128)
 
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Feature requires PyTorch 2.3 or later",
+    )
     def test_send_forward_recv_backward_send_backward_recv_forward(self):
         """Test send_forward_recv_backward and send_backward_recv_forward operations."""
         if not dist.is_initialized():
