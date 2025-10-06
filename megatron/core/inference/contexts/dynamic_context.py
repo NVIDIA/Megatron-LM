@@ -1002,13 +1002,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         # if self.total_request_count >= self.max_total_requests:
         #     raise RequestOverflowError(request_id)
         # +++
-        if self.total_request_count - self.paused_request_count >= self.max_active_requests:
+        if (
+            self.total_request_count - self.paused_request_count >= self.max_active_requests
+            # or
+            # self.get_active_request_count() >= self.chunk_allocator.active_count
+        ):
             raise RequestOverflowError(request_id)
+        # <<<
+
+        # >>>
+        if request_id == 4:
+            pax({
+                "chunk_allocator" : self.chunk_allocator,
+                "total_request_count" : self.total_request_count,
+                "paused_request_count" : self.paused_request_count,
+            })
         # <<<
 
         # Preallocate chunks.
         num_chunks_needed = math.ceil(context_length / self.chunk_size_tokens)
-        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
+        # >>>
+        # new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
+        # +++
+        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(self, num_chunks_needed)
+        # <<<
         if new_chunk_ids is None:
             raise ChunkOverflowError(request_id)
 
@@ -1317,14 +1334,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         resume_request_count = 0
         if self.paused_request_count > 0:
-            active_chunk_count_total = self.chunk_allocator.active_count
-            active_chunk_count_used = self.request_kv_chunk_counts[
-                # >>>
-                self.paused_request_count:self.total_request_count
-                # self.paused_request_count:(self.paused_request_count + active_request_count)
-                # <<<
-            ].sum().item()
-            active_chunk_count_avail = active_chunk_count_total - active_chunk_count_used
+            active_chunk_count_avail = self.chunk_allocator.get_active_avail(self)
+            # pax("active_chunk_count_avail")
 
             paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
             paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
@@ -1417,7 +1428,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 == 0
             ), "The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. "
 
-            chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
+            # >>>
+            # chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
+            # +++
+            chunk_ids = self.chunk_allocator.allocate_memory_chunks(self, resume_request_count)
+            # <<<
             # >>>
             if chunk_ids is None:
                 pax({

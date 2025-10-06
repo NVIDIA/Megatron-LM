@@ -60,31 +60,90 @@ class ChunkAllocator:
             f"; active {self.active_count}"
         )
 
-    def is_memory_available(self, num_chunks: int) -> bool:
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def get_active_avail(self, context: "DynamicInferenceContext"):
+        """Compute number of available active chunks.
+
+        Args:
+            context (DynamicInferenceContext): Dynamic inference context.
+        """
+        active_total = self.active_count
+        active_used = context.request_kv_chunk_counts[
+            context.paused_request_count:context.total_request_count
+        ].sum().item()
+        active_avail = active_total - active_used
+        # >>>
+        # if active_used != 0:
+        #     pax("active_total, active_used, active_avail")
+        # <<<
+        return active_avail
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def is_memory_available(self, num_chunks: int) -> bool:
+    #     """Check if memory chunks are available.
+
+    #     Args:
+    #         num_chunks (int): Number of chunks to check.
+
+    #     Return:
+    #         (bool) Is memory available?
+    #     """
+    #     return self.total_avail >= num_chunks
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def is_memory_available(
+        self,
+        context: "DynamicInferenceContext",
+        num_chunks: int,
+    ) -> bool:
         """Check if memory chunks are available.
 
         Args:
+            context (DynamicInferenceContext): Dynamic inference context.
             num_chunks (int): Number of chunks to check.
 
         Return:
             (bool) Is memory available?
         """
-        return self.total_avail >= num_chunks
+        return self.get_active_avail(context) >= num_chunks
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-    def allocate_memory_chunks(self, num_chunks: int = 1) -> Optional[Tensor]:
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def allocate_memory_chunks(self, num_chunks: int = 1) -> Optional[Tensor]:
+    #     """Allocate memory chunks if available, else return None.
+
+    #     Args:
+    #         num_chunks (int): Number of chunks to allocate.
+
+    #     Return:
+    #         (Optional[Tensor]) Allocated chunk IDs.
+    #     """
+    #     if self.is_memory_available(num_chunks):
+    #         self.total_avail -= num_chunks
+    #         return self.chunk_bag[self.total_avail : (self.total_avail + num_chunks)]
+    #     else:
+    #         return None
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def allocate_memory_chunks(
+        self,
+        context: "DynamicInferenceContext",
+        num_chunks: int,
+    ) -> Optional[Tensor]:
         """Allocate memory chunks if available, else return None.
 
         Args:
+            context (DynamicInferenceContext): Dynamic inference context.
             num_chunks (int): Number of chunks to allocate.
 
         Return:
             (Optional[Tensor]) Allocated chunk IDs.
         """
-        if self.is_memory_available(num_chunks):
+        if self.is_memory_available(context, num_chunks):
             self.total_avail -= num_chunks
             return self.chunk_bag[self.total_avail : (self.total_avail + num_chunks)]
         else:
             return None
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def release_memory_chunks(self, chunks: Tensor) -> None:
         """Release memory chunks.
