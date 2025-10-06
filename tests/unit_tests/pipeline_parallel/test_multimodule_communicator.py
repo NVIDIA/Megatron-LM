@@ -211,34 +211,34 @@ class TestBridgeCommunicator:
         assert bridge_communicator.current_rank == dist.get_rank()
         assert bridge_communicator.comm_map is not None
 
-    # def test_multimodule_communicator_init(self):
-    #     """Test MultiModulePipelineCommunicator initialization."""
+    def test_multimodule_communicator_init(self):
+        """Test MultiModulePipelineCommunicator initialization."""
 
-    #     # Create process group grids for each module
-    #     image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1)
-    #     audio_encoder_grid = create_hypercomm_grid(offset=1, tp=1, cp=1, pp=1, dp=1)
-    #     llm_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=2, dp=1)
-    #     generator_grid = create_hypercomm_grid(offset=6, tp=2, cp=1, pp=1, dp=1)
+        # Create process group grids for each module
+        image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1)
+        audio_encoder_grid = create_hypercomm_grid(offset=1, tp=1, cp=1, pp=1, dp=1)
+        llm_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=2, dp=1)
+        generator_grid = create_hypercomm_grid(offset=6, tp=2, cp=1, pp=1, dp=1)
 
-    #     # Define module-grid mapping
-    #     module_to_grid_map = {
-    #         'image_encoder': image_encoder_grid,
-    #         'audio_encoder': audio_encoder_grid,
-    #         'llm': llm_grid,
-    #         'generator': generator_grid,
-    #     }
-    #     # Define module computation topology
-    #     topology = {
-    #         'image_encoder': ['llm'],
-    #         'audio_encoder': ['llm'],
-    #         'llm': ['generator'],
-    #         'generator': [],
-    #     }
-    #     config = ModelParallelConfig(bf16=True)
-    #     # Initialize communicator
-    #     mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
-    #     # Test attributes match expectations
-    #     assert mllm_comm.module_to_grid_map == module_to_grid_map
-    #     assert mllm_comm.topology == topology
-    #     assert mllm_comm.config == config
-    #     assert mllm_comm.current_rank == dist.get_rank()
+        # Define module-grid mapping
+        module_to_grid_map = {
+            'image_encoder': image_encoder_grid,
+            'audio_encoder': audio_encoder_grid,
+            'llm': llm_grid,
+            'generator': generator_grid,
+        }
+        # Define module computation topology
+        topology = {
+            'image_encoder': ['llm'],
+            'audio_encoder': ['llm'],
+            'llm': ['generator'],
+            'generator': [],
+        }
+        config = ModelParallelConfig(bf16=True)
+        # Initialize communicator
+        mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
+        # Test attributes match expectations
+        assert mllm_comm.module_to_grid_map == module_to_grid_map
+        assert mllm_comm.topology == topology
+        assert mllm_comm.config == config
+        assert mllm_comm.current_rank == dist.get_rank()
