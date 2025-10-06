@@ -1,4 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import logging
+
 
 class MetadataBase:
     """
@@ -63,4 +65,4 @@ class MetadataBase:
         Print all the data in the metadata.
         """
         for key, value in self.state_data.items():
-            print(f"{key}: {value}")
+            logging.info(f"{key}: {value}")

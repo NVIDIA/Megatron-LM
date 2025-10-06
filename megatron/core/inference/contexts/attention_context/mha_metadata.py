@@ -14,18 +14,18 @@ class MHAMetadata(MetadataBase):
 
     def __init__(
         self,
-        chunk_count_total,
-        max_kv_chunk_count,
+        block_count_total,
+        max_kv_block_count,
         max_requests,
-        chunk_size_tokens,
+        block_size_tokens,
         max_seqlen,
         debug=False,
     ):
         super().__init__(debug)
         device = torch.cuda.current_device()
         self.device = device
-        self.max_blocks = chunk_count_total
-        self.max_kv_chunks = max_kv_chunk_count
+        self.max_blocks = block_count_total
+        self.max_kv_blocks = max_kv_block_count
         self.max_bs = max_requests
         self.max_seqlen = max_seqlen
         self._query_lengths_buf = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
@@ -35,7 +35,7 @@ class MHAMetadata(MetadataBase):
         self._cu_kv_seq_lengths_buf = torch.zeros(self.max_bs + 1, dtype=torch.int32, device=device)
         self._kv_seq_lengths_buf = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
         self._block_table_buf = torch.zeros(
-            (self.max_bs, self.max_kv_chunks), dtype=torch.int32, device=device
+            (self.max_bs, self.max_kv_blocks), dtype=torch.int32, device=device
         )
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
@@ -46,7 +46,7 @@ class MHAMetadata(MetadataBase):
         self,
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
-        request_to_kv_chunk_ids: torch.Tensor,
+        request_to_kv_block_ids: torch.Tensor,
         padded_active_token_count: int,
         real_batch_size: int,
         graph_batch_size: Optional[int] = None,
@@ -55,7 +55,7 @@ class MHAMetadata(MetadataBase):
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
-            request_to_kv_chunk_ids: (>real_batch_size, max_kv_chunks)
+            request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             padded_active_token_count: int
             real_batch_size: int
             graph_batch_size: Optional[int]
@@ -66,7 +66,7 @@ class MHAMetadata(MetadataBase):
         assert real_batch_size <= graph_batch_size <= self.max_bs
         assert request_query_lengths.shape[0] == real_batch_size
         assert request_kv_length_offsets.shape[0] == real_batch_size
-        assert request_to_kv_chunk_ids.shape[0] == real_batch_size
+        assert request_to_kv_block_ids.shape[0] == real_batch_size
 
         self.tensor_copy_and_pad(
             self._query_lengths_buf, request_query_lengths, real_batch_size, graph_batch_size
@@ -87,10 +87,10 @@ class MHAMetadata(MetadataBase):
         )
         self.tensor_copy_and_pad(
             self._block_table_buf,
-            request_to_kv_chunk_ids,
+            request_to_kv_block_ids,
             real_batch_size,
             graph_batch_size,
-            pad_value=torch.tensor(self.max_kv_chunks, dtype=torch.int32, device=self.device).fill_(
+            pad_value=torch.tensor(self.max_kv_blocks, dtype=torch.int32, device=self.device).fill_(
                 -1
             ),
         )
@@ -139,18 +139,18 @@ class GraphMHAMetadata(MHAMetadata):
 
     def __init__(
         self,
-        chunk_count_total,
-        max_kv_chunk_count,
+        block_count_total,
+        max_kv_block_count,
         max_requests,
-        chunk_size_tokens,
+        block_size_tokens,
         max_seqlen,
         debug=False,
     ):
         super().__init__(
-            chunk_count_total,
-            max_kv_chunk_count,
+            block_count_total,
+            max_kv_block_count,
             max_requests,
-            chunk_size_tokens,
+            block_size_tokens,
             max_seqlen,
             debug,
         )
@@ -159,7 +159,7 @@ class GraphMHAMetadata(MHAMetadata):
         self,
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
-        request_to_kv_chunk_ids: torch.Tensor,
+        request_to_kv_block_ids: torch.Tensor,
         padded_active_token_count: int,
         real_batch_size: int,
         graph_batch_size: Optional[int] = None,
@@ -168,7 +168,7 @@ class GraphMHAMetadata(MHAMetadata):
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
-            request_to_kv_chunk_ids: (>real_batch_size, max_kv_chunks)
+            request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             padded_active_token_count: int
             real_batch_size: int
             graph_batch_size: Optional[int]
@@ -176,7 +176,7 @@ class GraphMHAMetadata(MHAMetadata):
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
-            request_to_kv_chunk_ids,
+            request_to_kv_block_ids,
             padded_active_token_count,
             real_batch_size,
             graph_batch_size,
@@ -195,7 +195,7 @@ class NonGraphMHAMetadata(MHAMetadata):
         self,
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
-        request_to_kv_chunk_ids: torch.Tensor,
+        request_to_kv_block_ids: torch.Tensor,
         padded_active_token_count: int,
         real_batch_size: int,
         graph_batch_size: Optional[int] = None,
@@ -204,7 +204,7 @@ class NonGraphMHAMetadata(MHAMetadata):
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
-            request_to_kv_chunk_ids: (>real_batch_size, max_kv_chunks)
+            request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             padded_active_token_count: int
             real_batch_size: int
             graph_batch_size: Optional[int]
@@ -212,7 +212,7 @@ class NonGraphMHAMetadata(MHAMetadata):
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
-            request_to_kv_chunk_ids,
+            request_to_kv_block_ids,
             padded_active_token_count,
             real_batch_size,
             graph_batch_size,

@@ -406,19 +406,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_attn_metadata = None
 
         self.graph_attn_metadata["mha_metadata"] = GraphMHAMetadata(
-            chunk_count_total=chunk_count_total,
-            max_kv_chunk_count=self.max_kv_chunk_count,
+            block_count_total=block_count_total,
+            max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
-            chunk_size_tokens=self.chunk_size_tokens,
+            block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
             debug=False,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAMetadata(
-            chunk_count_total=chunk_count_total,
-            max_kv_chunk_count=self.max_kv_chunk_count,
+            block_count_total=block_count_total,
+            max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
-            chunk_size_tokens=self.chunk_size_tokens,
+            block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
             debug=False,
         )
@@ -854,11 +854,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_slice = slice(self.paused_request_count, self.total_request_count)
         query_lengths_view = self.request_query_lengths[active_slice]
         request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
-        request_to_kv_chunk_ids_view = self.request_to_kv_chunk_ids[active_slice]
+        request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
             request_kv_length_offsets=request_kv_length_offsets_view,
-            request_to_kv_chunk_ids=request_to_kv_chunk_ids_view,
+            request_to_kv_block_ids=request_to_kv_block_ids_view,
             padded_active_token_count=self.padded_active_token_count,
             real_batch_size=real_req_batch_size,
             graph_batch_size=graph_req_batch_size,
@@ -1127,10 +1127,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
-        tensor_swap(self.request_to_kv_chunk_ids, src_idxs, dst_idxs)
-        tensor_swap(self.request_kv_chunk_counts, src_idxs, dst_idxs)
-        tensor_swap(self.request_last_kv_chunk_id, src_idxs, dst_idxs)
-        tensor_swap(self.request_last_kv_chunk_offset, src_idxs, dst_idxs)
+        tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
+        tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
