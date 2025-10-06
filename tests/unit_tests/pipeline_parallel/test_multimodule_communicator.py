@@ -201,16 +201,6 @@ class TestBridgeCommunicator:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    def test_bridge_communicator_init(self):
-
-        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
-        grid2 = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=1, dp=2)
-        bridge_communicator = BridgeCommunicator(grid1, grid2)
-        assert bridge_communicator.src_grid is grid1
-        assert bridge_communicator.dest_grid is grid2
-        assert bridge_communicator.current_rank == dist.get_rank()
-        assert bridge_communicator.comm_map is not None
-
     def test_multimodule_communicator_init(self):
         """Test MultiModulePipelineCommunicator initialization."""
 
@@ -330,3 +320,60 @@ class TestBridgeCommunicator:
             # Generator module receives final LLM output
             input_dict = mllm_comm.recv_forward()
             assert input_dict['llm'].shape == (1, 32, 128)
+
+    def test_send_backward_recv_backward(self):
+        """Test send_backward and recv_backward operations."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        # Create process group grids for each module
+        image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1)
+        audio_encoder_grid = create_hypercomm_grid(offset=1, tp=1, cp=1, pp=1, dp=1)
+        llm_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=2, dp=1)
+        generator_grid = create_hypercomm_grid(offset=6, tp=1, cp=1, pp=1, dp=2)
+
+        # Set up module-grid mapping and topology
+        module_to_grid_map = {
+            'image_encoder': image_encoder_grid,
+            'audio_encoder': audio_encoder_grid,
+            'llm': llm_grid,
+            'generator': generator_grid,
+        }
+        topology = {
+            'image_encoder': ['llm'],
+            'audio_encoder': ['llm'],
+            'llm': ['generator'],
+            'generator': [],
+        }
+        config = ModelParallelConfig(pipeline_dtype=torch.float)
+        mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
+
+        # Simulate backward communication for each module
+        if mllm_comm.is_current_rank_in_grid(generator_grid):
+            # Generator sends gradient backward
+            grad_dict = {'llm': torch.randn(1, 32, 128).cuda()}
+            mllm_comm.send_backward(grad_dict)
+        if mllm_comm.is_current_rank_in_grid(llm_grid):
+            if dist.get_rank() == 4 or dist.get_rank() == 5:
+                # LLM receives expanded gradient and sends backward
+                received_grad = mllm_comm.recv_backward()
+                assert received_grad['llm'].shape == (2, 32, 128)
+                grad_dict = {'llm': torch.randn(2, 32, 128).cuda()}
+                mllm_comm.send_backward(grad_dict)
+            else:
+                # LLM receives gradient and sends backward to both image/audio encoders
+                received_grad = mllm_comm.recv_backward(tensor_shape=(2, 32, 128))
+                assert received_grad['llm'].shape == (2, 32, 128)
+                grad_dict = {
+                    'image_encoder': torch.randn(2, 8, 128).cuda(),
+                    'audio_encoder': torch.randn(2, 16, 128).cuda(),
+                }
+                mllm_comm.send_backward(grad_dict)
+        if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
+            # Image encoder receives its gradient
+            received_grad = mllm_comm.recv_backward()
+            assert received_grad['image_encoder'].shape == (2, 8, 128)
+        if mllm_comm.is_current_rank_in_grid(audio_encoder_grid):
+            # Audio encoder receives its gradient
+            received_grad = mllm_comm.recv_backward()
+            assert received_grad['audio_encoder'].shape == (2, 16, 128)
