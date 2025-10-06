@@ -207,7 +207,7 @@ functional:x_notify:
   script:
     - env
     - |
-      if [[ "$CI_COMMIT_BRANCH" == "dev" ]]; then
+      if [[ "$CI_COMMIT_BRANCH" == "*dev*" ]]; then
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
       else
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}

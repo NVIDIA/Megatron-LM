@@ -36,6 +36,7 @@ from megatron.core import mpu
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model, get_tokenizer
 import asyncio
+from functools import partial
 from typing import AsyncIterator, List, Union
 
 REQUEST_ID = 0
@@ -283,7 +284,7 @@ def main():
     elif args.model_provider == "mamba":
         model_builder = mamba_builder
 
-    model = get_model(model_provider(model_builder), wrap_with_ddp=False)
+    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
     tokenizer = get_tokenizer()
     load_checkpoint(model, None, None)
     model = model[0]
