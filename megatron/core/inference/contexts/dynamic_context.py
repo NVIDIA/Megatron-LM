@@ -243,7 +243,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_requests, max_tokens.
         # >>>
         # self.max_requests = active_chunk_count_total
-        self.max_requests = self.chunk_allocator.active_count
+        # +++
+        # self.max_requests = self.chunk_allocator.active_count
+        # +++
+        self.max_total_requests = self.chunk_allocator.total_count - 1 # -1 for dummy chunk
+        self.max_active_requests = self.chunk_allocator.active_count
         # <<<
         # >>>
         # pax({
@@ -275,7 +279,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request state.
         self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_total_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
@@ -333,7 +337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
         self.request_to_kv_chunk_ids = torch.full(
-            (self.max_requests, self.max_kv_chunk_count),
+            (self.max_total_requests, self.max_kv_chunk_count),
             -1,
             dtype=torch.int,
             device=torch.cuda.current_device(),
@@ -344,11 +348,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_cuda_graphs is not None:
 
             # Ensure valid num_cuda_graphs.
-            num_cuda_graphs = min(max(num_cuda_graphs, 1), self.max_requests)
+            num_cuda_graphs = min(max(num_cuda_graphs, 1), self.max_active_requests)
 
             # Cuda graph step size.
             cuda_graph_rounder = 8
-            self.cuda_graph_step_size = self.max_requests / num_cuda_graphs
+            self.cuda_graph_step_size = self.max_active_requests / num_cuda_graphs
             self.cuda_graph_step_size = (
                 math.ceil(self.cuda_graph_step_size / cuda_graph_rounder) * cuda_graph_rounder
             )
@@ -357,13 +361,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Cuda graph token counts.
             if num_cuda_graphs == 1:
-                self.cuda_graph_token_counts = [self.max_requests]
+                self.cuda_graph_token_counts = [self.max_active_requests]
             else:
                 self.cuda_graph_token_counts = list(
-                    range(self.cuda_graph_step_size, self.max_requests, self.cuda_graph_step_size)
+                    range(self.cuda_graph_step_size, self.max_active_requests, self.cuda_graph_step_size)
                 )
-                if self.cuda_graph_token_counts[-1] != self.max_requests:
-                    self.cuda_graph_token_counts.append(self.max_requests)
+                if self.cuda_graph_token_counts[-1] != self.max_active_requests:
+                    self.cuda_graph_token_counts.append(self.max_active_requests)
                 self.cuda_graph_token_counts.reverse()
 
             # Set used for validating active cuda graph token count.
@@ -385,20 +389,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # corresponding tensors are used.
 
         self.query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
         self.cu_query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
         self.kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
         self.cu_kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
         self.request_to_kv_chunk_ids_cudagraph_only = torch.full(
-            (self.max_requests, self.max_kv_chunk_count),
+            (self.max_total_requests, self.max_kv_chunk_count),
             0,
             dtype=torch.int,
             device=torch.cuda.current_device(),
@@ -720,8 +724,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # warmup both decode and non-decode engine steps
         if num_warmup_tokens is not None:
-            if num_warmup_tokens > self.max_requests:
-                raise ActiveRequestCountOverflowError(self.max_requests, num_warmup_tokens)
+            if num_warmup_tokens > self.max_active_requests:
+                raise ActiveRequestCountOverflowError(self.max_active_requests, num_warmup_tokens)
 
             if warmup_engine_mode == WarmupEngineMode.NON_DECODE:
                 assert self.non_decode_cuda_graphs, "Set non-decode cuda graphs to True"
@@ -740,7 +744,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 math.ceil(active_token_count / self.cuda_graph_step_size)
                 * self.cuda_graph_step_size
             )
-            self.padded_active_token_count = min(self.padded_active_token_count, self.max_requests)
+            self.padded_active_token_count = min(self.padded_active_token_count, self.max_active_requests)
             assert self.padded_active_token_count in self.cuda_graph_token_counts_set
             assert self.padded_active_token_count >= active_token_count
         else:
@@ -748,7 +752,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only():
                 # For decode-only, the padded active token count cannot exceed max-requests.
                 self.padded_active_token_count = min(
-                    self.padded_active_token_count, self.max_requests
+                    self.padded_active_token_count, self.max_active_requests
                 )
 
         # How are we calculating the padded active request count?
@@ -994,8 +998,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # TODO : Should move this into some waiting queue
         if self.active_token_count + context_length > self.max_tokens:
             raise TokenOverflowError(request_id)
-        if self.total_request_count >= self.max_requests:
+        # >>>
+        # if self.total_request_count >= self.max_total_requests:
+        #     raise RequestOverflowError(request_id)
+        # +++
+        if self.total_request_count - self.paused_request_count >= self.max_active_requests:
             raise RequestOverflowError(request_id)
+        # <<<
 
         # Preallocate chunks.
         num_chunks_needed = math.ceil(context_length / self.chunk_size_tokens)
@@ -1455,17 +1464,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             return "%d[%d:%d]" % (r, q, kv)
         request_strs = [
             get_request_str(i)
-            for i in range(self.total_request_count)
+            for i in range(self.total_request_count + finished_request_count)
         ]
         # pax("request_strs")
-        print("++++++++++ requests: %s --- %s ..... paused: %s, resumed: %s, finished: %s ..... alloc: %d/%d [%d]" % (
+        print("++++++++++ requests: %s -- %s -- %s ..... paused: %s, resumed: %s, finished: %s ..... alloc: %d/%d [%d]" % (
             ", ".join(request_strs[:self.paused_request_count]),
             ", ".join(request_strs[self.paused_request_count:self.total_request_count]),
+            ", ".join(request_strs[self.total_request_count:(self.total_request_count + finished_request_count)]),
             "--" if newly_paused_request_ids is None else newly_paused_request_ids.tolist(),
             newly_resumed_request_ids.tolist(),
             self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
-            self.chunk_allocator.total_avail,
-            self.chunk_allocator.total_count,
+            self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
+            self.chunk_allocator.total_count - 1,
             self.chunk_allocator.active_count,
         ))
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
