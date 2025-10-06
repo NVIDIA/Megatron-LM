@@ -1065,6 +1065,7 @@ class CudaGraphManager(torch.nn.Module):
             )
 
         self.cudagraph_runners = []
+        self.inference_cudagraphs_lookup_table = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
         # Without pipeline parallelism, microbatches execute one at a time.
@@ -1147,15 +1148,27 @@ class CudaGraphManager(torch.nn.Module):
             bwd_mempool = CudaGraphManager.bwd_mempool
 
         if self.reuse_cudagraphs:
-            runner = next(
-                (
-                    r
-                    for r in self.cudagraph_runners
-                    if r.status == _GraphStatus.FWD_READY
-                    and not r.get_mismatch_errors(args, kwargs)
-                ),
-                None,
-            )
+            is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            if is_inference_mode:
+                batch_size = kwargs['hidden_states'].shape[0]
+                is_decode_only = kwargs["inference_context"].is_decode_only()
+                # Attempt to retrieve the corresponding runner from the lookup table.
+                # The table is keyed on (batch_size, is_decode_only).
+                # It returns None if no match is found, in which case a new runner is created
+                # and cached in the lookup table.
+                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+            else:
+                # Todo: For training, we could also cache runners based on input shape.
+                runner = next(
+                    (
+                        r
+                        for r in self.cudagraph_runners
+                        if r.status == _GraphStatus.FWD_READY
+                        and not r.get_mismatch_errors(args, kwargs)
+                    ),
+                    None,
+                )
+
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
                     assert False
@@ -1169,6 +1182,11 @@ class CudaGraphManager(torch.nn.Module):
                         self.share_cudagraph_io_buffers,
                     )
                     self.cudagraph_runners.append(runner)
+                    if is_inference_mode:
+                        # Cache the newly created runner in the inference lookup table.
+                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                            runner
+                        )
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
