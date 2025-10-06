@@ -1504,7 +1504,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
             self.chunk_allocator.total_count - 1,
             self.chunk_allocator.get_paused_used(self),
-            self.chunk_allocator.total_count - self.chunk_allocator.active_count - 1,
+            self.chunk_allocator.paused_count,
             self.chunk_allocator.get_active_used(self),
             self.chunk_allocator.active_count,
         )

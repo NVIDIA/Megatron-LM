@@ -45,6 +45,7 @@ class ChunkAllocator:
         self.total_count = 2 * active_count + 1 # +1 for dummy_chunk_idx
         self.total_avail = self.total_count - 1 # -1 for dummy_chunk_idx
         self.active_count = active_count
+        self.paused_count = self.total_count - self.active_count - 1 # -1 for dummy_chunk_idx
         self.dummy_chunk_idx = self.total_count - 1
 
         # Initialize chunk pool as a "stack" data structure
@@ -87,14 +88,7 @@ class ChunkAllocator:
         Args:
             context (DynamicInferenceContext): Dynamic inference context.
         """
-        active_total = self.active_count
-        active_used = self.get_active_used(context)
-        active_avail = active_total - active_used
-        # >>>
-        # if active_used != 0:
-        #     pax("active_total, active_used, active_avail")
-        # <<<
-        return active_avail
+        return self.active_count - self.get_active_used(context)
 
     def get_paused_avail(self, context: "DynamicInferenceContext"):
         """Compute number of paused chunks available.
@@ -102,14 +96,24 @@ class ChunkAllocator:
         Args:
             context (DynamicInferenceContext): Dynamic inference context.
         """
-        paused_total = self.total_count - self.active_count - 1 # -1 for dummy chunk
-        paused_used = self.get_paused_used(context)
-        paused_avail = paused_total - paused_used
-        # >>>
-        # if paused_used != 0:
-        #     pax("paused_total, paused_used, paused_avail")
-        # <<<
-        return paused_avail
+        return self.paused_count - self.get_paused_used(context)
+
+    def get_active_needed_addl(self, context: "DynamicInferenceContext"):
+        """Compute max number of additional chunks needed to complete currently
+        active requests.
+
+        Args:
+            context (DynamicInferenceContext): Dynamic inference context.
+        """
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_chunks_needed_total = active_request_count * context.max_kv_chunk_count
+        active_chunks_used = self.get_active_used(context)
+        active_chunks_needed_addl = active_chunks_needed_total - active_chunks_used
+        # pax("active_request_count, active_chunks_used",
+        #     "active_chunks_needed_total, active_chunks_needed_addl")
+        return active_chunks_needed_addl
+
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -139,17 +143,19 @@ class ChunkAllocator:
             (bool) Is memory available?
         """
         # >>>
-        paused_avail = self.get_paused_avail(context)
+        # paused_avail = self.get_paused_avail(context)
         active_avail = self.get_active_avail(context)
-        if active_avail >= num_chunks and self.total_avail == 0:
-            pax("self, num_chunks, paused_avail, active_avail", {
-                "paused_used" : self.get_paused_used(context),
-                "active_used" : self.get_active_used(context),
-                "total_request_count" : context.total_request_count,
-                "paused_request_count" : context.paused_request_count,
-            })
+        active_needed_addl = self.get_active_needed_addl(context)
+        # if active_avail >= num_chunks and self.total_avail == 0:
+        #     pax("self, num_chunks", {
+        #         "paused_used" : "%d / %d" % (self.get_paused_used(context), self.paused_count),
+        #         "active_used" : "%d / %d" % (self.get_active_used(context), self.active_count),
+        #         "total_request_count" : context.total_request_count,
+        #         "paused_request_count" : context.paused_request_count,
+        #     }, "active_addl")
         # <<<
-        return self.get_active_avail(context) >= num_chunks
+        # return self.get_active_avail(context) >= num_chunks
+        return active_avail >= num_chunks and active_needed_addl <= self.total_avail
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

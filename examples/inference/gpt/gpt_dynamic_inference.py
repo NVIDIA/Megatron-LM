@@ -121,7 +121,6 @@ def get_model() -> MegatronModule:
     return model
 
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> int:
     """Estimate memory remaining for context's `memory_buffer`.
 
@@ -133,12 +132,6 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
     args = get_args()
     active_buffer_size_gb = args.inference_dynamic_batching_active_buffer_size_gb
     active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
-    # >>>
-    # pax({
-    #     "active buffer gb" : get_args().inference_dynamic_batching_active_buffer_size_gb,
-    #     "1024**3" : 1024**3,
-    # }, "active_buffer_size_bytes")
-    # <<<
     return active_buffer_size_bytes
 
 
@@ -156,7 +149,6 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 
 #     # args = get_args()
 #     # model = GPTInferenceWrapper(model, args, inference_context="not-actually-set") # None)
-#     # pax("model")
 
 #     num_tokens_step = 1000
 #     num_tokens_min = num_tokens_step
@@ -182,7 +174,6 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 #             dtype=torch.long,
 #             device=torch.cuda.current_device(),
 #         ).unsqueeze(0)
-#         # pax("input_ids, position_ids")
 #         # result = model.run_one_forward_step(
 #         #     {
 #         #         "tokens": input_ids,
@@ -201,15 +192,11 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 #             )
 #         t = time.time() - t
 #         time_map[num_tokens] = t
-#         # >>>
-#         # pax("result")
-#         # <<<
 #     print("~~ x ~~")
 #     [ print(x) for x in time_map.keys() ]
 #     print("~~ y ~~")
 #     [ print(y) for y in time_map.values() ]
-#     pax()
-#     pax("time_map")
+#     raise Exception("matplotlib.")
 #     return max_tokens
 def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
     """Estimate `max_tokens` for the context.
@@ -219,7 +206,6 @@ def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
     correlation between `max_tokens` and request throughput.
     """
     return 16384
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 def get_inference_context(
@@ -247,10 +233,6 @@ def get_inference_context(
     active_buffer_size_bytes = get_inference_context_active_buffer_size_bytes(model)
     max_tokens = get_inference_context_max_tokens(model)
 
-    # >>>
-    # pax("active_buffer_size_bytes, max_tokens")
-    # <<<
-
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -263,13 +245,8 @@ def get_inference_context(
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
         ),
-        # >>>
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         active_buffer_size_bytes=active_buffer_size_bytes,
-        # +++
-        # chunk_size_tokens=4, # 256,
-        # active_buffer_size_bytes=int(2 * 1024**2),
-        # <<<
         max_tokens=max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,

@@ -344,30 +344,6 @@ def build_dynamic_engine_setup_prefix(
         f"r/step {args.incoming_requests_per_step}"
     )
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # # Buffer limits config
-    # flw = args.inference_dynamic_batching_buffer_overflow_factor
-    # flw_str = "no overflow" if flw is None else f"{flw:.1f}"
-    # buffer_limits_str = (
-    #     f"bf {args.inference_dynamic_batching_buffer_size_gb:.0f}, {flw_str} "
-    #     f"[r {context.max_requests}, t {context.max_tokens}]"
-    # )
-
-    # # Guaranteed request config
-    # guaranteed_fraction_str = (
-    #     f"gtd {args.inference_dynamic_batching_buffer_guaranteed_fraction:.2f} "
-    #     f"[r {context.gtd_request_count}]"
-    # )
-
-    # parts = [
-    #     get_model_size_str(model),
-    #     "dynamic",
-    #     cg_str,
-    #     request_str,
-    #     buffer_limits_str,
-    #     guaranteed_fraction_str,
-    # ]
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     # Buffer limits config
     buffer_limits_str = (
         f"bf {args.inference_dynamic_batching_active_buffer_size_gb:.0f} "
@@ -381,6 +357,5 @@ def build_dynamic_engine_setup_prefix(
         request_str,
         buffer_limits_str,
     ]
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     return " | ".join(parts)
