@@ -10,7 +10,7 @@ from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType
 
 from megatron.core.enums import ModelType
-from megatron.core.rerun_state_machine import RerunMode
+from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode, RerunState
 from megatron.core.transformer.enums import AttnBackend
 
 SAFE_GLOBALS = [
@@ -23,7 +23,9 @@ SAFE_GLOBALS = [
     Namespace,
     AttnBackend,
     ModelType,
+    RerunDiagnostic,
     RerunMode,
+    RerunState,
 ]
 
 

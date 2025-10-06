@@ -92,14 +92,14 @@ else
     # If this is a second run (of checkpoint-resume), we might want to use a
     # different model configuration than during first time. So if key `MODEL_ARGS_2`
     # exists we use it, otherwise we use the same as for the first run.
-    if [[ $RUN_NUMBER -eq 2 && $(/usr/local/bin/yq 'has("MODEL_ARGS_2")' "$TRAINING_PARAMS_PATH") == true ]]; then
-        export KEY="MODEL_ARGS_2"
+    if [[ $RUN_NUMBER -gt 1 && $(/usr/local/bin/yq 'has("MODEL_ARGS_'$RUN_NUMBER'")' "$TRAINING_PARAMS_PATH") == true ]]; then
+        export KEY="MODEL_ARGS_$RUN_NUMBER"
     else
         export KEY="MODEL_ARGS"
     fi
 
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(/usr/local/bin/yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(/usr/local/bin/yq 'explode(.) | ... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
@@ -135,10 +135,12 @@ else
     TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
     # Split into array while preserving quotes
     eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
-    PARAMS=(
-        "--exit-duration-in-mins"
-        $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
-    )
+    if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        PARAMS=(
+            "--exit-duration-in-mins"
+            $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+        )
+    fi
 fi
 
 # Extract training params
@@ -152,9 +154,9 @@ export WANDB_API_KEY="${WANDB_API_KEY:-}"
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
 LAST_RANK=7
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
@@ -164,22 +166,25 @@ DISTRIBUTED_ARGS=(
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
-    --node_rank $SLURM_NODEID
+    --node_rank $NODE_RANK
     --log-dir $LOG_DIR
     --tee "0:3,7:3"
     --redirects "3"
 )
 
-sleep 5
-set -x
-fuser -k /dev/nvidia* || true
-nvidia-smi pmon -c 1
-
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+        -m coverage run \
+        --data-file=.coverage.unit_tests \
+        --source=megatron/core \
+        /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
+        -m coverage run \
+        --data-file=.coverage.unit_tests \
+        --source=megatron/core \
+        $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 
 # Run after script

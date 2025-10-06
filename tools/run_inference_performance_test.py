@@ -36,6 +36,7 @@ from megatron.core import mpu
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model, get_tokenizer
 import asyncio
+from functools import partial
 from typing import AsyncIterator, List, Union
 
 REQUEST_ID = 0
@@ -133,7 +134,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
             max_requests_override=args.inference_dynamic_batching_max_requests_override,
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-            chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+            block_size_tokens=args.inference_dynamic_batching_block_size,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             model, inference_wrapper_config, inference_context=context
@@ -171,7 +172,7 @@ async def generate(
         tokenizer = get_tokenizer()
         prompts = [tokenizer.detokenize(request.prompt_tokens) for request in inference_requests]
 
-    request_ids: List[str] = [
+    request_ids: List[int] = [
         inference_engine.add_request(
             prompt=prompt,
             inference_request=inference_request,
@@ -245,9 +246,8 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        active_requests, finished_requests, step_time = inference_engine.step(
-            sampling_params, verbose=False
-        )
+        result = inference_engine.step(sampling_params, verbose=False)
+        finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
             latency = time.perf_counter() - start_time
@@ -284,7 +284,7 @@ def main():
     elif args.model_provider == "mamba":
         model_builder = mamba_builder
 
-    model = get_model(model_provider(model_builder), wrap_with_ddp=False)
+    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
     tokenizer = get_tokenizer()
     load_checkpoint(model, None, None)
     model = model[0]

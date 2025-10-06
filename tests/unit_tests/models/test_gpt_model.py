@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -270,8 +270,6 @@ class TestGPTModelWithCustomPG:
         "tp_size, dp_size, cp_size", [(1, 8, 1), (2, 4, 1)]  # TP 1, DP 8, CP 1  # TP 2, DP 4, CP 1
     )
     def test_gpt_model_with_custom_pg(self, tp_size, dp_size, cp_size):
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
-        model_parallel_cuda_manual_seed(123)
 
         # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
         grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
@@ -286,19 +284,22 @@ class TestGPTModelWithCustomPG:
         embd_group = torch.distributed.new_group(
             ranks=embd_group_ranks, timeout=timedelta(minutes=30)
         )
-        model_comm_pgs = ModelCommProcessGroups(
+        pg_collection = ProcessGroupCollection(
             tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group
         )
 
+        model_parallel_cuda_manual_seed(
+            1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank()
+        )
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=1024, num_attention_heads=16, use_cpu_initialization=True
+            num_layers=2, hidden_size=1024, num_attention_heads=16, use_cpu_initialization=False
         )
         self.gpt_model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=512,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
             post_process=False,
         )
 

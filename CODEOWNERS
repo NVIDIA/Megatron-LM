@@ -55,16 +55,27 @@ megatron/core/inference/
 [ParallelState] @mcore-reviewers/core-adlr @mcore-reviewers/core-nemo
 megatron/core/parallel_state.py
 
+[Post-Training] @mcore-reviewers/post-training
+megatron/core/post_training/
+megatron/post_training
+
 [CI][1] @mcore-reviewers/ci
 .gitlab/
 .github/
 .gitlab-ci.yml
-Dockerfile.ci.lts
-Dockerfile.ci.dev
-tests/
+docker/
+tests/unit_tests/run_ci_test.sh
+tests/test_utils/python_scripts/
+tests/functional_tests/python_test_utils/
+tests/functional_tests/shell_test_utils/
 megatron/core/transformer/transformer_block.py
 megatron/core/transformer/transformer_layer.py
 
+^[Tests][1] @mcore-reviewers/ci
+tests/functional_tests/test_cases/
+tests/functional_tests/recipes/
+tests/unit_tests/
+
 [RL] @mcore-reviewers/rl
-megatron/training/rl/
+megatron/rl/
 examples/rl/

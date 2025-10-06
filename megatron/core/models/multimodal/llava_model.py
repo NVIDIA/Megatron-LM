@@ -15,7 +15,7 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_ima
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -82,7 +82,7 @@ class LLaVAModel(MegatronModule):
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         tile_tags (list): Optional tile tags.
-        model_comm_pgs (ModelCommProcessGroups): Model communication process groups.
+        pg_collection (ProcessGroupCollection): Model communication process groups.
         vp_stage (int): Virtual pipeline stage.
     """
 
@@ -120,7 +120,7 @@ class LLaVAModel(MegatronModule):
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         max_num_tiles: int = 0,
         tokenizer_type: str = "",
         vp_stage: Optional[int] = None,
@@ -147,9 +147,9 @@ class LLaVAModel(MegatronModule):
         self.vision_projection = None
         self.language_model = None
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        self.model_comm_pgs = model_comm_pgs
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
 
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
@@ -162,7 +162,7 @@ class LLaVAModel(MegatronModule):
                     attn_module.submodules.core_attention == TEDotProductAttention and HAVE_TE
                 ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
-                self.cp_group = self.model_comm_pgs.cp
+                self.cp_group = self.pg_collection.cp
                 assert (
                     self.cp_group.size() == self.context_parallel_lm
                 ), "CP Group size should match the Language Model CP size"
@@ -202,7 +202,7 @@ class LLaVAModel(MegatronModule):
                     rotary_base=language_rotary_base,
                     fp16_lm_cross_entropy=fp16_lm_cross_entropy,
                     scatter_embedding_sequence_parallel=False,
-                    model_comm_pgs=self.model_comm_pgs,
+                    pg_collection=self.pg_collection,
                 )
             else:
                 self.language_model = GPTModel(
@@ -220,7 +220,7 @@ class LLaVAModel(MegatronModule):
                     rope_scaling_factor=language_rope_scaling_factor,
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
-                    model_comm_pgs=self.model_comm_pgs,
+                    pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
 
@@ -259,7 +259,7 @@ class LLaVAModel(MegatronModule):
                     patch_dim=patch_dim,
                     model_subtype=vision_transformer_config.vision_model_type,
                     add_class_token=add_class_token,
-                    model_comm_pgs=self.model_comm_pgs,
+                    pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
             elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
@@ -312,7 +312,7 @@ class LLaVAModel(MegatronModule):
                     add_class_token=add_class_token,
                     embedder_bias=embedder_bias,
                     use_mask_token=use_mask_token,
-                    model_comm_pgs=self.model_comm_pgs,
+                    pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
             elif vision_transformer_config.vision_model_type.startswith("hf://"):
@@ -341,7 +341,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_layer_spec,
                 vision_projection_type,
                 vision_projection_input_size,
-                tp_group=self.model_comm_pgs.tp,
+                tp_group=self.pg_collection.tp,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains

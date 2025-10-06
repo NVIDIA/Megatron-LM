@@ -140,7 +140,7 @@ class TestVLMTextGenerationController:
             ).tolist()
             prompt_tokens[3] = self.image_token_index
 
-            request_id = str(i)
+            request_id = i
             inference_request = VLMInferenceRequest(
                 request_id=request_id,
                 prompt=prompt,

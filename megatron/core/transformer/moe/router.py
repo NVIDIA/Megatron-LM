@@ -8,8 +8,8 @@ import torch
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
-    ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
+    ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -27,29 +27,36 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """
         Initialize the Router module.
 
         Args:
             config (TransformerConfig): Configuration object for the Transformer model.
-            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
-        self.tp_group = model_comm_pgs.tp
-        self.cp_group = model_comm_pgs.cp
-        self.tp_cp_group = model_comm_pgs.tp_cp
+        self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.tp_cp_group = pg_collection.tp_cp
+        self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
+        if self.config.add_bias_linear:
+            self.bias = torch.nn.Parameter(
+                torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+            )
+        else:
+            self.bias = None
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -61,6 +68,9 @@ class Router(ABC, MegatronModule):
             self.config.init_method(self.weight)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
+            setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -74,13 +84,16 @@ class Router(ABC, MegatronModule):
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+        if self.bias is not None and self.bias.device.type == 'cpu':
+            self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, router_dtype)
+        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
     @abstractmethod
@@ -128,15 +141,15 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
-            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
+        super().__init__(config=config, pg_collection=pg_collection)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
@@ -146,15 +159,44 @@ class TopKRouter(Router):
         if self.enable_expert_bias:
             self.register_buffer(
                 'local_tokens_per_expert',
-                torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
                 persistent=False,
             )
             self.register_buffer(
-                'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
+                'expert_bias',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
             )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        # Initialize global tokens per expert for global aux loss
+        if self.get_aux_loss_coeff("global_aux_loss") > 0:
+            self.register_buffer(
+                'global_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'ga_steps',
+                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
+                persistent=False,
+            )
+        else:
+            self.global_tokens_per_expert = None
+            self.ga_steps = None
 
     def _maintain_float32_expert_bias(self):
         """
@@ -217,7 +259,7 @@ class TopKRouter(Router):
 
     def is_aux_loss_enabled(self) -> bool:
         """Check if the auxiliary loss is enabled."""
-        for aux_loss_type in ["aux_loss", "seq_aux_loss"]:
+        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
@@ -291,6 +333,44 @@ class TopKRouter(Router):
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs, seq_aux_loss_coeff, aux_loss, "seq_load_balancing_loss", self.tp_cp_group
+        )
+        return probs
+
+    def _apply_global_aux_loss(
+        self, probs: torch.Tensor, scores_for_aux_loss: torch.Tensor, routing_map: torch.Tensor
+    ):
+        """Apply the global auxiliary loss for the given scores and routing map."""
+        global_aux_loss_coeff = self.get_aux_loss_coeff("global_aux_loss")
+        if global_aux_loss_coeff == 0:
+            return probs
+
+        tokens_per_expert = routing_map.sum(dim=0)
+        tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            tokens_per_expert, self.tp_dp_cp_group
+        )
+
+        self.global_tokens_per_expert += tokens_per_expert
+        self.ga_steps += 1
+        averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+
+        num_tokens = scores_for_aux_loss.shape[0]
+        total_num_tokens = num_tokens * self.tp_dp_cp_group.size()
+
+        global_aux_loss = switch_load_balancing_loss_func(
+            probs=scores_for_aux_loss,
+            tokens_per_expert=averated_tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=global_aux_loss_coeff,
+            fused=self.config.moe_router_fusion,
+        )
+        probs = self.attach_and_log_load_balancing_loss(
+            probs,
+            global_aux_loss_coeff,
+            global_aux_loss,
+            "global_load_balancing_loss",
+            self.tp_dp_cp_group,
         )
         return probs
 
@@ -379,8 +459,8 @@ class TopKRouter(Router):
             eps = self.config.moe_input_jitter_eps
             if self.input_jitter is None:
                 self.input_jitter = torch.distributions.uniform.Uniform(
-                    torch.tensor(1.0 - eps, device=input.device),
-                    torch.tensor(1.0 + eps, device=input.device),
+                    torch.tensor(1.0 - eps, dtype=input.dtype, device=input.device),
+                    torch.tensor(1.0 + eps, dtype=input.dtype, device=input.device),
                 ).rsample
             return input * self.input_jitter(input.shape)
         else:
@@ -440,6 +520,9 @@ class TopKRouter(Router):
             probs = self._apply_seq_aux_loss(
                 probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
             )
+            probs = self._apply_global_aux_loss(
+                probs, scores_for_aux_loss, routing_map_for_aux_loss
+            )
 
         # Update expert bias and tokens_per_expert
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
@@ -448,6 +531,12 @@ class TopKRouter(Router):
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
         return probs, routing_map
+
+    def reset_global_aux_loss_tracker(self):
+        """Reset the global aux loss tracker."""
+        if self.global_tokens_per_expert is not None:
+            self.global_tokens_per_expert.zero_()
+            self.ga_steps.zero_()
 
     def forward(self, input: torch.Tensor):
         """
