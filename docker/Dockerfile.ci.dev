@@ -49,6 +49,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
 EOF
+
+# Install DeepEP
+RUN bash -ex <<"EOF"
+    cd /workspace
+    uv pip install nvidia-nvshmem-cu12
+    pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
+        ln -s libnvshmem_host.so.3 libnvshmem_host.so
+    popd
+
+    git clone --branch v1.2.1 https://github.com/deepseek-ai/DeepEP.git
+    TORCH_CUDA_ARCH_LIST="9.0" uv pip install --no-build-isolation -v DeepEP/.
+    rm -rf DeepEP
+EOF
+
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
