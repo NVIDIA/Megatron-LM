@@ -96,14 +96,8 @@ def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
     for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (3, "KB"), (0, "bytes")):
         nquery = int(1024**exp)
-        # >>>
-        # if n_bytes >= nquery:
-        #     return "%d %s" % (n_bytes // nquery, suffix)
-        # +++
         if round(n_bytes / nquery) >= 1:
-            # return "%d %s" % (round(n_bytes / nquery), suffix)
             return "%.3g %s" % (n_bytes / nquery, suffix)
-        # <<<
     raise Exception("something went wrong.")
 
 
@@ -150,10 +144,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused requests that live on the CPU.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage.
-        # >>>
-        # model (torch.nn.Module): Model used for inference. This is needed for
-        #     computing `max_tokens` below.
-        # <<<
         chunk_size_tokens (int): Size of KV cache chunk size.
         tensor_model_parallel_size (Optional[int]): Tensor model parallel size.
         num_cuda_graphs (Optional[int]): Maximum number of cuda graphs to capture,
@@ -222,44 +212,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Initialize chunk allocator.
-        # >>>
-        # active_buffer_size_bytes_0 = active_buffer_size_bytes
-        # <<<
         active_chunk_count_total = active_buffer_size_bytes // self.chunk_size_bytes
         self.chunk_allocator = ChunkAllocator(active_count=active_chunk_count_total)
         del active_chunk_count_total # no accidental use; use chunk_allocator
-        # >>>
-        # active_buffer_size_bytes = active_chunk_count_total * self.chunk_size_bytes
         active_buffer_size_bytes = self.chunk_allocator.active_count * self.chunk_size_bytes
-        # <<<
-
-        # >>>
-        # active_buffer_size_bytes_1 = active_buffer_size_bytes
-        # pax("active_chunk_count_total", {
-        #     "chunk_allocator" : self.chunk_allocator,
-        # }, "active_buffer_size_bytes_0, active_buffer_size_bytes_1")
-        # <<<
 
         # Set max_requests, max_tokens.
-        # >>>
-        # self.max_requests = active_chunk_count_total
-        # +++
-        # self.max_requests = self.chunk_allocator.active_count
-        # +++
         self.max_total_requests = self.chunk_allocator.total_count - 1 # -1 for dummy chunk
         self.max_active_requests = self.chunk_allocator.active_count
-        # <<<
-        # >>>
-        # pax({
-        #     "chunk_allocator" : self.chunk_allocator,
-        #     "max_requests" : self.max_requests,
-        # })
-        # <<<
         self.max_tokens = max_tokens
-
-        # >>>
-        # pax({"chunk_allocator": self.chunk_allocator})
-        # <<<
 
         # Initialize context state.
         self.params_dtype = params_dtype
@@ -408,46 +369,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # # Guaranteed active requests.
-        # # * See details in the class docstring above. `gtd_request_fraction` is
-        # #   the fraction of chunks in the memory buffer that are reserved for
-        # #   guaranteeing that some number of active requests can always proceed
-        # #   with their generations. The number of chunks defined by
-        # #   `buffer_guaranteed_fraction * chunk_count_total` is converted to a
-        # #   number of requests that this reserved space can safely handle
-        # #   (`gtd_request_count`).
-        # # * Note: computing the size of this guaranteed space from chunks rather
-        # #   than bytes is safer due to the non-linear impacts of a large
-        # #   `chunk_size_tokens` or `max_kv_chunk_count`. When computing from
-        # #   chunks, this space will always be less than `chunk_count_total`. When
-        # #   computing from bytes, this space can unexpectedly be much larger than
-        # #   `chunk_count_total`, resulting in stalled generations.
-        # gtd_chunk_count = int(buffer_guaranteed_fraction * chunk_count_total)
-        # gtd_chunk_count = min(gtd_chunk_count, chunk_count_total)
-        # self.gtd_request_count = max(1, gtd_chunk_count // self.max_kv_chunk_count)
-        # self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-        # >>>
-        # # Store the dummy chunk idx reference for convenience
-        # self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
-        # <<<
-
         # Reset attention state.
         self.reset_attention_state()
 
-        # >>>
         # Print info.
         print("DynamicInferenceContext: allocated context with active buffer size %s (%d chunks)." % (
             get_mem_size_str(active_buffer_size_bytes),
             self.chunk_allocator.active_count,
         ))
-        # <<<
-
-        # >>>
-        # print("~~~\nexiting ..."); exit()
-        # <<<
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
@@ -1006,6 +935,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count - self.paused_request_count >= self.max_active_requests
             # or
             # self.get_active_request_count() >= self.chunk_allocator.active_count
+            or self.paused_request_count != 0
         ):
             raise RequestOverflowError(request_id)
         # <<<
@@ -1356,10 +1286,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             # >>>
             # if active_request_count + resume_request_count == 0:
             # if active_request_count == 0:
-            if resume_request_count >= 2:
-                pax("active_chunk_count_total, active_chunk_count_used, active_chunk_count_avail",
-                    "paused_chunk_counts, paused_chunk_counts_cumsum",
-                    "active_request_count, resume_request_count")
+            # if resume_request_count >= 2:
+            # if True:
+            #     pax("active_chunk_count_avail",
+            #         "paused_chunk_counts, paused_chunk_counts_cumsum",
+            #         "active_request_count, resume_request_count")
             # <<<
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
@@ -1500,11 +1431,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             newly_resumed_request_ids.tolist(),
             self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
         )
-        alloc_str = "alloc: t %d/%d [ p %d/%d, a %d/%d ]" % (
+        # alloc_str = "alloc: t %d/%d [ p %d/%d, a %d/%d ]" % (
+        alloc_str = "alloc: t %d/%d [ a %d/%d ]" % (
             self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
             self.chunk_allocator.total_count - 1,
-            self.chunk_allocator.get_paused_used(self),
-            self.chunk_allocator.paused_count,
+            # self.chunk_allocator.get_paused_used(self),
+            # self.chunk_allocator.paused_count,
             self.chunk_allocator.get_active_used(self),
             self.chunk_allocator.active_count,
         )
