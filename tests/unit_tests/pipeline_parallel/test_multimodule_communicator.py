@@ -377,3 +377,77 @@ class TestBridgeCommunicator:
             # Audio encoder receives its gradient
             received_grad = mllm_comm.recv_backward()
             assert received_grad['audio_encoder'].shape == (2, 16, 128)
+
+    def test_send_forward_recv_backward_send_backward_recv_forward(self):
+        """Test send_forward_recv_backward and send_backward_recv_forward operations."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        # Create process group grids for each module
+        image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1)
+        audio_encoder_grid = create_hypercomm_grid(offset=1, tp=1, cp=1, pp=1, dp=1)
+        llm_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=2, dp=1)
+        generator_grid = create_hypercomm_grid(offset=6, tp=1, cp=1, pp=1, dp=2)
+
+        # Set up module-grid mapping and topology
+        module_to_grid_map = {
+            'image_encoder': image_encoder_grid,
+            'audio_encoder': audio_encoder_grid,
+            'llm': llm_grid,
+            'generator': generator_grid,
+        }
+        topology = {
+            'image_encoder': ['llm'],
+            'audio_encoder': ['llm'],
+            'llm': ['generator'],
+            'generator': [],
+        }
+        config = ModelParallelConfig(pipeline_dtype=torch.float)
+        mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
+
+        # Simulate bidirectional send/recv for forward and backward in pipeline
+
+        # Encoder stages send forward to the first stage of LLM, and receive backward from the first stage of LLM
+        if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
+            output_dict = {'image_encoder': torch.randn(2, 8, 128).cuda()}
+            received_grad = mllm_comm.send_forward_recv_backward(output_dict)
+            assert received_grad['image_encoder'].shape == (2, 8, 128)
+        if mllm_comm.is_current_rank_in_grid(audio_encoder_grid):
+            output_dict = {'audio_encoder': torch.randn(2, 16, 128).cuda()}
+            received_grad = mllm_comm.send_forward_recv_backward(output_dict)
+            assert received_grad['audio_encoder'].shape == (2, 16, 128)
+        if mllm_comm.is_current_rank_in_grid(llm_grid):
+            if dist.get_rank() == 2 or dist.get_rank() == 3:
+                grad_dict = {
+                    'image_encoder': torch.randn(2, 8, 128).cuda(),
+                    'audio_encoder': torch.randn(2, 16, 128).cuda(),
+                }
+                input_dict = mllm_comm.send_backward_recv_forward(grad_dict)
+                assert input_dict['image_encoder'].shape == (2, 8, 128)
+                assert input_dict['audio_encoder'].shape == (2, 16, 128)
+
+        # First stage of LLM sends forward to the second stage of LLM, and receive backward from the second stage of LLM
+        if mllm_comm.is_current_rank_in_grid(llm_grid):
+            if dist.get_rank() == 2 or dist.get_rank() == 3:
+                output_dict = {'llm': torch.randn(2, 32, 128).cuda()}
+                received_grad = mllm_comm.send_forward_recv_backward(
+                    output_dict, tensor_shape=(2, 32, 128)
+                )
+                assert received_grad['llm'].shape == (2, 32, 128)
+            if dist.get_rank() == 4 or dist.get_rank() == 5:
+                grad_dict = {'llm': torch.randn(2, 32, 128).cuda()}
+                input_dict = mllm_comm.send_backward_recv_forward(
+                    grad_dict, tensor_shape=(2, 32, 128)
+                )
+                assert input_dict['llm'].shape == (2, 32, 128)
+
+        # Second stage of LLM sends forward to generator, and receive backward from generator
+        if mllm_comm.is_current_rank_in_grid(llm_grid):
+            if dist.get_rank() == 4 or dist.get_rank() == 5:
+                output_dict = {'llm': torch.randn(2, 32, 128).cuda()}
+                received_grad = mllm_comm.send_forward_recv_backward(output_dict)
+                assert received_grad['llm'].shape == (2, 32, 128)
+        if mllm_comm.is_current_rank_in_grid(generator_grid):
+            grad_dict = {'llm': torch.randn(1, 32, 128).cuda()}
+            input_dict = mllm_comm.send_backward_recv_forward(grad_dict)
+            assert input_dict['llm'].shape == (1, 32, 128)
