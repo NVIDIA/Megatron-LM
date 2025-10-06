@@ -61,22 +61,55 @@ class ChunkAllocator:
         )
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def get_active_used(self, context: "DynamicInferenceContext"):
+        """Compute number of active chunks used.
+
+        Args:
+            context (DynamicInferenceContext): Dynamic inference context.
+        """
+        return context.request_kv_chunk_counts[
+            context.paused_request_count:context.total_request_count
+        ].sum().item()
+
+    def get_paused_used(self, context: "DynamicInferenceContext"):
+        """Compute number of paused chunks used.
+
+        Args:
+            context (DynamicInferenceContext): Dynamic inference context.
+        """
+        return context.request_kv_chunk_counts[
+            :context.paused_request_count
+        ].sum().item()
+
     def get_active_avail(self, context: "DynamicInferenceContext"):
-        """Compute number of available active chunks.
+        """Compute number of active chunks available.
 
         Args:
             context (DynamicInferenceContext): Dynamic inference context.
         """
         active_total = self.active_count
-        active_used = context.request_kv_chunk_counts[
-            context.paused_request_count:context.total_request_count
-        ].sum().item()
+        active_used = self.get_active_used(context)
         active_avail = active_total - active_used
         # >>>
         # if active_used != 0:
         #     pax("active_total, active_used, active_avail")
         # <<<
         return active_avail
+
+    def get_paused_avail(self, context: "DynamicInferenceContext"):
+        """Compute number of paused chunks available.
+
+        Args:
+            context (DynamicInferenceContext): Dynamic inference context.
+        """
+        paused_total = self.total_count - self.active_count - 1 # -1 for dummy chunk
+        paused_used = self.get_paused_used(context)
+        paused_avail = paused_total - paused_used
+        # >>>
+        # if paused_used != 0:
+        #     pax("paused_total, paused_used, paused_avail")
+        # <<<
+        return paused_avail
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -105,6 +138,17 @@ class ChunkAllocator:
         Return:
             (bool) Is memory available?
         """
+        # >>>
+        paused_avail = self.get_paused_avail(context)
+        active_avail = self.get_active_avail(context)
+        if active_avail >= num_chunks and self.total_avail == 0:
+            pax("self, num_chunks, paused_avail, active_avail", {
+                "paused_used" : self.get_paused_used(context),
+                "active_used" : self.get_active_used(context),
+                "total_request_count" : context.total_request_count,
+                "paused_request_count" : context.paused_request_count,
+            })
+        # <<<
         return self.get_active_avail(context) >= num_chunks
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
@@ -140,7 +184,13 @@ class ChunkAllocator:
         """
         if self.is_memory_available(context, num_chunks):
             self.total_avail -= num_chunks
-            return self.chunk_bag[self.total_avail : (self.total_avail + num_chunks)]
+            chunk_ids = self.chunk_bag[self.total_avail : (self.total_avail + num_chunks)]
+            # >>>
+            # assert num_chunks == chunk_ids.numel()
+            if num_chunks != chunk_ids.numel():
+                pax("self, num_chunks")
+            # <<<
+            return chunk_ids
         else:
             return None
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

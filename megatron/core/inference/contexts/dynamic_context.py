@@ -1010,21 +1010,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise RequestOverflowError(request_id)
         # <<<
 
-        # >>>
-        if request_id == 4:
-            pax({
-                "chunk_allocator" : self.chunk_allocator,
-                "total_request_count" : self.total_request_count,
-                "paused_request_count" : self.paused_request_count,
-            })
-        # <<<
-
         # Preallocate chunks.
         num_chunks_needed = math.ceil(context_length / self.chunk_size_tokens)
         # >>>
         # new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
         # +++
         new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(self, num_chunks_needed)
+        # <<<
+        # >>>
+        # if request_id == 4:
+        #     pax({
+        #         "chunk_allocator" : self.chunk_allocator,
+        #         "total_request_count" : self.total_request_count,
+        #         "paused_request_count" : self.paused_request_count,
+        #     }, "new_chunk_ids")
         # <<<
         if new_chunk_ids is None:
             raise ChunkOverflowError(request_id)
@@ -1076,7 +1075,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_token_count += context_length
 
         # >>>
-        print(f"++++++++ chunk allocator ... {self.chunk_allocator}.")
+        # print(f"++++++++ chunk allocator ... {self.chunk_allocator}.")
         # pax({"max_requests": self.max_requests})
         # <<<
 
@@ -1447,7 +1446,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             col_idx = self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
             ]
-            self.request_to_kv_chunk_ids[row_idx, col_idx] = chunk_ids
+            # >>>
+            # self.request_to_kv_chunk_ids[row_idx, col_idx] = chunk_ids
+            # +++
+            try:
+                self.request_to_kv_chunk_ids[row_idx, col_idx] = chunk_ids
+            except Exception as e:
+                pax({
+                    "request_to_kv_chunk_ids" : self.request_to_kv_chunk_ids,
+                }, "row_idx, col_idx, resume_request_count, chunk_ids")
+            # <<<
             self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
             ] += 1
@@ -1482,17 +1490,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             for i in range(self.total_request_count + finished_request_count)
         ]
         # pax("request_strs")
-        print("++++++++++ requests: %s -- %s -- %s ..... paused: %s, resumed: %s, finished: %s ..... alloc: %d/%d [%d]" % (
+        request_str = "requests: %s -- %s -- %s" % (
             ", ".join(request_strs[:self.paused_request_count]),
             ", ".join(request_strs[self.paused_request_count:self.total_request_count]),
             ", ".join(request_strs[self.total_request_count:(self.total_request_count + finished_request_count)]),
+        )
+        newly_str = "paused: %s, resumed: %s, finished: %s" % (
             "--" if newly_paused_request_ids is None else newly_paused_request_ids.tolist(),
             newly_resumed_request_ids.tolist(),
             self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
+        )
+        alloc_str = "alloc: t %d/%d [ p %d/%d, a %d/%d ]" % (
             self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
             self.chunk_allocator.total_count - 1,
+            self.chunk_allocator.get_paused_used(self),
+            self.chunk_allocator.total_count - self.chunk_allocator.active_count - 1,
+            self.chunk_allocator.get_active_used(self),
             self.chunk_allocator.active_count,
-        ))
+        )
+        print("++++++++++ %s" % " ..... ".join((
+            request_str,
+            # newly_str,
+            alloc_str,
+        )))
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         return newly_paused_request_ids
