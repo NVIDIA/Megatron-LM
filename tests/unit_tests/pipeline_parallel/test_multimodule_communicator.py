@@ -242,3 +242,37 @@ class TestBridgeCommunicator:
         assert mllm_comm.topology == topology
         assert mllm_comm.config == config
         assert mllm_comm.current_rank == dist.get_rank()
+
+    def test_compute_total_pipeline_stages_overall_and_till_rank(self):
+        """Test compute_total_pipeline_stages for overall chain and until specific ranks."""
+
+        # Create process group grids for each module
+        image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1)
+        audio_encoder_grid = create_hypercomm_grid(offset=1, tp=1, cp=1, pp=1, dp=1)
+        llm_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=2, dp=1)
+        generator_grid = create_hypercomm_grid(offset=6, tp=1, cp=1, pp=1, dp=2)
+
+        # Define module-grid mapping and topology
+        module_to_grid_map = {
+            'image_encoder': image_encoder_grid,
+            'audio_encoder': audio_encoder_grid,
+            'llm': llm_grid,
+            'generator': generator_grid,
+        }
+        topology = {
+            'image_encoder': ['llm'],
+            'audio_encoder': ['llm'],
+            'llm': ['generator'],
+            'generator': [],
+        }
+
+        # Overall total pipeline stages: max(1,1) + 2 + 1 = 4
+        total = MultiModulePipelineCommunicator.compute_total_pipeline_stages(
+            topology, module_to_grid_map
+        )
+        assert total == 4
+
+        llm_pp_rank = MultiModulePipelineCommunicator.compute_total_pipeline_stages(
+            topology, module_to_grid_map, rank=2, module_name='llm'
+        )
+        assert llm_pp_rank == 2
