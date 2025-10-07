@@ -449,7 +449,9 @@ def main():
     model = get_model()
     requests = build_requests(args, tokenizer)
     context = get_inference_context(requests, sampling_params, model)
-    pax("requests, context")
+    # >>>
+    # pax({"requests / len": len(requests)})
+    # <<<
     controller = get_inference_controller(model, context)
 
     # Validate all context_length's <= max_tokens.

@@ -1200,7 +1200,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).numel()
 
         # >>>
-        newly_resumed_request_ids = self.request_ids[(self.paused_request_count - resume_request_count):self.paused_request_count]
+        # newly_resumed_request_ids = self.request_ids[(self.paused_request_count - resume_request_count):self.paused_request_count]
         # <<<
 
         self.paused_request_count -= resume_request_count
@@ -1286,41 +1286,41 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        def get_request_str(i):
-            r = self.request_ids[i].item()
-            q = self.request_query_lengths[i].item()
-            kv = self.request_kv_length_offsets[i].item()
-            # pax("request_id")
-            return "%d[%d:%d]" % (r, q, kv)
-        request_strs = [
-            get_request_str(i)
-            for i in range(self.total_request_count + finished_request_count)
-        ]
-        # pax("request_strs")
-        request_str = "requests: %s -- %s -- %s" % (
-            ", ".join(request_strs[:self.paused_request_count]),
-            ", ".join(request_strs[self.paused_request_count:self.total_request_count]),
-            ", ".join(request_strs[self.total_request_count:(self.total_request_count + finished_request_count)]),
-        )
-        newly_str = "paused: %s, resumed: %s, finished: %s" % (
-            "--" if newly_paused_request_ids is None else newly_paused_request_ids.tolist(),
-            newly_resumed_request_ids.tolist(),
-            self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
-        )
-        # alloc_str = "alloc: t %d/%d [ p %d/%d, a %d/%d ]" % (
-        alloc_str = "alloc: t %d/%d [ a %d/%d ]" % (
-            self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
-            self.chunk_allocator.total_count - 1,
-            # self.chunk_allocator.get_paused_used(self),
-            # self.chunk_allocator.paused_count,
-            self.chunk_allocator.get_active_used(),
-            self.chunk_allocator.active_count,
-        )
-        print("++++++++++ %s" % " ..... ".join((
-            request_str,
-            # newly_str,
-            alloc_str,
-        )))
+        # def get_request_str(i):
+        #     r = self.request_ids[i].item()
+        #     q = self.request_query_lengths[i].item()
+        #     kv = self.request_kv_length_offsets[i].item()
+        #     # pax("request_id")
+        #     return "%d[%d:%d]" % (r, q, kv)
+        # request_strs = [
+        #     get_request_str(i)
+        #     for i in range(self.total_request_count + finished_request_count)
+        # ]
+        # # pax("request_strs")
+        # request_str = "requests: %s -- %s -- %s" % (
+        #     ", ".join(request_strs[:self.paused_request_count]),
+        #     ", ".join(request_strs[self.paused_request_count:self.total_request_count]),
+        #     ", ".join(request_strs[self.total_request_count:(self.total_request_count + finished_request_count)]),
+        # )
+        # newly_str = "paused: %s, resumed: %s, finished: %s" % (
+        #     "--" if newly_paused_request_ids is None else newly_paused_request_ids.tolist(),
+        #     newly_resumed_request_ids.tolist(),
+        #     self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
+        # )
+        # # alloc_str = "alloc: t %d/%d [ p %d/%d, a %d/%d ]" % (
+        # alloc_str = "alloc: t %d/%d [ a %d/%d ]" % (
+        #     self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
+        #     self.chunk_allocator.total_count - 1,
+        #     # self.chunk_allocator.get_paused_used(self),
+        #     # self.chunk_allocator.paused_count,
+        #     self.chunk_allocator.get_active_used(),
+        #     self.chunk_allocator.active_count,
+        # )
+        # print("++++++++++ %s" % " ..... ".join((
+        #     request_str,
+        #     # newly_str,
+        #     alloc_str,
+        # )))
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         return newly_paused_request_ids

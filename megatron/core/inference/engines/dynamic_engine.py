@@ -622,7 +622,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ active %d, paused %d, finished %d ] ... "
+                "reqs: %d [ active %d, paused %d, waiting %d, finished %d ] ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.step_count,
@@ -643,6 +643,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     prev_total_request_count,
                     prev_total_request_count - prev_paused_request_count,
                     prev_paused_request_count,
+                    len(self.waiting_request_ids),
                     self.finished_request_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
@@ -654,6 +655,10 @@ class DynamicInferenceEngine(AbstractEngine):
             print(output_str)
 
         self.step_count += 1
+        # >>>
+        # if self.step_count >= 100: # 600, 305
+        #     raise Exception(f"step {self.step_count}.")
+        # <<<
         range_pop()
         return {
             "active_requests": active_requests,
