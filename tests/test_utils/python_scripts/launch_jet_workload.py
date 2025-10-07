@@ -106,6 +106,8 @@ def launch_and_wait_for_completion(
                                         "MCORE_BACKWARDS_COMMIT": (
                                             os.getenv("MCORE_BACKWARDS_COMMIT") or ""
                                         ),
+                                        "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
+                                        "TRANSFORMERS_OFFLINE": "1",
                                     }
                                 }
                             }
