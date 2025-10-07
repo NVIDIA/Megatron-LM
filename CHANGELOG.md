@@ -17,8 +17,6 @@
     * Add HyperCommGrid: N-Dimensional Communication Grid for Model Parallelism ([MR \!3398](https://github.com/NVIDIA/Megatron-LM/commit/45400df7da7fa23e3aff86804e5ac254d9a8d3c0))  
       * Flexible creation and management of communication groups  
     * Add support for Spike No More embedding initializations and weight decay skipping ([MR \!3500](https://github.com/NVIDIA/Megatron-LM/commit/ee74aa66a06b24e511270f285db475941ef63bfd))  
-  * MoE  
-    * @zijie  
   * Model support  
     * Add MiMo video VLM train example (\[MR \!3543)  
     * Add AVLM for MIMO (\[MR \!3624)  
