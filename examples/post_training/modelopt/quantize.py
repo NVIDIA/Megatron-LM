@@ -11,10 +11,10 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+
 import modelopt.torch.quantization as mtq
 from modelopt.torch.export import import_mcore_gpt_from_hf
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
@@ -166,9 +166,16 @@ if __name__ == "__main__":
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
+        from modelopt.torch.export import import_mcore_gpt_from_hf
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_mcore_gpt_from_hf(unwrapped_model, args.pretrained_model_path, workspace_dir)
+        import_mcore_gpt_from_hf(
+            unwrapped_model,
+            args.pretrained_model_path,
+            workspace_dir,
+            dtype=import_dtype,
+        )
 
     def _custom_prompt_forward_loop_func(model):
         all_prompts = args.prompts.split("|")
@@ -237,4 +244,4 @@ if __name__ == "__main__":
     _custom_prompt_forward_loop_func(unwrapped_model)
 
     if args.save is not None and args.export_quant_cfg in QUANT_CFG_CHOICES:
-        save_checkpoint(1, model, None, None, 0)
+        save_checkpoint(1, model, None, None, 0, release=True)

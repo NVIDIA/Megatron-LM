@@ -423,7 +423,8 @@ class MambaMixer(MegatronModule):
                 out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
 
-        zxBCdt = self.compute_in_proj(hidden_states)
+        # zxBCdt will have shape (b, l, d)
+        zxBCdt = self.compute_in_proj_and_transpose_batch_seq_dims(hidden_states)
 
         # Training path using memory-efficient kernel
         if self.use_mem_eff_path and not in_inference_mode:
@@ -468,8 +469,11 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def compute_in_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Computes the input projection given the input hidden states."""
+    def compute_in_proj_and_transpose_batch_seq_dims(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the input projection given the input hidden states and
+        then transposes the batch and sequence dimensions.
+        """
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
@@ -488,6 +492,7 @@ class MambaMixer(MegatronModule):
         cu_seqlens: Optional[torch.Tensor] = None,
         return_varlen_states: bool = False,
         batch_indices: Optional[torch.Tensor] = None,
+        is_chunked_prefill: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encapsulates the core selective scan block logic which is shared between
@@ -506,8 +511,12 @@ class MambaMixer(MegatronModule):
 
         Returns:
             A tuple containing the output tensor and the output bias tensor.
+            The output tensor will have shape (l, b, d).
         """
         is_dynamic_batching = seq_idx is not None
+        assert not (
+            is_dynamic_batching and is_chunked_prefill
+        ), "Cannot use chunked prefill with dynamic batching"
 
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
@@ -529,8 +538,13 @@ class MambaMixer(MegatronModule):
             conv_state[batch_indices] = causal_conv1d_varlen_states(
                 xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
             )
+
             # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
             # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
+            xBC = xBC.transpose(1, 2)
+        elif is_chunked_prefill:
+            # Maintain channels-last memory layout to use initial_states for causal_conv1d_fn
+            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200 # pylint: disable=line-too-long
             xBC = xBC.transpose(1, 2)
         else:
             # transpose: b l pd --> b pd l
@@ -555,6 +569,10 @@ class MambaMixer(MegatronModule):
             }
             if is_dynamic_batching:
                 causal_conv1d_kwargs["seq_idx"] = seq_idx
+            elif is_chunked_prefill:
+                causal_conv1d_kwargs["initial_states"] = (
+                    conv_state[:, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
+                )
             xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
             del causal_conv1d_kwargs
 
@@ -609,6 +627,8 @@ class MambaMixer(MegatronModule):
                     "return_varlen_states": return_varlen_states,
                 }
             )
+        elif is_chunked_prefill:
+            mamba_chunk_scan_combined_kwargs["initial_states"] = ssm_state
         y = mamba_chunk_scan_combined(
             *mamba_chunk_scan_combined_args, **mamba_chunk_scan_combined_kwargs
         )
@@ -638,9 +658,25 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         return y
-        return out, out_bias
 
-    def ssm_block_decode(self, zxBCdt, conv_state, ssm_state, batch_indices=None):
+    def ssm_block_decode_only(self, zxBCdt, conv_state, ssm_state, batch_indices=None):
+        """
+        Encapsulates the core selective scan block logic for pure decode batches.
+
+        Args:
+            zxBCdt: The input tensor of shape (b, l, d), which is a concatenation of
+                z, x, B, C, and dt projections. The batch dimension must be 1.
+            conv_state: The convolution state tensor for inference.
+            ssm_state: The selective scan state tensor for inference.
+            batch_indices: A map from batch id to position in the Mamba state tensors for
+                dynamic inference.
+
+        Returns:
+            The output tensor.
+        """
+        assert zxBCdt.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+        zxBCdt = zxBCdt.squeeze(0)
+
         z, xBC, dt = torch.split(
             zxBCdt,
             [
@@ -756,12 +792,14 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             y = self.norm(y, z)
 
-        return y
+        # Restore batch dimension
+        return y.unsqueeze(0)
 
     def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
         """
         Executes dynamic inference by separating decode and prefill requests and
-        running them independently.
+        running them independently. Also runs the chunked prefill request independently
+        if it exists.
         """
         sequence_packing_available, reason_for_no_sequence_packing = (
             check_mamba_sequence_packing_support()
@@ -775,61 +813,100 @@ class MambaMixer(MegatronModule):
             batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
                 : context.padded_active_token_count
             ]
+            # Ensure batch dimension is first
             out, out_bias, _, _ = self.step(
                 hidden_states.transpose(0, 1), conv_state, ssm_state, batch_indices=batch_indices
             )
+            # Restore sequence dimension as first
             return out.transpose(0, 1), out_bias
 
-        # Compute split between decode and prefill
+        # Compute input projection before splitting into prefill and decode
+        # to ensure sequence parallel all-gather.
+        # zxBCdt will have shape (b, l, d)
+        zxBCdt = self.compute_in_proj_and_transpose_batch_seq_dims(hidden_states)
+
+        # Compute split between decode and prefill.
         seq_idx, cu_seqlens, _return_varlen_states = self._get_varlen_generation_state(context)
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
         ]
         batch_indices = context.request_to_mamba_state_idx
 
-        # First request with query len > 1 is prefill-start
+        # First request with query len > 1 is prefill-start.
         first_prefill_token_idx = torch.nonzero(active_query_lengths > 1)[0].int()
 
-        zxBCdt = self.compute_in_proj(hidden_states)
-
-        # Decode slice (requests before prefill start)
+        # Process decode requests if there are any.
         if first_prefill_token_idx > 0:
             zxBCdt_decode = zxBCdt[:, :first_prefill_token_idx]
             batch_indices_decode = batch_indices[:first_prefill_token_idx]
-
-            y_decode = self.ssm_block_decode(zxBCdt_decode, conv_state, ssm_state, batch_indices)
+            y_decode = self.ssm_block_decode_only(
+                zxBCdt_decode, conv_state, ssm_state, batch_indices_decode
+            ).transpose(0, 1)
         else:
             y_decode = None
 
-        # Prefill slice (remaining active tokens/requests)
         active_token_count = context.active_token_count
         active_request_count = context.get_active_request_count()
         padded_active_token_count = context.padded_active_token_count
 
-        zxBCdt_prefill = zxBCdt[:, first_prefill_token_idx:active_token_count]
-        cu_seqlens_prefill = F.pad(
-            cu_seqlens[first_prefill_token_idx + 1 :] - first_prefill_token_idx, (1, 0)
-        )
-        seq_idx_prefill = (
-            seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_token_idx
-        )
-        batch_indices_prefill = batch_indices[first_prefill_token_idx:active_request_count]
+        # Process the chunked prefill request if it exists.
+        if context.chunked_prefill_request_id != -1:
+            chunked_prefill_request_token_count = active_query_lengths[-1]
+            zxBCdt_chunked_prefill = zxBCdt[
+                :, active_token_count - chunked_prefill_request_token_count : active_token_count
+            ]
+            batch_index_chunked_prefill = batch_indices[context.chunked_prefill_request_id]
 
-        y_prefill = self.ssm_block(
-            zxBCdt_prefill,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            seq_idx=seq_idx_prefill,
-            cu_seqlens=cu_seqlens_prefill,
-            return_varlen_states=True,
-            batch_indices=batch_indices_prefill,
-        )
+            y_prefill_chunked = self.ssm_block(
+                zxBCdt_chunked_prefill,
+                conv_state=conv_state[batch_index_chunked_prefill].unsqueeze(0),
+                ssm_state=ssm_state[batch_index_chunked_prefill].unsqueeze(0),
+                is_chunked_prefill=True,
+            )
 
+            # Remove the chunked prefill request from the request / token counts so
+            # the subsequent prefill computation ignores the chunked prefill request.
+            active_token_count -= chunked_prefill_request_token_count
+            active_request_count -= 1
+        else:
+            y_prefill_chunked = None
+
+        # Process non-chunked prefill requests if there are any.
+        if (remaining_prefill_tokens := active_token_count - first_prefill_token_idx) > 0:
+            zxBCdt_prefill = zxBCdt[:, first_prefill_token_idx:active_token_count]
+            cu_seqlens_prefill = F.pad(
+                cu_seqlens[first_prefill_token_idx + 1 : active_request_count + 1]
+                - first_prefill_token_idx,
+                (1, 0),
+            )
+            seq_idx_prefill = (
+                seq_idx[:, first_prefill_token_idx:active_token_count] - first_prefill_token_idx
+            )
+            batch_indices_prefill = batch_indices[first_prefill_token_idx:active_request_count]
+
+            y_prefill = self.ssm_block(
+                zxBCdt_prefill,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                seq_idx=seq_idx_prefill,
+                cu_seqlens=cu_seqlens_prefill,
+                return_varlen_states=True,
+                batch_indices=batch_indices_prefill,
+            )
+        else:
+            y_prefill = None
+
+        # Assemble the final output by concatenating the decode output,
+        # non-chunked prefill output, and chunked prefill output together.
+        y_prefill = maybe_cat(y_prefill, y_prefill_chunked, required=True)
         y = maybe_cat(y_decode, y_prefill, required=True)
 
-        if (num_padding_tokens := padded_active_token_count - active_token_count) > 0:
+        # Add padding tokens back if necessary. Note that we use the context active token count
+        # in case we modified the local count for chunked prefill above.
+        if (num_padding_tokens := padded_active_token_count - context.active_token_count) > 0:
             y = torch.cat((y, y.new_zeros(num_padding_tokens, *y.shape[1:])), dim=0)
 
+        # The output projection will perform the sequence parallel reduce-scatter if necessary.
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
@@ -838,35 +915,19 @@ class MambaMixer(MegatronModule):
         """
         Performs inference step for decoding
         """
-
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
         dtype = hidden_states.dtype
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
 
-        in_fp8_mode = HAVE_TE and FP8GlobalStateManager.is_fp8_enabled()
-
-        if not in_fp8_mode:
-            # l b d --> b d
-            hidden_states = hidden_states.squeeze(0)
-
         # b d_model --> b p(2d)
         zxBCdt, _ = self.in_proj(hidden_states)
-
-        if in_fp8_mode:
-            zxBCdt = zxBCdt.squeeze(0)
-
+        
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
-        y = self.ssm_block_decode(zxBCdt, conv_state, ssm_state, batch_indices=batch_indices)
-
-        if in_fp8_mode:
-            y = y.unsqueeze(0)
+        y = self.ssm_block_decode_only(zxBCdt, conv_state, ssm_state, batch_indices=batch_indices)
 
         # b pd --> b d
         out, out_bias = self.out_proj(y)
-
-        if not in_fp8_mode:
-            out = out.unsqueeze(0)
 
         return out, out_bias, conv_state, ssm_state
 

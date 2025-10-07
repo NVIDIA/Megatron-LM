@@ -178,7 +178,7 @@ if [[ "$IS_NEMO_TEST" == "true" ]]; then
         -m coverage run \
         --data-file=.coverage.unit_tests \
         --source=megatron/core \
-        -m $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+        /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
         -m coverage run \

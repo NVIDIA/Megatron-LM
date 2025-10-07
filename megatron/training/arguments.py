@@ -1434,6 +1434,13 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--inference-dynamic-batching-unified-memory-level',
+                       type=int, default=0, choices=[0, 1],
+                       help='Set unified memory usage within the dynamic '
+                       'inference context. The levels are: 0) no unified memory, '
+                       '1) allocate `memory_buffer` in unified memory. '
+                       'Eventually, additional levels will be included to '
+                       'control other tensors within the context.')
     group.add_argument('--symmetric-ar-type', type=str, default=None,
                        choices=['two_shot', "one_shot", "multimem_all_reduce", None],
                        help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')
@@ -1446,7 +1453,8 @@ def _add_inference_args(parser):
     group.add_argument('--initialize-socket-comms',
                        action='store_true', default=False,
                        help='Initialize socket communication for dynamic engine coordinator.')
-
+    group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
     return parser
 
 
@@ -2301,13 +2309,15 @@ def _add_learning_rate_args(parser):
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--override-opt_param-scheduler', action='store_true',
+    group.add_argument('--override-opt_param-scheduler', '--override-opt-param-scheduler',
+                       action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '
                        'number of iterations, and decay style from input '
                        'arguments and ignore values from checkpoints. Note'
                        'that all the above values will be reset.')
-    group.add_argument('--use-checkpoint-opt_param-scheduler', action='store_true',
+    group.add_argument('--use-checkpoint-opt_param-scheduler', '--use-checkpoint-opt-param-scheduler',
+                       action='store_true',
                        help='Use checkpoint to set the values of the scheduler '
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '

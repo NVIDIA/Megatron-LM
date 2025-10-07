@@ -1,3 +1,7 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+import math
+
 import pytest
 import torch
 
@@ -6,6 +10,8 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
@@ -67,6 +73,8 @@ class TestDynamicContext:
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=(544, 4),
             mamba_ssm_states_shape=(8, 64, 16),
+            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+            # this is for compatibility with the LTS environment
         )
         return dynamic_context
 
@@ -187,7 +195,13 @@ class TestDynamicContext:
         with pytest.raises(RequestOverflowError):
             for i in range(dynamic_context.max_requests + 1):
                 dynamic_context.add_request(
-                    i, torch.zeros(10, device='cuda')
+                    DynamicInferenceRequest(
+                        request_id=i,
+                        prompt_tokens=torch.zeros(10, device='cuda'),
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=dynamic_context.max_tokens - 10
+                        ),
+                    )
                 )  # Adding more than allowed requests
 
     @pytest.mark.experimental
@@ -213,7 +227,13 @@ class TestDynamicContext:
 
         with pytest.raises(TokenOverflowError):
             dynamic_context.add_request(
-                1, torch.arange(0, 25, device='cuda')
+                DynamicInferenceRequest(
+                    request_id=1,
+                    prompt_tokens=torch.arange(0, 25, device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - 25
+                    ),
+                )
             )  # Exceeding max token count
 
     @pytest.mark.experimental
@@ -367,7 +387,13 @@ class TestDynamicContext:
         assert dynamic_context.chunk_size_tokens == 128
         context_length = 144
         dynamic_context.add_request(
-            request_id=0, tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - context_length
+                ),
+            )
         )
         assert dynamic_context.total_request_count == 1
         assert dynamic_context.active_token_count == context_length
@@ -817,7 +843,13 @@ class TestDynamicContext:
         # Add a request to populate states
         context_length = 10
         dynamic_context.add_request(
-            request_id=0, tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - 10
+                ),
+            )
         )
         dynamic_context.initialize_attention_state()
 
@@ -886,7 +918,15 @@ class TestDynamicContext:
 
         current_token_idx = 0
         for req_id, data in request_data.items():
-            dynamic_context.add_request(req_id, data["tokens"])
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=req_id,
+                    prompt_tokens=data["tokens"],
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - len(data["tokens"])
+                    ),
+                )
+            )
             # Update the initial_token_offset as requests are added
             request_data[req_id]["initial_token_offset"] = current_token_idx
             current_token_idx += data["prefill_len"]
@@ -967,7 +1007,15 @@ class TestDynamicContext:
         new_request_tokens = torch.randint(0, 100, (12,), device='cuda').long()
         new_request_prefill_len = new_request_tokens.shape[0]
         initial_token_offset_new_request = dynamic_context.active_token_count
-        dynamic_context.add_request(new_request_id, new_request_tokens)
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=new_request_id,
+                prompt_tokens=new_request_tokens,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - len(new_request_tokens)
+                ),
+            )
+        )
         request_data[new_request_id] = {
             "tokens": new_request_tokens,
             "prefill_len": new_request_prefill_len,
@@ -1049,3 +1097,133 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
+
+    @pytest.mark.experimental
+    def test_unified_memory(self):
+        from megatron.core.inference.unified_memory import has_unified_memory
+
+        if not has_unified_memory:
+            pytest.skip("Unified memory not available due to bad environment.")
+
+        self._setup_model_parallel_group(1, 1)
+
+        # Compute number of contexts needed to fill GPU memory.
+        gpu_size_gb = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
+        )
+        buffer_size_gb = 20
+        num_contexts = math.ceil(gpu_size_gb / buffer_size_gb) + 1
+
+        # Allocate enough contexts to fill GPU memory.
+        def init_contexts(*, unified_memory_level):
+            contexts = []
+            for i in range(num_contexts):
+                contexts.append(
+                    DynamicInferenceContext(
+                        params_dtype=torch.float32,
+                        num_layers=4,
+                        kv_channels=8,
+                        num_attention_heads=2,
+                        max_sequence_length=512,
+                        buffer_size_gb=buffer_size_gb,
+                        buffer_overflow_factor=1,
+                        buffer_guaranteed_fraction=0,
+                        unified_memory_level=unified_memory_level,
+                    )
+                )
+
+        # Pure GPU memory test should OOM.
+        try:
+            init_contexts(unified_memory_level=0)
+        except torch.OutOfMemoryError:
+            pass
+        else:
+            raise Exception("expected OOM.")
+
+        # Unified memory test should succeed.
+        init_contexts(unified_memory_level=1)
+
+    @pytest.mark.experimental
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_chunked_prefill(self, is_hybrid_model: bool):
+        """Test adding a request with a prompt that requires multiple memory chunks."""
+        self._setup_model_parallel_group(1, 1)
+
+        chunk_size_tokens = 64
+        prompt_length = 200  # Requires ceil(200/64) = 4 chunks
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            buffer_guaranteed_fraction=0.1,
+            chunk_size_tokens=chunk_size_tokens,
+            max_requests_override=None,
+            max_tokens_override=None,
+            buffer_overflow_factor=None,
+            is_hybrid_model=is_hybrid_model,
+        )
+
+        num_chunks_needed = math.ceil(prompt_length / chunk_size_tokens)
+        assert num_chunks_needed == 4
+
+        # Add the long prompt request
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=123,
+                prompt_tokens=torch.arange(0, prompt_length, dtype=torch.long, device='cuda'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - prompt_length
+                ),
+            )
+        )
+
+        # Verify request-level metadata
+        assert dynamic_context.total_request_count == 1
+        assert dynamic_context.active_token_count == prompt_length
+        assert dynamic_context.request_ids[0] == 123
+        assert dynamic_context.request_query_lengths[0] == prompt_length
+        assert dynamic_context.request_kv_chunk_counts[0] == num_chunks_needed
+
+        # Verify chunk allocation and mapping
+        assigned_chunk_ids = dynamic_context.request_to_kv_chunk_ids[0, :num_chunks_needed]
+        assert torch.all(assigned_chunk_ids != -1)
+        assert dynamic_context.request_last_kv_chunk_id[0] == assigned_chunk_ids[-1]
+        assert (
+            dynamic_context.request_last_kv_chunk_offset[0]
+            == (prompt_length - 1) % chunk_size_tokens
+        )
+
+        # Verify token-level metadata
+        active_tokens = slice(0, prompt_length)
+        # Check token_to_chunk_idx
+        for i in range(num_chunks_needed):
+            start_idx = i * chunk_size_tokens
+            end_idx = min((i + 1) * chunk_size_tokens, prompt_length)
+            token_slice = slice(start_idx, end_idx)
+            assert torch.all(
+                dynamic_context.token_to_chunk_idx[active_tokens][token_slice]
+                == assigned_chunk_ids[i]
+            )
+
+        # Check token_to_local_position_within_kv_chunk
+        expected_local_positions = (
+            torch.arange(0, prompt_length, dtype=torch.long, device='cuda') % chunk_size_tokens
+        )
+        assert torch.all(
+            dynamic_context.token_to_local_position_within_kv_chunk[active_tokens]
+            == expected_local_positions
+        )
+
+        # Check other token mappings
+        assert torch.all(
+            dynamic_context.token_to_input_ids[active_tokens]
+            == torch.arange(0, prompt_length, dtype=torch.long, device='cuda')
+        )
+        assert torch.all(
+            dynamic_context.token_to_pos_ids[active_tokens]
+            == torch.arange(0, prompt_length, dtype=torch.long, device='cuda')
+        )
