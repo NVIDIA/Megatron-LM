@@ -213,7 +213,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize chunk allocator.
         active_chunk_count_total = active_buffer_size_bytes // self.chunk_size_bytes
-        self.chunk_allocator = ChunkAllocator(active_count=active_chunk_count_total)
+        self.chunk_allocator = ChunkAllocator(
+            context=self,
+            active_count=active_chunk_count_total,
+        )
         del active_chunk_count_total # no accidental use; use chunk_allocator
         active_buffer_size_bytes = self.chunk_allocator.active_count * self.chunk_size_bytes
 
@@ -927,34 +930,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # TODO : Should move this into some waiting queue
         if self.active_token_count + context_length > self.max_tokens:
             raise TokenOverflowError(request_id)
-        # >>>
-        # if self.total_request_count >= self.max_total_requests:
-        #     raise RequestOverflowError(request_id)
-        # +++
         if (
             self.total_request_count - self.paused_request_count >= self.max_active_requests
-            # or
-            # self.get_active_request_count() >= self.chunk_allocator.active_count
             or self.paused_request_count != 0
         ):
             raise RequestOverflowError(request_id)
-        # <<<
 
         # Preallocate chunks.
         num_chunks_needed = math.ceil(context_length / self.chunk_size_tokens)
-        # >>>
-        # new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
-        # +++
-        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(self, num_chunks_needed)
-        # <<<
-        # >>>
-        # if request_id == 4:
-        #     pax({
-        #         "chunk_allocator" : self.chunk_allocator,
-        #         "total_request_count" : self.total_request_count,
-        #         "paused_request_count" : self.paused_request_count,
-        #     }, "new_chunk_ids")
-        # <<<
+        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
         if new_chunk_ids is None:
             raise ChunkOverflowError(request_id)
 
@@ -1263,7 +1247,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         resume_request_count = 0
         if self.paused_request_count > 0:
-            active_chunk_count_avail = self.chunk_allocator.get_active_avail(self)
+            active_chunk_count_avail = self.chunk_allocator.get_active_avail()
             # pax("active_chunk_count_avail")
 
             paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
@@ -1358,17 +1342,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 == 0
             ), "The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. "
 
-            # >>>
-            # chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
-            # +++
-            chunk_ids = self.chunk_allocator.allocate_memory_chunks(self, resume_request_count)
-            # <<<
-            # >>>
-            if chunk_ids is None:
-                pax({
-                    "chunk_allocator" : self.chunk_allocator,
-                }, "resume_request_count, chunk_ids")
-            # <<<
+            chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
@@ -1377,16 +1351,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             col_idx = self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
             ]
-            # >>>
-            # self.request_to_kv_chunk_ids[row_idx, col_idx] = chunk_ids
-            # +++
-            try:
-                self.request_to_kv_chunk_ids[row_idx, col_idx] = chunk_ids
-            except Exception as e:
-                pax({
-                    "request_to_kv_chunk_ids" : self.request_to_kv_chunk_ids,
-                }, "row_idx, col_idx, resume_request_count, chunk_ids")
-            # <<<
+            self.request_to_kv_chunk_ids[row_idx, col_idx] = chunk_ids
             self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
             ] += 1
@@ -1437,7 +1402,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.chunk_allocator.total_count - 1,
             # self.chunk_allocator.get_paused_used(self),
             # self.chunk_allocator.paused_count,
-            self.chunk_allocator.get_active_used(self),
+            self.chunk_allocator.get_active_used(),
             self.chunk_allocator.active_count,
         )
         print("++++++++++ %s" % " ..... ".join((

@@ -66,8 +66,8 @@ from lutil import pax as _pax, get_mem_stats_str
 import builtins
 builtins.pax = _pax
 
-def print_mem(key):
-    print(f"+++++++++++ {key} ........... {get_mem_stats_str()}.")
+# def print_mem(key):
+#     print(f"+++++++++++ {key} ........... {get_mem_stats_str()}.")
 # <<<
 
 
@@ -135,6 +135,7 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
     return active_buffer_size_bytes
 
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 # # >>>
 # def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
 # # def get_inference_context_max_tokens(controller: torch.nn.Module) -> int:
@@ -206,15 +207,13 @@ def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
     correlation between `max_tokens` and request throughput.
     """
     return 16384
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 def get_inference_context(
     requests: List[Request],
     sampling_params: SamplingParams,
-    # >>>
-    # buffer_size_bytes: int,
     model: torch.nn.Module,
-    # <<<
     calculate_max_sequence_length_from_requests: bool =True,
 ):
     """The inference context manages the KV cache and other inference state."""
@@ -424,7 +423,7 @@ def main():
     )
 
     # >>>
-    print_mem("initialize_megatron()")
+    # print_mem("initialize_megatron()")
     # <<<
 
     # Start Nsight profiler.
@@ -473,7 +472,7 @@ def main():
     )
 
     # >>>
-    print_mem("engine")
+    # print_mem("engine")
     # exit()
     # <<<
 
