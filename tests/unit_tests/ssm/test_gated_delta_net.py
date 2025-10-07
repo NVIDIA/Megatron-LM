@@ -14,7 +14,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net_mixer import GatedDeltaNetMixer
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -48,7 +48,7 @@ except ImportError:
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
-class TestGatedDeltaNetMixer:
+class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, tp_size, sp, cp_size):
@@ -71,11 +71,11 @@ class TestGatedDeltaNetMixer:
         # Initialize model
         self.transformer_config = TransformerConfig(
             hidden_size=256,
-            gdn_conv_kernel_dim=2,
-            gdn_qk_head_dim=64,
-            gdn_v_head_dim=64,
-            gdn_num_qk_heads=4,
-            gdn_num_v_heads=8,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
             num_layers=1,
             normalization="RMSNorm",
             use_cpu_initialization=True,
@@ -91,7 +91,7 @@ class TestGatedDeltaNetMixer:
             linear_attention_type="gated_delta_net", normalization="RMSNorm"
         ).submodules.self_attention.submodules
 
-        self.gdn_mixer = GatedDeltaNetMixer(
+        self.gdn = GatedDeltaNet(
             self.transformer_config,
             submodules=gdn_submodules,
             layer_number=1,
@@ -102,28 +102,24 @@ class TestGatedDeltaNetMixer:
             A_init_range=(1, 16),
             pg_collection=pg_collection,
         )
-        self.gdn_mixer = self.gdn_mixer.cuda().bfloat16()
+        self.gdn = self.gdn.cuda().bfloat16()
 
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
     def test_gpu_forward(self):
-        mixer = self.gdn_mixer
+        gdn = self.gdn
 
         micro_batch_size = 2
         seq_length = 64
         hidden_states = torch.ones(
-            (
-                seq_length // self.sp_size // self.cp_size,
-                micro_batch_size,
-                mixer.config.hidden_size,
-            ),
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
             device=torch.cuda.current_device(),
             dtype=torch.bfloat16,
         )
         attention_mask = None
 
-        output, bias = mixer(hidden_states, attention_mask)
+        output, bias = gdn(hidden_states, attention_mask)
 
         assert output.dim() == 3, f"Output too many dimensions ({output.shape=})"
         assert output.shape[0] == seq_length // self.sp_size // self.cp_size, (
@@ -134,8 +130,8 @@ class TestGatedDeltaNetMixer:
             output.shape[1] == micro_batch_size
         ), f"Output shape {output.shape[1]=} mismatch with {micro_batch_size=}"
         assert (
-            output.shape[2] == mixer.config.hidden_size
-        ), f"Output shape {output.shape[2]=} mismatch with {mixer.config.hidden_size=}"
+            output.shape[2] == gdn.config.hidden_size
+        ), f"Output shape {output.shape[2]=} mismatch with {gdn.config.hidden_size=}"
         assert (
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
@@ -150,7 +146,7 @@ class TestGatedDeltaNetMixer:
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_mixer_correctness(tmp_path_dist_ckpt, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     # Constants
     seed = 123
     sequence_length = 256
@@ -192,11 +188,11 @@ def test_parallel_gated_delta_net_mixer_correctness(tmp_path_dist_ckpt, tp, sp, 
     # Initialize transformer config
     transformer_config = TransformerConfig(
         hidden_size=128,
-        gdn_conv_kernel_dim=2,
-        gdn_qk_head_dim=32,
-        gdn_v_head_dim=32,
-        gdn_num_qk_heads=4,
-        gdn_num_v_heads=8,
+        linear_conv_kernel_dim=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
         num_layers=1,
         normalization=normalization,
         use_cpu_initialization=True,

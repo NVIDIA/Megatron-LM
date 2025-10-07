@@ -395,10 +395,10 @@ def num_floating_point_operations(args, batch_size):
 
             if args.linear_attention_type == "gated_delta_net":
                 # Calculate the FLOPs for the gated delta net attention.
-                qk_head_dim = args.gdn_qk_head_dim
-                v_head_dim = args.gdn_v_head_dim
-                num_qk_heads = args.gdn_num_qk_heads
-                num_v_heads = args.gdn_num_v_heads
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
                 linear_self_attn_term = (
@@ -409,7 +409,7 @@ def num_floating_point_operations(args, batch_size):
                         args.hidden_size
                         * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
                         ## conv1d
-                        + args.gdn_conv_kernel_dim
+                        + args.linear_conv_kernel_dim
                         * (2 * qk_dim + v_dim)
                         ## gated delta rule
                         + num_v_heads
@@ -425,7 +425,8 @@ def num_floating_point_operations(args, batch_size):
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
-        
+            num_standard_attention_layers = num_layers
+
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers

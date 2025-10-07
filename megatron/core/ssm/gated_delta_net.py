@@ -16,6 +16,7 @@ from torch import Tensor
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class GatedDeltaNetMixerSubmodules:
+class GatedDeltaNetSubmodules:
     """
     Contains the module specs for the input linear, output norm, and output linear layers.
     """
@@ -65,28 +66,17 @@ class GatedDeltaNetMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = IdentityOp
 
 
-class GatedDeltaNetMixer(MegatronModule):
-    """
-    Args:
-        config: The config of the model.
-        submodules: Contains the module specs for the input and output linear layers.
-        layer_number: The layer number of this GDN layer.
-        bias: Whether to use bias in the linear layers.
-        conv_bias: Whether to use bias in the causal convolution.
-        conv_init: The initialization range for the causal convolution weights.
-        A_init_range: The initialization range for the attention weights.
-        use_qk_l2norm: Whether to use L2 normalization in the kernel of the gated delta rule.
-        *headdim: The hidden size of each attention head.
-        *ngroups: The number of attention heads.
-        *use_mem_eff_path: Whether to use the memory-efficient path for the GDN model.
-        pg_collection: The required process groups to use for tensor model parallel and context
-            parallel.
+class GatedDeltaNet(MegatronModule):
+    """Gated Delta Net (GDN) layer class
+
+    GDN layer takes input with size [s, b, h]
+    and returns output of the same size.
     """
 
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: GatedDeltaNetMixerSubmodules,
+        submodules: GatedDeltaNetSubmodules,
         layer_number: int = None,
         bias: bool = False,
         conv_bias: bool = False,
@@ -95,6 +85,20 @@ class GatedDeltaNetMixer(MegatronModule):
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
     ):
+        """
+        Args:
+            config: The config of the model.
+            submodules: Contains the module specs for the input and output linear layers.
+            layer_number: The layer number of this GDN layer.
+            bias: Whether to use bias in the linear layers.
+            conv_bias: Whether to use bias in the causal convolution.
+            conv_init: The initialization range for the causal convolution weights.
+            use_qk_l2norm: Whether to use L2 normalization in the kernel of the gated delta rule.
+            A_init_range: The initialization range for the attention weights.
+            pg_collection: The required process groups to use for tensor model parallel and context
+                parallel.
+        """
+
         if not HAVE_FLA:
             raise ImportError("FLA is not installed. Please install it with `pip install fla`.")
 
@@ -108,7 +112,7 @@ class GatedDeltaNetMixer(MegatronModule):
         assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
         self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
-        assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNetMixer"
+        assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
@@ -118,20 +122,21 @@ class GatedDeltaNetMixer(MegatronModule):
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
-        self.conv_kernel_dim = config.gdn_conv_kernel_dim
-        self.qk_head_dim = config.gdn_qk_head_dim
-        self.v_head_dim = config.gdn_v_head_dim
-        self.num_qk_heads = config.gdn_num_qk_heads
-        self.num_v_heads = config.gdn_num_v_heads
-        self.qk_dim = self.qk_head_dim * self.num_qk_heads
-        self.v_dim = self.v_head_dim * self.num_v_heads
+        self.conv_kernel_dim = config.linear_conv_kernel_dim
+        self.key_head_dim = config.linear_key_head_dim
+        self.value_head_dim = config.linear_value_head_dim
+        self.num_key_heads = config.linear_num_key_heads
+        self.num_value_heads = config.linear_num_value_heads
+        self.qk_dim = self.key_head_dim * self.num_key_heads
+        self.v_dim = self.value_head_dim * self.num_value_heads
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
         # We may remove this restriction in the future.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_v_heads * 2
+        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
         if self.config.fp8:
-            assert self.in_proj_dim % 16 == 0, (
+            fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
+            assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN layer "
                 "input projection output tensor must be a multiple of 16."
             )
@@ -170,7 +175,7 @@ class GatedDeltaNetMixer(MegatronModule):
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
 
         # Time step projection (discretization)
-        self.num_v_heads_local_tp = self.num_v_heads // self.tp_size
+        self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         # dt_bias parameter
         self.dt_bias = nn.Parameter(
             torch.empty(
@@ -194,7 +199,7 @@ class GatedDeltaNetMixer(MegatronModule):
         self.out_norm = build_module(
             submodules.out_norm,
             config=self.config,
-            hidden_size=self.v_head_dim,
+            hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
 
@@ -254,8 +259,26 @@ class GatedDeltaNetMixer(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
-        hidden_states: (nL, B, D) / (L B D)
-        Returns: same shape as hidden_states
+        Perform a forward pass through the GDN module.
+
+        Args:
+            hidden_states (Tensor): Hidden states.
+            attention_mask (Tensor): Attention mask.
+            key_value_states (Optional[Tensor]): Key/value states (for cross attention).
+            inference_context (Optional[BaseInferenceContext]): Inference context that manages
+                KV cache.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            attention_bias (Optional[Tensor]): Attention bias.
+            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
+            sequence_len_offset (Optional[int]): Sequence length offset used for
+                inference CUDA graphs.
+
+        Return:
+            (Tuple[Tensor, Tensor]) GDN output and bias.
+
         """
         # TODO: Deal with attention_mask
 
@@ -291,12 +314,12 @@ class GatedDeltaNetMixer(MegatronModule):
             [
                 (self.qk_dim * 2 + self.v_dim) // self.tp_size,
                 self.v_dim // self.tp_size,
-                self.num_v_heads // self.tp_size,
-                self.num_v_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
             ],
             dim=-1,
         )
-        gate = gate.reshape(batch, seq_len, -1, self.v_head_dim)
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
         alpha = alpha.reshape(batch, seq_len, -1)
 
@@ -321,16 +344,16 @@ class GatedDeltaNetMixer(MegatronModule):
             [self.qk_dim // self.tp_size, self.qk_dim // self.tp_size, self.v_dim // self.tp_size],
             dim=-1,
         )
-        query = query.reshape(batch, seq_len, -1, self.qk_head_dim)
-        key = key.reshape(batch, seq_len, -1, self.qk_head_dim)
-        value = value.reshape(batch, seq_len, -1, self.v_head_dim)
+        query = query.reshape(batch, seq_len, -1, self.key_head_dim)
+        key = key.reshape(batch, seq_len, -1, self.key_head_dim)
+        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
             query = l2norm(query.contiguous())
             key = l2norm(key.contiguous())
-        if self.num_v_heads // self.num_qk_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_qk_heads, dim=2)
+        if self.num_value_heads // self.num_key_heads > 1:
+            query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
+            key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
 
         # Make contiguous
         query = query.contiguous()
@@ -435,8 +458,8 @@ class GatedDeltaNetMixer(MegatronModule):
                 self.qk_dim // self.tp_size,
                 self.v_dim // self.tp_size,
                 self.v_dim // self.tp_size,
-                self.num_v_heads // self.tp_size,
-                self.num_v_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
             ],
             ["query", "key", "value", "z", "beta", "alpha"],
             0,

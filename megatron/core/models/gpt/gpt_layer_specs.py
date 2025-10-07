@@ -93,10 +93,14 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use multi-latent attention. Defaults to False.
+        linear_attention_type (str, optional): The type of linear attention. Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
+        normalization (str, optional): The normalization to use. Defaults to None.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_kitchen (bool, optional): To use KitchenSpecProvider. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
 
@@ -171,10 +175,14 @@ def get_gpt_layer_local_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use multi-latent attention. Defaults to False.
+        linear_attention_type (str, optional): The type of linear attention. Defaults to None.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
+        normalization (str, optional): The normalization to use. Defaults to None.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_kitchen (bool, optional): To use KitchenSpecProvider. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
@@ -477,7 +485,10 @@ def get_gpt_decoder_block_spec(
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
-    """GPT block spec."""
+    """Helper function to get GPT block spec.
+
+    Return a list of transformer layer spec of the current pipeline stage."""
+
     get_layer_spec_kwargs = {
         "qk_layernorm": config.qk_layernorm,
         "moe_use_legacy_grouped_gemm": config.moe_use_legacy_grouped_gemm,
@@ -494,27 +505,29 @@ def get_gpt_decoder_block_spec(
         get_layer_spec_fn = get_gpt_layer_local_spec
 
     layer_spec_dict = {}
-    for moe in [0, 1]:
-        for la in [0, 1]:
-            if moe and config.moe_layer_freq is None:
-                continue
-            if la and config.linear_attention_type is None:
-                continue
-
-            if moe:
+    for mlp_type in ["dense", "moe"]:
+        for attention_type in ["softmax_attention", "linear_attention"]:
+            if mlp_type == "moe":
+                if config.moe_layer_freq is None:
+                    # Skip if there is no MoE layer in the model.
+                    continue
                 num_experts = config.num_moe_experts
                 moe_grouped_gemm = config.moe_grouped_gemm
             else:
                 num_experts = None
                 moe_grouped_gemm = None
-            if la:
+            if attention_type == "linear_attention":
+                if config.linear_attention_type is None:
+                    # Skip if there is no linear attention layer in the model.
+                    continue
                 linear_attention_type = config.linear_attention_type
                 multi_latent_attention = None
             else:
                 linear_attention_type = None
                 multi_latent_attention = config.multi_latent_attention
 
-            layer_spec_dict[f"moe{moe}_la{la}"] = get_layer_spec_fn(
+            layer_spec_key = f"{mlp_type}_{attention_type}"
+            layer_spec_dict[layer_spec_key] = get_layer_spec_fn(
                 num_experts=num_experts,
                 moe_grouped_gemm=moe_grouped_gemm,
                 multi_latent_attention=multi_latent_attention,
@@ -578,9 +591,11 @@ def get_gpt_decoder_block_spec(
     # Create the layer specs for the model.
     layer_specs = []
     for layer_number in range(config.num_layers):
-        moe = moe_layer_pattern[layer_number]
-        la = linear_attention_pattern[layer_number]
-        layer_spec_key = f"moe{moe}_la{la}"
+        mlp_type = "moe" if moe_layer_pattern[layer_number] else "dense"
+        attention_type = (
+            "linear_attention" if linear_attention_pattern[layer_number] else "softmax_attention"
+        )
+        layer_spec_key = f"{mlp_type}_{attention_type}"
         if layer_spec_key not in layer_spec_dict:
             raise ValueError(f"Invalid layer spec key: {layer_spec_key}")
         layer_specs.append(layer_spec_dict[layer_spec_key])

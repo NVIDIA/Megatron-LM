@@ -3167,15 +3167,15 @@ def _add_linear_attention_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
-    group.add_argument('--gdn-conv-kernel-dim', default=4, type=int,
+    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
                        help='Conv kernel dimension for the gated delta net.')
-    group.add_argument('--gdn-qk-head-dim', default=128, type=int,
+    group.add_argument('--linear-key-head-dim', default=128, type=int,
                        help='Query and key head dimension for the gated delta net.')
-    group.add_argument('--gdn-v-head-dim', default=128, type=int,
+    group.add_argument('--linear-value-head-dim', default=128, type=int,
                        help='Value and gate head dimension for the gated delta net.')
-    group.add_argument('--gdn-num-qk-heads', default=16, type=int,
+    group.add_argument('--linear-num-key-heads', default=16, type=int,
                        help='Number of query and key heads for the gated delta net.')
-    group.add_argument('--gdn-num-v-heads', default=32, type=int,
+    group.add_argument('--linear-num-value-heads', default=32, type=int,
                        help='Number of value and gate heads for the gated delta net.')
     return parser
 

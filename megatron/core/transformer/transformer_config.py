@@ -228,19 +228,19 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
-    gdn_conv_kernel_dim: Optional[int] = None
+    linear_conv_kernel_dim: Optional[int] = None
     """Conv kernel dimension for the gated delta net."""
 
-    gdn_qk_head_dim: Optional[int] = None
+    linear_key_head_dim: Optional[int] = None
     """Query and key head dimension for the gated delta net."""
 
-    gdn_v_head_dim: Optional[int] = None
+    linear_value_head_dim: Optional[int] = None
     """Value and gate head dimension for the gated delta net."""
 
-    gdn_num_qk_heads: Optional[int] = None
+    linear_num_key_heads: Optional[int] = None
     """Number of query and key heads for the gated delta net."""
 
-    gdn_num_v_heads: Optional[int] = None
+    linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
 
     ####################
@@ -788,32 +788,32 @@ class TransformerConfig(ModelParallelConfig):
             if self.linear_attention_type == "gated_delta_net":
                 # Check required parameters
                 assert (
-                    self.gdn_conv_kernel_dim is not None
-                ), "gdn_conv_kernel_dim must be set for gated delta net."
+                    self.linear_conv_kernel_dim is not None
+                ), "linear_conv_kernel_dim must be set for gated delta net."
                 assert (
-                    self.gdn_qk_head_dim is not None
-                ), "gdn_qk_head_dim must be set for gated delta net."
+                    self.linear_key_head_dim is not None
+                ), "linear_key_head_dim must be set for gated delta net."
                 assert (
-                    self.gdn_v_head_dim is not None
-                ), "gdn_v_head_dim must be set for gated delta net."
+                    self.linear_value_head_dim is not None
+                ), "linear_value_head_dim must be set for gated delta net."
                 assert (
-                    self.gdn_num_qk_heads is not None
-                ), "gdn_num_qk_heads must be set for gated delta net."
+                    self.linear_num_key_heads is not None
+                ), "linear_num_key_heads must be set for gated delta net."
                 assert (
-                    self.gdn_num_v_heads is not None
-                ), "gdn_num_v_heads must be set for gated delta net."
-                assert self.gdn_num_v_heads % self.gdn_num_qk_heads == 0, (
-                    f"gdn_num_v_heads ({self.gdn_num_v_heads}) must be a multiple of "
-                    f"gdn_num_qk_heads ({self.gdn_num_qk_heads})."
+                    self.linear_num_value_heads is not None
+                ), "linear_num_value_heads must be set for gated delta net."
+                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                    f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
 
                 # Check tensor parallelism compatibility
                 assert (
-                    self.gdn_num_qk_heads % self.tensor_model_parallel_size == 0
-                ), "gdn_num_qk_heads must be a multiple of tensor_model_parallel_size."
+                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
+                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
                 assert (
-                    self.gdn_num_v_heads % self.tensor_model_parallel_size == 0
-                ), "gdn_num_v_heads must be a multiple of tensor_model_parallel_size."
+                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
+                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
 
                 # Do not support yet, but coming soon.
                 assert self.context_parallel_size == 1, (
