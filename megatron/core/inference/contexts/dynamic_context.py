@@ -988,11 +988,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.active_token_count += context_length
 
-        # >>>
-        # print(f"++++++++ chunk allocator ... {self.chunk_allocator}.")
-        # pax({"max_requests": self.max_requests})
-        # <<<
-
     def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
@@ -1054,10 +1049,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # finished_request_count are requests that have reached the termination criterion
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
-        # >>>
-        # if finished_request_count > 0:
-        #     raise Exception("huh?")
-        # <<<
         assert (
             active_request_count + finished_request_count + self.paused_request_count
             == self.total_request_count
@@ -1148,21 +1139,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_requiring_new_chunk_count = (
                 (active_requests_requiring_new_chunk == 1).sum().item()
             )
-            # >>>
-            # if active_requests_requiring_new_chunk_count > 0:
-            #     pax("active_requests_requiring_new_chunk")
-            # <<<
 
-            # >>> [ new ]
             if active_requests_requiring_new_chunk_count > 0:
                 newly_paused_request_ids = self.request_ids[
                     torch.nonzero(active_requests_requiring_new_chunk)
                     + self.paused_request_count
                 ]
-                # >>>
-                # pax("newly_paused_request_ids")
-                # <<<
-            # <<<
 
             # Swap unfinished active requests on the left side with paused requests on the right side
             # NOTE : We add paused request count because we concatenate
@@ -1193,58 +1175,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 dst_idxs = torch.cat((active_request_ids_on_left, paused_requests_idxs_on_right))
                 src_idxs = torch.cat((paused_requests_idxs_on_right, active_request_ids_on_left))
-                # >>> [ new ]
-                # newly_paused_request_ids = self.request_ids[dst_idxs]
-                # <<<
                 self._move_book_keeping_tensors(
                     src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
                 )
-                # >>> [ orig ]
-                # newly_paused_request_ids = self.request_ids[dst_idxs]
-                # <<<
-                # >>>
-                # pax("active_request_ids_on_left, paused_requests_idxs_on_right")
-                # <<<
 
             self.paused_request_count += active_requests_requiring_new_chunk_count
             active_request_count -= active_requests_requiring_new_chunk_count
-
-            # >>>
-            # if active_requests_requiring_new_chunk_count > 0:
-            #     pax({
-            #         "chunk_allocator" : self.chunk_allocator,
-            #         "paused_request_count" : self.paused_request_count,
-            #     }, "active_request_count")
-            # <<<
 
         # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
         # Assign released chunks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # num_non_gtd_chunks = max(0, self.chunk_allocator.chunk_count_avail - self.gtd_chunk_count)
-        # if num_non_gtd_chunks:
-        #     # if we have non-gtd chunks, use them. Do not dip into the gtd-chunk pool
-        #     resume_request_count = min(num_non_gtd_chunks, self.paused_request_count)
-        # else:
-        #     # only dip into the gtd-chunk pool if we have run out of non-gtd-chunks and the active
-        #     # request count has fallen below a certain threshold.
-        #     resume_request_count = min(
-        #         max(self.gtd_request_count - active_request_count, 0), self.paused_request_count
-        #     )
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # if active_request_count < self.chunk_allocator.active_count:
-        #     resume_request_count = min(
-        #         # >>>
-        #         # self.chunk_allocator.active_avail,
-        #         # <<<
-        #         self.chunk_allocator.total_avail,
-        #         self.chunk_allocator.active_count - active_request_count,
-        #         self.paused_request_count,
-        #     )
-        # else:
-        #     resume_request_count = 0
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_chunk_count_avail = self.chunk_allocator.get_active_avail()
@@ -1254,41 +1195,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
             paused_chunk_counts += 1 # +1 for newly added chunk
             paused_chunk_counts_cumsum = paused_chunk_counts.cumsum(dim=0)
-            # >>>
-            # paused_chunk_counts_cumsum += 1 # +1 for newly added chunk
-            # <<<
             resume_request_count = torch.nonzero(
                 paused_chunk_counts_cumsum <= active_chunk_count_avail
             ).numel()
 
-            # for i in range(self.paused_request_count - 1, -1, -1):
-            #     current_chunk_count
-            #     pax("i")
-            # if resume_request_count != 1:
-            #     pax("resume_request_count")
-
-            # >>>
-            # if active_request_count + resume_request_count == 0:
-            # if active_request_count == 0:
-            # if resume_request_count >= 2:
-            # if True:
-            #     pax("active_chunk_count_avail",
-            #         "paused_chunk_counts, paused_chunk_counts_cumsum",
-            #         "active_request_count, resume_request_count")
-            # <<<
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
         # >>>
         newly_resumed_request_ids = self.request_ids[(self.paused_request_count - resume_request_count):self.paused_request_count]
-        # <<<
-
-        # >>>
-        # if resume_request_count != 0 and self.chunk_allocator.total_avail == 0:
-        if active_request_count + resume_request_count == 0:
-            pax({
-                "chunk_allocator" : self.chunk_allocator,
-                "paused_request_count" : self.paused_request_count,
-            }, "active_request_count, resume_request_count")
         # <<<
 
         self.paused_request_count -= resume_request_count
@@ -1302,10 +1214,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # requests are newly paused during this update.
         if newly_paused_request_ids is not None and resume_request_count > 0:
             newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
-        # >>>
-        # if newly_paused_request_ids is not None and newly_paused_request_ids.numel() > 0:
-        #     pax("newly_paused_request_ids")
-        # <<<
+            # >>>
+            # newly_resumed_request_ids = newly_resumed_request_ids[-resume_request_count:]
+            # <<<
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         # All these active requests are in decode phase, so they need only 1 token per request
