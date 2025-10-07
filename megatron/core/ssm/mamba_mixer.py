@@ -376,6 +376,7 @@ class MambaMixer(MegatronModule):
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
         # trainable variables for the current tensor parallel rank, with each tensor parallel rank
+
         # having indepdendent trainable variables. All context parallel ranks in a tensor parallel
         # rank store the same trainable variables, but only use and update their unique/independent
         # slice of them.
@@ -423,12 +424,16 @@ class MambaMixer(MegatronModule):
                 out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
 
-        # zxBCdt will have shape (b, l, d)
-        zxBCdt = self.compute_in_proj_and_transpose_batch_seq_dims(hidden_states)
+        zxBCdt, _ = self.in_proj(hidden_states)
+
+        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
 
         # Training path using memory-efficient kernel
         if self.use_mem_eff_path and not in_inference_mode:
             assert ssm_state is None
+
+            # transpose: l b pd --> b l pd
+            zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
             # TODO(duncan): Can this code be removed?
             if self.conv1d.bias is not None:
@@ -469,23 +474,9 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def compute_in_proj_and_transpose_batch_seq_dims(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the input projection given the input hidden states and
-        then transposes the batch and sequence dimensions.
-        """
-        zxBCdt, _ = self.in_proj(hidden_states)
-
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
-
-        # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-
-        return zxBCdt
-
     def ssm_block(
         self,
-        x_ssm_in: torch.Tensor,
+        zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor] = None,
         ssm_state: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
@@ -493,13 +484,13 @@ class MambaMixer(MegatronModule):
         return_varlen_states: bool = False,
         batch_indices: Optional[torch.Tensor] = None,
         is_chunked_prefill: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Encapsulates the core selective scan block logic which is shared between
         the training forward pass and the inference prefill pass.
 
         Args:
-            x_ssm_in: The input tensor of shape (b, l, d), which is a concatenation of
+            zxBCdt: The input tensor of shape (l, b, d), which is a concatenation of
                 z, x, B, C, and dt projections.
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
@@ -510,19 +501,21 @@ class MambaMixer(MegatronModule):
                 dynamic inference.
 
         Returns:
-            A tuple containing the output tensor and the output bias tensor.
-            The output tensor will have shape (l, b, d).
+            The output tensor of shape (l, b, d).
         """
         is_dynamic_batching = seq_idx is not None
         assert not (
             is_dynamic_batching and is_chunked_prefill
         ), "Cannot use chunked prefill with dynamic batching"
 
+        # transpose: l b pd --> b l pd
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
 
         z, xBC, dt = torch.split(
-            x_ssm_in,
+            zxBCdt,
             [
                 self.cp.d_inner_local_tpcp,
                 self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
@@ -661,20 +654,24 @@ class MambaMixer(MegatronModule):
 
     def ssm_block_decode_only(self, zxBCdt, conv_state, ssm_state, batch_indices=None):
         """
-        Encapsulates the core selective scan block logic for pure decode batches.
+        Encapsulates the core selective scan block logic for inference decoding.
 
         Args:
-            zxBCdt: The input tensor of shape (b, l, d), which is a concatenation of
-                z, x, B, C, and dt projections. The batch dimension must be 1.
+            zxBCdt: The input tensor of shape (l, b, d), which is a concatenation of
+                z, x, B, C, and dt projections. For decoding, l must be 1.
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors for
                 dynamic inference.
 
         Returns:
-            The output tensor.
+            The output tensor of shape (l, b, d_inner_local_tp), consistent with ssm_block.
         """
-        assert zxBCdt.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+        seq_len, batch_size, _ = zxBCdt.shape
+        dtype = zxBCdt.dtype
+        assert seq_len == 1, "Only support decoding with 1 token at a time for now"
+
+        # Remove sequence dimension
         zxBCdt = zxBCdt.squeeze(0)
 
         z, xBC, dt = torch.split(
@@ -696,7 +693,7 @@ class MambaMixer(MegatronModule):
             )  # (B D)
             if self.conv1d.bias is not None:
                 xBC = xBC + self.conv1d.bias
-            xBC = self.act(xBC).to(dtype=dtype)
+            xBC = self.act(xBC).to(dtype=xBC.dtype)
         else:
             xBC = causal_conv1d_update(
                 xBC,
@@ -792,7 +789,7 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             y = self.norm(y, z)
 
-        # Restore batch dimension
+        # Restore sequence dimension
         return y.unsqueeze(0)
 
     def dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
@@ -813,17 +810,14 @@ class MambaMixer(MegatronModule):
             batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
                 : context.padded_active_token_count
             ]
-            # Ensure batch dimension is first
             out, out_bias, _, _ = self.step(
                 hidden_states.transpose(0, 1), conv_state, ssm_state, batch_indices=batch_indices
             )
-            # Restore sequence dimension as first
             return out.transpose(0, 1), out_bias
 
         # Compute input projection before splitting into prefill and decode
         # to ensure sequence parallel all-gather.
-        # zxBCdt will have shape (b, l, d)
-        zxBCdt = self.compute_in_proj_and_transpose_batch_seq_dims(hidden_states)
+        zxBCdt, _ = self.in_proj(hidden_states)
 
         # Compute split between decode and prefill.
         seq_idx, cu_seqlens, _return_varlen_states = self._get_varlen_generation_state(context)
@@ -837,10 +831,10 @@ class MambaMixer(MegatronModule):
 
         # Process decode requests if there are any.
         if first_prefill_token_idx > 0:
-            zxBCdt_decode = zxBCdt[:, :first_prefill_token_idx]
+            zxBCdt_decode = zxBCdt[:first_prefill_token_idx]
             batch_indices_decode = batch_indices[:first_prefill_token_idx]
             y_decode = self.ssm_block_decode_only(
-                zxBCdt_decode, conv_state, ssm_state, batch_indices_decode
+                zxBCdt_decode.transpose(0, 1), conv_state, ssm_state, batch_indices_decode
             ).transpose(0, 1)
         else:
             y_decode = None
@@ -853,7 +847,7 @@ class MambaMixer(MegatronModule):
         if context.chunked_prefill_request_id != -1:
             chunked_prefill_request_token_count = active_query_lengths[-1]
             zxBCdt_chunked_prefill = zxBCdt[
-                :, active_token_count - chunked_prefill_request_token_count : active_token_count
+                active_token_count - chunked_prefill_request_token_count : active_token_count
             ]
             batch_index_chunked_prefill = batch_indices[context.chunked_prefill_request_id]
 
@@ -873,7 +867,7 @@ class MambaMixer(MegatronModule):
 
         # Process non-chunked prefill requests if there are any.
         if (remaining_prefill_tokens := active_token_count - first_prefill_token_idx) > 0:
-            zxBCdt_prefill = zxBCdt[:, first_prefill_token_idx:active_token_count]
+            zxBCdt_prefill = zxBCdt[first_prefill_token_idx:active_token_count]
             cu_seqlens_prefill = F.pad(
                 cu_seqlens[first_prefill_token_idx + 1 : active_request_count + 1]
                 - first_prefill_token_idx,
@@ -916,17 +910,16 @@ class MambaMixer(MegatronModule):
         Performs inference step for decoding
         """
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
-        dtype = hidden_states.dtype
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
 
-        # b d_model --> b p(2d)
+        # (1, b, d_model) -> (1, b, proj_dim)
         zxBCdt, _ = self.in_proj(hidden_states)
-        
+
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
         y = self.ssm_block_decode_only(zxBCdt, conv_state, ssm_state, batch_indices=batch_indices)
 
-        # b pd --> b d
+        # y has shape (1, b, d_inner), which is what out_proj expects
         out, out_bias = self.out_proj(y)
 
         return out, out_bias, conv_state, ssm_state
