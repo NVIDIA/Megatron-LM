@@ -455,3 +455,238 @@ class TestMultiModulePipelineCommunicator:
             grad_dict = {'llm': torch.randn(1, 32, 128).cuda()}
             input_dict = mllm_comm.send_backward_recv_forward(grad_dict)
             assert input_dict['llm'].shape == (1, 32, 128)
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Feature requires PyTorch 2.3 or later",
+    )
+    def test_send_forward_recv_forward_with_transformer_blocks(self):
+        """Test send_forward and recv_forward operations."""
+
+        # Set model/test dimensions for easier debugging and output comparison
+        hidden_size = 16
+        sequence_length = 2
+        micro_batch_size = 2
+
+        # For reproducibility, set a fixed seed
+        torch.manual_seed(12345)
+        dtype = torch.float32
+
+        # Create random input hidden states tensor
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, hidden_size), device="cuda"
+        ).to(dtype)
+        current_rank = dist.get_rank()
+
+        # ========== Initialize tensor model-parallel environment ==========
+        parallel_state_tp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+        # ========== Build reference 1D grid and transformer block for weight sharing ==========
+        ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
+        ref_block = _create_transformer_block(
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
+        )
+        _avg_params(
+            ref_block, ref_grid.get_pg("dp")
+        )  # Ensure parameters are averaged across data parallel (DP)
+
+        # ========== Create different transformer blocks for each model stage ==========
+        # Image encoder
+        image_encoder_block, image_encoder_grid = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=1,
+            cp_size=1,
+            pp_size=1,
+            dp_size=1,
+            grid_offset=0,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        # Audio encoder
+        audio_encoder_block, audio_encoder_grid = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=1,
+            cp_size=1,
+            pp_size=1,
+            dp_size=1,
+            grid_offset=1,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        # LLM (Large Language Model) block with tensor & pipeline parallelism
+        llm_block, llm_grid = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=2,
+            cp_size=1,
+            pp_size=2,
+            dp_size=1,
+            grid_offset=2,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        # Generator block (final stage) with DP=2
+        generator_block, generator_grid = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=1,
+            cp_size=1,
+            pp_size=1,
+            dp_size=2,
+            grid_offset=6,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+
+        # ========== Define module-to-grid correspondence and pipeline topology ==========
+        module_to_grid_map = {
+            'image_encoder': image_encoder_grid,
+            'audio_encoder': audio_encoder_grid,
+            'llm': llm_grid,
+            'generator': generator_grid,
+        }
+        topology = {
+            'image_encoder': ['llm'],  # image_encoder sends output to llm
+            'audio_encoder': ['llm'],  # audio_encoder sends output to llm
+            'llm': ['generator'],  # llm sends output to generator
+            'generator': [],  # generator is the final module
+        }
+        config = ModelParallelConfig(pipeline_dtype=torch.float)
+        # Define dimension mapping for sequence, batch, hidden
+        dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+        seq_dim = dim_mapping['s']
+
+        # Communication handler for multi-module pipeline (send/recv abstraction)
+        mllm_comm = MultiModulePipelineCommunicator(
+            module_to_grid_map, topology, config, dim_mapping=dim_mapping
+        )
+
+        # ========== Run actual distributed pipeline blocks (per process, depending on role) ==========
+        if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
+            # Image encoder rank: run forward and send output
+            image_encoder_output = image_encoder_block(
+                hidden_states=hidden_states, attention_mask=None
+            )
+            output_dict = {'image_encoder': image_encoder_output}
+            mllm_comm.send_forward(output_dict)
+        if mllm_comm.is_current_rank_in_grid(audio_encoder_grid):
+            # Audio encoder rank: run forward and send output
+            audio_encoder_output = audio_encoder_block(
+                hidden_states=hidden_states, attention_mask=None
+            )
+            output_dict = {'audio_encoder': audio_encoder_output}
+            mllm_comm.send_forward(output_dict)
+        if mllm_comm.is_current_rank_in_grid(llm_grid):
+            if dist.get_rank() == 2 or dist.get_rank() == 3:
+                # LLM stage 0 (receives both image and audio, concatenates along seq_dim)
+                input_dict = mllm_comm.recv_forward()
+                llm_output = llm_block(
+                    hidden_states=torch.cat(
+                        [input_dict['image_encoder'], input_dict['audio_encoder']], dim=seq_dim
+                    ),
+                    attention_mask=None,
+                )
+                output_dict = {'llm': llm_output}
+                mllm_comm.send_forward(output_dict)
+            else:
+                # LLM stage 1 (receives output of previous LLM stage)
+                input_dict = mllm_comm.recv_forward(
+                    tensor_shape=(sequence_length * 2, micro_batch_size, hidden_size)
+                )
+                llm_output = llm_block(hidden_states=input_dict['llm'], attention_mask=None)
+                output_dict = {'llm': llm_output}
+                mllm_comm.send_forward(output_dict)
+
+        if mllm_comm.is_current_rank_in_grid(generator_grid):
+            # Generator block: only receives from llm and runs forward
+            input_dict = mllm_comm.recv_forward()
+            generator_output = generator_block(hidden_states=input_dict['llm'], attention_mask=None)
+
+        # ========== Build a reference (serial/global) pipeline for correctness checking ==========
+        global_image_encoder_block, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        global_audio_encoder_block, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        global_llm_block_pp_stage_0, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        global_llm_block_pp_stage_1, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        global_generator_block, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+
+        # Run each stage sequentially as a global pipeline (for truth)
+        global_image_encoder_output = global_image_encoder_block(
+            hidden_states=hidden_states, attention_mask=None
+        )
+        global_audio_encoder_output = global_audio_encoder_block(
+            hidden_states=hidden_states, attention_mask=None
+        )
+        # Compare output between global and distributed blocks for image/audio stage
+        if current_rank == 0:
+            torch.testing.assert_close(
+                global_image_encoder_output, image_encoder_output, rtol=1e-3, atol=1e-3
+            )
+        if current_rank == 1:
+            torch.testing.assert_close(
+                global_audio_encoder_output, audio_encoder_output, rtol=1e-3, atol=1e-3
+            )
+
+        # Feed outputs to LLM stages (emulate pipeline cut with concatenation)
+        global_llm_input = torch.cat(
+            [global_image_encoder_output, global_audio_encoder_output], dim=seq_dim
+        )
+        global_llm_pp_stage_0_output = global_llm_block_pp_stage_0(
+            hidden_states=global_llm_input, attention_mask=None
+        )
+        if current_rank == 2 or current_rank == 3:
+            torch.testing.assert_close(
+                global_llm_pp_stage_0_output, llm_output, rtol=1e-3, atol=1e-3
+            )
+        global_llm_pp_stage_1_output = global_llm_block_pp_stage_1(
+            hidden_states=global_llm_pp_stage_0_output, attention_mask=None
+        )
+        if current_rank == 4 or current_rank == 5:
+            torch.testing.assert_close(
+                global_llm_pp_stage_1_output, llm_output, rtol=1e-3, atol=1e-3
+            )
+
+        # Generator output and comparison to distributed output (for each DP chunk)
+        global_generator_block_output = global_generator_block(
+            hidden_states=global_llm_pp_stage_1_output, attention_mask=None
+        )
+        global_generator_block_chunks = torch.split(
+            global_generator_block_output, global_generator_block_output.shape[1] // 2, dim=1
+        )
+        if current_rank == 6:
+            torch.testing.assert_close(
+                global_generator_block_chunks[0], generator_output, rtol=1e-3, atol=1e-3
+            )
+        if current_rank == 7:
+            torch.testing.assert_close(
+                global_generator_block_chunks[1], generator_output, rtol=1e-3, atol=1e-3
+            )
