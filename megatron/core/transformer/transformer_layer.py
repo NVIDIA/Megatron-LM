@@ -112,14 +112,14 @@ def get_transformer_layer_offset(
                     else config.num_layers_in_last_pipeline_stage // vp_size
                 )
 
-                num_layers_per_vritual_model_chunk_in_middle_pipeline_stage = (
+                num_layers_per_virtual_model_chunk_in_middle_pipeline_stage = (
                     middle_num_layers // vp_size
                 )
 
                 # First stage + middle stage + last stage
                 total_virtual_chunks = (
                     num_layers_per_virtual_model_chunk_in_first_pipeline_stage
-                    + num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
+                    + num_layers_per_virtual_model_chunk_in_middle_pipeline_stage
                     + num_layers_per_virtual_model_chunk_in_last_pipeline_stage
                 )
 
@@ -132,7 +132,7 @@ def get_transformer_layer_offset(
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
                         + middle_pipeline_rank
                         * (
-                            num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
+                            num_layers_per_virtual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
                         )
                     )
