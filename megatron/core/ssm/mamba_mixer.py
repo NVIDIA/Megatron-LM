@@ -811,9 +811,9 @@ class MambaMixer(MegatronModule):
                 : context.padded_active_token_count
             ]
             out, out_bias, _, _ = self.step(
-                hidden_states.transpose(0, 1), conv_state, ssm_state, batch_indices=batch_indices
+                hidden_states, conv_state, ssm_state, batch_indices=batch_indices
             )
-            return out.transpose(0, 1), out_bias
+            return out, out_bias
 
         # Compute input projection before splitting into prefill and decode
         # to ensure sequence parallel all-gather.
@@ -909,15 +909,29 @@ class MambaMixer(MegatronModule):
         """
         Performs inference step for decoding
         """
+        is_dynamic_batching = batch_indices is not None
+
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
-        assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+
+        if not is_dynamic_batching:
+            assert (
+                hidden_states.shape[0] == 1
+            ), "Only support decoding with 1 token at a time for now"
 
         # (1, b, d_model) -> (1, b, proj_dim)
         zxBCdt, _ = self.in_proj(hidden_states)
 
+        # Make batch size leading dimension since that is 1
+        if is_dynamic_batching:
+            zxBCdt = zxBCdt.transpose(0, 1)
+
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
         y = self.ssm_block_decode_only(zxBCdt, conv_state, ssm_state, batch_indices=batch_indices)
+
+        # Restore sequence length as first dimension
+        if is_dynamic_batching:
+            y = y.transpose(0, 1)
 
         # y has shape (1, b, d_inner), which is what out_proj expects
         out, out_bias = self.out_proj(y)
