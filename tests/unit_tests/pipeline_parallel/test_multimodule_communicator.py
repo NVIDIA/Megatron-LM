@@ -870,9 +870,7 @@ class TestMultiModulePipelineCommunicator:
                 # If grid2 expands DP: each output_grid_2 chunk corresponds to a split of the reference output
                 grid2_dp_ranks = grid_2._gen_rank_enum([x for x in grid_2.dim_names if x != "dp"])
                 global_block_2_chunks = torch.split(
-                    hidden_states_ref,
-                    hidden_states_ref.shape[1] // (grid2_dp // grid1_dp),
-                    dim=1,
+                    hidden_states_ref, hidden_states_ref.shape[1] // (grid2_dp // grid1_dp), dim=1
                 )
                 relevant_chunk = None
                 for i, dp_ranks in enumerate(grid2_dp_ranks):
@@ -887,4 +885,3 @@ class TestMultiModulePipelineCommunicator:
                 torch.testing.assert_close(
                     hidden_states_ref, output_grid_2_first_chunk, rtol=1e-3, atol=1e-3
                 )
-
