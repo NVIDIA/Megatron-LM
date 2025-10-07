@@ -93,7 +93,10 @@ def get_batch(data_iterator, vp_stage=None):
             for key, data in batch.items():
                 if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
                     continue
-                batch[key] = data.index_select(1, index)
+                if data is None:  # On PP rank 0, labels and loss_mask will be None
+                    batch[key] = None
+                else:
+                    batch[key] = data.index_select(1, index)
 
         # Reshape from [B,S] to [T,1]
         # I don't think this is needed
