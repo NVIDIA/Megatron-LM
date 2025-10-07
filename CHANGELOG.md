@@ -62,6 +62,8 @@
   * Set default for packed\_seq\_params in get\_rotary\_seq\_len ([MR \!3651](https://github.com/NVIDIA/Megatron-LM/commit/510d58c46664f44c556005ac928c5c531e12f761))  
   * Fix dynamic example script errors ([MR \!3653](https://github.com/NVIDIA/Megatron-LM/commit/72e290bf1f4bbf0c8047bb10a51da6ea6372e163))  
   * Guard TE import fix ([MR \!3666](https://github.com/NVIDIA/Megatron-LM/commit/ac198fc0d60a8c748597e01ca4c6887d3a7bcf3d))  
+* Breaking changes:  
+  * `megatron.core.distributed.custom_fsdp` refactored as breaking change to `megatron.core.distributed.fsdp.src.megatron_fsdp`  
 * Known issues
 
 ## NVIDIA Megatron Core 0.13.0
