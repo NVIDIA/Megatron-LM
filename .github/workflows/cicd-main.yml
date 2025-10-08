@@ -42,7 +42,7 @@ jobs:
       force_run_all: "false"
       docs_only: "false"
       is_deployment_workflow: "false"
-      is_merge_group: "false"
+      is_merge_group: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,7 +58,7 @@ jobs:
         needs.pre-flight.outputs.is_deployment_workflow == 'false' 
           && needs.pre-flight.outputs.is_ci_workload == 'false'
           && needs.pre-flight.outputs.docs_only == 'false'
-          && needs.pre-flight.outputs.is_merge_group == 'true'
+          && needs.pre-flight.outputs.is_merge_group == 'false'
       )
     steps:
       - name: Checkout
