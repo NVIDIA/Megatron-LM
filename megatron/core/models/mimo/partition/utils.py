@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from __future__ import annotations
-
-"""Token- and weight-partitioning helper (CP, TP, SP).
+"""Token and weight partitioning helper (CP, TP, SP).
 
 The adapter slices sequences across *context-parallel* ranks and can further
 scatter them across *sequence-parallel* ranks when sequence-parallelism is
 enabled.
 """
+from __future__ import annotations
+
+
 from dataclasses import dataclass
 from typing import Optional, Protocol, Tuple, runtime_checkable
 
@@ -32,8 +33,8 @@ except ModuleNotFoundError:  # pragma: no cover
 class PartitionConfig:
     """Minimal runtime information needed to shard inputs.
 
-    NOTE: Always construct PartitionConfig using the provided classmethods
-    (from_model or from_mp_config) to ensure all fields, including cp_group,
+    NOTE: Always construct PartitionConfig using the provided classmethod
+    (from_mp_config) to ensure all fields, including cp_group,
     are set correctly.
     """
 
@@ -80,27 +81,6 @@ class PartitionConfig:
         _language_max_sequence_length: int
         _kv_format: str
         cp_group: Optional[ProcessGroup]
-
-    @classmethod
-    def from_model(cls, model: _ParallelAttrs) -> "PartitionConfig":
-        """
-        Creates a PartitionConfig from a model.
-        """
-        cp_size = model.context_parallel_lm
-        cp_group = model.cp_group if cp_size > 1 else None
-        if cp_size > 1 and cp_group is None:
-            cp_group = get_context_parallel_group()
-
-        return cls(
-            cp_size=cp_size,
-            tp_size=model.tensor_model_parallel_size_lm,
-            seq_parallel=model.sequence_parallel_lm,
-            use_cp=cp_size > 1,
-            tp_comm_overlap=model.tp_comm_overlap_lm,
-            max_seq_len=model._language_max_sequence_length,
-            kv_format=model._kv_format,
-            cp_group=cp_group,
-        )
 
     @classmethod
     def from_mp_config(
