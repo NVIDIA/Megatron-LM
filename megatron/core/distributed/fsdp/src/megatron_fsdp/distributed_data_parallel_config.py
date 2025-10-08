@@ -117,13 +117,18 @@ class DistributedDataParallelConfig:
       This option will cause additional memory overhead, however, it is necessary for
       to register user buffer (nccl_ub=True) for the Megatron FSDP. 
       This option will be automatically set to True when nccl_ub=True.
-   """
+    """
 
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
-    Valid values are 'no_shard', 'optim', 'optim_grads', 'optim_grads_params'.
-    This option is only effective when Hybrid FSDP is enabled.
+    Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
+    """
+
+    disable_symmetric_registration: bool = False
+    """If true, disable symmetric (window) registration for NCCL userbuffer registration.
+      This option will force to use conventional (local) userbuffer registration 
+      when nccl_ub is set.
     """
 
     def __post_init__(self):

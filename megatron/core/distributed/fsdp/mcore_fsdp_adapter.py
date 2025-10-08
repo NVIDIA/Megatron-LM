@@ -80,6 +80,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
+
         self.megatron_fsdp_dist_index = self._init_dist_index(grad_comm_pgs, model_comm_pgs)
 
         self.bucket_size = self.ddp_config.bucket_size
@@ -158,7 +159,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_cp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=True
                 )
-                inter_fsdp_group = parallel_state.get_inter_distributed_optimizer_instance_group()
+                outer_fsdp_group = parallel_state.get_inter_distributed_optimizer_instance_group()
                 hybrid_fsdp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
@@ -166,39 +167,34 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_cp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
-                inter_fsdp_group = None
+                outer_fsdp_group = None
                 hybrid_fsdp_group = None
-        elif grad_comm_pgs is not None and model_comm_pgs is not None:
+        else:
             tp_group = getattr(model_comm_pgs, 'tp', None)
             if enable_hsdp:
                 dp_cp_group = grad_comm_pgs.intra_dp_cp
-                inter_fsdp_group = grad_comm_pgs.inter_dist_opt
+                outer_fsdp_group = grad_comm_pgs.inter_dist_opt
                 hybrid_fsdp_group = grad_comm_pgs.dp_cp
             else:
                 dp_cp_group = grad_comm_pgs.dp_cp
-                inter_fsdp_group = None
+                outer_fsdp_group = None
                 hybrid_fsdp_group = None
-        else:
-            raise ValueError(
-                "Both grad_comm_pgs and model_comm_pgs must be either None or provided together."
-            )
 
         if tp_group is None:
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             tp_group = single_rank_group
 
         if enable_hsdp:
-            mesh = _get_hsdp_tp_mesh(inter_fsdp_group, dp_cp_group, tp_group)
+            mesh = _get_hsdp_tp_mesh(outer_fsdp_group, dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
-                use_hybrid_fsdp=True,
                 hsdp_outer_dp_shard=self.ddp_config.outer_dp_sharding_strategy != "no_shard",
                 device_mesh=DeviceMesh.from_group(
-                    [inter_fsdp_group, dp_cp_group, tp_group],
+                    [outer_fsdp_group, dp_cp_group, tp_group],
                     device_type="cuda",
                     mesh=mesh.tolist(),
-                    mesh_dim_names=["inter_fsdp_dp", "dp_cp", "tp"],
+                    mesh_dim_names=["outer_fsdp_dp", "dp_cp", "tp"],
                 ),
-                dp_inter_dim="inter_fsdp_dp",
+                dp_outer_dim="outer_fsdp_dp",  # Use Hybrid FSDP!
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 hybrid_fsdp_group=hybrid_fsdp_group,
@@ -226,20 +222,20 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.synchronize_param_gather()
 
 
-def _get_hsdp_tp_mesh(inter_fsdp_dp_group, dp_cp_group, tp_group):
+def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
     mesh = einops.rearrange(
         torch.arange(world_size),
-        "(inter_fsdp_dp fsdp tp) -> inter_fsdp_dp fsdp tp",
-        inter_fsdp_dp=inter_fsdp_dp_group.size(),
+        "(outer_fsdp_dp fsdp tp) -> outer_fsdp_dp fsdp tp",
+        outer_fsdp_dp=outer_fsdp_dp_group.size(),
         tp=tp_group.size(),
     )
 
     mesh_fsdp_ranks = einops.rearrange(
         mesh,
-        'inter_fsdp_dp fsdp tp -> (inter_fsdp_dp tp) fsdp',
+        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp tp) fsdp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
     )
@@ -251,7 +247,7 @@ def _get_hsdp_tp_mesh(inter_fsdp_dp_group, dp_cp_group, tp_group):
 
     mesh_tp_ranks = einops.rearrange(
         mesh,
-        'inter_fsdp_dp fsdp tp -> (inter_fsdp_dp fsdp) tp',
+        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp) tp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
     )
@@ -261,18 +257,18 @@ def _get_hsdp_tp_mesh(inter_fsdp_dp_group, dp_cp_group, tp_group):
         f"do not match the ranks in the TP group {tp_group_ranks}."
     )
 
-    mesh_inter_fsdp_dp_ranks = einops.rearrange(
+    mesh_outer_fsdp_dp_ranks = einops.rearrange(
         mesh,
-        'inter_fsdp_dp fsdp tp -> (fsdp tp) inter_fsdp_dp',
+        'outer_fsdp_dp fsdp tp -> (fsdp tp) outer_fsdp_dp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
     )
-    inter_fsdp_dp_group_ranks = dist.get_process_group_ranks(inter_fsdp_dp_group)
+    outer_fsdp_dp_group_ranks = dist.get_process_group_ranks(outer_fsdp_dp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(
-        mesh_inter_fsdp_dp_ranks, inter_fsdp_dp_group_ranks
+        mesh_outer_fsdp_dp_ranks, outer_fsdp_dp_group_ranks
     ), (
-        f"[Megatron-FSDP] Inter FSDP Data Parallel ranks in the mesh {mesh_inter_fsdp_dp_ranks} "
-        f"do not match the ranks in the Inter FSDP DP group {inter_fsdp_dp_group_ranks}."
+        f"[Megatron-FSDP] Outer FSDP Data Parallel ranks in the mesh {mesh_outer_fsdp_dp_ranks} "
+        f"do not match the ranks in the Outer FSDP DP group {outer_fsdp_dp_group_ranks}."
     )
 
     return mesh
