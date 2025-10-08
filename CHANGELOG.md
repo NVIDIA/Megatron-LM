@@ -17,9 +17,23 @@
     * Add HyperCommGrid: N-Dimensional Communication Grid for Model Parallelism ([MR \!3398](https://github.com/NVIDIA/Megatron-LM/commit/45400df7da7fa23e3aff86804e5ac254d9a8d3c0))  
       * Flexible creation and management of communication groups  
     * Add support for Spike No More embedding initializations and weight decay skipping ([MR \!3500](https://github.com/NVIDIA/Megatron-LM/commit/ee74aa66a06b24e511270f285db475941ef63bfd))  
+  * MoE  
+    * We're actively optimizing large-scale fine-grained MoE performance on Blackwell Platform.  
+    * Features:  
+      * Support Expert Parallel A2A Overlapping ([MR \!3470](https://github.com/NVIDIA/Megatron-LM/commit/0c6c1176fb3e3e00534b3591f1ad023d4ecad6fb); [MR \!3074](https://github.com/NVIDIA/Megatron-LM/commit/4b30ec54aba97e16a083eca33d2df1dd48e1b48f))  
+      * Support CP and recompute for MTP ([MR \!3330](https://github.com/NVIDIA/Megatron-LM/commit/650ab87d04105869f197f2ddc441e3b18ca93724))  
+      * Add support for global aux loss ([MR \!3318](https://github.com/NVIDIA/Megatron-LM/commit/e58d9080ea212e005ccba0b6607bfcc86451285d))  
+    * Memory Optimization  
+      * Support recomputation for FP8 layernorm/moe\_act/shared\_experts ([MR \!3465](https://github.com/NVIDIA/Megatron-LM/commit/6850cc6a739d168f8c84db6cdacf4fe2931c0c49))  
+      * Support optimizer offloading for DSV3 FP8 training  ([MR \!3659](https://github.com/NVIDIA/Megatron-LM/commit/abbde02f54b62a5194ebe951218e98feceba6d42))  
+    * Performance Optimization  
+      * Add MoE router fusion ([MR \!3809](https://github.com/NVIDIA/Megatron-LM/commit/d93743a9f11d5d17824b8b49868cc90f2904896f))  
+      * Updates for MoE cudagraph ([MR \!3631](https://github.com/NVIDIA/Megatron-LM/commit/95452706d7aa16dc174813e12639a8c8356fbe87))  
+    * Bug fixes:  
+      * Fix router input jitter dtype ([MR \!3774](https://github.com/NVIDIA/Megatron-LM/commit/20b395424d2e2bbfaab57b2f954294eb57c90c82))
   * Model support  
-    * Add MiMo video VLM train example (\[MR \!3543)  
-    * Add AVLM for MIMO (\[MR \!3624)  
+    * Add MiMo video VLM train example ([MR \!3543](https://github.com/NVIDIA/Megatron-LM/commit/786f5629d3462aff2f8855f51db70e882c475116))  
+    * Add AVLM for MIMO ([MR \!3624](https://github.com/NVIDIA/Megatron-LM/commit/db41707430bff743f986b5779712c74242b99caa))  
   * Ease of use  
     * Add uv support for source installs ([MR \!3615](https://github.com/NVIDIA/Megatron-LM/commit/164204cd7216e642bdef7299c569d95f02f9a79e))  
     * Automated weekly prereleases ([MR \!3574](https://github.com/NVIDIA/Megatron-LM/commit/7e59266c70ef34a246438640af690b55c7ecac28))  
