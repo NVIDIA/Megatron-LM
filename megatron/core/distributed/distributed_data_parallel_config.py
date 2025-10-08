@@ -6,6 +6,7 @@ from typing import Optional
 
 @dataclass
 class DistributedDataParallelConfig:
+    """Configuration for DistributedDataParallel."""
 
     grad_reduce_in_fp32: bool = False
     """If true, reduce grads in fp32."""
