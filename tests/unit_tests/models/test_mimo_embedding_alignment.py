@@ -20,7 +20,10 @@ class TestEmbeddingAlignment:
     def setup_method(self):
         """Set up for each test."""
         # Create a minimal MimoModelConfig
-        language_model_spec = ModuleSpec(module=MagicMock, params={'config': MagicMock()})
+        language_model_spec = ModuleSpec(
+            module=MagicMock,
+            params={'config': MagicMock(context_parallel_size=1, sequence_parallel=False)},
+        )
         self.mimo_config = MimoModelConfig(
             language_model_spec=language_model_spec,
             modality_submodules_spec={},
