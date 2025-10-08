@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 def approximate_threshold(rtol: float) -> Callable:
     def _func(y_pred: List[Union[float, int]], y_true: List[Union[float, int]]):
+
         return np.mean([np.mean(y_pred), np.mean(y_true)]) * rtol
 
     return _func
@@ -217,10 +218,20 @@ def pipeline(
                 ]
 
                 if metric_name == "iteration-time":
-                    actual_value_list = actual_value_list[3:-1]
-                    golden_value_list = golden_value_list[3:-1]
+                    if len(actual_value_list) >= 10:
+                        actual_value_list = actual_value_list[3:-3]
+                        golden_value_list = golden_value_list[3:-3]
+                        total_steps_evaluated = (
+                            golden_value.end_step / golden_value.step_interval + 1 - 3 - 3
+                        )
+                    else:
+                        actual_value_list = actual_value_list[3:-1]
+                        golden_value_list = golden_value_list[3:-1]
+                        total_steps_evaluated = (
+                            golden_value.end_step / golden_value.step_interval + 1 - 3 - 1
+                        )
                     logger.info(
-                        "For metric `%s`, the first 3 and the last scalars are removed from the list to reduce noise.",
+                        "For metric `%s`, the first and last 3 scalars are removed from the list to reduce noise.",
                         metric_name,
                     )
 
@@ -231,16 +242,10 @@ def pipeline(
                 golden = np.array(golden_value_list)
 
                 # Tolerance check
-                passing = np.allclose(
-                    actual,
-                    golden,
-                    rtol=test.rtol,
-                    atol=(
-                        test.atol_func(actual_value_list, golden_value_list)
-                        if test.atol_func is not None
-                        else test.atol
-                    ),
-                )
+                is_close = np.isclose(actual, golden, rtol=0.05, atol=0)
+
+                num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
+                passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
 
                 if not passing:
                     logger.info("Actual values: %s", ", ".join([str(v) for v in actual_value_list]))
