@@ -44,6 +44,8 @@ spec:
 
     NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
 
+    # Note: This test is very expensive, so we hardcode N_REPEAT=1
+
     ARGUMENTS=(
         "DATA_PATH=/workspace/data/gpt3_data"
         "DATA_CACHE_PATH=/workspace/data/cache"
@@ -54,7 +56,7 @@ spec:
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
-        "N_REPEAT={n_repeat}"
+        "N_REPEAT=1" 
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
@@ -64,9 +66,6 @@ spec:
 products:
   - test_case: [gpt3_mr_mcore_reruns_resume_check_grads]
     products:
-      # The test takes 10 minutes to run a single loop, so we shouldn't run it 5x on each MR.
-      # - environment: [dev]
-      #   scope: [mr]
-      #   platforms: [dgx_h100]
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
+        platforms: [dgx_h100]

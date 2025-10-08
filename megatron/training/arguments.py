@@ -722,8 +722,12 @@ def validate_args(args, defaults={}):
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
     if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
-        assert not args.check_for_nan_in_loss_and_grad, \
+        if not args.inference_dynamic_batching:
+            assert not args.check_for_nan_in_loss_and_grad, \
             "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
+        else:
+            assert args.fp8 is None, \
+            "fp8 is not supported with inference dynamic batching and full_iteration CUDA graph"
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
@@ -2554,7 +2558,10 @@ def _add_distributed_args(parser):
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
     group.add_argument('--distributed-timeout-minutes', type=int, default=10,
-                       help='Timeout minutes for torch.distributed.')
+                       help='Default timeout minutes for torch.distributed.')
+    group.add_argument('--distributed-timeout-seconds-after-init', type=int, default=None,
+                       help='Timeout seconds for process groups after initialization.'
+                            'This timeout is applied to all process groups after initialization.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--defer-embedding-wgrad-compute', action='store_true',

@@ -3,7 +3,7 @@
 """Pretrain utilities."""
 
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
@@ -90,7 +90,12 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-from megatron.core.parallel_state import destroy_global_memory_buffer, destroy_model_parallel
+from megatron.core.parallel_state import (
+    destroy_global_memory_buffer,
+    destroy_model_parallel,
+    update_pg_timeout
+)
+
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -2182,7 +2187,16 @@ def train(
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
-
+        # Update the timeout for all process groups after initialization
+        # We update the timeout after the first successful iteration,
+        # which takes longer than others usually
+        if args.distributed_timeout_seconds_after_init is not None and iteration == start_iteration+1:
+            # TODO: some dynamic timeout setting is required
+            # based on the iteration time considering interval-based steps (e.g. eval, checkpoint)
+            # e.g. timeout for normal iterations vs timeout for iterations with checkpoint
+            # this timeout is triggered when there's no collective communication
+            # for the duration of timeout
+            update_pg_timeout(timedelta(seconds=args.distributed_timeout_seconds_after_init))
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check

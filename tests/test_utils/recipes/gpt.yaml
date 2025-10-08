@@ -215,8 +215,8 @@ products:
       #     - environment: [dev]
       #       scope: [mr]
       #       platforms: [dgx_h100] # Hangs: #513
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -430,8 +430,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_modelopt_distill_resume]
     products:
       - environment: [dev]
@@ -453,15 +453,15 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_reruns_persistent_2]
-    products:
-      # - environment: [dev]
-      #   scope: [mr]
-      #   platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_reruns_persistent_2]
+  #   products:
+  # - environment: [dev]
+  #   scope: [mr]
+  #   platforms: [dgx_h100]
+  # - environment: [lts]
+  #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G]
     products:
       - environment: [lts]

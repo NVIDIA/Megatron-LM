@@ -97,12 +97,17 @@ class DynamicEngineTestConfig:
     use_cuda_graphs_for_non_decode_steps: bool = True
     fp8: bool = False
     model_provider: str = "gpt"
-    actually_build_cuda_graphs: bool = (
-        False  # only test_simple requires us to actually build a cuda-graph
-    )
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
+    cuda_graph_scope: str = "full_iteration"
+    force_build_cuda_graphs: bool = False
+    # If False, do not build cuda graphs in the tests, even if
+    # num_cuda_graphs is set.
+    # For tests concerning cuda-graph warmups, we set this to False
+    # to avoid the overhead of building the graphs, which is not
+    # relevant to the test. The tests only check if the required
+    # context attributes are set correctly.
 
     def __post_init__(self):
 
@@ -254,7 +259,7 @@ class TestDynamicInferenceEngine:
             use_cudagraphable_rng=False,
             force_reset_rng=True,
         )
-
+        
         # Requests.
         requests = cls._build_requests(test_config)
 
@@ -266,7 +271,8 @@ class TestDynamicInferenceEngine:
                 hidden_size=32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                enable_cuda_graph=test_config.num_cuda_graphs is not None,
+                enable_cuda_graph=(test_config.num_cuda_graphs is not None
+                and test_config.force_build_cuda_graphs),
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -282,6 +288,7 @@ class TestDynamicInferenceEngine:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
+                cuda_graph_scope=test_config.cuda_graph_scope,
             )
 
             # GPT model.
@@ -303,7 +310,8 @@ class TestDynamicInferenceEngine:
                 mamba_num_heads=16,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                enable_cuda_graph=test_config.num_cuda_graphs is not None,
+                enable_cuda_graph=(test_config.num_cuda_graphs is not None
+                and test_config.force_build_cuda_graphs),
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -318,6 +326,7 @@ class TestDynamicInferenceEngine:
                 add_bias_linear=test_config.expert_model_parallel_size == 1,
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                cuda_graph_scope=test_config.cuda_graph_scope,
             )
 
             # Mamba model.
@@ -404,8 +413,7 @@ class TestDynamicInferenceEngine:
                 -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
             ),
             random_seed=test_config.random_seed,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None
-            and test_config.actually_build_cuda_graphs,
+            enable_cuda_graph=transformer_config.enable_cuda_graph,
         )
 
         # Test env.
@@ -484,15 +492,13 @@ class TestDynamicInferenceEngine:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @pytest.mark.parametrize(
-        "num_cuda_graphs", [None, 4]
-    )  # todo: cannot run test case with multiple num_cuda_graphs like [None, 1, 4]
-    def test_simple(self, model_provider: str, num_cuda_graphs) -> None:
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
+    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -500,8 +506,9 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             model_provider=model_provider,
             num_cuda_graphs=num_cuda_graphs,
-            actually_build_cuda_graphs=num_cuda_graphs is not None,
             context_max_requests_override=32,
+            cuda_graph_scope=cuda_graph_scope,
+            force_build_cuda_graphs=True,
         )
 
         # Validate max_requests, max_tokens.
@@ -826,6 +833,11 @@ class TestDynamicInferenceEngine:
         assert len(finished_requests) == len(
             prompts
         ), "Should return same number of finished requests as prompts"
+
+        request_ids = [r.request_id for r in finished_requests]
+        assert request_ids == sorted(
+            request_ids
+        ), f"Request ids are not in sorted order: {request_ids}"
 
         # Check each request was processed
         for i, request in enumerate(finished_requests):

@@ -317,4 +317,3 @@ for i in $(seq 1 $N_REPEAT); do
     fi
 done
 
-coverage combine -q
