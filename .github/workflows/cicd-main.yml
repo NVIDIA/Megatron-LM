@@ -91,11 +91,10 @@ jobs:
   cicd-wait-in-queue:
     runs-on: ubuntu-latest
     needs: [pre-flight, linting]
-    environment: test
+    environment: ${{ needs.pre-flight.outputs.is_merge_group == 'true' && 'merge-gate' || 'test' }}
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.docs_only == 'true')
     steps:
       - name: Running CI tests
