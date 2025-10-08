@@ -27,10 +27,15 @@ publish:test_release_pypi_build_wheel:
   needs: [test:build_image]
   parallel:
     matrix:
-      - PLATFORM: arm64
+      - PACKAGE: megatron-core
+        PLATFORM: arm64
         IMAGE: quay.io/pypa/manylinux_2_28_aarch64
-      - PLATFORM: amd64
+      - PACKAGE: megatron-core
+        PLATFORM: amd64
         IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+      - PACKAGE: megatron-fsdp
+        IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+        PLATFORM: amd64
   tags:
     - arch/${PLATFORM}
     - env/prod
@@ -52,27 +57,53 @@ publish:test_release_pypi_build_wheel:
     - git fetch origin $PUBLISH_COMMIT
     - git checkout $PUBLISH_COMMIT
   script:
+    - set -x
     - echo $PUBLISH_DRYRUN
     - |
+      if [ "$PACKAGE" = "megatron-core" ]; then
+        ROOTDIR="megatron/core"
+        BUILD_DIR="."
+      elif [ "$PACKAGE" = "megatron-fsdp" ]; then
+        ROOTDIR="megatron/core/distributed/fsdp/src/megatron_fsdp"
+        BUILD_DIR="megatron/core/distributed/fsdp/src"
+      else
+        echo Unknown package: $PACKAGE
+        exit 1
+      fi
+    - |
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
-        PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
-        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py
+        PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" $ROOTDIR/package_info.py)
+        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" $ROOTDIR/package_info.py
       fi
 
+    - pushd $BUILD_DIR
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
-    - auditwheel repair dist/*.whl
-    - rm -rf dist/*.whl
-
-    - pushd megatron/core
+    - USE_DIST_DIR=0
+    - auditwheel repair dist/*.whl || USE_DIST_DIR=1
+    - |
+      if [ "$USE_DIST_DIR" != "1" ]; then
+        rm -rf dist/*.whl
+      fi
+    - popd
+    - pushd $ROOTDIR
     - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp311-cp311/bin/python -c "import package_info; print(package_info.__version__)")
     - popd
-    - echo "EXPECTED_RELEASE_NUMBER_$PLATFORM=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
+    - echo "EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
+    - mkdir -p wheelhouse/
+    - |
+      if [ "$PACKAGE" = "megatron-fsdp" ]; then
+        cp -a megatron/core/distributed/fsdp/src/dist/* wheelhouse/
+      fi
+    - |
+      ls -al wheelhouse/ || true
+      ls -al dist/ || true
   artifacts:
     paths:
       - megatron/core/package_info.py
       - wheelhouse/
       - dist/
+      - megatron/core/distributed/fsdp/src/megatron_fsdp/package_info.py
     reports:
       dotenv: build.env
   retry:
@@ -89,8 +120,12 @@ publish:test_release_pypi_test_wheel:
       optional: true
   parallel:
     matrix:
-      - PLATFORM: arm64
-      - PLATFORM: amd64
+      - PACKAGE: megatron-core
+        PLATFORM: arm64
+      - PACKAGE: megatron-core
+        PLATFORM: amd64
+      - PACKAGE: megatron-fsdp
+        PLATFORM: amd64
   services:
     - name: docker:24.0.5-dind
       variables:
@@ -110,36 +145,55 @@ publish:test_release_pypi_test_wheel:
     GIT_STRATEGY: none
     PUBLISH_DRYRUN: "yes"
   script:
+    - set -x
+    - env
     - rm -rf megatron
     - pip install -U --no-cache-dir pip
     - |
-      if [[ "$PLATFORM" == "arm64" ]]; then
-        for file in wheelhouse/*cp311*aarch64.whl; do
-          pip install --no-cache-dir "$file"
-        done
-
+      if [ "$PACKAGE" = "megatron-core" ]; then
+        ROOTPATH="megatron.core"
+        WHEEL_PREFIX="megatron_core"
+      elif [ "$PACKAGE" = "megatron-fsdp" ]; then
+        ROOTPATH="megatron_fsdp"
+        WHEEL_PREFIX="megatron_fsdp"
       else
-        for file in wheelhouse/*cp311*x86_64.whl; do
-          pip install --no-cache-dir "$file"
-        done
+        echo Unknown package: $PACKAGE
+        exit 1
       fi
-
-    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
-
     - |
-      if [[ "$PLATFORM" == "arm64" ]]; then
-        test "$EXPECTED_RELEASE_NUMBER_arm64" == "$RELEASE_NUMBER"
+      ls -al wheelhouse/ || true
+      ls -al dist/ || true  
+      ls -al megatron/core/distributed/fsdp/src/megatron_fsdp/package_info.py || true
+      ls -al megatron/core/distributed/fsdp/src/wheelhouse/ || true
+      ls -al megatron/core/distributed/fsdp/src/dist/ || true
+    - |
+      if [ "$PACKAGE" = "megatron-core" ]; then
+        if [[ "$PLATFORM" == "arm64" ]]; then
+          for file in wheelhouse/$WHEEL_PREFIX*cp311*aarch64.whl; do
+            pip install --no-cache-dir "$file"
+          done
+        else
+          for file in wheelhouse/$WHEEL_PREFIX*cp311*x86_64.whl; do
+            pip install --no-cache-dir "$file"
+          done
+        fi
       else
-        test "$EXPECTED_RELEASE_NUMBER_amd64" == "$RELEASE_NUMBER"
+        pip install --no-cache-dir wheelhouse/$WHEEL_PREFIX*.whl
       fi
-
+    - RELEASE_NUMBER=$(python -c "import $ROOTPATH; print($ROOTPATH.__version__)")
+    - |
+      var=EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}
+      EXPECTED_RELEASE_NUMBER=$(echo "${!var}")
+      test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - echo "RELEASE_NUMBER=$RELEASE_NUMBER" | tee -a build.env
   artifacts:
     reports:
       dotenv: build.env
     paths:
+      - megatron/core/package_info.py
       - wheelhouse/
       - dist/
+      - megatron/core/distributed/fsdp/src/megatron_fsdp/package_info.py
   retry:
     max: 2
 
@@ -163,13 +217,15 @@ publish:test_release_version_bump:
   variables:
     PUBLISH_DRYRUN: "yes"
   script:
+    - set -x
     - env
     - echo $PUBLISH_DRYRUN
-    - MAJOR=$(cat megatron/core/package_info.py | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
-    - MINOR=$(cat megatron/core/package_info.py | awk '/^MINOR = /' | awk -F"= " '{print $2}')
-    - PATCH=$(cat megatron/core/package_info.py | awk '/^PATCH = /' | awk -F"= " '{print $2}')
-    - PRERELEASE=$(cat megatron/core/package_info.py | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
 
+    - ROOTDIR="megatron/core"
+    - MAJOR=$(cat $ROOTDIR/package_info.py | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
+    - MINOR=$(cat $ROOTDIR/package_info.py | awk '/^MINOR = /' | awk -F"= " '{print $2}')
+    - PATCH=$(cat $ROOTDIR/package_info.py | awk '/^PATCH = /' | awk -F"= " '{print $2}')
+    - PRERELEASE=$(cat $ROOTDIR/package_info.py | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
     - |
       if [[ "$PRERELEASE" != "" ]]; then
         NEXT_PATCH=$PATCH
@@ -178,9 +234,24 @@ publish:test_release_version_bump:
         NEXT_PATCH=$((${PATCH} + 1))
         NEXT_PRERELEASE=$NEXT_PRERELEASE
       fi
+    - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" $ROOTDIR/package_info.py
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '$NEXT_PRERELEASE'" $ROOTDIR/package_info.py
 
-    - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" megatron/core/package_info.py
-    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '$NEXT_PRERELEASE'" megatron/core/package_info.py
+    - ROOTDIR="megatron/core/distributed/fsdp/src/megatron_fsdp"
+    - MAJOR=$(cat $ROOTDIR/package_info.py | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
+    - MINOR=$(cat $ROOTDIR/package_info.py | awk '/^MINOR = /' | awk -F"= " '{print $2}')
+    - PATCH=$(cat $ROOTDIR/package_info.py | awk '/^PATCH = /' | awk -F"= " '{print $2}')
+    - PRERELEASE=$(cat $ROOTDIR/package_info.py | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
+    - |
+      if [[ "$PRERELEASE" != "" ]]; then
+        NEXT_PATCH=$PATCH
+        NEXT_PRERELEASE=rc$((${PRERELEASE#rc} + 1))
+      else
+        NEXT_PATCH=$((${PATCH} + 1))
+        NEXT_PRERELEASE=$NEXT_PRERELEASE
+      fi
+    - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" $ROOTDIR/package_info.py
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '$NEXT_PRERELEASE'" $ROOTDIR/package_info.py
 
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
@@ -224,6 +295,7 @@ publish:test_release_pypi_push_wheel:
     PUBLISH_DRYRUN: "yes"
   timeout: 3m
   script:
+    - set -x
     - echo $PUBLISH_DRYRUN
     - |
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
@@ -241,8 +313,9 @@ publish:test_release_pypi_push_wheel:
     - pip install twine
 
     - |
+      CMD=$(echo -E "twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository   $REPOSITORY wheelhouse/* dist/*")
       if [[ "$PUBLISH_DRYRUN" != "yes" ]]; then
-        twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository   $REPOSITORY wheelhouse/* dist/*
+        eval "$CMD"
       fi
 
 publish:test_release_github:
