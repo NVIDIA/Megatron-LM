@@ -44,7 +44,7 @@ jobs:
       is_deployment_workflow: "false"
       is_merge_group: "true"
     steps:
-      - name: Checkout
+      - name: Checkout.
         uses: actions/checkout@v4
 
   linting:
