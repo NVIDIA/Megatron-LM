@@ -61,8 +61,15 @@ class DistributedDataParallelConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
-    use_custom_fsdp: bool = False
+    use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
+
+    use_custom_fsdp: bool = False
+    """
+    NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
+    Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
+    Future updates will drop support for `use_custom_fsdp` to avoid confusion.
+    """
 
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
@@ -80,10 +87,10 @@ class DistributedDataParallelConfig:
       based on your system's memory and performance requirements."""
 
     preserve_fp32_weights: bool = True
-    """If true, preserve fp32 weights in the custom FSDP ParamAndGradBuffer."""
+    """If true, preserve fp32 weights in the Megatron FSDP ParamAndGradBuffer."""
 
-    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False
-    """If true, keep the fp8 transpose cache when using custom FSDP."""
+    keep_fp8_transpose_cache: bool = False
+    """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
     nccl_ub: bool = False
     """If true, allocate and register NCCL userbuffer for param and grad buffer.
@@ -106,13 +113,38 @@ class DistributedDataParallelConfig:
 
     fsdp_double_buffer: bool = False
     """If true, use persistently allocated double buffers for the 
-      temporary memory needed in the custom FSDP communications.
+      temporary memory needed in the Megatron FSDP communications.
       This option will cause additional memory overhead, however, it is necessary for
-      to register user buffer (nccl_ub=True) for the custom FSDP. 
+      to register user buffer (nccl_ub=True) for the Megatron FSDP. 
       This option will be automatically set to True when nccl_ub=True.
    """
 
+    outer_dp_sharding_strategy: str = 'no_shard'
+    """
+    Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
+    Valid values are 'no_shard', 'optim', 'optim_grads', 'optim_grads_params'.
+    This option is only effective when Hybrid FSDP is enabled.
+    """
+
+    disable_symmetric_registration: bool = False
+    """If true, disable symmetric (window) registration for NCCL userbuffer registration.
+      This option will force to use conventional (local) userbuffer registration 
+      when nccl_ub is set.
+    """
+
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
     def __post_init__(self):
+        import os
+
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.nccl_ub:
+            if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
+                raise ValueError(
+                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
+                    "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
+                )

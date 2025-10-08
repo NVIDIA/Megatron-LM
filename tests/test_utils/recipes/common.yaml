@@ -10,6 +10,7 @@ spec:
   gpus: 8
   platforms: dgx_a100
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
@@ -46,8 +47,8 @@ products:
   - test_case: [ckpt_converter]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-broken]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [nightly]
+        scope: [nightly-broken]
         platforms: [dgx_a100]

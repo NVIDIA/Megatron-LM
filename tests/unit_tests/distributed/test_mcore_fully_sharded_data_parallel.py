@@ -9,13 +9,13 @@ from torch import testing
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.custom_fsdp.fully_sharded_data_parallel import (
-    FullyShardedDataParallel,
-)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.process_groups_config import GradCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -81,7 +81,21 @@ class TestFullyShardedDataParallel:
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
     def test_fsdp_with_process_groups(self, dp_size):
         """Test that FSDP works correctly with different process group configurations."""
-        from torch.distributed.device_mesh import init_device_mesh
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dp dimension
+        grid = HyperCommGrid([dp_size], ["dp"])
+
+        # Create process groups config with ONLY dp group
+        pg_collection = ProcessGroupCollection()
+
+        pg_collection.dp = grid.create_pg("dp")
+        pg_collection.dp_cp = pg_collection.dp
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()
@@ -98,7 +112,7 @@ class TestFullyShardedDataParallel:
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_custom_fsdp=True,
+            use_megatron_fsdp=True,
         )
 
         # Create two identical models
@@ -119,20 +133,12 @@ class TestFullyShardedDataParallel:
             fsdp_unit_modules=[torch.nn.Linear],
         )
 
-        # Create a 1D mesh with dimension [dp_size]
-        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
-        grad_comm_pgs = GradCommProcessGroups()
-
-        # Get dp process group from device mesh
-        dp_group = device_mesh.get_group(mesh_dim="dp")
-        grad_comm_pgs.dp = dp_group
-
         # Wrap second model with explicit process groups
         fsdp_model2 = FullyShardedDataParallel(
             config=transformer_config,
             ddp_config=fsdp_config,
             module=model2,
-            grad_comm_pgs=grad_comm_pgs,
+            pg_collection=pg_collection,
             fsdp_unit_modules=[torch.nn.Linear],
         )
 
@@ -148,7 +154,7 @@ class TestFullyShardedDataParallel:
             init_state_fn=None,
             model_chunks=[fsdp_model1],
             per_model_buffers={0: [fsdp_model1.param_and_grad_buffer]},
-            data_parallel_group=fsdp_model1.dp_cp_group,
+            data_parallel_group=fsdp_model1.megatron_fsdp_dist_index.get_dp_group(),
             data_parallel_group_gloo=None,
             data_parallel_group_idx=0,
             distributed_optimizer_instance_id=0,
@@ -161,7 +167,7 @@ class TestFullyShardedDataParallel:
             init_state_fn=None,
             model_chunks=[fsdp_model2],
             per_model_buffers={0: [fsdp_model2.param_and_grad_buffer]},
-            data_parallel_group=fsdp_model2.dp_cp_group,
+            data_parallel_group=fsdp_model2.megatron_fsdp_dist_index.get_dp_group(),
             data_parallel_group_gloo=None,
             data_parallel_group_idx=0,
             distributed_optimizer_instance_id=1,
@@ -191,32 +197,21 @@ class TestFullyShardedDataParallel:
         testing.assert_close(out1, out2, rtol=0, atol=0)
         testing.assert_close(loss1, loss2, rtol=0, atol=0)
 
+        fsdp_model1.stop_communication()
+        fsdp_model2.stop_communication()
+
         # Check parameters after optimization step
         for (name1, param1), (_, param2) in zip(
-            model1.named_parameters(), model2.named_parameters()
+            fsdp_model1.named_parameters(), fsdp_model2.named_parameters()
         ):
-            if hasattr(param1, 'fully_shard_param_local_shard') and hasattr(
-                param2, 'fully_shard_param_local_shard'
-            ):
-                testing.assert_close(
-                    param1.fully_shard_param_local_shard,
-                    param2.fully_shard_param_local_shard,
-                    rtol=0,
-                    atol=0,
-                    msg=f"Parameters for {name1} don't match",
-                )
+            testing.assert_close(
+                param1._local_tensor,
+                param2._local_tensor,
+                rtol=0,
+                atol=0,
+                msg=f"Parameters for {name1} don't match",
+            )
 
-        if hasattr(torch.nn.parameter.Parameter, "main_grad"):
-            # Custom fsdp adds the `main_grad` attribute function to the
-            # torch Parameter, remove this attribute function so that
-            # it doesn't conflict with the code in the non-custom fsdp
-            # test branch.
-            delattr(torch.nn.parameter.Parameter, "main_grad")
-
-    @pytest.mark.skipif(
-        version.parse(torch.__version__) < version.parse('2.3.0'),
-        reason="nccl_ub requires a recent version of APEX",
-    )
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
         ("dp_size", "nccl_ub", "fsdp_double_buffer"), [(8, False, True), (8, True, True)]
@@ -227,6 +222,24 @@ class TestFullyShardedDataParallel:
         Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False
         Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False]
         """
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
+        if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):
+            pytest.skip("nccl_ub requires PyTorch 2.7.0 or later")
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dp dimension
+        grid = HyperCommGrid([dp_size], ["dp"])
+
+        # Create process groups config with ONLY dp group
+        pg_collection = ProcessGroupCollection()
+
+        pg_collection.dp = grid.create_pg("dp")
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()
@@ -242,7 +255,7 @@ class TestFullyShardedDataParallel:
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_custom_fsdp=True,
+            use_megatron_fsdp=True,
             nccl_ub=False,
             fsdp_double_buffer=False,
         )
@@ -253,7 +266,7 @@ class TestFullyShardedDataParallel:
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             bucket_size=10000,
-            use_custom_fsdp=True,
+            use_megatron_fsdp=True,
             nccl_ub=nccl_ub,
             fsdp_double_buffer=fsdp_double_buffer,
         )
@@ -295,7 +308,7 @@ class TestFullyShardedDataParallel:
             init_state_fn=None,
             model_chunks=[baseline_fsdp_model],
             per_model_buffers={0: [baseline_fsdp_model.param_and_grad_buffer]},
-            data_parallel_group=baseline_fsdp_model.dp_cp_group,
+            data_parallel_group=baseline_fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
             data_parallel_group_gloo=None,
             data_parallel_group_idx=0,
             distributed_optimizer_instance_id=0,
@@ -308,7 +321,7 @@ class TestFullyShardedDataParallel:
             init_state_fn=None,
             model_chunks=[target_fsdp_model],
             per_model_buffers={0: [target_fsdp_model.param_and_grad_buffer]},
-            data_parallel_group=target_fsdp_model.dp_cp_group,
+            data_parallel_group=target_fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
             data_parallel_group_gloo=None,
             data_parallel_group_idx=0,
             distributed_optimizer_instance_id=1,
@@ -339,29 +352,24 @@ class TestFullyShardedDataParallel:
         testing.assert_close(loss1, loss2, rtol=0, atol=0)
 
         # Check parameters after optimization step
+        baseline_fsdp_model.stop_communication()
+        target_fsdp_model.stop_communication()
         for (name1, param1), (_, param2) in zip(
-            model1.named_parameters(), model2.named_parameters()
+            baseline_fsdp_model.named_parameters(), target_fsdp_model.named_parameters()
         ):
-            if hasattr(param1, 'fully_shard_param_local_shard') and hasattr(
-                param2, 'fully_shard_param_local_shard'
-            ):
-                testing.assert_close(
-                    param1.fully_shard_param_local_shard,
-                    param2.fully_shard_param_local_shard,
-                    rtol=0,
-                    atol=0,
-                    msg=f"Parameters for {name1} don't match",
-                )
-
-        if hasattr(torch.nn.parameter.Parameter, "main_grad"):
-            # Custom fsdp adds the `main_grad` attribute function to the
-            # torch Parameter, remove this attribute function so that
-            # it doesn't conflict with the code in the non-custom fsdp
-            # test branch.
-            delattr(torch.nn.parameter.Parameter, "main_grad")
+            testing.assert_close(
+                param1._local_tensor,
+                param2._local_tensor,
+                rtol=0,
+                atol=0,
+                msg=f"Parameters for {name1} don't match",
+            )
 
     @classmethod
     def hsdp_one_step_test(cls, num_fsdp_group):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
         setup_seed(42)  # Ensure reproducibility
         Utils.initialize_model_parallel(num_distributed_optimizer_instances=num_fsdp_group)
 
@@ -377,7 +385,7 @@ class TestFullyShardedDataParallel:
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 bucket_size=10000,
-                use_custom_fsdp=True,
+                use_megatron_fsdp=True,
                 num_distributed_optimizer_instances=num_fsdp_group,
             )
 
@@ -412,7 +420,7 @@ class TestFullyShardedDataParallel:
                 init_state_fn=None,
                 model_chunks=[fsdp_model],
                 per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
-                data_parallel_group=fsdp_model.dp_cp_group,
+                data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
                 data_parallel_group_gloo=None,
                 data_parallel_group_idx=0,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -439,8 +447,9 @@ class TestFullyShardedDataParallel:
                 return outputs, loss
 
             out, loss = train_step(fsdp_model, distopt, input_data)
+            fsdp_model.stop_communication()
 
-            return out, loss, fsdp_model.optimizer_named_parameters()
+            return out, loss, fsdp_model.named_parameters()
         finally:
             Utils.destroy_model_parallel()
 
@@ -457,17 +466,12 @@ class TestFullyShardedDataParallel:
         testing.assert_close(loss1, loss2, rtol=0, atol=0)
 
         for (name1, param1), (name2, param2) in zip(named_params1, named_params2):
+            if param1.grad is None:
+                continue  # Skip if no gradient
             testing.assert_close(
-                param1.grad,
-                param2.grad,
+                param1.grad._local_tensor,
+                param2.grad._local_tensor,
                 rtol=0,
                 atol=0,
                 msg=f"Parameter gradients for {name1} and {name2} don't match",
             )
-
-        if hasattr(torch.nn.parameter.Parameter, "main_grad"):
-            # Custom fsdp adds the `main_grad` attribute function to the
-            # torch Parameter, remove this attribute function so that
-            # it doesn't conflict with the code in the non-custom fsdp
-            # test branch.
-            delattr(torch.nn.parameter.Parameter, "main_grad")

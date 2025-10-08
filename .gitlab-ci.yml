@@ -1,8 +1,8 @@
 .merge_train_rule: &merge_train_rule
   UNIT_TEST: "yes"
   UNIT_TEST_REPEAT: 1
-  UNIT_TEST_TIMEOUT: 15
-  INTEGRATION_TEST: "yes"
+  UNIT_TEST_TIMEOUT: 30
+  INTEGRATION_TEST: "no"
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
   FUNCTIONAL_TEST_SCOPE: mr-slim
@@ -31,7 +31,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_REF_PROTECTED == "true"
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev")
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -44,14 +44,14 @@ workflow:
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
-        on_new_commit: none
+        on_new_commit: interruptible
 
     # For merge-trains that need to be fast-tracked
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         CLUSTER_A100: ""
@@ -64,14 +64,26 @@ workflow:
 
     # For MRs with integration suite
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
-      variables: *merge_train_rule
+      variables:
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 30
+        INTEGRATION_TEST: "yes"
+        INTEGRATION_TEST_SCOPE: mr
+        FUNCTIONAL_TEST: "no"
+        FUNCTIONAL_TEST_SCOPE: mr-slim
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
+        PUBLISH: "no"
 
     # For MRs with nightly
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
@@ -87,7 +99,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
@@ -103,7 +115,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
@@ -118,7 +130,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         PUBLISH: "no"
@@ -238,6 +250,7 @@ variables:
       - "code-freeze"
       - "release"
       - "review-reminder"
+      - "upgrade-dependencies"
     description: Type of publish (freeze or final release)
 
   # CI wide variables

@@ -7,6 +7,7 @@ import sys
 from functools import partial
 from typing import Any, Dict, Optional
 
+import json
 import jsonlines
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -20,6 +21,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_provider import model_provider
+from megatron.post_training.loss_func import loss_func
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import (
@@ -35,7 +37,20 @@ REMOVE_THINK_CHAT_TEMPLATE = (
 )
 
 
+def add_finetune_args(parser):
+    """Add additional arguments for finetune."""
+    group = parser.add_argument_group(title='Finetune')
+    group.add_argument("--offline-distillation-data", type=str, help="Path to the offline dataset directory with base model features.")
+
+
+    add_modelopt_args(parser)
+    return parser
+
 def get_eos_id():
+    """Return the eos token id.
+    
+    We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
+    we need to replace it with some other special tokens that do not appear in message."""
     tokenizer = get_tokenizer()
     hf_tokenizer = tokenizer._tokenizer
 
@@ -43,20 +58,42 @@ def get_eos_id():
         return 128001
     if hf_tokenizer.eos_token == "<|eot|>":
         return 200001
+    if hf_tokenizer.eos_token == "<|im_end|>":
+        return 151643
+    if hf_tokenizer.eos_token == "<|return|>":
+        return 199999
 
     return hf_tokenizer.eos_token_id
 
+
+class OfflineDataset(torch.utils.data.Dataset):
+    def __init__(self, data_dir: str, num_samples):
+        self.data_dir = data_dir
+        self.num_samples = num_samples
+        self.file_paths = []
+
+        for item in os.listdir(data_dir):
+            item_path = os.path.join(data_dir, item)
+            if os.path.isfile(item_path):
+                self.file_paths.append(item_path)
+
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        idx = idx % len(self.file_paths)
+        file_path = self.file_paths[idx]
+        sample = torch.load(file_path)
+        return sample
 
 class SFTDataset(torch.utils.data.Dataset):
 
     hf_dataset_to_kwargs = {
         "Open-Orca/OpenOrca": {"split": "train"},
         "Open-Orca/SlimOrca": {"split": "train"},
-        "nvidia/HelpSteer2": {"split": "train"},
         "nvidia/Daring-Anteater": {"split": "train"},
         "Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered": {"split": "train"},
-        "/hf-local/modelopt/AA-Synthetic-Scout": {"split": "train"},
-        "/hf-local/modelopt/Multilingual": {"split": "train"},
+        "HuggingFaceH4/ultrachat_200k": {"split": "train_sft"},
     }
 
     hf_dataset_to_conversation = {
@@ -64,21 +101,14 @@ class SFTDataset(torch.utils.data.Dataset):
             data["question"], data["response"]
         ),
         "Open-Orca/SlimOrca": lambda data: SFTDataset._sharegpt_to_openai_conversations(data),
-        "nvidia/HelpSteer2": lambda data: SFTDataset._to_conversation(
-            data["prompt"], data["response"]
-        ),
         "nvidia/Daring-Anteater": lambda data: SFTDataset._sharegpt_to_openai_conversations(data),
         "Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered": lambda data: SFTDataset._sharegpt_to_openai_conversations(
-            data
-        ),
-        "/hf-local/modelopt/AA-Synthetic-Scout": lambda data: SFTDataset._special_to_openai_conversations(
             data
         ),
     }
 
     hf_dataset_to_prompt_template = {
         "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
-        "nvidia/HelpSteer2": "{{ messages['prompt'] + ' ' + messages['response'] + ' ' }}",
     }
 
     def __init__(
@@ -88,7 +118,6 @@ class SFTDataset(torch.utils.data.Dataset):
         tokenizer: transformers.PreTrainedTokenizerBase,
         seq_length: int,
         hf_dataset: Optional[str] = None,
-        num_medusa_heads: int = 0,
         num_shards: int = 1,
         shard_index: int = 0,
     ):
@@ -106,8 +135,6 @@ class SFTDataset(torch.utils.data.Dataset):
             tokenizer: hf tokenizer
             seq_length: max sequence length
             hf_dataset: not supported yet
-            num_medusa_heads: number of medusa heads will incease the sample sequence
-                length for training additional medusa prediction heads
         """
         if not isinstance(tokenizer, transformers.PreTrainedTokenizerBase):
             raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
@@ -120,7 +147,6 @@ class SFTDataset(torch.utils.data.Dataset):
         self.data_transformation = lambda data: data
         self.num_shards = num_shards
         self.shard_index = shard_index
-        self.num_medusa_heads = num_medusa_heads
         self.indexed_dataset = []
         self._raw_sample_index = 0
 
@@ -210,7 +236,7 @@ class SFTDataset(torch.utils.data.Dataset):
 
     def _process_and_pack_example(self):
         """Process multiple raw data and pack them into fixed sequence length."""
-        required_packed_tokens = self.seq_length + 1 + self.num_medusa_heads
+        required_packed_tokens = self.seq_length + 1
         current_packed_samples = []
         current_packed_samples_token_count = 0
 
@@ -252,7 +278,7 @@ class SFTDataset(torch.utils.data.Dataset):
         # Check if this is OpenAI chat data?
         conversations = example.get("conversations", None)
         if conversations is None:
-            conversations = example.get("messagess", None)
+            conversations = example.get("messages", None)
 
         # We don't use the data if there is no assistant reply or the conversation that
         # starts with the assistant.
@@ -328,50 +354,69 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
-    # Providing additional Medusa arguments to prepare the data
-    kwargs = {
-        "tokenizer": tokenizer._tokenizer,
-        "seq_length": args.seq_length,
-        # Optional kwargs
-        "hf_dataset": args.finetune_hf_dataset,
-        "num_shards": mpu.get_data_parallel_world_size(),
-        "shard_index": mpu.get_data_parallel_rank(),
-        "num_medusa_heads": args.export_num_medusa_heads,
-    }
+    if args.export_offline_model:
+        train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
+        valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
+        test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
 
-    data_path = [
-        args.train_data_path[0] if args.train_data_path else None,
-        args.valid_data_path[0] if args.valid_data_path else None,
-        args.test_data_path[0] if args.test_data_path else None,
-    ]
+        print_rank_0("> finished creating offline SFT datasets ...")
+    else:
+        kwargs = {
+            "tokenizer": tokenizer._tokenizer,
+            "seq_length": args.seq_length,
+            # Optional kwargs
+            "hf_dataset": args.finetune_hf_dataset,
+            "num_shards": mpu.get_expert_data_parallel_world_size(),
+            "shard_index": mpu.get_expert_data_parallel_rank(),
+        }
 
-    train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
-    valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
-    test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+        data_path = [
+            args.train_data_path[0] if args.train_data_path else None,
+            args.valid_data_path[0] if args.valid_data_path else None,
+            args.test_data_path[0] if args.test_data_path else None,
+        ]
 
-    print_rank_0("> finished creating SFT datasets ...")
+        train_ds = SFTDataset(train_val_test_num_samples[0], data_path[0], **kwargs)
+        valid_ds = SFTDataset(train_val_test_num_samples[1], data_path[1], **kwargs)
+        test_ds = SFTDataset(train_val_test_num_samples[2], data_path[2], **kwargs)
+
+        print_rank_0("> finished creating SFT datasets ...")
 
     return train_ds, valid_ds, test_ds
 
 
 def get_batch(data_iterator):
-    """Generate a batch."""
+    """Generate a batch.
+    
+    For OfflineDataset, the aux_hidden_states and final hidden_states from the
+    base model are loaded for offline speculative model training."""
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
     args = get_args()
 
-    # Items and their type.
-    keys = ["input_ids", "loss_mask"]
-    datatype = torch.int64
-
     # Broadcast data since only TP rank-0 has the data_iterator.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    if not args.export_offline_model:
+        keys = ["input_ids", "loss_mask"]
+        datatype = torch.int64
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+    else:
+        keys = ["input_ids"]
+        datatype = torch.int64
+        data_b = tensor_parallel.broadcast_data(keys, data, datatype)
+        data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
+        data_b["loss_mask"][data_b["loss_mask"]==get_eos_id()] = 0
+        data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
+
+        keys = ["aux_hidden_states", "hidden_states"]
+        datatype = torch.bfloat16
+        feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
+
 
     # Unpack the data received.
     tokens_ = data_b["input_ids"]
@@ -381,73 +426,10 @@ def get_batch(data_iterator):
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens, get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss
+        tokens, get_eos_id(), get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss, False
     )
     loss_mask = loss_mask * answer_only_loss_mask.to(dtype=loss_mask.dtype)
 
-    # Medusa label and loss_mask preparation
-    #
-    # Explanation:
-    #
-    # To predict 1 + k labels, an input tokens need to have additional k tokens. Given
-    # sequence length s, then overall s + 1 + k tokens are fed from the dataset.
-    #
-    # inputs = tokens[0:s]
-    # labels = tokens[1:1+s]
-    # kth medusa head labels = tokens[1+k:1+k+s]
-    #
-    # Examples: (s=5, k=2)
-    #
-    #                   | 0 1 2 3 4 5 6 7 |
-    # ------------------|-----------------|
-    # tokens            | x x x x x x x x |
-    # inputs            | x x x x x       |
-    # lm_head labels    |   x x x x x     | (next token prediction)
-    # 1st medusa labels |     x x x x x   | (next-next token prediction)
-    # 2nd medusa labels |       x x x x x | (next-next-next token prediction)
-    #
-    for i in range(args.export_num_medusa_heads):
-        new_labels = tokens_[:, 2 + i : 2 + i + args.seq_length]
-        new_loss_mask = data_b["loss_mask"][:, 2 + i : 2 + i + args.seq_length].to(
-            dtype=loss_mask.dtype
-        )
-        labels = torch.cat((labels, new_labels), dim=-1)
-        loss_mask = torch.cat((loss_mask, new_loss_mask), dim=-1)
-
-    if args.export_num_medusa_heads > 0:
-        loss_mask = loss_mask.view(args.export_num_medusa_heads + 1, -1)
-
-    # if args.export_num_eagle_layers > 0:
-    #    loss_mask = loss_mask[:, 1:]
-
-    # MTP label and loss_mask preparation
-    # Examples: (s=5, k=2)
-    #
-    #                   | 0 1 2 3 4 5 |
-    # ------------------|-------------|
-    # tokens            | x x x x x x |
-    # inputs            | x x x x x   |
-    # lm_head labels    |   x x x x x | (next token prediction)
-    # mtp_0 labels      |     x x x x | (next-next token prediction)
-    # mtp_1 labels      |       x x x | (next-next-next token prediction)
-    #
-    # mtp_i_labels = labels[:, 1 + i :]
-    # So we do not need to prepare extra labels for mtp
-    # Modelopt will shift labels and reuse them
-    #
-    # loss_mask
-    if args.export_num_mtp > 0:
-        loss_masks = []
-        for i in range(args.export_num_mtp):
-            new_loss_mask = data_b["loss_mask"][:, 2 + i : 1 + args.seq_length].to(
-                dtype=loss_mask.dtype, device=loss_mask.device
-            )
-            if i in args.export_freeze_mtp:
-                new_loss_mask = torch.zeros_like(
-                    new_loss_mask, dtype=loss_mask.dtype, device=loss_mask.device
-                )
-            loss_masks.append(new_loss_mask)
-        loss_mask = torch.cat(loss_masks, dim=-1)
 
     labels = labels.contiguous()
     loss_mask = loss_mask.contiguous()
@@ -459,76 +441,23 @@ def get_batch(data_iterator):
         "attention_mask": attention_mask,
         "position_ids": position_ids,
     }
+
+    if args.export_offline_model:
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:args.seq_length]
+        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:args.seq_length]
+
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
-    return batch.values()
-
-
-def _mask_loss(output_tensor, loss_mask, mp_reduce=False):
-    """Apply mask to the unreduced loss tensor."""
-    args = get_args()
-
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-
-    if args.context_parallel_size > 1:
-        loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), loss_mask.sum().view(1)])
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-        loss = loss[0] / loss[1]
-    else:
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-    if mp_reduce and args.tensor_model_parallel_size > 1:
-        # KD loss requires extra all-reduce to ensure same values across MP-TP partitions.
-        loss = torch.sum(tensor_parallel.gather_from_tensor_model_parallel_region(loss.reshape(1)))
-
-    return loss
-
-
-def _allreduce_loss(loss):
-    """Reduce loss for reporting purposes."""
-    args = get_args()
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss.isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-        )
-
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
-
-    return loss * args.context_parallel_size, averaged_loss[0]
-
-
-def loss_func(loss_mask: torch.Tensor, model: GPTModel, output_tensor: torch.Tensor):
-    """Loss function (with KD Loss support).
-
-    Args:
-        loss_mask (Tensor): Used to mask out some portions of the loss
-        model (GPTModel): The model (can be wrapped)
-        output_tensor (Tensor): The tensor with the losses
-    """
-    args = get_args()
-
-    # Unwrap for both Distillation and LANA
-    model = unwrap_model(model)
-
-    # Standard lm loss
-    output_tensor = output_tensor.float()  # cache
-    loss_lm = _mask_loss(output_tensor, loss_mask)
-    loss_lm, loss_lm_avg = _allreduce_loss(loss_lm)
-    loss, report = loss_lm, {'lm loss': loss_lm_avg}
-
-    return loss, report
+    return batch
 
 
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
-    report_draft_acceptance_length(model)
+    args = get_args()
+    if not args.export_offline_model:
+        report_draft_acceptance_length(model)
+
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -540,14 +469,27 @@ def forward_step(data_iterator, model: GPTModel):
     """
     timers = get_timers()
 
+    args = get_args()
+
     # Get the batch.
     timers("batch-generator", log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+    batch = get_batch(data_iterator)
+    tokens = batch["tokens"]
+    labels = batch["labels"]
+    loss_mask = batch["loss_mask"]
+    attention_mask = batch["attention_mask"]
+    position_ids = batch["position_ids"]
+    if args.export_offline_model:
+        aux_hidden_states = batch["aux_hidden_states"]
+        hidden_states = batch["hidden_states"]
     timers("batch-generator").stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+    if args.export_offline_model:
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
+    else:
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask, model)
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 if __name__ == "__main__":
@@ -556,7 +498,7 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        extra_args_provider=add_modelopt_args,
+        extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
         non_loss_data_func=non_loss_data_func,
     )

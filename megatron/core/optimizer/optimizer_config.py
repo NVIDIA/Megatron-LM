@@ -115,6 +115,11 @@ class OptimizerConfig:
     adam_eps: float = 1e-08
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
+    decoupled_weight_decay: bool = True
+    """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
+    original Adam update rule will be used. Defaults to True.
+    """
+
     # SGD.
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
@@ -124,6 +129,13 @@ class OptimizerConfig:
     #######################
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
+
+    overlap_param_gather: bool = False
+    """If true, overlap param all-gather with forward compute. 
+        This argument is intended to have the same value as the "overlap_param_gather" argument 
+        in the "distributed_data_parallel_config.py" file. In the optimizer, this argument is 
+        only used when "reuse_grad_buf_for_mxfp8_param_ag=True & fp8_param_gather=True".
+    """
 
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
@@ -182,10 +194,26 @@ class OptimizerConfig:
         # different for different training precision settings. FP8 cases require different
         # handling while FP8 delayed scaling is an exception because the Adam optimizer in
         # TransformerEngine supports it in the kernel computation.
+        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
         self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
             self.use_precision_aware_optimizer
-            and (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+            and (
+                self.main_params_dtype != torch.float32
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or self.optimizer_cpu_offload
+            )
         )
+
+        if self.fp8_recipe == "mxfp8":
+            if not self.reuse_grad_buf_for_mxfp8_param_ag:
+                import warnings
+
+                warnings.warn(
+                    "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
+                    "will use significant amount additional GPU memory."
+                    "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
+                    "recommended for mxfp8 training."
+                )
 
         if self.use_precision_aware_optimizer:
             assert (

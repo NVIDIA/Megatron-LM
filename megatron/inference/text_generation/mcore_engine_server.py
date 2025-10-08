@@ -25,9 +25,6 @@ class ModelInferenceWrapperServer(GPTInferenceWrapper):
     ) -> Dict[str, Any]:
         """
         Slices out the tokens, position ids, and masking for the specific context window.
-        This version also sets `runtime_gather_output` to be False to be compatible with
-        the inference server in tools/run_text_generation_server.py, which expects parallel logits
-        distributed across TP ranks.
 
         Args:
             inference_input (Dict[str, Any]): The inference input for the batch.
@@ -40,7 +37,6 @@ class ModelInferenceWrapperServer(GPTInferenceWrapper):
         inference_input = super().get_batch_for_context_window(
             inference_input, context_start_position, context_end_position
         )
-        inference_input["runtime_gather_output"] = False
         return inference_input
 
 
@@ -53,12 +49,12 @@ def run_mcore_engine(
     logprobs=True,
     tokens_to_generate=0,
     top_n_logprobs=0,
-    echo=False,
+    random_seed=-1,
 ):
     """Server-compatible version of the MCore Engine, used in
     tools/run_text_generation_server.py."""
 
-    values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs]
+    values = [tokens_to_generate, logprobs, top_k, top_p, temperature, top_n_logprobs, random_seed]
     values_float_tensor = broadcast_float_list(len(values), float_list=values, data_parallel=False)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
@@ -66,6 +62,10 @@ def run_mcore_engine(
     top_p = values_float_tensor[3].item()
     temperature = values_float_tensor[4].item()
     top_n_logprobs = int(values_float_tensor[5].item())
+    random_seed = int(values_float_tensor[6].item())
+
+    if random_seed > 0:
+        engine.text_generation_controller.sampling_rng.manual_seed(random_seed)
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -77,7 +77,6 @@ def run_mcore_engine(
         top_n_logprobs=top_n_logprobs,
         return_prompt_top_n_logprobs=True
     )
-    sampling_params.add_attributes({"echo": echo})
 
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=False, data_parallel=False
@@ -98,9 +97,11 @@ def run_mcore_engine(
 
     # Detokenize prompts into strings to pass through the engine
     detokenized_prompts = [
-        tokenizer.detokenize(p, skip_special_tokens=True)
-        if accepts_skip
-        else tokenizer.detokenize(p)
+        (
+            tokenizer.detokenize(p, skip_special_tokens=True)
+            if accepts_skip
+            else tokenizer.detokenize(p)
+        )
         for p in tokenized_prompts
     ]
 

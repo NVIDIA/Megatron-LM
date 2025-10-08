@@ -31,16 +31,13 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
     """The BERT dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
-
+        indexed_dataset (IndexedDataset): The IndexedDataset around which
+            to build the MegatronDataset
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
-
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
-
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
-
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset.
+            When None, build as many samples as correspond to one epoch.
         index_split (Split): The indexed_indices Split
-
         config (BERTMaskedWordPieceDatasetConfig): The config
     """
 
@@ -83,6 +80,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
         Returns:
             Dict[str, Union[int, numpy.ndarray]]: The
         """
+
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
         sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
         numpy_random_state = numpy.random.RandomState(seed=(self.config.random_seed + idx) % 2**32)

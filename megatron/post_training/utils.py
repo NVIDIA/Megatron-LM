@@ -36,3 +36,24 @@ def get_mtbench_chat_data():
 
     dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
     return dataset.map(mtbench_to_oai_chat)
+
+def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=True):
+    """Move tensors to device if not meta device; otherwise materialize with empty_like().
+   
+    Args:
+        module: The target module to apply this transformation.
+        device: The desired device of the parameters
+            and buffers in this module.
+        recurse: Whether parameters and buffers of submodules should
+            be recursively moved to the specified device.
+    """
+
+    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
+        if tensor.device == torch.device("meta"):
+            return torch.empty_like(tensor, device=device)
+        else:
+            return tensor.to(device)
+
+    module._apply(
+        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
+    )

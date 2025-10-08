@@ -128,7 +128,7 @@ def initialize_megatron(
             args.data_parallel_random_init,
             args.te_rng_tracker,
             args.inference_rng_tracker,
-            use_cudagraphable_rng=args.enable_cuda_graph,
+            use_cudagraphable_rng=args.enable_cuda_graph or args.external_cuda_graph,
         )
 
         # Setup MoE aux loss scale value.
@@ -269,7 +269,21 @@ def _initialize_tp_communicators():
             args.hidden_size,
         ]
 
-    if is_te_min_version("1.9.0"):
+
+    if is_te_min_version("2.7.0"):
+        UserBufferQuantizationMode = te_module.base.UserBufferQuantizationMode
+        quantization_modes = [UserBufferQuantizationMode.FP8 if args.fp8 else UserBufferQuantizationMode.NONE]
+        if args.fp8 is not None and args.first_last_layers_bf16 and (args.num_layers_at_start_in_bf16 > 0 or args.num_layers_at_end_in_bf16 > 0):
+            quantization_modes.append(UserBufferQuantizationMode.NONE)
+        # The process group with the target bootstrap backend is created in Transformer Engine.
+        te_module.base.initialize_ub(
+            shape=input_shape,
+            tp_size=args.tensor_model_parallel_size,
+            quantization_modes=quantization_modes,
+            ub_cfgs=ub_cfgs,
+            bootstrap_backend=args.tp_comm_bootstrap_backend,
+        )
+    elif is_te_min_version("1.9.0"):
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(
             shape=input_shape,
@@ -342,26 +356,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
-            # Deprecation warning for encoder pipeline parallelism
-            if args.encoder_pipeline_model_parallel_size > 0 or args.encoder_tensor_model_parallel_size > 0:
-                warnings.warn(
-                    "Encoder-specific pipeline parallelism functionality is deprecated and will be removed in core_r0.14.0. "
-                    "This includes the parameters 'encoder_tensor_model_parallel_size' and 'encoder_pipeline_model_parallel_size', "
-                    "as well as all associated encoder pipeline parallel logic and infrastructure. "
-                    "This functionality is being replaced by the new 'orthotope' parallelism management system, which provides "
-                    "a more general and flexible approach to handling complex parallelism configurations including encoder-decoder models. "
-                    "Please refrain from building new features or dependencies on encoder pipeline parallelism as this entire "
-                    "capability will not be supported in future releases. For migration guidance and information on the orthotope "
-                    "system, please refer to the Megatron-LM documentation.",
-                    DeprecationWarning,
-                    stacklevel=2
-                )
-            
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
-                args.pipeline_model_parallel_split_rank,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
@@ -372,12 +370,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
-                encoder_tensor_model_parallel_size=args.encoder_tensor_model_parallel_size,
-                encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.enable_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
+                sharp_enabled_group=args.sharp_enabled_group,
             )
             if args.rank == 0:
                 print(

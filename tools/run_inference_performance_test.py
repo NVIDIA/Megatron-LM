@@ -3,15 +3,15 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 import argparse
-from collections import OrderedDict
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
 import random
 import torch
 import sys
 import time
 import tqdm
 import warnings
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -36,6 +36,7 @@ from megatron.core import mpu
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model, get_tokenizer
 import asyncio
+from functools import partial
 from typing import AsyncIterator, List, Union
 
 REQUEST_ID = 0
@@ -54,12 +55,7 @@ def add_text_generate_args(parser):
         default=False,
         help='Return the log probabilities of the final output tokens',
     )
-    group.add_argument(
-        "--top-n-logprobs",
-        type=int,
-        default=0,
-        help="Top-N logprobs"
-    )
+    group.add_argument("--top-n-logprobs", type=int, default=0, help="Top-N logprobs")
     group.add_argument(
         "--num-tokens-to-generate",
         type=int,
@@ -176,7 +172,7 @@ async def generate(
         tokenizer = get_tokenizer()
         prompts = [tokenizer.detokenize(request.prompt_tokens) for request in inference_requests]
 
-    request_ids: List[str] = [
+    request_ids: List[int] = [
         inference_engine.add_request(
             prompt=prompt,
             inference_request=inference_request,
@@ -239,7 +235,6 @@ def generate_dynamic(
     sampling_params: SamplingParams,
 ):
     global REQUEST_ID
-    req_data = OrderedDict()
     for request in inference_requests:
         request_id = REQUEST_ID
         REQUEST_ID += 1
@@ -247,44 +242,22 @@ def generate_dynamic(
         inference_engine.add_request(
             request_id, prompt_tokens, num_tokens_to_generate=args.num_tokens_to_generate
         )
-        cur_time = time.perf_counter()
-        req_data[request_id] = {
-            "prompt_tokens": prompt_tokens,
-            "output_tokens": [],
-            "tpot": [],
-            "prev_time": cur_time,
-            "start_time": cur_time,
-        }
 
+    start_time = time.perf_counter()
+    all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result, _ = inference_engine.step(sampling_params, verbose=False)
-        if result is not None:
-            request_ids, finished_request_ids, sample = result
+        result = inference_engine.step(sampling_params, verbose=False)
+        finished_requests = result["finished_requests"]
+        for request in finished_requests:
+            req_id = request.request_id
+            latency = time.perf_counter() - start_time
+            print(
+                f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and "
+                f"generated {request.generated_length} tokens"
+            )
+        all_finished_requests.extend(finished_requests)
 
-            request_ids = request_ids.tolist()
-            sample = sample.tolist()
-
-            cur_time = time.perf_counter()
-            for req_id, token in zip(request_ids, sample):
-                req_data[req_id]["output_tokens"].append(token)
-                req_data[req_id]["tpot"].append(cur_time - req_data[req_id]["prev_time"])
-                req_data[req_id]["prev_time"] = cur_time
-                if req_id in finished_request_ids:
-                    req_data[req_id]["finish_time"] = time.perf_counter()
-                    latency = req_data[req_id]["finish_time"] - req_data[req_id]["start_time"]
-                    print(
-                        f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and generated {len(req_data[req_id]['tpot'])} tokens"
-                    )
-
-    return [
-        InferenceRequest(
-            prompt="",
-            request_id=str(request_id),
-            prompt_tokens=data["prompt_tokens"],
-            generated_tokens=data["output_tokens"],
-        )
-        for request_id, data in req_data.items()
-    ]
+    return all_finished_requests
 
 
 @torch.inference_mode()
@@ -307,11 +280,11 @@ def main():
 
     # Set up model and load checkpoint
     if args.model_provider == "gpt":
-        model_provider = gpt_model_provider
+        model_builder = gpt_builder
     elif args.model_provider == "mamba":
-        model_provider = mamba_model_provider
+        model_builder = mamba_builder
 
-    model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
     tokenizer = get_tokenizer()
     load_checkpoint(model, None, None)
     model = model[0]
@@ -331,6 +304,7 @@ def main():
         top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
+    sampling_params.add_attributes({"no_early_termination": True})
 
     requests = []
     if args.num_input_tokens is not None:
@@ -360,10 +334,10 @@ def main():
 
     if args.enable_cuda_graph:
         print(f"Running warmup for CUDA graphs...")
+        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
+        warmup_sampling_params.add_attributes({"no_early_termination": True})
         if args.engine_type == "static":
-            inference_engine.generate(
-                prompts=None, inference_requests=requests, sampling_params=sampling_params
-            )
+            inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
         elif args.engine_type == "dynamic":
             generate_dynamic(args, requests, inference_engine, sampling_params)
 
@@ -404,6 +378,7 @@ def main():
                 'id': result.request_id,
                 'num_input_tokens': len(result.prompt_tokens),
                 'num_output_tokens': len(result.generated_tokens),
+                'tpot': result.tpot,
                 'latency': latency,
                 'memory_usage_GB': memory_allocated / (1024**3),
             }

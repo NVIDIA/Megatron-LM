@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Strategies using TensorStore to load and save Zarr arrays. """
+"""Strategies using TensorStore to load and save Zarr arrays."""
 
 from functools import partial
 from itertools import starmap
@@ -8,7 +8,6 @@ from logging import getLogger
 from pathlib import Path
 from typing import Union
 
-import tensorstore as ts
 import torch
 
 from ..core import CheckpointingException
@@ -17,13 +16,24 @@ from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy, StrategyAction, register_default_strategy
 from .zarr import load_zarr_based_sharded_metadata, postprocess_numpy_array
 
+try:
+    import tensorstore as ts
+
+    HAVE_TENSORSTORE = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    ts = MagicMock()
+    HAVE_TENSORSTORE = False
+
+
 logger = getLogger(__name__)
 
 
 def register_default_tensorstore_strategies():
     """Register default strategies leveraging tensorstore."""
     register_default_strategy(
-        StrategyAction.LOAD_SHARDED, 'zarr', 1, TensorStoreLoadShardedStrategy()
+        StrategyAction.LOAD_SHARDED, "zarr", 1, TensorStoreLoadShardedStrategy()
     )
 
 
@@ -39,9 +49,9 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
             checkpoint_dir = Path(checkpoint_dir)
 
         if torch.distributed.get_rank() == 0:
-            print(f'Loading distributed checkpoint with {self.__class__.__name__}')
+            print(f"Loading distributed checkpoint with {self.__class__.__name__}")
             if self.load_directly_on_device:
-                print(f'Loading distributed checkpoint directly on the GPU')
+                print(f"Loading distributed checkpoint directly on the GPU")
         load_fn = partial(
             _load_from_array,
             checkpoint_dir=checkpoint_dir,
@@ -74,7 +84,7 @@ def merge_global_slice_with_shape(global_slice, actual_shape, key):
         if isinstance(dim_slice, slice):
             assert (
                 dim_slice.start < dim_size
-            ), f'Got empty slice for ShardedTensor {key} ({dim_slice}, {dim_size})'
+            ), f"Got empty slice for ShardedTensor {key} ({dim_slice}, {dim_size})"
             if dim_slice.stop > dim_size:
                 dim_slice = slice(dim_slice.start, dim_size, dim_slice.step)
         return dim_slice
@@ -112,9 +122,9 @@ def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
         x = arr[global_slice].read().result()  # flattened tensors loading is delayed
     else:
         _msg = (
-            f'Global shape mismatch for loaded ({arr.shape})'
-            f' and expected ({sharded_tensor.global_shape}) tensor'
-            f' for key {sharded_tensor.key}'
+            f"Global shape mismatch for loaded ({arr.shape})"
+            f" and expected ({sharded_tensor.global_shape}) tensor"
+            f" for key {sharded_tensor.key}"
         )
         raise CheckpointingException(_msg)
     return x
@@ -126,10 +136,14 @@ def open_ts_array(arr_path: Path):
     Args:
         arr_path (Path): path to a Zarr (Tensorstore) array
     """
-    spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}
-    spec['kvstore'] = {'driver': 'file', 'path': str(arr_path)}
+    if not HAVE_TENSORSTORE:
+        raise RuntimeError(
+            "tensorstore is required, please install it with `pip install tensorstore`"
+        )
+    spec = {"driver": "zarr", "metadata_key": ".zarray", "kvstore": {}}
+    spec["kvstore"] = {"driver": "file", "path": str(arr_path)}
     try:
         arr = ts.open(ts.Spec(spec), open=True).result()
     except Exception as e:
-        raise CheckpointingException(f'Array {arr_path} could not be loaded. Error: {e}') from e
+        raise CheckpointingException(f"Array {arr_path} could not be loaded. Error: {e}") from e
     return arr

@@ -18,9 +18,9 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 class BackendSpecProvider(Protocol):
@@ -63,6 +63,11 @@ class BackendSpecProvider(Protocol):
         """Which module and submodules to use for grouped mlp"""
         ...
 
+    @abstractmethod
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        ...
+
 
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
@@ -102,11 +107,15 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm:
             warnings.warn(
-                'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
-                'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
+                "The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. "
+                "Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP."
             )
             return GroupedMLP, None
         else:
             return SequentialMLP, MLPSubmodules(
                 linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
             )
+
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        return None

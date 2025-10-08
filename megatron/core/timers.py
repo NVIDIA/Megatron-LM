@@ -8,11 +8,24 @@ from typing import List
 
 import torch
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
 from megatron.core.utils import is_torch_min_version
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
 
 
@@ -446,4 +459,7 @@ class Timers:
         if writer is not None:
             for name in name_to_min_max_time:
                 _, max_time = name_to_min_max_time[name]
-                writer.add_scalar(name + '-time', max_time, iteration)
+                if isinstance(writer, SummaryWriter) and SummaryWriter is not None:
+                    writer.add_scalar(name + '-time', max_time, iteration)
+                elif writer == wandb and wandb is not None:
+                    writer.log({name + '-time': max_time}, iteration)

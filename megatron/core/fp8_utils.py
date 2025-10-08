@@ -1,11 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
+
+import weakref
 from contextlib import nullcontext
+from functools import wraps
 from typing import List, Optional
 
 import torch
-from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -21,9 +23,16 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
+
 # Check if Transformer Engine has class for fp8 tensors.
 HAVE_TE_FP8_TENSOR_CLASS = False
-try:
+if HAVE_TE:
     if is_te_min_version("2.0"):
         # In TE2.x, QuantizedTensor is the base class for all different type of fp8 tensors,
         # including fp8 tensor for delayed scaling, current scaling and mxfp8, etc.
@@ -32,19 +41,42 @@ try:
         from transformer_engine.pytorch.float8_tensor import Float8Tensor as FP8_TENSOR_CLASS
 
     HAVE_TE_FP8_TENSOR_CLASS = True
-except (ImportError, ModuleNotFoundError):
-    # FP8 tensor class not found
-    pass
+else:
+    HAVE_TE_FP8_TENSOR_CLASS = False
+    FP8_TENSOR_CLASS = None
 
 # Check if Transformer Engine has MXFP8Tensor class
-HAVE_TE_MXFP8TENSOR = False
+
 try:
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
     HAVE_TE_MXFP8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
-    pass
+    HAVE_TE_MXFP8TENSOR = False
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TELinear,
+        TERowParallelLinear,
+    )
+
+    TE_LINEAR_TYPES = (
+        TELinear,
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinear,
+    )
+else:
+    TE_LINEAR_TYPES = ()
+
+try:
+    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+except ImportError:
+    Fp8Padding = None
+    Fp8Unpadding = None
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -130,6 +162,10 @@ if HAVE_TE and is_te_min_version("2.2"):
 
         args = [model_params, main_params, start_offsets, data_parallel_group]
         if fsdp_shard_model_params is not None:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging not found, please install it with `pip install packaging`"
+                )
             if get_te_version() == PkgVersion("2.3.0.dev0+5fdd7bb") or is_te_min_version("2.3.0"):
                 args.append(fsdp_shard_model_params)
             else:
@@ -211,7 +247,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
 
         # Update scaling factors.
         packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
@@ -298,7 +334,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
 
         # Update scaling factors.
         packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
@@ -321,9 +357,9 @@ elif HAVE_TE and is_te_min_version("1.0"):
         for model_module in model:
             for param in model_module.parameters():
                 if is_float8tensor(param) and param._fp8_meta is not None:
-                    fp8_meta = param._fp8_meta['scaling_fwd']
+                    fp8_meta = param._fp8_meta["scaling_fwd"]
                     fp8_meta_index = param._fp8_meta_index
-                    if hasattr(param, 'get_high_precision_init_val'):
+                    if hasattr(param, "get_high_precision_init_val"):
                         fp8_meta.amax_history[0][fp8_meta_index].copy_(
                             param.get_high_precision_init_val().abs().max()
                         )
@@ -335,8 +371,12 @@ else:
     def _modify_underlying_storage_impl(*args, **kwargs):
         raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
 
-    def _quantize_param_shard_impl(*args, **kwargs):
-        raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
+    def _quantize_param_shard_impl(model_params, *args, **kwargs):
+        if len(model_params) == 0:
+            return
+        else:
+            # If TE is not installed, there shouldn't be any fp8 params.
+            raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
 
     def _correct_amax_history_if_needed_impl(*args, **kwargs):
         # If TE is not installed, we are definitely not using fp8 for training, so no correction
@@ -366,9 +406,85 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
     _correct_amax_history_if_needed_impl(model)
 
 
+def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
+    """Check if the layer is in bf16."""
+    num_bf16_layers_at_start = (
+        config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
+    )
+    num_bf16_layers_at_end = (
+        config.num_layers_at_end_in_bf16 if config.first_last_layers_bf16 else 0
+    )
+    # Since layer_no is a global layer index, additional checks on whether
+    # we are in the first or last pipeline-parallel rank are not needed.
+    is_first_layer = layer_no < num_bf16_layers_at_start
+    is_last_layer = layer_no >= config.num_layers - num_bf16_layers_at_end
+
+    if layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer):
+        return True
+    else:
+        return False
+
+
 if HAVE_TE:
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
+
+    def get_fp8_recipe(config: TransformerConfig):
+        """Return fp8 recipe.
+
+        Arguments:
+            config (TransformerConfig): Configuration object.
+
+        Returns:
+            FP8 recipe.
+        """
+        if config.fp8 == "e4m3":
+            fp8_format = transformer_engine.common.recipe.Format.E4M3
+        elif config.fp8 == "hybrid":
+            fp8_format = transformer_engine.common.recipe.Format.HYBRID
+        else:
+            raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
+        # Select fp8 recipe (TE version >= 2.1.0).
+        fp8_recipe = None
+        if is_te_min_version("2.1.0"):
+            if config.fp8_recipe == Fp8Recipe.delayed:
+                fp8_recipe = TEDelayedScaling(
+                    config=config,
+                    fp8_format=fp8_format,
+                    override_linear_precision=(False, False, not config.fp8_wgrad),
+                )
+            elif config.fp8_recipe == Fp8Recipe.tensorwise and is_te_min_version("2.2.0.dev0"):
+                fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
+                    fp8_format=fp8_format, fp8_dpa=config.fp8_dot_product_attention
+                )
+            elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
+                fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
+                    fp8_format=fp8_format
+                )
+            elif config.fp8_recipe == Fp8Recipe.mxfp8:
+                fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
+                    fp8_format=fp8_format
+                )
+            else:
+                raise ValueError(
+                    "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "
+                    "DelayedScaling are the only supported FP8 recipes. Please also make sure "
+                    "you are using a compatible TE version."
+                )
+        else:
+            # Assert that the user is using delayed scaling.
+            assert config.fp8_recipe == Fp8Recipe.delayed, (
+                "Please make sure to use TransformerEngine version >= 2.2.0.dev0 for "
+                "Float8CurrentScaling, >= 2.1.0 for MXFP8BlockScaling, and >= 2.3.0.dev0 for "
+                "Float8BlockScaling."
+            )
+            fp8_recipe = TEDelayedScaling(
+                config=config,
+                fp8_format=fp8_format,
+                override_linear_precision=(False, False, not config.fp8_wgrad),
+            )
+        return fp8_recipe
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return fp8 context manager.
@@ -386,75 +502,14 @@ if HAVE_TE:
             that needs to be trained in bf16.
         """
 
-        num_bf16_layers_at_start = (
-            config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
-        )
-        num_bf16_layers_at_end = (
-            config.num_layers_at_end_in_bf16 if config.first_last_layers_bf16 else 0
-        )
-        # Since layer_no is a global layer index, additional checks on whether
-        # we are in the first or last pipeline-parallel rank are not needed.
-        is_first_layer = layer_no < num_bf16_layers_at_start
-        is_last_layer = layer_no >= config.num_layers - num_bf16_layers_at_end
-
         need_fp8_context = config.fp8 if not is_init else config.fp8_param
 
-        if not need_fp8_context:
-            # bf16 training
-            fp8_context = nullcontext()
-        elif layer_no >= 0 and config.first_last_layers_bf16 and (is_first_layer or is_last_layer):
-            # fp8 training but this layer_no should be bf16
+        if not need_fp8_context or is_first_last_bf16_layer(config, layer_no):
+            # bf16 training or bf16 layer in fp8 training
             fp8_context = nullcontext()
         else:
             # fp8 training and this layer_no is in fp8
-            import transformer_engine  # To keep out TE dependency when not training in fp8
-
-            if config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-            # Select fp8 recipe (TE version >= 2.1.0).
-            fp8_recipe = None
-            if is_te_min_version("2.1.0"):
-                if config.fp8_recipe == Fp8Recipe.delayed:
-                    fp8_recipe = TEDelayedScaling(
-                        config=config,
-                        fp8_format=fp8_format,
-                        override_linear_precision=(False, False, not config.fp8_wgrad),
-                    )
-                elif config.fp8_recipe == Fp8Recipe.tensorwise and is_te_min_version("2.2.0.dev0"):
-                    fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
-                        fp8_format=fp8_format
-                    )
-                elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
-                    fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
-                        fp8_format=fp8_format
-                    )
-                elif config.fp8_recipe == Fp8Recipe.mxfp8:
-                    fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
-                        fp8_format=fp8_format
-                    )
-                else:
-                    raise ValueError(
-                        "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "
-                        "DelayedScaling are the only supported FP8 recipes. Please also make sure "
-                        "you are using a compatible TE version."
-                    )
-            else:
-                # Assert that the user is using delayed scaling.
-                assert config.fp8_recipe == Fp8Recipe.delayed, (
-                    "Please make sure to use TransformerEngine version >= 2.2.0.dev0 for "
-                    "Float8CurrentScaling, >= 2.1.0 for MXFP8BlockScaling, and >= 2.3.0.dev0 for "
-                    "Float8BlockScaling."
-                )
-                fp8_recipe = TEDelayedScaling(
-                    config=config,
-                    fp8_format=fp8_format,
-                    override_linear_precision=(False, False, not config.fp8_wgrad),
-                )
+            fp8_recipe = get_fp8_recipe(config)
 
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
@@ -493,6 +548,104 @@ if HAVE_TE:
 
 else:
 
+    def get_fp8_recipe(config: TransformerConfig):
+        """Returns None since TE is not available."""
+        return None
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
+
+
+if HAVE_TE:
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    # Modules that have been wrapped for inference for fp8
+    _fp8_inference_wrapped_modules = weakref.WeakSet()
+
+    def _wrap_te_linear_for_padding(module: torch.nn.Module):
+        """Wrap a TE linear module to automatically pad sequences for FP8 inference.
+
+        Modifies the module's forward method to:
+        1. Pad input sequences to FP8 alignment requirements
+        2. Run the original forward pass
+        3. Unpad outputs to original sequence length
+
+        Args:
+            module: A Transformer Engine linear layer (TELinear, TEColumnParallelLinear, etc.)
+        """
+        if module in _fp8_inference_wrapped_modules:
+            return
+        _pad_func = Fp8Padding(1)
+        _unpad_func = Fp8Unpadding(1)
+
+        original_forward = module.forward
+
+        @wraps(original_forward)
+        def padded_forward(input_tensor, *args, **kwargs):
+            # Only do padding for fp8 if we are in fp8 context
+            if not FP8GlobalStateManager.is_fp8_enabled():
+                return original_forward(input_tensor, *args, **kwargs)
+
+            seq_len, batch_size, hidden_size = input_tensor.shape
+            # Reshape to (S, B*H) to pad sequence dimension
+            input_2d = input_tensor.reshape(seq_len, -1)
+            # Pad the sequence dimension
+            padded_input_2d, _ = _pad_func(input_2d, [seq_len])
+            padded_seq_len = padded_input_2d.shape[0]
+
+            # Reshape back to (padded_S, B, H)
+            padded_input_3d = padded_input_2d.view(padded_seq_len, batch_size, hidden_size)
+            output = original_forward(padded_input_3d, *args, **kwargs)
+
+            # Handle output
+            if isinstance(output, tuple):
+                output_tensor = output[0]
+                other_outputs = output[1:]
+            else:
+                output_tensor = output
+                other_outputs = ()
+
+            # Unpad output - reshape to 2D, unpad, reshape back
+            _, _, output_hidden_size = output_tensor.shape
+            output_2d = output_tensor.reshape(padded_seq_len, -1)
+            unpadded_output_2d = _unpad_func(output_2d, [seq_len])
+            unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)
+
+            if other_outputs:
+                return (unpadded_output,) + other_outputs
+            else:
+                return unpadded_output
+
+        module.forward = padded_forward
+        _fp8_inference_wrapped_modules.add(module)
+
+    def prepare_model_for_fp8_inference(model):
+        """Prepare a model for FP8 inference by wrapping TE linear layers with padding support.
+
+        FP8 TE Gemms have specific shape requirements. This function wraps all Transformer
+        Engine linear layers in the model to automatically pad/unpad sequences during inference.
+
+        Args:
+            model (model (GPTModel): Model containing TE linear layers.
+
+        Returns:
+            GPTModel: The same model with wrapped linear layers (modified in-place).
+
+        """
+        assert Fp8Padding and Fp8Unpadding, "TE version does not have FP8 padding functions"
+        # Find and wrap all TE linear layers
+        for module in model.modules():
+            if isinstance(module, TE_LINEAR_TYPES):
+                _wrap_te_linear_for_padding(module)
+
+        return model
+
+else:
+
+    def prepare_model_for_fp8_inference(model):
+        """If trys using prepare_model_for_fp8_inference without TE we error"""
+        raise RuntimeError(
+            "prepare_model_for_fp8_inference requires Transformer Engine to be installed. "
+            "Please install transformer-engine to use FP8 inference."
+        )

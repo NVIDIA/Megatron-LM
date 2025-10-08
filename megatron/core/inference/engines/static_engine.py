@@ -6,7 +6,6 @@ from collections import OrderedDict
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import torch
-from tqdm import tqdm
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -16,6 +15,16 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    tqdm = MagicMock()
+    HAVE_TQDM = False
 
 
 class StaticInferenceEngine(AbstractEngine):
@@ -60,7 +69,7 @@ class StaticInferenceEngine(AbstractEngine):
         self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
-    def get_new_request_id(self) -> str:
+    def get_new_request_id(self) -> int:
         """Gets a new request id from the scheduler"""
         return self.scheduler.get_new_request_id()
 
@@ -74,7 +83,7 @@ class StaticInferenceEngine(AbstractEngine):
         inference_request: Optional[InferenceRequest] = None,
         *,
         inference_parameters: Optional[SamplingParams] = None,
-    ) -> str:
+    ) -> int:
         """
         Adds a request to the scheduler and returns the request ID.
 
@@ -104,6 +113,7 @@ class StaticInferenceEngine(AbstractEngine):
             sampling_params = inference_parameters
 
         if inference_request is None:
+            # Support legacy single-arg tokenize_prompt mocks in tests.
             prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
         else:
             prompt_tokens = inference_request.prompt_tokens
@@ -118,7 +128,7 @@ class StaticInferenceEngine(AbstractEngine):
         )
 
     def get_stream_generator(
-        self, request_id: str
+        self, request_id: int
     ) -> Union[AsyncGenerator[InferenceRequest, None], None]:
         """Returns the stream generator for the given request ID if it exists."""
         stream = self.scheduler.streams.get(request_id, None)
@@ -156,7 +166,7 @@ class StaticInferenceEngine(AbstractEngine):
         """
         # TODO :M core- get rng state tracker
 
-        request_ids: List[str] = []
+        request_ids: List[int] = []
 
         if self.random_seed:
             torch.random.manual_seed(self.random_seed)
@@ -196,6 +206,13 @@ class StaticInferenceEngine(AbstractEngine):
                 to enable dynamic batching. Mainly used with an inference server.
                 Defaults to False.
         """
+
+        if not HAVE_TQDM:
+            raise ImportError(
+                "tqdm is required for StaticInferenceEngine, "
+                "please install it with `pip install tqdm`"
+            )
+
         prev_num_requests_pending = self.scheduler.num_requests_pending()
         tbar = tqdm(desc="static requests", total=prev_num_requests_pending)
         while self.scheduler.have_requests_pending():
@@ -218,14 +235,14 @@ class StaticInferenceEngine(AbstractEngine):
             prev_num_requests_pending = crnt_num_requests_pending
 
         # TODO: Later for dynamic batching we will do something like this
-        """ 
+        """
             if dynamic_batching:
                 result_dict: Dict[
                     str, InferenceRequest
                 ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
                     active_requests
                 )
-            self.scheduler.update_requests_pools(result_dict=result_dict)         
+            self.scheduler.update_requests_pools(result_dict=result_dict)
         """
 
     def _wrapped_run_engine(self, cuda_device):

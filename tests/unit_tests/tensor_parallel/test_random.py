@@ -35,7 +35,7 @@ def test_cuda_rng_states_tracker():
 
 def test_model_parallel_cuda_manual_seed():
     Utils.initialize_model_parallel(4, 2)
-    model_parallel_cuda_manual_seed(0)
+    model_parallel_cuda_manual_seed(0, force_reset_rng=True)
     rng_tracker = get_cuda_rng_tracker()
     assert rng_tracker.get_states()['model-parallel-rng'] is not None
     Utils.destroy_model_parallel()

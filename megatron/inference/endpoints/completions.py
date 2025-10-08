@@ -13,6 +13,7 @@ from megatron.inference.endpoints.common import send_do_generate, LOCK
 
 from flask import request, jsonify
 from flask_restful import Resource
+import random
 
 
 def detokenize(prompt, tok) -> list[str]:
@@ -74,8 +75,8 @@ class MegatronCompletions(Resource):
             local_kwargs["top_p_sampling"] = 0
 
         echo = local_kwargs.pop("echo")
-        if (not echo) and (local_kwargs["tokens_to_generate"] == 0):
-            return "echo=False not supported when tokens_to_generate=0", 400
+        if not echo and local_kwargs["tokens_to_generate"] == 0:
+            return "echo=False not supported when tokens_to_generate == 0", 400
 
         if local_kwargs.pop("best_of") > 1:
             return "best_of > 1 not supported", 400
@@ -100,6 +101,7 @@ class MegatronCompletions(Resource):
             tokens_to_generate = local_kwargs["tokens_to_generate"]
             logprobs = local_kwargs["return_output_log_probs"]
             top_n_logprobs = local_kwargs["return_topk_logprobs"]
+            random_seed = local_kwargs["random_seed"]
             response_dict = run_mcore_engine(
                 self.engine,
                 prompts,
@@ -109,7 +111,7 @@ class MegatronCompletions(Resource):
                 logprobs,
                 tokens_to_generate,
                 top_n_logprobs=top_n_logprobs,
-                echo=echo,
+                random_seed=random_seed
             )
             result = [
                 response_dict["text"],

@@ -1,9 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import torch
-from transformers import AutoConfig, AutoModel
 
 from megatron.core.transformer.module import MegatronModule
+
+try:
+    from transformers import AutoConfig, AutoModel
+
+    HAVE_TRANSFORMERS = True
+except ImportError:
+    HAVE_TRANSFORMERS = False
 
 
 class HuggingFaceModule(MegatronModule):
@@ -39,6 +45,12 @@ class AutoHuggingFaceModel(HuggingFaceModule):
     """
 
     def __init__(self, config):
+        if not HAVE_TRANSFORMERS:
+            raise ImportError(
+                "transformers is required for AutoHuggingFaceModel, "
+                "please install it with `pip install transformers`"
+            )
+
         super().__init__(config)
         self.model = AutoModel.from_pretrained(config.huggingface_model_name_or_path)
 
@@ -49,6 +61,13 @@ class AutoHuggingFaceModel(HuggingFaceModule):
 
 def get_hf_model_type(model_path):
     """Get the Huggingface model type."""
+
+    if not HAVE_TRANSFORMERS:
+        raise ImportError(
+            "transformers is required for get_hf_model_type, "
+            "please install it with `pip install transformers`"
+        )
+
     hf_config = AutoConfig.from_pretrained(model_path.split("hf://")[1])
     model_type = hf_config.architectures[0].lower()
 

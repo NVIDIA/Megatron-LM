@@ -2,7 +2,7 @@
 
 import torch.distributed as dist
 
-from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 class TestProcessGroupsConfig:
@@ -14,7 +14,7 @@ class TestProcessGroupsConfig:
         mock_pg2 = mocker.Mock(spec=dist.ProcessGroup)
 
         # Create instance
-        model_pgs = ModelCommProcessGroups()
+        model_pgs = ProcessGroupCollection()
 
         # Test setting attributes after creation
         model_pgs.tp = mock_pg1
@@ -30,12 +30,12 @@ class TestProcessGroupsConfig:
         assert not hasattr(model_pgs, 'cp')  # Not set yet
 
     def test_grad_comm_process_groups(self, mocker):
-        """Test basic functionality of GradCommProcessGroups."""
+        """Test basic functionality of ProcessGroupCollection."""
         # Create mock process groups
         mock_pg = mocker.Mock(spec=dist.ProcessGroup)
 
         # Create instance
-        grad_pgs = GradCommProcessGroups()
+        grad_pgs = ProcessGroupCollection()
 
         # Test setting attributes after creation
         grad_pgs.dp = mock_pg
@@ -54,7 +54,7 @@ class TestProcessGroupsConfig:
         mock_pg2 = mocker.Mock(spec=dist.ProcessGroup)
 
         # Create instance
-        model_pgs = ModelCommProcessGroups()
+        model_pgs = ProcessGroupCollection()
 
         # Set the hierarchical context parallel groups
         model_pgs.hcp = [mock_pg1, mock_pg2]

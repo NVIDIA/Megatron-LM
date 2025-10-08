@@ -6,11 +6,13 @@ from typing import Dict, Optional, Tuple, Union
 import torch.nn as nn
 
 from megatron.core import dist_checkpointing
+from megatron.core.utils import is_torch_min_version
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 
 try:
+    import modelopt.torch.opt as mto
     from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 except ImportError as e:
     raise ImportError("Required `\"nvidia-modelopt[torch]\"` is not installed!") from e
@@ -78,18 +80,19 @@ def load_modelopt_state(load_dir: Optional[str] = None, model: Optional[nn.Modul
         if sharded_load_dir is None:
             print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
             return {}
-        return restore_sharded_modelopt_state([model], sharded_load_dir)
+        restore_sharded_modelopt_state([model], sharded_load_dir)
     else:
         print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
             state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
-            return {}
         if state_dict is None:
             print_rank_0("No checkpoint state_dict found. Skipping loading ModelOpt state.")
-            return {}
-        return state_dict.get("modelopt_state", {})
+        else:
+            modelopt_state = state_dict.get("modelopt_state", None)
+        if modelopt_state is not None:
+            mto.restore_from_modelopt_state(model, modelopt_state)
 
 
 def load_modelopt_checkpoint(
@@ -144,7 +147,21 @@ def load_modelopt_checkpoint(
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
     elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
-        sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix)
+
+        force_pre_mcore_014 = not is_torch_min_version("2.6a0")
+        if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
+            logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
+                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
+
+        # NOTE: singleton_local_shards only take care of the weight and bias. There are be issue when linear_fc1._amax
+        #       is a matrix such as NVFP4 real quant, awq, and blockwise 128.
+        if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
+            metadata = {"singleton_local_shards": False}
+        else:
+            metadata = {"singleton_local_shards": True}
+
+        sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix, metadata=metadata)
+
         if additional_sharded_prefix:
             unwrapped_model[0]._register_load_state_dict_pre_hook(
                 _remove_prefix_state_dict_pre_hook

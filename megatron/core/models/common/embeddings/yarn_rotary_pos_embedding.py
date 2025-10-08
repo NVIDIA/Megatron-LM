@@ -12,6 +12,7 @@ from torch import Tensor
 
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.transformer import TransformerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow (float, optional): Slow beta value for Yarn RoPE. Defaults to 1.
         mscale (float, optional): Mscale value for Yarn RoPE. Defaults to 1.
         mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
+        correction_range_round_to_int (bool): Whether to round dim range bounds to integer.
+            Defaults to True
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Defaults to None.
     """
@@ -56,6 +59,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow: float = 1.0,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        correction_range_round_to_int: bool = True,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.dim = kv_channels
@@ -66,38 +70,42 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
+        self.correction_range_round_to_int = correction_range_round_to_int
 
         device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
-        self.inv_freq_extra = 1.0 / (
-            self.rotary_base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
-        )
-        self.inv_freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.rotary_base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
-        )
-        super().__init__(
-            kv_channels,
-            rotary_percent,
-            rotary_interleaved,
-            seq_len_interpolation_factor,
-            rotary_base,
-            use_cpu_initialization,
-            cp_group,
-        )
 
-        self._set_cos_sin_cache(
-            self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
-        )
+        with torch.device(device):
+            self.inv_freq_extra = 1.0 / (
+                self.rotary_base
+                ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            )
+            self.inv_freq_inter = 1.0 / (
+                self.scaling_factor
+                * self.rotary_base
+                ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            )
+            super().__init__(
+                kv_channels,
+                rotary_percent,
+                rotary_interleaved,
+                seq_len_interpolation_factor,
+                rotary_base,
+                use_cpu_initialization,
+                cp_group,
+            )
+
+            self._set_cos_sin_cache(
+                self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
+            )
 
     @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
+    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
@@ -120,6 +128,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             self.dim,
             self.rotary_base,
             self.original_max_position_embeddings,
+            self.correction_range_round_to_int,
         )
         inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, self.dim // 2).to(
             device=self.inv_freq_extra.device, dtype=torch.float32
@@ -135,26 +144,26 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
         freqs = torch.outer(seq, inv_freq)
 
-        _mscale = float(
-            _yarn_get_mscale(self.scaling_factor, self.mscale)
-            / _yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        _mscale = _yarn_get_concentration_factor(
+            self.scaling_factor, self.mscale, self.mscale_all_dim
         )
 
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if self.cp_group is not None and self.cp_group.size() > 1:
+        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb, _mscale
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype):
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
+        self.packed_seq_cached = packed_seq
 
-        emb, _mscale = self.forward(seq_len, offset)
+        emb, _mscale = self.forward(seq_len, offset, packed_seq)
         self.register_buffer(
             "cos_cached", (emb.cos() * _mscale).to(dtype).contiguous(), persistent=False
         )
@@ -162,14 +171,17 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             "sin_cached", (emb.sin() * _mscale).to(dtype).contiguous(), persistent=False
         )
 
-    def get_cached_cos_sin(self, seq_len, offset=0, dtype=torch.get_default_dtype()):
+    def get_cached_cos_sin(
+        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False
+    ):
         """Get cached cos and sin values."""
         if (
             seq_len > self.max_seq_len_cached
             or offset != self.offset_cached
             or dtype != self.dtype_cached
+            or packed_seq != self.packed_seq_cached
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype)
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 
@@ -189,9 +201,13 @@ def _yarn_find_correction_range(
     dim: int,
     rotary_base: float = 10000,
     max_position_embeddings: int = 2048,
+    round_to_int: bool = True,
 ) -> tuple[int, int]:
-    low = math.floor(_yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings))
-    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings))
+    low = _yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings)
+    if round_to_int:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
@@ -208,3 +224,26 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+@lru_cache(maxsize=8)
+def _yarn_get_concentration_factor(
+    scaling_factor: float, mscale: float, mscale_all_dim: float
+) -> float:
+    """
+    Get the concentration factor (factor multiplied to the sine and cosine components of the
+    embedding). This factor is also known as attention factor, and sometimes homonymously known as
+    "mscale"
+    """
+    return float(
+        _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim)
+    )
+
+
+def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> float:
+    fields = ["yarn_rotary_scaling_factor", "yarn_mscale", "yarn_mscale_all_dim"]
+    if all(hasattr(config, f) for f in fields):
+        return _yarn_get_concentration_factor(
+            config.yarn_rotary_scaling_factor, config.yarn_mscale, config.yarn_mscale_all_dim
+        )
+    return 1.0

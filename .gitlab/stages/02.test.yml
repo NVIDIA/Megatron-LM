@@ -18,6 +18,11 @@ wait_for_resources:
     - test:build_image
   image: python:3.10
   timeout: 7 days
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
   tags:
     - arch/amd64
     - env/prod
@@ -31,7 +36,7 @@ wait_for_resources:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export NUM_CONCURRENT_JOBS
-    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
+    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID --target-branch $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
   rules:
     - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       when: never
@@ -158,6 +163,8 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
     ENVIRONMENT: dev
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
+      when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -172,6 +179,8 @@ test:unit_tests_pyt(LTS)_mcore(legacy):
     ENVIRONMENT: lts
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
+      when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -207,7 +216,12 @@ test:unit_tests_notify:
     - team/megatron
   script:
     - env
-    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "*dev*" ]]; then
+        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
+      else
+        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+      fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
@@ -223,7 +237,7 @@ test:unit_tests_notify:
     paths:
       - scripts
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
       when: always
     - when: never
 
@@ -362,3 +376,42 @@ test:unit_tests_x_coverage_report:
       when: on_success
     - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
       when: on_success
+
+test:safe_imports:
+  extends: [.test_rules]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/builder-large
+    - team/megatron
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
+  image:
+    name: python:3.11
+    entrypoint: [""]
+  needs: [test:build_image]
+  script:
+    - env
+    - python -m ensurepip --upgrade
+    - python -m pip install --no-cache-dir -e .
+    - python -m pip install --no-cache-dir click
+    - python .gitlab/scripts/check_imports.py --package-name megatron.core
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+  retry:
+    max: 2

@@ -68,6 +68,14 @@ def add_modelopt_args(parser):
         default=None,
         help='Path to distillation configuration yaml file.',
     )
+
+    group.add_argument(
+        '--teacher-model-config',
+        type=str,
+        default=None,
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+    )
+
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,
@@ -80,47 +88,6 @@ def add_modelopt_args(parser):
         choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
     )
-
-    # Speculative decoding
-    group.add_argument(
-        '--export-num-medusa-heads',
-        type=int,
-        default=0,
-        help='Number of Medusa heads for speculative decoding.',
-    )
-    group.add_argument(
-        '--export-eagle-algorithm',
-        type=str,
-        choices=['eagle1', 'eagle3', 'eagle-mtp'],
-        default="eagle-mtp",
-        help='Chosing the between different flavors of EAGLE algorithms.',
-    )
-    group.add_argument(
-        '--export-num-eagle-layers',
-        type=int,
-        default=0,
-        help='Number of EAGLE layers for speculative decoding.',
-    )
-    group.add_argument(
-        '--export-draft-vocab-size',
-        type=int,
-        default=0,
-        help='The reduced vocabulary size of the draft model.',
-    )
-    group.add_argument(
-        '--export-num-mtp',
-        type=int,
-        default=0,
-        help='Number of MTP modules for speculative decoding.',
-    )
-    group.add_argument(
-        '--export-freeze-mtp',
-        type=int,
-        nargs="*",
-        default=[],
-        help='Index of MTP that will be frozen in training.',
-    )
-
 
 
     # Finetuning
@@ -141,6 +108,13 @@ def add_modelopt_args(parser):
         '--export-moe-apply-probs-on-input',
         action="store_true",
         help='Use Llama-4 expert scaling on input instead of output.',
+    )
+
+    # Speculative decoding
+    group.add_argument(
+        '--export-offline-model',
+        action="store_true",
+        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
     )
 
     return parser

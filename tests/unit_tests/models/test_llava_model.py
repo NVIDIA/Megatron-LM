@@ -325,8 +325,8 @@ class TestLLaVAModel:
                 [0, 512, 1024, 1600], dtype=torch.int32
             ).cuda(),  # Just example values.
             cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
-            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).cuda(),
-            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).cuda(),
+            max_seqlen_q=1600,
+            max_seqlen_kv=1600,
         )
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
@@ -539,7 +539,7 @@ def create_test_args(cp_size, sequence_parallel):
 
 class TestLLaVAModelTokenParallel:
 
-    def _init_llava_model(self, cp_size, tp_size, sequence_parallel, cp_group=None):
+    def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
         language_hidden_size = 64
         language_num_attention_heads = 16
 
@@ -608,7 +608,6 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
-            cp_group=cp_group,
         )
 
         return model
@@ -713,9 +712,7 @@ class TestLLaVAModelTokenParallel:
         )
         model = None
         with ctx:
-            model = self._init_llava_model(
-                cp_size, tp_size, sequence_parallel, cp_group=ps.get_context_parallel_group()
-            )
+            model = self._init_llava_model(cp_size, tp_size, sequence_parallel)
 
         if model is None:
             return
@@ -772,12 +769,19 @@ def count_parameters(model):
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    "cp_size, tp_size, has_sp, seq_len, expected_padding",
-    [(1, 1, False, 99, 0), (2, 2, True, 99, 5), (2, 2, False, 99, 1)],
+    "cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding",
+    [
+        (1, 1, False, 99, False, 0),
+        (2, 2, True, 99, False, 5),
+        (2, 2, False, 99, False, 1),
+        (1, 4, False, 99, True, 13),
+    ],
 )
-def test_get_padding(cp_size, tp_size, has_sp, seq_len, expected_padding):
+def test_get_padding(cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding):
     """Test calculating padding for context parallel."""
-    padding = context_parallel.get_padding(seq_len, cp_size, tp_size, has_sp)
+    padding = context_parallel.get_padding(
+        seq_len, cp_size, tp_size, has_sp, fp8_enabled=fp8_enabled
+    )
 
     assert padding == expected_padding
 

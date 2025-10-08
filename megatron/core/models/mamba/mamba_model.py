@@ -10,7 +10,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
@@ -49,7 +49,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
-        model_comm_pgs (ModelCommProcessGroups, optional): Model communication process groups.
+        pg_collection (ProcessGroupCollection, optional): Model communication process groups.
     """
 
     def __init__(
@@ -72,9 +72,9 @@ class MambaModel(LanguageModule):
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
-        super().__init__(config=config)
+        super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -92,11 +92,6 @@ class MambaModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
-                required_pgs=['tp', 'pp', 'cp', 'tp_cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
-            )
-
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
@@ -108,7 +103,7 @@ class MambaModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=model_comm_pgs.tp,
+                tp_group=self.pg_collection.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -118,7 +113,7 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=model_comm_pgs.cp,
+                cp_group=self.pg_collection.cp,
             )
 
         self.decoder = build_module(
@@ -130,7 +125,7 @@ class MambaModel(LanguageModule):
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=self.pg_collection,
         )
 
         # Output
@@ -145,7 +140,7 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
-                tp_group=model_comm_pgs.tp,
+                tp_group=self.pg_collection.tp,
             )
 
         if self.pre_process or self.post_process:
@@ -195,6 +190,11 @@ class MambaModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        in_inference_mode = inference_context is not None and not self.training
+
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -215,7 +215,7 @@ class MambaModel(LanguageModule):
         # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
         # reference held by this caller function, enabling early garbage collection
         # for inference.
-        if inference_context is not None and not self.training:
+        if in_inference_mode:
             decoder_input = WrappedTensor(decoder_input)
 
         # The following assert will currently fail when running inference.
@@ -244,11 +244,7 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if (
-            not self.training
-            and inference_context is not None
-            and inference_context.materialize_only_last_token_logits
-        ):
+        if in_inference_mode and inference_context.materialize_only_last_token_logits:
             hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
         logits, _ = self.output_layer(

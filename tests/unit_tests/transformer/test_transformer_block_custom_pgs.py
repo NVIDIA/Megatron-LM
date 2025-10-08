@@ -17,11 +17,12 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
@@ -51,7 +52,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         submodules (TransformerLayerSubmodules): Submodule specifications with process group params
         layer_number (int, optional): Index of this layer. Defaults to 1.
         hidden_dropout (float, optional): Override dropout rate. Defaults to None.
-        model_comm_pgs (ModelCommProcessGroups, optional): Default process groups. Defaults to None.
+        pg_collection (ProcessGroupCollection, optional): Default process groups. Defaults to None.
         vp_stage (int, optional): Virtual pipeline stage. Defaults to None.
     """
 
@@ -61,7 +62,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
     ):
         # Temporarily replace attention and MLP with IdentityOp,
@@ -81,13 +82,13 @@ class HeterogenousTransformerLayer(TransformerLayer):
             submodules=new_submodules,
             layer_number=layer_number,
             hidden_dropout=hidden_dropout,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
 
         assert (
-            'model_comm_pgs' in submodules.self_attention.params
-        ), "model_comm_pgs should be in the params of the submodules"
+            'pg_collection' in submodules.self_attention.params
+        ), "pg_collection should be in the params of the submodules"
         self.self_attention = build_module(
             original_attention, config=self.config, layer_number=layer_number
         )
@@ -167,16 +168,13 @@ def copy_weights_to_tp_mlp(ref_mlp, tp_mlp, tp_group):
             tp_mlp.linear_fc2.bias.copy_(ref_fc2.bias.to(tp_mlp.linear_fc2.bias.device))
 
 
-def _gpt_te_layer_spec_with_hetro_pgs(attn_model_comm_pgs, mlp_model_comm_pgs):
+def _gpt_te_layer_spec_with_hetro_pgs(attn_pg_collection, mlp_pg_collection):
     return ModuleSpec(
         module=HeterogenousTransformerLayer,
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={
-                    "attn_mask_type": AttnMaskType.causal,
-                    "model_comm_pgs": attn_model_comm_pgs,
-                },
+                params={"attn_mask_type": AttnMaskType.causal, "pg_collection": attn_pg_collection},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -187,7 +185,7 @@ def _gpt_te_layer_spec_with_hetro_pgs(attn_model_comm_pgs, mlp_model_comm_pgs):
             pre_mlp_layernorm=IdentityOp,
             mlp=ModuleSpec(
                 module=MLP,
-                params={'tp_group': mlp_model_comm_pgs.tp},
+                params={'tp_group': mlp_pg_collection.tp},
                 submodules=MLPSubmodules(
                     linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
                 ),
@@ -263,30 +261,30 @@ class TestTransformerBlockWithProcessGroups:
         )
 
         # Create custom process groups
-        device_mesh = torch.distributed.init_device_mesh(
-            "cuda", (1, 1, dp_size, cp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "cp", "tp")
-        )
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
 
-        tp_group = device_mesh.get_group(mesh_dim="tp")
-        cp_group = device_mesh.get_group(mesh_dim="cp")
-        pp_group = device_mesh.get_group(mesh_dim="pp")
-        ep_group = device_mesh.get_group(mesh_dim="ep")
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
+        # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
+        grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
 
-        dp_group = device_mesh.get_group(mesh_dim="dp")
-        dp_cp_mesh = device_mesh["dp", "cp"]
-        dp_cp_group = dp_cp_mesh._flatten().get_group()
-        grad_comm_pgs = GradCommProcessGroups()
+        tp_group = grid.create_pg("tp")
+        cp_group = grid.create_pg("cp")
+        pp_group = grid.create_pg("pp")
+        ep_group = grid.create_pg("ep")
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
 
-        grad_comm_pgs.dp = dp_group
-        grad_comm_pgs.dp_cp = dp_cp_group
+        dp_group = grid.create_pg("dp")
+        dp_cp_group = grid.create_pg(["dp", "cp"])
+        pg_collection.dp = dp_group
+        pg_collection.dp_cp = dp_cp_group
 
         # Create a transformer block with custom process groups
         custom_block = (
             TransformerBlock(
                 transformer_config,
                 get_gpt_layer_with_transformer_engine_spec(),
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
             .cuda()
             .bfloat16()
@@ -312,8 +310,7 @@ class TestTransformerBlockWithProcessGroups:
             config=transformer_config,
             ddp_config=ddp_config,
             module=custom_block,
-            grad_comm_pgs=grad_comm_pgs,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         # Create test input
@@ -393,9 +390,9 @@ class TestTransformerBlockWithProcessGroups:
         actual_world_size = torch.cuda.device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
-        Utils.initialize_model_parallel()
+        # we are testing the custom pgs path, thus we call initialize_distributed intead of initialize_model_parallel
+        Utils.initialize_distributed()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
 
         # Create transformer configuration
         transformer_config = TransformerConfig(
@@ -410,22 +407,24 @@ class TestTransformerBlockWithProcessGroups:
         )
 
         # Create custom process groups
-        device_mesh = torch.distributed.init_device_mesh(
-            "cuda",
-            (attn_tp_size, attn_cp_size, mlp_tp_size),
-            mesh_dim_names=("attn_tp", "attn_cp", "mlp_tp"),
-        )
-        attn_tp_group = device_mesh.get_group(mesh_dim="attn_tp")
-        attn_cp_group = device_mesh.get_group(mesh_dim="attn_cp")
-        mlp_tp_group = device_mesh.get_group(mesh_dim="mlp_tp")
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
 
-        attn_model_comm_pgs = ModelCommProcessGroups(tp=attn_tp_group, cp=attn_cp_group)
-        mlp_model_comm_pgs = ModelCommProcessGroups(tp=mlp_tp_group)
+        # Create HyperCommGrid with dimensions mlp_tp, attn_cp, attn_tp (reversed from device mesh order)
+        grid = HyperCommGrid(
+            [mlp_tp_size, attn_cp_size, attn_tp_size], ["mlp_tp", "attn_cp", "attn_tp"]
+        )
+
+        attn_tp_group = grid.create_pg("attn_tp")
+        attn_cp_group = grid.create_pg("attn_cp")
+        mlp_tp_group = grid.create_pg("mlp_tp")
+
+        attn_pg_collection = ProcessGroupCollection(tp=attn_tp_group, cp=attn_cp_group)
+        mlp_pg_collection = ProcessGroupCollection(tp=mlp_tp_group)
 
         # Get the layer spec with different process groups for attention and mlp
-        hetro_layer_spec = _gpt_te_layer_spec_with_hetro_pgs(
-            attn_model_comm_pgs, mlp_model_comm_pgs
-        )
+        hetro_layer_spec = _gpt_te_layer_spec_with_hetro_pgs(attn_pg_collection, mlp_pg_collection)
         custom_block = TransformerBlock(transformer_config, hetro_layer_spec).cuda().bfloat16()
 
         sequence_length = 4096
@@ -470,16 +469,20 @@ class TestTransformerBlockWithProcessGroups:
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
-        Utils.initialize_model_parallel()
+        Utils.initialize_distributed()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
-        grid_cp_2_tp_4 = torch.distributed.init_device_mesh(
-            "cuda", (2, 4), mesh_dim_names=("cp", "tp")
-        )
 
-        tp_group = grid_cp_2_tp_4.get_group(mesh_dim="tp")
-        cp_group = grid_cp_2_tp_4.get_group(mesh_dim="cp")
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        # Create HyperCommGrid with dimensions tp, cp (reversed from device mesh order)
+        grid_cp_2_tp_4 = HyperCommGrid([4, 2, 1, 1], ["tp", "cp", "ep", "pp"])
+
+        tp_group = grid_cp_2_tp_4.create_pg("tp")
+        cp_group = grid_cp_2_tp_4.create_pg("cp")
+        ep_group = grid_cp_2_tp_4.create_pg("ep")
+        pp_group = grid_cp_2_tp_4.create_pg("pp")
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, ep=ep_group, pp=pp_group)
+        model_parallel_cuda_manual_seed(
+            1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank()
+        )
 
         transformer_config = TransformerConfig(
             num_layers=3,
@@ -494,7 +497,7 @@ class TestTransformerBlockWithProcessGroups:
             TransformerBlock(
                 transformer_config,
                 get_gpt_layer_with_transformer_engine_spec(),
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
             .cuda()
             .bfloat16()
@@ -511,27 +514,28 @@ class TestTransformerBlockWithProcessGroups:
         )
         hidden_states.retain_grad()
 
-        grid_cp_2_tp_2_dp_2 = torch.distributed.init_device_mesh(
-            "cuda", (2, 2, 2, 1, 1), mesh_dim_names=("cp", "tp", "dp", "pp", "ep")
-        )
-        tp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="tp")
-        cp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="cp")
-        dp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="dp")
-        pp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="pp")
-        ep_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="ep")
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
-        grad_comm_pgs = GradCommProcessGroups()
+        # Create HyperCommGrid with dimensions ep, pp, dp, cp, tp (reversed from device mesh order)
+        grid_cp_2_tp_2_dp_2 = HyperCommGrid([2, 2, 2, 1, 1], ["tp", "cp", "dp", "pp", "ep"])
+        tp_group = grid_cp_2_tp_2_dp_2.create_pg("tp")
+        cp_group = grid_cp_2_tp_2_dp_2.create_pg("cp")
+        dp_group = grid_cp_2_tp_2_dp_2.create_pg("dp")
+        pp_group = grid_cp_2_tp_2_dp_2.create_pg("pp")
+        ep_group = grid_cp_2_tp_2_dp_2.create_pg("ep")
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
 
-        dp_cp_mesh = grid_cp_2_tp_2_dp_2["cp", "dp"]
-        dp_cp_group = dp_cp_mesh._flatten().get_group()
-        grad_comm_pgs.dp = dp_group
-        grad_comm_pgs.dp_cp = dp_cp_group
+        model_parallel_cuda_manual_seed(
+            1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank()
+        )
+
+        dp_cp_group = grid_cp_2_tp_2_dp_2.create_pg(["dp", "cp"])
+        pg_collection.dp = dp_group
+        pg_collection.dp_cp = dp_cp_group
 
         transformer_block_cp2_tp2 = (
             TransformerBlock(
                 transformer_config,
                 get_gpt_layer_with_transformer_engine_spec(),
-                model_comm_pgs=model_comm_pgs,
+                pg_collection=pg_collection,
             )
             .cuda()
             .bfloat16()
@@ -542,8 +546,7 @@ class TestTransformerBlockWithProcessGroups:
             config=transformer_config,
             ddp_config=ddp_config,
             module=transformer_block_cp2_tp2,
-            grad_comm_pgs=grad_comm_pgs,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         output_cp2_tp_2_dp_2 = transformer_block_cp2_tp2_dp_2(
@@ -609,23 +612,25 @@ class TestTransformerBlockWithProcessGroups:
         torch.manual_seed(12345)
         model_parallel_cuda_manual_seed(123)
 
-        if reverse_tp_dp_order:
-            device_mesh = torch.distributed.init_device_mesh(
-                "cuda", (1, 1, tp_size, dp_size), mesh_dim_names=("pp", "ep", "tp", "dp")
-            )
-        else:
-            device_mesh = torch.distributed.init_device_mesh(
-                "cuda", (1, 1, dp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "tp")
-            )
-        pp_group = device_mesh.get_group(mesh_dim="pp")
-        ep_group = device_mesh.get_group(mesh_dim="ep")
-        dp_group = device_mesh.get_group(mesh_dim="dp")
-        tp_group = device_mesh.get_group(mesh_dim="tp")
-        mlp_model_comm_pgs = ModelCommProcessGroups(tp=tp_group, pp=pp_group, ep=ep_group)
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
 
-        grad_comm_pgs = GradCommProcessGroups()
-        grad_comm_pgs.dp = dp_group
-        grad_comm_pgs.dp_cp = dp_group
+        if reverse_tp_dp_order:
+            # Create HyperCommGrid with dimensions ep, pp, tp, dp (reversed from device mesh order)
+            grid = HyperCommGrid([dp_size, tp_size, 1, 1], ["dp", "tp", "pp", "ep"])
+        else:
+            # Create HyperCommGrid with dimensions ep, pp, dp, tp (reversed from device mesh order)
+            grid = HyperCommGrid([tp_size, dp_size, 1, 1], ["tp", "dp", "pp", "ep"])
+
+        pp_group = grid.create_pg("pp")
+        ep_group = grid.create_pg("ep")
+        dp_group = grid.create_pg("dp")
+        tp_group = grid.create_pg("tp")
+        mlp_pg_collection = ProcessGroupCollection(tp=tp_group, pp=pp_group, ep=ep_group)
+
+        mlp_pg_collection.dp = dp_group
+        mlp_pg_collection.dp_cp = dp_group
 
         transformer_config = TransformerConfig(
             num_layers=1,
@@ -647,7 +652,7 @@ class TestTransformerBlockWithProcessGroups:
 
         custom_mlp_spec = ModuleSpec(
             module=MLP,
-            params={'tp_group': mlp_model_comm_pgs.tp},
+            params={'tp_group': mlp_pg_collection.tp},
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
             ),
@@ -674,8 +679,7 @@ class TestTransformerBlockWithProcessGroups:
             config=transformer_config,
             ddp_config=ddp_config,
             module=custom_mlp,
-            model_comm_pgs=mlp_model_comm_pgs,
-            grad_comm_pgs=grad_comm_pgs,
+            pg_collection=mlp_pg_collection,
         )
 
         sequence_length = 4096

@@ -6,14 +6,23 @@ import pytest
 import torch
 from packaging import version
 
-from megatron.core import parallel_state
+import megatron.core.parallel_state as parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
+
+    HAVE_FUSED_QKV_ROPE = True
+except ImportError:
+    HAVE_FUSED_QKV_ROPE = False
 
 
 class TestParallelAttention:
@@ -74,8 +83,17 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
-    def test_fused_rope_gpu_forward(self):
+    @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
+    @pytest.mark.parametrize("rotary_interleaved", [True, False])
+    @pytest.mark.parametrize("fused_qkv_rope", [True, False])
+    def test_fused_rope_gpu_forward(self, rotary_interleaved, fused_qkv_rope):
         self.parallel_attention.config.apply_rope_fusion = True
+        if rotary_interleaved and not is_te_min_version("2.3.0"):
+            pytest.skip("Only TE >= 2.3.0 supports interleaved fused RoPE.")
+        if fused_qkv_rope and not HAVE_FUSED_QKV_ROPE:
+            pytest.skip("Fused QKV RoPE not available.")
+        self.parallel_attention.config.rotary_interleaved = rotary_interleaved
+        self.parallel_attention.config.fused_single_qkv_rope = fused_qkv_rope
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2
@@ -103,6 +121,7 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
+        self.parallel_attention.config.rotary_interleaved = False
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
@@ -146,8 +165,8 @@ class TestSelfAttention:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def run_self_attention(self, model_comm_pgs):
-        tensor_model_parallel_size = torch.distributed.get_world_size(model_comm_pgs.tp)
+    def run_self_attention(self, pg_collection):
+        tensor_model_parallel_size = torch.distributed.get_world_size(pg_collection.tp)
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -160,7 +179,7 @@ class TestSelfAttention:
             get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         config = self.self_attention.config
@@ -198,9 +217,9 @@ class TestSelfAttention:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
 
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
-        self.run_self_attention(model_comm_pgs)
+        self.run_self_attention(pg_collection)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
@@ -216,14 +235,17 @@ class TestSelfAttention:
         )
         model_parallel_cuda_manual_seed(123)
 
-        # Create device mesh for TP and CP groups
-        device_mesh = torch.distributed.init_device_mesh(
-            "cuda", (tp_size, cp_size), mesh_dim_names=("tp", "cp")
-        )
-        # Get TP and CP process groups from device mesh
-        tp_group = device_mesh.get_group(mesh_dim="tp")
-        cp_group = device_mesh.get_group(mesh_dim="cp")
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
 
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        # Create HyperCommGrid with dimensions cp, tp (reversed from device mesh order)
+        grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])
 
-        self.run_self_attention(model_comm_pgs)
+        # Get TP and CP process groups from HyperCommGrid
+        tp_group = grid.create_pg("tp")
+        cp_group = grid.create_pg("cp")
+
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        self.run_self_attention(pg_collection)

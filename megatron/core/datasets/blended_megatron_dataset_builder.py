@@ -35,7 +35,8 @@ class BlendedMegatronDatasetBuilder(object):
 
         is_built_on_rank (Callable): A callable which returns True if the dataset should be built on
             the current rank and False otherwise. It should be Megatron Core parallelism aware i.e.
-            global rank, local group rank, and virtual rank may inform its return value.
+            global rank, local group rank, and virtual rank may inform its return value. Should
+            return true for exactly one process on global rank 0.
 
         config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
     """
@@ -68,16 +69,9 @@ class BlendedMegatronDatasetBuilder(object):
                         continue
                     weights_are_none = self.config.blend_per_split[split.value][1] is None
                 if size_is_none:
-                    assert (
-                        weights_are_none
-                    ), f"size_is_none => weights_are_none fails for {split.name} split"
-
-        if torch.distributed.is_initialized():
-            gb_rank = torch.distributed.get_rank()
-            if gb_rank == 0:
-                assert (
-                    self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0"
+                    assert weights_are_none, f"""size_is_none => weights_are_none fails 
+                    for {split.name} split
+                    This can occur with multiple validation sets if datasets have weights"""
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
@@ -251,6 +245,20 @@ class BlendedMegatronDatasetBuilder(object):
                         blended_datasets[i] = self._build_megatron_dataset_splits(
                             prefixes[0], split_spoof, sizes_spoof
                         )[i]
+                        continue
+                    elif self.config.multiple_validation_sets and i == Split.valid.value:
+                        # handle multiple validation sets
+                        validation_datasets = []
+                        if self.config.full_validation:
+                            # verify that size is None, which causes a single epoch dataset
+                            # to be built
+                            assert sizes_spoof[i] is None
+                        for prefix in prefixes:
+                            ds = self._build_megatron_dataset_splits(
+                                prefix, split_spoof, sizes_spoof
+                            )[i]
+                            validation_datasets.append(ds)
+                        blended_datasets[i] = validation_datasets
                         continue
 
                     # Build mid-level datasets
@@ -529,6 +537,7 @@ def _get_size_per_split_per_dataset(
     Returns:
         List[List[int]]: The number of samples to request per MegatronDataset per split
     """
+
     assert numpy.isclose(sum(normalized_weights), 1.0)
 
     # Use margin as buffer to ensure we satiate the request

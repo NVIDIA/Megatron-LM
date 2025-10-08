@@ -19,7 +19,7 @@ from torch.nn.modules.loss import _Loss
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_rank,
+    get_context_parallel_group,
     get_pipeline_model_parallel_world_size,
     get_tensor_and_context_parallel_rank,
     get_tensor_model_parallel_group,
@@ -28,11 +28,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
 from megatron.core.transformer import MegatronModule, TransformerConfig, TransformerLayer
-from megatron.core.utils import (
-    get_model_config,
-    get_model_type,
-    get_model_xattn,
-)
+from megatron.core.utils import get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +58,7 @@ def load_distillation_config(
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
 
-    intermediate_pairs = cfg["intermediate_layer_pairs"]
+    intermediate_pairs = cfg.get("intermediate_layer_pairs", [])
     logit_pair = cfg["logit_layers"]
     skip_lm_loss = cfg["skip_lm_loss"]
     loss_scale = cfg["kd_loss_scale"]
@@ -73,7 +69,22 @@ def load_distillation_config(
         # NOTE: Projection layer shared among intermediate layer pairs.
         projection_layer = ProjectionLayer(student_cfg, teacher_cfg)
 
-        for student_layer, teacher_layer in intermediate_pairs:
+        for entry in intermediate_pairs:
+            if len(entry) == 2:
+                student_layer, teacher_layer = entry
+                loss = "hidden_cosine"
+            elif len(entry) == 3:
+                student_layer, teacher_layer, loss = entry
+
+            loss_fn = None
+
+            if loss == "mse":
+                loss_fn = MSELoss
+            elif loss == "hidden_cosine":
+                loss_fn = HiddenStateCosineLoss
+            else:
+                assert False, f"loss passed was {loss=}"
+
             if get_tensor_and_context_parallel_rank() == 0:
                 print(
                     "Distillation: Adding intermediate loss between"
@@ -82,7 +93,7 @@ def load_distillation_config(
                 )
             student_layer = _adjust_layer_index_for_pp(student_layer, student_cfg)
             teacher_layer = _adjust_layer_index_for_pp(teacher_layer, teacher_cfg)
-            criterion[(student_layer, teacher_layer)] = HiddenStateCosineLoss(
+            criterion[(student_layer, teacher_layer)] = loss_fn(
                 student_cfg, projection_layer=projection_layer
             )
 
@@ -201,6 +212,27 @@ class HiddenStateCosineLoss(BaseLoss):
         loss = loss.view(*predictions.shape[:2])
 
         # NOTE: Tensor sequence length is still split among TP ranks.
+        return self.post_forward(loss, is_sequence_parallel=self._config.sequence_parallel)
+
+
+class MSELoss(BaseLoss):
+    """Calculates MSE loss between two tensors without reducing the sequence dim."""
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        """Forward function.
+
+        Args:
+            predictions: Student model tensors (size [s, b, h])
+            targets: Teacher model tensors (size [s, b, h])
+
+        Returns:
+            MSE loss of tensors (size [b, s])
+        """
+        predictions, targets = self.pre_forward(predictions, targets)
+
+        loss = F.mse_loss(predictions, targets, reduction="none")
+        loss = loss.mean(dim=-1)
+
         return self.post_forward(loss, is_sequence_parallel=self._config.sequence_parallel)
 
 
@@ -533,28 +565,25 @@ def get_tensor_shapes_adjust_fn_for_distillation(
         return None
 
     def adjust_tensor_shapes(recv_tensor_shapes: List[Tuple[int, ...]], send_tensor_shapes: List[Tuple[int, ...]]):
-        rank = get_pipeline_model_parallel_rank()
         teacher_config = get_model_config(model.teacher_model)
-        teacher_model_type = get_model_type(model.teacher_model)
-        teacher_encoder_decoder_xattn = get_model_xattn(model.teacher_model)
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
 
         teacher_recv_tensor_shapes = get_tensor_shapes(
-            rank=rank - 1,
-            model_type=teacher_model_type,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=teacher_config,
-            encoder_decoder_xattn=teacher_encoder_decoder_xattn,
+            tp_group=tp_group,
+            cp_group=cp_group,
         )
         teacher_send_tensor_shapes = get_tensor_shapes(
-            rank=rank,
-            model_type=teacher_model_type,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=teacher_config,
-            encoder_decoder_xattn=teacher_encoder_decoder_xattn,
+            tp_group=tp_group,
+            cp_group=cp_group,
         )
         model.set_student_input_tensor_shape(recv_tensor_shapes)
 

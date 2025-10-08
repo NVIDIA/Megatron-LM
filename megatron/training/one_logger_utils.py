@@ -3,7 +3,7 @@ import time, os
 
 from .global_vars import get_one_logger, get_args
 
-_one_logger_utils_version = "1.1.0-mlm"
+_one_logger_utils_version = "1.2.0-mlm"
 
 
 def get_timestamp_in_ms():
