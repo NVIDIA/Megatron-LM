@@ -682,7 +682,12 @@ class TestDynamicInferenceEngine:
         assert len(finished_requests) == len(
             prompts
         ), "Should return same number of finished requests as prompts"
-        print()
+
+        request_ids = [r.request_id for r in finished_requests]
+        assert request_ids == sorted(
+            request_ids
+        ), f"Request ids are not in sorted order: {request_ids}"
+
         # Check each request was processed
         for i, request in enumerate(finished_requests):
             # Verify each request has generated tokens
