@@ -54,6 +54,10 @@ class TransformerConfig(ModelParallelConfig):
     mtp_loss_scaling_factor: Optional[float] = None
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
