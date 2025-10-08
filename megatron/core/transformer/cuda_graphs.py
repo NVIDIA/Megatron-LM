@@ -833,7 +833,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
-            if not self.is_first_layer:
+            if self.is_transformer_decoder_layer and not self.is_first_layer:
                 # transformer layers hidden_states are already saved as the output of the previous
                 # layer's cudagraph so avoid saving again
                 kwargs_copy = dict(kwargs)
