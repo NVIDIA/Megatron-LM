@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=2
+GPUS_PER_NODE=8
 NUM_NODES=1
 DEBUG_MODE=false    # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678     # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
@@ -53,6 +53,7 @@ DISTRIBUTED_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
+    --context-parallel-size 2
 )
 
 TRAINING_ARGS=(
@@ -138,7 +139,7 @@ else
     ${GPT_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
-    torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    nsys profile -w true -t cublas,cuda,nvtx,osrt -s cpu -c cudaProfilerApi -o /workspace/logs/nsys/output uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py  --profile \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \

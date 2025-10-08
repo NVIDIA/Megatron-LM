@@ -119,7 +119,7 @@ class MimoModel(MegatronModule):
         device = reference_embeddings.device
         dtype = reference_embeddings.dtype
 
-        batch_size, seq_length = input_ids.size()
+        batch_size, seq_length = input_ids.size() # input_ids is [B, S]
         logger.debug(
             f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
         )
@@ -250,7 +250,7 @@ class MimoModel(MegatronModule):
         special_token_ids: Optional[Dict[str, int]] = None,
         packing_kwargs: Optional[dict] = None,
     ):
-        """Forward pass through the multimodal model.
+        f"""Forward pass through the multimodal model.
 
         Args:
             input_ids: Input token IDs. Shape: (B, S)
@@ -273,7 +273,15 @@ class MimoModel(MegatronModule):
                                special token IDs. If provided, these will override the
                                model's configured special_token_ids.
             packing_kwargs: Optional dictionary of kwargs to construct PackedSeqParams
-                            if packed_seq_params is not provided.
+                            if packed_seq_params is not provided. For example:
+                                {
+                                    "cu_seqlens_q": cu_seqlens,
+                                    "cu_seqlens_kv": cu_seqlens,
+                                    "cu_seqlens_q_padded": cu_seqlens_padded,
+                                    "cu_seqlens_kv_padded": cu_seqlens_padded,
+                                    "max_seqlen_q": torch.tensor(max(seqlens_padded), dtype=torch.int32),
+                                    "max_seqlen_kv": torch.tensor(max(seqlens_padded), dtype=torch.int32),
+                                }
 
         Returns:
             tuple: Tuple containing model outputs and loss mask
@@ -340,7 +348,7 @@ class MimoModel(MegatronModule):
                     embeddings=combined_embeddings,
                     labels=labels,
                     loss_mask=loss_mask,
-                    attention_mask=None,
+                    attention_mask=attention_mask,
                     packed_seq_params=packed_seq_params,
                     pre=self.pre_process,
                     post=self.post_process,
