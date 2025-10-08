@@ -61,6 +61,7 @@ jobs:
 
       - name: Run linting
         run: |
+          export PATH=".venv/bin:$PATH"
           export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}" 
           export CHECK_ONLY=true 
           export SKIP_DOCS=false 
