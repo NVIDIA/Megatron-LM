@@ -31,14 +31,20 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.53.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
 
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
     if: |
-      !(needs.pre-flight.outputs.is_deployment_workflow == 'true'
-      || needs.pre-flight.outputs.docs_only == 'true')
+      (
+        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+          && needs.pre-flight.outputs.is_ci_workload == 'true'
+      ) || (
+        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+          && needs.pre-flight.outputs.is_ci_workload == 'false'
+          && needs.pre-flight.outputs.docs_only == 'false'
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -97,7 +103,7 @@ jobs:
     environment: nemo-ci
     if: |
       (
-        success()
+        success() 
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -163,7 +169,8 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || always()
       )
       && !cancelled()
     runs-on: ubuntu-latest
@@ -174,96 +181,33 @@ jobs:
 
       - name: Get workflow result
         id: result
+        shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
         run: |
-          # Get workflow run details and check job conclusions
-          LATEST_ATTEMPT=$(gh run view $RUN_ID --json jobs -q '[.jobs[] | select(.conclusion != null) | .conclusion] | last')
-          NUM_FAILED=$(gh run view $RUN_ID --json jobs -q '[.jobs[] | select(.conclusion == "failure") | .name] | length')
-          NUM_CANCELLED=$(gh run view $RUN_ID --json jobs -q '[.jobs[] | select(.conclusion == "cancelled") | .name] | length')
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 
-          if [[ $NUM_FAILED -eq 0 && $NUM_CANCELLED -eq 0 ]]; then
-            RESULT="success"
-          elif [[ $NUM_CANCELLED -gt 0 ]]; then
-            RESULT="cancelled"
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
           else
-            RESULT="failure"
-          fi
-
-          # Output the final status
-          echo "code=$RESULT" | tee -a $GITHUB_OUTPUT
-
-      - name: Checkout for GH CLI
-        uses: actions/checkout@v4
-
-      - name: Remove label if not cancelled
-        if: |
-          steps.result.outputs.code != 'cancelled'
-          && github.event.label.name == 'Run CICD'
-          && github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.number }}
-        run: gh pr edit "$PR_NUMBER" --remove-label "Run CICD"
-
-      - name: Pipeline successful, add PR comment
-        if: |
-          steps.result.outputs.code == 'success'
-          && github.event_name == 'pull_request'
-          && env.SLACK_WEBHOOK != ''
-        uses: peter-evans/create-or-update-comment@v4
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-        with:
-          issue-number: ${{ github.event.number }}
-          body: |
-            [🤖]: Hi @${{ github.event.pull_request.user.login }} 👋,
-
-            We wanted to let you know that a [CICD pipeline](https://github.com/${{ env.REPOSITORY }}/actions/runs/${{ env.RUN_ID }}) for this PR just finished successfully.
-
-            So it might be time to merge this PR or get some approvals.
-
-            //cc @chtruong814 @ko3n1g @pablo-garay @thomasdhc
-
-      - name: "Pipeline not successful and not cancelled: Send Slack alert & create step summary"
-        if: |
-          steps.result.outputs.code == 'failure'
-          && github.event.label.name == 'Run CICD'
-          && env.SLACK_WEBHOOK != ''
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          PR_NUMBER: ${{ github.event.number }}
-          SERVER_URL: ${{ github.server_url }}
-        run: |
-          set -x
-          pip install PyGithub
-          export BRANCH_NAME=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
-
-          python .github/scripts/notify.py
-
-      - name: Exit
-        if: ${{ always() }}
-        env:
-          RESULT: ${{ steps.result.outputs.code }}
-        run: |
-          if [ $RESULT == "success" ]; then
-            exit 0
-          else
-            exit 1
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              # Show which jobs failed
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              exit 1
           fi
 
   Coverage_Fake:
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test, pre-flight]
     if: |
-      (needs.pre-flight.outputs.docs_only == 'true'
-      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      )
+      && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
     environment: nemo-ci
     steps:
@@ -286,9 +230,8 @@ jobs:
     needs: [Nemo_CICD_Test]
     if: |
       (
-        needs.pre-flight.outputs.docs_only == 'false'
-        && needs.pre-flight.outputs.is_deployment_workflow == 'false'
-        && success()
+        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || success()
       )
       && !cancelled()
     strategy:
