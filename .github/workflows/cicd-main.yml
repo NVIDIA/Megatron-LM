@@ -20,6 +20,8 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -30,8 +32,20 @@ permissions:
   contents: read
 
 jobs:
+  # pre-flight:
+  # uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    runs-on: ubuntu-latest
+    outputs:
+      is_ci_workload: "false"
+      force_run_all: "false"
+      docs_only: "false"
+      is_deployment_workflow: "false"
+      is_merge_group: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
   linting:
     runs-on: ubuntu-latest
@@ -44,6 +58,7 @@ jobs:
         needs.pre-flight.outputs.is_deployment_workflow == 'false' 
           && needs.pre-flight.outputs.is_ci_workload == 'false'
           && needs.pre-flight.outputs.docs_only == 'false'
+          && needs.pre-flight.outputs.is_merge_group == 'false'
       )
     steps:
       - name: Checkout
@@ -80,6 +95,7 @@ jobs:
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.docs_only == 'true')
     steps:
       - name: Running CI tests
@@ -170,6 +186,7 @@ jobs:
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
         || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
         || always()
       )
       && !cancelled()
@@ -185,7 +202,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 
@@ -206,6 +223,7 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || github.event == 'merge_group'
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
