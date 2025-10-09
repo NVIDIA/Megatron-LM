@@ -903,12 +903,12 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
-    assert not (args.hybrid_context_parallel
-    and (args.pipeline_model_parallel_size > 1
-         or args.enable_cuda_graph
-         or args.use_megatron_fsdp
-         or args.dataloader_type != 'single')
-    ), "Hybrid context parallelism not supported with pipeline parallelism, CUDA Graph, FSDP and non-single dataloader type now"
+    if args.hybrid_context_parallel:
+        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
+        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
+        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
+        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
+        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
