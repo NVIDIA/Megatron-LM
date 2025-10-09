@@ -199,6 +199,13 @@ class MoELayer(BaseMoELayer):
         The original hidden states are returned as a residual connection.
         """
         residual = hidden_states
+
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        # Shared expert computation is still performed in hidden dimension with the 'residual' tensor.
+        if self.config.moe_latent_size:
+            assert not self.shared_expert_overlap, "Shared expert overlap not supported when MoE latent projections are used."
+            hidden_states, _ = self.fc1_latent_proj(hidden_states)
+
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -256,6 +263,11 @@ class MoELayer(BaseMoELayer):
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
+
+        # Project the output back from latent dimension to hidden dimension.
+        if self.config.moe_latent_size:
+            output, _ = self.fc2_latent_proj(output)
+
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -267,25 +279,13 @@ class MoELayer(BaseMoELayer):
 
     def dispatch_compute_combine(self, hidden_states, probs, residual, shared_expert_output=None):
         """This is a combined method of dispatch, compute, and combine."""
-        # Project the hidden_states from hidden dimension down to latent dimenion.
-        # Shared expert computation is still performed in hidden dimension with the 'residual' tensor.
-        if self.config.moe_latent_size:
-            assert not self.shared_expert_overlap, "Shared expert overlap not supported when MoE latent projections are used."
-            experts_input, _ = self.fc1_latent_proj(hidden_states)
-        else:
-            experts_input = hidden_states
-
-        dispatched_input, probs = self.dispatch(experts_input, probs)
+        dispatched_input, probs = self.dispatch(hidden_states, probs)
         output, shared_expert_output, mlp_bias = self.experts_compute(
             dispatched_input, probs, residual, shared_expert_output
         )
-
-        # Project the output back from latent dimension to hidden dimension
-        if self.config.moe_latent_size:
-            if mlp_bias is not None:
-                output = output + mlp_bias
-            output, mlp_bias = self.fc2_latent_proj(output)
-
+        if self.config.moe_latent_size and mlp_bias is not None:
+            output = output + mlp_bias
+            mlp_bias = None
         output = self.combine(output, shared_expert_output)
         return output, mlp_bias
 
