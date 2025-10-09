@@ -68,13 +68,16 @@ class HybridCPDataLoaderWrapper:
             max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank
         )
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        self.dp_cp_group = pg_collection.dp_cp
-        self.dp_group = pg_collection.dp
-        self.tp_group = pg_collection.tp
+            self.dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+            self.dp_group = parallel_state.get_data_parallel_group()
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            self.dp_cp_group = pg_collection.dp_cp
+            self.dp_group = pg_collection.dp
+            self.tp_group = pg_collection.tp
         assert (
             self.dp_cp_group is not None and self.dp_group is not None
-        ), "dp_cp_group and dp_group not found in pg_collection"
+        ), "dp_cp_group and dp_group not found"
 
         self.total_hdp_gpus = self.dp_cp_group.size()
 
