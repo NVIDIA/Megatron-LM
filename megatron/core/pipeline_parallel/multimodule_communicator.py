@@ -242,14 +242,22 @@ class MultiModulePipelineCommunicator:
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [receive_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name}')
-                    input_dict[bridge_comm.src_module_name] = bridge_comm.recv_forward()
+                    received_tensor = bridge_comm.recv_forward()
+                    if received_tensor.shape[-1] == 1:
+                        received_tensor = received_tensor.squeeze(-1)
+                    input_dict[bridge_comm.src_module_name] = received_tensor
                     logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [receive_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} tensor shape: {input_dict[bridge_comm.src_module_name].shape} sum {input_dict[bridge_comm.src_module_name].sum()} DONE')
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
                 logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [receive_forward] p2p comm module_name: {module_name} ')
-                input_dict[module_name] = rank_module_info.p2p_communicator.recv_forward(
+                received_tensor = rank_module_info.p2p_communicator.recv_forward(
                     tensor_shapes=tensor_shape, is_first_stage=False
                 )
+                if isinstance(received_tensor, torch.Tensor) and received_tensor.shape[-1] == 1:
+                    received_tensor = received_tensor.squeeze(-1)
+                elif isinstance(received_tensor, list):
+                    received_tensor = [tensor.squeeze(-1) if tensor.shape[-1] == 1 else tensor for tensor in received_tensor]
+                input_dict[module_name] = received_tensor
                 logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [receive_forward] p2p comm module_name: {module_name} tensor shape: {input_dict[module_name][0].shape} sum {input_dict[module_name][0].sum()} DONE')
         return input_dict
 
@@ -265,14 +273,25 @@ class MultiModulePipelineCommunicator:
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
                     logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name}], module_name: {module_name} tensor shape: {output_dict[module_name].shape} sum {output_dict[module_name].sum()}')
-                    bridge_comm.send_forward(output_dict[module_name])
+                    tensor_to_send = output_dict[module_name]
+                    if tensor_to_send.ndim == 2:
+                        # p2p and bridge assumes we are exchaning 3d tensor
+                        # modality encoders may return  2d tensor (b*s, h)
+                        tensor_to_send = tensor_to_send.unsqueeze(-1)
+                    bridge_comm.send_forward(tensor_to_send)
                     # time.sleep(10)
                     logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] bridge [src - {bridge_comm.src_module_name}] [dest - {bridge_comm.dest_module_name} DONE')
             else:
                 # If not last stage, send forward activation by using P2P communicator.
+                logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] p2p comm module_name: {module_name} output dict keys: {output_dict.keys()}')
                 logging.debug(f'[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] [send_forward] p2p comm module_name: {module_name} tensor shape: {output_dict[module_name].shape} sum {output_dict[module_name].sum()}')
+                tensor_to_send = output_dict[module_name]
+                if tensor_to_send.ndim == 2:
+                    # p2p and bridge assumes we are exchaning 3d tensor
+                    # modality encoders may return  2d tensor (b*s, h)
+                    tensor_to_send = tensor_to_send.unsqueeze(-1)
                 rank_module_info.p2p_communicator.send_forward(
-                    output_dict[module_name], is_last_stage=False
+                    tensor_to_send, is_last_stage=False
                 )
 
     def send_forward_recv_backward(
