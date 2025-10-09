@@ -231,7 +231,7 @@ def model_provider(
         }
     elif runtime_args.model_provider == "mock":
         kwargs = {
-            "image_special_token_id": image_special_token_id,
+            "special_token_id": image_special_token_id,
         }
     else:
         raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock']")
