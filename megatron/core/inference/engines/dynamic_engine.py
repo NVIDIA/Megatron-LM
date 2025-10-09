@@ -518,15 +518,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs = []
                     # If the request log probs span > 1 token we are in prefill
                     if len(request_log_probs) > 1:
-                        if torch.distributed.get_rank() == 0:
-                            print(f"Adding {len(request_log_probs)} log probs to prompt_log_probs")
                         request.prompt_log_probs.extend(request_log_probs[:-1])
                         request.generated_log_probs.append(request_log_probs[-1])
                     else:
-                        if torch.distributed.get_rank() == 0:
-                            print(
-                                f"Adding {len(request_log_probs)} log probs to generated_log_probs"
-                            )
                         request.generated_log_probs.extend(request_log_probs)
 
                 if request_id in finished_request_ids:
