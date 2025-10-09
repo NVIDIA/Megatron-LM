@@ -5,6 +5,10 @@ Fine-grained Activation Offloading
 <h4>NVIDIA, rednote</h4>
 <div align="left">
 
+# What is Fine-grained Activation Offloading?
+
+Memory capacity are more and more important with the rising of extreme sparse MoE models like DeepSeek-V3 and Qwen3-235B. Fine-grained Activation Offloading targets at offloading the activation at the granularity of specific modules, so that we can calibrate the amount of offloading activation to maximize the training throughput.
+
 # Quick Start
 
 ```bash
@@ -24,6 +28,8 @@ Fine-grained Activation Offloading
 * Support MTP
 * Support mixed dense & moe layer
 * Support A2A Overlap
+* Support CUDA Graph
+  * (Temporary) cuda graph scope cannot contains the offloading modules
 
 ## Known issues
 * We explicitly resize some tensors to 0 to release the memory space immediately, which sometimes leads to illegal memory access. Please remove the released tensors in `group_prefetch_offload_commit` if you run into the issue.
