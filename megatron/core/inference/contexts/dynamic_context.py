@@ -1118,20 +1118,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
 
-    def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
-        """
-        Swaps all the relevent booking tensors with src idxs to dst idxs
-        """
-        tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
-        tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
-        tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
-        tensor_swap(self.request_ids, src_idxs, dst_idxs)
-        tensor_swap(next_tokens, src_idxs, dst_idxs)
-        tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
-        tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
-        tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
-        tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
-
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
