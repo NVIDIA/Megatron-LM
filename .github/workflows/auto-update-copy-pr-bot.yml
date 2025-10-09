@@ -1,0 +1,30 @@
+on:
+  push:
+
+jobs:
+  auto-update-copy-pr-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Fetch list of members in mcore-reviewers team
+        shell: bash -euxo pipefail {0}
+        run: |
+          #!/bin/bash
+
+          get_members() {
+              local org=$1 team=$2 seen_file=$3    
+
+              gh api "/orgs/$org/teams/$team/members" --paginate --jq '.[].login' >> "$seen_file"
+              
+              gh api "/orgs/$org/teams/$team/teams" --paginate --jq '.[].slug' | while read -r child; do
+                  get_members "$org" "$child" "$seen_file"
+              done
+
+              cat "$seen_file"
+          }
+
+          tmp=$(mktemp)
+          get_members "NVIDIA" "mcore-reviewers" "$tmp" | sort -u > final.txt && rm "$tmp"
+          cat final.txt
