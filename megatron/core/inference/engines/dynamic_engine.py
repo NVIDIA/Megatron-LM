@@ -3,6 +3,7 @@
 import asyncio
 import multiprocessing
 import os
+import psutil
 import struct
 import time
 import warnings
@@ -19,6 +20,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
+    get_mem_size_str,
     WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -54,6 +56,9 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+
+process = psutil.Process(os.getpid())
 
 
 def format_mem_bytes(mem_bytes):
@@ -620,10 +625,16 @@ class DynamicInferenceEngine(AbstractEngine):
             context = self.context
             mem = torch.cuda.memory_stats()
             step_type = "decode" if is_decode_only else "non-decode"
+            # >>>
+            mem_info = process.memory_info()
+            # <<<
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ active %d, paused %d, waiting %d, finished %d ] ... "
+                "reqs: %d [ active %d/%d, paused %d/%d, waiting %d, finished %d ] ... "
+                # >>>
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
+                # "mem: alloc %.1f gb, res %.1f gb, cpu p %s/v %s."
+                # <<<
                 % (
                     self.step_count,
                     datetime.now().strftime("%H:%M:%S"),
@@ -642,12 +653,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     ),
                     prev_total_request_count,
                     prev_total_request_count - prev_paused_request_count,
+                    context.chunk_allocator.active_count,
                     prev_paused_request_count,
+                    context.chunk_allocator.paused_count,
                     len(self.waiting_request_ids),
                     self.finished_request_count,
+                    # >>>
                     mem["allocation.all.current"],
+                    # <<<
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
+                    # >>>
+                    # get_mem_size_str(mem_info.rss),
+                    # get_mem_size_str(mem_info.vms),
+                    # <<<
                 )
             )
             if prev_is_decode_only:

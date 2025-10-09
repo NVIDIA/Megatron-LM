@@ -26,6 +26,7 @@ class ChunkAllocator:
         self.context = context
 
         active_count -= 1 # -1 for dummy_chunk_idx (see below)
+        active_count = max(1, active_count) # need at least one chunk
         self.total_count = 2 * active_count + 1 # +1 for dummy_chunk_idx
         self.total_avail = self.total_count - 1 # -1 for dummy_chunk_idx
         self.active_count = active_count

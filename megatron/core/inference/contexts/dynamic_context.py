@@ -98,7 +98,7 @@ def get_mem_size_str(n_bytes: int) -> str:
         nquery = int(1024**exp)
         if round(n_bytes / nquery) >= 1:
             return "%.3g %s" % (n_bytes / nquery, suffix)
-    raise Exception("something went wrong.")
+    raise Exception(f"something went wrong, n_bytes={n_bytes}.")
 
 
 # pylint: disable=line-too-long
@@ -217,7 +217,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             context=self,
             active_count=active_chunk_count_total,
         )
-        del active_chunk_count_total # no accidental use; use chunk_allocator
+        del active_chunk_count_total # use self.chunk_allocator.active_count
         active_buffer_size_bytes = self.chunk_allocator.active_count * self.chunk_size_bytes
 
         # Set max_requests, max_tokens.
@@ -300,6 +300,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
+        # >>>
+        pax({
+            "max_sequence_length" : self.max_sequence_length,
+            "max_kv_chunk_count" : self.max_kv_chunk_count,
+        })
+        # <<<
         self.request_to_kv_chunk_ids = torch.full(
             (self.max_total_requests, self.max_kv_chunk_count),
             -1,

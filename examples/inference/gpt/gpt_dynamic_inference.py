@@ -137,6 +137,7 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 # # >>>
+# @torch.inference_mode()
 # def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
 # # def get_inference_context_max_tokens(controller: torch.nn.Module) -> int:
 # # <<<
@@ -155,7 +156,10 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 #     num_tokens_min = num_tokens_step
 #     num_tokens_max = 24000 # 1000000
 #     time_map = {}
-#     tbar = tqdm(range(num_tokens_min, num_tokens_max, num_tokens_step))
+#     # >>>
+#     # tbar = tqdm(range(num_tokens_min, num_tokens_max, num_tokens_step))
+#     tbar = tqdm([ 16384 ])
+#     # <<<
 #     # tbar = tqdm((3000,))
 #     # tbar = tqdm((3072,))
 #     # tbar = tqdm((1000,))
@@ -184,13 +188,20 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 #         # )
 #         t = time.time()
 #         for _ in range(3):
-#             result = model(
-#                 input_ids,
-#                 position_ids,
-#                 attention_mask=None,
-#                 inference_context=None,
-#                 runtime_gather_output=True,  # Inference should always gather the logits
-#             )
+#             mem0 = torch.cuda.memory_stats()
+#             with torch.inference_mode():
+#                 result = model(
+#                     input_ids,
+#                     position_ids,
+#                     attention_mask=None,
+#                     inference_context=None,
+#                     runtime_gather_output=True,  # Inference should always gather the logits
+#                 )
+#             mem1 = torch.cuda.memory_stats()
+#             pax("mem0, mem1", {
+#                 "peak / 0" : mem0["allocated_bytes.all.peak"],
+#                 "peak / 1" : mem1["allocated_bytes.all.peak"],
+#             })
 #         t = time.time() - t
 #         time_map[num_tokens] = t
 #     print("~~ x ~~")
@@ -199,6 +210,7 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
 #     [ print(y) for y in time_map.values() ]
 #     raise Exception("matplotlib.")
 #     return max_tokens
+# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
     """Estimate `max_tokens` for the context.
 
@@ -227,6 +239,10 @@ def get_inference_context(
         max_sequence_length = max_context_length + max_gen_length
     else:
         max_sequence_length = args.inference_max_seq_length
+    # >>>
+    pax("max_context_length, max_gen_length",
+        "calculate_max_sequence_length_from_requests, max_sequence_length")
+    # <<<
 
     # Active buffer size & max tokens.
     active_buffer_size_bytes = get_inference_context_active_buffer_size_bytes(model)
