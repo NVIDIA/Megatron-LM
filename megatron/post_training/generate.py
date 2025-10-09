@@ -138,6 +138,8 @@ def simple_speculative_generate(
         for i in range(draft_tokens.shape[-1]):
             if torch.equal(draft_tokens[:, i : i + 1], output_ids[:, offset: offset + 1]):
                 offset += 1
+            else:
+                break
 
         # Broadcast the accepted offset from the last rank.
         offset = [offset]
