@@ -4,19 +4,25 @@
 See https://platform.openai.com/docs/api-reference/completions/create
 """
 
-import torch
 import numpy as np
-from megatron.training import get_tokenizer
-from megatron.inference.text_generation.mcore_engine_server import run_mcore_engine
-from megatron.inference.text_generation.api import generate_and_post_process
-from megatron.inference.endpoints.common import send_do_generate, LOCK
+import torch
 
-from flask import request, jsonify
-from flask_restful import Resource
-import random
+try:
+    from flask import jsonify, request
+    from flask_restful import Resource
+
+    HAVE_FLASK = True
+except ImportError:
+    Resource = object
+
+    HAVE_FLASK = False
+
+from megatron.core.inference.text_generation_server.endpoints.common import LOCK, send_do_generate
+from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 
 
 def detokenize(prompt, tok) -> list[str]:
+    """Detokenizes the given prompt."""
     if isinstance(prompt, str):
         return [prompt]
     elif isinstance(prompt, list):
@@ -38,13 +44,18 @@ def detokenize(prompt, tok) -> list[str]:
 
 
 class MegatronCompletions(Resource):
+    """Completions endpoint."""
+
     def __init__(self, engine, args):
         self.engine = engine
         self.args = args
 
     def post(self):
+        """Handles a POST request."""
+        assert HAVE_FLASK
+
         req = request.get_json()
-        tokenizer = get_tokenizer()
+        tokenizer = self.engine.controller.tokenizer
         prompts = detokenize(req["prompt"], tokenizer)
 
         # convert the openai-local-completions api to the format
@@ -111,7 +122,7 @@ class MegatronCompletions(Resource):
                 logprobs,
                 tokens_to_generate,
                 top_n_logprobs=top_n_logprobs,
-                random_seed=random_seed
+                random_seed=random_seed,
             )
             result = [
                 response_dict["text"],
@@ -189,7 +200,11 @@ class MegatronCompletions(Resource):
                             tokenizer.detokenize([tk]) for tk in truncated_generation_tokens
                         ],
                         "text_offset": truncated_generation_tok_offsets,
-                        "top_logprobs": [None] + truncated_generation_topk_logprobs if truncated_generation_topk_logprobs is not None else None,
+                        "top_logprobs": (
+                            [None] + truncated_generation_topk_logprobs
+                            if truncated_generation_topk_logprobs is not None
+                            else None
+                        ),
                     },
                 }
             )

@@ -1,17 +1,23 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import datetime
 import json
+import logging
 import os
 import sys
 
-from flask import Flask, request, jsonify
-from flask_restful import Resource, Api
+try:
+    from flask import Flask, jsonify, request
+    from flask_restful import Api, Resource
 
-from megatron.core.inference.sampling_params import SamplingParams
-from megatron.inference.endpoints.common import send_do_generate, send_do_beam_search, LOCK
-from megatron.inference.endpoints.completions import MegatronCompletions
-from megatron.inference.text_generation import beam_search_and_post_process
-from megatron.inference.text_generation.mcore_engine_server import run_mcore_engine
+    HAVE_FLASK = True
+except ImportError as e:
+    Resource = object
+
+    HAVE_FLASK = False
+
+from megatron.core.inference.text_generation_server.endpoints.common import LOCK, send_do_generate
+from megatron.core.inference.text_generation_server.endpoints.completions import MegatronCompletions
+from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -19,11 +25,14 @@ sys.path.append(
 
 
 class MegatronGenerate(Resource):
+    """Text generation endpoint."""
+
     def __init__(self, engine, args):
         self.engine = engine
         self.args = args
 
     def put(self):
+        """Handle generation request."""
         if not "prompts" in request.get_json():
             return "prompts argument required", 400
 
@@ -32,6 +41,9 @@ class MegatronGenerate(Resource):
 
         if "sentences" in request.get_json():
             return "sentences is no longer used.  Replace with prompts", 400
+
+        if "beam_width" in request.get_json():
+            return "Beam search is no longer supported.", 400
 
         prompts = request.get_json()["prompts"]
         if not isinstance(prompts, list):
@@ -72,7 +84,10 @@ class MegatronGenerate(Resource):
         if "top_k" in request.get_json():
             top_k = request.get_json()["top_k"]
             if not (isinstance(top_k, int)):
-                return "top_k must be an integer equal to or greater than 0 and less than or equal to 1000"
+                return (
+                    "top_k must be an integer equal to or greater than 0 "
+                    "and less than or equal to 1000"
+                )
             if not (0 <= top_k <= 1000):
                 return "top_k must be equal to or greater than 0 and less than or equal to 1000"
 
@@ -147,16 +162,6 @@ class MegatronGenerate(Resource):
             if not isinstance(no_log, bool):
                 return "no_log must be a boolean value"
 
-        beam_width = None
-        if "beam_width" in request.get_json():
-            beam_width = request.get_json()["beam_width"]
-            if not isinstance(beam_width, int):
-                return "beam_width must be integer"
-            if beam_width < 1:
-                return "beam_width must be an integer > 1"
-            if len(prompts) > 1:
-                return "When doing beam_search, batch size must be 1"
-
         stop_token = 50256
         if "stop_token" in request.get_json():
             stop_token = request.get_json()["stop_token"]
@@ -172,45 +177,35 @@ class MegatronGenerate(Resource):
         with LOCK:  # Need to get lock to keep multiple threads from hitting code
 
             if not no_log:
-                print("request IP: " + str(request.remote_addr))
-                print(json.dumps(request.get_json()), flush=True)
-                print("start time: ", datetime.datetime.now())
+                logging.info(f"request IP: {str(request.remote_addr)}")
+                logging.info(json.dumps(request.get_json()))
+                logging.info(f"start time: {datetime.datetime.now()}")
 
             try:
-                if beam_width is not None:
-                    send_do_beam_search()  # Tell other ranks we're doing beam_search
-                    response, response_seg, response_scores = beam_search_and_post_process(
-                        self.engine.text_generation_controller.inference_wrapped_model.model,
-                        prompts=prompts,
-                        tokens_to_generate=tokens_to_generate,
-                        beam_size=beam_width,
-                        add_BOS=add_BOS,
-                        stop_token=stop_token,
-                        num_return_gen=beam_width,  # Returning whole beam
-                        length_penalty=length_penalty,
-                        prevent_newline_after_colon=prevent_newline_after_colon,
-                    )
+                send_do_generate()  # Tell other ranks we're doing generate
 
-                    return jsonify(
-                        {"text": response, "segments": response_seg, "scores": response_scores}
-                    )
-                else:
-                    send_do_generate()  # Tell other ranks we're doing generate
+                response_dict = run_mcore_engine(
+                    self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate
+                )
 
-                    response_dict = run_mcore_engine(self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate)
-
-                    return jsonify(response_dict)
+                return jsonify(response_dict)
 
             except ValueError as ve:
                 return ve.args[0]
 
 
 class MegatronServer(object):
+    """Megatron text generation server."""
+
     def __init__(self, model, args=None):
+        if not HAVE_FLASK:
+            raise RuntimeError(f"`flask` and/or `flask_restful` are not installed.")
+
         self.app = Flask(__name__, static_url_path='')
         api = Api(self.app)
         api.add_resource(MegatronGenerate, '/api', resource_class_args=[model, args])
         api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model, args])
 
     def run(self, url, port):
+        """Run the server."""
         self.app.run(url, threaded=True, debug=False, port=port)
