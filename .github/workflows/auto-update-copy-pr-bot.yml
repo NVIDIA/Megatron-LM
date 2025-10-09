@@ -1,3 +1,5 @@
+name: Auto Update Copy PR Bot
+
 on:
   push:
 
@@ -9,7 +11,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Fetch list of members in mcore-reviewers team
-        shell: bash -euxo pipefail {0}]
+        shell: bash -euxo pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
