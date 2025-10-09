@@ -1262,7 +1262,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1280,8 +1280,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # get max attention score for logging and run qk_clip()
     # Part of MuonClip Optimizer step
+    log_max_attention_score = 0
     if args.qk_clip:
-        log_max_attention_score = 0
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
                 if hasattr(transformer_layer.self_attention, 'qk_clip'):
