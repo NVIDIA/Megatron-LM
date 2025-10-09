@@ -33,6 +33,7 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
+from megatron.core.transformer.cpu_offload import PipelineOffloadManager
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -645,6 +646,11 @@ class TransformerBlock(MegatronModule):
                             inner_quantization_context = nullcontext()
                     else:
                         inner_quantization_context = nullcontext()
+                    
+                    if l_no == self.num_layers_per_pipeline_rank - 1:
+                        PipelineOffloadManager.get_instance().set_last_layer(True)
+                    else:
+                        PipelineOffloadManager.get_instance().set_last_layer(False)
 
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(

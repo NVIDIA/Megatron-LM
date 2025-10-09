@@ -305,9 +305,9 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-        if self.offload_core_attention and self.training:
-            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[query, key, value])
-            offload_context = contextlib.nullcontext()
+            if self.offload_core_attention and self.training:
+                core_attn_out, = group_prefetch_offload_commit(core_attn_out, name="core_attn", release_tensors=[query, key, value])
+                offload_context = contextlib.nullcontext()
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -340,7 +340,7 @@ class MultiLatentAttention(Attention):
         with offload_context:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
+            output, bias = group_prefetch_offload_commit(output, bias, name="attn_proj", release_tensors=[core_attn_out])
             offload_context = contextlib.nullcontext()
 
         return output, bias

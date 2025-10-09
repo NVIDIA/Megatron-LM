@@ -36,7 +36,6 @@ from megatron.core.transformer.cpu_offload import (
     PipelineOffloadManager,
     group_prefetch_offload_start,
     group_prefetch_offload_commit,
-    mark_layer_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -482,8 +481,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
-        if self.config.fine_grained_activation_offloading:
-            kwargs["hidden_states"] = mark_layer_start(kwargs["hidden_states"])
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context
@@ -567,7 +564,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         if self.offload_self_attn:
-            attention_output_with_bias, = group_prefetch_offload_commit(attention_output_with_bias, release_tensors=[input_layernorm_output])
+            attention_output_with_bias, = group_prefetch_offload_commit(attention_output_with_bias, name="self_attn", release_tensors=[input_layernorm_output])
             offload_context = contextlib.nullcontext()
         nvtx_range_pop(suffix="self_attention")
 
@@ -588,7 +585,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="self_attn_bda")
 
         if self.offload_attn_norm:
-            hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
+            hidden_states, = group_prefetch_offload_commit(hidden_states, name="attn_norm", release_tensors=[residual])
             offload_context = contextlib.nullcontext()
 
         # Residual connection.
@@ -705,7 +702,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="mlp_bda")
         if self.offload_mlp_norm:
-            hidden_states, = group_prefetch_offload_commit(hidden_states, release_tensors=[residual])
+            hidden_states, = group_prefetch_offload_commit(hidden_states, name="mlp_norm", release_tensors=[residual])
             offload_context = contextlib.nullcontext()
 
         # Jit compiled function creates 'view' tensor. This tensor
