@@ -527,8 +527,13 @@ class _CudaGraphRunner(torch.nn.Module):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
         self.fwd_graph_outputs = outputs
-
         self.fwd_graph_output_surface = self.get_tensors(outputs)
+
+        input_tensors = self.get_tensors(
+            self.fwd_graph_input_args, 
+            self.fwd_graph_input_kwargs
+        )
+        self.fwd_graph_input_surface = list(input_tensors)
 
         if self.training and torch.is_grad_enabled():
             assert (
@@ -575,28 +580,23 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph_input_args, 
             self.fwd_graph_input_kwargs
         )
-        fwd_graph_input_surface = input_tensors + tuple(self.base_module.parameters())
+        fwd_input_surface = input_tensors + tuple(self.base_module.parameters())
 
         torch.cuda.synchronize()
         with torch.cuda.graph(self.bwd_graph, pool=self.bwd_mempool):
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
-                inputs=tuple(i for i in fwd_graph_input_surface if i.requires_grad),
+                inputs=tuple(i for i in fwd_input_surface if i.requires_grad),
                 grad_outputs=tuple(o for o in static_grad_outputs if o is not None),
                 retain_graph=self.backward_retain_grad,
                 only_inputs=True,
                 allow_unused=True,
             )
-        assert len(grad_inputs) == len(fwd_graph_input_surface)
-
-
-        dgrads_buffers = grad_inputs[:len(input_tensors)]
-        wgrads_buffers = grad_inputs[len(input_tensors):]
+        grad_inputs = list(grad_inputs)
 
         self.static_grad_outputs = static_grad_outputs
         self.static_grad_inputs = []
         self.params_to_backprop = []
-        self.fwd_graph_input_surface = list(input_tensors)
 
         # Constructs a tuple suitable for returning from Graphed.backward:
         # Pads out the actually-needed grads with Nones in gradient slots for inputs
@@ -604,13 +604,17 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = []
         for idx, input_tensor in enumerate(input_tensors):
             if input_tensor.requires_grad:
-                self.static_grad_inputs.append(dgrads_buffers[idx])
+                self.static_grad_inputs.append(grad_inputs.pop(0))
             else:
                 self.static_grad_inputs.append(None)
 
+        # at this point static_grad_inputs hold the input dgrads, add the wgrads next
+        assert len(grad_inputs) == len(tuple(self.base_module.parameters()))
+        assert len(self.static_grad_inputs) == len(input_tensors)
+
         # filter out params that did not return a wgrad
         for idx, param in enumerate(self.base_module.parameters()):
-            wgrad_buffer = wgrads_buffers[idx]
+            wgrad_buffer = grad_inputs.pop(0)
             if (wgrad_buffer is not None) and param.requires_grad:
                 self.fwd_graph_input_surface.append(param)
                 self.params_to_backprop.append(param)
