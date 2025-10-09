@@ -898,8 +898,7 @@ def hybrid_context_parallel_forward_backward(
     num_samples_this_group = num_samples_this_group.cpu().numpy()
     num_total_groups = num_samples_this_group.shape[0]
 
-    # TODO: How does this variable affect downstream logic?
-    num_microbatches = 1
+    current_microbatch = 0
 
     # Upto last group, we don't need any sync.
     with no_sync_func():
@@ -920,10 +919,11 @@ def hybrid_context_parallel_forward_backward(
                     config,
                     collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(
-                        first_val_step, forward_only, num_microbatches == 1
+                        first_val_step, forward_only, current_microbatch == 0
                     ),
-                    current_microbatch=num_microbatches - 1,
+                    current_microbatch=current_microbatch,
                 )
+                current_microbatch += 1
                 total_num_tokens += num_tokens.item()
                 if not forward_only:
                     backward_step(
@@ -953,10 +953,11 @@ def hybrid_context_parallel_forward_backward(
                 config,
                 collect_non_loss_data,
                 is_first_microbatch=check_first_val_step(
-                    first_val_step, forward_only, num_microbatches == 1
+                    first_val_step, forward_only, current_microbatch == 0
                 ),
-                current_microbatch=num_microbatches - 1,
+                current_microbatch=current_microbatch,
             )
+            current_microbatch += 1
             total_num_tokens += num_tokens.item()
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -975,9 +976,9 @@ def hybrid_context_parallel_forward_backward(
         config,
         collect_non_loss_data,
         is_first_microbatch=check_first_val_step(
-            first_val_step, forward_only, num_microbatches == 1
+            first_val_step, forward_only, current_microbatch == 0
         ),
-        current_microbatch=num_microbatches - 1,
+        current_microbatch=current_microbatch,
     )
     total_num_tokens += num_tokens.item()
     if not forward_only:
