@@ -52,6 +52,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    use_truncateless_packing: bool = False
+    """Option to use packing without split"""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -204,7 +207,10 @@ class GPTDataset(MegatronDataset):
                 self.masks_and_position_ids_are_cached = True
         else:
             attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
+            # For padded sequences, loss_mask need to reinitialize
+            loss_mask = torch.ones(self.config.sequence_length, dtype=torch.float, device=attention_mask.device)
+            if self.config.eod_mask_loss:
+                loss_mask[tokens == self.config.tokenizer.eod] = 0.0
             position_ids = self.cached_position_ids
 
         # For padded sequences, mask the loss
@@ -249,8 +255,11 @@ class GPTDataset(MegatronDataset):
         idx = self.shuffle_index[idx]
 
         # Get the beginning and end documents and offsets
-        doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
-        doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
+        if self.config.use_truncateless_packing:
+            doc_index_beg, doc_index_beg_offset, doc_index_end, doc_index_end_offset = self.sample_index[idx]
+        else:
+            doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
+            doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
 
         document_ids = []
         sample_parts = []
@@ -334,6 +343,8 @@ class GPTDataset(MegatronDataset):
 
         if path_to_cache:
             base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
+            if self.config.use_truncateless_packing:
+                base = f"{base}-truncateless"
             get_path_to = lambda affix: os.path.join(path_to_cache, f"{base}-{affix}")
             path_to_description = get_path_to("description.txt")
             path_to_document_index = get_path_to("document_index.npy")
@@ -435,15 +446,27 @@ class GPTDataset(MegatronDataset):
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
             else:
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths
-            sample_index = helpers.build_sample_idx(
-                sequence_lengths_for_cpp,
-                document_index,
-                sequence_length,
-                num_epochs,
-                num_tokens_per_epoch,
-                drop_last_partial_sequence,
-                self.config.add_extra_token_to_sequence,
-            )
+
+            if self.config.use_truncateless_packing:
+                sample_index = helpers.build_sample_idx_by_nextfit(
+                    sequence_lengths_for_cpp,
+                    document_index,
+                    sequence_length,
+                    num_epochs,
+                    num_tokens_per_epoch,
+                    drop_last_partial_sequence,
+                    self.config.add_extra_token_to_sequence,
+                )
+            else:
+                sample_index = helpers.build_sample_idx(
+                    sequence_lengths_for_cpp,
+                    document_index,
+                    sequence_length,
+                    num_epochs,
+                    num_tokens_per_epoch,
+                    drop_last_partial_sequence,
+                    self.config.add_extra_token_to_sequence,
+                )
 
             # Build the shuffle index
             if separate_final_epoch:

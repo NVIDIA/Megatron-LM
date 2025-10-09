@@ -247,6 +247,103 @@ py::array_t<T> build_sample_idx(
   );
 }
 
+template <typename T>
+py::array_t<T> build_sample_idx_by_nextfit(
+  const py::array_t<int32_t> &sizes_,
+  const py::array_t<int32_t> &document_idx_,
+  const int32_t seq_length,
+  const int32_t num_epochs,
+  const int64_t tokens_per_epoch,
+  const bool drop_last_partial_sequence = true,
+  const int add_extra_token_to_sequence = 1
+){
+
+  assert(seq_length > 1);
+  assert(num_epochs > 0);
+  assert(tokens_per_epoch > 1);
+
+  auto sizes = sizes_.unchecked<1>();
+  auto document_idx = document_idx_.unchecked<1>();
+
+  int32_t target_length = seq_length;
+
+  std::vector<std::vector<std::tuple<T, T, T>>> bins;
+  std::vector<int32_t> bin_remaining;
+
+  for (int64_t i = 0; i < document_idx_.shape(0); ++i) {
+    T doc_idx = i;
+    int32_t doc_length = sizes[document_idx[doc_idx]];
+
+    if (doc_length >= target_length) {
+      int32_t parts = doc_length / target_length;
+      for (int32_t k = 0; k < parts; ++k) {
+        T start = target_length * k;
+        T end = target_length * (k + 1);
+        bins.push_back({std::make_tuple(doc_idx, start, end)});
+        bin_remaining.push_back(0);
+      }
+
+      int32_t remaining = doc_length - parts * target_length;
+      if (remaining > 1) {
+        T start = target_length * parts;
+        T end = doc_length;
+        bins.push_back({std::make_tuple(doc_idx, start, end)});
+        bin_remaining.push_back(target_length - remaining);
+      }
+    } else {
+      if (bins.empty() || bin_remaining.back() < doc_length) {
+        bins.push_back({std::make_tuple(doc_idx, 0, doc_length)});
+        bin_remaining.push_back(target_length - doc_length);
+      } else {
+        bins.back().push_back(std::make_tuple(doc_idx, 0, doc_length));
+        bin_remaining.back() -= doc_length;
+      }
+    }
+  }
+
+  int64_t actual_samples = bins.size();
+  T *sample_idx = new T[4 * (actual_samples)];
+
+  for (int64_t i = 0; i < actual_samples; ++i) {
+    const auto &bin = bins[i];
+
+    if (bin.size() == 1) {
+      sample_idx[4 * i] = std::get<0>(bin[0]);     // first doc index
+      sample_idx[4 * i + 1] = std::get<1>(bin[0]); // start offset
+      sample_idx[4 * i + 2] = std::get<0>(bin[0]); // last doc index
+      sample_idx[4 * i + 3] = std::get<2>(bin[0]); // end offset
+    } else {
+      sample_idx[4 * i] = std::get<0>(bin[0]);         // first doc index
+      sample_idx[4 * i + 1] = std::get<1>(bin[0]);     // start offset
+      sample_idx[4 * i + 2] = std::get<0>(bin.back()); // last doc index
+      sample_idx[4 * i + 3] = std::get<2>(bin.back()); // end offset
+    }
+  }
+
+  if (actual_samples == 0) {
+    sample_idx[0] = 0;
+    sample_idx[1] = 0;
+    sample_idx[2] = 0;
+    sample_idx[3] = 0;
+  }
+
+  py::capsule free_when_done(
+    sample_idx,
+    [](void *mem_){
+      T *mem = reinterpret_cast<T*>(mem_);
+      delete[] mem;
+    }
+  );
+
+  const auto byte_size = sizeof(T);
+  return py::array_t<T>(
+    std::vector<int64_t>{actual_samples, 4},
+    {4 * byte_size, byte_size},
+    sample_idx,
+    free_when_done
+  );
+}
+
 inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
                                      const int32_t max_length,
                                      std::mt19937 &rand32_gen)
@@ -843,6 +940,8 @@ PYBIND11_MODULE(helpers_cpp, m)
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx_int32", &build_sample_idx<int32_t>);
   m.def("build_sample_idx_int64", &build_sample_idx<int64_t>);
+  m.def("build_sample_idx_nf_int32", &build_sample_idx_by_nextfit<int32_t>);
+  m.def("build_sample_idx_nf_int64", &build_sample_idx_by_nextfit<int64_t>);
   m.def("build_blending_indices", &build_blending_indices);
   m.def("build_exhaustive_blending_indices", &build_exhaustive_blending_indices);
 }
