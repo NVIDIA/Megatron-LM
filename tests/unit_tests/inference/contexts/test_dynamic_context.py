@@ -62,7 +62,7 @@ class TestDynamicContext:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_initialize_dynamic_context(self):
         self._setup_model_parallel_group(1, 1)
 
@@ -89,7 +89,7 @@ class TestDynamicContext:
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_is_static_batching(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = DynamicInferenceContext(
@@ -105,7 +105,7 @@ class TestDynamicContext:
         )
         assert not dynamic_context.is_static_batching()
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_is_memory_available(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = DynamicInferenceContext(
@@ -132,7 +132,7 @@ class TestDynamicContext:
         assert dynamic_context.chunk_allocator.is_memory_available(6)
         assert not dynamic_context.chunk_allocator.is_memory_available(6, safe=True)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_request_overflow(self):
         self._setup_model_parallel_group(1, 1)
         set_rounder(1)
@@ -153,7 +153,7 @@ class TestDynamicContext:
                     i, torch.zeros(10, device='cuda')
                 )  # Adding more than allowed requests
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_token_overflow_error(self):
         self._setup_model_parallel_group(1, 1)
         set_rounder(1)
@@ -177,7 +177,7 @@ class TestDynamicContext:
                 1, torch.arange(0, 25, device='cuda')
             )  # Exceeding max token count
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_reset(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = DynamicInferenceContext(
@@ -243,7 +243,7 @@ class TestDynamicContext:
         )
         assert torch.all(dynamic_context.request_to_kv_chunk_ids == -1)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_allocate_and_release_memory_chunks(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -278,7 +278,7 @@ class TestDynamicContext:
             == None
         )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_add_request(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -344,7 +344,7 @@ class TestDynamicContext:
             % dynamic_context.chunk_size_tokens
         )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_update_request(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -514,7 +514,7 @@ class TestDynamicContext:
             )
         )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_release_memory_chunks_for_finished_requests(self):
         """Test that memory chunks are correctly released for finished requests."""
         self._setup_model_parallel_group(1, 1)
@@ -565,7 +565,7 @@ class TestDynamicContext:
         # Verify that 3 chunks were released by checking the available chunks
         assert dynamic_context.chunk_allocator.chunk_count_avail == initial_available_chunks + 3
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_finished_requests_with_multiple_chunks(self):
         """Test that all memory chunks are correctly released for finished requests that use multiple chunks."""
         self._setup_model_parallel_group(1, 1)
@@ -629,7 +629,7 @@ class TestDynamicContext:
         # Verify that all 6 chunks were released by checking the available chunks
         assert dynamic_context.chunk_allocator.chunk_count_avail == initial_available_chunks + 6
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_calculate_and_store_log_probs(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
