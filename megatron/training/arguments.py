@@ -3078,7 +3078,7 @@ def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")
     group.add_argument('--q-lora-rank', type=int, default=None,
                        help="Rank of Query tensor's low rank representation.")
-    group.add_argument('--kv-lora-rank', type=int, default=32,
+    group.add_argument('--kv-lora-rank', type=int, default=512,
                        help="Rank of Key and Value tensors' low rank representation.")
     group.add_argument('--qk-head-dim', type=int, default=128,
                        help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim")
