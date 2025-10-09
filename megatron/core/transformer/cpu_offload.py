@@ -122,7 +122,11 @@ class PipelineOffloadManager:
         if cur_vpp_rank == self._vpp - 1:
             self.flush()
         first_last_vpp_rank = first_last_vpp_rank and (cur_vpp_rank == self._vpp - 1)
-        cur_chunk = ChunkOffloadHandler(num_layer, first_last_vpp_rank, offload)
+        # If the model chunk contains only the dense layers, initialize a null chunk handler.
+        if num_layer <= num_dense_layer:
+            cur_chunk = NullChunkOffloadHandler(num_layer, first_last_vpp_rank, offload)
+        else:
+            cur_chunk = ChunkOffloadHandler(num_layer, first_last_vpp_rank, offload)
         # save for latter push
         self._stages[cur_vpp_rank].append(cur_chunk)
         if cur_vpp_rank == self._vpp - 1:
