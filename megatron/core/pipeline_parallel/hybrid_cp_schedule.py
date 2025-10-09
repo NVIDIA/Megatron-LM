@@ -76,8 +76,8 @@ class HybridCPDataLoaderWrapper:
             self.dp_group = pg_collection.dp
             self.tp_group = pg_collection.tp
         assert (
-            self.dp_cp_group is not None and self.dp_group is not None
-        ), "dp_cp_group and dp_group not found"
+            self.dp_cp_group is not None and self.dp_group is not None and self.tp_group is not None
+        ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
 
         self.total_hdp_gpus = self.dp_cp_group.size()
 
@@ -983,7 +983,5 @@ def hybrid_context_parallel_forward_backward(
     total_num_tokens += num_tokens.item()
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-
-    torch.distributed.barrier(parallel_state.get_data_parallel_group(with_context_parallel=True))
 
     return forward_data_store, total_num_tokens
