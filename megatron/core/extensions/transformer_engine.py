@@ -294,14 +294,14 @@ class TELinear(te.pytorch.Linear):
                 extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
-        if self.config.fine_grained_activation_offloading:
-            te_version = get_te_version()
-            if te_version == PkgVersion("2.8.0.dev0+93a67af"):
-                extra_kwargs["fine_grained_activation_offloading"] = self.config.fine_grained_activation_offloading
-            else:
-                raise ValueError(
-                    f"Transformer Engine v{te_version} does not support fine_grained_activation_offloading."
-                )
+        # if self.config.fine_grained_activation_offloading:
+        #     te_version = get_te_version()
+        #     if te_version == PkgVersion("2.8.0.dev0+93a67af"):
+        extra_kwargs["fine_grained_activation_offloading"] = self.config.fine_grained_activation_offloading
+            # else:
+            #     raise ValueError(
+            #         f"Transformer Engine v{te_version} does not support fine_grained_activation_offloading."
+            #     )
         if (
             self.config.tp_comm_overlap
             and tp_comm_buffer_name
@@ -513,14 +513,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
 
-        if self.config.fine_grained_activation_offloading:
-            te_version = get_te_version()
-            if te_version == PkgVersion("2.8.0.dev0+93a67af"):
-                extra_kwargs["fine_grained_activation_offloading"] = self.config.fine_grained_activation_offloading
-            else:
-                raise ValueError(
-                    f"Transformer Engine v{te_version} does not support fine_grained_activation_offloading."
-                )
+        # if self.config.fine_grained_activation_offloading:
+        #     te_version = get_te_version()
+        #     if te_version == PkgVersion("2.8.0.dev0+93a67af"):
+        extra_kwargs["fine_grained_activation_offloading"] = self.config.fine_grained_activation_offloading
+            # else:
+            #     raise ValueError(
+            #         f"Transformer Engine v{te_version} does not support fine_grained_activation_offloading."
+            #     )
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -1116,14 +1116,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
                     )
-            if self.config.fine_grained_activation_offloading:
-                te_version = get_te_version()
-                if te_version == PkgVersion("2.8.0.dev0+93a67af"):
-                    extra_kwargs["fine_grained_activation_offloading"] = self.config.fine_grained_activation_offloading
-                else:
-                    raise ValueError(
-                        f"Transformer Engine v{te_version} does not support fine_grained_activation_offloading."
-                    )
+            # if self.config.fine_grained_activation_offloading:
+            #     te_version = get_te_version()
+            #     if te_version == PkgVersion("2.8.0.dev0+93a67af"):
+            extra_kwargs["fine_grained_activation_offloading"] = self.config.fine_grained_activation_offloading
+                # else:
+                #     raise ValueError(
+                #         f"Transformer Engine v{te_version} does not support fine_grained_activation_offloading."
+                #     )
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 

@@ -692,11 +692,11 @@ class Attention(MegatronModule, ABC):
         if self.offload_qkv_linear:
             if not hidden_states.is_contiguous():
                 hidden_states = hidden_states.contiguous()
-            hidden_states = group_prefetch_offload_start(hidden_states)
+            hidden_states = group_prefetch_offload_start(hidden_states, name="qkv_linear")
             hidden_states.offloading_activation = True
             with PipelineOffloadManager.get_instance():
                 query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
-            query, key, value = group_prefetch_offload_commit(query, key, value, release_tensors=[hidden_states])
+            query, key, value = group_prefetch_offload_commit(query, key, value, name="qkv_linear", release_tensors=[hidden_states])
         else:
             query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
@@ -863,7 +863,7 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
         if self.offload_core_attention and self.training:
-            core_attn_out, = group_prefetch_offload_commit(core_attn_out, release_tensors=[query, key, value])
+            core_attn_out, = group_prefetch_offload_commit(core_attn_out, name="core_attn", release_tensors=[query, key, value])
             offload_context = contextlib.nullcontext()
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -886,7 +886,7 @@ class Attention(MegatronModule, ABC):
         with offload_context:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = group_prefetch_offload_commit(output, bias, release_tensors=[core_attn_out])
+            output, bias = group_prefetch_offload_commit(output, bias, name="attn_proj", release_tensors=[core_attn_out])
             offload_context = contextlib.nullcontext()
         nvtx_range_pop(suffix="linear_proj")
 
