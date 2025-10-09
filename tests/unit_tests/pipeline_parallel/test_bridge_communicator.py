@@ -11,13 +11,101 @@ from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_rank
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_expert_model_parallel_rank,
+    get_tensor_model_parallel_rank,
+)
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def _create_transformer_block(
+    dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
+) -> TransformerBlock:
+    torch.manual_seed(12345)
+    model_parallel_cuda_manual_seed(
+        123,
+        tp_rank=(
+            pg_collection.tp.rank()
+            if pg_collection is not None
+            else get_tensor_model_parallel_rank()
+        ),
+        ep_rank=torch.distributed.get_rank(),
+        etp_rank=torch.distributed.get_rank(),
+    )
+    if pg_collection is not None:
+        cp_size = pg_collection.cp.size()
+    else:
+        cp_size = get_context_parallel_group().size()
+    transformer_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=hidden_size,
+        num_attention_heads=8,
+        use_cpu_initialization=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        bf16=dtype == torch.bfloat16,
+        context_parallel_size=cp_size,
+    )
+
+    block = (
+        TransformerBlock(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            pg_collection=pg_collection,
+        )
+        .cuda()
+        .to(dtype)
+    )
+    with torch.no_grad():
+        for mod in block.modules():
+            if hasattr(mod, "bias") and mod.bias is not None:
+                mod.bias.zero_()
+    return block
+
+
+def _shard_and_copy_(
+    ref_block: TransformerBlock, tgt_block: TransformerBlock, tp_size: int, tp_rank: int
+) -> None:
+    """Copy weights from *ref_block* into a tensor-parallel *tgt_block*."""
+
+    ref_sd = ref_block.state_dict()
+    tgt_sd = tgt_block.state_dict()
+
+    for name, tgt_param in tgt_sd.items():
+        full_param = ref_sd[name]
+
+        # Skip non-tensor entries (e.g., _metadata or other buffers stored as BytesIO).
+        if not (torch.is_tensor(tgt_param) and torch.is_tensor(full_param)):
+            logging.info(f'_shard_and_copy_ skipping non-tensor entry: {name}')
+            continue
+
+        # Exact match – just copy.
+        if full_param.shape == tgt_param.shape:
+            tgt_param.copy_(full_param)
+            continue
+
+        # ColumnParallel: shard along dim-0.
+        if tgt_param.shape[0] * tp_size == full_param.shape[0]:
+            slice_ = torch.chunk(full_param, tp_size, dim=0)[tp_rank]
+            tgt_param.copy_(slice_)
+            continue
+
+        # RowParallel: shard along dim-1.
+        if tgt_param.shape[1] * tp_size == full_param.shape[1]:
+            slice_ = torch.chunk(full_param, tp_size, dim=1)[tp_rank]
+            tgt_param.copy_(slice_)
+            continue
+
+        raise RuntimeError(
+            f"Unhandled TP sharding for {name}: ref {full_param.shape} tgt {tgt_param.shape}"
+        )
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
@@ -41,6 +129,55 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     _ = grid.create_pg(["pp"])
     _ = grid.create_pg(["dp"])
     return grid
+
+
+def _get_pg_collection_from_grid(grid):
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = grid.get_pg("tp")
+    pg_collection.cp = grid.get_pg("cp")
+    pg_collection.pp = grid.get_pg("pp")
+    return pg_collection
+
+
+def _avg_params(module: torch.nn.Module, group: dist.ProcessGroup = None) -> None:
+    world = dist.get_world_size(group=group or dist.group.WORLD)
+    for p in module.parameters():
+        dist.all_reduce(p.data, op=dist.ReduceOp.SUM, group=group or dist.group.WORLD)
+        p.data.div_(world)
+
+
+def get_transformer_block_and_grid(
+    ref_block,
+    tp_size=1,
+    cp_size=1,
+    pp_size=1,
+    dp_size=1,
+    grid_offset: int = 0,
+    use_global_parallel_state: bool = False,
+    hidden_size: int = 4096,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Utility to build a ``TransformerBlock`` for tests."""
+
+    current_rank = dist.get_rank()
+    if use_global_parallel_state:
+        block = _create_transformer_block(dtype=dtype, hidden_size=hidden_size)
+        _shard_and_copy_(ref_block, block, tp_size, get_tensor_model_parallel_rank())
+        grid = None
+    else:
+        grid = create_hypercomm_grid(
+            offset=grid_offset, tp=tp_size, cp=cp_size, pp=pp_size, dp=dp_size
+        )
+        if grid.rank_offset <= current_rank < grid.rank_offset + grid.size:
+            pg_collection = _get_pg_collection_from_grid(grid)
+            block = _create_transformer_block(
+                dtype=dtype, hidden_size=hidden_size, pg_collection=pg_collection
+            )
+            _shard_and_copy_(ref_block, block, tp_size, pg_collection.tp.rank())
+        else:
+            block = None
+
+    return block, grid
 
 
 class TestBridgeCommunicator:
@@ -72,6 +209,200 @@ class TestBridgeCommunicator:
         assert bridge_communicator.dest_grid is grid2
         assert bridge_communicator.current_rank == dist.get_rank()
         assert bridge_communicator.comm_map is not None
+
+    def test_send_forward_recv_forward(self):
+        """Test send_forward and recv_forward operations."""
+
+        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
+        grid2 = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, comm_dtype=torch.float32)
+
+        random_hidden_state = torch.randn(16, 128, 512)
+        if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
+            random_hidden_state = random_hidden_state.cuda()
+            bridge_communicator.send_forward(random_hidden_state)
+
+        else:
+            received_activation = bridge_communicator.recv_forward()
+            # default assunes bsh
+            assert received_activation.shape == (
+                32,
+                128,
+                512,
+            ), f"Expected activation shape {(32, 128, 512)}, got {received_activation.shape}"
+
+    def test_send_backward_recv_backward(self):
+        """Test send_backward and recv_backward operations."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        # Create source and destination grids
+        grid1 = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        grid2 = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
+        random_grad_state = torch.randn(16, 128, 512)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, comm_dtype=torch.float32)
+
+        if bridge_communicator.is_current_rank_in_grid(bridge_communicator.dest_grid):
+            random_grad_state = random_grad_state.cuda()
+            bridge_communicator.send_backward(random_grad_state)
+
+        else:
+            received_gradient = bridge_communicator.recv_backward()
+            assert received_gradient.shape == (
+                4,
+                128,
+                512,
+            ), f"Expected gradient shape {(4, 128, 512)}, got {received_gradient.shape}"
+
+    def test_send_forward_recv_backward_send_backward_recv_forward(self):
+        """Test combined send_forward_recv_backward and send_backward_recv_forward operations."""
+
+        # Create source and destination grids
+        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
+        grid2 = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, comm_dtype=torch.float32)
+
+        if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
+            random_hidden_state = torch.randn(16, 128, 512).cuda()
+            received_grad = bridge_communicator.send_forward_recv_backward(random_hidden_state)
+            assert (
+                received_grad.shape == random_hidden_state.shape
+            ), f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
+
+        else:
+            random_grad_state = torch.randn(32, 128, 512).cuda()
+            received_activation = bridge_communicator.send_backward_recv_forward(random_grad_state)
+
+            assert received_activation.shape == (
+                32,
+                128,
+                512,
+            ), f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize(
+        "grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp",
+        [
+            (2, 1, 2, 1, 2),  # TP2DP2 to TP4DP1
+            (4, 1, 4, 1, 4),  # TP4DP1 to TP4DP1
+            (2, 2, 4, 1, 2),  # TP2DP2 to TP4DP1
+            (4, 1, 2, 2, 2),  # TP4DP1 to TP2DP2
+        ],
+    )
+    def test_bridge_communicator_with_transformer_blocks(
+        self, grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp
+    ):
+        """Test bridge communicator with two transformer blocks having different process group configurations."""
+        hidden_size = 1024
+        sequence_length = 16
+        micro_batch_size = 8
+        torch.manual_seed(12345)
+        dtype = torch.float32
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, hidden_size), device="cuda"
+        ).to(dtype)
+        current_rank = dist.get_rank()
+
+        # we compare output with transformer block with global parallel state
+        # so need to initialize model parallel state
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=parallel_state_tp, create_gloo_process_groups=False
+        )
+        ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
+        ref_block = _create_transformer_block(
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
+        )
+        _avg_params(ref_block, ref_grid.get_pg("dp"))
+        block_grid_1, grid_1 = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=grid1_tp,
+            dp_size=grid1_dp,
+            grid_offset=0,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        block_grid_2, grid_2 = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=grid2_tp,
+            dp_size=grid2_dp,
+            grid_offset=4,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+
+        dist.barrier()
+        bridge_communicator = BridgeCommunicator(
+            grid_1, grid_2, dim_mapping={'s': 0, 'h': 2, 'b': 1}, comm_dtype=dtype
+        )
+        output_grid_2 = None
+        if grid_1 is not None and bridge_communicator.is_current_rank_in_grid(grid_1):
+            output_grid_1 = block_grid_1(hidden_states=hidden_states, attention_mask=None)
+            bridge_communicator.send_forward(output_grid_1)
+
+        if grid_2 is not None and bridge_communicator.is_current_rank_in_grid(grid_2):
+            received_activation = bridge_communicator.recv_forward()
+            output_grid_2 = block_grid_2(hidden_states=received_activation, attention_mask=None)
+            factor = max(grid1_dp, grid2_dp) // min(grid1_dp, grid2_dp)
+            expected_output_shape = (
+                sequence_length,
+                micro_batch_size * factor if grid1_dp > grid2_dp else micro_batch_size // factor,
+                hidden_size,
+            )
+            assert (
+                output_grid_2.shape == expected_output_shape
+            ), f"Output2 shape mismatch: {output_grid_2.shape}"
+
+        global_block_1, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        global_block_2, _ = get_transformer_block_and_grid(
+            ref_block,
+            tp_size=parallel_state_tp,
+            use_global_parallel_state=True,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+
+        global_block_1_output = global_block_1(hidden_states=hidden_states, attention_mask=None)
+        global_block_2_output = global_block_2(
+            hidden_states=global_block_1_output, attention_mask=None
+        )
+
+        if grid_2 is not None and bridge_communicator.is_current_rank_in_grid(grid_2):
+            if grid1_dp == grid2_dp:
+                torch.testing.assert_close(
+                    global_block_2_output, output_grid_2, rtol=1e-3, atol=1e-3
+                )
+            elif grid1_dp < grid2_dp:
+                print(
+                    f"output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}"
+                )
+                grid2_dp_ranks = grid_2._gen_rank_enum([x for x in grid_2.dim_names if x != "dp"])
+                global_block_2_chunks = torch.split(
+                    global_block_2_output, global_block_2_output.shape[1] // grid2_dp, dim=1
+                )
+                relevant_chunk = None
+                for i, dp_ranks in enumerate(grid2_dp_ranks):
+                    if current_rank in dp_ranks:
+                        relevant_chunk = global_block_2_chunks[i]
+                torch.testing.assert_close(relevant_chunk, output_grid_2, rtol=1e-3, atol=1e-3)
+            else:
+                output_grid_2_first_chunk = torch.chunk(output_grid_2, grid1_dp // grid2_dp, dim=1)[
+                    0
+                ]
+                torch.testing.assert_close(
+                    global_block_2_output, output_grid_2_first_chunk, rtol=1e-3, atol=1e-3
+                )
+
+        Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
         "tp, cp, pp, dp, expected_src_ranks, expected_dest_ranks",

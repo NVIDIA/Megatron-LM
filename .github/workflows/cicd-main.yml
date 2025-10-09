@@ -14,7 +14,7 @@
 name: CICD NeMo
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0 */2 * * *"
   push:
     branches:
       - main
@@ -108,18 +108,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - test_case: "bert_mr_mcore_tp2_pp2_dgx_a100_1N8G"
-            model: "bert"
-          - test_case: "bert_mr_mcore_tp2_pp2_dgx_a100_1N8G"
-            model: "bert"
-          - test_case: "bert_mr_mcore_tp2_pp2_dgx_a100_1N8G"
-            model: "bert"
-          - test_case: "bert_mr_mcore_tp2_pp2_dgx_a100_1N8G"
-            model: "bert"
+          - model: "gpt"
+            test_case: "gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G"
+          - model: "gpt"
+            test_case: "gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G"
+          - model: "moe"
+            test_case: "gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer"
+          - model: "moe"
+            test_case: "gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed"
     needs:
       - pre-flight
       - cicd-wait-in-queue
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci

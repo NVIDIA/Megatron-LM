@@ -141,6 +141,69 @@ pre:label_merge_request:
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
 
+pre:maybe_cherry_pick_to_main:
+  rules:
+    - if: "$CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev' && $CI_MERGE_REQUEST_LABELS =~ /mirror-to-main/"
+    - when: never
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: nentangso/alpine-git-curl-jq
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - |
+      set -x
+      MR_ID=$CI_MERGE_REQUEST_IID
+      TARGET_BRANCH="cp/$MR_ID-into-main"
+      TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$TARGET_BRANCH)" != "" ]] && echo true || echo false)
+
+      if [[ "$TARGET_BRANCH_EXISTS_OK" == "true" ]]; then
+        echo Target branch already exists, will not cherry-pick again.
+        exit 0
+      fi
+
+      MR=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}")
+
+      LABELS=$(echo -E $MR | jq '.labels | join(",")' | tr -d '"')
+      AUTHOR_ID=$(echo -E $MR | jq '.author.id' | tr -d '"')
+      AUTHOR_NAME=$(echo -E $MR | jq '.author.username' | tr -d '"')
+      TITLE=$(echo -E $MR | jq '.title' | tr -d '"')
+      MILESTONE_ID=$(echo -E $MR | jq '.milestone.id' | tr -d '"')
+
+      git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+      git config --global user.email "mcore-bot@nvidia.com"
+      git config --global user.name "Mcore Bot"
+
+      git fetch origin dev
+      git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      START_COMMIT=$(git merge-base origin/dev origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME)
+      END_COMMIT=$(git rev-parse HEAD)
+
+      git fetch origin main
+      git checkout main
+      git checkout -b $TARGET_BRANCH
+
+      git cherry-pick $START_COMMIT..$END_COMMIT
+      git push -u origin $TARGET_BRANCH
+
+      curl \
+        --header "PRIVATE-TOKEN: $PAT" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=$TARGET_BRANCH" \
+        -d "target_branch=main" \
+        -d "title=cp MR !$MR_ID from dev: \`$TITLE\`" \
+        -d "labels=cherry-picked-from-dev" \
+        -d "reviewer_ids=$AUTHOR_ID" \
+        -d "milestone_id=$MILESTONE_ID" \
+        -d "description=[🤖]: Hi @$AUTHOR_NAME 👋,<br><br>we've cherry picked \`$TITLE (!$MR_ID)\` into \`main\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+
 pre:maybe_cherry_pick_commit:
   rules:
     - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'

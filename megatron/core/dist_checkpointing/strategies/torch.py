@@ -830,7 +830,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
-            torch.distributed.barrier()
 
         return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 

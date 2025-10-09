@@ -177,12 +177,21 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
                 use_te=args.transformer_impl == "transformer_engine",
             )
         else:
+            local_core_attention=args.export_force_local_attention
+            if config.context_parallel_size > 1:
+                print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
+                local_core_attention=False
+                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
+                use_arbitrary_attention_mask = False
+            else:
+                use_arbitrary_attention_mask = True
+
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
-                local_core_attention=args.export_force_local_attention,
+                local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=True,
+                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
             )
 
         model_kwargs = {

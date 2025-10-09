@@ -9,7 +9,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 CHECK_THRESHOLDS = {
-    "iteration-time": [common.ApproximateTest(atol=2.0, rtol=0)],
+    "iteration-time": [
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
+    ],
     "mem-allocated-bytes": [
         common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
     ],

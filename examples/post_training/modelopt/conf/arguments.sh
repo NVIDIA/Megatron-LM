@@ -63,6 +63,11 @@ if [ -z ${PP} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}PP${WHITE} not set! (default: ${PP})\n"
 fi
 
+if [ -z ${CP} ]; then
+    CP=1
+    printf "${MLM_WARNING} Variable ${PURPLE}CP${WHITE} not set! (default: ${CP})\n"
+fi
+
 if [ -z ${DP} ]; then
     DP=1
     printf "${MLM_WARNING} Variable ${PURPLE}DP${WHITE} not set! (default: ${DP})\n"
@@ -70,7 +75,7 @@ fi
 
 
 if [ -z ${LAUNCH_SCRIPT} ]; then
-    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((ETP * EP * PP * DP))"
+    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((ETP * EP * PP * CP * DP))"
 fi
 
 # Install TensorRT Model Optimizer if haven't.

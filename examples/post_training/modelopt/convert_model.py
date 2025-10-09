@@ -126,9 +126,16 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
 
     if args.pretrained_model_path is not None:
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16 
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_mcore_gpt_from_hf(unwrapped_model, args.pretrained_model_path, workspace_dir)
+        print_rank_0("Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype)))
+        import_mcore_gpt_from_hf(
+            unwrapped_model,
+            args.pretrained_model_path,
+            workspace_dir,
+            dtype = import_dtype,
+        )
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
@@ -173,6 +180,6 @@ if __name__ == "__main__":
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()
 
-    save_checkpoint(1, model, None, None, 0)
+    save_checkpoint(1, model, None, None, 0, release=True)
 
     destroy_model_parallel()

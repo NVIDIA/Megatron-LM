@@ -224,7 +224,7 @@ class MegatronFSDP(torch.nn.Module):
         # step of the model will reduce all gradients and gather all parameters
         # for synchronized operations such as distributed optimization and
         # distributed checkpointing particularly sharding with HSDP / DP-Outer.
-        self.model_auto_sync = self.set_model_auto_sync(sync_model_each_microbatch)
+        self.set_model_auto_sync(sync_model_each_microbatch)
 
         # Check if the module contains (Megatron-Core) expert parallel parameters or DTensors.
         has_expert_parameters = self._check_module_parameter_types()
