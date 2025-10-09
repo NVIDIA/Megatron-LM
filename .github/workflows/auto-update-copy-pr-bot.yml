@@ -6,6 +6,7 @@ on:
 jobs:
   auto-update-copy-pr-bot:
     runs-on: ubuntu-latest
+    environment: nemo-ci
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -13,7 +14,7 @@ jobs:
       - name: Fetch list of members in mcore-reviewers team
         shell: bash -euxo pipefail {0}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           #!/bin/bash
 
