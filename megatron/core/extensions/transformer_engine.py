@@ -1072,11 +1072,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     **packed_seq_kwargs,
                 )
 
-                # TODO(boxiangw): remove this WAR for TE
-                batch_max_attention_scores, _ = torch.max(batch_max_attention_scores, dim=1)
-                batch_max_attention_scores = batch_max_attention_scores.view(
-                    self.config.num_attention_heads
-                )
                 assert batch_max_attention_scores.shape == (
                     self.config.num_attention_heads,
                 ), f"batch_max_attention_scores shape is not (n, ) \
