@@ -125,9 +125,9 @@ class MockVLMDataset(Dataset):
             "loss_mask": loss_mask,
             "position_ids": position_ids,
             "modality_inputs": {
-                "clip_encoder": {
-                    "images": image,
-                }
+               "images": {
+                "clip_encoder": {'x': image},
+            }
             },
         }
 
@@ -200,7 +200,7 @@ def get_mock_vlm_dataloader(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         collate_fn=lambda batch: _collate_fn(batch),
     )
@@ -218,7 +218,7 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     Returns:
         Dictionary of batched tensors
     """
-    images = torch.stack([item["modality_inputs"]["clip_encoder"]["images"] for item in batch])
+    images = torch.stack([item["modality_inputs"]["images"]["clip_encoder"]['x'] for item in batch])
     input_ids = torch.stack([item["input_ids"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
     loss_mask = torch.stack([item["loss_mask"] for item in batch])
@@ -230,8 +230,8 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "loss_mask": loss_mask,
         "position_ids": position_ids,
         "modality_inputs": {
-            "clip_encoder": {
-                "images": images,
+            "images": {
+                "clip_encoder": {'x': images},
             }
         },
     }
