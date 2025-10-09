@@ -46,25 +46,22 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Nvidia driver check
+    - name: Copy data
       shell: bash
+      if: inputs.is_unit_test == 'false'
+      env:
+        SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
+        TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
+        MODEL: ${{ inputs.model }}
       run: |
-        docker run --rm --ipc=host --runtime=nvidia --gpus all ubuntu nvidia-smi  # Check driver version
+        mkdir -p $TARGET_DIR/text/data/
 
-    - name: FS check
-      shell: bash
-      run: |
-        ls -al /mnt/datadrive/TestData/megatron-lm/
-
-    # - name: Copy data
-    #   shell: bash
-    #   if: inputs.is_unit_test == 'false'
-    #   env:
-    #     SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
-    #     TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
-    #   run: |
-    #     mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
-    #     cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/the_pile/bert_shard00/
+        if [[ "$MODEL" == "bert" ]]; then
+          mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
+          cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/data/
+        elif [[ "$MODEL" == "gpt" ]] || [[ "$MODEL" == "moe" ]]; then
+          cp -a $SOURCE_DIR/text/the_pile/shard00/. $TARGET_DIR/text/data/
+        fi
 
     - name: Install curl, sudo
       shell: bash
@@ -93,28 +90,21 @@ runs:
         dockerfile: docker/Dockerfile.ci.dev
         skip-extraction: ${{ steps.cache.outputs.cache-hit }}
 
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
     - name: Download test data
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.PAT }}
         TIMEOUT: ${{ inputs.timeout }}
+        IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
         echo "::group::Download test data"
-        docker run \
-          --rm \
-          -d \
-          --name test-data-container \
-          -v $(pwd):/workdir \
-          -w /workdir \
-          -e GH_TOKEN=$GH_TOKEN \
-          python:3.10-slim \
-          bash -c "sleep $(( $TIMEOUT * 60 + 60 ))"
-
-        docker exec -t test-data-container pip install --no-cache-dir pygithub click
-        docker exec -t test-data-container python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
-
-        docker cp test-data-container:/workdir/assets ./assets
-        docker container rm -f test-data-container || true
+        pip install --no-cache-dir pygithub click
+        python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
         echo "::endgroup::"
 
     - name: Create run-script (unit test)
@@ -130,7 +120,8 @@ runs:
           bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
             --tag ${{ inputs.tag }} \
             --environment dev \
-            --bucket '\''${{ inputs.test_case }}'\''
+            --bucket '\''${{ inputs.test_case }}'\'' \
+            --log-dir /opt/megatron-lm/outputs/logs
         '
 
         RUN_TEST_EOF
@@ -141,22 +132,34 @@ runs:
     - name: Create run-script (e2e test)
       shell: bash
       if: inputs.is_unit_test == 'false'
+      env:
+        MODEL: ${{ inputs.model }}
       run: |
         echo "::group::Create run-script"
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
+
+
         docker exec -t test_container_${{ github.run_id }} bash -c '
+
           set -e
-          ls -al /workspace/data/bert_data
+          ls -al /workspace/data
+          
+          if [[ "${{ inputs.model }}" == "bert" ]]; then
+            TRAINING_SCRIPT_PATH=pretrain_bert.py
+          elif [[ "${{ inputs.model }}" == "gpt" ]] || [[ "${{ inputs.model }}" == "moe" ]]; then
+            TRAINING_SCRIPT_PATH=pretrain_gpt.py
+          fi
+          
           ARGUMENTS=(
-            "DATA_PATH=/workspace/data/bert_data"
+            "DATA_PATH=/workspace/data"
             "DATA_CACHE_PATH=/workspace/data/cache" 
             "OUTPUT_PATH=$(pwd)/outputs/"
             "TENSORBOARD_PATH=$(pwd)/tensorboard"
             "CHECKPOINT_SAVE_PATH=$(pwd)/checkpoints"
             "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
-            "TRAINING_SCRIPT_PATH=pretrain_bert.py"
+            "TRAINING_SCRIPT_PATH=$TRAINING_SCRIPT_PATH"
             "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/model_config.yaml"
             "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dev_dgx_h100.json"
             "N_REPEAT=5"
@@ -200,7 +203,7 @@ runs:
           -e NCCL_IB_DISABLE=1 \
           -e NCCL_P2P_LEVEL=NVL \
           --workdir /opt/megatron-lm/ \
-          -v /mnt/datadrive/TestData/megatron-lm/artifacts/text/the_pile/bert_shard00/:/workspace/data/bert_data \
+          -v /home/runner/_work/TestData/megatron-lm/artifacts/text/data/:/workspace/data \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
           megatron-core \
@@ -227,7 +230,7 @@ runs:
         timeout_seconds: ${{ steps.timeout_in_seconds.outputs.main }}
         max_attempts: 3
         shell: bash
-        retry_on: timeout
+        retry_on: any
         command: /bin/bash job.sh
         on_retry_command: /bin/bash retry_job.sh
 
@@ -238,7 +241,7 @@ runs:
         echo "::group::Check result"
 
         docker exec test_container_${{ github.run_id }} /opt/venv/bin/coverage xml
-        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/logs ./
+        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/outputs/logs ./
         docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/.coverage .coverage
         docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/coverage.xml coverage.xml
 

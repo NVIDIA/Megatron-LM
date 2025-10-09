@@ -14,10 +14,10 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+
 import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -169,8 +169,14 @@ if __name__ == "__main__":
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_mcore_gpt_from_hf(unwrapped_model, args.pretrained_model_path, workspace_dir)
+        import_mcore_gpt_from_hf(
+            unwrapped_model,
+            args.pretrained_model_path,
+            workspace_dir,
+            dtype=import_dtype,
+        )
 
     def _custom_prompt_forward_loop_func(model):
         all_prompts = args.prompts.split("|")

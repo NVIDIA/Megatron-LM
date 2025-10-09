@@ -196,7 +196,7 @@ def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> 
         workload_manifest
         for workload_manifest in workload_manifests
         for test_case in test_cases.split(",")
-        if workload_manifest.spec.test_case == test_case
+        if workload_manifest["spec"]["test_case"] == test_case
     )
 
     if len(workload_manifests) == 0:

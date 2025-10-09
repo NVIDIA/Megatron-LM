@@ -172,23 +172,12 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
-sleep 5
-set -x
-fuser -k /dev/nvidia* || true
-nvidia-smi pmon -c 1
-
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
-        -m coverage run \
-        --data-file=.coverage.unit_tests \
-        --source=megatron/core \
-        -m $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+        --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
-        -m coverage run \
-        --data-file=.coverage.unit_tests \
-        --source=megatron/core \
         $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 

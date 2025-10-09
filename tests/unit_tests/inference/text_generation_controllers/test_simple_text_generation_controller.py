@@ -14,7 +14,11 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    InferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -112,6 +116,8 @@ class TestTextGenerationController:
                 buffer_size_gb=1,
                 buffer_guaranteed_fraction=0.1,
                 materialize_only_last_token_logits=False,
+                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                # this is for compatibility with the LTS environment
             )
 
         inference_wrapped_model = GPTInferenceWrapper(
@@ -494,6 +500,57 @@ class TestTextGenerationController:
                 active_requests
             )
 
+    def test_add_bos_token(self):
+        self.setup_model(torch.float32)
+
+        prompt = "sample prompt"
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(1, len(prompt))))
+                for _ in range(len(x))
+            ]
+        )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
+        self.mock_tokenizer.tokenize.return_value = [
+            random.randint(0, self.vocab_size - 1) for _ in range(len(prompt))
+        ]
+
+        # Test on a tokenizer that does not add BOS by default
+        no_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
+        assert no_bos_to_no_bos[0] != self.mock_tokenizer.bos
+        no_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+        assert no_bos_to_yes_bos[0] == self.mock_tokenizer.bos
+        assert no_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+
+        # Force the first token to be BOS to emulate a tokenizer that does add BOS by default
+        self.mock_tokenizer.tokenize.return_value[0] = self.mock_tokenizer.bos
+
+        yes_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
+        assert yes_bos_to_no_bos[0] != self.mock_tokenizer.bos
+        yes_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+        assert yes_bos_to_yes_bos[0] == self.mock_tokenizer.bos
+        assert yes_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+
+        # Test on an input that has had multiple BOS added
+        self.mock_tokenizer.tokenize.return_value[1] = self.mock_tokenizer.bos
+
+        many_bos_to_no_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=False)
+        assert many_bos_to_no_bos[0] != self.mock_tokenizer.bos
+        many_bos_to_yes_bos = self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+        assert many_bos_to_yes_bos[0] == self.mock_tokenizer.bos
+        assert many_bos_to_yes_bos[1] != self.mock_tokenizer.bos
+
+        # Test the assert triggered when the tokenizer has no bos
+        self.mock_tokenizer.bos = None
+        with pytest.raises(AssertionError):
+            self.text_generation_controller.tokenize_prompt(prompt, add_BOS=True)
+
     def test_zero_tokens_generated_batch_vs_single(self):
         """
         Verifies that when `num_tokens_to_generate=0`, the outputs from batched inference
@@ -662,11 +719,17 @@ class TestTextGenerationController:
             context = self.text_generation_controller.inference_wrapped_model.inference_context
             for request_id, request in active_requests.items():
                 context.add_request(
-                    request_id=int(request_id),
-                    tokens=torch.tensor(
-                        request.prompt_tokens, dtype=torch.long, device=torch.cuda.current_device()
-                    ),
-                    num_tokens_to_generate=25,
+                    DynamicInferenceRequest(
+                        request_id=int(request_id),
+                        prompt_tokens=torch.tensor(
+                            request.prompt_tokens,
+                            dtype=torch.long,
+                            device=torch.cuda.current_device(),
+                        ),
+                        sampling_params=SamplingParams(
+                            top_k=10, return_log_probs=True, num_tokens_to_generate=25
+                        ),
+                    )
                 )
             sampling_params = SamplingParams(top_k=10, return_log_probs=True)
             while context.has_unfinished_requests():
