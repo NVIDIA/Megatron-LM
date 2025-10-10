@@ -179,7 +179,7 @@ pre:maybe_cherry_pick_to_main:
       MILESTONE_ID=$(echo -E $MR | jq '.milestone.id' | tr -d '"')
 
       git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
-      git remote set-url mr-origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${CI_MERGE_REQUEST_SOURCE_PROJECT_URL}.git"
+      git remote add mr-origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${CI_MERGE_REQUEST_SOURCE_PROJECT_URL}.git"
 
       git config --global user.email "mcore-bot@nvidia.com"
       git config --global user.name "Mcore Bot"
