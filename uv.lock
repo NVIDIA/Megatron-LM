@@ -1182,6 +1182,16 @@ wheels = [
 ]
 
 [[package]]
+name = "emerging-optimizers"
+version = "0.1.0"
+source = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=fb1add873e7851ec34b48581ea1b15761b73d189#fb1add873e7851ec34b48581ea1b15761b73d189" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "typing-extensions" },
+]
+
+[[package]]
 name = "exceptiongroup"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2227,6 +2237,9 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+emerging-optimizers = [
+    { name = "emerging-optimizers" },
+]
 flash-mla = [
     { name = "flash-mla" },
 ]
@@ -2314,6 +2327,7 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+emerging-optimizers = [{ name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=fb1add873e7851ec34b48581ea1b15761b73d189" }]
 flash-mla = [{ name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=9edee0c022cd0938148a18e334203b0aab43aa19" }]
 linting = [
     { name = "black", specifier = "==24.4.2" },

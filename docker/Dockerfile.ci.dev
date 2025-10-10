@@ -32,7 +32,7 @@ COPY megatron/core/package_info.py /workspace/megatron/core/
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
-    uv sync --extra dev --extra mlm --link-mode copy --locked \
+    uv sync --extra dev --extra mlm --link-mode copy --locked --all-groups \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
