@@ -23,10 +23,11 @@ def get_moe_module_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    fallback_to_eager_attn: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
     if use_te is not None and use_te:
-        backend: BackendSpecProvider = TESpecProvider()
+        backend: BackendSpecProvider = TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(

@@ -218,6 +218,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms: int = 16
     """Number of SMs to use for HybridEP. In pure NVL scenarios, 
     16 SMs can generally achieve good bandwidth."""
+    
+    fallback_to_eager_attn: bool = False
 
     ####################
     # linear attention
