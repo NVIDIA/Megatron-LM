@@ -280,6 +280,10 @@ def get_megatron_muon_optimizer(
     # TODO(deyuf): allow user to select optimizer mix and relax ChainedOptimizer design
     config.optimizer = 'adam'
 
+    # used for torch_dist checkpointing
+    def init_state_fn(opt, config=None):
+        pass
+
     # need to wrap into megatron mix precision optimizer. (only support bf16 w/o loss scale now)
     if config.fp16:
         raise Exception('muon with fp16 is not supported.')
@@ -293,9 +297,9 @@ def get_megatron_muon_optimizer(
             reset_config_bf16 = True
         else:
             # if not using layer_wise wrapper, just create master weight here is fine
-            optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, None)
+            optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, init_state_fn)
     else:
-        optimizer = FP32Optimizer(optimizer, config, None)
+        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
 
     optimizers.append(optimizer)
 
