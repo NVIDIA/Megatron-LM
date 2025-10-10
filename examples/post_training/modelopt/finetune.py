@@ -2,12 +2,12 @@
 
 """Supervised Finetuning GPT."""
 import itertools
+import json
 import os
 import sys
 from functools import partial
 from typing import Any, Dict, Optional
 
-import json
 import jsonlines
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
@@ -20,17 +20,16 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_provider import model_provider
 from megatron.post_training.loss_func import loss_func
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import (
-    average_losses_across_data_parallel_group,
     get_batch_on_this_cp_rank,
     get_ltor_masks_and_position_ids,
     print_rank_0,
-    unwrap_model,
 )
+from model_provider import model_provider
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -48,7 +47,7 @@ def add_finetune_args(parser):
 
 def get_eos_id():
     """Return the eos token id.
-    
+
     We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
     we need to replace it with some other special tokens that do not appear in message."""
     tokenizer = get_tokenizer()
@@ -79,7 +78,7 @@ class OfflineDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.num_samples
-    
+
     def __getitem__(self, idx):
         idx = idx % len(self.file_paths)
         file_path = self.file_paths[idx]
@@ -387,7 +386,7 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
 
 def get_batch(data_iterator):
     """Generate a batch.
-    
+
     For OfflineDataset, the aux_hidden_states and final hidden_states from the
     base model are loaded for offline speculative model training."""
     # TODO: this is pretty hacky, find a better way
@@ -495,7 +494,7 @@ def forward_step(data_iterator, model: GPTModel):
 if __name__ == "__main__":
     pretrain(
         train_valid_test_sft_datasets_provider,
-        model_provider,
+        partial(model_provider, modelopt_gpt_mamba_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         extra_args_provider=add_finetune_args,
