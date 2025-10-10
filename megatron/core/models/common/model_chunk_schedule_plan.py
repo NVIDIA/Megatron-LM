@@ -321,7 +321,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # build preprocess
         self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
 
-        # build layer schedule plan for each layer
+        # build layer schedule plan for each layer.
+        # The methods to obtain layers are different for MTP so we need the other build plan for MTP.
+        # Also, this can help annotate MTP layer so that it can know where MTP is.
         self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
         self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
 
