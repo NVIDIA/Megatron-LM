@@ -939,7 +939,7 @@ class MLASelfAttention(MultiLatentAttention):
 
         assert self.core_attention.max_attention_score.shape == (
             self.num_attention_heads_per_partition,
-        ), f"max_attention_score shape is not (n, ) \
+        ), f"max_attention_score shape is not ({self.num_attention_heads_per_partition}, ) \
                     but {self.core_attention.max_attention_score.shape}"
 
         # only update the weight if any head has
