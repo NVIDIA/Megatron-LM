@@ -147,6 +147,7 @@ linting = [
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
 flash_mla = ["flash_mla"]
+emerging_optimizers = ["emerging_optimizers"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
