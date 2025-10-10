@@ -52,6 +52,10 @@ class VisionModalitySubmodules(ModalitySubmodules):
                 len(self.output_projections) <= 1
             ), "VisionModalitySubmodules currently supports only one output projection"
 
+        self.pre_process = False
+        self.post_process = False
+        self.share_embeddings_and_output_weights=False
+
     def encode(self, encoders_data_batch: Dict) -> List[torch.Tensor]:
         """Encode image data batch into a list of tensors.
 
