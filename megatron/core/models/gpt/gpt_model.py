@@ -372,14 +372,13 @@ class GPTModel(LanguageModule):
                 (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
                 or self.config.flash_decode
             )
-            and rotary_pos_cos is not None
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
             sequence_len_offset = torch.tensor(
                 [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
-                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
+                device=torch.cuda.current_device(),
             )
         else:
             sequence_len_offset = None
