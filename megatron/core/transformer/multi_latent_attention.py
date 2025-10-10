@@ -925,21 +925,21 @@ class MLASelfAttention(MultiLatentAttention):
 
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
-        
+
         if self.core_attention.max_attention_score is None:
             raise ValueError("max_attention_score is None")
 
-        # Check if we're in absorption mode (cache_mla_latents enabled and linear_kv_up_proj deleted)
+        # Check if we're in absorption mode
         if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
             raise ValueError(
                 "qk_clip is not supported when cache_mla_latents is enabled and absorption is "
                 "active. The linear_kv_up_proj layer has been deleted during absorption "
                 "preparation."
             )
-        
+
         assert self.core_attention.max_attention_score.shape == (
-                    self.num_attention_heads_per_partition,
-                ), f"max_attention_score shape is not (n, ) \
+            self.num_attention_heads_per_partition,
+        ), f"max_attention_score shape is not (n, ) \
                     but {self.core_attention.max_attention_score.shape}"
 
         # only update the weight if any head has
@@ -949,15 +949,14 @@ class MLASelfAttention(MultiLatentAttention):
         ):
             # Use num_attention_heads_per_partition for tensor parallel scenarios
             num_heads = self.num_attention_heads_per_partition
-            
+
             # qk_clip_balancing_eta (n, 1, 1)
             assert self.core_attention.max_attention_score.shape == (
                 num_heads,
             ), f"max_attention_score shape is not ({num_heads},) \
                 but {self.core_attention.max_attention_score.shape}"
             self.qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_balancing_threshold
-                / self.core_attention.max_attention_score,
+                self.config.qk_clip_balancing_threshold / self.core_attention.max_attention_score,
                 max=1.0,
             ).view(num_heads, 1, 1)
             assert torch.all(self.qk_clip_balancing_eta <= 1.0)
@@ -967,7 +966,7 @@ class MLASelfAttention(MultiLatentAttention):
                 q_proj_weight = self.linear_q_proj.weight
             else:
                 q_proj_weight = self.linear_q_up_proj.weight
-            
+
             # Handle different weight access patterns (main_param vs direct access)
             if hasattr(q_proj_weight, 'main_param'):
                 weight = q_proj_weight.main_param.data
@@ -976,9 +975,7 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Reshape to (n, a + b, -1)
             weight_reshaped = weight.view(
-                num_heads,
-                self.config.qk_head_dim + self.config.qk_pos_emb_head_dim,
-                -1,
+                num_heads, self.config.qk_head_dim + self.config.qk_pos_emb_head_dim, -1
             )
 
             # Split into qk_head_dim and qk_pos_emb_head_dim parts: (n, a, -1) and (n, b, -1)
@@ -986,14 +983,15 @@ class MLASelfAttention(MultiLatentAttention):
             weight_q_pe = weight_reshaped[:, self.config.qk_head_dim :, :]
 
             # Clipping
-            weight_q_nope = weight_q_nope * torch.pow(self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha)
+            weight_q_nope = weight_q_nope * torch.pow(
+                self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha
+            )
             weight_q_pe = weight_q_pe * self.qk_clip_balancing_eta
 
             # Concatenate back and reshape to original shape
             weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
             weight_q_updated = weight_q_updated.view(
-                num_heads * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim),
-                -1,
+                num_heads * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim), -1
             )
 
             # Apply the updated weights
@@ -1004,7 +1002,7 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Update k side weight, keep v side weight unchanged
             kv_proj_weight = self.linear_kv_up_proj.weight
-            
+
             # Handle different weight access patterns
             if hasattr(kv_proj_weight, 'main_param'):
                 weight_kv = kv_proj_weight.main_param.data
@@ -1013,9 +1011,7 @@ class MLASelfAttention(MultiLatentAttention):
 
             # shape: (n, qk_head_dim + v_head_dim, kv_lora_rank)
             weight_reshaped = weight_kv.view(
-                num_heads,
-                self.config.qk_head_dim + self.config.v_head_dim,
-                -1,
+                num_heads, self.config.qk_head_dim + self.config.v_head_dim, -1
             )
 
             # Split into qk_head_dim and v_head_dim parts: (n, a, -1) and (n, b, -1)
@@ -1023,15 +1019,16 @@ class MLASelfAttention(MultiLatentAttention):
             weight_v = weight_reshaped[:, self.config.qk_head_dim :, :]
 
             # Clipping
-            weight_k = weight_k * torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha)
+            weight_k = weight_k * torch.pow(
+                self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha
+            )
 
             # Concatenate back and reshape to original shape
             weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
             weight_kv_updated = weight_kv_updated.view(
-                num_heads * (self.config.qk_head_dim + self.config.v_head_dim),
-                -1,
+                num_heads * (self.config.qk_head_dim + self.config.v_head_dim), -1
             )
-            
+
             # Apply the updated weights
             if hasattr(kv_proj_weight, 'main_param'):
                 kv_proj_weight.main_param.data.copy_(weight_kv_updated)
