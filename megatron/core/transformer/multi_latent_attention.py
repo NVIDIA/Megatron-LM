@@ -932,9 +932,15 @@ class MLASelfAttention(MultiLatentAttention):
         # Check if we're in absorption mode (cache_mla_latents enabled and linear_kv_up_proj deleted)
         if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
             raise ValueError(
-                "qk_clip is not supported when cache_mla_latents is enabled and absorption is active. "
-                "The linear_kv_up_proj layer has been deleted during absorption preparation."
+                "qk_clip is not supported when cache_mla_latents is enabled and absorption is "
+                "active. The linear_kv_up_proj layer has been deleted during absorption "
+                "preparation."
             )
+        
+        assert self.core_attention.max_attention_score.shape == (
+                    self.num_attention_heads_per_partition,
+                ), f"max_attention_score shape is not (n, ) \
+                    but {self.core_attention.max_attention_score.shape}"
 
         # only update the weight if any head has
         # max_attention_score > qk_clip_balancing_threshold

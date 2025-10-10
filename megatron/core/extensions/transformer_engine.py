@@ -1058,11 +1058,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     **packed_seq_kwargs,
                 )
 
-                assert batch_max_attention_scores.shape == (
-                    self.config.num_attention_heads,
-                ), f"batch_max_attention_scores shape is not (n, ) \
-                    but {batch_max_attention_scores.shape}"
-
                 # Update QK_Clip balancing eta
                 if self.max_attention_score is None:
                     self.max_attention_score = batch_max_attention_scores
