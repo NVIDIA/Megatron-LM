@@ -1,0 +1,210 @@
+import torch
+import torch.distributed as dist
+from functools import partial
+import logging
+from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.models.heterogenous_parallel.model_specs import get_vlm_mimo_model
+from tests.unit_tests.models.heterogenous_parallel.parallel_utils import (
+    get_module_to_grid_tuple, 
+    multimodule_no_sync, 
+    finalize_model_grads,
+    get_pg_collections_for_rank
+)
+from tests.unit_tests.models.heterogenous_parallel.data import get_data_iterator, get_batch
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+import megatron.core.pipeline_parallel.schedules as schedule
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def loss_func(loss_mask, output_tensor):
+    """Simple loss function for MIMO model training.
+    
+    Args:
+        loss_mask: mask indicating which tokens contribute to the loss
+        output_tensor: model output tensor
+    
+    Returns:
+        tuple: (loss, num_tokens, metrics_dict)
+    """
+    losses = output_tensor.float()
+    
+    loss_mask = loss_mask.contiguous().view(-1).float()
+    
+    total_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    total_loss = torch.sum(losses.view(-1) * loss_mask)
+    reporting_loss = torch.cat([total_loss.clone().detach().view(1), total_tokens.view(1)])
+    
+    return (total_loss, total_tokens, {'lm loss': (reporting_loss)})
+
+
+def forward_step(data_iterator, model):
+    """Forward step for MIMO model training.
+    
+    Args:
+        data_iterator: iterator over the dataset
+        model: MIMO model instance
+    
+    Returns:
+        tuple: (output_tensor, loss_function)
+    """
+    data_batch = get_batch(data_iterator)
+    if data_batch is None:
+        data_batch = {'input_ids': None}
+    output_tensor, loss_mask = model(**data_batch)
+    # Return output and loss function
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
+    vision_num_layers, vision_hidden_size, 
+    language_num_layers, language_hidden_size, 
+    vocab_size, image_seq_length, seq_length, 
+    special_token_ids,
+    vision_tp, vision_pp, vision_dp,
+    language_tp, language_pp, language_dp,
+    batch_size, num_microbatches
+):
+    """Test 1F1B schedule with VLM MIMO model using custom process groups.
+    
+    Args:
+        vision_num_layers: Number of layers in vision encoder
+        vision_hidden_size: Hidden size for vision encoder
+        language_num_layers: Number of layers in language model
+        language_hidden_size: Hidden size for language model
+        vocab_size: Vocabulary size
+        image_seq_length: Sequence length for images
+        seq_length: Total sequence length (text tokens = seq_length - image_seq_length)
+        special_token_ids: Dictionary of special token IDs
+        vision_tp, vision_pp, vision_dp: Vision model parallelism configs (TP, PP, DP)
+        language_tp, language_pp, language_dp: Language model parallelism configs (TP, PP, DP)
+        batch_size: Batch size for training
+        num_microbatches: Number of microbatches for pipeline parallelism
+    """
+    logging.info("Creating VLM MIMO model...")
+    mimo_model, module_to_grid_map, topology = get_vlm_mimo_model(
+        vision_num_layers=vision_num_layers,
+        vision_hidden_size=vision_hidden_size,
+        language_num_layers=language_num_layers,
+        language_hidden_size=language_hidden_size,
+        vocab_size=vocab_size,
+        seq_len=seq_length,
+        special_token_ids=special_token_ids,
+        vision_tp=vision_tp,
+        vision_pp=vision_pp,
+        vision_dp=vision_dp,
+        language_tp=language_tp,
+        language_pp=language_pp,
+        language_dp=language_dp,
+    )
+    
+    logging.info(f"Rank {dist.get_rank()}: Model created successfully")
+    
+    # Set up module to grid tuple for no_sync and finalize_model_grads
+    module_to_grid_tuple = get_module_to_grid_tuple(
+        mimo_model, 
+        module_to_grid_map['images'], 
+        module_to_grid_map['language_module']
+    )
+    
+    # Configure no_sync and finalize_model_grads functions
+    mimo_model.config.no_sync_func = partial(multimodule_no_sync, module_to_grid_tuple=module_to_grid_tuple)
+    mimo_model.config.finalize_model_grads_func = partial(finalize_model_grads, module_to_grid_tuple=module_to_grid_tuple)
+    
+    # Create multimodule communicator
+    multimodule_communicator = MultiModulePipelineCommunicator(
+        module_to_grid_map, topology, mimo_model.config, dim_mapping={'b': 0, 's': 1, 'h': 2}
+    )
+    
+    logging.info(f"Rank {dist.get_rank()}: Creating data iterator...")
+    
+    # Get data iterator
+    data_iterator = get_data_iterator(
+        encoder_grid=module_to_grid_map['images'],
+        llm_grid=module_to_grid_map['language_module'],
+        image_seq_length=image_seq_length,
+        seq_length=seq_length,
+        image_special_token_id=special_token_ids['images'],
+        batch_size=batch_size,
+        vocab_size=vocab_size,
+        vision_hidden_size=vision_hidden_size
+    )
+    
+    # Set model type for unit test
+    mimo_model.model_type = 'unit-test'
+    
+    # Prepare common arguments for schedule
+    common_args = {
+        'forward_step_func': forward_step,
+        'data_iterator': data_iterator,
+        'model': [mimo_model],
+        'num_microbatches': num_microbatches,
+        'seq_length': seq_length,
+        'micro_batch_size': batch_size,
+        'forward_only': False,
+    }
+    
+    # Get pg collections for modules that should be initialized on this rank
+    pg_collection = get_pg_collections_for_rank(module_to_grid_map)
+    
+    logging.info(f"Rank {dist.get_rank()}: Starting 1F1B schedule...")
+    
+    # Run 1F1B schedule
+    losses_reduced = schedule.forward_backward_pipelining_without_interleaving(
+        p2p_communicator=multimodule_communicator, 
+        pg_collection=pg_collection, 
+        **common_args
+    )
+    
+    logging.info(f"Rank {dist.get_rank()}: Training completed. Losses: {losses_reduced}")
+    
+    return losses_reduced
+
+
+if __name__ == "__main__":
+    # Initialize distributed training
+    Utils.initialize_distributed()
+    
+    # Model parameters
+    vision_num_layers = 16
+    vision_hidden_size = 1024
+    language_num_layers = 16
+    language_hidden_size = 2048
+
+    # Data parameters
+    vocab_size = 48000
+    image_seq_length = 1024
+    seq_length = 4096  # Total sequence length (text tokens = seq_length - image_seq_length)
+    special_token_ids = {"images": 32000}
+
+    # Model parallelisms (CP and EP are hardcoded to 1 in model_specs.py)
+    vision_tp, vision_pp, vision_dp = 2, 2, 1
+    language_tp, language_pp, language_dp = 2, 2, 1
+    
+    # Training parameters
+    batch_size = 2
+    num_microbatches = 16
+
+ 
+    losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
+        vision_num_layers=vision_num_layers,
+        vision_hidden_size=vision_hidden_size,
+        language_num_layers=language_num_layers,
+        language_hidden_size=language_hidden_size,
+        vocab_size=vocab_size,
+        image_seq_length=image_seq_length,
+        seq_length=seq_length,
+        special_token_ids=special_token_ids,
+        vision_tp=vision_tp,
+        vision_pp=vision_pp,
+        vision_dp=vision_dp,
+        language_tp=language_tp,
+        language_pp=language_pp,
+        language_dp=language_dp,
+        batch_size=batch_size,
+        num_microbatches=num_microbatches,
+    )
+    logging.info(f"Final losses: {losses}")
+
+    dist.destroy_process_group()
