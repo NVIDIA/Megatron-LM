@@ -335,7 +335,18 @@ def get_mtp_layer_spec_for_backend(
 def mtp_on_this_rank(
     config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
 ) -> bool:
-    """Check if there is MTP on the current rank."""
+    """
+    Check if there is MTP on the current rank.
+
+    Behavior:
+        - If a custom pipeline model parallel layout is provided in the config:
+            - If virtual pipeline parallelism is enabled (and `ignore_virtual` is False), checks
+              whether any MTP layers are present on this (pp_rank, vp_stage) pair.
+            - Otherwise, checks all virtual pipeline ranks of the current pipeline rank. Returns
+              True if any virtual sub-rank includes at least one MTP layer.
+        - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
+          pipeline stage. The function returns True only on the last pipeline stage.
+    """
     mtp_on_this_rank = False
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     if config.pipeline_model_parallel_layout is not None:
@@ -367,7 +378,7 @@ def mtp_on_this_rank(
 
 def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
     """Get the ranks of the MTP layers."""
-    mtp_ranks = []
+    mtp_ranks = set()
     if config.mtp_num_layers is None:
         return []
     if config.pipeline_model_parallel_layout is None:
@@ -377,8 +388,8 @@ def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
         for vpp_rank in range(len(layout[pp_rank])):
             num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
             if num_layers_to_build:
-                mtp_ranks.append(pp_ranks[pp_rank])
-    return list(set(mtp_ranks))
+                mtp_ranks.add(pp_ranks[pp_rank])
+    return list(mtp_ranks)
 
 
 def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:

@@ -153,15 +153,18 @@ class PostProcessNode(ScheduleNode):
         """Implements the forward pass for postprocessing.
 
         This method handles:
-        1. Final layer normalization
-        2. Output layer computation
-        3. Loss computation if labels are provided
+        1. Output layer computation
+        2. Loss computation if labels are provided
 
         Args:
             hidden_states: The hidden states from the transformer layers.
 
         Returns:
             The logits or loss depending on whether labels are provided.
+
+        Note:
+            Final layernorm now has been moved from the post-process stage to the
+            last decoder layer, so we don't need to run the final layer norm here.
         """
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(

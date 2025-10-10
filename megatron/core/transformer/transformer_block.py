@@ -385,7 +385,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def has_final_layernorm_in_this_stage(self):
         """
-        check if this vpp stage contains the final layernorm
+        Check if this vpp stage contains the final layernorm.
+
+        Note:
+            Final layernorm now has been moved from the post-process stage to the last decoder
+            layer by using this function.
+            There will be a small numeric difference because of grad norm reduction when final
+            layernorm is placed in different pipeline stages in deterministic mode. It can still
+            be bitwise aligned by disabling grad norm clipping.
         """
         if self.config.mtp_num_layers is None:
             # for model without MTPLayer, the final layernorm is set in the stage which does

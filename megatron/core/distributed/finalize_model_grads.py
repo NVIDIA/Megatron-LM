@@ -234,10 +234,7 @@ def _allreduce_embedding_grad(
             model_module = model[0]
         elif is_pp_last_stage(pp_group):
             model_module = model[-1]
-        elif (
-            getattr(config, 'mtp_num_layers', 0) is not None
-            and getattr(config, 'mtp_num_layers', 0) > 0
-        ):
+        elif getattr(config, 'mtp_num_layers', None) is not None and config.mtp_num_layers > 0:
             # Embedding for MTP layers is in the last virtual pipeline model parallel stage.
             model_module = model[-1]
         else:  # We do not support an interleaved schedule for models with encoders yet.

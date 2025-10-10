@@ -534,11 +534,8 @@ class GPTModel(LanguageModule):
             )
 
         if not self.post_process:
-            # TODO(shifangx): currently, hidden_states shape is [B*(1+mtp_num_layers), S, H]
-            # we need to set variable_seq_lengths to True in ModelParallelConfig
             return hidden_states
 
-        # TODO(lit): check whether the condition is compatible with 1f1b.
         if self.config.mtp_num_layers is not None:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
@@ -748,7 +745,6 @@ class GPTModel(LanguageModule):
         # embedding layer in the mtp process stage and tie it to the embedding in the pre
         # processing stage.
         # Now MTP loss is computed in post processing stage, so the output_layer is not needed.
-        # TODO(lit): consider the situation that no post-process but have mtp.
         if self.mtp_process and not self.pre_process:
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
