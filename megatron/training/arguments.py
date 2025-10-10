@@ -1357,6 +1357,8 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    group.add_argument('--fallback-to-eager-attn', action='store_true',
+                       help='fallback to eager attention in TE impl if desired features are not available')
     
     # FP4 related arguments
     group.add_argument('--fp4-format', default=None,

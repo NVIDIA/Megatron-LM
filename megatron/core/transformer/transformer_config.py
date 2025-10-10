@@ -215,6 +215,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
+    fallback_to_eager_attn: bool = False
+
     ####################
     # linear attention
     ####################
