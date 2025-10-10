@@ -406,7 +406,7 @@ test:safe_imports:
     - python -m pip install --no-cache-dir click
     - python .gitlab/scripts/check_imports.py --package-name megatron.core
   rules:
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'dev'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
