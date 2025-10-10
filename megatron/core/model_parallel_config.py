@@ -1,10 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, ContextManager, Optional
 
 import torch
-import warnings
 
 
 @dataclass
