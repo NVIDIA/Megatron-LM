@@ -788,6 +788,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         state_dict = {}
         state_dict['optimizer'] = self.optimizer.state_dict()
+        # print(f"state_dict: {self.optimizer}, {state_dict['optimizer'].keys()}")
         if self.grad_scaler:
             state_dict['grad_scaler'] = self.grad_scaler.state_dict()
         state_dict['fp32_from_fp16_params'] = self.fp32_from_float16_groups
@@ -1222,6 +1223,11 @@ class ChainedOptimizer(MegatronOptimizer):
         if isinstance(state_dict, dict):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
+            # if optimizer.config.optimizer == 'muon':
+            #     print(f"muon: {state.keys()}, {state['optimizer'].keys()}")
+            #     continue
+            # else:
+            #     print(f"adam: {state.keys()}, {state['optimizer'].keys()}")
             optimizer.load_state_dict(state)
         self._synchronize_steps()
 
