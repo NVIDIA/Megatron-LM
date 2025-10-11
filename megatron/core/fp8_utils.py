@@ -406,6 +406,15 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
     _correct_amax_history_if_needed_impl(model)
 
 
+def post_all_gather_processing(model_params):
+    try:
+        from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
+
+        post_all_gather_processing(model_params)
+    except ImportError:
+        pass
+
+
 def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
     """Check if the layer is in bf16."""
     num_bf16_layers_at_start = (
