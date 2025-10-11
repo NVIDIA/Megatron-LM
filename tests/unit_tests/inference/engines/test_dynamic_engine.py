@@ -425,6 +425,7 @@ class TestDynamicInferenceEngine:
         """Test request overflow."""
         self._run_test(context_max_requests_override=1)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
