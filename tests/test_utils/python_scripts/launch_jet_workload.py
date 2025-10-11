@@ -487,15 +487,17 @@ def main(
                 )
 
             if is_flaky_failure(concat_allranks_logs):
-                logger.error("Detected flaky failure, attempt restart.")
+                if n_attempts < 9:
+                    logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
             if (
                 "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
-                logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
+                if n_nondeterminism_attemps < 3:
+                    logger.error("Non-determinism, let's try another node.")
                 continue
 
             telemetrics_and_exit(
