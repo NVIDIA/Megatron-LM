@@ -146,7 +146,6 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
-
     #######################
     # Distributed optimizer
     #######################

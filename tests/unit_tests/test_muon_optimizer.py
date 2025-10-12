@@ -1,15 +1,14 @@
 import os
+
 import pytest
-
-from packaging.version import Version
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging.version import Version
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer, TensorParallelMuon
+from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed

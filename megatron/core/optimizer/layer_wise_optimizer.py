@@ -4,12 +4,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from .optimizer import ChainedOptimizer, MegatronOptimizer, Float16OptimizerWithFloat16Params
-from .optimizer_config import OptimizerConfig
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
-
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, MegatronOptimizer
+from .optimizer_config import OptimizerConfig
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -27,6 +27,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     4. Do regular update with chained optimizers, optimizer is already modified so partial update happens
     5. allgather updated params to every rank(currently through broadcast loop)
     """
+
     def __init__(
         self,
         optimizers: List[MegatronOptimizer],
@@ -40,7 +41,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if config.bf16:
             if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
                 raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
-            optimizers = [Float16OptimizerWithFloat16Params(optim, config, None, None) for optim in optimizers]
+            optimizers = [
+                Float16OptimizerWithFloat16Params(optim, config, None, None) for optim in optimizers
+            ]
         super().__init__(optimizers)
 
         # TODO(kunlun, deyuf): potential future perf optimization
@@ -50,7 +53,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # single allgather later and all current distopt optimization can be applied
 
     def shard_params(self, optimizers):
-        """Shard all params into lists by rank. """
+        """Shard all params into lists by rank."""
         # We'll optimize sharding later if there is perf issue. should be ok since linear are grouped already
         # Key is to create separate sharding for dp/expt parallel, saved in dp_cp_params_list, expt_dp_params_list
         # example of 4 dp rank and 10 non-expert parameters p0-p9, then dp_cp_params_list will look like
@@ -94,7 +97,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def broadcast_params(self):
-        """All rank broadcast updated local params(allgatherv). """
+        """All rank broadcast updated local params(allgatherv)."""
         # Broadcast linear layer weights to all other ranks.
         # This may not be slower than PyTorch allgatherv which calls broadcast internally.
         # TODO(skyw): Profile and implement more efficient version.
@@ -117,9 +120,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_main_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=None
-        )
+        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
         return grad_norm
 
     @torch.no_grad()
@@ -154,5 +155,3 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def load_state_dict_from_file(self, filename: str) -> None:
         """Load the parameter state of the optimizer."""
         super().load_state_dict(torch.load(filename))
-
-
