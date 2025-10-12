@@ -25,7 +25,7 @@ try:
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
     else:
         dist_all_gather_func = torch.distributed._all_gather_base
-except:
+except (ImportError, AttributeError):
     dist_all_gather_func = torch.distributed._all_gather_base
 
 
