@@ -108,6 +108,7 @@ def launch_and_wait_for_completion(
                                         ),
                                         "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
                                         "TRANSFORMERS_OFFLINE": "1",
+                                        "CLUSTER": cluster,
                                     }
                                 }
                             }
