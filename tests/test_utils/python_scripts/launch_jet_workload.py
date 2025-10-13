@@ -287,6 +287,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
         or "Unpack failed: incomplete input" in concat_allranks_logs
         or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
     )
 
 
