@@ -863,7 +863,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             or (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope)
             or (self.is_moe_layer and 'moe' in self.config.cuda_graph_scope)
         ):
-            # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
+            # CUDA Graph captures the whole MLP/MoE part, or 1f1b overlapping is enabled.
+            # CUDA Graph output is the layer output.
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
             output = cuda_graph_output.pop()
         elif self.is_moe_layer and 'moe_router' in self.config.cuda_graph_scope:
@@ -1000,6 +1001,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if using_cuda_graph:
                 return True
         return False
+
+    def backward_dw_cudagraph(self, microbatch_idx):
+        """
+        CUDA Graph backward weight gradient computation for this layer.
+        """
+        cg_index = microbatch_idx % len(self.cuda_graphs)
+        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
+            return
+        self.cuda_graphs[cg_index].backward_dw()
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):

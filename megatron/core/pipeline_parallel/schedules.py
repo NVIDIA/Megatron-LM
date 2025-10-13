@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial
+from itertools import zip_longest
 from typing import Callable, Iterator, List, Optional, Union
 
 import torch
@@ -810,6 +811,59 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     if num_warmup_microbatches > 0:
         order.extend(backward_order[-num_warmup_microbatches:])
     return order
+
+
+def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk):
+    """
+    Get the order for overlap_moe_expert_parallel_comm schedule for the original
+    chunk-wise order list.
+    """
+    first_backward_idx, last_forward_idx = None, None
+    for idx, c_id in enumerate(order):
+        if first_backward_idx is None and c_id < 0:
+            first_backward_idx = idx
+        if c_id > 0:
+            last_forward_idx = idx
+    assert (
+        first_backward_idx is not None
+        and last_forward_idx is not None
+        and first_backward_idx < last_forward_idx
+    ), "Invalid order"
+    for idx, c_id in enumerate(order[first_backward_idx + 1 : last_forward_idx]):
+        if idx % 2 == 0:
+            assert c_id > 0, "Invalid order"
+        else:
+            assert c_id < 0, "Invalid order"
+
+    def get_layer_range(c_id):
+        num_layers = num_layers_per_chunk[abs(c_id) - 1]
+        num_layers_previous_chunks = sum(num_layers_per_chunk[: abs(c_id) - 1])
+        if c_id > 0:
+            return list(
+                range(num_layers_previous_chunks + 1, num_layers_previous_chunks + num_layers + 1)
+            )
+        return list(range(-num_layers_previous_chunks - num_layers, -num_layers_previous_chunks))
+
+    new_order = []
+    for c_id in order[:first_backward_idx]:
+        new_order += get_layer_range(c_id)
+
+    for c_id_b, c_id_f in zip(
+        order[first_backward_idx : last_forward_idx + 1 : 2],
+        order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
+    ):
+        for l_b, l_f in zip_longest(get_layer_range(c_id_b), get_layer_range(c_id_f), fillvalue=0):
+            if l_f != 0 and l_b != 0:
+                new_order += [l_f, l_b]
+            elif l_f != 0:
+                new_order += [l_f]
+            else:
+                new_order += [l_b]
+
+    for c_id in order[last_forward_idx + 1 :]:
+        new_order += get_layer_range(c_id)
+
+    return new_order
 
 
 def forward_backward_pipelining_with_interleaving(
