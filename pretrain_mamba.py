@@ -56,7 +56,7 @@ def get_batch(data_iterator, vp_stage=None):
 
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage):
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
