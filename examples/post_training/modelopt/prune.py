@@ -15,9 +15,10 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
-
+import modelopt.torch.opt as mto
 import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
+from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -29,19 +30,6 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 
 warnings.filterwarnings("ignore")
-
-
-SUPPORTED_PRUNING_HPARAMS = {
-    # Width pruning
-    "ffn_hidden_size",
-    "hidden_size",
-    "num_attention_heads",
-    "num_query_groups",
-    "mamba_num_heads",
-    "mamba_head_dim",
-    # Depth pruning
-    "num_layers",
-}
 
 
 def add_prune_args(parser):
@@ -72,43 +60,43 @@ def add_prune_args(parser):
         help="HuggingFace pretrained model",
     )
     # Pruning parameters
-    parser.add_argument(
+    group.add_argument(
         "--target-ffn-hidden-size",
         type=int,
         help="Prune MLP FFN hidden size to this value",
     )
-    parser.add_argument(
+    group.add_argument(
         "--target-hidden-size",
         type=int,
         help="Prune hidden size (embedding dim) to this value",
     )
-    parser.add_argument(
+    group.add_argument(
         "--target-num-attention-heads",
         type=int,
         help="Prune number of attention heads to this value. Must be supplied with --target-num-query-groups",
     )
-    parser.add_argument(
+    group.add_argument(
         "--target-num-query-groups",
         type=int,
         help="Prune number of query groups to this value. Must be supplied with --target-num-attention-heads",
     )
-    parser.add_argument(
+    group.add_argument(
         "--target-mamba-num-heads",
         type=int,
         help="Prune number of Mamba attention heads to this value",
     )
-    parser.add_argument(
+    group.add_argument(
         "--target-mamba-head-dim",
         type=int,
         help="Prune dimension of Mamba attention heads to this value",
     )
-    parser.add_argument(
+    group.add_argument(
         "--target-num-layers",
         type=int,
         help="Prune number of transformer layers to this value based on "
         "Block Influence metric (cosine similarity) as per https://arxiv.org/abs/2403.03853",
     )
-    parser.add_argument(
+    group.add_argument(
         "--layers-to-drop",
         type=int,
         metavar="N",
@@ -122,16 +110,7 @@ def add_prune_args(parser):
 def check_arguments(args):
     """Checking user arguments."""
     if args.layers_to_drop:
-        other_params = [
-            args.target_ffn_hidden_size,
-            args.target_hidden_size,
-            args.target_num_attention_heads,
-            args.target_num_query_groups,
-            args.target_mamba_num_heads,
-            args.target_mamba_head_dim,
-            args.target_num_layers,
-        ]
-        if any(p is not None for p in other_params):
+        if any(getattr(args, f"target_{k}", None) is not None for k in SUPPORTED_HPARAMS):
             raise ValueError("--layers_to_drop cannot be used with other pruning parameters")
 
 
@@ -206,8 +185,8 @@ if __name__ == "__main__":
         print_rank_0("Pruning model...")
         export_config = {
             k: getattr(args, f"target_{k}")
-            for k in SUPPORTED_PRUNING_HPARAMS
-            if getattr(args, f"target_{k}") is not None
+            for k in SUPPORTED_HPARAMS
+            if getattr(args, f"target_{k}", None) is not None
         }
         mtp.prune(
             unwrapped_model,
@@ -216,6 +195,10 @@ if __name__ == "__main__":
             dummy_input=None,  # Not used
             config={"forward_loop": _hf_dataset_forword_loop_func},
         )
+        # [WAR till modelopt 0.39]: Remove prune state to avoid converting again on restore which forces TP=1.
+        if mto.ModeloptStateManager.has_state_for_mode_type("prune", model=unwrapped_model):
+            mto.ModeloptStateManager.remove_state(unwrapped_model)
+
     print_rank_0(f"Pruned Model:\n {unwrapped_model}")
 
     _custom_prompt_forward_loop_func(unwrapped_model)
