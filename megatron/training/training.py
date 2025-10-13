@@ -237,9 +237,6 @@ def num_floating_point_operations(args, batch_size):
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
-        # Attention projection size.
-        query_projection_size = args.kv_channels * args.num_attention_heads
-        query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
         # Group Query Attention.
         if not args.group_query_attention:
             args.num_query_groups = args.num_attention_heads
@@ -330,10 +327,9 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
-            self_attn_term = (
+            standard_self_attn_term = (
                 3
                 * 2  # fwd(1) + bwd(2) *FMA
-                * num_layers
                 * (
                     ## q lora + rope + q norm
                     q_term
@@ -350,28 +346,97 @@ def num_floating_point_operations(args, batch_size):
                     ## core attn
                     + args.seq_length
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2
+                    / 2  # causal mask (only half of the mask is non-zero)
                     + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
         else:
             ## MHA or GQA
-            self_attn_term = (
-                expansion_factor
-                * num_layers
-                * args.hidden_size
-                * args.hidden_size
+            query_projection_size = args.kv_channels * args.num_attention_heads
+            key_projection_size = args.kv_channels * args.num_query_groups
+            value_projection_size = args.kv_channels * args.num_query_groups
+            standard_self_attn_term = (
+                3
+                * 2  # fwd(1) + bwd(2) *FMA
                 * (
-                    (
-                        1
-                        + (args.num_query_groups / args.num_attention_heads)
-                        # # Only half of the attention matrix is non-zero and needs to be multiplied with V.
-                        + (args.seq_length / args.hidden_size / 2)
-                    )
-                    * query_projection_to_hidden_size_ratio
+                    ## qkv proj
+                    args.hidden_size
+                    * (query_projection_size + key_projection_size + value_projection_size)
+                    ## core attention
+                    + query_projection_size
+                    * args.seq_length
+                    / 2  # causal mask (only half of the mask is non-zero)
+                    * 2  # QK^T and (QK^T)V
+                    ## out proj
+                    + query_projection_size
+                    * args.hidden_size
                 )
             )
+
+        if args.linear_attention_type is not None:
+            # Calculate number of dense and MoE Transformer MLPs.
+            if isinstance(args.linear_attention_freq, int):
+                linear_attention_pattern = [
+                    # [1,1,...,1,0,1,1,...,1,0,...]
+                    0 if ((i + 1) % args.linear_attention_freq == 0)
+                    else 1 for i in range(num_layers)
+                ]
+            elif isinstance(args.linear_attention_freq, list):
+                linear_attention_pattern = args.linear_attention_freq
+                assert len(linear_attention_pattern) == num_layers, (
+                    f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
+                    f"expected {num_layers}, "
+                    f"current linear attention pattern: {args.linear_attention_freq}"
+                )
+            elif args.linear_attention_freq is None:
+                linear_attention_pattern = [1] * num_layers
+            else:
+                raise ValueError(
+                    f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
+                    f" {args.linear_attention_freq}"
+                )
+            num_linear_attention_layers = sum(linear_attention_pattern)
+            num_standard_attention_layers = num_layers - num_linear_attention_layers
+
+            if args.linear_attention_type == "gated_delta_net":
+                # Calculate the FLOPs for the gated delta net attention.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                linear_self_attn_term = (
+                    3
+                    * 2  # fwd(1) + bwd(2) *FMA
+                    * (
+                        ## in proj
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                        ## conv1d
+                        + args.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
+                        ## gated delta rule
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
+            else:
+                raise ValueError(f"Invalid linear_attention_type: {args.linear_attention_type}")
+        else:
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+        self_attn_term = (
+            linear_self_attn_term * num_linear_attention_layers
+            + standard_self_attn_term * num_standard_attention_layers
+        )
 
         total_floating_point_operations = (
             batch_size
@@ -528,6 +593,30 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_decay):
+    """Get the no weight decay condition function."""
+
+    # Default case: no_wd_decay_cond_type is None
+    no_wd_decay_cond_fn = None
+
+    if no_wd_decay_cond_type == 'qwen3_next':
+        # Qwen3-Next applies weight decay to qk layernorm as a special case
+        def qwen3_next_no_wd_decay_cond(name, param):
+            if "q_layernorm" in name or "k_layernorm" in name:
+                no_wd = False
+            else:
+                no_wd = (
+                    name.endswith(".bias")
+                    or len(param.shape) == 1
+                    or (default_skip_embedding_weight_decay and "embedding" in name)
+                )
+            return no_wd
+        no_wd_decay_cond_fn = qwen3_next_no_wd_decay_cond
+    elif no_wd_decay_cond_type is not None:
+        raise ValueError(f"Invalid no_wd_decay_cond_type: {no_wd_decay_cond_type}")
+
+    return no_wd_decay_cond_fn
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -664,8 +753,15 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    no_wd_decay_cond = get_no_wd_decay_cond(
+        args.no_weight_decay_cond_type,
+        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+    )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider,
+        model_type,
+        checkpointing_context=checkpointing_context,
+        no_wd_decay_cond=no_wd_decay_cond,
     )
 
     timers('model-and-optimizer-setup').stop()

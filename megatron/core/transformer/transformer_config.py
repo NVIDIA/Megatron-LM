@@ -192,6 +192,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    attention_output_gate: bool = False
+    """Whether to apply output gate to the attention layers."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -211,6 +214,34 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
+
+    ####################
+    # linear attention
+    ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use. Currently support gated_delta_net."""
+
+    linear_attention_freq: Optional[Union[int, List[int]]] = None
+    """Frequency between LA (linear attention) layers 
+    and SDPA (scaled dot-product attention) layers.
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+
+    linear_conv_kernel_dim: Optional[int] = None
+    """Conv kernel dimension for the gated delta net."""
+
+    linear_key_head_dim: Optional[int] = None
+    """Query and key head dimension for the gated delta net."""
+
+    linear_value_head_dim: Optional[int] = None
+    """Value and gate head dimension for the gated delta net."""
+
+    linear_num_key_heads: Optional[int] = None
+    """Number of query and key heads for the gated delta net."""
+
+    linear_num_value_heads: Optional[int] = None
+    """Number of value and gate heads for the gated delta net."""
 
     ####################
     # initialization
@@ -428,6 +459,9 @@ class TransformerConfig(ModelParallelConfig):
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
     there are multiple shared experts.
     None means no shared expert."""
+
+    moe_shared_expert_gate: bool = False
+    """Enable gate for shared expert."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
@@ -743,6 +777,54 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.linear_attention_type is not None:
+            supported_la_types = ["gated_delta_net", "mamba"]
+            assert self.linear_attention_type in supported_la_types, (
+                f"linear_attention_type ({self.linear_attention_type}) only support"
+                f" one of {supported_la_types}."
+            )
+            assert (
+                self.linear_attention_freq is not None
+            ), f"linear_attention_freq must be set for linear attention."
+
+            if self.linear_attention_type == "gated_delta_net":
+                # Check required parameters
+                assert (
+                    self.linear_conv_kernel_dim is not None
+                ), "linear_conv_kernel_dim must be set for gated delta net."
+                assert (
+                    self.linear_key_head_dim is not None
+                ), "linear_key_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_value_head_dim is not None
+                ), "linear_value_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_num_key_heads is not None
+                ), "linear_num_key_heads must be set for gated delta net."
+                assert (
+                    self.linear_num_value_heads is not None
+                ), "linear_num_value_heads must be set for gated delta net."
+                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                    f"linear_num_key_heads ({self.linear_num_key_heads})."
+                )
+
+                # Check tensor parallelism compatibility
+                assert (
+                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
+                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+                assert (
+                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
+                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+
+                # Do not support yet, but coming soon.
+                assert self.context_parallel_size == 1, (
+                    f"Gated delta net does not support context parallel for now,"
+                    f" but got {self.context_parallel_size=}."
+                )
+            elif self.linear_attention_type == "mamba":
+                raise NotImplementedError("Mamba is not supported yet.")
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1552,6 +1634,9 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        if self.attention_output_gate:
+            raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (

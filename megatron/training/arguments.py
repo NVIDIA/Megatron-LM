@@ -69,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_linear_attention_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -319,10 +320,35 @@ def moe_freq_type(x):
       This allows defining arbitrary patterns of expert and dense layers.
       The pattern length must match the total number of transformer layers.
       Examples:
-          "([0]+[1]*23)": 1 dense layer followed by 23 experts layers
+          "([0]+[1]*23)": 1 dense layer followed by 23 expert layers
           "([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.
     """
     if isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        return _eval_pattern(x)
+    else:
+        # it's a single int but in str
+        return int(x)
+
+def la_freq_type(x):
+    """Frequency between LA (linear attention) layers and SDPA (scaled dot-product attention) layers.
+
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+      where 1 indicates an LA layer and 0 indicates a SDPA layer.
+      This allows defining arbitrary patterns of LA and SDPA layers.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers
+          "([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.
+    """
+    if x is None or isinstance(x, int):
         return x
     assert isinstance(x, str)
     if '[' in x:
@@ -1542,6 +1568,8 @@ def _add_network_size_args(parser):
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
+    group.add_argument('--attention-output-gate', action='store_true',
+                       help='Whether to apply output gate to the attention.')
     group.add_argument('--softmax-type', type=str, default='vanilla',
                        choices=['learnable', 'vanilla', 'off-by-one'],
                        help='Type of softmax to use for the attention. Supports both a fixed offset and '
@@ -1860,6 +1888,12 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['qwen3_next'],
+                       help='Type of no weight decay condition. Choices: '
+                       'None (default): param no weight decay if and only if it is 1D; or it is bias; '
+                       'or it is embedding and embedding_init_method_std is not None. '
+                       '"qwen3_next": In addition to the default rules, '
+                       'apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -3028,7 +3062,7 @@ def _add_moe_args(parser):
                             '- A string containing a Python list expression that defines a custom pattern, e.g.: '
                             '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
                             'where 1 indicates an expert layer and 0 indicates a dense layer. '
-                            'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 experts layers, '
+                            'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 expert layers, '
                             '"([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.')
     group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
                        help='The hidden size of each expert\'s feed-forward network (ffn). '
@@ -3037,6 +3071,8 @@ def _add_moe_args(parser):
                        help='Shared expert total ffn hidden size. '
                        'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" if there are multiple shared experts. '
                        'None means no shared expert.')
+    group.add_argument('--moe-shared-expert-gate', action='store_true',
+                       help='Enable gate for shared expert. Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-shared-expert-overlap', action='store_true',
                        help='Enable overlapping between shared expert computations and dispatcher communications. '
                        'Without this, the shared epxerts execute after the routed experts. '
@@ -3159,6 +3195,31 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_linear_attention_args(parser):
+    group = parser.add_argument_group(title="la")
+    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net', 'mamba'], type=str,
+                       help='Type of linear attention to use. Currently support gated_delta_net and mamba.')
+    group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
+                       help='Frequency between LA (linear attention) layers and'
+                            ' SDPA (scaled dot-product attention) layers. Accepts either: '
+                            '- An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
+                            'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
+                            '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
+                       help='Conv kernel dimension for the gated delta net.')
+    group.add_argument('--linear-key-head-dim', default=128, type=int,
+                       help='Query and key head dimension for the gated delta net.')
+    group.add_argument('--linear-value-head-dim', default=128, type=int,
+                       help='Value and gate head dimension for the gated delta net.')
+    group.add_argument('--linear-num-key-heads', default=16, type=int,
+                       help='Number of query and key heads for the gated delta net.')
+    group.add_argument('--linear-num-value-heads', default=32, type=int,
+                       help='Number of value and gate heads for the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):
