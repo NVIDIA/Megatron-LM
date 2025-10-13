@@ -380,14 +380,12 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
                        f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
 
     if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
-        metadata['singleton_local_shards'] = False
         if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
             if args.ckpt_fully_parallel_save:
                 metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
             else:
                 metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
     else:
-        metadata['singleton_local_shards'] = True
         if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
             if args.dist_ckpt_optim_fully_reshardable:
                 metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
@@ -395,6 +393,7 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
             else:
                 metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
+    metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
     return metadata
 
