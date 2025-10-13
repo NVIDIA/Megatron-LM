@@ -2,20 +2,22 @@ import torch
 import torch.distributed as dist
 from functools import partial
 import logging
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.models.heterogenous_parallel.model_specs import get_vlm_mimo_model
 from tests.unit_tests.models.heterogenous_parallel.parallel_utils import (
     get_module_to_grid_tuple, 
     multimodule_no_sync, 
     finalize_model_grads,
-    get_pg_collections_for_rank
+    get_pg_collections_for_rank,
+    zero_grad_buffer_for_multimodule
 )
 from tests.unit_tests.models.heterogenous_parallel.data import get_data_iterator, get_batch
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 import megatron.core.pipeline_parallel.schedules as schedule
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 def loss_func(loss_mask, output_tensor):
@@ -64,7 +66,8 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     special_token_ids,
     vision_tp, vision_pp, vision_dp,
     language_tp, language_pp, language_dp,
-    batch_size, num_microbatches
+    batch_size, num_microbatches,
+    num_iterations=1, profile_start_step=None, profile_end_step=None, enable_profiling=False
 ):
     """Test 1F1B schedule with VLM MIMO model using custom process groups.
     
@@ -148,23 +151,47 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     # Get pg collections for modules that should be initialized on this rank
     pg_collection = get_pg_collections_for_rank(module_to_grid_map)
     
-    logging.info(f"Rank {dist.get_rank()}: Starting 1F1B schedule...")
+    all_losses = []
     
-    # Run 1F1B schedule
-    losses_reduced = schedule.forward_backward_pipelining_without_interleaving(
-        p2p_communicator=multimodule_communicator, 
-        pg_collection=pg_collection, 
-        **common_args
-    )
+    for iteration in range(num_iterations):
+        # Start profiling if enabled
+        if enable_profiling and profile_start_step is not None and iteration == profile_start_step:
+            logging.info(f"Rank {dist.get_rank()}: Starting profiler at iteration {iteration}")
+            torch.cuda.cudart().cudaProfilerStart()
+        
+        logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Starting 1F1B schedule...")
+        
+        # Run 1F1B schedule
+        losses_reduced = schedule.forward_backward_pipelining_without_interleaving(
+            p2p_communicator=multimodule_communicator, 
+            pg_collection=pg_collection, 
+            **common_args
+        )
+        
+        all_losses.append(losses_reduced)
+        logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Losses: {losses_reduced}")
+        
+        zero_grad_buffer_for_multimodule(module_to_grid_tuple)
+        
+        # Stop profiling if enabled
+        if enable_profiling and profile_end_step is not None and iteration == profile_end_step:
+            logging.info(f"Rank {dist.get_rank()}: Stopping profiler at iteration {iteration}")
+            torch.cuda.cudart().cudaProfilerStop()
     
-    logging.info(f"Rank {dist.get_rank()}: Training completed. Losses: {losses_reduced}")
+    logging.info(f"Rank {dist.get_rank()}: Training completed. All losses: {all_losses}")
     
-    return losses_reduced
+    return all_losses
 
 
 if __name__ == "__main__":
     # Initialize distributed training
     Utils.initialize_distributed()
+
+    # Profiling configuration
+    enable_profiling = True
+    num_iterations = 6
+    profile_start_step = 3
+    profile_end_step = 5
     
     # Model parameters
     vision_num_layers = 16
@@ -185,7 +212,6 @@ if __name__ == "__main__":
     # Training parameters
     batch_size = 2
     num_microbatches = 16
-
  
     losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         vision_num_layers=vision_num_layers,
@@ -204,6 +230,10 @@ if __name__ == "__main__":
         language_dp=language_dp,
         batch_size=batch_size,
         num_microbatches=num_microbatches,
+        num_iterations=num_iterations,
+        profile_start_step=profile_start_step,
+        profile_end_step=profile_end_step,
+        enable_profiling=enable_profiling,
     )
     logging.info(f"Final losses: {losses}")
 

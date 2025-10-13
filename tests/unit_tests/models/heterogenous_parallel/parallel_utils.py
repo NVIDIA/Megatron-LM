@@ -53,3 +53,14 @@ def finalize_model_grads(model, num_tokens=None, pg_collection=None, *, module_t
     for module, grid in module_to_grid_tuple:
         if module is not None and is_current_rank_in_grid(grid):
             _finalize_model_grads([module], num_tokens=num_tokens, pg_collection=_get_pg_collection_with_embedding_groups(grid))
+
+
+def zero_grad_buffer_for_multimodule(module_to_grid_tuple):
+    """Reset gradient buffers for all DDP-wrapped modules in their respective grids.
+        
+    Args:
+        module_to_grid_tuple: Tuple of (module, grid) pairs to reset grads for each module
+    """
+    for module, grid in module_to_grid_tuple:
+        if module is not None and is_current_rank_in_grid(grid):
+            module.zero_grad_buffer()
