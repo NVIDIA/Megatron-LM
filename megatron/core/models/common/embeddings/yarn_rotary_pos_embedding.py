@@ -85,13 +85,13 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
             )
             super().__init__(
-                kv_channels,
-                rotary_percent,
-                rotary_interleaved,
-                seq_len_interpolation_factor,
-                rotary_base,
-                use_cpu_initialization,
-                cp_group,
+                kv_channels=kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                use_cpu_initialization=use_cpu_initialization,
+                cp_group=cp_group,
             )
 
             self._set_cos_sin_cache(
