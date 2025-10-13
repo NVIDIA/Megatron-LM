@@ -301,10 +301,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
         # >>>
-        pax({
-            "max_sequence_length" : self.max_sequence_length,
-            "max_kv_chunk_count" : self.max_kv_chunk_count,
-        })
+        # pax({
+        #     "max_sequence_length" : self.max_sequence_length,
+        #     "max_kv_chunk_count" : self.max_kv_chunk_count,
+        # })
         # <<<
         self.request_to_kv_chunk_ids = torch.full(
             (self.max_total_requests, self.max_kv_chunk_count),
@@ -1195,15 +1195,40 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_chunk_count_avail = self.chunk_allocator.get_active_avail()
+            # >>>
             # pax("active_chunk_count_avail")
+            # <<<
 
             paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
             paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
             paused_chunk_counts += 1 # +1 for newly added chunk
             paused_chunk_counts_cumsum = paused_chunk_counts.cumsum(dim=0)
-            resume_request_count = torch.nonzero(
-                paused_chunk_counts_cumsum <= active_chunk_count_avail
-            ).numel()
+            # >>>
+            # resume_request_count = torch.nonzero(
+            #     paused_chunk_counts_cumsum <= active_chunk_count_avail
+            # ).numel()
+            # +++
+            resume_request_count = min(
+                torch.nonzero(
+                    paused_chunk_counts_cumsum <= active_chunk_count_avail
+                ).numel(),
+                self.chunk_allocator.total_avail,
+            )
+            # <<<
+            # >>>
+            # if resume_request_count > self.chunk_allocator.total_avail:
+            #     pax({
+            #         "chunk_allocator" : self.chunk_allocator,
+            #         "active_used" : "%d / %d" % (
+            #             self.chunk_allocator.get_active_used(),
+            #             self.chunk_allocator.active_count,
+            #         ),
+            #         "paused_used" : "%d / %d" % (
+            #             self.chunk_allocator.get_paused_used(),
+            #             self.chunk_allocator.paused_count,
+            #         ),
+            #     }, "resume_request_count")
+            # <<<
 
         # >>>
         # newly_resumed_request_ids = self.request_ids[(self.paused_request_count - resume_request_count):self.paused_request_count]
@@ -1259,6 +1284,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 == 0
             ), "The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. "
 
+            # >>>
+            if resume_request_count > self.chunk_allocator.total_avail:
+                pax({"chunk_allocator": self.chunk_allocator}, "resume_request_count")
+            # <<<
             chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,

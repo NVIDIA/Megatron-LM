@@ -557,6 +557,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+        # >>>
+        ec = os.environ["INFERENCE_EMPTY_CACHE"]
+        if ec == "1":
+            torch.cuda.empty_cache()
+        elif ec == "0":
+            pass
+        else:
+            raise Exception(f"specialize for ec '{ec}'.")
+        # <<<
 
         # Previous context state, for printing output below.
         prev_is_decode_only = self.context.is_decode_only()
@@ -626,13 +635,20 @@ class DynamicInferenceEngine(AbstractEngine):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if is_decode_only else "non-decode"
             # >>>
-            mem_info = process.memory_info()
+            # mem_info = process.memory_info()
             # <<<
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ active %d/%d, paused %d/%d, waiting %d, finished %d ] ... "
+                # >>>
+                # "reqs: %d [ active %d/%d, paused %d/%d, waiting %d, finished %d ] ... "
+                "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
+                # <<<
+                # >>>
+                "chunks: a %d/%d, p %d/%d ... "
+                # <<<
                 # >>>
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
+                # "mem: tensors %d, alloc %f gb, res %f gb."
                 # "mem: alloc %.1f gb, res %.1f gb, cpu p %s/v %s."
                 # <<<
                 % (
@@ -651,13 +667,21 @@ class DynamicInferenceEngine(AbstractEngine):
                             ),
                         )
                     ),
-                    prev_total_request_count,
+                    # >>>
+                    # prev_total_request_count,
+                    # <<<
                     prev_total_request_count - prev_paused_request_count,
                     context.chunk_allocator.active_count,
                     prev_paused_request_count,
                     context.chunk_allocator.paused_count,
                     len(self.waiting_request_ids),
                     self.finished_request_count,
+                    # >>>
+                    context.chunk_allocator.get_active_used(),
+                    context.chunk_allocator.active_count,
+                    context.chunk_allocator.get_paused_used(),
+                    context.chunk_allocator.paused_count,
+                    # <<<
                     # >>>
                     mem["allocation.all.current"],
                     # <<<
@@ -674,10 +698,6 @@ class DynamicInferenceEngine(AbstractEngine):
             print(output_str)
 
         self.step_count += 1
-        # >>>
-        # if self.step_count >= 100: # 600, 305
-        #     raise Exception(f"step {self.step_count}.")
-        # <<<
         range_pop()
         return {
             "active_requests": active_requests,

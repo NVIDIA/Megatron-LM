@@ -240,8 +240,8 @@ def get_inference_context(
     else:
         max_sequence_length = args.inference_max_seq_length
     # >>>
-    pax("max_context_length, max_gen_length",
-        "calculate_max_sequence_length_from_requests, max_sequence_length")
+    # pax("max_context_length, max_gen_length",
+    #     "calculate_max_sequence_length_from_requests, max_sequence_length")
     # <<<
 
     # Active buffer size & max tokens.
@@ -604,14 +604,25 @@ def main():
         if engine.capture_stats else
         "--"
     )
-    print(
-        f"{setup_prefix} … "
-        f"capture {capture_str} … "
-        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        f"total time: {total_time:.3f}s … "
-        f"steps: {engine.step_count:d} … "
-        f"throughput: {throughput:.3f} tok/s"
-    )
+    # >>>
+    # print(
+    #     f"{setup_prefix} … "
+    #     f"capture {capture_str} … "
+    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+    #     f"total time: {total_time:.3f}s … "
+    #     f"steps: {engine.step_count:d} … "
+    #     f"throughput: {throughput:.3f} tok/s"
+    # )
+    # +++
+    print(" … ".join((
+        f"{setup_prefix}",
+        f"throughput: {throughput:.3f} tok/s",
+        f"total time: {total_time:.3f}s",
+        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB",
+        f"steps: {engine.step_count:d}",
+        f"capture {capture_str}",
+    )))
+    # <<<
     print("~~~")
 
     # Stop Nsight profiler.
