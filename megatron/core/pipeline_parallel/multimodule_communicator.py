@@ -68,6 +68,10 @@ class MultiModulePipelineCommunicator:
                         'generator': []
                     }
             config (ModelParallelConfig): A ModelParallelConfig object.
+            dim_mapping (Dict[str, List[int]]): Define dimension mapping for sequence, batch, hidden.
+                Example:
+                    dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+                Default: None
         """
         self.module_to_grid_map = module_to_grid_map
         self.topology = topology
@@ -243,6 +247,10 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
+        logging.debug(
+            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
+            f"[receive_forward] tensors_shape: {tensor_shape}, is_first_stage: {is_first_stage}"
+        )
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
 
@@ -250,33 +258,11 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[receive_forward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name}"
-                    )
                     input_dict[bridge_comm.src_module_name] = bridge_comm.recv_forward()
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[receive_forward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"tensor shape: {input_dict[bridge_comm.src_module_name].shape} "
-                        f"sum {input_dict[bridge_comm.src_module_name].sum()} DONE"
-                    )
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[receive_forward] p2p comm module_name: {module_name} "
-                )
                 input_dict[module_name] = rank_module_info.p2p_communicator.recv_forward(
                     tensor_shapes=tensor_shape, is_first_stage=False
-                )
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[receive_forward] p2p comm module_name: {module_name} "
-                    f"tensor shape: {input_dict[module_name][0].shape} "
-                    f"sum {input_dict[module_name][0].sum()} DONE"
                 )
         return input_dict
 
@@ -286,34 +272,18 @@ class MultiModulePipelineCommunicator:
         Args:
             output_dict: A dictionary mapping module names to tensors.
         """
+        logging.debug(
+            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
+            f"[send_forward] output_dict keys: {output_dict.keys()}, is_last_stage: {is_last_stage}"
+        )
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_forward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"tensor shape: {output_dict[module_name].shape} "
-                        f"sum {output_dict[module_name].sum()}"
-                    )
                     bridge_comm.send_forward(output_dict[module_name])
-                    # time.sleep(10)
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_forward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}] "
-                        f"DONE"
-                    )
             else:
                 # If not last stage, send forward activation by using P2P communicator.
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[send_forward] p2p comm module_name: {module_name} "
-                    f"tensor shape: {output_dict[module_name].shape} "
-                    f"sum {output_dict[module_name].sum()}"
-                )
                 rank_module_info.p2p_communicator.send_forward(
                     output_dict[module_name], is_last_stage=False
                 )
@@ -333,49 +303,27 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
+        logging.debug(
+            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
+            f"[send_forward_recv_backward] output_dict keys: {output_dict.keys()}, "
+            f"tensor_shape: {tensor_shape}, is_last_stage: {is_last_stage}"
+        )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_forward_recv_backward] bridge [src-{bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"output_dict tensor shape: {output_dict[module_name].shape} "
-                        f"sum {output_dict[module_name].sum()}"
-                    )
-
                     grad_dict[bridge_comm.src_module_name] = bridge_comm.send_forward_recv_backward(
                         output_dict[module_name]
-                    )
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_forward_recv_backward] bridge [src-{bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"grad_dict grad shape: {grad_dict[bridge_comm.src_module_name].shape} "
-                        f"sum {grad_dict[bridge_comm.src_module_name].sum()} DONE"
                     )
             else:
                 # If not last stage, send forward activation and receive backward gradient
                 # by using P2P communicator.
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[send_forward_recv_backward] p2p comm module_name: {module_name} "
-                    f"output_dict tensor shape: {output_dict[module_name].shape} "
-                    f"sum {output_dict[module_name].sum()}"
-                )
                 grad_dict[module_name] = (
                     rank_module_info.p2p_communicator.send_forward_recv_backward(
                         output_dict[module_name], tensor_shapes=tensor_shape, is_last_stage=False
                     )
-                )
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[send_forward_recv_backward] p2p comm module_name: {module_name} "
-                    f"grad_dict grad shape: {grad_dict[module_name].shape} "
-                    f"sum {grad_dict[module_name].sum()} DONE"
                 )
         return grad_dict
 
@@ -394,50 +342,29 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
+        logging.debug(
+            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
+            f"[send_backward_recv_forward] grad_dict keys: {grad_dict.keys()}, "
+            f"tensor_shape: {tensor_shape}, is_first_stage: {is_first_stage}"
+        )
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_stage == 0:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_backward_recv_forward] bridge [src-{bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"grad_dict grad shape: {grad_dict[bridge_comm.src_module_name].shape} "
-                        f"sum {grad_dict[bridge_comm.src_module_name].sum()}"
-                    )
                     input_dict[bridge_comm.src_module_name] = (
                         bridge_comm.send_backward_recv_forward(
                             grad_dict[bridge_comm.src_module_name]
                         )
                     )
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_backward_recv_forward] bridge [src-{bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"input_dict tensor shape: {input_dict[bridge_comm.src_module_name].shape} "
-                        f"sum {input_dict[bridge_comm.src_module_name].sum()} DONE"
-                    )
             else:
                 # If not first stage, send backward gradient and receive forward activation
                 # by using P2P communicator.
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[send_backward_recv_forward] p2p comm module_name: {module_name} "
-                    f"grad_dict grad shape: {grad_dict[module_name].shape} "
-                    f"sum {grad_dict[module_name].sum()}"
-                )
                 input_dict[module_name] = (
                     rank_module_info.p2p_communicator.send_backward_recv_forward(
                         grad_dict[module_name], tensor_shapes=tensor_shape, is_first_stage=False
                     )
-                )
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[send_backward_recv_forward] p2p comm module_name: {module_name} "
-                    f"input_dict tensor shape: {input_dict[module_name].shape} "
-                    f"sum {input_dict[module_name].sum()} DONE"
                 )
         return input_dict
 
@@ -452,39 +379,21 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
+        logging.debug(
+            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
+            f"[recv_backward] tensor_shape: {tensor_shape}, is_last_stage: {is_last_stage}"
+        )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[recv_backward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                    )
                     grad_dict[bridge_comm.src_module_name] = bridge_comm.recv_backward()
-                    # time.sleep(10)
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[recv_backward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"grad shape: {grad_dict[bridge_comm.src_module_name].shape} "
-                        f"sum {grad_dict[bridge_comm.src_module_name].sum()} DONE"
-                    )
             else:
                 # If not last stage, receive backward gradient by using P2P communicator.
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[recv_backward] p2p comm module_name: {module_name} "
-                )
                 grad_dict[module_name] = rank_module_info.p2p_communicator.recv_backward(
                     tensor_shapes=tensor_shape, is_last_stage=False
-                )
-                logging.debug(
-                    f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                    f"[recv_backward] p2p comm module_name: {module_name} "
-                    f"DONE"
                 )
         return grad_dict
 
@@ -494,25 +403,16 @@ class MultiModulePipelineCommunicator:
         Args:
             grad_dict: A dictionary mapping module names to tensors.
         """
+        logging.debug(
+            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
+            f"[send_backward] grad_dict keys: {grad_dict.keys()}, is_first_stage: {is_first_stage}"
+        )
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_stage == 0:
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_backward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"grad shape: {grad_dict[bridge_comm.src_module_name].shape} "
-                        f"sum {grad_dict[bridge_comm.src_module_name].sum()}"
-                    )
                     bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
-                    logging.debug(
-                        f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-                        f"[send_backward] bridge [src - {bridge_comm.src_module_name}] "
-                        f"[dest - {bridge_comm.dest_module_name}], module_name: {module_name} "
-                        f"DONE"
-                    )
             else:
                 # If not first stage, send backward activation by using P2P communicator.
                 rank_module_info.p2p_communicator.send_backward(
