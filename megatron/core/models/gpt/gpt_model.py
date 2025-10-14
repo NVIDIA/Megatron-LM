@@ -33,7 +33,11 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class GPTModel(LanguageModule):
@@ -387,7 +391,9 @@ class GPTModel(LanguageModule):
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching in fp8 mode
             # to avoid corrupting amax calculations
-            if inference_context.is_dynamic_batching() and self.config.fp8:
+            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
+                self.config
+            ):
                 decoder_input[inference_context.padding_slice] = 0.0
 
             # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the

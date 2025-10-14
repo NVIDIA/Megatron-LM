@@ -31,6 +31,7 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
+    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -859,7 +860,7 @@ class Attention(MegatronModule, ABC):
 
                 # Clear the outputs for padding tokens when in fp8 mode to avoid corrupting
                 # amax calculations
-                if self.config.fp8:
+                if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':

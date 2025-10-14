@@ -1997,3 +1997,8 @@ def get_asyncio_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     return loop
+
+
+def is_using_quantization_scales(config):
+    """Returns whether the model is using quantization scales based on the config."""
+    return config.fp8 or config.fp4
