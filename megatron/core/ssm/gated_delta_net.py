@@ -36,20 +36,18 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 try:
     from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
     chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
 
     HAVE_FLA = False
 
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_update = None
 
 
 logger = logging.getLogger(__name__)

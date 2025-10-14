@@ -33,6 +33,8 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+logger = logging.getLogger(__name__)
+
 """ We use the following notation throughout this file:
      H: hidden size
      B: micro batch size
@@ -989,7 +991,9 @@ class _DeepepManager(_DispatchManager):
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
-                print("DeepEP only supports float32 probs, please set --moe-router-dtype=fp32")
+                logger.info(
+                    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
             self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
