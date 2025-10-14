@@ -280,15 +280,15 @@ class MoEModelTestContainer:
         """Test if the routing map is padded correctly for FP8 training.
 
         The test runs the forward flow twice:
-        1. First with moe_router_padding_for_fp8=False
-        2. Then with moe_router_padding_for_fp8=True
+        1. First with moe_router_padding_for_quantization=False
+        2. Then with moe_router_padding_for_quantization=True
 
         We verify that:
         1. The results are the same in both cases
         2. The number of tokens received by each expert is padded to a multiple of 16
         """
-        # First run with moe_router_padding_for_fp8 = False
-        moe_layer = self.new_moe_layer(moe_router_padding_for_fp8=False)
+        # First run with moe_router_padding_for_quantization = False
+        moe_layer = self.new_moe_layer(moe_router_padding_for_quantization=False)
 
         num_tokens = 32
         hidden_states = torch.randn(
@@ -309,8 +309,8 @@ class MoEModelTestContainer:
         grad_1 = hidden_states.grad.clone()
         hidden_states.grad = None
 
-        # Run with moe_router_padding_for_fp8 = True
-        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_fp8=True, fp8="hybrid")
+        # Run with moe_router_padding_for_quantization = True
+        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_quantization=True, fp8="hybrid")
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
