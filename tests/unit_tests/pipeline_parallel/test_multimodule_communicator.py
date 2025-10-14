@@ -73,7 +73,7 @@ class TestMultiModulePipelineCommunicator:
         assert mllm_comm.config == config
         assert mllm_comm.current_rank == dist.get_rank()
 
-    def test_compute_total_pipeline_stages_overall_and_till_rank(self):
+    def test_compute_total_pipeline_stages(self):
         """Test compute_total_pipeline_stages for overall chain and until specific ranks."""
 
         # Create process group grids for each module
@@ -160,6 +160,58 @@ class TestMultiModulePipelineCommunicator:
             # Generator module receives final LLM output
             input_dict = mllm_comm.recv_forward()
             assert input_dict['llm'].shape == (1, 32, 128)
+
+    def test_send_forward_recv_forward_with_different_pp_size(self):
+        """Test for the case when pp(image_encoder) != pp(audio_encoder)."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        # Create process group grids for each module
+        image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=2, dp=1)
+        audio_encoder_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=1, dp=1)
+        llm_grid = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=2, dp=1)
+
+        # Set up module-grid mapping and topology
+        module_to_grid_map = {
+            'image_encoder': image_encoder_grid,
+            'audio_encoder': audio_encoder_grid,
+            'llm': llm_grid
+        }
+        topology = {
+            'image_encoder': ['llm'],
+            'audio_encoder': ['llm'],
+            'llm': [],
+        }
+        config = ModelParallelConfig(pipeline_dtype=torch.float)
+        mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
+
+        # Simulate forward communication for each module
+        if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
+            output_dict = {'image_encoder': torch.randn(2, 8, 128).cuda()}
+            if dist.get_rank() == 0:
+                # Image encoder sends output forward
+                mllm_comm.send_forward(output_dict)
+            else:
+                # Image stage receives image outputs
+                input_dict = mllm_comm.recv_forward(tensor_shape=(2, 8, 128))
+                assert input_dict['image_encoder'].shape == (2, 8, 128)
+                mllm_comm.send_forward(output_dict)
+        if mllm_comm.is_current_rank_in_grid(audio_encoder_grid):
+            # Audio encoder sends output forward
+            output_dict = {'audio_encoder': torch.randn(2, 16, 128).cuda()}
+            mllm_comm.send_forward(output_dict)
+        if mllm_comm.is_current_rank_in_grid(llm_grid):
+            output_dict = {'llm': torch.randn(2, 32, 128).cuda()}
+            if dist.get_rank() == 4 or dist.get_rank() == 5:
+                # LLM stage receives both image and audio outputs
+                input_dict = mllm_comm.recv_forward()
+                assert input_dict['image_encoder'].shape == (2, 8, 128)
+                assert input_dict['audio_encoder'].shape == (2, 16, 128)
+                mllm_comm.send_forward(output_dict)
+            else:
+                # LLM stage receives concatenated LLM outputs
+                input_dict = mllm_comm.recv_forward(tensor_shape=(2, 32, 128))
+                assert input_dict['llm'].shape == (2, 32, 128)
 
     def test_send_backward_recv_backward(self):
         """Test send_backward and recv_backward operations."""
