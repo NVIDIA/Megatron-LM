@@ -175,13 +175,9 @@ class TestMultiModulePipelineCommunicator:
         module_to_grid_map = {
             'image_encoder': image_encoder_grid,
             'audio_encoder': audio_encoder_grid,
-            'llm': llm_grid
+            'llm': llm_grid,
         }
-        topology = {
-            'image_encoder': ['llm'],
-            'audio_encoder': ['llm'],
-            'llm': [],
-        }
+        topology = {'image_encoder': ['llm'], 'audio_encoder': ['llm'], 'llm': []}
         config = ModelParallelConfig(pipeline_dtype=torch.float)
         mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
 
