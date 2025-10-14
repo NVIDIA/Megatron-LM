@@ -2001,4 +2001,4 @@ def get_asyncio_loop():
 
 def is_using_quantization_scales(config):
     """Returns whether the model is using quantization scales based on the config."""
-    return config.fp8 or config.fp4
+    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
