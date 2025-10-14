@@ -280,18 +280,35 @@ def get_megatron_muon_optimizer(
     # TODO(deyuf): allow user to select optimizer mix and relax ChainedOptimizer design
     config.optimizer = 'adam'
 
-    # used for torch_dist checkpointing
-    def init_state_fn(opt, config=None):
-        pass
+    # Needed for torch_dist ckpt_format, unlike torch ckpt_format
+    # For other emerging optimizers, need to implement init_state_fn as well
+    # TODO(boxiangw): Improve usability after optimizer refactor
+    # TODO(boxiangw): support precision aware optimizer
+    def muon_init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for p in group['params']:
+                if len(opt.state[p]) == 0:
+                    opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
+    
+    def adam_init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for p in group['params']:
+                if len(opt.state[p]) == 0:
+                    if config is None or not config.use_precision_aware_optimizer:
+                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                    else:
+                        opt.initialize_state(p)
 
     # need to wrap into megatron mix precision optimizer. (only support bf16 w/o loss scale now)
     if config.fp16:
         raise Exception('muon with fp16 is not supported.')
+
     reset_config_bf16 = False
     if config.bf16:
         if layer_wise_distributed_optimizer:
             # creating master weight before layerwise sharding will lead to unnecessary master
-            # weight  so here we delay master weight creation into layer_wise unset config.bf16
+            # weight so here we delay master weight creation into layer_wise unset config.bf16
             # will also result in all optimizers below(adam) to also not be wrapped
             config.bf16 = False
             reset_config_bf16 = True
@@ -325,5 +342,5 @@ def get_megatron_muon_optimizer(
         log_single_rank(logger, logging.INFO, 'Using LayerWiseDistributedOptimizer for Muon')
         if reset_config_bf16:
             config.bf16 = True
-        return LayerWiseDistributedOptimizer(optimizers, config, pg_collection)
+        return LayerWiseDistributedOptimizer(optimizers, config, pg_collection, muon_init_state_fn=muon_init_state_fn, adam_init_state_fn=adam_init_state_fn)
     return ChainedOptimizer(optimizers)
