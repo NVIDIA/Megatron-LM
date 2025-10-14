@@ -205,8 +205,8 @@ class MambaModel(LanguageModule):
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
-            # Clear the outputs for padding tokens when using dynamic batching in fp8 mode
-            # to avoid corrupting amax calculations
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
             # TODO(ksanthanam): Add unit test once dynamic engine supports hybrid models
             if (
                 in_inference_mode

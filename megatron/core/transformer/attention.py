@@ -858,8 +858,8 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                # Clear the outputs for padding tokens when in fp8 mode to avoid corrupting
-                # amax calculations
+                # Clear the outputs for padding tokens when using quantization scales
+                # to avoid corrupting amax calculations
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 

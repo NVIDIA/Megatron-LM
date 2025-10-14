@@ -389,8 +389,8 @@ class GPTModel(LanguageModule):
             sequence_len_offset = None
 
         if in_inference_mode:
-            # Clear the outputs for padding tokens when using dynamic batching in fp8 mode
-            # to avoid corrupting amax calculations
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
             if inference_context.is_dynamic_batching() and is_using_quantization_scales(
                 self.config
             ):
