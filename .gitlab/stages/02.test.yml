@@ -289,7 +289,7 @@ test:linting_formatting:
     - git fetch origin main:main
     - |
       if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
-        bash tools/autoformat.sh
+        BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" bash tools/autoformat.sh
         set -e
         git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
         git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
