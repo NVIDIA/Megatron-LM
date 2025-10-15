@@ -36,10 +36,10 @@ MODEL_ARGS:
   --transformer-impl: transformer_engine
   # Data args
   --seq-length: 4096
-  --data-cache-path: ${DATA_CACHE_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/bpe/merges.txt
+  --data-cache-path: /workspace/data/cache
+  --data-path: /workspace/data/gpt3_data/my-gpt3_00_text_document
+  --vocab-file: /workspace/data/gpt3_data/bpe/vocab.json
+  --merge-file: /workspace/data/gpt3_data/bpe/merges.txt
   --split: 949,50,1
   # Add network size args
   --num-layers: 16
@@ -104,8 +104,8 @@ MODEL_ARGS:
   --eval-iters: 32
   --eval-interval: 200
   # Add checkpointing args
-  --save: ${CHECKPOINT_SAVE_PATH}
-  --load: ${CHECKPOINT_LOAD_PATH}
+  --save: /opt/megatron-lm/runs/82c8dc72-e955-4033-a246-b61784f57fa7/checkpoints
+  --load: /tmp/checkpoints/
   --save-interval: 25
   # Add initialization args
   --init-method-std: 0.02
@@ -118,11 +118,11 @@ MODEL_ARGS:
   --log-throughput: true
   --log-interval: 1
   --logging-level: 40
-  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --tensorboard-dir: /opt/megatron-lm/runs/82c8dc72-e955-4033-a246-b61784f57fa7/tensorboard
   # Add mixed precision args
   --bf16: true
   --exit-interval: 50
-TEST_TYPE: ckpt-resume
+TEST_TYPE: regular
 METRICS:
   - "iteration-time"
   - "lm loss"
