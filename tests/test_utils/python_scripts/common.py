@@ -2,8 +2,8 @@ import copy
 import itertools
 import pathlib
 from typing import List, Optional
-import click 
 
+import click
 import yaml
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
