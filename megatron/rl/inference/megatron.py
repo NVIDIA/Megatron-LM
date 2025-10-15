@@ -90,8 +90,9 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     """
     tokenizer = get_tokenizer()
 
+    enable_cuda_graph = args.cuda_graph_impl == "local"
     num_cuda_graphs = None
-    if args.enable_cuda_graph:
+    if enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
     # Inference context.
@@ -127,7 +128,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     return DynamicInferenceEngine(
         controller=text_generation_controller,
         context=inference_context,
-        enable_cuda_graph=args.enable_cuda_graph,
+        enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
     )
 

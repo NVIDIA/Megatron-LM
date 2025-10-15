@@ -16,8 +16,8 @@ name: Approve Test Queue
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # Runs every 5 minutes
-  workflow_dispatch:  # Allows manual triggering
+    - cron: "*/5 * * * *" # Runs every 5 minutes
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
   approve-queue:
@@ -82,8 +82,8 @@ jobs:
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
           # Count running and queued workflows
-          queued_workflows = sum(1 for run in queued_workflow_runs if run["name"] == "CICD NeMo")
-          in_progress_workflows = sum(1 for run in in_progress_workflow_runs if run["name"] == "CICD NeMo")
+          queued_workflows = sum(1 for run in queued_workflow_runs if run["name"] == "CICD Megatron-LM")
+          in_progress_workflows = sum(1 for run in in_progress_workflow_runs if run["name"] == "CICD Megatron-LM")
 
           total_workflows = queued_workflows + in_progress_workflows
           print(f"Current queued workflows: {queued_workflows}")
@@ -98,7 +98,7 @@ jobs:
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
           pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
-          pending_workflows = [run for run in pending_workflows if run["name"] == "CICD NeMo"]
+          pending_workflows = [run for run in pending_workflows if run["name"] == "CICD Megatron-LM"]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
@@ -150,4 +150,3 @@ jobs:
             -H 'Content-type: application/json' \
             --data "{\"text\":\":robot_joy: <https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|Test-queue-approval-bot workflow> failed. Please review manually.\n\ncc ${SLACK_WEBHOOK_ADMIN}\"}" \
             $SLACK_WEBHOOK
-

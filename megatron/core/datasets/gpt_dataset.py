@@ -204,7 +204,7 @@ class GPTDataset(MegatronDataset):
                 self.masks_and_position_ids_are_cached = True
         else:
             attention_mask = self.cached_attention_mask
-            loss_mask = self.cached_loss_mask
+            loss_mask = self.cached_loss_mask.clone()
             position_ids = self.cached_position_ids
 
         # For padded sequences, mask the loss

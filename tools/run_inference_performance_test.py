@@ -149,7 +149,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             text_generation_controller,
             context,
             termination_id=-1,
-            enable_cuda_graph=args.enable_cuda_graph,
+            enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
         )
 
@@ -332,7 +332,7 @@ def main():
                 )
             )
 
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")
         warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
         warmup_sampling_params.add_attributes({"no_early_termination": True})

@@ -77,12 +77,17 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
-    actually_build_cuda_graphs: bool = (
-        False  # only test_simple requires us to actually build a cuda-graph
-    )
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
+    cuda_graph_scope: str = "full_iteration"
+    force_build_cuda_graphs: bool = False
+    # If False, do not build cuda graphs in the tests, even if
+    # num_cuda_graphs is set.
+    # For tests concerning cuda-graph warmups, we set this to False
+    # to avoid the overhead of building the graphs, which is not
+    # relevant to the test. The tests only check if the required
+    # context attributes are set correctly.
 
     def __post_init__(self):
 
@@ -234,7 +239,11 @@ class TestDynamicInferenceEngine:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None,
+            cuda_graph_impl=(
+                "local"
+                if test_config.num_cuda_graphs is not None and test_config.force_build_cuda_graphs
+                else "none"
+            ),
             inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -248,6 +257,7 @@ class TestDynamicInferenceEngine:
             pipeline_dtype=torch.bfloat16,
             add_bias_linear=test_config.expert_model_parallel_size == 1,
             inference_sampling_seed=test_config.random_seed,
+            cuda_graph_scope=test_config.cuda_graph_scope,
         )
 
         # Requests.
@@ -310,8 +320,7 @@ class TestDynamicInferenceEngine:
                 -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
             ),
             random_seed=test_config.random_seed,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None
-            and test_config.actually_build_cuda_graphs,
+            enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
         )
 
         # Test env.
@@ -389,21 +398,21 @@ class TestDynamicInferenceEngine:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize(
-        "num_cuda_graphs", [None, 4]
-    )  # todo: cannot run test case with multiple num_cuda_graphs like [None, 1, 4]
-    def test_simple(self, num_cuda_graphs) -> None:
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
+    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    def test_simple(self, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
 
         # Run test.
         env = self._run_test(
             num_cuda_graphs=num_cuda_graphs,
-            actually_build_cuda_graphs=num_cuda_graphs is not None,
             context_max_requests_override=32,
+            cuda_graph_scope=cuda_graph_scope,
+            force_build_cuda_graphs=True,
         )
 
         # Validate max_requests, max_tokens.
@@ -430,7 +439,7 @@ class TestDynamicInferenceEngine:
                 f"expected ({expected_generated_tokens})."
             )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -447,7 +456,7 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.max_requests == 420
         assert env.engine.context.max_tokens == 420
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -469,6 +478,7 @@ class TestDynamicInferenceEngine:
         env.engine.schedule_waiting_requests()
         assert list(env.engine.waiting_request_ids) == [1]
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -488,6 +498,7 @@ class TestDynamicInferenceEngine:
         else:
             raise Exception("should have raised TokenOverflowError(is_transient=False).")
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -502,6 +513,7 @@ class TestDynamicInferenceEngine:
         env.engine._add_request(env.requests[0])
         assert list(env.engine.waiting_request_ids) == [0]
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -509,6 +521,7 @@ class TestDynamicInferenceEngine:
         """Test adding multiple requests simultaneously."""
         self._run_test(num_gap_steps=0)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -516,6 +529,7 @@ class TestDynamicInferenceEngine:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -547,6 +561,7 @@ class TestDynamicInferenceEngine:
                 actual_cuda_graph_token_counts,
             )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -651,6 +666,7 @@ class TestDynamicInferenceEngine:
         )
         context.reset()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -682,13 +698,19 @@ class TestDynamicInferenceEngine:
         assert len(finished_requests) == len(
             prompts
         ), "Should return same number of finished requests as prompts"
-        print()
+
+        request_ids = [r.request_id for r in finished_requests]
+        assert request_ids == sorted(
+            request_ids
+        ), f"Request ids are not in sorted order: {request_ids}"
+
         # Check each request was processed
         for i, request in enumerate(finished_requests):
             # Verify each request has generated tokens
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
 
+    @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -728,6 +750,7 @@ class TestDynamicInferenceEngine:
 
         engine_task.cancel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -744,6 +767,7 @@ class TestDynamicInferenceEngine:
             skip_prompt_log_probs_for_dynamic_inference=True,
         )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -775,7 +799,7 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -786,6 +810,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=None, num_tokens_total=20, use_fixed_output_lengths=True
         )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

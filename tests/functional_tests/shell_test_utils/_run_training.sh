@@ -175,15 +175,9 @@ DISTRIBUTED_ARGS=(
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
-        -m coverage run \
-        --data-file=.coverage.unit_tests \
-        --source=megatron/core \
-        /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+        --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
-        -m coverage run \
-        --data-file=.coverage.unit_tests \
-        --source=megatron/core \
         $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: CICD NeMo
+name: CICD Megatron-LM
 on:
   schedule:
     - cron: "0 */2 * * *"
@@ -20,6 +20,8 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -31,35 +33,52 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.53.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
 
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
     if: |
-      !(needs.pre-flight.outputs.is_deployment_workflow == 'true'
-      || needs.pre-flight.outputs.docs_only == 'true')
+      (
+        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+          && needs.pre-flight.outputs.is_ci_workload == 'true'
+      ) || (
+        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+          && needs.pre-flight.outputs.is_ci_workload == 'false'
+          && needs.pre-flight.outputs.docs_only == 'false'
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-      - name: Install ruff
-        run: |
-          pip install ruff
+          fetch-depth: 0
 
-      # - name: Check lint
-      #   run: |
-      #     pip install pre-commit==3.6.0
-      #     pre-commit install
-      #     pre-commit run --all-files --show-diff-on-failure --color=always
+      - name: Install uv
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.7.2
+
+      - name: Install linting tools
+        run: |
+          uv sync --locked --only-group linting
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Run linting
+        run: |
+          export PATH=".venv/bin:$PATH"
+          export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}" 
+          export CHECK_ONLY=true 
+          export SKIP_DOCS=false 
+          bash tools/autoformat.sh
 
   cicd-wait-in-queue:
     runs-on: ubuntu-latest
     needs: [pre-flight, linting]
-    environment: test
+    environment: ${{ needs.pre-flight.outputs.is_merge_group == 'true' && 'merge-gate' || 'test' }}
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
@@ -86,10 +105,11 @@ jobs:
     environment: nemo-ci
     if: |
       (
-        success()
+        success() 
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
+      && !needs.pre-flight.outputs.is_merge_group == 'true'
       && !cancelled()
     steps:
       - name: Checkout
@@ -129,6 +149,7 @@ jobs:
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
+      && !needs.pre-flight.outputs.is_merge_group == 'true'
       && !cancelled()
     steps:
       - name: Checkout
@@ -152,7 +173,9 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || always()
       )
       && !cancelled()
     runs-on: ubuntu-latest
@@ -163,96 +186,35 @@ jobs:
 
       - name: Get workflow result
         id: result
+        shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
-          # Get workflow run details and check job conclusions
-          LATEST_ATTEMPT=$(gh run view $RUN_ID --json jobs -q '[.jobs[] | select(.conclusion != null) | .conclusion] | last')
-          NUM_FAILED=$(gh run view $RUN_ID --json jobs -q '[.jobs[] | select(.conclusion == "failure") | .name] | length')
-          NUM_CANCELLED=$(gh run view $RUN_ID --json jobs -q '[.jobs[] | select(.conclusion == "cancelled") | .name] | length')
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
+          SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped")] | length') || echo 0
 
-          if [[ $NUM_FAILED -eq 0 && $NUM_CANCELLED -eq 0 ]]; then
-            RESULT="success"
-          elif [[ $NUM_CANCELLED -gt 0 ]]; then
-            RESULT="cancelled"
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] && ([ "${SKIPPED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]); then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
           else
-            RESULT="failure"
-          fi
-
-          # Output the final status
-          echo "code=$RESULT" | tee -a $GITHUB_OUTPUT
-
-      - name: Checkout for GH CLI
-        uses: actions/checkout@v4
-
-      - name: Remove label if not cancelled
-        if: |
-          steps.result.outputs.code != 'cancelled'
-          && github.event.label.name == 'Run CICD'
-          && github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.number }}
-        run: gh pr edit "$PR_NUMBER" --remove-label "Run CICD"
-
-      - name: Pipeline successful, add PR comment
-        if: |
-          steps.result.outputs.code == 'success'
-          && github.event_name == 'pull_request'
-          && env.SLACK_WEBHOOK != ''
-        uses: peter-evans/create-or-update-comment@v4
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-        with:
-          issue-number: ${{ github.event.number }}
-          body: |
-            [🤖]: Hi @${{ github.event.pull_request.user.login }} 👋,
-
-            We wanted to let you know that a [CICD pipeline](https://github.com/${{ env.REPOSITORY }}/actions/runs/${{ env.RUN_ID }}) for this PR just finished successfully.
-
-            So it might be time to merge this PR or get some approvals.
-
-            //cc @chtruong814 @ko3n1g @pablo-garay @thomasdhc
-
-      - name: "Pipeline not successful and not cancelled: Send Slack alert & create step summary"
-        if: |
-          steps.result.outputs.code == 'failure'
-          && github.event.label.name == 'Run CICD'
-          && env.SLACK_WEBHOOK != ''
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          PR_NUMBER: ${{ github.event.number }}
-          SERVER_URL: ${{ github.server_url }}
-        run: |
-          set -x
-          pip install PyGithub
-          export BRANCH_NAME=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
-
-          python .github/scripts/notify.py
-
-      - name: Exit
-        if: ${{ always() }}
-        env:
-          RESULT: ${{ steps.result.outputs.code }}
-        run: |
-          if [ $RESULT == "success" ]; then
-            exit 0
-          else
-            exit 1
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              # Show which jobs failed
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion == "failure") | .name'
+              exit 1
           fi
 
   Coverage_Fake:
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test, pre-flight]
     if: |
-      (needs.pre-flight.outputs.docs_only == 'true'
-      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || github.event == 'merge_group'
+      )
+      && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
     environment: nemo-ci
     steps:
@@ -275,9 +237,8 @@ jobs:
     needs: [Nemo_CICD_Test]
     if: |
       (
-        needs.pre-flight.outputs.docs_only == 'false'
-        && needs.pre-flight.outputs.is_deployment_workflow == 'false'
-        && success()
+        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || success()
       )
       && !cancelled()
     strategy:

@@ -281,6 +281,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
+    intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
@@ -459,11 +460,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
-            setattr(
-                optimizer,
-                'grad_stats_parallel_group',
-                parallel_state.get_intra_distributed_optimizer_instance_group(),
-            )
+            setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
@@ -532,6 +529,7 @@ def get_megatron_optimizer(
     expt_tp_pp_group = process_groups['expt_tp_pp_group']
     intra_dp_cp_group_gloo = process_groups['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups['intra_expt_dp_group_gloo']
+    intra_dist_opt_group = process_groups['intra_dist_opt_group']
 
     model_parallel_rank = get_pg_rank(mp_group)
 
@@ -570,6 +568,7 @@ def get_megatron_optimizer(
                     data_parallel_group=dp_cp_group,
                     data_parallel_group_gloo=intra_dp_cp_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
+                    intra_dist_opt_group=intra_dist_opt_group,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 )
             )
@@ -610,6 +609,7 @@ def get_megatron_optimizer(
                 data_parallel_group=intra_dp_cp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
+                intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
@@ -643,6 +643,7 @@ def get_megatron_optimizer(
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
+                intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )

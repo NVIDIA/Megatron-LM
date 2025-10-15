@@ -61,7 +61,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_$CLUSTER.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -215,8 +215,8 @@ products:
       #     - environment: [dev]
       #       scope: [mr]
       #       platforms: [dgx_h100] # Hangs: #513
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -430,8 +430,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_modelopt_distill_resume]
     products:
       - environment: [dev]
@@ -453,15 +453,15 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_reruns_persistent_2]
-    products:
-      # - environment: [dev]
-      #   scope: [mr]
-      #   platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_reruns_persistent_2]
+  #   products:
+  # - environment: [dev]
+  #   scope: [mr]
+  #   platforms: [dgx_h100]
+  # - environment: [lts]
+  #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G]
     products:
       - environment: [lts]

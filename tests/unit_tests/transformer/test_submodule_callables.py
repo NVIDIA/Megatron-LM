@@ -8,6 +8,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyNode,
+    DummyState,
     build_data,
     compare_captures,
     deterministic_mode,
@@ -65,9 +66,14 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     callables, dw = build_layer_callables(model)
     attn, post_attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
+    dummy_model = DummyState()
+    dummy_model.decoder = DummyState()
+    dummy_model.decoder.final_layernorm = None
     for i in range(microbatches):
         # build mock func/state
         node = DummyNode()
+        node.is_mtp = False
+        node.chunk_state.model = dummy_model
 
         # attn fwd
         hidden_states = attn(node, input_tensors[i])

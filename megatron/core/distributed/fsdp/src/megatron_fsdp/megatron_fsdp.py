@@ -436,6 +436,11 @@ class MegatronFSDP(torch.nn.Module):
             # This setting is needed to have this attribute present after every
             # un-shard of the FSDP params.
             param.__fsdp_param__ = True
+            # Transformer Engine accumulates gradient on top of the `main_grad`
+            # buffer when gradient accumulation fusion in enabled. But with FSDP,
+            # we want to overwrite the `main_grad` which is enabled by this
+            # attribute.
+            param.overwrite_main_grad = True
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
