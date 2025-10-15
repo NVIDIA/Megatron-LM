@@ -14,6 +14,8 @@ from contextlib import nullcontext
 
 import torch
 
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -31,8 +33,7 @@ from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_model, print_rank_0
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
+from model_provider import model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -146,12 +147,14 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
+        # Set up model and load checkpoint
         if model_type == "gpt":
-            model = get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
+            model_builder = gpt_builder
         elif model_type == "mamba":
-            model = get_model(partial(model_provider, mamba_builder), wrap_with_ddp=False)
+            model_builder = mamba_builder
         else:
-            raise ValueError(f"Invalid model type {model_type}")
+            raise ValueError(f"Invalid model provider {model_type}")
+        model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)
@@ -193,8 +196,7 @@ def main(model_type: str = "gpt"):
             except ValueError as ve:
                 pass
         elif choice.item() == 1:
-            raise NotImplementedError(f"Beam search is not supported")
-
+            break
 
 if __name__ == "__main__":
     main(model_type="gpt")
