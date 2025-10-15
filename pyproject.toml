@@ -76,7 +76,7 @@ dev = [
     "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "grouped-gemm~=1.1",
+    "nv-grouped-gemm~=1.1",
     "transformer-engine[pytorch]>=2.7.0a0,<2.9.0",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
@@ -145,7 +145,7 @@ flash_mla = ["flash_mla"]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
-    "grouped-gemm",
+    "nv-grouped-gemm",
     "flash_mla",
     "mamba-ssm",
     "transformer-engine",
@@ -166,16 +166,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-grouped-gemm = [
-    { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.2" },
-]
-mamba-ssm = [
-    { git = "https://github.com/state-spaces/mamba", rev = "v2.2.6.post2" },
-]
-causal-conv1d = [
-    { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "9d700d167c4ad299b0a5265ed1bdb4ee4a0ca111" },
-]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.8" } # on `release_v2.7
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.8" } # on `release_v2.8`
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
