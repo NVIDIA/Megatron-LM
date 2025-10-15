@@ -56,8 +56,10 @@ class TextGenerationController:
         self.model_is_pipeline_parallel = not (
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
+
         # Initialize cache for sequence parallel modules
         self._sequence_parallel_attr_cache = None
+        self.moe_layer_cache = None
 
         # Attributes for sequence parallel
         self.sequence_parallel_attrs = [
