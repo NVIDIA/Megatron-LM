@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+# torchrun --nproc_per_node=8 -m pytest -xvs tests/unit_tests/transformer/test_multi_token_prediction.py
 import os
 import sys
 
@@ -32,7 +32,7 @@ from megatron.training.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear # noqa: F401
 
     HAVE_TE = True
     from megatron.core.utils import is_te_min_version
@@ -92,7 +92,7 @@ class TestMultiTokenPredictionLayer:
             assert mtp.layers[i].hnorm.weight.shape[0] == config.hidden_size
             assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp_size
             assert mtp.layers[i].eh_proj.weight.shape[1] == config.hidden_size * 2
-            assert mtp.layers[i].transformer_layer is not None
+            assert mtp.layers[i].mtp_model_layer is not None
         num_weights = sum([p.numel() for p in mtp.parameters()])
         if tp_size == 1:
             assert num_weights == 58560 * config.mtp_num_layers
@@ -119,7 +119,7 @@ class TestMultiTokenPredictionLayer:
             assert mtp.layers[i].hnorm.weight.shape[0] == config.hidden_size
             assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp_size
             assert mtp.layers[i].eh_proj.weight.shape[1] == config.hidden_size * 2
-            assert mtp.layers[i].transformer_layer is not None
+            assert mtp.layers[i].mtp_model_layer is not None
         num_weights = sum([p.numel() for p in mtp.parameters()])
         if tp_size == 1:
             assert num_weights == 58560 * config.mtp_num_layers
@@ -322,32 +322,44 @@ class TestMTPLossLoggingHelper:
         MTPLossLoggingHelper.tracker = {}
 
     def test_save_loss_to_tracker(self):
-        """Test saving loss to tracker."""
-        # Create a dummy loss tensor
+        """Test saving metrics to tracker."""
+        # Create dummy metric tensors
         loss = torch.tensor(1.3)
+        correct = torch.tensor(50.0)
+        total = torch.tensor(100.0)
         layer_number = 2
         num_layers = self.num_layers
 
-        # Test saving loss
-        MTPLossLoggingHelper.save_loss_to_tracker(
-            loss=loss, layer_number=layer_number, num_layers=num_layers
+        # Test saving metrics
+        MTPLossLoggingHelper.save_metrics_to_tracker(
+            loss=loss, correct=correct, total=total, 
+            layer_number=layer_number, num_layers=num_layers
         )
 
         # Verify tracker state
-        assert "values" in MTPLossLoggingHelper.tracker
-        assert MTPLossLoggingHelper.tracker["values"].shape == (num_layers,)
-        assert MTPLossLoggingHelper.tracker["values"][layer_number] == loss
+        assert "loss_values" in MTPLossLoggingHelper.tracker
+        assert "correct_values" in MTPLossLoggingHelper.tracker
+        assert "total_values" in MTPLossLoggingHelper.tracker
+        assert MTPLossLoggingHelper.tracker["loss_values"].shape == (num_layers,)
+        assert MTPLossLoggingHelper.tracker["correct_values"].shape == (num_layers,)
+        assert MTPLossLoggingHelper.tracker["total_values"].shape == (num_layers,)
+        assert MTPLossLoggingHelper.tracker["loss_values"][layer_number] == loss
+        assert MTPLossLoggingHelper.tracker["correct_values"][layer_number] == correct
+        assert MTPLossLoggingHelper.tracker["total_values"][layer_number] == total
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
     def test_track_mtp_metrics(self):
         """Test tracking MTP metrics."""
-        # First save some losses
+        # First save some metrics
         loss = torch.tensor(2.3)
+        correct = torch.tensor(75.0)
+        total = torch.tensor(100.0)
         num_layers = self.num_layers
         for i in range(num_layers):
-            MTPLossLoggingHelper.save_loss_to_tracker(
-                loss=loss, layer_number=i, num_layers=num_layers
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                loss=loss, correct=correct, total=total,
+                layer_number=i, num_layers=num_layers
             )
 
         # Create dummy writer and loss dict
@@ -380,6 +392,8 @@ class TestMTPLossLoggingHelper:
             assert total_loss_dict[f"mtp_{i+1} loss"] == loss * loss_scale
 
         # Verify tracker is cleaned
-        assert torch.all(MTPLossLoggingHelper.tracker["values"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["loss_values"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["correct_values"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["total_values"] == 0)
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None

@@ -39,6 +39,7 @@ except ImportError:
     HAVE_TE = False
 
 
+
 def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict, word_emb_weight: Tensor, word_emb_weight_key: str
 ) -> None:
@@ -108,8 +109,10 @@ class MTPLossLoggingHelper:
     tracker = {}
 
     @staticmethod
-    def save_loss_to_tracker(
+    def save_metrics_to_tracker(
         loss: torch.Tensor,
+        correct: torch.Tensor,
+        total: torch.Tensor,
         layer_number: int,
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
@@ -128,55 +131,100 @@ class MTPLossLoggingHelper:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=loss.device)
-        tracker["values"][layer_number] += loss.detach()
+        # Initialize the tracker if not exists.
+        if "loss_values" not in tracker:
+            tracker["loss_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "correct_values" not in tracker:
+            tracker["correct_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "total_values" not in tracker:
+            tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+
+        tracker["loss_values"][layer_number] += loss.detach()
+        tracker["correct_values"][layer_number] += correct.detach()
+        tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
-    def clean_loss_in_tracker():
+    @staticmethod
+    def clean_metrics_in_tracker():
         """Clear the mtp losses."""
         tracker = MTPLossLoggingHelper.tracker
-        tracker["values"].zero_()
+        tracker["loss_values"].zero_()
+        tracker["correct_values"].zero_()
+        tracker["total_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
-    def reduce_loss_in_tracker():
-        """Collect and reduce the mtp losses across ranks."""
+    @staticmethod
+    def reduce_metrics_in_tracker():
+        """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_values" not in tracker or "correct_values" not in tracker or "total_values" not in tracker:
             return
-        values = tracker["values"]
-        # Reduce mtp losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+        
+        for key in ["loss_values"]:
+            values = tracker[key]
+            # Reduce mtp losses across ranks.
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
+        for  key in ["correct_values", "total_values"]:
+            values = tracker[key]
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+                )
 
+    @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
-        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_values" not in tracker or "correct_values" not in tracker or "total_values" not in tracker:
             return
-        mtp_losses = tracker["values"] * loss_scale
+        mtp_losses = tracker["loss_values"] * loss_scale
+        mtp_corrects = tracker["correct_values"]
+        mtp_totals = tracker["total_values"]
+        
         mtp_num_layers = mtp_losses.shape[0]
         for i in range(mtp_num_layers):
-            name = f"mtp_{i+1} loss"
-            loss = mtp_losses[i]
-            if total_loss_dict is not None:
-                if name in total_loss_dict:
-                    total_loss_dict[name] += loss
-                else:
-                    total_loss_dict[name] = loss
-            if writer is not None:
-                writer.add_scalar(name, loss, iteration)
-            if wandb_writer is not None:
-                wandb_writer.log({f"{name}": loss}, iteration)
+            loss_name = f"mtp_{i+1} loss"
+            step_acc_name = f"mtp_{i+1}_acceptance_rate"
+            cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
-        MTPLossLoggingHelper.clean_loss_in_tracker()
+
+            loss = mtp_losses[i]
+
+            step_rate = (mtp_corrects[i] / max(mtp_totals[i], 1)) * 100.0
+            if total_loss_dict is not None:
+                total_loss_dict[loss_name] = total_loss_dict.get(loss_name, 0) + loss
+                total_loss_dict[f"{step_acc_name}_correct"] = (
+                    total_loss_dict.get(f"{step_acc_name}_correct", 0.0) + mtp_corrects[i]
+                )
+                total_loss_dict[f"{step_acc_name}_total"] = (
+                    total_loss_dict.get(f"{step_acc_name}_total", 0.0) + mtp_totals[i]
+                )
+                cum_correct = total_loss_dict[f"{step_acc_name}_correct"]
+                cum_total = total_loss_dict[f"{step_acc_name}_total"]
+                cum_rate = (cum_correct / max(cum_total, 1)) * 100.0
+            else:
+                cum_rate = 0.0
+
+            if writer is not None:
+                writer.add_scalar(loss_name, loss, iteration)
+                writer.add_scalar(step_acc_name, step_rate, iteration)
+                writer.add_scalar(cum_acc_name, cum_rate, iteration)
+            if wandb_writer is not None:
+                wandb_writer.log({f"{loss_name}": loss}, iteration)
+                wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
+                wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
 
 
 @dataclass
@@ -191,19 +239,19 @@ class MultiTokenPredictionLayerSubmodules:
             embedding normalization to be applied.
         eh_proj (Union[ModuleSpec, type]): Specification or instance of the
             linear projection to be applied.
-        transformer_layer (Union[ModuleSpec, type]): Specification
-            or instance of the transformer block to be applied.
+        mtp_model_layer (Union[ModuleSpec, type]): Specification
+            or instance of the transformer, mamba, ... block to be applied.
     """
 
     enorm: Union[ModuleSpec, type] = None
     hnorm: Union[ModuleSpec, type] = None
     eh_proj: Union[ModuleSpec, type] = None
-    transformer_layer: Union[ModuleSpec, type] = None
+    mtp_model_layer: Union[ModuleSpec, type] = None
     layer_norm: Union[ModuleSpec, type] = None
 
 
 def get_mtp_layer_spec(
-    transformer_layer_spec: ModuleSpec, use_transformer_engine: bool
+    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -211,13 +259,13 @@ def get_mtp_layer_spec(
         ModuleSpec: Module specification with TE modules
     """
     return get_mtp_layer_spec_for_backend(
-        transformer_layer_spec,
+        mtp_model_layer_spec,
         backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    transformer_layer_spec: ModuleSpec, backend: BackendSpecProvider
+   mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -232,7 +280,7 @@ def get_mtp_layer_spec_for_backend(
             enorm=layer_norm_impl,
             hnorm=layer_norm_impl,
             eh_proj=column_parallel_linear_impl,
-            transformer_layer=transformer_layer_spec,
+            mtp_model_layer=mtp_model_layer_spec,
             layer_norm=layer_norm_impl,
         ),
     )
@@ -324,6 +372,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MultiTokenPredictionLayerSubmodules,
+        mtp_hybrid_override_pattern: str = None,
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
     ):
@@ -332,15 +381,20 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.submodules = submodules
         self.layer_number = layer_number
         self.vp_stage = vp_stage
+        self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
 
-        self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
-        attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-        assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-            f"Multi-Token Prediction (MTP) is not jet supported with "
-            + f"{attn_mask_type} attention mask type."
-            + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-        )
-
+        if config.mtp_num_layers is not None:
+            if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
+                self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
+                if self_attention_spec.submodules.self_attention is not None:
+                    self_attention_spec = self_attention_spec.submodules.self_attention
+                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                        f"Multi-Token Prediction (MTP) is not jet supported with "
+                        + f"{attn_mask_type} attention mask type."
+                        + f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                    )
+        
         self.enorm = build_module(
             self.submodules.enorm,
             config=self.config,
@@ -371,9 +425,20 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
         )
-        self.transformer_layer = build_module(
-            self.submodules.transformer_layer, config=self.config, vp_stage=vp_stage
-        )
+        if self.config.mtp_num_layers is not None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+            # We do not need pre and post process stage for MTP layer, given they are handled in the 
+            # MultiTokenPredictionLayer itself.
+            self.mtp_model_layer = build_module(
+                    self.submodules.mtp_model_layer,
+                    self.config,
+                    pre_process=False, 
+                    post_process=False,
+                    hybrid_override_pattern=self.mtp_hybrid_override_pattern,
+                    dtype=self.config.params_dtype,
+                    model_comm_pgs=model_comm_pgs,
+                    vp_stage=self.vp_stage
+            )
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
@@ -471,23 +536,20 @@ class MultiTokenPredictionLayer(MegatronModule):
             if self.sequence_parallel:
                 hidden_states = scatter_to_sequence_parallel_region(hidden_states)
 
-        # Use a separate context for the transformer layer. This is to ensure that when the
-        # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is True
-        # so that the fp8 weight caching can be triggered correctly.
-        with transformer_layer_rng_context, transformer_layer_fp8_context:
-            hidden_states, _ = self.transformer_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-            )
+            # Use a separate context for the transformer layer. This is to ensure that when the
+            # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is True
+            # so that the fp8 weight caching can be triggered correctly.
+            with transformer_layer_rng_context, transformer_layer_fp8_context:
+                if self.config.mtp_num_layers is not None:
+                    # Since pre-process is set to False, we need to set the input tensor manually.
+                    self.mtp_model_layer.set_input_tensor(hidden_states)
+                    hidden_states = self.mtp_model_layer(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        inference_params=inference_params,
+                        inference_context=context,
+                    )
 
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)
@@ -588,10 +650,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
+        mtp_hybrid_override_pattern: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(config=config)
+        self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
+        self.sequence_parallel = config.sequence_parallel
         self.vp_stage = vp_stage
         self._build_layers()
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
@@ -599,7 +665,7 @@ class MultiTokenPredictionBlock(MegatronModule):
     def _build_layers(self):
         def build_layer(layer_spec, layer_number):
             return build_module(
-                layer_spec, config=self.config, layer_number=layer_number, vp_stage=self.vp_stage
+                layer_spec, config=self.config, layer_number=layer_number, vp_stage=self.vp_stage, mtp_hybrid_override_pattern=self.mtp_hybrid_override_pattern
             )
 
         self.layers = torch.nn.ModuleList(
@@ -659,6 +725,157 @@ class MultiTokenPredictionBlock(MegatronModule):
             position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
             # embedding
             decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.config.recompute_granularity == 'full' and self.training:
+                hidden_states = self._checkpointed_forward(
+                    layer_number=layer_number,
+                    hidden_states=hidden_states,
+                    decoder_input=decoder_input,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    extra_block_kwargs=extra_block_kwargs,
+                )
+            else:
+                custom_forward = self._custom(layer_number)
+                hidden_states = custom_forward(
+                    hidden_states=hidden_states,
+                    decoder_input=decoder_input,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    extra_block_kwargs=extra_block_kwargs,
+                )
+            # output
+            mtp_logits, _ = output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+            # Calc loss for the current Multi-Token Prediction (MTP) layers.
+            labels, _ = roll_tensor(labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+            loss_mask, num_tokens = roll_tensor(
+                loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+            )
+            mtp_loss = compute_language_model_loss(labels, mtp_logits)
+            mtp_loss = loss_mask * mtp_loss
+            
+            # Acceptance rate: compare predictions with labels
+            # mtp_logits shape: [s, b, vocab_size] (tensor parallel: vocab is split)
+            # labels shape: [b, s], loss_mask shape: [b, s]
+            # Get the tensor parallel group for consistent processing
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            
+            # For tensor parallel, we need to gather the full vocabulary logits
+            # This matches exactly how the loss computation works internally
+            if tp_group is not None and tp_group.size() > 1:
+                # Gather logits from all TP ranks to get full vocabulary
+                mtp_logits_full = gather_from_tensor_model_parallel_region(mtp_logits)  # [s, b, full_vocab_size]
+                
+                # Get predictions from the full vocabulary
+                preds = torch.argmax(mtp_logits_full, dim=-1)  # [s, b]
+            else:
+                # No tensor parallelism, use predictions directly
+                preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+            
+            # Transform labels and mask to match the format expected by loss computation: [b, s] => [s, b]
+            labels_match = labels.transpose(0, 1).contiguous()  # [s, b]
+            mask_match = loss_mask.transpose(0, 1).contiguous()  # [s, b]
+            
+            # Handle sequence parallelism if enabled
+            if self.sequence_parallel:
+                # For sequence parallel, we need to scatter the predictions and labels/masks
+                # to match the sequence dimension split
+                # TODO: maybe remove it.
+                sp_group = parallel_state.get_context_parallel_group()
+                if sp_group is not None and sp_group.size() > 1:
+                    # Scatter predictions along sequence dimension
+                    preds = scatter_to_sequence_parallel_region(preds)  # [s/SP, b]
+                    # Scatter labels and mask along sequence dimension  
+                    labels_match = scatter_to_sequence_parallel_region(labels_match)  # [s/SP, b]
+                    mask_match = scatter_to_sequence_parallel_region(mask_match)  # [s/SP, b]
+            
+            # Now all tensors have matching shapes for comparison
+            correct = ((preds == labels_match) & mask_match.bool()).sum().float()
+            total = mask_match.sum().float()
+            
+            if self.training:
+                MTPLossLoggingHelper.save_metrics_to_tracker(
+                    torch.sum(mtp_loss) / num_tokens,
+                    correct,
+                    total,
+                    layer_number,
+                    self.config.mtp_num_layers,
+                    avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                )
+            mtp_loss_scale = self.mtp_loss_scaling_factor / self.config.mtp_num_layers
+            if self.config.calculate_per_token_loss:
+                hidden_states_main_model = MTPLossAutoScaler.apply(
+                    hidden_states_main_model, mtp_loss_scale * mtp_loss
+                )
+            else:
+                hidden_states_main_model = MTPLossAutoScaler.apply(
+                    hidden_states_main_model, mtp_loss_scale * mtp_loss / num_tokens
+                )
+
+        return hidden_states_main_model
+
+    def _checkpointed_forward(self, layer_number, *args, **kwargs):
+        def checkpoint_handler(forward_func):
+            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+            if self.config.fp8:
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                return te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    *args,
+                    **kwargs,
+                )
+            else:
+                return tensor_parallel.checkpoint(
+                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                )
+
+        if self.config.recompute_method == 'uniform':
+            # Uniformly divide the total number of Transformer layers and checkpoint
+            # the input activation of each divided chunk.
+            # A method to further reduce memory usage reducing checkpoints.
+            assert (
+                self.config.recompute_num_layers == 1
+            ), "recompute_num_layers must be 1 for MTP recompute"
+            hidden_states = checkpoint_handler(self._custom(layer_number))
+        elif self.config.recompute_method == 'block':
+            # TODO: implement block-based recompute for MTP
+            warnings.warn(
+                "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
+            )
+            hidden_states = self._custom(0, len(self.layers))(*args, **kwargs)
+        else:
+            raise ValueError("Invalid activation recompute method.")
+
+        return hidden_states
+
+    def _custom(self, layer_number):
+        def custom_forward(
+            hidden_states: Tensor,
+            decoder_input: Tensor,
+            attention_mask: Tensor,
+            rotary_pos_emb: Tensor = None,
+            rotary_pos_cos: Tensor = None,
+            rotary_pos_sin: Tensor = None,
+            inference_params: InferenceParams = None,
+            packed_seq_params: PackedSeqParams = None,
+            sequence_len_offset: Tensor = None,
+            extra_block_kwargs: dict = None,
+        ) -> Tensor:
             # norm, linear projection and transformer
             hidden_states = self.layers[layer_number](
                 decoder_input=decoder_input,

@@ -497,6 +497,7 @@ def validate_args(args, defaults={}):
     assert args.global_batch_size > 0
 
     if args.hybrid_override_pattern is not None or args.is_hybrid_model:
+        # TODO: we need to also check for these!!!
         assert args.hybrid_override_pattern is not None, "--hybrid-override-pattern must be set for hybrid models"
         assert args.is_hybrid_model, "--is-hybrid-model must be set for hybrid models"
 
@@ -3063,6 +3064,16 @@ def _add_experimental_args(parser):
     # TODO(duncan): change this to hybrid-layer-pattern throughout code before merging into main?
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern.')
+    group.add_argument(
+        "--mtp-hybrid-override-pattern",
+        type=str,
+        default=None,
+        help='Force a specific hybrid layer pattern for MTP layers.'
+        'If a value greater than 0.0 is supplied to any of the hybrid ratio'
+        'arguments, then the number of each type of layer in the'
+        'override pattern must match number in the overidden'
+        'pattern',
+    )
     group.add_argument('--mamba-state-dim', type=int, default=128,
                        help='State dimension for Mamba layers.')
     group.add_argument('--mamba-head-dim', type=int, default=64,

@@ -188,7 +188,6 @@ class MambaMixer(MegatronModule):
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
-
         assert self.d_state is not None and self.d_state > 0
         assert self.headdim is not None and self.headdim > 0
         assert self.ngroups is not None and self.ngroups > 0
@@ -200,7 +199,6 @@ class MambaMixer(MegatronModule):
         else:
             assert self.d_inner % self.headdim == 0, "d_inner must be evenly divisible by headdim"
             self.nheads = self.d_inner // self.headdim
-
         if self.config.fp8:
             assert (2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads) % 16 == 0, (
                 "For FP8, the innermost dimension of the Mamba layer "

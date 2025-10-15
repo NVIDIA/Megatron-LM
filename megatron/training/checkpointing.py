@@ -1176,6 +1176,7 @@ def load_args_from_checkpoint(
     _set_arg('attention_backend', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
+    _set_arg('mtp_hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
 
     _set_arg('num_experts', force=True)

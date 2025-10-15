@@ -1,11 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
-import os
 import torch
 from functools import partial
-from typing import List, Optional, Tuple, Union
-
+from typing import List, Optional, Tuple
+from megatron.core.models.mamba.mamba_layer_specs import get_mamba_mtp_block_spec
 from megatron.training import get_args
 from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
@@ -28,10 +27,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
 )
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-
 from megatron.training.datasets.sft_dataset import SFTDataset
-
 stimer = StragglerDetector()
 
 def count_parameters_in_layer(model, layer_name):
@@ -66,6 +62,15 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     else:
         raise("You must provide a valid Mamba layer spec!")
 
+
+    use_te = args.transformer_impl == "transformer_engine"
+    if args.mtp_num_layers is not None:
+        assert args.spec is not None
+        assert args.mtp_hybrid_override_pattern is not None, "We need to set the override hybrid pattern for MTP layers!"
+        mtp_block_spec = get_mamba_mtp_block_spec(
+            config, mamba_stack_spec, use_transformer_engine=use_te, vp_stage=vp_stage
+        )
+    
     model = MambaModel(
         config=config,
         mamba_stack_spec=mamba_stack_spec,
@@ -73,6 +78,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         hybrid_override_pattern=args.hybrid_override_pattern,
+        mtp_hybrid_override_pattern=args.mtp_hybrid_override_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
@@ -80,7 +86,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
-        vp_stage=vp_stage
+        vp_stage=vp_stage,
+        mtp_block_spec=mtp_block_spec,
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):
@@ -189,7 +196,7 @@ def forward_step(data_iterator, model: MambaModel):
 
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+                              labels=labels, loss_mask=loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
 
