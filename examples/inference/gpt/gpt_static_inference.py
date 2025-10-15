@@ -118,7 +118,7 @@ async def generate(
             prev_idx = len(output.generated_text)
         print()
 
-    request_ids: List[str] = [
+    request_ids: List[int] = [
         inference_engine.add_request(prompt=prompt, sampling_params=sampling_params, streaming=True)
         for prompt in prompts
     ]
@@ -194,7 +194,7 @@ def main():
     requests = build_requests(args, tokenizer)
     prompts = [r.prompt_text for r in requests]
 
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")
         inference_engine.generate(
             prompts=["warmup"], sampling_params=SamplingParams(num_tokens_to_generate=10)
@@ -257,7 +257,7 @@ def main():
     print_rank_0(
         "static | cg %d | %s | reqs %d [ batch %d ] ... mem %.1f/%.1f ... time %.3f."
         % (
-            args.enable_cuda_graph,
+            args.cuda_graph_impl == "local",
             (
                 f"<user prompts>"
                 if args.prompts

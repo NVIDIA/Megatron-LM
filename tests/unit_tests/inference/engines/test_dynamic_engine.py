@@ -4,7 +4,7 @@ import asyncio
 import random
 import types
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pytest
 import torch
@@ -58,7 +58,8 @@ class DynamicEngineTestConfig:
     num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
     min_prompt_length: int = 4
     max_prompt_length: int = 16
-    num_tokens_to_generate: int = 4
+    num_tokens_to_generate: Optional[int] = 4
+    num_tokens_total: Optional[int] = None
     max_sequence_length: Optional[int] = None
 
     num_gap_steps: int = 2
@@ -76,18 +77,28 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
-    actually_build_cuda_graphs: bool = (
-        False  # only test_simple requires us to actually build a cuda-graph
-    )
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
+    cuda_graph_scope: str = "full_iteration"
+    force_build_cuda_graphs: bool = False
+    # If False, do not build cuda graphs in the tests, even if
+    # num_cuda_graphs is set.
+    # For tests concerning cuda-graph warmups, we set this to False
+    # to avoid the overhead of building the graphs, which is not
+    # relevant to the test. The tests only check if the required
+    # context attributes are set correctly.
 
     def __post_init__(self):
 
         # Compute max_sequence_length.
         assert self.max_sequence_length is None
-        self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
+        assert self.num_tokens_to_generate is None or self.num_tokens_total is None
+        if self.num_tokens_to_generate is not None:
+            self.max_sequence_length = self.max_prompt_length + self.num_tokens_to_generate
+        else:
+            assert self.num_tokens_total is not None
+            self.max_sequence_length = self.num_tokens_total
 
         # Update overrides if not using overflow factor.
         if self.context_buffer_overflow_factor is None:
@@ -127,18 +138,29 @@ class TestDynamicInferenceEngine:
                 )
 
             # Num tokens to generate.
+            num_tokens_to_generate = test_config.num_tokens_to_generate
+            num_tokens_total = test_config.num_tokens_total
+
             if test_config.use_fixed_output_lengths:
-                num_tokens_to_generate = random.randint(
-                    1, test_config.max_sequence_length - prompt_length
-                )
-            else:
-                num_tokens_to_generate = test_config.num_tokens_to_generate
+                if num_tokens_to_generate is not None:
+                    num_tokens_to_generate = random.randint(
+                        1, test_config.max_sequence_length - prompt_length
+                    )
+                else:
+                    num_tokens_total = random.randint(
+                        prompt_length + 1, test_config.max_sequence_length
+                    )
 
             # Sampling params.
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
                 return_log_probs=test_config.return_log_probs,
             )
+            if not hasattr(sampling_params, "num_tokens_total"):
+                # Remove this if statement branch in megatron-core 0.16
+                sampling_params.add_attributes({"num_tokens_total": num_tokens_total})
+            else:
+                sampling_params.num_tokens_total = num_tokens_total
             sampling_params.add_attributes(
                 {
                     "skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs_for_dynamic_inference
@@ -185,6 +207,8 @@ class TestDynamicInferenceEngine:
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+            # this is for compatibility with the LTS environment
         )
 
         return context
@@ -215,7 +239,11 @@ class TestDynamicInferenceEngine:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None,
+            cuda_graph_impl=(
+                "local"
+                if test_config.num_cuda_graphs is not None and test_config.force_build_cuda_graphs
+                else "none"
+            ),
             inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -229,6 +257,7 @@ class TestDynamicInferenceEngine:
             pipeline_dtype=torch.bfloat16,
             add_bias_linear=test_config.expert_model_parallel_size == 1,
             inference_sampling_seed=test_config.random_seed,
+            cuda_graph_scope=test_config.cuda_graph_scope,
         )
 
         # Requests.
@@ -291,8 +320,7 @@ class TestDynamicInferenceEngine:
                 -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
             ),
             random_seed=test_config.random_seed,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None
-            and test_config.actually_build_cuda_graphs,
+            enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
         )
 
         # Test env.
@@ -349,9 +377,15 @@ class TestDynamicInferenceEngine:
             ), f"request.status == '{request.status}'."
 
             num_tokens_to_generate = request.sampling_params.num_tokens_to_generate
+            num_tokens_total = request.sampling_params.num_tokens_total
+            num_tokens_expected = (
+                num_tokens_to_generate
+                if num_tokens_total is None
+                else num_tokens_total - len(request.prompt_tokens)
+            )
             assert (
-                num_tokens_to_generate is None
-                or len(request.generated_tokens) == num_tokens_to_generate
+                (num_tokens_to_generate is None and num_tokens_total is None)
+                or len(request.generated_tokens) == num_tokens_expected
                 or request.status == Status.FAILED
             ), (
                 f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
@@ -364,21 +398,21 @@ class TestDynamicInferenceEngine:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize(
-        "num_cuda_graphs", [None, 4]
-    )  # todo: cannot run test case with multiple num_cuda_graphs like [None, 1, 4]
-    def test_simple(self, num_cuda_graphs) -> None:
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
+    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    def test_simple(self, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
 
         # Run test.
         env = self._run_test(
             num_cuda_graphs=num_cuda_graphs,
-            actually_build_cuda_graphs=num_cuda_graphs is not None,
             context_max_requests_override=32,
+            cuda_graph_scope=cuda_graph_scope,
+            force_build_cuda_graphs=True,
         )
 
         # Validate max_requests, max_tokens.
@@ -394,7 +428,7 @@ class TestDynamicInferenceEngine:
             [41, 56, 15, 58],
             [28, 17, 6, 37],
             [17, 2, 54, 47],
-            [],
+            [],  # this request is failed due to max sequence length overflow
         ]
 
         assert len(env.requests) == len(expected_generated_tokens_list)
@@ -405,7 +439,7 @@ class TestDynamicInferenceEngine:
                 f"expected ({expected_generated_tokens})."
             )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -422,13 +456,13 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.max_requests == 420
         assert env.engine.context.max_tokens == 420
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_request_overflow(self) -> None:
         """Test request overflow."""
-        self._run_test(context_max_requests_override=1)
+        self._run_test(context_max_requests_override=4)
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -441,8 +475,10 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
         env.engine._add_request(env.requests[1])
+        env.engine.schedule_waiting_requests()
         assert list(env.engine.waiting_request_ids) == [1]
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -462,6 +498,7 @@ class TestDynamicInferenceEngine:
         else:
             raise Exception("should have raised TokenOverflowError(is_transient=False).")
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -476,6 +513,7 @@ class TestDynamicInferenceEngine:
         env.engine._add_request(env.requests[0])
         assert list(env.engine.waiting_request_ids) == [0]
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -483,6 +521,7 @@ class TestDynamicInferenceEngine:
         """Test adding multiple requests simultaneously."""
         self._run_test(num_gap_steps=0)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -490,6 +529,7 @@ class TestDynamicInferenceEngine:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -521,6 +561,7 @@ class TestDynamicInferenceEngine:
                 actual_cuda_graph_token_counts,
             )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -614,6 +655,7 @@ class TestDynamicInferenceEngine:
         # add all requests to the context.
         for request in tqdm(env.requests, "add requests"):
             env.engine._add_request(request)
+        env.engine.schedule_waiting_requests()
 
         # we should now have more active tokens than max requests.
         context.initialize_attention_state()
@@ -624,6 +666,7 @@ class TestDynamicInferenceEngine:
         )
         context.reset()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -639,7 +682,7 @@ class TestDynamicInferenceEngine:
         prompts = ["prompt1", "prompt2", "prompt3", "prompt4"]
 
         # Mock the tokenize_prompt method to return predictable token sequences
-        def mock_tokenize_prompt(prompt):
+        def mock_tokenize_prompt(prompt, add_BOS=False):
             # Return a token sequence based on the prompt number
             prompt_num = int(prompt[-1])
             return [10 + i for i in range(prompt_num + 2)]
@@ -655,13 +698,19 @@ class TestDynamicInferenceEngine:
         assert len(finished_requests) == len(
             prompts
         ), "Should return same number of finished requests as prompts"
-        print()
+
+        request_ids = [r.request_id for r in finished_requests]
+        assert request_ids == sorted(
+            request_ids
+        ), f"Request ids are not in sorted order: {request_ids}"
+
         # Check each request was processed
         for i, request in enumerate(finished_requests):
             # Verify each request has generated tokens
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
 
+    @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -701,6 +750,7 @@ class TestDynamicInferenceEngine:
 
         engine_task.cancel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -717,6 +767,7 @@ class TestDynamicInferenceEngine:
             skip_prompt_log_probs_for_dynamic_inference=True,
         )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -748,6 +799,18 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_num_tokens_total(self):
+        """Simple test, but using num_tokens_total instead of num_tokens_to_generate."""
+        # Run test.
+        env = self._run_test(
+            num_tokens_to_generate=None, num_tokens_total=20, use_fixed_output_lengths=True
+        )
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

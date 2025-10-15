@@ -47,8 +47,9 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Image Recognition",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -75,11 +76,12 @@ dev = [
     "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
-    "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
+    "grouped-gemm~=1.1",
+    "transformer-engine[pytorch]>=2.7.0a0,<2.9.0",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
+    "av<16.0.0",                                                          # At the time, av 16.0.0 is not compatible with Python 3.12
     "flashinfer-python",
     "wget",
     "onnxscript",
@@ -110,8 +112,16 @@ test = [
     "pydantic",
     "tensorboard",
     "pyyaml",
+    "nemo-run",
 ]
-
+docs = [
+    "sphinx",
+    "sphinx-autobuild",    # For live doc serving while editing docs
+    "sphinx-autodoc2",     # For documenting Python API
+    "sphinx-copybutton",   # Adds a copy button for code blocks
+    "myst_parser",         # For our markdown docs
+    "nvidia-sphinx-theme", # Our NVIDIA theme
+]
 build = [
     "setuptools<80.0.0",
     "packaging>=24.2",
@@ -119,6 +129,7 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
+    "nvidia-mathdx",     # for TE
 ]
 linting = [
     "ruff~=0.9.0",
@@ -133,17 +144,18 @@ flash_mla = ["flash_mla"]
 [tool.uv]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
+    "causal-conv1d",
+    "grouped-gemm",
+    "flash_mla",
+    "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
-    "mamba-ssm",
-    "causal-conv1d",
-    "nv-grouped-gemm",
-    "flash_mla",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton
-# because they are already installed in the base image.
+# We don't define override-dependencies globally but rather locally where we need it.
+# For instance, when installing into a PyTorch base image, we don't want to install torch, 
+# torchvision, and triton.
 override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
@@ -154,7 +166,16 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
+grouped-gemm = [
+    { git = "https://github.com/fanshiqing/grouped_gemm", rev = "v1.1.2" },
+]
+mamba-ssm = [
+    { git = "https://github.com/state-spaces/mamba", rev = "v2.2.6.post2" },
+]
+causal-conv1d = [
+    { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "9d700d167c4ad299b0a5265ed1bdb4ee4a0ca111" },
+]
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.8" } # on `release_v2.7
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
@@ -193,17 +214,22 @@ markers = [
 ]
 
 [tool.coverage.run]
-data_file = ".coverage_$LOCAL_RANK"
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
-relative_files = true
+parallel = true
+sigterm = false
 
 [tool.coverage.paths]
-source = ["/opt/megatron-lm/"]
+source = [
+    ".",
+    "/opt/megatron-lm/",
+    "/opt/megatron-lm-legacy/",
+    "/home/runner/work/Megatron-LM/Megatron-LM/",
+]
 
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the

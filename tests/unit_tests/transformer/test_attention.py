@@ -17,6 +17,13 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
+
+    HAVE_FUSED_QKV_ROPE = True
+except ImportError:
+    HAVE_FUSED_QKV_ROPE = False
+
 
 class TestParallelAttention:
 
@@ -78,11 +85,15 @@ class TestParallelAttention:
 
     @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     @pytest.mark.parametrize("rotary_interleaved", [True, False])
-    def test_fused_rope_gpu_forward(self, rotary_interleaved):
+    @pytest.mark.parametrize("fused_qkv_rope", [True, False])
+    def test_fused_rope_gpu_forward(self, rotary_interleaved, fused_qkv_rope):
         self.parallel_attention.config.apply_rope_fusion = True
         if rotary_interleaved and not is_te_min_version("2.3.0"):
             pytest.skip("Only TE >= 2.3.0 supports interleaved fused RoPE.")
+        if fused_qkv_rope and not HAVE_FUSED_QKV_ROPE:
+            pytest.skip("Fused QKV RoPE not available.")
         self.parallel_attention.config.rotary_interleaved = rotary_interleaved
+        self.parallel_attention.config.fused_single_qkv_rope = fused_qkv_rope
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2

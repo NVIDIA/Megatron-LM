@@ -289,6 +289,9 @@ class TransformerConfig(ModelParallelConfig):
     use_fused_weighted_squared_relu: bool = False
     """If True, uses fused weighted squared relu kernel when using MoE."""
 
+    fused_single_qkv_rope: bool = False
+    """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
+
     ####################
     # activation recomputation
     ####################
@@ -424,11 +427,17 @@ class TransformerConfig(ModelParallelConfig):
     """Shared expert total ffn hidden size.
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
     there are multiple shared experts.
-    None means no shared expert."""
+    None means no shared expert.
+    By default, the shared experts execute before the router. However, when
+    moe_shared_expert_overlap or overlap_moe_expert_parallel_comm is set,
+    the shared experts execute after the router, before the routed experts.
+    This makes the gradients from the router and the shared experts added in
+    different orders to the hidden_states, causing minor numerical differences
+    in the hidden_states gradient."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared epxerts execute after the routed experts."""
+    Without this, the shared experts execute before the router."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -602,7 +611,8 @@ class TransformerConfig(ModelParallelConfig):
     # Cuda Graphs
     ##################
     enable_cuda_graph: bool = False
-    """When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
+    """DEPRECATED and replaced by cuda_graph_impl.
+    When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
     CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
     determines the scope of graph capture."""
 
@@ -622,13 +632,23 @@ class TransformerConfig(ModelParallelConfig):
     """Number of warmup steps for CUDA graphs"""
 
     external_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+    """DEPRECATED and replaced by cuda_graph_impl.
+    When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
+    cuda_graph_impl: str = "none"
+    """Determines the CUDA graph capture implementation.
+    "none": no CUDA graph.
+    "local": capture the CUDA graph using MCore local implementation. Either partial CUDA graph
+    (1/many CUDA graph per layer) or full iteration CUDA graph (1 CUDA graph for whole iteration
+    excluding optimizer) is enabled.
+    "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
     cuda_graph_scope: str = "full"
-    """Determines the CUDA graphs capturing scope. When external_cuda_graph is set to true,
-    valid values are "full" and "attn". "Full" scope captures a whole Transformer
-    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention().
-    When enable_cuda_graph is set to true, "full_iteration" can be specified as cuda_graph_scope
+    """Determines the CUDA graphs capturing scope.
+    When cuda_graph_impl is set to "transformer_engine", valid values are "full" and "attn".
+    "Full" scope captures a whole Transformer layer. "Attn" scope only captures operations in
+    TransformerLayer._forward_attention().
+    When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
@@ -1350,11 +1370,48 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
 
-        if self.enable_cuda_graph:
+        if self.enable_cuda_graph or self.external_cuda_graph:
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Do not use enable_cuda_graph or external_cuda_graph with cuda_graph_impl."
+            assert (
+                not self.enable_cuda_graph or not self.external_cuda_graph
+            ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+
+            if self.enable_cuda_graph:
+                warnings.warn('enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.')
+                self.cuda_graph_impl = "local"
+            if self.external_cuda_graph:
+                warnings.warn(
+                    'external_cuda_graph is deprecated, '
+                    'use cuda_graph_impl=transformer_engine instead.'
+                )
+                self.cuda_graph_impl = "transformer_engine"
+        if self.cuda_graph_impl != "none":
+            assert self.cuda_graph_impl in [
+                "transformer_engine",
+                "local",
+            ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
             if self.recompute_granularity:
-                raise ValueError("CUDA graphs not supported with activation recomputation.")
+                if (
+                    self.recompute_granularity != "selective"
+                    or self.cuda_graph_impl != "transformer_engine"
+                    or self.cuda_graph_scope != "attn"
+                ):
+                    raise ValueError("CUDA graphs not supported with activation recomputation.")
+                else:
+                    for module in self.recompute_modules:
+                        if module in ['core_attn', 'mla_up_proj']:
+                            raise ValueError(
+                                f'attn cuda graph is not supported with {module} recompute.'
+                            )
+                    if "layernorm" in self.recompute_modules:
+                        warnings.warn(
+                            "input_layernorm recompute is not supported with attention "
+                            "cudagraph. Will only recompute the pre_mlp_layernorm."
+                        )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
@@ -1525,9 +1582,6 @@ class MLATransformerConfig(TransformerConfig):
     rotary_scaling_factor: float = 40
     """Rotary scaling factor for the rotary embeddings, used by yarn."""
 
-    max_position_embeddings: int = 4096
-    """This arg is not used, will be deprecated."""
-
     original_max_position_embeddings: int = 4096
     """Original maximum position embeddings for the original model, used by yarn."""
 
@@ -1552,20 +1606,6 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
-
-        # TODO(boxiangw): Deprecate this check
-        if self.max_position_embeddings != 4096:
-            if self.original_max_position_embeddings == 4096:
-                # only override the original_max_position_embeddings if it is not set
-                self.original_max_position_embeddings = self.max_position_embeddings
-            self.max_position_embeddings = 4096
-            warnings.warn(
-                "MLA config max_position_embeddings is overridden by customer input, "
-                "please use the original_max_position_embeddings instead for YaRN!"
-                "max_position_embeddings will be deprecated in the future."
-                "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
-                "and assigned max_position_embeddings back to the original value."
-            )
 
         if self.cache_mla_latents:
             assert (

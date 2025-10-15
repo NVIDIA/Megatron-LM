@@ -123,10 +123,12 @@ def main(
         }
 
     else:
-        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x.spec.model)
+        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x["spec"]["model"])
 
         gitlab_pipeline = {
-            "stages": sorted(list(set([test_case.spec.model for test_case in list_of_test_cases]))),
+            "stages": sorted(
+                list(set([test_case["spec"]["model"] for test_case in list_of_test_cases]))
+            ),
             "workflow": {
                 "rules": [
                     {
@@ -153,12 +155,12 @@ def main(
             script = [
                 "export PYTHONPATH=$(pwd); "
                 "python tests/test_utils/python_scripts/launch_jet_workload.py",
-                f"--model {test_case.spec.model}",
-                f"--environment {test_case.spec.environment}",
+                f"--model {test_case['spec']['model']}",
+                f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
                 f"--time-limit {time_limit}",
                 f"--scope {scope}",
-                f"--test-case '{test_case.spec.test_case}'",
+                f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
                 f"--platform {platform}",
@@ -177,28 +179,27 @@ def main(
 
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")
-                test_case.spec.model
                 script.append(
-                    f"--wandb-experiment {wandb_experiment}-{test_case.spec.model}-{test_case.spec.test_case}"
+                    f"--wandb-experiment {wandb_experiment}-{test_case['spec']['model']}-{test_case['spec']['test_case']}"
                 )
 
             needs = [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}]
 
             if enable_warmup:
                 if test_idx == 0:
-                    warmup_job = test_case.spec.test_case
+                    warmup_job = test_case['spec']['test_case']
                 elif warmup_job != "":
                     needs.append({"job": warmup_job})
 
-            gitlab_pipeline[test_case.spec.test_case] = {
-                "stage": f"{test_case.spec.model}",
+            gitlab_pipeline[test_case['spec']['test_case']] = {
+                "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
                 "timeout": "7 days",
                 "needs": needs,
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
-                "allow_failure": test_case.spec.model == "gpt-nemo",
+                "allow_failure": test_case["spec"]["model"] == "gpt-nemo",
             }
 
     with open(output_path, 'w') as outfile:

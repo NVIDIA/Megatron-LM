@@ -28,7 +28,7 @@ except ImportError:
 
         USING_APEX_OPTIMIZER = True
     except ImportError:
-        from torch.optim import AdamW as Adam
+        from torch.optim import Adam as Adam
 
         HAVE_APEX_OR_TE = False
 
@@ -507,7 +507,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
+        assert (
+            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            or optimizer is None
+        ), (
             "Only Adam and HybridDeviceOptimizer currently supported, "
             "due to checkpointing requirements."
         )
@@ -637,7 +640,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             step = None
             for optimizer in self.optimizer.sub_optimizers:
-                if isinstance(optimizer, torch.optim.AdamW):
+                if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
                     if len(optimizer.state) == 0:
                         continue
                     steps = list(set([s["step"].item() for s in optimizer.state.values()]))

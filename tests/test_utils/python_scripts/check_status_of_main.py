@@ -63,13 +63,18 @@ def is_sucess(target_branch: str):
 
 @click.command()
 @click.option("--target-branch", type=str, help="Target branch to check")
-def main(target_branch: str):
+@click.option("--continuous/--once", is_flag=True, help="Continuous mode", default=True)
+def main(target_branch: str, continuous: bool):
     while is_pending(target_branch):
         logger.info(f"Waiting for branch {target_branch} to finish")
+        if not continuous:
+            break
         time.sleep(60)
 
     if not is_sucess(target_branch=target_branch):
         sys.exit(1)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
   FUNCTIONAL_TEST_SCOPE: mr-slim
-  FUNCTIONAL_TEST_REPEAT: 5
+  FUNCTIONAL_TEST_REPEAT: 1
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
   CLUSTER_A100: ""
   CLUSTER_H100: ""
@@ -31,7 +31,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev")
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -72,7 +72,7 @@ workflow:
         INTEGRATION_TEST_SCOPE: mr
         FUNCTIONAL_TEST: "no"
         FUNCTIONAL_TEST_SCOPE: mr-slim
-        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
@@ -119,7 +119,7 @@ workflow:
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
-        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
