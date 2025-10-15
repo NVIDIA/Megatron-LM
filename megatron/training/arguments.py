@@ -458,6 +458,28 @@ def validate_args(args, defaults={}):
         args.recompute_granularity = 'selective'
     del args.recompute_activations
 
+    if args.enable_cuda_graph or args.external_cuda_graph:
+        assert (
+            args.cuda_graph_impl == "none"
+        ), "Do not use --enable-cuda-graph or --external-cuda-graph with --cuda-graph-impl."
+        assert (
+            not args.enable_cuda_graph or not args.external_cuda_graph
+        ), "--enable-cuda-graph and --external-cuda-graph cannot be enabled at the same time."
+
+        if args.enable_cuda_graph:
+            print_rank_0(
+                '--enable-cuda-graph is deprecated, use --cuda-graph-impl=local instead.', args.rank
+            )
+            args.cuda_graph_impl = "local"
+            del args.enable_cuda_graph
+        if args.external_cuda_graph:
+            print_rank_0(
+                '--external-cuda-graph is deprecated, use --cuda-graph-impl=transformer_engine instead.',
+                args.rank,
+            )
+            args.cuda_graph_impl = "transformer_engine"
+            del args.external_cuda_graph
+
     # Set input defaults.
     for key in defaults:
         # For default to be valid, it should not be provided in the
@@ -721,7 +743,7 @@ def validate_args(args, defaults={}):
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
-    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
         if not args.inference_dynamic_batching:
             assert not args.check_for_nan_in_loss_and_grad, \
             "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
@@ -1104,7 +1126,9 @@ def validate_args(args, defaults={}):
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
             "--inference-batch-times-seqlen-threshold requires setting --pipeline-model-parallel-size > 1."
-        assert not args.enable_cuda_graph, "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
+        assert (
+            args.cuda_graph_impl == "none"
+        ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
     if args.inference_dynamic_batching:
         assert args.inference_dynamic_batching_buffer_size_gb is not None
@@ -1162,15 +1186,10 @@ def validate_args(args, defaults={}):
         )
 
     # CUDA Graphs
-    if args.enable_cuda_graph or args.external_cuda_graph:
-        assert (
-            not args.enable_cuda_graph or not args.external_cuda_graph
-        ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+    if args.cuda_graph_impl != "none":
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-
-    if args.external_cuda_graph:
         assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
             "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
             "The training may crash with illegal memory access."
@@ -1370,20 +1389,29 @@ def _add_inference_args(parser):
     group.add_argument('--flash-decode', default=False, action="store_true",
                        help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
-                       help='Use CUDA graph capture and replay. --cuda-graph-scope=\"full_iteration\" '
-                       'enables whole iteration CUDA graph. ')
+                       help='Deprecated. Use --cuda-graph-impl=local instead. '
+                       'Use local implementation of CUDA graph capture and replay. '
+                       '--cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. ')
     group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
                        help="Number of CUDA graph warmup steps")
     group.add_argument('--external-cuda-graph', action='store_true',
-                       help='Use CUDA graph capture and replay. The CUDA graphs are'
-                       'manually captured in the training script.')
+                       help='Deprecated. Use --cuda-graph-impl=transformer_engine instead. '
+                       'Use TE make_graphed_callables() to capture the CUDA graph.')
+    group.add_argument('--cuda-graph-impl', type=str, default='none',
+                       choices=['none', 'local', 'transformer_engine'],
+                       help='Determines the CUDA graph capture implementation. '
+                       '"none": no CUDA graph. '
+                       '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
+                       '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
     group.add_argument('--cuda-graph-scope', type=str, default='full',
                        choices=['full', 'attn', 'full_iteration'],
                        help='Determines the CUDA graphs capturing scope. Valid values are '
                        '\"full\", \"attn\" and \"full_iteration\". \"Full\" scope captures a whole '
                        'Transformer layer. \"Attn\" scope only captures operations in '
                        'TransformerLayer._forward_attention(). \"ful_iteration\" scope captures a '
-                       'whole iteration.')
+                       'whole iteration. '
+                       'full_iteration scope is only supported with --cuda-graph-impl=local, '
+                       'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')

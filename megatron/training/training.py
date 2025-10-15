@@ -2101,7 +2101,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
@@ -2165,7 +2165,7 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
-    if args.external_cuda_graph:
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -2221,7 +2221,10 @@ def train(
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
         # Capture CUDA Graphs.
-        if args.external_cuda_graph and iteration == args.cuda_graph_warmup_steps:
+        if (
+            args.cuda_graph_impl == "transformer_engine"
+            and iteration == args.cuda_graph_warmup_steps
+        ):
             if iteration > start_iteration and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
             cuda_graph_helper.create_cudagraphs()
@@ -2300,7 +2303,10 @@ def train(
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
-                    if args.external_cuda_graph and iteration == args.cuda_graph_warmup_steps:
+                    if (
+                        args.cuda_graph_impl == "transformer_engine"
+                        and iteration == args.cuda_graph_warmup_steps
+                    ):
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
@@ -2487,7 +2493,7 @@ def evaluate(
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     if eval_iters is None:

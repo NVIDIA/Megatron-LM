@@ -239,8 +239,11 @@ class TestDynamicInferenceEngine:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None
-            and test_config.force_build_cuda_graphs,
+            cuda_graph_impl=(
+                "local"
+                if test_config.num_cuda_graphs is not None and test_config.force_build_cuda_graphs
+                else "none"
+            ),
             inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -317,7 +320,7 @@ class TestDynamicInferenceEngine:
                 -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
             ),
             random_seed=test_config.random_seed,
-            enable_cuda_graph=transformer_config.enable_cuda_graph,
+            enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
         )
 
         # Test env.

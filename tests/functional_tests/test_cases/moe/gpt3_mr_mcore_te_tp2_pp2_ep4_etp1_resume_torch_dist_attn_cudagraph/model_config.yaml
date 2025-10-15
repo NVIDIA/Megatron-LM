@@ -119,7 +119,7 @@ MODEL_ARGS:
   --logging-level: 40
   --tensorboard-dir: ${TENSORBOARD_PATH}
   # CUDA Graph args
-  --external-cuda-graph: true
+  --cuda-graph-impl: transformer_engine
   --cuda-graph-scope: attn
   --cuda-graph-warmup-steps: 0
   --te-rng-tracker: true

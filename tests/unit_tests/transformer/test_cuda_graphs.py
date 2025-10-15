@@ -59,7 +59,7 @@ class TestParallelTransformerBlockCudagraphs:
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
         )
         self.parallel_transformer_block = TransformerBlock(
             self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
@@ -198,7 +198,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
         virtual_pipeline_model_parallel_size=vpp,
         pipeline_model_parallel_size=pp,
         deallocate_pipeline_outputs=True,
-        enable_cuda_graph=True,
+        cuda_graph_impl="local",
         use_te_rng_tracker=True,
         account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
         account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
@@ -294,7 +294,7 @@ class TestLLaVACudaGraph:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs
+            cuda_graph_impl="local",  # Enable CUDA graphs
         )
 
         # Create vision transformer config
@@ -303,7 +303,7 @@ class TestLLaVACudaGraph:
             hidden_size=16,
             num_attention_heads=2,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs for vision model too
+            cuda_graph_impl="local",  # Enable CUDA graphs for vision model too
         )
 
         # Create vision projection config
@@ -471,7 +471,7 @@ class TestParallelMambaBlockCudagraphs:
                 num_layers=len(hybrid_override_pattern),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                enable_cuda_graph=True,
+                cuda_graph_impl="local",
             )
             modules = mamba_stack_spec.submodules
             return MambaStack(
@@ -566,7 +566,7 @@ class TestCaptureFreezeGC:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
             inference_rng_tracker=True,
             tensor_model_parallel_size=1,  # needed?
         )

@@ -139,7 +139,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         ),
         max_sequence_length=max_sequence_length,
         num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
+            args.inference_dynamic_batching_num_cuda_graphs
+            if args.cuda_graph_impl == "local"
+            else None
         ),
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
@@ -225,7 +227,7 @@ def run_inference(
     output_times = []
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
     else:
         cuda_graph_request_count_map = None
@@ -274,7 +276,7 @@ def run_inference(
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
-        if args.enable_cuda_graph and cuda_graph_request_count is not None:
+        if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
             cuda_graph_request_count_map[cuda_graph_request_count] += 1
 
         # Update requests.
@@ -368,7 +370,7 @@ def main():
         controller,
         context,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
-        enable_cuda_graph=args.enable_cuda_graph,
+        enable_cuda_graph=args.cuda_graph_impl == "local",
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
