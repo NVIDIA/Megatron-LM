@@ -607,7 +607,7 @@ class TestCaptureFreezeGC:
             num_cuda_graphs=num_cuda_graphs,
             buffer_size_gb=20,
             buffer_guaranteed_fraction=0.05,
-            chunk_size_tokens=256,
+            block_size_tokens=256,
             buffer_overflow_factor=1.1,
             max_requests_override=512,
             max_tokens_override=8196,
