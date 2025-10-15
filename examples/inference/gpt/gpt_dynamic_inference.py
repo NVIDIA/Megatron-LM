@@ -12,8 +12,6 @@ from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
-import sys
-import os
 
 import torch
 from tqdm import tqdm
@@ -40,14 +38,11 @@ sys.path.append(
 )
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
 from model_provider import model_provider
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 
 from megatron.core.utils import configure_nvtx_profiling
-from model_provider import model_provider
 
 import json
 
@@ -62,7 +57,6 @@ from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider
 
 import torch
 import io

@@ -8,9 +8,15 @@ if __name__ != "__main__":
 else:
     from typing import Any
 
+    import torch
+
     def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
         """Logs a message to the given rank."""
-        print(*args[1:], **kwargs)
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == rank:
+                logger.log(*args, **kwargs)
+        else:
+            logger.log(*args, **kwargs)
 
 
 logger = logging.getLogger(__name__)
@@ -208,5 +214,5 @@ if __name__ == "__main__":
         (9, 0.0, 0.0, "MMMMMMMMM"),
     ]
     for t in test_cases:
-        print("")
+        logging.info("")
         allocate_layers(*t)
