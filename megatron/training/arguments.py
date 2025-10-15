@@ -411,6 +411,9 @@ def validate_args(args, defaults={}):
         if args.save_interval is not None:
             assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
                 f"save_interval should be divisible by number of global batches per inference iteration."
+        if args.rl_use_sequence_packing:
+            assert args.seq_length <= args.rl_sequence_packing_bin_size, \
+                f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -765,6 +768,8 @@ def validate_args(args, defaults={}):
     args.consumed_train_samples = 0
     args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
+    if args.rl_use_sequence_packing:
+        args.consumed_train_bins = 0
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
@@ -1482,9 +1487,6 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
-    group.add_argument('--initialize-socket-comms',
-                       action='store_true', default=False,
-                       help='Initialize socket communication for dynamic engine coordinator.')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')  
     return parser
@@ -1933,6 +1935,7 @@ def _add_rl_args(parser):
                        help="Type of inference server to use.")
     group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
                        help="Conversation template, if using a chat server.")
+    group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
@@ -1951,6 +1954,15 @@ def _add_rl_args(parser):
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, calculate the intra-group similarity of rollouts.')
+    group.add_argument('--rl-use-sequence-packing', action='store_true',
+                       help='Enable sequence packing')
+    group.add_argument('--rl-sequence-packing-bin-size', type=int, default=8192,
+                       help='Override bin size for sequence packing.')
+    group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
+                       choices=['fifo', 'round-robin'],
+                       help='Algorithm for distributing packed bins across ranks. '
+                            'fifo: first-in-first-out sequential distribution, '
+                            'round-robin: distribute bins cyclically across ranks for better load balancing')
     return parser
 
 def _add_training_args(parser):
