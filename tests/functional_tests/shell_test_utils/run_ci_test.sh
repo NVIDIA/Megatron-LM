@@ -231,7 +231,7 @@ for i in $(seq 1 $N_REPEAT); do
         if [[ "$TEST_TYPE" == "release" ]]; then
             EXTRACT_ARGS=("--is-convergence-test")
         else
-            EXTRACT_ARGS=("--is-normal-test")
+            EXTRACT_ARGS=("--is-normal-test" "--step-size" "1")
         fi
 
         # Read test values from Tensorboard for non-inference tests.
@@ -285,7 +285,8 @@ for i in $(seq 1 $N_REPEAT); do
                         --logs-dir $TENSORBOARD_PATH \
                         --train-iters $TRAIN_ITERS \
                         --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
-                        --is-second-run
+                        --is-second-run \
+                        "${EXTRACT_ARGS[@]}"
                             
                     echo "Running pytest 1st vs 2nd run comparison"
                     uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \

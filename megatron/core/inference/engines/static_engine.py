@@ -234,17 +234,6 @@ class StaticInferenceEngine(AbstractEngine):
             tbar.update(prev_num_requests_pending - crnt_num_requests_pending)
             prev_num_requests_pending = crnt_num_requests_pending
 
-        # TODO: Later for dynamic batching we will do something like this
-        """
-            if dynamic_batching:
-                result_dict: Dict[
-                    str, InferenceRequest
-                ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
-                    active_requests
-                )
-            self.scheduler.update_requests_pools(result_dict=result_dict)
-        """
-
     def _wrapped_run_engine(self, cuda_device):
         """
         Explicitly sets the CUDA device before running the engine.

@@ -76,7 +76,7 @@ test:unit_tests_configure:
         "--test-cases all"
         "--cluster dgxh100_coreweave"
         "--platform dgx_h100"
-        "--partition batch_short,batch"
+        "--partition batch"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job test:unit_tests_configure"
@@ -163,6 +163,10 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
     ENVIRONMENT: dev
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: never
+    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
+      when: never
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
       when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
@@ -179,6 +183,10 @@ test:unit_tests_pyt(LTS)_mcore(legacy):
     ENVIRONMENT: lts
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: never
+    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
+      when: never
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
       when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
@@ -217,7 +225,7 @@ test:unit_tests_notify:
   script:
     - env
     - |
-      if [[ "$CI_COMMIT_BRANCH" == "*dev*" ]]; then
+      if [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
       else
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
@@ -406,7 +414,7 @@ test:safe_imports:
     - python -m pip install --no-cache-dir click
     - python .gitlab/scripts/check_imports.py --package-name megatron.core
   rules:
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'dev'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true

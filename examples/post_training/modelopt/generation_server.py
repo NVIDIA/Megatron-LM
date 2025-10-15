@@ -169,7 +169,7 @@ def main(model_provider: str = "gpt"):
 
     inference_engine = get_inference_engine(args, model)
 
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")
         inference_engine.generate(
             prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)

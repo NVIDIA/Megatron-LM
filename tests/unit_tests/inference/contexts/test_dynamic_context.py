@@ -81,7 +81,7 @@ class TestDynamicContext:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_initialize_dynamic_context(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -123,7 +123,7 @@ class TestDynamicContext:
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_is_static_batching(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -141,7 +141,7 @@ class TestDynamicContext:
         )
         assert not dynamic_context.is_static_batching()
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
         self._setup_model_parallel_group(1, 1)
@@ -172,7 +172,7 @@ class TestDynamicContext:
         assert dynamic_context.chunk_allocator.is_memory_available(6)
         assert not dynamic_context.chunk_allocator.is_memory_available(6, safe=True)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_request_overflow(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -204,7 +204,7 @@ class TestDynamicContext:
                     )
                 )  # Adding more than allowed requests
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_token_overflow_error(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -236,7 +236,7 @@ class TestDynamicContext:
                 )
             )  # Exceeding max token count
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -314,7 +314,7 @@ class TestDynamicContext:
             assert torch.all(dynamic_context.mamba_conv_states == 0)
             assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_allocate_and_release_memory_chunks(self, is_hybrid_model):
         self._setup_model_parallel_group(1, 1)
@@ -365,7 +365,7 @@ class TestDynamicContext:
             == None
         )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_add_request(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -441,7 +441,7 @@ class TestDynamicContext:
             % dynamic_context.chunk_size_tokens
         )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -651,7 +651,7 @@ class TestDynamicContext:
                 )
             )
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_chunks_for_finished_requests(self, is_hybrid_model: bool):
         """Test that memory chunks are correctly released for finished requests."""
@@ -724,7 +724,7 @@ class TestDynamicContext:
             assert mamba_idx[3] == -1
             assert mamba_idx[4] == -1
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_finished_requests_with_multiple_chunks(self, is_hybrid_model: bool):
         """Test that all memory chunks are correctly released for finished requests that use multiple chunks."""
@@ -799,7 +799,7 @@ class TestDynamicContext:
             assert torch.all(dynamic_context.mamba_conv_states == 0)
             assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_mamba_states_cache(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -880,7 +880,7 @@ class TestDynamicContext:
         assert torch.all(conv_state_layer3 == 30.0)
         assert torch.all(ssm_state_layer3 == 40.0)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_calculate_and_store_log_probs(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1098,7 +1098,7 @@ class TestDynamicContext:
 
                 current_global_token_offset += expected_len
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     def test_unified_memory(self):
         from megatron.core.inference.unified_memory import has_unified_memory
 
@@ -1143,7 +1143,7 @@ class TestDynamicContext:
         # Unified memory test should succeed.
         init_contexts(unified_memory_level=1)
 
-    @pytest.mark.experimental
+    @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_chunked_prefill(self, is_hybrid_model: bool):
         """Test adding a request with a prompt that requires multiple memory chunks."""

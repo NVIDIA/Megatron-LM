@@ -138,13 +138,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Capture cuda graph.
         if enable_cuda_graph is not None:
-            self.enable_cuda_graph = enable_cuda_graph
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
         else:
-            self.enable_cuda_graph = (
-                controller.inference_wrapped_model.model.config.enable_cuda_graph
-            )
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
         self.capture_stats = None
-        if self.enable_cuda_graph:
+        if self.cuda_graph_impl == "local":
 
             time_start = time.time()
             mem_stats_start = torch.cuda.memory_stats()

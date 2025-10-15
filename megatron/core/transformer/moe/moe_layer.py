@@ -189,16 +189,11 @@ class MoELayer(BaseMoELayer):
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
-    def experts_compute(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
-    ):
-        """Computes the output of the experts on the dispatched tokens.
+    def shared_experts_compute(self, hidden_states: torch.Tensor):
+        """Computes the output of the shared experts.
 
-        This method first post-processes the dispatched input to get permuted tokens
-        for each expert. It then passes the tokens through the local experts.
         If a shared expert is configured and not overlapped with communication,
-        it is also applied. The output from the experts is preprocessed for the
-        combine step.
+        it is computed here.
         """
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
@@ -210,14 +205,26 @@ class MoELayer(BaseMoELayer):
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
                         parallel_state.get_tensor_model_parallel_group(),
-                        residual,
+                        hidden_states,
                     )
                 else:
                     shared_expert_output = tensor_parallel.checkpoint(
-                        self.shared_experts, False, residual
+                        self.shared_experts, False, hidden_states
                     )
             else:
-                shared_expert_output = self.shared_experts(residual)
+                shared_expert_output = self.shared_experts(hidden_states)
+
+        return shared_expert_output
+
+    def routed_experts_compute(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
+    ):
+        """Computes the output of the routed experts on the dispatched tokens.
+
+        This method first post-processes the dispatched input to get permuted tokens
+        for each expert. It then passes the tokens through the local experts.
+        The output from the experts is preprocessed for the combine step.
+        """
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -225,7 +232,7 @@ class MoELayer(BaseMoELayer):
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
-        return output, shared_expert_output, mlp_bias
+        return output, mlp_bias
 
     def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Combines expert outputs via communication and adds shared expert output.
@@ -263,11 +270,10 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
+            shared_expert_output = self.shared_experts_compute(hidden_states)
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, shared_expert_output, mlp_bias = self.experts_compute(
-                dispatched_input, probs, residual
-            )
+            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
             return output, mlp_bias
 
