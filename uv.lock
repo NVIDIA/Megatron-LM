@@ -608,14 +608,13 @@ wheels = [
 
 [[package]]
 name = "causal-conv1d"
-version = "1.5.2"
-source = { registry = "https://pypi.org/simple" }
+version = "1.5.3"
+source = { git = "https://github.com/Dao-AILab/causal-conv1d?rev=9d700d167c4ad299b0a5265ed1bdb4ee4a0ca111#9d700d167c4ad299b0a5265ed1bdb4ee4a0ca111" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/03/e5/2d2b2e067234c0022ff491ff8e574ca0c67094b2deb61249a2be21789cbb/causal_conv1d-1.5.2.tar.gz", hash = "sha256:9b7d8ec8d07e3590a1dfa010e4e87d1442635c3f96d665a3c1ce3025d8cc4b84", size = 23883, upload-time = "2025-07-18T22:15:36.988Z" }
 
 [[package]]
 name = "certifi"
@@ -1498,6 +1497,16 @@ wheels = [
 ]
 
 [[package]]
+name = "grouped-gemm"
+version = "1.1.2"
+source = { git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.2#63a7fb6e132a7dc07061ca009c377f29c81e7360" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "numpy" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+]
+
+[[package]]
 name = "grpcio"
 version = "1.75.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2003,8 +2012,8 @@ wheels = [
 
 [[package]]
 name = "mamba-ssm"
-version = "2.2.5"
-source = { registry = "https://pypi.org/simple" }
+version = "2.2.6.post2"
+source = { git = "https://github.com/state-spaces/mamba?rev=v2.2.6.post2#3d3f2d546824bb132193af316444504e075450c4" }
 dependencies = [
     { name = "einops" },
     { name = "ninja" },
@@ -2014,7 +2023,6 @@ dependencies = [
     { name = "transformers" },
     { name = "triton", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ba/2d/fbd909f6e6d48c491a9ed7ae68e8a890d8409aba4a6356741e2a9c6adad5/mamba_ssm-2.2.5.tar.gz", hash = "sha256:5055c8e631a22bb3cfc9958828a7a57ea14deef2ab2a98dcf425a27c87dcf6a7", size = 113753, upload-time = "2025-07-19T06:16:06.875Z" }
 
 [[package]]
 name = "markdown"
@@ -2167,10 +2175,10 @@ dev = [
     { name = "causal-conv1d" },
     { name = "einops" },
     { name = "flashinfer-python" },
+    { name = "grouped-gemm" },
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "multi-storage-client" },
-    { name = "nv-grouped-gemm" },
     { name = "nvidia-modelopt", marker = "(sys_platform != 'darwin' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
@@ -2180,7 +2188,7 @@ dev = [
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tensorstore", version = "0.1.77", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "tqdm" },
-    { name = "transformer-engine", extra = ["pytorch"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "transformer-engine", marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "wget" },
 ]
 lts = [
@@ -2207,6 +2215,7 @@ mlm = [
 build = [
     { name = "cython" },
     { name = "hatchling" },
+    { name = "nvidia-mathdx" },
     { name = "packaging" },
     { name = "pybind11" },
     { name = "setuptools" },
@@ -2256,16 +2265,16 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'dev'", specifier = "<16.0.0" },
-    { name = "causal-conv1d", marker = "extra == 'dev'", specifier = "~=1.5" },
+    { name = "causal-conv1d", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=9d700d167c4ad299b0a5265ed1bdb4ee4a0ca111" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "einops", marker = "extra == 'lts'" },
     { name = "flashinfer-python", marker = "extra == 'dev'" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
-    { name = "mamba-ssm", marker = "extra == 'dev'", specifier = "~=2.2" },
+    { name = "grouped-gemm", marker = "extra == 'dev'", git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.2" },
+    { name = "mamba-ssm", marker = "extra == 'dev'", git = "https://github.com/state-spaces/mamba?rev=v2.2.6.post2" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=6.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "numpy", specifier = "<2.0.0" },
-    { name = "nv-grouped-gemm", marker = "extra == 'dev'", specifier = "~=1.1" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.33.0a0,<0.34.0" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = ">=0.4.0a0,<0.5.0" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
@@ -2282,7 +2291,7 @@ requires-dist = [
     { name = "torch" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'dev'", specifier = ">=2.6.0a0,<2.8.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.8" },
     { name = "transformers", marker = "extra == 'lts'" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -2296,6 +2305,7 @@ provides-extras = ["mlm", "dev", "lts"]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
+    { name = "nvidia-mathdx" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pybind11" },
     { name = "setuptools", specifier = "<80.0.0" },
@@ -2903,17 +2913,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nv-grouped-gemm"
-version = "1.1.4.post4"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "absl-py" },
-    { name = "numpy" },
-    { name = "torch", marker = "sys_platform == 'never'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/01/b1/9dfb1bc27593b75ea9e0a7376ad89243e075362b6ebbb691aaeacf955a73/nv_grouped_gemm-1.1.4.post4.tar.gz", hash = "sha256:35e0cdd427b0dbfd910e8a77e6743b99c95c7d840d167a7f1dcc166a46da9f88", size = 26450, upload-time = "2025-08-28T08:56:42.06Z" }
-
-[[package]]
 name = "nvidia-cudnn-frontend"
 version = "1.14.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2930,6 +2929,14 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9f/a1/dde4659f0fc4fb39038061474ac6ced39fae8064aeb5aa2c3af433d32080/nvidia_cudnn_frontend-1.14.1-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:18ed95eed3dc6808c5feb76b477136de012f47c081100290cb07bd75e0ca92fd", size = 1719875, upload-time = "2025-09-05T05:36:44.657Z" },
     { url = "https://files.pythonhosted.org/packages/8d/a8/3e851fbf7dc0ed3f34258f4c891f4b53a4fc33b9734fcd97ce38a8b72fbc/nvidia_cudnn_frontend-1.14.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:56426b68d5d70a787b9c584e41f4c044466d56464d086270bcd4504f91521935", size = 1828643, upload-time = "2025-09-05T04:47:58.037Z" },
     { url = "https://files.pythonhosted.org/packages/61/8c/dd94ced0a9e63b6d5a7a21ba3dcdef48a774c33ebc00cfda32c5be8e5b4f/nvidia_cudnn_frontend-1.14.1-cp313-cp313-win_amd64.whl", hash = "sha256:2cf16cbdba247dd983cde277f9ce111be0e4bc3148468bc2d496500336c2d76a", size = 1269394, upload-time = "2025-09-05T05:38:41.659Z" },
+]
+
+[[package]]
+name = "nvidia-mathdx"
+version = "25.1.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/59/00/f1a73ac224d466b31b6eb09794656112e896185678720b05668777e87db3/nvidia_mathdx-25.1.1-py3-none-any.whl", hash = "sha256:4fb948fe4842d24e679f3d0c140c8a0e8e24c3c7ae5eb6e08584253ad94a198b", size = 39894902, upload-time = "2025-05-06T22:58:32.29Z" },
 ]
 
 [[package]]
@@ -3096,16 +3103,46 @@ wheels = [
 name = "onnx-ir"
 version = "0.1.8"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_python_implementation != 'PyPy' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and platform_python_implementation != 'PyPy' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_python_implementation == 'PyPy' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and platform_python_implementation != 'PyPy' and sys_platform != 'linux'",
+    "python_full_version == '3.13.*' and platform_python_implementation != 'PyPy' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and platform_python_implementation == 'PyPy' and sys_platform != 'linux'",
+]
 dependencies = [
-    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "numpy" },
-    { name = "onnx" },
-    { name = "typing-extensions" },
+    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy", marker = "python_full_version >= '3.13'" },
+    { name = "onnx", marker = "python_full_version >= '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version >= '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/af/4a/7ea3952e556e7281b8bfe7f7fce016a13fdac85544d6d6af8ebca5cae160/onnx_ir-0.1.8.tar.gz", hash = "sha256:85ea59eaf165b2b107788193480a260e2723cfc7a1dac1bde7085fd0b7e380d7", size = 108961, upload-time = "2025-09-05T15:45:33.887Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0f/1c/3bb51fa9e278cbc655a1943c8016163d76a6e24137e73e5198ebc20fc965/onnx_ir-0.1.8-py3-none-any.whl", hash = "sha256:61a42021b6249e566ff3b89a03342bc88dce4dc2d984b97cfb060f33ef179f8a", size = 125316, upload-time = "2025-09-05T15:45:31.211Z" },
+]
+
+[[package]]
+name = "onnx-ir"
+version = "0.1.10"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "numpy", marker = "python_full_version < '3.13'" },
+    { name = "onnx", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/5d/94b3ebe3c50d25aab3f967964f42af29bc1f08e8c80782cd59904735d658/onnx_ir-0.1.10.tar.gz", hash = "sha256:513cda24f9710aa1160ec54bf7530ac0ffc3d4ca9e34ac2fb1e2448815bdf2a0", size = 111018, upload-time = "2025-09-30T20:11:40.286Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/6f/da74d497be6d4466c3975847524c1e9240a9e665bd1bcb952e7b6c9a5a7c/onnx_ir-0.1.10-py3-none-any.whl", hash = "sha256:55b6a1bd05e1448e2f8385875f1739f8d2e0dc7936ee25f0f5d2f6f7e2619144", size = 127515, upload-time = "2025-09-30T20:11:38.912Z" },
 ]
 
 [[package]]
@@ -3117,7 +3154,8 @@ dependencies = [
     { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "numpy" },
     { name = "onnx" },
-    { name = "onnx-ir" },
+    { name = "onnx-ir", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "onnx-ir", version = "0.1.10", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "packaging" },
     { name = "typing-extensions" },
 ]
@@ -4671,15 +4709,15 @@ wheels = [
 
 [[package]]
 name = "sentry-sdk"
-version = "2.39.0"
+version = "2.40.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4c/72/43294fa4bdd75c51610b5104a3ff834459ba653abb415150aa7826a249dd/sentry_sdk-2.39.0.tar.gz", hash = "sha256:8c185854d111f47f329ab6bc35993f28f7a6b7114db64aa426b326998cfa14e9", size = 348556, upload-time = "2025-09-25T09:15:39.064Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/b5/ce879ce3292e5ca41fa3ebf68f60645032eca813c9ed8f92dcf09804c0e3/sentry_sdk-2.40.0.tar.gz", hash = "sha256:b9c4672fb2cafabcc28586ab8fd0ceeff9b2352afcf2b936e13d5ba06d141b9f", size = 351703, upload-time = "2025-10-06T12:27:29.207Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/dd/44/4356cc64246ba7b2b920f7c97a85c3c52748e213e250b512ee8152eb559d/sentry_sdk-2.39.0-py2.py3-none-any.whl", hash = "sha256:ba655ca5e57b41569b18e2a5552cb3375209760a5d332cdd87c6c3f28f729602", size = 370851, upload-time = "2025-09-25T09:15:36.35Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/d1/a54bd3622c6e742e6a01bc3bac45966b7ba886e29827da6b8ca7ae234e21/sentry_sdk-2.40.0-py2.py3-none-any.whl", hash = "sha256:d5f6ae0f27ea73e7b09c70ad7d42242326eb44765e87a15d8c5aab96b80013e6", size = 374747, upload-time = "2025-10-06T12:27:27.051Z" },
 ]
 
 [[package]]
@@ -5410,45 +5448,17 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.7.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "transformer-engine-cu12" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/dd/7a/4d97df64d87d0ba3af8ce3f8fa8661493058efe20fa6012059a9793f25e9/transformer_engine-2.7.0-py3-none-any.whl", hash = "sha256:99f6c61df25fc36db1b62d45a2502662ed6d3560d9657f39827af3911b6bb3b7", size = 582666, upload-time = "2025-09-26T03:40:42.936Z" },
-]
-
-[package.optional-dependencies]
-pytorch = [
-    { name = "transformer-engine-torch" },
-]
-
-[[package]]
-name = "transformer-engine-cu12"
-version = "2.7.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "importlib-metadata", version = "8.6.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "packaging" },
-    { name = "pydantic" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/14/08/679185ce7b97aa1771ae874efcce95102bffcce28881638e872eb4410a0c/transformer_engine_cu12-2.7.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:32ac626081d8f43177956bfd6acabddc8d0535af9364b3518dc9b59b676b530e", size = 316959191, upload-time = "2025-09-26T03:42:09.374Z" },
-    { url = "https://files.pythonhosted.org/packages/51/6a/1242ad9b3779c73f70abf19bb34d287dd622c198833de39568b3fb34cd0b/transformer_engine_cu12-2.7.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:66a7355d7534869899b2508b605879fc49f34f74ec0acc4219b3d5fd6449c124", size = 317283039, upload-time = "2025-09-26T03:37:21.555Z" },
-]
-
-[[package]]
-name = "transformer-engine-torch"
-version = "2.7.0"
-source = { registry = "https://pypi.org/simple" }
+version = "2.8.0+40c69e75"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.8#40c69e751a47ec87786283e125c5eb264101270f" }
 dependencies = [
     { name = "einops" },
+    { name = "importlib-metadata", version = "8.6.1", source = { registry = "https://pypi.org/simple" } },
     { name = "onnx" },
     { name = "onnxscript" },
+    { name = "packaging" },
+    { name = "pydantic" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/d4/9eee944ee198f389981257f617ac3967c9ad893dad93155509da4577f202/transformer_engine_torch-2.7.0.tar.gz", hash = "sha256:ca4d83592ea3939868e9a9c046edba08f44c10bf6f9f252b1c0ec3dbab9edbaf", size = 175008, upload-time = "2025-09-26T03:32:34.066Z" }
 
 [[package]]
 name = "transformers"

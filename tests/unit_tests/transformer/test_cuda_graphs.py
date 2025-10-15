@@ -638,6 +638,7 @@ class TestCaptureFreezeGC:
 
         return engine.capture_stats
 
+    @pytest.mark.flaky_in_dev  # Issue #2855
     @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
