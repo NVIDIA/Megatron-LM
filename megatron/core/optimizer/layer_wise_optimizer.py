@@ -20,6 +20,7 @@ import torch
 from absl import logging
 from emerging_optimizers import utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+from emerging_optimizers.orthogonalized_optimizers.tensor_parallel_muon import TensorParallelMuon
 
 from megatron.core.models.gpt import gpt_model as mcore_gpt_model
 from megatron.core.optimizer import Adam, clip_grads
@@ -86,7 +87,7 @@ def default_params_group_func(
             module.embedding, "position_embeddings"
         ), "Traditional position embedding is not supported in favor of RoPE"
 
-    if hasattr(module, "output_layer"):
+    if hasattr(module, "output_layer") and (not module.share_embeddings_and_output_weights or not hasattr(module, "embedding")):
         embed_params_list.append(module.output_layer.weight)
 
     collected_num_params = (
@@ -96,6 +97,16 @@ def default_params_group_func(
         + len(embed_params_list)
     )
     total_num_params = sum(1 for _ in module.parameters())
+    total_named_params = sum(1 for _ in module.named_parameters())
+    print(f"Total number of parameters: {total_num_params}")
+    print(f"Total number of named parameters: {total_named_params}")
+    # decoder_params = dict(module.decoder.named_parameters())
+    # all_params = dict(module.parameters())
+    # diff_keys = list(all_params.keys() - decoder_params.keys())
+    # print(diff_keys)
+
+
+    print(f"Total number of parameters: {total_num_params}, number of collected parameters: {collected_num_params}")
     assert (
         total_num_params == collected_num_params
     ), "Total number of parameters should be equal to the sum of linear, norm and embedding \
@@ -133,7 +144,8 @@ def group_params_layer_wise(
     layer_wise_optimizer = None
     broadcast_params_list = []
     num_linear_params_per_rank = math.ceil(len(linear_params_list) / dp_group.size())
-    tp_args = {}
+    #NK modification 
+    tp_args = {"tp_group": tp_group}
 
     # TODO(boxiangw): Wait for TP Muon in emerging optimizers
     # if linear_optimizer_cls is tp_muon.TensorParallelMuon:
@@ -452,7 +464,8 @@ def get_layer_wise_optimizer(
         # if transformer_config.tensor_model_parallel_size > 1:
         #     linear_optimizer_cls = tp_muon.TensorParallelMuon
         # else:
-        linear_optimizer_cls = Muon
+        # NK modification
+        linear_optimizer_cls = TensorParallelMuon
         linear_opt_kwargs = dict(
             lr=config.lr,
             weight_decay=getattr(config, "muon_linear_wd", config.weight_decay),
