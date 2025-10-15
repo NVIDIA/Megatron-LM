@@ -8,7 +8,6 @@ from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import pydantic
-
 from tensorboard.backend.event_processing import event_accumulator
 
 # By default TB tries to be smart about what to load in memory to avoid OOM
