@@ -448,7 +448,7 @@ class MambaMixer(MegatronModule):
             batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
                 : context.padded_active_token_count
             ]
-            out, out_bias, _, _ = self.step(
+            out, out_bias = self.decode(
                 hidden_states, conv_state, ssm_state, batch_indices=batch_indices
             )
             return out, out_bias
@@ -471,7 +471,7 @@ class MambaMixer(MegatronModule):
         if first_prefill_token_idx > 0:
             zxBCdt_decode = zxBCdt[:first_prefill_token_idx]
             batch_indices_decode = batch_indices[:first_prefill_token_idx]
-            y_decode = self.ssm_block_decode(
+            y_decode = self.ssm_decode(
                 zxBCdt_decode.transpose(0, 1), conv_state, ssm_state, batch_indices_decode
             ).transpose(0, 1)
         else:
@@ -544,7 +544,7 @@ class MambaMixer(MegatronModule):
         return out, out_bias
 
     def decode(
-        self, hidden_states, conv_state, ssm_state, batch_indices: torch.Tensor = None
+        self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Performs inference step for decoding."""
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
@@ -564,7 +564,9 @@ class MambaMixer(MegatronModule):
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
 
-        y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+        y = self.ssm_decode(
+            zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=batch_indices
+        )
 
         # Restore sequence length as first dimension
         if is_dynamic_batching:
@@ -618,7 +620,7 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             y = self.norm(y)
 
-        return out, out_bias
+        return y
 
     def ssm_prefill(
         self,

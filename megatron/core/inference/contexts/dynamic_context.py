@@ -1280,7 +1280,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.chunk_size_tokens)
 
-        if self.is_hybrid_model and (not is_chunked_prefill or req.finished_chunk_token_count == 0):
+        if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
             if self.mamba_state_free_slot_count == 0:
                 raise ContextOverflowError(request_id)
