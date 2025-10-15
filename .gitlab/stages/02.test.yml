@@ -76,7 +76,7 @@ test:unit_tests_configure:
         "--test-cases all"
         "--cluster dgxh100_coreweave"
         "--platform dgx_h100"
-        "--partition batch_short,batch"
+        "--partition batch"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job test:unit_tests_configure"
