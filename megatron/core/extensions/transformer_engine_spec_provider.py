@@ -17,9 +17,9 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
-from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.utils import get_te_version, is_te_min_version
 
 

@@ -218,8 +218,6 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms: int = 16
     """Number of SMs to use for HybridEP. In pure NVL scenarios, 
     16 SMs can generally achieve good bandwidth."""
-    
-    fallback_to_eager_attn: bool = False
 
     ####################
     # linear attention
@@ -772,6 +770,10 @@ class TransformerConfig(ModelParallelConfig):
     transformer_impl: str = "transformer_engine"
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
+
+    fallback_to_eager_attn: bool = False
+    """Whether to fallback to eager attention in TE implementation.
+    Suggested for when desired features are not available in TE implementation."""
 
     #####################################
     # Fine-grained Activation Offloading
@@ -1814,6 +1816,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
                 )
+
+        if self.fallback_to_eager_attn:
+            assert self.transformer_impl == "transformer_engine", (
+                f"fallback_to_eager_attn is only available with transformer_engine implementation,"
+                f" but got {self.transformer_impl=}."
+            )
 
 
 @dataclass
