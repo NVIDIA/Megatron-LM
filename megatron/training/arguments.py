@@ -1348,6 +1348,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--fallback-to-eager-attn', action='store_true',
+                       help='Fallback to eager attention in TE implementation. '
+                       'Suggested for when desired features are not available in TE implementation.')
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
@@ -1357,8 +1360,6 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
-    group.add_argument('--fallback-to-eager-attn', action='store_true',
-                       help='fallback to eager attention in TE impl if desired features are not available')
     
     # FP4 related arguments
     group.add_argument('--fp4-format', default=None,
