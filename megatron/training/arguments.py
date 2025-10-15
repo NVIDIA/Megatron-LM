@@ -746,7 +746,7 @@ def validate_args(args, defaults={}):
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
-    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
         if not args.inference_dynamic_batching:
             assert not args.check_for_nan_in_loss_and_grad, \
             "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
@@ -1206,6 +1206,87 @@ def validate_args(args, defaults={}):
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
+        if args.cuda_graph_impl == "local":
+            if args.cuda_graph_scope:
+                assert args.cuda_graph_scope == [
+                    "full_iteration"
+                ], "For local cuda graph implementation, the only valid value for --cuda-graph-scope is full_iteration. To use other scopes, use --cuda-graph-impl=transformer_engine."
+
+        if args.cuda_graph_impl == "transformer_engine":
+            assert (
+                "full_iteration" not in args.cuda_graph_scope
+            ), "To use full iteration cuda graph, please use --enable-cuda-graph instead of --external-cuda-graph."
+
+            if not args.cuda_graph_scope:
+                # Set the scope default to the whole layer. This will work for a dense model but may raise error for MoE.
+                # So the user should explicitly set the scope for MoE models.
+                if args.hybrid_override_pattern is not None:
+                    if '*' in args.hybrid_override_pattern:
+                        args.cuda_graph_scope.append('attn')
+                    if 'M' in args.hybrid_override_pattern:
+                        args.cuda_graph_scope.append('mamba')
+                    if 'E' in args.hybrid_override_pattern:
+                        args.cuda_graph_scope.append('moe')
+                    if '-' in args.hybrid_override_pattern:
+                        args.cuda_graph_scope.append('mlp')
+                elif args.num_experts is None or args.num_experts <= 1:
+                    args.cuda_graph_scope = ['attn', 'mlp']
+                elif args.moe_layer_freq == 1 or (
+                    isinstance(args.moe_layer_freq, list) and 0 not in args.moe_layer_freq
+                ):
+                    args.cuda_graph_scope = ['attn', 'moe']
+                else:
+                    args.cuda_graph_scope = ['attn', 'mlp', 'moe']
+
+            for scope in args.cuda_graph_scope:
+                assert scope in [
+                    'attn',
+                    'mlp',
+                    'moe',
+                    'moe_router',
+                    'moe_preprocess',
+                    'mamba',
+                ], f"--cuda-graph-scope should be attn, mlp, moe, moe_router, moe_preprocess, or mamba, got {args.cuda_graph_scope}."
+            assert (
+                'moe' not in args.cuda_graph_scope or 'moe_router' not in args.cuda_graph_scope
+            ), 'cuda_graph_scope must not contain both moe and moe_router.'
+            if 'moe_preprocess' in args.cuda_graph_scope:
+                assert (
+                    'moe_router' in args.cuda_graph_scope
+                ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+            if args.num_experts is None or args.num_experts <= 1:
+                assert (
+                    'moe' not in args.cuda_graph_scope and 'moe_router' not in args.cuda_graph_scope
+                ), 'moe cuda graph is only supported for MoE.'
+            else:
+                if (
+                    args.moe_layer_freq == 1
+                    or (isinstance(args.moe_layer_freq, list) and 0 not in args.moe_layer_freq)
+                ) and (
+                    args.hybrid_override_pattern is None or '-' not in args.hybrid_override_pattern
+                ):
+                    assert (
+                        'mlp' not in args.cuda_graph_scope
+                    ), 'mlp cuda graph is only supported for dense layers, but not found in the model.'
+                if args.moe_token_dispatcher_type in ['flex', 'allgather']:
+                    assert (
+                        'moe' not in args.cuda_graph_scope
+                    ), 'moe cuda graph is not supported for flex or allgather token dispatcher.'
+                elif args.moe_token_dispatcher_type == 'alltoall' and (
+                    args.moe_expert_capacity_factor is None
+                    or not args.moe_pad_expert_input_to_capacity
+                ):
+                    assert (
+                        'moe' not in args.cuda_graph_scope
+                    ), 'moe cuda graph is only supported with drop-padding MoE.'
+                    if (
+                        args.moe_expert_capacity_factor is not None
+                        or args.moe_router_padding_for_fp8
+                    ):
+                        assert (
+                            'moe_preprocess' not in args.cuda_graph_scope
+                        ), 'moe_preprocess cuda graph is not supported when there are DtoH copies and synchronizations in the preprocess step.'
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1404,22 +1485,27 @@ def _add_inference_args(parser):
                        help="Number of CUDA graph warmup steps")
     group.add_argument('--external-cuda-graph', action='store_true',
                        help='Deprecated. Use --cuda-graph-impl=transformer_engine instead. '
-                       'Use TE make_graphed_callables() to capture the CUDA graph.')
+                       'Use TE make_graphed_callables() to capture the CUDA graph. '
+                       'Use --cuda-graph-scope=\"attn\", \"mlp\", \"moe\", \"moe_router\", \"moe_preprocess\", \"mamba\" for partial capture. ')
     group.add_argument('--cuda-graph-impl', type=str, default='none',
                        choices=['none', 'local', 'transformer_engine'],
                        help='Determines the CUDA graph capture implementation. '
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-    group.add_argument('--cuda-graph-scope', type=str, default='full',
-                       choices=['full', 'attn', 'full_iteration'],
-                       help='Determines the CUDA graphs capturing scope. Valid values are '
-                       '\"full\", \"attn\" and \"full_iteration\". \"Full\" scope captures a whole '
-                       'Transformer layer. \"Attn\" scope only captures operations in '
-                       'TransformerLayer._forward_attention(). \"ful_iteration\" scope captures a '
-                       'whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, '
-                       'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=[],
+                       help='Determines the CUDA graphs capturing scope. '
+                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+                       '"attn": captures operations in TransformerLayer._forward_attention(). '
+                       '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
+                       '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
+                       '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(), '
+                       'including the shared experts if they are not overlapped with EP comm. '
+                       '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
+                       '"mamba": captures the mamba layer. '
+                       '"full_iteration": captures a whole iteration. '
+                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       'If not specified, the default scope is to capture the whole Transformer layer.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')

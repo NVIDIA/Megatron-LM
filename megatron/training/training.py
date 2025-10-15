@@ -2125,7 +2125,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
@@ -2540,7 +2540,7 @@ def evaluate(
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     if eval_iters is None:
