@@ -1359,9 +1359,9 @@ class StragglerDetector:
         power = 0
         clock = 0
         if ls_ev != le_ev:
-            logger.warning(f"Event Start/Stop out of sync {ls_ev}/{le_ev}")
+            self._log_rank_0(f"Event Start/Stop out of sync {ls_ev}/{le_ev}")
         elif ls_bs != ls_be:
-            logger.warning(f"get_batch Start/Stop out of sync {ls_bs}/{ls_be}")
+            self._log_rank_0(f"get_batch Start/Stop out of sync {ls_bs}/{ls_be}")
         else:
             temp = torch.cuda.temperature()
             power = torch.cuda.power_draw()
@@ -1418,7 +1418,7 @@ class StragglerDetector:
                 now = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
                 min_flops, min_frank, _ = o_dt.aflops[0]()
                 max_flops, max_frank, _ = o_dt.aflops[-1]()
-                logger.info(
+                self._log_rank_0(
                     f"{now} | "
                     f"MnRtt/Rnk: {o_dt.min_elapsed} | "
                     f"MxRtt/Rnk: {o_dt.max_elapsed} | "
@@ -1439,12 +1439,12 @@ class StragglerDetector:
                     line = f"^^^^ Bottom {self.mmcnt} Ranks with lowest  Etpt(TF):"
                     for i in range(self.mmcnt):
                         line += f" {o_dt.aflops[i]},"
-                    logger.info(line)
+                    self._log_rank_0(line)
                     line = f"^^^^ Top    {self.mmcnt} Ranks with highest Etpt(TF):"
                     shift = self.world - self.mmcnt
                     for i in range(self.mmcnt):
                         line += f" {o_dt.aflops[i+shift]},"
-                    logger.info(line)
+                    self._log_rank_0(line)
                 ret = True
 
         # Check/Communicate if tracking is turned off or on
@@ -1479,7 +1479,7 @@ class StragglerDetector:
                 self.stop = self.null_method
                 state = "OFF"
             if self.rank == 0:
-                logger.info(f"Toggling StragglerDetector State {state}")
+                self._log_rank_0(f"Toggling StragglerDetector State {state}")
 
     def _handler(self) -> None:
         """Thread function for the controller.
@@ -1493,7 +1493,7 @@ class StragglerDetector:
 
         if self.rank == 0:
             state = "OFF" if self._off else "ON"
-            logger.info(
+            self._log_rank_0(
                 f"Controller ready to recv commands on port {self.port}. Current state {state}"
             )
             while True and self.sock is not None:
@@ -1507,9 +1507,9 @@ class StragglerDetector:
                     final_resp = f"{resp}{msg_len}\r\n\r\n{msg}"
                     conn.send(final_resp.encode())
                     conn.close()
-                    logger.info(msg)
+                    self._log_rank_0(msg)
                 except Exception as err:
-                    logger.error(f"Error in stragler handler.. {str(err)}")
+                    self._log_rank_0(f"Error in stragler handler.. {str(err)}")
                     return
 
     def _controller(self):
@@ -1530,7 +1530,7 @@ class StragglerDetector:
                 )
                 self.ctrlr.start()
         except Exception as err:
-            logger.warning(f"StragglerDetector cannot be controlled.. {str(err)}")
+            self._log_rank_0(f"StragglerDetector cannot be controlled.. {str(err)}")
 
     def _min_max(
         self,
@@ -1694,6 +1694,21 @@ class StragglerDetector:
         """Default method to initialize start/stop method ptrs"""
         pass
 
+    def _log_rank_0(self, message: str) -> None:
+        """Log message on rank 0, with fallback if logger is not available.
+
+        Args:
+            message (str): The message to log
+        """
+        if self.rank == 0:
+            try:
+                if logger is not None:
+                    logger.info(message)
+                else:
+                    print(message, flush=True)
+            except (AttributeError, NameError):
+                print(message, flush=True)
+
     def __enter__(self) -> "StragglerDetector":
         """Define context/instance entry
 
@@ -1736,7 +1751,7 @@ class StragglerDetector:
         # Should not suppress errors even if turned off
         if ex_type is not None:
             err = traceback.format_exception(ex_type, ex_val, ex_tb)
-            logger.warning(f"{str(ex_val)}\n{err}")
+            self._log_rank_0(f"{str(ex_val)}\n{err}")
         self.stop()
         return False
 
