@@ -48,7 +48,7 @@ def build_tokenizer(args, **kwargs):
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
         tokenizer = _HuggingFaceTokenizer(
-            args.tokenizer_model, trust_remote_code = args.trust_remote_code, **kwargs,
+            args.tokenizer_model, trust_remote_code=args.trust_remote_code, **kwargs
         )
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
@@ -78,11 +78,7 @@ def build_tokenizer(args, **kwargs):
 
         kwargs = dict()
         if args.tokenizer_prompt_format == "nvlm-yi-34b":
-            kwargs = {
-                "from_slow": True,
-                "legacy": False,
-                "add_bos_token": True,
-            }
+            kwargs = {"from_slow": True, "legacy": False, "add_bos_token": True}
 
         # Currently, only HuggingFace tokenizers are supported.
         underlying_tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -97,10 +93,7 @@ def build_tokenizer(args, **kwargs):
             args.force_system_message,
         )
     elif args.tokenizer_type == "SFTTokenizer":
-        tokenizer = SFTTokenizer(
-            args.tokenizer_model,
-            args.sft_tokenizer_prompt_format, 
-        )
+        tokenizer = SFTTokenizer(args.tokenizer_model, args.sft_tokenizer_prompt_format)
     elif args.tokenizer_type == 'NullMultimodalTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullMultimodalTokenizer(args.vocab_size)
@@ -144,7 +137,7 @@ class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
-            **kwargs
+            **kwargs,
         )
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
@@ -367,6 +360,10 @@ class _GPT2BPETokenizer(MegatronLegacyTokenizer):
     def eod(self):
         return self.eod_id
 
+    @property
+    def eos(self):
+        return self.eod_id
+
 
 class _SentencePieceTokenizer(MegatronLegacyTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
@@ -574,6 +571,10 @@ class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
         return self._eos_id
 
     @property
+    def eos(self):
+        return self._eos_id
+
+    @property
     def additional_special_tokens_ids(self):
         return None
 
@@ -621,6 +622,10 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
 
     @property
     def eod(self):
+        return self.eos_id
+
+    @property
+    def eos(self):
         return self.eos_id
 
     @property
@@ -747,7 +752,7 @@ class CustomTikTokenizer(MegatronLegacyTokenizer):
     @property
     def eos(self) -> int:
         return self._eos_id
-    
+
     @property
     def pad(self) -> int:
         return self._pad_id
@@ -859,8 +864,13 @@ class _NullTokenizer(MegatronLegacyTokenizer):
         return self._eod_id
 
     @property
+    def eos(self):
+        return self._eod_id
+
+    @property
     def additional_special_tokens_ids(self):
         return None
+
 
 class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
     def __init__(self, vocab_size, image_token=None, image_token_id=None):
@@ -868,9 +878,15 @@ class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
         self._vocab_size_without_eod = int(vocab_size)
         self._eod_id = self._vocab_size_without_eod
 
-        from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, IMAGE_TOKEN
+        from megatron.core.models.multimodal.llava_model import (
+            DEFAULT_IMAGE_TOKEN_INDEX,
+            IMAGE_TOKEN,
+        )
+
         self._image_token = image_token if image_token is not None else IMAGE_TOKEN
-        self._image_token_id = image_token_id if image_token_id is not None else DEFAULT_IMAGE_TOKEN_INDEX
+        self._image_token_id = (
+            image_token_id if image_token_id is not None else DEFAULT_IMAGE_TOKEN_INDEX
+        )
 
     def tokenize(self, text):
         return [int(x) for x in text.split(' ')]
@@ -887,7 +903,9 @@ class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
         return offsets
 
     def convert_tokens_to_ids(self, tokens):
-        ids = [(int(t) if t != self._image_token else self._image_token_id) for t in tokens.split('  ')]
+        ids = [
+            (int(t) if t != self._image_token else self._image_token_id) for t in tokens.split('  ')
+        ]
         return ids if len(ids) > 1 else ids[0]
 
     @property
@@ -916,6 +934,10 @@ class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
 
     @property
     def eod(self):
+        return self._eod_id
+
+    @property
+    def eos(self):
         return self._eod_id
 
     @property
