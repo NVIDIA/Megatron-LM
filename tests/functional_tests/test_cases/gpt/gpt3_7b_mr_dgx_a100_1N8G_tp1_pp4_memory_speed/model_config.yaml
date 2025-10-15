@@ -58,6 +58,7 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --log-memory-to-tensorboard: true
+  --exit-interval: 25
 TEST_TYPE: regular
 METRICS:
   - "iteration-time"
