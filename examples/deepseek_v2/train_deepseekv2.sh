@@ -72,6 +72,7 @@ LR_WARMUP_ITERS=2
 LR_DECAY_ITERS=$(( ${TRAIN_ITERS} - ${LR_WARMUP_ITERS}))
 OUTPUT_BASEPATH=${EXPERIMENT_DIR}/deepseek-ckpts/test_ft
 GEMM_TUNING="${GEMM_TUNING:-0}"
+MOE_USE_LEGACY_GROUPED_GEMM="${MOE_USE_LEGACY_GROUPED_GEMM:-true}"
 
 TRAIN_LOG=${EXPERIMENT_DIR}/MI300X-$MODEL_NAME-${PR}-seq${SEQ_LEN}-tp${TP}pp${PP}ep${EP}-mbs${MBS}gbs${GBS}-ac_${AC}-do_${DO}-fa_${FL}-sp_${SP}-${TIMESTAMP}.log
 
@@ -92,6 +93,14 @@ else
 	      "
 fi
 
+if [ $MOE_USE_LEGACY_GROUPED_GEMM = true ]; then
+    USE_LEGACY_GROUPED_GEMM_OPTION="--moe-use-legacy-grouped-gemm"
+else
+    USE_LEGACY_GROUPED_GEMM_OPTION=""
+    # disable gemm tuning when using TE Group GEMM.
+    GEMM_TUNING=0
+    echo "[WARN] GEMM tuning is disabled when using TransformerEngine Group GEMM."
+fi
 
 # gemm tuning, https://github.com/ROCm/TransformerEngine
 if [ "$GEMM_TUNING" -eq 1 ]; then
@@ -384,7 +393,7 @@ megatron_options="  \
         --disable-bias-linear \
         --use-mcore-models \
         --moe-grouped-gemm \
-        --moe-use-legacy-grouped-gemm \
+        $USE_LEGACY_GROUPED_GEMM_OPTION \
         --ckpt-format torch \
         --rotary-base ${ROPE_THETA} \
         --rotary-scaling-factor ${SCALE_FACTOR} \
@@ -396,7 +405,7 @@ megatron_options="  \
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
-run_cmd="torchrun $DISTRIBUTED_ARGS examples/deepseek_v2/pretrain_deepseek.py 
+run_cmd="torchrun $DISTRIBUTED_ARGS pretrain_gpt.py 
  ${megatron_options} ${data_args} ${pr_options} ${activation_checkpoint_options} \
  ${do_options} ${sp_options} ${moe_options} ${offload_option} ${sft_option} ${vp_options} ${flash_options} ${save_args}"
 

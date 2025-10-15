@@ -17,6 +17,30 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+def to_float8(tensor: torch.Tensor) -> Float8Tensor:
+    """Convert a tensor to FP8 format."""
+    try:
+        return Float8Tensor.to_float8(tensor)
+    except Exception as e:
+        # Handle the case where the method fails (due to API changes in TransformerEngine)
+        # https://github.com/NVIDIA/TransformerEngine/commit/544dd14b4301beb47136f273deff3f532cdde181
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
+
+        fp8_dtype = tex.DType.kFloat8E4M3
+        scale = 1.0
+
+        # Create a quantizer for FP8 conversion
+        quantizer = Float8Quantizer(
+            scale=torch.full([1], scale, dtype=torch.float32, device="cuda"),
+            amax=torch.empty([1], dtype=torch.float32, device="cuda"),
+            fp8_dtype=fp8_dtype,
+        )
+
+        # Return the quantized tensor
+        return quantizer(tensor.cuda())
+
+
 class TestFP8:
     @pytest.mark.parametrize('dtype', ['bf16', 'fp16', 'fp8'])
     @pytest.mark.parametrize('src_rank', [0, 6])
@@ -25,9 +49,7 @@ class TestFP8:
 
         def get_ten(dtype: str = 'fp8'):
             if dtype == 'fp8':
-                return Float8Tensor.to_float8(
-                    torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda')
-                )
+                return to_float8(torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda'))
             elif dtype == 'bf16':
                 return torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda')
             elif dtype == 'fp16':
@@ -39,7 +61,7 @@ class TestFP8:
 
         # because of a bug in TE, with the cast broadcast fails
         if isinstance(ten, Float8Tensor):
-            ten = ten.from_float8()
+            ten = ten.dequantize()
         torch.distributed.broadcast(ten, src=src_rank)
         assert torch.all(ten == src_rank)
 
@@ -57,9 +79,7 @@ class TestFP8:
         Utils.initialize_model_parallel(*src_tp_pp)
 
         def get_fp8_tensor(fill_val=1):
-            return Float8Tensor.to_float8(
-                torch.full((3,), fill_val, dtype=torch.bfloat16, device='cuda')
-            )
+            return to_float8(torch.full((3,), fill_val, dtype=torch.bfloat16, device='cuda'))
 
         def get_state_dict(fill_val=1):
             return {

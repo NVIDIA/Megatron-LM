@@ -2,8 +2,8 @@ from typing import Dict
 
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
 from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.scheduler import Scheduler
 
 
@@ -25,15 +25,17 @@ class TestScheduler:
     def test_scheduler(self):
         prompt = "sample prompt"
         prompt_tokens = torch.randn(5)
-        inference_parameters = CommonInferenceParams()
+        sampling_params = SamplingParams()
 
+        active_request_ids = []
         for i in range(self.max_batch_size):
-            self.scheduler.add_request(prompt, prompt_tokens, inference_parameters)
+            request_id = self.scheduler.add_request(prompt, prompt_tokens, sampling_params)
             assert (
                 len(self.scheduler.active_request_pool) == i + 1
             ), f"Active request pool should have {i+1} requests, but it has only {len(self.scheduler.active_request_pool)}"
+            active_request_ids.append(request_id)
 
-        self.scheduler.add_request(prompt, prompt_tokens, inference_parameters)
+        request_id = self.scheduler.add_request(prompt, prompt_tokens, sampling_params)
         assert (
             len(self.scheduler.waiting_request_pool) == 1
         ), f"Waiting request pool should have 1 request but it has {len(self.scheduler.waiting_request_pool)} requests"
@@ -42,12 +44,18 @@ class TestScheduler:
         assert (
             waiting_request.status == Status.WAITING_IN_QUEUE
         ), f"Status should be WAITING_IN_QUEUE, but its {waiting_request.status} for the waiting request"
+        assert (
+            request_id == waiting_request.request_id
+        ), f"Waiting request request ID should match returned request ID"
 
         assert (
             self.scheduler.have_requests_pending()
         ), "Scheduler should have requests pending, but it seems to be having no requests"
 
-        active_request_dict: Dict[int, InferenceRequest] = self.scheduler.active_request_pool
+        active_request_dict: Dict[str, InferenceRequest] = self.scheduler.active_request_pool
+        assert set(active_request_dict.keys()) == set(
+            active_request_ids
+        ), f"Active request pool IDs should match returned request IDs"
         for request_id, request in active_request_dict.items():
             # Mark every even request compelted
             if int(request_id) % 2 == 0:
@@ -66,7 +74,7 @@ class TestScheduler:
             len(self.scheduler.completed_request_pool) == 2
         ), f"Completed request pool should have 2 requests but it has {len(self.scheduler.completed_request_pool)} requests "
 
-        active_request_dict: Dict[int, InferenceRequest] = self.scheduler.active_request_pool
+        active_request_dict: Dict[str, InferenceRequest] = self.scheduler.active_request_pool
         for request_id, request in active_request_dict.items():
             # Mark all requests compelted
             request.status = Status.COMPLETED

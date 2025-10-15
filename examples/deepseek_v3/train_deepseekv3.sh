@@ -111,6 +111,7 @@ SP=true
 DO=true
 FL=true
 SFT=false
+ENABLE_DEEP_EP="${ENABLE_DEEP_EP:-false}"
 FUSED_PADDED_MLA_ATTENTION=${FUSED_PADDED_MLA_ATTENTION:-false}
 ATTENTION_SINK_K=${ATTENTION_SINK_K:-0}
 WINDOW_SIZE=${WINDOW_SIZE:-none}
@@ -270,6 +271,7 @@ elif [ $MODEL_SIZE = 16B ]; then
     MOE_INTERMEDIATE_SIZE=1408
     MAX_POSITION_EMBEDDINGS=${SEQ_LEN:-4096}
     EXTRA_VOCAB_SIZE=0
+    Q_LORA_RANK=512
     KV_LORA_RANK=512
     QK_NOPE_HEAD_DIM=128
     QK_ROPE_HEAD_DIM=64
@@ -279,11 +281,11 @@ elif [ $MODEL_SIZE = 16B ]; then
     NUM_EXPERTS=64
     ROUTER_TOPK=6
     NUM_SHARED_EXPERTS=2
-    MOE_LAYER_FREQ=1
+    MOE_LAYER_FREQ=([0]*3+[1]*24)
     
     moe_options=" \
+        --q-lora-rank ${Q_LORA_RANK} \
         --moe-router-num-groups ${EP} \
-        --moe-router-group-topk 1
     "
 fi
 if [ $MOE_PERMUTE_FUSION != false ]; then
@@ -294,8 +296,10 @@ else
 fi
 moe_options=" \
     ${moe_options} \
+    --moe-router-dtype fp32 \
     --multi-latent-attention \
     --qk-layernorm \
+    --rerun-mode disabled \
     --attention-sink-k ${ATTENTION_SINK_K} \
     --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
     --enable-shared-expert \
@@ -306,8 +310,9 @@ moe_options=" \
     --moe-router-topk ${ROUTER_TOPK} \
     ${moe_permute_fustion_options} \
     --num-experts ${NUM_EXPERTS} \
-    --moe-token-dispatcher-type alltoall \
-    --moe-shared-expert-overlap \
+    --moe-router-pre-softmax \
+    --mscale 1.0 \
+    --mscale-all-dim 1.0 \
     --moe-aux-loss-coeff 1e-2 \
     --expert-model-parallel-size ${EP} \
     --expert-tensor-parallel-size ${ETP} \
@@ -315,8 +320,23 @@ moe_options=" \
     --qk-head-dim ${QK_NOPE_HEAD_DIM} \
     --qk-pos-emb-head-dim ${QK_ROPE_HEAD_DIM} \
     --v-head-dim ${V_HEAD_DIM} \
-    --kv-channels ${V_HEAD_DIM} "
-    
+    --kv-channels ${V_HEAD_DIM} \
+    --no-rope-fusion \
+    "
+
+if [ $ENABLE_DEEP_EP = true ]; then
+    moe_options=" \
+            ${moe_options} \
+            --moe-token-dispatcher-type flex \
+            --moe-enable-deepep \
+        "
+else 
+    moe_options=" \
+            ${moe_options} \
+            --moe-token-dispatcher-type alltoall \
+            --moe-shared-expert-overlap \
+    "
+fi
 
 if [ $WINDOW_SIZE != none ]; then
     moe_options=" \
@@ -515,7 +535,7 @@ megatron_options="  \
         $USE_GROUPED_GEMM_OPTION \
         $USE_LEGACY_GROUPED_GEMM_OPTION \
         --distributed-timeout-minutes 60 \
-        --eod-mask-loss 
+        --eod-mask-loss
         "
         # --save ${CHECKPOINT_PATH} \
 
@@ -553,7 +573,7 @@ fi
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
-run_cmd="torchrun $DISTRIBUTED_ARGS examples/deepseek_v3/pretrain_deepseek_v3.py 
+run_cmd="torchrun $DISTRIBUTED_ARGS pretrain_gpt.py
  ${megatron_options} ${pr_options} ${load_options} ${activation_checkpoint_options} \
  ${do_options} ${sp_options} ${moe_options} ${offload_option} ${comm_overlap_option} ${sft_option} ${vp_options} ${flash_options} ${profile_options} ${LOGGING_ARGS}"
 

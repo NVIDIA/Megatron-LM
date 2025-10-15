@@ -1,4 +1,4 @@
-ARG BASE_DOCKER=rocm/pytorch:rocm6.3_ubuntu22.04_py3.10_pytorch_release_2.5.1_preview
+ARG BASE_DOCKER=rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1
 FROM $BASE_DOCKER
 
 ARG PYTORCH_ROCM_ARCH_OVERRIDE="gfx942"
@@ -10,14 +10,18 @@ WORKDIR $WORKSPACE_DIR
 
 RUN pip3 install \
 scipy \
+wheel \
+PyGithub \
+pytest-xdist \
+psutil \
 transformers \
 einops \
 flask-restful \
-nltk \
 pytest \
 pytest-cov \
 pytest_mock \
 pytest-csv \
+pytest-asyncio \
 pytest-random-order \
 sentencepiece \
 wrapt \
@@ -31,9 +35,16 @@ datasets \
 tiktoken \
 pynvml
 
-RUN pip3 install "huggingface_hub[cli]"
-RUN python3 -m nltk.downloader punkt_tab
+RUN python -m pip install -U "nltk>=3.8.2"
 
+RUN pip3 install "huggingface_hub[cli]"
+
+ENV NLTK_DATA=/usr/share/nltk_data
+RUN python - <<'PY'
+import nltk
+ok = nltk.download('punkt_tab', download_dir='/usr/share/nltk_data', quiet=True)
+assert ok, "Failed to download punkt_tab"
+PY
 
 # Install Causal-Conv1d and its dependencies
 WORKDIR ${STAGE_DIR}
@@ -47,35 +58,44 @@ RUN git clone https://github.com/Dao-AILab/causal-conv1d causal-conv1d &&\
 
 # Install mamba
 WORKDIR ${STAGE_DIR}
-RUN git clone https://github.com/state-spaces/mamba mamba &&\
+RUN git clone https://github.com/sudhu2k/mamba mamba &&\
     cd mamba &&\
+    git checkout hipcub_warp_threads_deprecation &&\
     git show --oneline -s &&\
     pip install --no-build-isolation .
+
+# Build flash-attention
+ARG BUILD_FA="1"
+ARG FA_BRANCH="main"
+ARG FA_REPO="https://github.com/ROCm/flash-attention.git"
+WORKDIR $WORKSPACE_DIR
+RUN if [ "$BUILD_FA" -eq "1" ]; then \
+git clone ${FA_REPO} \
+&& cd flash-attention \
+&& git checkout ${FA_BRANCH} \
+&& MAX_JOBS=128 GPU_ARCHS=${PYTORCH_ROCM_ARCH_OVERRIDE} python3 setup.py install; \
+fi
 
 # Clone TE repo and submodules
 WORKDIR ${STAGE_DIR}
 
-ARG TE_BRANCH=release_v1.13_rocm
+ARG TE_COMMIT=c91bac54e9ff4992cdf2dbee9218d039986ebcd7
 ENV NVTE_FRAMEWORK=pytorch
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1
-RUN git clone --single-branch --depth 1 -b ${TE_BRANCH} https://github.com/ROCm/TransformerEngine.git && \
+
+RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git && \
     cd TransformerEngine && \
+    git checkout ${TE_COMMIT} && \
     git submodule update --init --recursive && \
     echo "TransformerEngine at commit:" $(git rev-parse HEAD) && \
-    pip install -v .
+    pip install .
 
 RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
     cd grouped_gemm &&\
     git checkout rocm &&\
     git submodule update --init --recursive &&\
     pip install .
-
-RUN git clone https://github.com/ROCm/flash-attention/ -b v2.7.3-cktile && \
-    cd flash-attention && \
-    GPU_ARCHS=${PYTORCH_ROCM_ARCH_OVERRIDE} python setup.py install && \
-    cd .. &&\
-    rm -rf flash-attention
 
 WORKDIR $WORKSPACE_DIR
 COPY . Megatron-LM
@@ -86,4 +106,3 @@ ENV PYTHONPATH=/var/lib/jenkins/triton/python
 
 # record configuration for posterity
 RUN pip list
-

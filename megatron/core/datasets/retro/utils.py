@@ -5,13 +5,12 @@
 import glob
 import logging
 import os
-from collections import defaultdict
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 import numpy as np
 import torch
-from tqdm import tqdm
+from torch.distributed import ProcessGroup
 
 from megatron.core import parallel_state
 from megatron.core.datasets.retro.config import RetroPreprocessingConfig
@@ -21,9 +20,28 @@ from megatron.core.datasets.retro.query.multi_split_gpt_dataset import (
 )
 from megatron.core.utils import log_single_rank
 
-from .external_libs import h5py
-
 logger = logging.getLogger(__name__)
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
+
+
+class Block(TypedDict):
+    """Specific block arg type to mute mypy."""
+
+    range: Tuple[int, int]
+    path: str
 
 
 def log_retro_rank_0(message: str) -> None:
@@ -81,7 +99,6 @@ class GPTToTextDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, gpt_dataset: MultiSplitGPTDataset, gpt_tokenizer: Any):
-
         super().__init__()
 
         self.gpt_dataset = gpt_dataset
@@ -110,7 +127,7 @@ class GPTToTextDataset(torch.utils.data.Dataset):
 
 
 def get_blocks(
-    dirname: str, n_samples: int, block_size: int, validate: Callable = None
+    dirname: str, n_samples: int, block_size: int, validate: Optional[Callable] = None
 ) -> SimpleNamespace:
     """Divide range [0, num_samples) to sequence of block ranges.
 
@@ -123,13 +140,22 @@ def get_blocks(
 
     Args:
         dirname (str): Path to directory containing block files.
-        n_samples (int): Ideal number of samples. The total number of saved block data is <=n_samples.
+        n_samples (int): Ideal number of samples.
+            The total number of saved block data is <=n_samples.
         block_size (int): Max number of samples per block file (e.g., 100000).
         validate (Callable): Method for validating each block file during load.
 
     Returns:
-        A namespace consisting of 2 lists: existing blocks, and missing blocks. The total number of samples between the existing and missing blocks should equal n_samples above.
+        A namespace consisting of 2 lists: existing blocks, and missing blocks.
+        The total number of samples between the existing and missing blocks should
+        equal n_samples above.
     """
+
+    if not HAVE_TQDM:
+        raise ImportError("tqdm is required to use the RetroDataset. Please install tqdm.")
+
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
 
     assert os.path.isdir(dirname), "missing directory '%s.'" % dirname
 
@@ -140,7 +166,8 @@ def get_blocks(
 
     # All block files (existing + missing).
     n_digits = int(np.ceil(np.log(n_samples) / np.log(10)) + 1)
-    all_blocks = [
+
+    all_blocks: List[Block] = [
         {
             "range": r,
             "path": os.path.join(
@@ -160,7 +187,6 @@ def get_blocks(
             block["path"] for block in all_blocks if os.path.exists(block["path"])
         ]
         for index, path in enumerate(tqdm(existing_block_paths, "validating block.")):
-
             assert path in all_block_path_set, "unexpected filename, '%s'." % path
 
             try:
@@ -192,8 +218,9 @@ def get_blocks_by_rank(
     dirname: str,
     n_samples: int,
     block_size: int,
-    validate: Callable = None,
+    validate: Optional[Callable] = None,
     sample: Optional[float] = None,
+    process_group: Optional[ProcessGroup] = None,
 ) -> SimpleNamespace:
     """Divide existing and missing blocks evenly across all ranks.
 
@@ -204,26 +231,36 @@ def get_blocks_by_rank(
 
     Args:
         dirname (str): Path to directory containing block files.
-        n_samples (int): Ideal number of samples. The total number of saved block data is <=n_samples.
+        n_samples (int): Ideal number of samples. The total number of saved block data
+            is <=n_samples.
         block_size (int): Max number of samples per block file (e.g., 100000).
         validate (Callable): Method for validating each block file during load.
-        sample (Optional[float]): If provided, sample a random subset of the blocks. Used for validating preprocessing correctness.
+        sample (Optional[float]): If provided, sample a random subset of the blocks.
+            Used for validating preprocessing correctness.
+        process_group (Optional[ProcessGroup]): Process group for distributed operations.
+            If None, uses data parallel group.
 
     Returns:
-        A namespace consisting of 2 lists: existing blocks, and missing blocks. Each of these two lists is potentially a sub-sample of the total set of existing and missing blocks, depending on whether sampling is used. Additionally, the attributes n_existing_world and n_missing_world are the total number of existing and missing blocks, independent of samples. Therefore, (n_existing_world + n_missing_world) * block_size == n_samples.
+        A namespace consisting of 2 lists: existing blocks, and missing blocks.
+        Each of these two lists is potentially a sub-sample of the total set of
+        existing and missing blocks, depending on whether sampling is used.
+        Additionally, the attributes n_existing_world and n_missing_world are the
+        total number of existing and missing blocks, independent of samples.
+        Therefore, (n_existing_world + n_missing_world) * block_size == n_samples.
     """
+
+    if process_group is None:
+        process_group = parallel_state.get_data_parallel_group()
 
     # Get world blocks.
     blocks = get_blocks(dirname, n_samples, block_size, validate)
 
     # This rank's existing and missing files.
-    data_parallel_rank = parallel_state.get_data_parallel_rank()
-    data_parallel_world_size = parallel_state.get_data_parallel_world_size()
     rank_existing_blocks = blocks.existing[
-        data_parallel_rank : len(blocks.existing) : data_parallel_world_size
+        process_group.rank() : len(blocks.existing) : process_group.size()
     ]
     rank_missing_blocks = blocks.missing[
-        data_parallel_rank : len(blocks.missing) : data_parallel_world_size
+        process_group.rank() : len(blocks.missing) : process_group.size()
     ]
 
     # Extend rank's existing and missing blocks (with None) such that all ranks

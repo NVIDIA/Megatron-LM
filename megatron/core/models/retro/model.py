@@ -5,9 +5,10 @@ from typing import Dict, Optional
 
 from torch import Tensor
 
-from megatron.core import InferenceParams
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
+from megatron.core.utils import deprecate_inference_params
 
 
 class RetroModel(GPTModel):
@@ -29,7 +30,9 @@ class RetroModel(GPTModel):
         context_mask: Tensor = None,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """RetroModel forward method.
 
@@ -43,9 +46,12 @@ class RetroModel(GPTModel):
             context_input_ids (Tensor): Context (i.e., neighbor) token IDs.
             context_position_ids (Tensor): Context (i.e., neighbor) position IDs.
             context_mask (Tensor): Context (i.e., neighbor) attention mask.
-            decoder_input (Tensor): When using pipeline parallelism, input_ids and position_ids will only be used on the first stage, and for all other stages decoder_input will be provided via communication from the previous stage.
+            decoder_input (Tensor): When using pipeline parallelism, input_ids
+                and position_ids will only be used on the first stage, and for
+                all other stages decoder_input will be provided via communication
+                from the previous stage.
             labels (Tensor): The labels of dimension [batch size, seq length].
-            inference_params (InferenceParams): Parameters for inference.
+            inference_context (BaseInferenceContext): Inference context.
 
         Returns:
             Output tensor of forward pass.
@@ -64,6 +70,8 @@ class RetroModel(GPTModel):
         # - context:     [ r, k*bs*l, d ]
         # - output:      [ ns, bs, d ]
 
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         # Context embedding (e.g., for Retro neighbor tokens).
         if context_input_ids is not None:
             context = self.embedding(context_input_ids, context_position_ids)
@@ -77,7 +85,7 @@ class RetroModel(GPTModel):
             attention_mask=attention_mask,
             decoder_input=decoder_input,
             labels=labels,
-            inference_params=inference_params,
+            inference_context=inference_context,
             extra_block_kwargs={"context": context, "context_mask": context_mask},
         )
 

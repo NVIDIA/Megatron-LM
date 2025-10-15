@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .tokenizer import build_tokenizer, get_tokenizer
+from .tokenizer import build_tokenizer

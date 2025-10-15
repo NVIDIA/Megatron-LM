@@ -5,6 +5,8 @@ import torch
 
 from megatron.core.jit import jit_fuser
 
+# pylint: disable=missing-function-docstring
+
 
 def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # type: (Tuple[Tensor, Optional[Tensor]], Tensor, float, bool) -> Tensor
@@ -15,6 +17,14 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # seem to be identical performance-wise (both just change the view).
 
     x, bias = x_with_bias  # unpack
+
+    # Run in-place if in eval mode and inputs do not require gradients
+    inplace = (
+        not training
+        and not x.requires_grad
+        and not residual.requires_grad
+        and (bias is None or not bias.requires_grad)
+    )
 
     # If we want to train mixed precision, then the output of this function
     # should be half precision. However, in AMP O1, the input (residual) is
@@ -28,13 +38,22 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # Addition-Dropout-Residual Addition operation. So doing it together inside
     # the conditional branch to improve performance
     if bias is not None:
-        x = x + bias
-        out = torch.nn.functional.dropout(x, p=prob, training=training)
-        out = residual + out
+        if inplace:
+            x.add_(bias)
+        else:
+            x = x + bias
+        out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
+        if inplace:
+            out.add_(residual)
+        else:
+            out = residual + out
         return out
     else:
-        out = torch.nn.functional.dropout(x, p=prob, training=training)
-        out = residual + out
+        out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
+        if inplace:
+            out.add_(residual)
+        else:
+            out = residual + out
         return out
 
 

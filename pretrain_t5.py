@@ -80,13 +80,7 @@ def model_provider(
     """
 
     args = get_args()
-
-    assert (
-        args.encoder_tensor_model_parallel_size == 0
-        or args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size
-    ), f"Because word embeddings are shared between the encoder & decoder, these \
-        have to have the same tensor parallel size."
-
+    
     config = core_transformer_config_from_args(args)
     if args.use_legacy_models:
         model = megatron.legacy.model.T5Model(
@@ -103,12 +97,7 @@ def model_provider(
         encoder_config.num_layers = args.encoder_num_layers
 
         if args.pipeline_model_parallel_size > 1:
-            assert (
-                args.encoder_pipeline_model_parallel_size > 0
-            ), "Need to know how to shard the encoder & decoder."
-
-        if args.encoder_pipeline_model_parallel_size > 0:
-            encoder_config.pipeline_model_parallel_size = args.encoder_pipeline_model_parallel_size
+            raise ValueError("Pipeline parallelism is not supported for T5.")
 
         encoder_layers_per_pipeline = (
             encoder_config.num_layers // encoder_config.pipeline_model_parallel_size
@@ -141,6 +130,8 @@ def model_provider(
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            relative_attention_num_buckets=args.relative_attention_num_buckets,
+            relative_attention_max_distance=args.relative_attention_max_distance,
             add_encoder=add_encoder,
             add_decoder=add_decoder,
         )
@@ -226,7 +217,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path),
         ],
-        renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         path_to_cache=args.data_cache_path,
         tokenizer=tokenizer,
@@ -237,6 +227,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
         masking_do_permutation=False,
         masking_use_longer_ngrams=False,
         masking_use_geometric_distribution=True,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
     )
 
     print_rank_0('> building train, validation, and test datasets for T5 ...')
@@ -254,41 +245,25 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
 
 
 def t5_embedding_ranks(pp_ranks):
-    """T5's embedding ranks consist of the encoder's first rank, and
-        the decoder's first & last ranks.
+    """T5's embedding ranks consist of the first and last ranks of the pipeline.
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
     first_rank = pp_ranks[0]
     last_rank = pp_ranks[-1]
 
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
     if len(pp_ranks) == 1:
         return [first_rank]
-    elif pp_ranks[epp] not in (first_rank, last_rank):
-        return [first_rank, pp_ranks[epp], last_rank]
     else:
         return [first_rank, last_rank]
 
 
 def t5_position_embedding_ranks(pp_ranks):
-    """T5's positional embeddings are the encoder & decoder first rank stages
+    """T5's positional embeddings are on the first rank stage
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
-    if len(pp_ranks) == 1 or pp_ranks[0] == pp_ranks[epp]:
-        return [pp_ranks[0]]
-    else:
-        return [pp_ranks[0], pp_ranks[epp]]
+    return [pp_ranks[0]]
 
 
 if __name__ == "__main__":
@@ -299,7 +274,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'},
         get_embedding_ranks=t5_embedding_ranks,

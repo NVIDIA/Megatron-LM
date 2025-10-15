@@ -5,6 +5,7 @@
 import logging
 import os
 from pathlib import Path
+from typing import Union
 
 import torch
 
@@ -14,6 +15,7 @@ from megatron.core.dist_checkpointing.strategies.base import (
     StrategyAction,
     register_default_strategy,
 )
+from megatron.core.msc_utils import MultiStorageClientFeature
 
 from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import CheckpointingException, ShardedObject, is_main_replica
@@ -35,20 +37,31 @@ def register_default_common_strategies():
 class TorchCommonSaveStrategy(SaveCommonStrategy):
     """Common save strategy leveraging native torch save/load."""
 
-    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
+    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Union[str, Path]):
         """Save common part of the state dict."""
         if torch.distributed.get_rank() == 0:
-            torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
+            path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                msc.torch.save(common_state_dict, path)
+            else:
+                torch.save(common_state_dict, path)
 
     def save_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
     ):
         """Save sharded objects from the state dict."""
         for sh_obj in nested_values(sharded_objects_state_dict):
             if is_main_replica(sh_obj.replica_id):
-                save_path = checkpoint_dir / f'{sh_obj.unique_key}.pt'
-                os.makedirs(save_path.parent, exist_ok=True)
-                torch.save(sh_obj.data, save_path)
+                save_path = os.path.join(checkpoint_dir, f"{sh_obj.unique_key}.pt")
+                parent_dir = os.path.dirname(save_path)
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    msc.os.makedirs(parent_dir, exist_ok=True)
+                    msc.torch.save(sh_obj.data, save_path)
+                else:
+                    os.makedirs(parent_dir, exist_ok=True)
+                    torch.save(sh_obj.data, save_path)
 
     def can_handle_sharded_objects(self):
         """This strategy can handle ShardedObjects."""
@@ -58,26 +71,34 @@ class TorchCommonSaveStrategy(SaveCommonStrategy):
 class TorchCommonLoadStrategy(LoadCommonStrategy):
     """Common load strategy leveraging native torch save/load."""
 
-    def load_common(self, checkpoint_dir: Path):
+    def load_common(self, checkpoint_dir: Union[str, Path]):
         """Load common (non-sharded) objects state dict from the checkpoint.
 
         Args:
-            checkpoint_dir (Path): checkpoint directory
+            checkpoint_dir (Union[str, Path]): checkpoint directory
 
         Returns:
             StateDict: state dict with non-sharded objects from the checkpoint
         """
-        load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
+        load_path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
         try:
-            return torch.load(load_path, map_location='cpu', weights_only=False)
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                return msc.torch.load(load_path, map_location='cpu', weights_only=False)
+            else:
+                return torch.load(load_path, map_location='cpu', weights_only=False)
         except FileNotFoundError as e:
             err_msg = f'Common file {load_path} does not exist'
-            ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                ckpt_files = [f.name for f in msc.Path(checkpoint_dir).iterdir()]
+            else:
+                ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
             logger.debug(f'{err_msg}. Checkpoint directory content: {ckpt_files}')
             raise CheckpointingException(err_msg) from e
 
     def load_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
     ):
         """Replaces all ShardedObject from a given state dict with values loaded from the
         checkpoint.
@@ -85,7 +106,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
         Args:
             sharded_objects_state_dict (ShardedStateDict):
                 sharded state dict defining what objects should be loaded.
-            checkpoint_dir (Path): checkpoint directory
+            checkpoint_dir (Union[str, Path]): checkpoint directory
 
         Returns:
             None: sharded state dict is modified in place
@@ -93,24 +114,33 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
 
         def load_sharded_object(sh_obj: ShardedObject):
             sh_obj.data = None
-            load_path = checkpoint_dir / f'{sh_obj.unique_key}.pt'
+            load_path = os.path.join(checkpoint_dir, f'{sh_obj.unique_key}.pt')
             try:
-                loaded_obj = torch.load(load_path, weights_only=False)
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    loaded_obj = msc.torch.load(load_path, weights_only=False)
+                else:
+                    loaded_obj = torch.load(load_path, weights_only=False)
             except FileNotFoundError as e:
                 # Backward compatible logic: previously the save format was incorrect
-                old_load_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
+                base, _ = os.path.splitext(sh_obj.unique_key)
+                old_load_path = os.path.join(checkpoint_dir, f"{base}.pt")
                 try:
-                    loaded_obj = torch.load(old_load_path, weights_only=False)
+                    if MultiStorageClientFeature.is_enabled():
+                        msc = MultiStorageClientFeature.import_package()
+                        loaded_obj = msc.torch.load(old_load_path, weights_only=False)
+                    else:
+                        loaded_obj = torch.load(old_load_path, weights_only=False)
                 except FileNotFoundError:
                     err_msg = f'Object shard {load_path} not found'
-                    obj_subdir = checkpoint_dir / sh_obj.key
-                    if obj_subdir.exists():
-                        obj_files = [f.name for f in obj_subdir.iterdir()]
+                    obj_subdir = os.path.join(checkpoint_dir, sh_obj.key)
+                    if os.path.exists(obj_subdir):
+                        obj_files = os.listdir(obj_subdir)
                         logger.debug(
                             f'{err_msg}. Object {sh_obj.key} directory content: {obj_files}'
                         )
                     else:
-                        ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
+                        ckpt_files = os.listdir(checkpoint_dir)
                         logger.debug(
                             f'{err_msg}. Object {sh_obj.key} directory does not exist. Checkpoint'
                             f' directory content: {ckpt_files}'
@@ -120,7 +150,13 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
 
         return dict_list_map_inplace(load_sharded_object, sharded_objects_state_dict)
 
-    def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
+    def load_sharded_metadata(self, checkpoint_dir: Union[str, Path]) -> ShardedStateDict:
+        if MultiStorageClientFeature.is_enabled():
+            msc = MultiStorageClientFeature.import_package()
+            checkpoint_dir = msc.Path(checkpoint_dir)
+        else:
+            checkpoint_dir = Path(checkpoint_dir)
+
         sharded_metadata = {}
         for subdir in checkpoint_dir.iterdir():
             if not subdir.is_dir():

@@ -29,7 +29,8 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         weights (List[Union[int, float]]): The weights that determine the dataset blend ratios
 
-        size (Optional[int]): The number of samples to draw from the blend. If None, for each dataset index idx draw exactly weights[idx] samples from datasets[idx].
+        size (Optional[int]): The number of samples to draw from the blend. If None, for each
+            dataset index idx draw exactly weights[idx] samples from datasets[idx].
 
         config (BlendedMegatronDatasetConfig): The config
 
@@ -74,16 +75,13 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers["split"] = self.split.name
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
-        unique_identifiers["renormalize_blend_weights"] = self.config.renormalize_blend_weights
 
         self.unique_description = json.dumps(
             unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
         )
         self.unique_description_hash = hashlib.md5(
-            self.unique_description.encode("utf-8")
+            self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
-
-        self.built_anew_on_cache_miss = False
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
@@ -105,6 +103,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The dataset index and the dataset sample index
         """
+
         path_to_cache = self.config.path_to_cache
 
         if path_to_cache:
@@ -128,7 +127,6 @@ class BlendedDataset(torch.utils.data.Dataset):
             log_single_rank(
                 logger, logging.INFO, f"Build and save the {type(self).__name__} indices"
             )
-            self.built_anew_on_cache_miss = True
 
             # Build the dataset and dataset sample indexes
             log_single_rank(
@@ -156,6 +154,19 @@ class BlendedDataset(torch.utils.data.Dataset):
                     dataset_index, dataset_sample_index, self.weights, len(self.datasets)
                 )
 
+            dataset_indices, dataset_sizes = numpy.unique(dataset_index, return_counts=True)
+            for i, (_index, _size) in enumerate(zip(dataset_indices, dataset_sizes)):
+                if len(self.datasets[_index]) < _size:
+                    raise IndexError(
+                        f"The {self.split.name} blend oversamples the contributing datasets and, "
+                        f"for example, requests {_size} samples from "
+                        f"{type(self.datasets[_index]).__name__} number {i} in excess of its size "
+                        f"{len(self.datasets[_index])}. The current value of the config attribute "
+                        f"mid_level_dataset_surplus may be increased, e.g. two- or ten-fold, from "
+                        f"its current value ({self.config.mid_level_dataset_surplus}) to ensure a "
+                        f"sufficient mid-level dataset sample margin from which to draw."
+                    )
+
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
                 # Write the description
@@ -168,7 +179,7 @@ class BlendedDataset(torch.utils.data.Dataset):
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    f"Unable to save the {type(self).__name__} indexes because path_to_cache is None",
+                    f"Cannot save the {type(self).__name__} indexes because path_to_cache is None",
                 )
 
             t_end = time.time()
@@ -182,7 +193,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
-        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode='r')
+        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -193,7 +204,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         )
         t_beg = time.time()
         dataset_sample_index = numpy.load(
-            path_to_dataset_sample_index, allow_pickle=True, mmap_mode='r'
+            path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
         )
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")

@@ -3,14 +3,16 @@
 """GPT-2 model."""
 
 import torch
+from typing import Optional
 
 from megatron.training import get_args
 from megatron.core import tensor_parallel
-from .module import MegatronModule
+from megatron.core.utils import deprecate_inference_params
 
 from .enums import AttnMaskType
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
+from .module import MegatronModule
 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
@@ -77,7 +79,9 @@ class GPTModel(MegatronModule):
                 retriever_input_ids=None,
                 retriever_position_ids=None,
                 retriever_attn_mask=None,
-                labels=None, tokentype_ids=None, inference_params=None):
+                labels=None, tokentype_ids=None, inference_context=None, *, inference_params=None):
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         lm_output = self.language_model(
             input_ids,
@@ -86,7 +90,7 @@ class GPTModel(MegatronModule):
             retriever_input_ids=retriever_input_ids,
             retriever_position_ids=retriever_position_ids,
             retriever_attn_mask=retriever_attn_mask,
-            inference_params=inference_params)
+            inference_context=inference_context)
 
         if self.post_process:
             return post_language_model_processing(

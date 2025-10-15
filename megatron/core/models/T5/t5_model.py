@@ -5,18 +5,23 @@ from typing import List, Literal, Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params, get_tensor_model_parallel_group_if_none
 
 
 class T5LMHead(MegatronModule):
@@ -38,6 +43,7 @@ class T5LMHead(MegatronModule):
         vocab_size: int,
         pre_process: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(T5LMHead, self).__init__(config=config)
 
@@ -55,6 +61,7 @@ class T5LMHead(MegatronModule):
             skip_bias_add=not share_embeddings_and_output_weights,
             gather_output=not self.parallel_output,
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+            tp_group=tp_group,
         )
 
     def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
@@ -135,11 +142,16 @@ class T5Model(LanguageModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal[
+            'learned_absolute', 'rope', 'relative'
+        ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
+        relative_attention_num_buckets: int = 32,
+        relative_attention_max_distance: int = 128,
         add_encoder: bool = True,
         add_decoder: bool = True,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
 
         super(T5Model, self).__init__(config=config)
@@ -159,8 +171,13 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            )
+        self.tp_group = get_tensor_model_parallel_group_if_none(model_comm_pgs.tp)
 
-        self.model_type = ModelType.encoder_and_decoder
+        self.model_type = ModelType.encoder_or_decoder
 
         # Tells schedules.py that this model has a skip connection
         # between the encoder's output and the decoder
@@ -177,6 +194,7 @@ class T5Model(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=self.position_embedding_type,
+                tp_group=self.tp_group,
             )
             if position_embedding_type == "learned_absolute":
                 self.position_embeddings = self.embedding.position_embeddings
@@ -191,6 +209,24 @@ class T5Model(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=model_comm_pgs.cp,
+            )
+
+        # Relative Position Embeddings
+        if self.position_embedding_type == 'relative':
+            self.encoder_relative_pos_emb = RelativePositionEmbedding(
+                bidirectional=True,
+                init_method=self.config.init_method,
+                num_attention_heads=self.config.num_attention_heads,
+                relative_attention_num_buckets=relative_attention_num_buckets,
+                relative_attention_max_distance=relative_attention_max_distance,
+            )
+            self.decoder_relative_pos_emb = RelativePositionEmbedding(
+                bidirectional=False,
+                init_method=self.config.init_method,
+                num_attention_heads=self.config.num_attention_heads,
+                relative_attention_num_buckets=relative_attention_num_buckets,
+                relative_attention_max_distance=relative_attention_max_distance,
             )
 
         # Transformer encoder
@@ -204,6 +240,7 @@ class T5Model(LanguageModule):
                 spec=encoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                model_comm_pgs=model_comm_pgs,
             )
         else:
             self.encoder = None
@@ -215,6 +252,7 @@ class T5Model(LanguageModule):
                 spec=decoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                model_comm_pgs=model_comm_pgs,
             )
         else:
             self.decoder = None
@@ -227,6 +265,7 @@ class T5Model(LanguageModule):
                 self.vocab_size,
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
+                tp_group=self.tp_group,
             )
             self.output_layer = self.lm_head.output_layer
 
@@ -243,8 +282,10 @@ class T5Model(LanguageModule):
         lm_labels: Tensor = None,
         encoder_hidden_states: Tensor = None,
         output_encoder_hidden_only: bool = False,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -255,11 +296,13 @@ class T5Model(LanguageModule):
             decoder_attn_mask (Tensor): self-attention mask for decoder
             encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
             lm_labels (Tensor): labels for decoder output
-            inference_params (InferenceParams): relevant arguments for inferencing
+            inference_context (BaseInferenceContext): relevant arguments for inferencing
 
         Returns:
             Tensor: loss tensor
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ## Encoder forward
         if encoder_hidden_states is None:
@@ -280,17 +323,41 @@ class T5Model(LanguageModule):
             rotary_pos_emb = None
             if self.position_embedding_type == 'rope':
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_params, self.encoder, encoder_input, self.config, packed_seq_params
+                    inference_context, self.encoder, encoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+            # Relative positional embeddings
+            encoder_attention_bias_parallel = None
+            if self.position_embedding_type == 'relative':
+                query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
+                    inference_context, self.encoder, encoder_input, self.config
+                )
+                key_seq_length = query_seq_length
+                attention_bias = self.encoder_relative_pos_emb(query_seq_length, key_seq_length)
+
+                # Scatter attention_bias to TP ranks
+                # First, reshape [1, num_head, seqlen_q, seqlen_kv] to
+                # [1, seqlen_q, seqlen_kv, num_head] to be scatter along
+                # the last (num_heads dimension)
+                attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
+                # Then, scatter to TP region
+                attention_bias_parallel = scatter_to_tensor_model_parallel_region(
+                    attention_bias, self.tp_group
+                )
+                # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
+                encoder_attention_bias_parallel = torch.permute(
+                    attention_bias_parallel, (0, 3, 1, 2)
+                )
 
             # Run encoder.
             if self.add_encoder:
                 encoder_hidden_states = self.encoder(
                     hidden_states=encoder_input,
                     attention_mask=encoder_attn_mask,
-                    inference_params=inference_params,
+                    inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=encoder_attention_bias_parallel,
                 )
             else:
                 encoder_hidden_states = self.encoder_hidden_state
@@ -315,9 +382,30 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.encoder, encoder_input, self.config, packed_seq_params
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Relative positional embeddings
+        decoder_attention_bias_parallel = None
+        if self.position_embedding_type == 'relative':
+            query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
+                inference_context, self.decoder, decoder_input, self.config
+            )
+            key_seq_length = query_seq_length
+            attention_bias = self.decoder_relative_pos_emb(query_seq_length, key_seq_length)
+
+            # Scatter attention_bias to TP ranks
+            # First, reshape [1, num_head, seqlen_q, seqlen_kv] to
+            # [1, seqlen_q, seqlen_kv, num_head] to be scatter along
+            # the last (num_heads dimension)
+            attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
+            # Then, scatter to TP region
+            attention_bias_parallel = scatter_to_tensor_model_parallel_region(
+                attention_bias, self.tp_group
+            )
+            # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
+            decoder_attention_bias_parallel = torch.permute(attention_bias_parallel, (0, 3, 1, 2))
 
         # Run decoder.
         decoder_hidden_states = self.decoder(
@@ -325,14 +413,17 @@ class T5Model(LanguageModule):
             attention_mask=decoder_attn_mask,
             context=encoder_hidden_states,
             context_mask=encoder_decoder_attn_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            attention_bias=decoder_attention_bias_parallel,
         )
 
         if self.post_process:
-            lm_logits = self.lm_head(
-                decoder_hidden_states, self.shared_embedding_or_output_weight()
-            )
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+            lm_logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
+
             if lm_labels is None:
                 # [s b h] => [b s h]
                 return lm_logits.transpose(0, 1).contiguous()
@@ -403,11 +494,6 @@ class T5Model(LanguageModule):
             ShardedStateDict: sharded state dict for the T5Model
         """
         sharded_sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        if not parallel_state.is_inside_encoder():
-            for k, sh_ten in sharded_sd.items():
-                if not k.startswith(f'{prefix}decoder'):
-                    # Bump replica_id of all the layers shared with the encoder (output, embedding)
-                    sh_ten.replica_id = (sh_ten.replica_id[0] + 1, *sh_ten.replica_id[1:])
         return sharded_sd
 
 

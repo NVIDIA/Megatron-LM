@@ -34,8 +34,8 @@ MODEL_ARGS:
   --tokenizer-type: BertWordPieceCase
   --calculate-per-token-loss: true
   --split: 99982,9,9
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --log-params-norm: true
   --log-num-zeros-in-grad: true
@@ -50,4 +50,5 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --deterministic-mode: true
   --ckpt-format: torch
+  --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

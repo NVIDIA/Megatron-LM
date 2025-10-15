@@ -62,7 +62,7 @@ OPTIONS=" \
     --exit-duration-in-mins 230 \
     --disable-bias-linear \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model ${WORKSPACE}/<path to tokenizer model> \
+    --tokenizer-model Qwen/Qwen2-72B-Instruct \
     --tokenizer-prompt-format qwen2p0 \
     --transformer-impl transformer_engine \
     --normalization RMSNorm \

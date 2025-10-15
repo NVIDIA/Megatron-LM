@@ -1,33 +1,36 @@
 CI:
-- .gitlab-ci.yml
-- Dockerfile.ci.lts
-- Dockerfile.ci.dev
-- .github/**
-- .gitlab/**
+  - .gitlab-ci.yml
+  - Dockerfile.ci.lts
+  - Dockerfile.ci.dev
+  - .github/**
+  - .gitlab/**
 
 Datasets:
-- megatron/core/datasets/**
+  - megatron/core/datasets/**
 
 BERT:
-- megatron/core/models/bert/**
+  - megatron/core/models/bert/**
 
 GPT:
-- megatron/core/models/gpt/**
+  - megatron/core/models/gpt/**
 
 RETRO:
-- megatron/core/models/retro/**
+  - megatron/core/models/retro/**
 
 Dist-Ckpt:
-- megatron/core/dist_checkpointing
+  - megatron/core/dist_checkpointing
 
 Dist-Opt:
-- megatron/core/optimizer/distrib_optimizer 
+  - megatron/core/optimizer/distrib_optimizer
 
 Inference:
-- megatron/core/inference
+  - megatron/core/inference
 
 MoE:
-- megatron/core/transformer/moe
+  - megatron/core/transformer/moe
 
 Tests:
-- tests/**
+  - tests/**
+
+ParallelState:
+  - megatron/core/parallel_state.py

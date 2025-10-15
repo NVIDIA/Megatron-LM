@@ -4,7 +4,7 @@ import hashlib
 import json
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import numpy
 import torch
@@ -26,7 +26,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
 
         indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The minimum number of samples to build from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The minimum number of samples to build from the indexed
+            dataset. When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indices Split
 
@@ -62,10 +63,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
         )
         self.unique_description_hash = hashlib.md5(
-            self.unique_description.encode("utf-8")
+            self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
-
-        self.built_anew_on_cache_miss = False
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:

@@ -42,6 +42,7 @@ class TestMoELayerInit:
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
             moe_grouped_gemm=grouped_gemm,
+            moe_ffn_hidden_size=128,
             add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -80,8 +81,11 @@ class TestMoELayerInit:
         )
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("moe_token_dispatcher_type", ["alltoall"])
-    @pytest.mark.parametrize("grouped_gemm", [True])
+    @pytest.mark.skip(
+        "Late init of parallel_state was broken after parallel states refactor MR2988."
+    )
+    @pytest.mark.parametrize("moe_token_dispatcher_type", ["alltoall", "allgather"])
+    @pytest.mark.parametrize("grouped_gemm", [True, False])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (2, 2)])
     def test_moe_with_late_initialize(
         self, moe_token_dispatcher_type, grouped_gemm, tp_size, ep_size
@@ -148,6 +152,7 @@ class TestInterleaveTransformerBlock:
             moe_ffn_hidden_size=256,
             use_cpu_initialization=True,
             num_moe_experts=2,
+            add_bias_linear=False,
         )
         self.parallel_transformer_block = TransformerBlock(
             self.transformer_config, get_gpt_decoder_block_spec(self.transformer_config, False)

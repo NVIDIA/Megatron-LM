@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from functools import partial
+from typing import List, Dict
 
 # Add megatron to the path.
 sys.path.append(
@@ -14,7 +15,7 @@ sys.path.append(
 import torch
 import yaml
 from config import EvaluationConfig
-from evaluation_datasets import get_evaluation_dataset
+from evaluation.evaluation_datasets import get_evaluation_dataset
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
@@ -24,10 +25,30 @@ from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
-from megatron.inference.text_generation.communication import broadcast_int_list
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.engines import StaticInferenceEngine
+from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
+from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
+    VLMTextGenerationController,
+)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+
+
+def is_first_rank():
+    """First tensor and pipeline parallel rank."""
+    return (
+        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    )
 
 
 def add_text_generation_args(parser):
@@ -56,10 +77,19 @@ def add_text_generation_args(parser):
             "VQAv2",
             "ChartQA",
             "MMMU",
-            "VideoMME",
             "OCRBench",
+            "OCRBench_v2",
             "MathVista",
             "AI2D",
+            "InfoVQA",
+            "SPDocVQA",
+            "RD_TableBench",
+            "VideoMME",
+            "PerceptionTest",
+            "MotionBench",
+            "PhysGameBench",
+            "MVBench",
+            "inference",
         ],
         help="Generation task to run",
     )
@@ -89,6 +119,7 @@ def get_evaluation_dataloader(
     num_frames,
     num_workers,
     vision_model_type,
+    split="validation"
 ):
     """Build evaluation dataset."""
     dataset = get_evaluation_dataset(
@@ -105,6 +136,7 @@ def get_evaluation_dataloader(
         partition_id,
         num_frames,
         vision_model_type,
+        split=split
     )
 
     dp_rank = parallel_state.get_data_parallel_rank()
@@ -140,6 +172,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.num_frames,
         args.num_workers,
         args.vision_model_type,
+        config.split
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
@@ -151,29 +184,77 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         1,
         args.pixel_shuffle,
         args.use_tile_tags,
+        args.max_num_tiles,
+        args.tokenizer_prompt_format,
     )
+
+    if args.use_mcore_inference:
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=args.hidden_size,
+            inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
+            fp32_residual_connection=args.fp32_residual_connection,
+            params_dtype=args.params_dtype,
+            padded_vocab_size=args.padded_vocab_size,
+        )
+        inference_wrapped_model = VLMInferenceWrapper(model, inference_wrapper_config)
+        tokenizer = get_tokenizer()
+        controller = VLMTextGenerationController(
+            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+        )
+        inference_engine = StaticInferenceEngine(
+            controller, max_batch_size=1, random_seed=args.seed
+        )
+        sampling_params = SamplingParams(
+            temperature=config.temperature,
+            top_k=config.top_k,
+            top_p=config.top_p,
+            num_tokens_to_generate=config.out_seq_length,
+        )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
         imgs = imgs.to("cuda")
         num_tiles = num_tiles.to("cuda")
 
-        conv = get_conversation(config.task, question)
+        conv = get_conversation(config.task, question, metadata)
 
-        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+        if not args.use_mcore_inference:
+            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
+        inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
         if is_first_rank():
-            resp_sentences, _, _, _ = generate_and_post_process(
-                model,
-                forward_step=forward_step,
-                prompts=[conv],
-                tokens_to_generate=config.out_seq_length,
-                top_k_sampling=config.top_k,
-                top_p_sampling=config.top_p,
-                add_BOS=False,
-                temperature=config.temperature,
-                random_seed=args.seed,
-                detokenize_segments=False,
-                data_parallel=True,
+
+            if args.use_mcore_inference:
+                inference_request = VLMInferenceRequest(
+                   request_id=inference_engine.get_new_request_id(),
+                   prompt=conv,
+                   prompt_tokens=controller.tokenize_prompt(conv),
+                   sampling_params=sampling_params,
+                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                   imgs=imgs,
+                   num_tiles=num_tiles,
+                   decoder_seq_length=args.decoder_seq_length,
+                )
+                results: List[InferenceRequest] = inference_engine.generate(
+                    inference_requests=[inference_request]
+                )
+
+                resp_sentences = [
+                    tokenizer.detokenize(result.prompt_tokens) + result.generated_text
+                    for result in results
+                ]
+            else:
+                resp_sentences, _, _, _ = generate_and_post_process(
+                    model, inference_context,
+                    forward_step=forward_step,
+                    prompts=[conv],
+                    tokens_to_generate=config.out_seq_length,
+                    top_k_sampling=config.top_k,
+                    top_p_sampling=config.top_p,
+                    add_BOS=False,
+                    temperature=config.temperature,
+                    random_seed=args.seed,
+                    detokenize_segments=False,
+                    data_parallel=True,
             )
 
             for generation in resp_sentences:
@@ -192,6 +273,13 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "OCRBench",
                     "MathVista",
                     "AI2D",
+                    "RealworldQA",
+                    "MotionBench",
+                    "PhysGameBench",
+                    "MVBench",
+                    "InfoVQA",
+                    "SPDocVQA",
+                    "inference",
                 ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
@@ -199,6 +287,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 elif config.task == "VideoMME":
                     output_name = "response"
                     output = question
+                elif config.task in ["OCRBench_v2", "RD_TableBench"]:
+                    output_name = "predict"
                 else:
                     raise NotImplementedError("no output name defined for", config.task)
 
@@ -211,15 +301,24 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     output["prompt"] = prompt
                     output[output_name] = generated
 
-                if config.task == "captioning":
+                if config.task in ["captioning", "RD_TableBench"]:
                     output["ground_truth"] = answers
                 elif config.task in (
                     "TextVQA",
                     "VQAv2",
                     "ChartQA",
                     "OCRBench",
+                    "OCRBench_v2",
                     "MathVista",
                     "AI2D",
+                    "PerceptionTest",
+                    "RealworldQA",
+                    "MotionBench",
+                    "PhysGameBench",
+                    "MVBench",
+                    "InfoVQA",
+                    "SPDocVQA",
+                    "inference",
                 ):
                     if isinstance(answers, str):
                         answers = [answers]
@@ -230,6 +329,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 elif config.task == "MMMU":
                     output["prediction"] = generated
                     output.update(metadata)
+                elif config.task == "VideoMME":
+                    pass
                 else:
                     raise NotImplementedError("no output processing defined for", config.task)
 
@@ -239,22 +340,48 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 yield output
                 idx += 1
         else:
-            generate_and_post_process(
-                model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
-            )
+            if args.use_mcore_inference:
+                inference_request = VLMInferenceRequest(
+                   request_id=inference_engine.get_new_request_id(),
+                   prompt=conv,
+                   prompt_tokens=controller.tokenize_prompt(conv),
+                   sampling_params=sampling_params,
+                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                   imgs=imgs,
+                   num_tiles=num_tiles,
+                   decoder_seq_length=args.decoder_seq_length,
+                )
+                inference_engine.generate(
+                    inference_requests=[inference_request]
+                )
+            else:
+                generate_and_post_process(
+                    model, inference_context, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+                )
 
             idx += 1
 
 
-def get_evaluation_config():
-    """Get evaluation config from a config file or command-line arguments."""
-    args = get_args()
-    if args.config_path:
-        with open(args.config_path, "r") as f:
-            config_dict = yaml.safe_load(f)
+def get_evaluation_configs(config_path=None) -> Dict[str, EvaluationConfig]:
+    """Get evaluation config(s) from a config file or command-line arguments.
 
-        config = EvaluationConfig(**config_dict)
-    else:
+    Args:
+        config_path: Optional path to config file. If not provided, will check args.config_path
+                    or fall back to command-line arguments.
+
+    Returns:
+        Dict[str, EvaluationConfig]: dict of configs.
+    """
+    args = get_args()
+    configs = {}
+
+    # Use provided config_path or fall back to args.config_path
+    config_file = config_path or args.config_path
+
+    # We check if we're trying to run a single config evals by checking for the task and output_path
+    # args.
+    if hasattr(args, "task") and args.task and hasattr(args, "output_path") and args.output_path:
+        # Single config from args
         config = EvaluationConfig(
             task=args.task,
             temperature=args.temperature,
@@ -268,28 +395,45 @@ def get_evaluation_config():
             partition_id=args.partition_id,
             num_samples_per_partition=args.num_samples_per_partition,
         )
-
-    # Default output path if not defined...
-    if not config.output_path:
-        os.makedirs("generated", exist_ok=True)
-        config.output_path = "generated/" + args.language_model_type
-
-    return config
-
-
-def is_first_rank():
-    """First tensor and pipeline parallel rank."""
-    return (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-        and parallel_state.get_tensor_model_parallel_rank() == 0
-    )
+        if not config.output_path:
+            default_output_dir = args.output_path if args.output_path else "generated"
+            os.makedirs(default_output_dir, exist_ok=True)
+            config.output_path = os.path.join(default_output_dir, args.language_model_type)
+        return {args.task: config}
+    elif config_file:
+        with open(config_file, "r") as f:
+            config_data = yaml.safe_load(f)
+        if 'datasets' not in config_data:
+            print("Error: 'datasets' key not found in config file for batch mode.")
+            sys.exit(1)
+        config_dict = config_data['datasets']
+        for key, value in config_dict.items():
+            config = EvaluationConfig(**value)
+            config.dataset = key
+            if not config.output_path:
+                # Use args.output_path if available, otherwise use "generated"
+                default_output_dir = getattr(args, 'output_path', None) or "generated"
+                os.makedirs(default_output_dir, exist_ok=True)
+                config.output_path = os.path.join(default_output_dir, f"{args.language_model_type}")
+            configs[key] = config
+        return configs
+    else:
+        raise ValueError("No config file provided and no task specified.")
 
 
 def get_output_path(config, dp_rank):
     """Generation output path."""
-    return (
-        f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
-    )
+
+    ckpt_step = None
+    try:
+        args = get_args()
+        ckpt_step = args.ckpt_step
+    except Exception as e:
+        print(f"Failed getting args: {type(e).__name__} - {e}")
+    if ckpt_step is not None:
+        return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}-step={args.ckpt_step}.jsonl"
+    else:
+        return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
 
 
 def generate_and_write_samples(model, config, print_output=True):
@@ -310,7 +454,6 @@ def generate_and_write_samples(model, config, print_output=True):
     if is_first_rank():
         output_file.close()
 
-
 class VLMForwardStep(ForwardStep):
     """Inference forward step for a multimodal model."""
 
@@ -321,28 +464,20 @@ class VLMForwardStep(ForwardStep):
         num_tiles,
         decoder_seq_length,
         model,
-        max_batch_size,
-        max_sequence_length,
+        inference_context,
     ):
         """Create multimodal forward step."""
         total_num_tiles = torch.sum(num_tiles).item()
         num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
 
-        super().__init__(model, max_batch_size, max_sequence_length + num_img_embeddings)
+        super().__init__(model, inference_context)
         self._images = images
         self._num_tiles = num_tiles
         self._num_img_embeddings = num_img_embeddings
         self.decoder_seq_length = decoder_seq_length
 
-        self._recv_only_vision_embeds = False
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
-        # In this case, the current stage should only receive vision embeddings.
-        if pp_rank > 0:
-            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
-
-        # Checks if the current stage only has a vision encoder
-        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
+        self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
+        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -350,7 +485,7 @@ class VLMForwardStep(ForwardStep):
             tokens,
             position_ids,
             attention_mask=None,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
             num_image_tiles=self._num_tiles,
             runtime_gather_output=True,
         )
@@ -385,20 +520,20 @@ class VLMForwardStep(ForwardStep):
         # On every PP stage(although inference params should only matter for decoder),
         # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
-                self.inference_params.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
+            if "image_tokens_count" not in self.inference_context.key_value_memory_dict:
+                self.inference_context.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
 
             if self._num_img_embeddings + num_tokens - num_image_tokens > self.decoder_seq_length:
-                self.inference_params.sequence_len_offset += self.decoder_seq_length - num_tokens
+                self.inference_context.sequence_len_offset += self.decoder_seq_length - num_tokens
             else:
-                self.inference_params.sequence_len_offset += (
-                    self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                self.inference_context.sequence_len_offset += (
+                    self.inference_context.key_value_memory_dict["image_tokens_count"] - num_image_tokens
                 )
 
         return logits
 
 
-def get_conversation(task, question):
+def get_conversation(task, question, metadata=None):
     """Get a conversation for a given task and evaluation question."""
     conversation = []
 
@@ -408,26 +543,37 @@ def get_conversation(task, question):
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": f"{IMAGE_TOKEN}\nProvide a one-sentence caption for provided image.",
+                "content": f"{IMAGE_TOKEN}\nGive a brief description of this image in one sentence.",
             },
         ]
-    elif task in ("TextVQA", "VQAv2", "ChartQA"):
+    elif task in ("TextVQA", "InfoVQA", "SPDocVQA"):
         conversation = [
-            {"role": "system", "content": "Answer the questions."},
+            {"role": "system", "content": "Follow the user's instruction and answer questions."},
+            {
+                "role": "user",
+                "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word, phrase, or number.",
+            },
+        ]
+    elif task == "VQAv2":
+        conversation = [
+            {"role": "system", "content": "Follow the user's instruction and answer questions."},
             {
                 "role": "user",
                 "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
             },
         ]
-    elif task in ("OCRBench", "MathVista", "AI2D"):
+    elif task == "ChartQA":
         conversation = [
-            {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+            {"role": "system", "content": "Follow the user's instruction and answer questions."},
+            {
+                "role": "user",
+                "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
+            },
         ]
     elif task == "MMMU":
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": question},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "VideoMME":
         q = (
@@ -443,15 +589,65 @@ def get_conversation(task, question):
 
         conversation = [
             {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{q}"},
+        ]
+    elif task in ("OCRBench", "OCRBench_v2", "RD_TableBench"):
+        conversation = [
+            {"role": "system", "content": "Follow the user's instruction and answer questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
+    elif task == "MathVista":
+        conversation = [
+            {"role": "system", "content": "You are math expert. Use your math knowledge to calculate the answer."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+        ]
+    elif task == "RealworldQA":
+        conversation = [
+            {"role": "system", "content": "Follow the user's instruction and answer questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+        ]
+    elif task == "AI2D":
+        conversation = [
+            {"role": "system", "content": "Follow the user's instruction and answer questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+        ]
+    elif task == "MotionBench":
+        extra_instruction = "Respond with only the letter choice (A, B, C, or D) of the correct option.\n"
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}\n{extra_instruction}"},
+        ]
+    elif task == "PhysGameBench":
+        extra_instruction = "Respond with only the letter choice (A, B, C, or D) of the correct option.\n"
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}\n{extra_instruction}"},
+        ]
+    elif task == "MVBench":
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase."},
+        ]
+    elif task in ["PerceptionTest"]:
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+        ]
+    elif task == "inference":
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{question}"},
+        ]
+    else:
+        raise NotImplementedError(f"No prompting support for task {task}")
+
 
     return conversation
 
 
 def get_prompt_and_generated(prompt_and_generation, prompt_format):
     """Strip prompt and other unnecessary text from generation."""
-    if prompt_format == "llama3":
+    if prompt_format in ("llama3", "llama3p1"):
         splitted = prompt_and_generation.split("<|start_header_id|>assistant<|end_header_id|>\n\n")
         prompt = splitted[0]
         generated = splitted[1]
@@ -471,45 +667,203 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
+    elif prompt_format in ("nemotron5"):
+        splitted = prompt_and_generation.split("<SPECIAL_14>assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<SPECIAL_15>")[0]
+    elif prompt_format in ("nemotron5-aligned"):
+        splitted = prompt_and_generation.split("Assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("[PREFIX]")[0]
+        generated = generated.split("\\n")[0]
     else:
         raise ValueError(f"Prompt format {prompt_format} is not supported.")
 
     # Remove possible garbage.
     generated = generated.strip()
-    generated = generated.split("\n\n")[0]
-    generated = generated.split("\n")[0]
 
     return prompt, generated
 
 
-def main():
-    """Vision language model text generation."""
-    initialize_megatron(extra_args_provider=add_text_generation_args)
+def run_eval(config, iteration=None):
+    # Run evaluation.
+    print(f"====== {config.task} {config.dataset} at iteration={iteration} scores ======")
 
-    if torch.distributed.get_rank() == 0:
-        logging.getLogger(__name__).warning(
-            "Models using pipeline parallelism are not supported yet."
-        )
+    if config.task == "TextVQA":
+        from evaluation.evaluate_textvqa import textvqa_eval
+        avg_acc = textvqa_eval(config.output_path)
+
+        score = {"TextVQA accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} TextVQA accuracy: {score}\n")
+
+    elif config.task == "OCRBench":
+        from evaluation.evaluate_ocrbench import ocrbench_eval
+        log, avg_acc = ocrbench_eval(config.output_path)
+
+        score = {"OCRBench accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} OCRBench accuracy: {score}\n")
+            f.write(f"{log}\n")
+
+    elif config.task == "MathVista":
+        from evaluation.evaluate_mathvista import mathvista_eval
+        avg_acc = mathvista_eval(config.output_path)
+
+        score = {"MathVista accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} MathVista accuracy: {score}\n")
+
+    elif config.task == "ChartQA":
+        from evaluation.evaluate_chartqa import chartqa_eval
+        avg_acc = chartqa_eval(config.output_path)
+
+        score = {"ChartQA accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} ChartQA accuracy: {score}\n")
+
+    elif config.task == "SPDocVQA":
+        from evaluation.evaluate_spdocvqa import spdocvqa_eval
+        avg_acc = spdocvqa_eval(config.output_path)
+
+        score = {"SPDocVQA accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} SPDocVQA accuracy: {score}\n")
+
+    elif config.task == "RealworldQA":
+        from evaluation.evaluate_realworldqa import realworldqa_eval
+        avg_acc = realworldqa_eval(config.output_path)
+
+        score = {"RealworldQA accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} RealworldQA accuracy: {score}\n")
+
+    elif config.task == "AI2D":
+        from evaluation.evaluate_ai2d import ai2d_eval
+        avg_acc = ai2d_eval(config.output_path)
+
+        score = {f"AI2D {config.dataset} accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} at iteration={iteration} AI2D accuracy: {score}\n")
+
+    elif config.task == "MMMU":
+        from evaluation.evaluate_mmmu import convert_to_mmmu_format
+        from examples.multimodal.evaluation.mmmu_utils import mmmu_main_eval
+        result_file = convert_to_mmmu_format(config.output_path)
+        result = json.load(open(result_file))
+        mmmu_results = mmmu_main_eval(result, {"answer_dict": config.gt_path})
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.split} at iteration={iteration} :\n")
+            for cat, cat_val in mmmu_results.items():
+                if 'Overall' in cat:
+                    cat = cat.replace("Overall-", "")
+                    print(f'{cat}: {cat_val["acc"] * 100:.2f}')
+                    f.write(f'{cat}: {cat_val["acc"] * 100:.2f}\n')
+
+        score = {"MMMU val accuracy": mmmu_results['Overall']['acc']}
+    elif config.task == 'captioning':
+        from evaluation.evaluate_coco import coco_captioning_eval
+        cider_score = coco_captioning_eval(config.output_path, config.gt_path)
+        score = {f"{config.task} {config.dataset} CIDEr": cider_score}
+
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} CIDEr scores at iteration={iteration}: {cider_score}\n")
+    elif config.task == 'MotionBench':
+        from evaluation.evaluate_video_motionbench import motionbench_eval
+        avg_acc = motionbench_eval(config.output_path)
+
+        score = {f"MotionBench accuracy": avg_acc}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {score}\n")
+    elif config.task == 'PhysGameBench':
+        from evaluation.evaluate_video_phys_game_bench import phys_game_bench_eval
+        avg_acc_dict = phys_game_bench_eval(config.output_path)
+
+        score = {f"PhysGame Total accuracy": avg_acc_dict['Physgame-Total-Acc']}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+    elif config.task == "MVBench":
+        from evaluation.evaluate_video_mvbench import mvbench_eval
+        avg_acc_dict = mvbench_eval(config.output_path)
+
+        score = {f"MVBench accuracy": avg_acc_dict['total-acc']}
+        with open(config.output_path + "-scores.txt", "a") as f:
+            f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+    elif config.task == "inference":
+        score = {"Inference accuracy:": None}
+        pass
+    else:
+        raise NotImplementedError(f"Evaluation of {config.task} not implemented yet")
+
+    print(score)
+    return score
+
+
+def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
+    """
+    Common evaluation loop used by both online evaluation during training and standalone evaluation.
+
+    Args:
+        model: The model to evaluate
+        configs: Dict[str, EvaluationConfig] - dictionary of evaluation configs
+        output_dir_override: Optional directory to override the output path in configs
+        iteration: Optional iteration number for logging
+        print_output: Whether to print generation output
+
+    Returns:
+        Dict[str, float]: Dictionary of evaluation scores
+    """
+    args = get_args()
+    scores = {}
+
+    for key, config in configs.items():
+        # Handle output path override for online evaluation
+        if output_dir_override:
+            config.output_path = os.path.join(output_dir_override, args.language_model_type)
+
+        # Generate samples and write to file
+        generate_and_write_samples(model, config, print_output=print_output)
+
+        # Synchronize before evaluation
+        torch.distributed.barrier()
+
+        # Run evaluation on the last rank
+        if is_last_rank():
+            task_scores = run_eval(config, iteration=iteration)
+            scores.update(task_scores)
+
+        # Synchronize after evaluation
+        torch.distributed.barrier()
+
+    return scores
+
+
+def eval_tasks():
+    """Vision language model text generation for single or batch tasks."""
+    initialize_megatron(extra_args_provider=add_text_generation_args)
 
     args = get_args()
 
-    def wrapped_model_provider(pre_process, post_process, add_encoder, add_decoder):
-        return model_provider(pre_process, post_process, add_encoder, add_decoder, parallel_output=False)
+    def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
+        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
+                              parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
 
     model = model[0]
-
     model.eval()
 
-    config = get_evaluation_config()
+    configs = get_evaluation_configs()
 
-    generate_and_write_samples(model, config)
+    # Use the common evaluation loop
+    run_evaluation_loop(model, configs, iteration=args.ckpt_step)
 
 
 if __name__ == "__main__":
-    main()
+    eval_tasks()

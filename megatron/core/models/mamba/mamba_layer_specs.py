@@ -9,6 +9,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -52,7 +53,7 @@ mamba_stack_spec = ModuleSpec(
         # Using the TE spec because we had problems getting the non-TE spec
         # working
         mlp_layer=ModuleSpec(
-            module=TransformerLayer,
+            module=MLPLayer,
             submodules=TransformerLayerSubmodules(
                 mlp=ModuleSpec(
                     module=MLP,

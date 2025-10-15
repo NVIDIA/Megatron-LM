@@ -1,0 +1,142 @@
+.integration_tests_rules:
+  stage: integration_tests
+  rules:
+    - if: $INTEGRATION_TEST == "yes"
+      when: on_success
+    - when: never
+
+default:
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: https://stg.vault.nvidia.com
+
+include:
+  - project: dl/jet/gitlab-templates
+    ref: main
+    file: downstreams.yml
+
+integration:configure:
+  needs:
+    - test:build_image
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
+      optional: true
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
+      optional: true
+    - job: test:build_nemo_image
+  extends: [.integration_tests_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  before_script:
+    - git rm -r tests/test_utils/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+    - ls tests/test_utils/local_recipes
+  script:
+    - set -x
+    - |
+      A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+      H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+    - |
+      ARGS=(
+        "--scope $INTEGRATION_TEST_SCOPE"
+        "--n-repeat 1"
+        "--time-limit $INTEGRATION_TEST_TIME_LIMIT"
+        "--test-cases $INTEGRATION_TEST_CASES"
+        "--container-image ${UTILITY_IMAGE}"
+        "--container-tag ${CI_PIPELINE_ID}"
+        "--slurm-account ${CI_SLURM_ACCOUNT}"
+        "--no-enable-warmup"
+        "--dependent-job integration:configure"
+        "--enable-lightweight-mode"
+      )
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-dev-A100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-dev-H100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-lts-A100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-lts-H100.yaml"
+  artifacts:
+    paths:
+      - functional-test-job-lts-A100.yaml
+      - functional-test-job-lts-H100.yaml
+      - functional-test-job-dev-H100.yaml
+      - functional-test-job-dev-A100.yaml
+      - tests/test_utils/local_recipes
+
+.integration_run:
+  needs:
+    - integration:configure
+    - test:build_image
+    - wait_for_resources
+  extends: [.integration_tests_rules]
+  trigger:
+    include:
+      - artifact: functional-test-job-$ENVIRONMENT-$CLUSTER.yaml
+        job: integration:configure
+    strategy: depend
+  variables:
+    RO_API_TOKEN: $PAT
+    CONTAINER_TAG: $CI_PIPELINE_ID
+    CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
+    GITLAB_ENDPOINT: $GITLAB_ENDPOINT
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    DASHBOARD_ENDPOINT: $DASHBOARD_ENDPOINT
+    MCORE_MR_COMMIT: $MCORE_MR_COMMIT
+    MCORE_BACKWARDS_COMMIT: $MCORE_BACKWARDS_COMMIT
+  inherit:
+    variables: true
+
+integration:run_lts_dgx_a100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: A100
+
+integration:run_lts_dgx_h100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: H100
+
+integration:run_dev_dgx_a100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: A100
+
+integration:run_dev_dgx_h100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: H100
