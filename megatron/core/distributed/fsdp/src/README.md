@@ -166,7 +166,10 @@ torch.distributed.checkpoint.save({"model": model.state_dict(), "optimizer": opt
 # Load model and optimizer state.
 ckpt_state_dict = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
 torch.distributed.checkpoint.load(state_dict=ckpt_state_dict, checkpoint_id=str(CKPT_DIR))
-model.load_state_dict(ckpt_state_dict["model"])
+# model.load_state_dict(strict=False) is only necessary to ignore TE FP8 extra state
+# that is missing from the DCP checkpoint but present in TEBaseModule.
+# Megatron-FSDP does not support TE FP8 extra state checkpointing with DCP.
+model.load_state_dict(ckpt_state_dict["model"], strict=False)
 optimizer.load_state_dict(ckpt_state_dict["optimizer"])
 ```
 
