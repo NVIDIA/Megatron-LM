@@ -1,5 +1,6 @@
 import copy
 import itertools
+import logging
 import pathlib
 from typing import List, Optional
 
@@ -7,6 +8,8 @@ import click
 import yaml
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+
+logger = logging.getLogger(__name__)
 
 
 class dotdict(dict):
@@ -100,11 +103,11 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
     )
 
     if len(workload_manifests) > 1:
-        print("Duplicate test_case found!")
+        logger.info("Duplicate test_case found!")
         return None
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return None
 
     return workload_manifests[0]
@@ -119,7 +122,7 @@ def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdi
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -137,7 +140,7 @@ def filter_by_environment(workload_manifests: List[dotdict], environment: str) -
     )
 
     if len(workload_manifests_copy) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests_copy
@@ -154,7 +157,7 @@ def filter_by_platform(workload_manifests: List[dotdict], platform: str) -> List
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -169,7 +172,7 @@ def filter_by_model(workload_manifests: List[dotdict], model: str) -> List[dotdi
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -185,7 +188,7 @@ def filter_by_tag(workload_manifests: List[dotdict], tag: str) -> List[dotdict]:
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -201,7 +204,7 @@ def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> 
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests

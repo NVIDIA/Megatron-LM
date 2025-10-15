@@ -31,8 +31,8 @@ def main(scope, model, test_case, environment, platform):
 
     workload = workloads[0]
     magic_values = dict(workload.spec)
-    magic_values["assets_dir"] = "$OUTPUT_PATH"
-    magic_values["artifacts_dir"] = "$OUTPUT_PATH"
+    magic_values["assets_dir"] = "/opt/megatron-lm/assets_dir"
+    magic_values["artifacts_dir"] = "/opt/megatron-lm/artifacts_dir"
     magic_values["environment"] = environment
     magic_values["test_case"] = workload.spec["test_case"]
     magic_values["name"] = workload.spec["name"].format(**magic_values)
@@ -47,7 +47,6 @@ def main(scope, model, test_case, environment, platform):
         for mount_path, host_path in workload.spec["artifacts"].items()
     ]
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
-    print(artifacts)
 
     executor = run.DockerExecutor(
         container_image="megatron-core",
@@ -63,7 +62,9 @@ def main(scope, model, test_case, environment, platform):
         packager=run.Packager(),
         volumes=artifacts,
     )
-    with run.Experiment("docker-experiment", executor=executor, log_level="INFO") as exp:
+    with run.Experiment(
+        "mcore-ci-test", executor=executor, log_level="INFO"
+    ) as exp:
         _ = exp.add([inline_script], tail_logs=False, name="task-1")
 
         exp.run(detach=False, tail_logs=True, sequential=False)

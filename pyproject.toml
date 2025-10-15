@@ -176,6 +176,7 @@ causal-conv1d = [
     { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "9d700d167c4ad299b0a5265ed1bdb4ee4a0ca111" },
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.8" } # on `release_v2.7
+nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "8ca8f7952a597f944985f1f1368a7acb9aa3a6c2" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
