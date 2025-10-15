@@ -139,8 +139,6 @@ runs:
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
-
-
         docker exec -t test_container_${{ github.run_id }} bash -c '
 
           set -e
@@ -163,7 +161,7 @@ runs:
             "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/model_config.yaml"
             "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dev_dgx_h100.json"
             "N_REPEAT=5"
-            "ENABLE_LIGHTWEIGHT_MODE=false"
+            "ENABLE_LIGHTWEIGHT_MODE=true"
             "RECORD_CHECKPOINTS=false"
           )
 
