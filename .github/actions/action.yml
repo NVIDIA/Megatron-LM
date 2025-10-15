@@ -179,7 +179,7 @@ runs:
         GH_TOKEN: ${{ inputs.PAT }}
       run: |
         echo "::group::Build test container"
-        docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.06-py3" --target=main -t megatron-core .
+        docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.09-py3" --target=main -t megatron-core .
         echo "::endgroup::"
 
     - name: Start container
