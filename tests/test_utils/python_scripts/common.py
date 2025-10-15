@@ -2,6 +2,7 @@ import copy
 import itertools
 import pathlib
 from typing import List, Optional
+import click 
 
 import yaml
 
@@ -95,7 +96,7 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if workload_manifest.spec["test_case"] == test_case
+        if workload_manifest["spec"]["test_case"] == test_case
     )
 
     if len(workload_manifests) > 1:
@@ -288,9 +289,16 @@ def load_workloads(
     return workloads
 
 
-if __name__ == "__main__":
-    workflows = load_workloads(container_tag="main")
+@click.command()
+@click.option("--model", required=False, type=str, default=None, help="Model to select")
+@click.option("--test-case", required=False, type=str, default=None, help="Test case to select")
+def main(model: Optional[str], test_case: Optional[str]):
+    workflows = load_workloads(container_tag="main", model=model, test_case=test_case)
     # Save workflows to YAML file
     output_file = "workflows.yaml"
     with open(output_file, "w") as f:
         yaml.dump([dict(workflow) for workflow in workflows], f)
+
+
+if __name__ == "__main__":
+    main()
