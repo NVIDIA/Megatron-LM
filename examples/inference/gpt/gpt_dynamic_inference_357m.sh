@@ -94,10 +94,8 @@ else
 fi
 
 # Command.
-# >>>
-# CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
-CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
-# <<<
+CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
+# CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
 if [[ -v NSIGHT_PREFIX ]]; then
     CMD="nsys profile -s none -t nvtx,cuda --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
 fi
