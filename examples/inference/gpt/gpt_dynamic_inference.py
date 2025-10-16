@@ -456,10 +456,14 @@ def main():
             # ---- Print each unique output ----
             for output_text, output_request_idxs in output_map.items():
                 if output_text is not None:
-                    o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                    # Use hash of prompt + generated text in case engine was
+                    # suspended and resumed, which misaligns boundary between
+                    # prompt and generated tokens.
+                    o_hash = hashlib.sha256(
+                        (prompt_text + output_text).encode()
+                    ).hexdigest()[:6]
                     o_len = len(requests[output_request_idxs[0]].output_tokens)
                     escaped_output_text = escape_str(output_text)
-                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
                 else:
                     o_hash = "--"
                     o_len = 0
