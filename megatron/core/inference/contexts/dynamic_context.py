@@ -1289,7 +1289,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
             if self.mamba_state_free_slot_count == 0:
-                raise ContextOverflowError(request_id)
+                raise ContextOverflowError(req.request_id)
             self.mamba_state_free_slot_count -= 1
             mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
             self.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
