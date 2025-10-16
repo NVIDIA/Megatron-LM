@@ -11,6 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 
+
 class HybridCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.

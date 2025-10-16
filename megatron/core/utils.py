@@ -1856,10 +1856,14 @@ def get_batch_on_this_cp_rank(
 
 
 def get_thd_batch_on_this_cp_rank(
-    batch: Dict[str, Any], cu_seqlens: torch.Tensor, max_seqlen: torch.Tensor, cp_size: Optional[int] = None, cp_rank: Optional[int] = None
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
 ):
-    """Slice each sub-sample in a packed sample batch input along 
-    sequence dimension into multiple chunks, which are parallelized 
+    """Slice each sub-sample in a packed sample batch input along
+    sequence dimension into multiple chunks, which are parallelized
     across GPUs in a context parallel group.
     """
     packed_seq_params = PackedSeqParams(
@@ -1880,10 +1884,7 @@ def get_thd_batch_on_this_cp_rank(
             "Context Parallel with THD format data"
         )
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens,
-            batch['tokens'].size(1),
-            cp_size,
-            cp_rank,
+            cu_seqlens, batch['tokens'].size(1), cp_size, cp_rank
         )
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
@@ -1897,21 +1898,27 @@ def get_thd_batch_on_this_cp_rank(
 ### hybrid context parallel ###
 ################################
 
+
 def get_batch_on_this_hybrid_cp_rank(
-    batch: Dict[str, Any], local_cp_size: int, cp_group: Optional[torch.distributed.ProcessGroup] = None
+    batch: Dict[str, Any],
+    local_cp_size: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
     assert local_cp_size is not None
     if cp_group is None:
-        # Get the local cp group required for this sample as defined by the Hybrid CP dataloader wrapper
+        # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
         if local_cp_size > 1:
-            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
+                group_size=local_cp_size
+            )
     else:
-        # If cp group is provided, it must match the local cp size defined by the Hybrid CP dataloader wrapper
+        # If cp group is provided, it must match the local cp size
+        # as defined by the HybridCPDataLoaderWrapper
         assert cp_group.size() == local_cp_size
-    
+
     # Convert [seqlen] to [1, seqlen] similar to default collate_fn
     # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
     for key, data in batch.items():
@@ -1933,11 +1940,14 @@ def get_batch_on_this_hybrid_cp_rank(
     )
 
     if cp_group is not None and cp_group.size() > 1:
-        # When using hybrid_context_parallel, each sub-sample of a packed sample is 
+        # When using hybrid_context_parallel, each sub-sample of a packed sample is
         # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-        batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
+        batch = get_batch_on_this_cp_rank(
+            batch, cp_group.size(), torch.distributed.get_rank(group=cp_group)
+        )
 
     return batch, packed_seq_params
+
 
 ######################
 ### NVTX profiling ###
