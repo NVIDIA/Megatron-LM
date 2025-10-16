@@ -65,10 +65,6 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunSta
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
 
-# Use this to test suspending and resuming the engine.
-SUSPEND_RESUME_INTERVAL = int(os.getenv("SUSPEND_RESUME_INTERVAL", 999999))
-
-
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
 
@@ -82,7 +78,13 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     )
     group.add_argument(
         "--termination-id", type=int, default=None,
-        help="Termination ID that overrides `tokenizer.eod`."
+        help="Termination ID that overrides `tokenizer.eod`.",
+    )
+    group.add_argument(
+        "--suspend-resume-interval", type=int, default=None,
+        help="Suspend and resume the dynamic engine every "
+        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
+        "system.",
     )
 
     return parser
@@ -274,7 +276,11 @@ def run_inference(
         result = engine.step_modern(sampling_params, verbose=True)
 
         # Test suspending and resuming engine.
-        if engine.step_count % SUSPEND_RESUME_INTERVAL == 0:
+        if (
+            args.suspend_resume_interval is not None
+            and
+            engine.step_count % args.suspend_resume_interval == 0
+        ):
             active_token_count_0 = engine.context.active_token_count
             engine.suspend()
             engine.resume()
