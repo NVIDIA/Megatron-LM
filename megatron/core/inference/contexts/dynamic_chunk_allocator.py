@@ -25,19 +25,17 @@ class ChunkAllocator:
 
         self.context = context
 
-        active_count -= 1 # -1 for dummy_chunk_idx (see below)
-        active_count = max(1, active_count) # need at least one chunk
-        self.total_count = 2 * active_count + 1 # +1 for dummy_chunk_idx
-        self.total_avail = self.total_count - 1 # -1 for dummy_chunk_idx
+        active_count -= 1  # -1 for dummy_chunk_idx (see below)
+        active_count = max(1, active_count)  # need at least one chunk
+        self.total_count = 2 * active_count + 1  # +1 for dummy_chunk_idx
+        self.total_avail = self.total_count - 1  # -1 for dummy_chunk_idx
         self.active_count = active_count
-        self.paused_count = self.total_count - self.active_count - 1 # -1 for dummy_chunk_idx
+        self.paused_count = self.total_count - self.active_count - 1  # -1 for dummy_chunk_idx
         self.dummy_chunk_idx = self.total_count - 1
 
         # Initialize chunk pool as a "stack" data structure
         self.chunk_bag = torch.arange(
-            self.total_count,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
+            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
     def __str__(self):
@@ -48,15 +46,19 @@ class ChunkAllocator:
 
     def get_active_used(self):
         """Compute number of active chunks used."""
-        return self.context.request_kv_chunk_counts[
-            self.context.paused_request_count:self.context.total_request_count
-        ].sum().item()
+        return (
+            self.context.request_kv_chunk_counts[
+                self.context.paused_request_count : self.context.total_request_count
+            ]
+            .sum()
+            .item()
+        )
 
     def get_paused_used(self):
         """Compute number of paused chunks used."""
-        return self.context.request_kv_chunk_counts[
-            :self.context.paused_request_count
-        ].sum().item()
+        return (
+            self.context.request_kv_chunk_counts[: self.context.paused_request_count].sum().item()
+        )
 
     def get_active_avail(self):
         """Compute number of active chunks available."""
