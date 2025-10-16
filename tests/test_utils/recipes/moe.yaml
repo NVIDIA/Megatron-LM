@@ -69,8 +69,6 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
@@ -125,8 +123,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_moe_mr_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
