@@ -437,34 +437,6 @@ def main():
         text_hashes = []
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
 
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # request_idx = request_idxs[0]
-            # request = requests[request_idx]
-
-            # prompt_text_escaped = escape_str(prompt_text)
-            # num_prompt_tokens = len(requests[request_idx].prompt_tokens)
-            # if request.output_text is not None:
-            #     # Use hash of prompt + generated text in case engine was suspended
-            #     # and resumed, which misaligns boundary between prompt and
-            #     # generated tokens.
-            #     text_hash = hashlib.sha256(
-            #         (request.prompt_text + str(request.output_text)).encode()
-            #     ).hexdigest()[:6]
-            #     output_text_escaped = escape_str(request.output_text)
-            #     num_output_tokens = len(requests[request_idx].output_tokens)
-            # else:
-            #     text_hash = "--"
-            #     output_text_escaped = "--"
-            #     num_output_tokens = 0
-            # text_hashes.append(text_hash)
-
-            # print(
-            #     f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, "
-            #     f"hash {text_hash}]. "
-            #     f"[prompt, {num_prompt_tokens} tokens] {prompt_text_escaped} .... "
-            #     f"[generated, {num_output_tokens} tokens] {output_text_escaped}"
-            # )
-            # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
@@ -479,16 +451,19 @@ def main():
             # ---- Print each unique output ----
             for output_text, output_request_idxs in output_map.items():
                 if output_text is not None:
-                    o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                    # Use hash of prompt + generated text in case engine was
+                    # suspended and resumed, which misaligns boundary between
+                    # prompt and generated tokens.
+                    o_hash = hashlib.sha256(
+                        (prompt_text + output_text).encode()
+                    ).hexdigest()[:6]
                     o_len = len(requests[output_request_idxs[0]].output_tokens)
                     escaped_output_text = escape_str(output_text)
-                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
                 else:
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
