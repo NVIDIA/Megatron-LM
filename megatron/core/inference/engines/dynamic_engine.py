@@ -133,6 +133,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.termination_id = termination_id
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
+        self.enable_chunked_prefill = enable_chunked_prefill
         self.unified_memory_level = unified_memory_level
         self.capture_stats = None
 
@@ -171,7 +172,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
-        self.enable_chunked_prefill = enable_chunked_prefill
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -209,8 +209,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
             logging.info(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
-                len(context.cuda_graph_token_counts),
-                context.cuda_graph_token_counts,
+                len(self.context.cuda_graph_token_counts),
+                self.context.cuda_graph_token_counts,
             )
             for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
                 # Iterate cuda graph dims.
@@ -246,7 +246,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         tbar.set_description(tbar_str)
                     else:
                         logging.info(
-                            f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}"
+                            f"{tbar_idx}/{len(self.context.cuda_graph_token_counts)}. {tbar_str}"
                         )
 
                     # Get flat tokens, position ids.
