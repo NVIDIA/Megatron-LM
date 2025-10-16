@@ -852,13 +852,12 @@ class Attention(MegatronModule, ABC):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
 
-    def qk_clip(self):
+    def clip_qk(self):
         """
-        qk_clip is a technique to clip the query and key attention scores to prevent the attention
-        scores from exploding. Per MuonClip usage, we update the weight by calling this function
-        after Muon optimizer step. It is implemented in the subclass MLASelfAttention.
+        QK Clipping is a technique to clip the query and key attention scores to prevent the attention
+        scores from exploding.
         """
-        raise NotImplementedError("qk_clip is not implemented.")
+        raise NotImplementedError("clip_qk is not implemented.")
 
 
 class SelfAttention(Attention):

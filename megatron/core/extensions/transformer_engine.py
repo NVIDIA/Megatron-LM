@@ -986,7 +986,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if config.qk_clip:
             # TE 2.9.0 introduces return_max_score for qk-clip getting the max attention score
             extra_kwargs["return_max_score"] = True
-            self.max_attention_score = None
+            self.current_max_attn_scores = None
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
@@ -1042,39 +1042,30 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
+            
+            core_attn_out = super().forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type.name,
+                **attention_bias_kwargs,
+                **packed_seq_kwargs,
+            )
 
             # TODO: add is_te_min_version("2.9.0") before merge
             if self.config.qk_clip:
                 # Update Q K outside of TE Attention API
-
-                # Forward pass and get max attention score
-                core_attn_out, batch_max_attention_scores = super().forward(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type.name,
-                    **attention_bias_kwargs,
-                    **packed_seq_kwargs,
-                )
+                core_attn_out, batch_max_attention_scores = core_attn_out
 
                 # Update QK_Clip balancing eta
-                if self.max_attention_score is None:
-                    self.max_attention_score = batch_max_attention_scores
+                if self.current_max_attn_scores is None:
+                    self.current_max_attn_scores = batch_max_attention_scores
                 else:
-                    self.max_attention_score = torch.max(
-                        self.max_attention_score, batch_max_attention_scores
+                    self.current_max_attn_scores = torch.max(
+                        self.current_max_attn_scores, batch_max_attention_scores
                     )
-            else:
-                core_attn_out = super().forward(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type.name,
-                    **attention_bias_kwargs,
-                    **packed_seq_kwargs,
-                )
+
         else:
             core_attn_out = super().forward(
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs

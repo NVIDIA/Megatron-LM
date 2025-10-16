@@ -1278,15 +1278,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-    # get max attention score for logging and run qk_clip()
+    # get max attention score for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_score = 0
     if args.qk_clip:
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
-                if hasattr(transformer_layer.self_attention, 'qk_clip'):
+                if hasattr(transformer_layer.self_attention, 'clip_qk'):
                     log_max_attention_score = max(log_max_attention_score, torch.max(transformer_layer.self_attention.core_attention.max_attention_score).item())
-                    transformer_layer.self_attention.qk_clip()
+                    transformer_layer.self_attention.clip_qk()
             
     timers('optimizer').stop()
 
