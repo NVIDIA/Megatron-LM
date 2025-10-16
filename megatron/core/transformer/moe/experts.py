@@ -21,8 +21,8 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -136,7 +136,9 @@ class GroupedMLP(MegatronModule):
             and "moe_act" in self.config.recompute_modules
         )
         if self.activation_recompute and (self.config.fp8 or self.config.fp4):
-            raise ValueError("moe_act recompute for fp8 or fp4 cannot work with the legacy GroupedMLP.")
+            raise ValueError(
+                "moe_act recompute for fp8 or fp4 cannot work with the legacy GroupedMLP."
+            )
 
         @jit_fuser
         def activation_func_with_probs(x, probs):
