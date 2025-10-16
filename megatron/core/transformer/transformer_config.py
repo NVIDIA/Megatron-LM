@@ -1357,13 +1357,16 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_router_padding_for_fp8:
             # enable moe_router_padding_for_quantization
             warnings.warn(
-                "--moe-router-padding-for-fp8 is going to be deprecated. Use --moe-router-padding-for-quantization instead."
+                "--moe-router-padding-for-fp8 is going to be deprecated. "
+                "Use --moe-router-padding-for-quantization instead."
             )
             self.moe_router_padding_for_quantization = True
 
         if self.moe_router_padding_for_quantization:
             if self.fp8 is None and self.fp4 is None:
-                raise ValueError("fp8/fp4 must be specified when moe_router_padding_for_quantization is True.")
+                raise ValueError(
+                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
+                )
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
                 raise ValueError(

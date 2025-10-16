@@ -8,8 +8,8 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.tensor_parallel import (
@@ -1142,6 +1142,14 @@ class _DeepepManager(_DispatchManager):
             fused=self.permute_fusion,
         )
         return hidden_states
+
+    def get_align_size_for_quantization(self):
+        """Get the alignment size for quantization."""
+        if self.config.fp8:
+            return get_fp8_align_size(self.config.fp8_recipe)
+        elif self.config.fp4:
+            return get_fp4_align_size(self.config.fp4_recipe)
+        return 16
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):

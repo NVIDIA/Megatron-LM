@@ -50,7 +50,7 @@ def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
 
 def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     """
-    Get the alignment size required for FP4 GEMM. 
+    Get the alignment size required for FP4 GEMM.
     FP4 GEMM requires Blackwell and later architectures.
 
     The value 32 is a hardware requirement: TMA (Tensor Memory Accelerator) requires
