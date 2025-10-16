@@ -988,7 +988,9 @@ class _HybridepManager(_DispatchManager):
             self.token_probs = self.token_probs.float()  # downcast or upcast
         if self.config.moe_router_padding_for_fp8:
             self.pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
-        dispatched_hidden, self.dispatched_probs, _, self.tokens_per_expert, self.handle = (
+
+        dispatched_hidden, self.dispatched_probs, _, self.tokens_per_expert, \
+        self.handle, self.num_dispatched_tokens, self.num_permuted_tokens = (
             hybrid_ep_dispatch(
                 hidden_states,
                 self.routing_map,
@@ -1001,15 +1003,15 @@ class _HybridepManager(_DispatchManager):
                 self.pad_multiple,
             )
         )
-        self.tokens_per_expert = self.tokens_per_expert.cpu()
         return dispatched_hidden
 
     def combine(self, hidden_states: torch.Tensor, async_finish: bool = True, allocate_on_comm_stream: bool = True) -> torch.Tensor:
         hidden_states = hybrid_ep_combine(
             hidden_states,
-            num_permuted_tokens=self.tokens_per_expert.sum(),  
             handle=self.handle,
             pad_multiple=self.pad_multiple,
+            num_dispatched_tokens=self.num_dispatched_tokens,
+            num_permuted_tokens=self.num_permuted_tokens,
         )
         self.handle = None
         return hidden_states
@@ -1367,7 +1369,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         # Initialize metadata
-        routing_map, probs = self._initialize_metadata(routing_map, probs)
+        if not self.config.moe_enable_hybridep:
+            routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
