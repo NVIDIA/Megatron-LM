@@ -1,22 +1,33 @@
-from megatron.core.inference.inference_client import InferenceClient
-from examples.inference.gpt.utils import add_common_inference_args
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import asyncio
-import torch.distributed as dist
-from examples.inference.gpt.gpt_dynamic_inference import get_model, get_inference_context, get_inference_controller, add_dynamic_inference_args
-from megatron.core.inference.inference_request import DynamicInferenceRequest
-from megatron.training import initialize_megatron
-import torch
+import json
 import os 
-from megatron.training import get_args, get_tokenizer 
-from megatron.core.inference.sampling_params import SamplingParams
-from examples.inference.gpt.utils import build_requests, build_dynamic_engine_setup_prefix, Request
-from megatron.core.inference.engines import DynamicInferenceEngine
 import time
+import torch
+import torch.distributed as dist
 from tqdm import tqdm
 from typing import List
-import json
-from megatron.training.arguments import parse_args
+
+from examples.inference.gpt.gpt_dynamic_inference import (
+    get_model,
+    get_inference_context,
+    get_inference_controller,
+    add_dynamic_inference_args,
+)
+from examples.inference.gpt.utils import (
+    add_common_inference_args,
+    build_requests,
+    build_dynamic_engine_setup_prefix,
+    Request,
+)
 from megatron.core import parallel_state
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.arguments import parse_args
 
 async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling_params: SamplingParams, port: int):
     # once you call engine.start_listening_to_data_parallel_coordinator,
