@@ -9,6 +9,11 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -37,6 +42,16 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
+
 stimer = StragglerDetector()
 
 
@@ -55,10 +70,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
 
-    cu_seqlens = batch.pop('cu_seqlens', None)
-    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    max_seqlen = batch.pop('max_seqlen', None)
-    local_cp_size = batch.pop('local_cp_size', None)
+    cu_seqlens = batch.pop('cu_seqlens')
+    max_seqlen = batch.pop('max_seqlen')
+    local_cp_size = batch.pop('local_cp_size')
     if local_cp_size is not None:
         local_cp_size = int(local_cp_size.item())
 
@@ -67,8 +81,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
+        cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
     
