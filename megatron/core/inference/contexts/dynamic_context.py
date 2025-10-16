@@ -161,9 +161,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         chunk_size_tokens (int): Size of KV cache chunk size.
         tensor_model_parallel_size (Optional[int]): Tensor model parallel size.
         num_cuda_graphs (Optional[int]): Maximum number of cuda graphs to capture,
-            where the cuda graph batch sizes range from 1 to `max_requests` (as
-            computed below). Due to rounding, the actual number of cuda graphs may
-            not equal this argument.
+            where the cuda graph batch sizes range from 1 to `max_active_requests`
+            (as computed below). Due to rounding, the actual number of cuda graphs
+            may not equal this argument.
         materialize_only_last_token_logits (bool): If True, only the last token logits
             are materialized in the context.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
@@ -242,7 +242,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         del active_chunk_count_total # use self.chunk_allocator.active_count
         active_buffer_size_bytes = self.chunk_allocator.active_count * self.chunk_size_bytes
 
-        # Set max_requests, max_tokens.
+        # Set max_total_requests, max_active_requests, max_tokens.
         self.max_total_requests = self.chunk_allocator.total_count - 1 # -1 for dummy chunk
         self.max_active_requests = self.chunk_allocator.active_count
         self.max_tokens = max_tokens
@@ -717,7 +717,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             num_warmup_tokens (Optional[int]): Number of tokens to use for
                 warming up cuda graphs. Must be less than or equal to
-                `max_requests`.
+                `max_active_requests`.
             warmup_engine_mode (WarmupEngineMode): Denote whether to setup
             for a decode or a non-decode cuda-graph warmup.
             num_warmup_requests (Optional[int]): [DEPRECATED] Use num_warmup_tokens instead.
@@ -974,20 +974,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
-    def check_availability(
-        self, req: DynamicInferenceRequest, safe: bool = False
-    ) -> (bool, bool, bool):
+    def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
         Check if the request can be added to the context.
         """
-        request_can_be_added = self.total_request_count < self.max_requests
+        request_can_be_added = (
+            self.total_request_count - self.paused_request_count
+            < self.max_active_requests
+        )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
         )
         chunks = math.ceil(
             (req.remaining_prompt_length + req.finished_chunk_token_count) / self.chunk_size_tokens
         ) - math.ceil(req.finished_chunk_token_count / self.chunk_size_tokens)
-        kv_cache_available = self.chunk_allocator.is_memory_available(chunks, safe=safe)
+        kv_cache_available = self.chunk_allocator.is_memory_available(chunks)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
@@ -1027,9 +1028,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_chunks_needed = overall_required_chunks - already_allocated_chunks
 
         if num_chunks_needed > 0:
-            new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(
-                num_chunks_needed, safe=not is_chunked_prefill
-            )
+            new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed)
             if new_chunk_ids is None or len(new_chunk_ids) != num_chunks_needed:
                 raise ChunkOverflowError(req.request_id)
 
@@ -1047,7 +1046,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             current_id = self.total_request_count
 
-        if current_id >= self.max_requests:
+        if current_id >= self.max_active_requests:
             raise RequestOverflowError(req.request_id)
 
         if self.active_token_count + chunk_length > self.max_tokens:
@@ -1145,7 +1144,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         between these request groups.
         - 0:paused_request_count -> paused requests
         - paused_request_count:total_request_count -> active requests
-        - total_request_count:max_requests -> completed requests are moved here.
+        - total_request_count:max_active_requests -> completed requests are moved here.
         The reason for maintaining contiguous tensors rather than multiple
         smaller (e.g., per-group or per-request) tensors is for both 1) speed
         (avoid unnecessary tensor allocations), and 2) compatibility with the

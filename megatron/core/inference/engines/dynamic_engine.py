@@ -593,7 +593,7 @@ class DynamicInferenceEngine(AbstractEngine):
         while self.waiting_request_ids:
             req = self.requests[self.waiting_request_ids[0]]
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req, safe=True)
+                self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
@@ -636,9 +636,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.active_token_count + remaining_len <= self.context.max_tokens
             )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(
-                req, safe=not is_continuing_chunked_prefill
-            )
+            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
             if request_can_be_added and kv_cache_available:
