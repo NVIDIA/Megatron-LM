@@ -29,7 +29,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 : ${BUFFER_GUARANTEED_FRACTION=0.05}
 
 # Cuda graphs.
-: ${ENABLE_CUDA_GRAPHS=1}
+: ${CUDA_GRAPH_IMPL=local}
 : ${NUM_CUDA_GRAPHS=16}
 : ${CUDA_GRAPH_SHARE_IO_BUFFERS=1}
 
@@ -71,9 +71,9 @@ ARGS=" \
 "
 
 # Cuda graphs.
-if [ "${ENABLE_CUDA_GRAPHS}" = 1 ]; then
+if [ "${CUDA_GRAPH_IMPL}" = "local" ]; then
     ARGS+=" \
-        --enable-cuda-graph \
+        --cuda-graph-impl local \
         --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
     "
 fi

@@ -9,7 +9,7 @@ import logging
 import math
 import warnings
 from dataclasses import dataclass, replace
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -395,20 +395,66 @@ class MambaMixer(MegatronModule):
         _, batch, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
-        if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "Mamba does not currently support dynamic inference batching."
-            assert not self.config.sequence_parallel
-            conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-            if inference_context.seqlen_offset > 0:
-                # The states are updated inplace
-                out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
-                return out, out_bias
+
+        in_inference_mode = inference_context is not None and not self.training
+        if in_inference_mode:
+            if inference_context.is_dynamic_batching():
+                return self.dynamic_inference(hidden_states, inference_context)
+            else:
+                assert inference_context.is_static_batching()
+                assert not self.config.sequence_parallel
+                conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
+                if inference_context.seqlen_offset > 0:
+                    # The states are updated inplace
+                    out, out_bias = self.decode(hidden_states, conv_state, ssm_state)
+                    return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
+
+        if in_inference_mode or not self.use_mem_eff_path:
+            # TODO(ksanthanam): Consider deprecating this path for training
+            y = self.ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+        else:
+            assert ssm_state is None
+            y = self.ssm_training(zxBCdt)
+
+        out, out_bias = self.out_proj(y)
+
+        return out, out_bias
+
+    def dynamic_inference(
+        self, hidden_states, inference_context: DynamicInferenceContext
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Runs inference computation for dynamic batching."""
+        raise NotImplementedError(f"Dynamic inference is not supported.")
+
+    def decode(self, hidden_states, conv_state, ssm_state) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Performs inference step for decoding."""
+        # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
+        dtype = hidden_states.dtype
+        assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+
+        #  b d_model --> b p(2d)
+        zxBCdt, _ = self.in_proj(hidden_states)
+
+        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
+
+        y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+
+        # l b pd --> l b d
+        out, out_bias = self.out_proj(y)
+        return out, out_bias
+
+    def ssm_training(self, zxBCdt: torch.Tensor) -> torch.Tensor:
+        """
+        Performs SSM computation for training step.
+
+        Uses the memory-efficient kernel `mamba_split_conv1d_scan_combined` which reduces the size
+        of forward activations stored for backprop and therefore reduces memory pressure during
+        training.
+        """
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
@@ -416,151 +462,151 @@ class MambaMixer(MegatronModule):
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
 
-        if self.use_mem_eff_path and inference_context is None:
-            assert ssm_state is None
+        # TODO(duncan): Can this code be removed?
+        if self.conv1d.bias is not None:
+            self.conv1d.bias.data_ptr()
 
-            # TODO(duncan): Can this code be removed?
-            if self.conv1d.bias is not None:
-                self.conv1d.bias.data_ptr()
+        y = mamba_split_conv1d_scan_combined(
+            zxBCdt,
+            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            self.cp.get_conv1d_bias(),
+            self.cp.get_dt_bias().float(),
+            A,
+            D=(
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            chunk_size=self.chunk_size,
+            activation=self.activation,
+            headdim=None if self.D_has_hdim else self.headdim,
+            ngroups=self.cp.ngroups_local_tpcp,
+            norm_before_gate=self.norm_before_gate,
+        )
 
-            y = mamba_split_conv1d_scan_combined(
-                zxBCdt,
-                rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                self.cp.get_conv1d_bias(),
-                self.cp.get_dt_bias().float(),
-                A,
-                D=(
-                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.cp.get_D()
-                ),
-                chunk_size=self.chunk_size,
-                activation=self.activation,
-                headdim=None if self.D_has_hdim else self.headdim,
-                ngroups=self.cp.ngroups_local_tpcp,
-                norm_before_gate=self.norm_before_gate,
-            )
+        y = rearrange(y, "b l d -> l b d").contiguous()
+        y = self.cp.post_conv_ssm(y)
 
-            y = rearrange(y, "b l d -> l b d").contiguous()
-            y = self.cp.post_conv_ssm(y)
+        if self.rmsnorm:
+            y = self.norm(y)
 
-            if self.rmsnorm:
-                y = self.norm(y)
+        return y
+
+    def ssm_prefill(
+        self,
+        zxBCdt: torch.Tensor,
+        conv_state: Optional[torch.Tensor],
+        ssm_state: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Performs SSM computation for inference prefill step."""
+
+        # transpose: l b pd --> b l pd
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        # (nheads_local_tpcp)
+        A = -torch.exp(self.cp.get_A_log().float())
+
+        z, xBC, dt = torch.split(
+            zxBCdt,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp,
+            ],
+            dim=-1,
+        )
+
+        # transpose: b l pd --> b pd l
+        xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+
+        # Compute short convolution
+        if conv_state is not None:
+            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            conv_state.copy_(F.pad(xBC, (self.d_conv - xBC.shape[-1], 0)))  # Update state (B D W)
+
+        seqlen = xBC.size(2)
+        if causal_conv1d_fn is None:
+            xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
         else:
-            # This path is always used for the inference prefill phase.
-            # `mamba_split_conv1d_scan_combined`, used in the other branch above, reduces the size
-            # of forward activations stored for backprop, which reduces memory pressure during
-            # training, and does not provide increased speed in the forward direction.
-            z, xBC, dt = torch.split(
-                zxBCdt,
-                [
-                    self.cp.d_inner_local_tpcp,
-                    self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
-                    self.cp.nheads_local_tpcp,
-                ],
-                dim=-1,
+            assert self.activation in ["silu", "swish"]
+            xBC = causal_conv1d_fn(
+                x=xBC,
+                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=self.cp.get_conv1d_bias(),
+                activation=self.activation,
             )
 
-            # transpose: b l pd --> b pd l
-            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        # transpose b pd l --> b l pd
+        xBC = rearrange(xBC, "b d l ->  b l d").contiguous()
 
-            # Compute short convolution
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(
-                    F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
-                )  # Update state (B D W)
+        x, B, C = torch.split(
+            xBC,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.ngroups_local_tpcp * self.d_state,
+            ],
+            dim=-1,
+        )
 
-            seqlen = xBC.size(2)
-            if causal_conv1d_fn is None:
-                xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                xBC = causal_conv1d_fn(
-                    x=xBC,
-                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                    bias=self.cp.get_conv1d_bias(),
-                    activation=self.activation,
-                )
+        # TODO Vijay: fuse most of the transposes with the GEMMS
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+        dt = dt.contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
 
-            # transpose b pd l --> b l pd
-            xBC = rearrange(xBC, "b d l ->  b l d").contiguous()
+        # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
+        # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
+        # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
+        # mathematically incorrect, and potentially arithmetically unstable.
+        assert (
+            self.cp.cp_size == 1 or self.rmsnorm
+        ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
-            x, B, C = torch.split(
-                xBC,
-                [
-                    self.cp.d_inner_local_tpcp,
-                    self.cp.ngroups_local_tpcp * self.d_state,
-                    self.cp.ngroups_local_tpcp * self.d_state,
-                ],
-                dim=-1,
-            )
+        y = mamba_chunk_scan_combined(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.chunk_size,
+            D=(
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            z=z if not self.rmsnorm else None,
+            dt_bias=self.cp.get_dt_bias().float(),
+            dt_softplus=True,
+            return_final_states=ssm_state is not None,
+        )
 
-            # TODO Vijay: fuse most of the transposes with the GEMMS
-            x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-            dt = dt.contiguous()
-            B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-            C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-            z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+        if ssm_state is not None:
+            y, last_state = y
+            ssm_state.copy_(last_state)
 
-            # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
-            # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
-            # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
-            # mathematically incorrect, and potentially arithmetically unstable.
-            assert (
-                self.cp.cp_size == 1 or self.rmsnorm
-            ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+        y = self.cp.post_conv_ssm(y)
 
-            y = mamba_chunk_scan_combined(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                self.chunk_size,
-                D=(
-                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.cp.get_D()
-                ),
-                z=z if not self.rmsnorm else None,
-                dt_bias=self.cp.get_dt_bias().float(),
-                dt_softplus=True,
-                return_final_states=ssm_state is not None,
-            )
+        if self.rmsnorm:
+            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            z = self.cp.post_conv_ssm(z)
+            y = self.norm(y, z)
 
-            if ssm_state is not None:
-                y, last_state = y
-                ssm_state.copy_(last_state)
+        return y
 
-            y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-            y = self.cp.post_conv_ssm(y)
+    def ssm_decode(
+        self, zxBCdt: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor
+    ) -> torch.Tensor:
+        """Performs SSM computation for inference decode step."""
 
-            if self.rmsnorm:
-                z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-                z = self.cp.post_conv_ssm(z)
-                y = self.norm(y, z)
-
-        out, out_bias = self.out_proj(y)
-
-        return out, out_bias
-
-    def step(self, hidden_states, conv_state, ssm_state):
-        """
-        Performs inference step for decoding
-        """
-        # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
-        dtype = hidden_states.dtype
-        assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+        dtype = zxBCdt.dtype
+        assert zxBCdt.shape[0] == 1, "Only support decoding with 1 token at a time for now"
 
         # l b d --> b d
-        hidden_states = hidden_states.squeeze(0)
-
-        #  b d_model --> b p(2d)
-        zxBCdt, _ = self.in_proj(hidden_states)
-
-        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
+        zxBCdt = zxBCdt.squeeze(0)
 
         z, xBC, dt = torch.split(
             zxBCdt,
@@ -675,9 +721,8 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             y = self.norm(y, z)
 
-        # b pd --> b d
-        out, out_bias = self.out_proj(y)
-        return out.unsqueeze(0), out_bias, conv_state, ssm_state
+        # b (h p) -> l b (h p)
+        return y.unsqueeze(0)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """

@@ -677,3 +677,74 @@ publish:upgrade_dependencies:
   rules:
     - if: $CI_COMMIT_BRANCH == "ci-upgrade-dependencies" && $PUBLISH == "yes" && $PUBLISH_SCOPE == "upgrade-dependencies"
     - when: never
+
+publish:merge_into_dev:
+  stage: publish
+  image: ${CI_MCORE_DEV_IMAGE}:${CI_PIPELINE_ID}
+  script:
+    - export GITLAB_ENDPOINT
+    - export RO_API_TOKEN=${PAT}
+    - |
+      git config --global user.email "mcore-bot@nvidia.com"
+      git config --global user.name "Mcore Bot"
+    - SOURCE_BRANCH=ci/merge-into-dev
+    - |
+      set -x
+      set +e
+
+      SOURCE_BRANCH_EXISTS=$([[ "$(git ls-remote --heads origin refs/heads/$SOURCE_BRANCH)" != "" ]] && echo true || echo false)
+
+      if [[ "$SOURCE_BRANCH_EXISTS" == "false" ]]; then
+        git fetch origin dev
+        git checkout -b $SOURCE_BRANCH origin/dev
+      else
+        git fetch origin $SOURCE_BRANCH
+        git checkout origin/$SOURCE_BRANCH
+      fi
+
+      git fetch origin main
+      git merge origin/main
+      CLEAN=$?
+      set -e
+    - |
+      if [[ "$CLEAN" -ne 0 ]]; then
+        echo "Merge failed"
+        URL="https://${GITLAB_ENDPOINT}/${CI_PROJECT_PATH}/-/commit/${CI_COMMIT_SHA}"
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        MESSAGE='{
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "beep boop 🤖: Cherry-picking main (<'$URL'|'${SHORT_SHA}'>) into dev failed.\nPlease merge it manually into '$SOURCE_BRANCH'.\n\ncc '$SLACK_ADMIN_DEV'"
+              }
+            }
+          ]
+        }'
+
+        curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_DEV}
+
+        exit 1
+      fi
+    - git push -u origin ci/merge-into-dev
+    - |
+      curl \
+        --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=$SOURCE_BRANCH" \
+        -d "target_branch=dev" \
+        -d "title=chore: Merge into dev" \
+        -d "labels=test::Run functional tests" \
+        -d "merge_when_pipeline_succeeds=true" \
+        -d "description=[🤖]: Hi @zijiey 👋,<br><br>merging \`$SOURCE_BRANCH\` into \`dev\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+    - when: never

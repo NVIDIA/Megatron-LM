@@ -26,7 +26,7 @@ def add_mmlu_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title='ModelOpt text generation ptq')
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
     group.add_argument("--lower-bound", type=float, default=None)
     add_modelopt_args(parser)
     return parser
@@ -147,7 +147,7 @@ if __name__ == "__main__":
     model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
     report_current_memory_info()
 
-    # Materialize the model from meta device to gpu before loading the checkpoint. 
+    # Materialize the model from meta device to gpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.to_empty(device="cuda")
     report_current_memory_info()
@@ -170,7 +170,7 @@ if __name__ == "__main__":
 
         correct = []
         for idx, test_example in enumerate(test_data):
-            if idx > args.percentage * len(test_data):
+            if idx > args.fraction * len(test_data):
                 break
             prompt = generate_prompt(test_example, dev_data, few_shots=0)
             label = ["A", "B", "C", "D"][test_example["answer"]]

@@ -90,8 +90,9 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     """
     tokenizer = get_tokenizer()
 
+    enable_cuda_graph = args.cuda_graph_impl == "local"
     num_cuda_graphs = None
-    if args.enable_cuda_graph:
+    if enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
     # Inference context.
@@ -127,7 +128,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     return DynamicInferenceEngine(
         controller=text_generation_controller,
         context=inference_context,
-        enable_cuda_graph=args.enable_cuda_graph,
+        enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
     )
 
@@ -140,6 +141,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _kill_engine: bool = PrivateAttr(False)
 
     async def base_generate(self, request: InferenceRequest):
+
+        tokenizer = get_tokenizer()
+
         sampling_params = SamplingParams(
             num_tokens_to_generate=request.generation_args.max_tokens or 1024,
             temperature=request.generation_args.temperature or 1.0,
@@ -148,6 +152,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._coordinator.engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs_for_dynamic_inference=True,
+            add_BOS=tokenizer.bos is not None,
         )
         request_ids = [
             self._coordinator.schedule_request(prompt=prompt, sampling_params=sampling_params)

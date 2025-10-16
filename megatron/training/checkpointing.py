@@ -380,14 +380,12 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
                        f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
 
     if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
-        metadata['singleton_local_shards'] = False
         if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
             if args.ckpt_fully_parallel_save:
                 metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
             else:
                 metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
     else:
-        metadata['singleton_local_shards'] = True
         if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
             if args.dist_ckpt_optim_fully_reshardable:
                 metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
@@ -395,12 +393,13 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
             else:
                 metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
+    metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -467,7 +466,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Checkpoint name.
     return_base_dir = (ckpt_type != CheckpointType.LEGACY)
-    checkpoint_name = get_checkpoint_name(save_dir, iteration, release=False, pipeline_parallel=pipeline_parallel,
+    checkpoint_name = get_checkpoint_name(save_dir, iteration, release=release, pipeline_parallel=pipeline_parallel,
         tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir)
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
@@ -634,7 +633,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         with open_file(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
-                    f.write(str(iteration))
+                    f.write("release" if release else str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
                 pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '

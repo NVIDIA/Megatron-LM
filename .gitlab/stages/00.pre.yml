@@ -3,9 +3,6 @@ include:
 
 .pre_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'main'
-      allow_failure: true
-      when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
@@ -25,7 +22,7 @@ include:
 
 pre:mirror_to_github:
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
       allow_failure: true
     - when: never
   tags:
@@ -61,6 +58,38 @@ pre:create_ci_branches:
       - branch: ci-pre-release
       - branch: ci-review-reminder
       - branch: ci-upgrade-dependencies
+      - branch: ci-approve-main
+      - branch: ci-approve-dev
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: python:3.10
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
+    - git switch --force-create $branch
+    - git push --force -u origin $branch
+  retry:
+    max: 2
+
+pre:create_ci_branches_dev:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev" && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
+    - when: never
+  parallel:
+    matrix:
+      - branch: ci-dev-unit-test-extended
+      - branch: ci-dev-rebuild-mcore-nemo-image
+      - branch: ci-dev-mr
+      - branch: ci-dev-nightly
+      - branch: ci-dev-upgrade-dependencies
   tags:
     - arch/amd64
     - env/prod
@@ -113,6 +142,71 @@ pre:label_merge_request:
     - |
       source labels
       curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
+
+pre:maybe_cherry_pick_to_main:
+  rules:
+    - if: "$CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev' && $CI_MERGE_REQUEST_LABELS =~ /mirror-to-main/"
+    - when: never
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: nentangso/alpine-git-curl-jq
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - |
+      set -x
+      MR_ID=$CI_MERGE_REQUEST_IID
+      TARGET_BRANCH="cp/$MR_ID-into-main"
+      TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$TARGET_BRANCH)" != "" ]] && echo true || echo false)
+
+      if [[ "$TARGET_BRANCH_EXISTS_OK" == "true" ]]; then
+        echo Target branch already exists, will not cherry-pick again.
+        exit 0
+      fi
+
+      MR=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}")
+
+      LABELS=$(echo -E $MR | jq '.labels | join(",")' | tr -d '"')
+      AUTHOR_ID=$(echo -E $MR | jq '.author.id' | tr -d '"')
+      AUTHOR_NAME=$(echo -E $MR | jq '.author.username' | tr -d '"')
+      TITLE=$(echo -E $MR | jq '.title' | tr -d '"')
+      MILESTONE_ID=$(echo -E $MR | jq '.milestone.id' | tr -d '"')
+
+      git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_PATH.git"
+      git remote add mr-origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH.git"
+
+      git config --global user.email "mcore-bot@nvidia.com"
+      git config --global user.name "Mcore Bot"
+
+      git fetch origin dev
+      git fetch mr-origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      START_COMMIT=$(git merge-base origin/dev mr-origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME)
+      END_COMMIT=$(git rev-parse HEAD)
+
+      git fetch origin main
+      git checkout main
+      git checkout -b $TARGET_BRANCH
+
+      git cherry-pick $START_COMMIT..$END_COMMIT
+      git push -u origin $TARGET_BRANCH
+
+      curl \
+        --header "PRIVATE-TOKEN: $PAT" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=$TARGET_BRANCH" \
+        -d "target_branch=main" \
+        -d "title=cp MR !$MR_ID from dev: \`$TITLE\`" \
+        -d "labels=cherry-picked-from-dev" \
+        -d "reviewer_ids=$AUTHOR_ID" \
+        -d "milestone_id=$MILESTONE_ID" \
+        -d "description=[🤖]: Hi @$AUTHOR_NAME 👋,<br><br>we've cherry picked \`$TITLE (!$MR_ID)\` into \`main\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
 
 pre:maybe_cherry_pick_commit:
   rules:
@@ -252,5 +346,55 @@ pre:check_status_of_main:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
+      when: always
+    - when: never
+
+pre:approve_merge_gate:
+  extends: [.pre_rules]
+  image: maniator/gh
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - |
+      set -eoux pipefail
+      EXIT_CODE=0
+      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
+
+      export GH_TOKEN=$GH_TOKEN
+      export REPO=NVIDIA/Megatron-LM
+      export TARGET_BRANCH="$CI_COMMIT_BRANCH"
+
+      if [[ $EXIT_CODE -eq 0 ]]; then
+        STATUS="approved"
+        COMMENT="Main is healthy. Submitting PR."
+      else
+        STATUS="rejected"
+        COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
+      fi
+
+      gh api "repos/$REPO/actions/runs?status=waiting" --jq '.workflow_runs[].id' \
+        | while read run_id; do
+            HEAD_BRANCH=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.head_branch')
+            PR_NUMBER="${HEAD_BRANCH##*/}"
+            if [ -n "$PR_NUMBER" ]; then
+                PR_BASE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref')
+                if [ "$PR_BASE" = "$TARGET_BRANCH" ]; then
+                    gh api \
+                      --method POST "repos/$REPO/actions/runs/$run_id/pending_deployments" \
+                      -F "environment_ids[]=$(gh api "repos/$REPO/environments" --jq '.environments[] | select(.name=="merge-gate") | .id')" \
+                      -f state="$STATUS" \
+                      -f comment="$COMMENT";
+                fi
+            fi
+        done
+  retry:
+    max: 2
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
       when: always
     - when: never
