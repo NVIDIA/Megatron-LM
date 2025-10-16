@@ -716,7 +716,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_seq_idx = self.token_to_position_in_request[:n]
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
-            assert key.shape[0] == n
+            if key.shape[0] != n:
+                raise AssertionError(
+                    f"apply_rotary_emb_key: key.shape[0]={key.shape[0]} != n={n}; "
+                    f"padded_active_request_count={self.padded_active_request_count}, "
+                    f"active_token_count={self.active_token_count}, total_request_count={self.total_request_count}, "
+                    f"paused_request_count={self.paused_request_count}"
+                )
             key = apply_rotary_pos_emb(
                 t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
