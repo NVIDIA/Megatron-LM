@@ -22,6 +22,8 @@ except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer as build_new_tokenizer
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.training.tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
@@ -51,7 +53,10 @@ class Encoder(object):
 
     def initializer(self):
         # Use Encoder class as a container for global data
-        Encoder.tokenizer = build_tokenizer(self.args)
+        if self.args.legacy_tokenizer:
+            tokenizer = build_tokenizer(self.args)
+        else:
+            Encoder.tokenizer = build_new_tokenizer(self.args)
         if self.args.split_sentences:
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
@@ -151,7 +156,10 @@ class Partition(object):
 
         startup_start = time.time()
         encoder = Encoder(self.args)
-        tokenizer = build_tokenizer(self.args)
+        if self.args.legacy_tokenizer:
+            tokenizer = build_tokenizer(self.args)
+        else:
+            tokenizer = build_new_tokenizer(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, 32)
 
@@ -219,6 +227,8 @@ def get_args():
     group.add_argument('--keep-sequential-samples', action='store_true',
                        help='Ensure ordering of samples in .jsonl files is '
                             'preserved when using partitions>1.')
+    # group.add_argument('--legacy-tokenizer', action='store_true',
+    #                    help='Use legacy tokenizer system.')
     args = parser.parse_args()
     args.keep_empty = False
 
@@ -371,7 +381,10 @@ def main():
     output_bin_files = {}
     output_idx_files = {}
     builders = {}
-    tokenizer = build_tokenizer(args)
+    if args.legacy_tokenizer:
+        tokenizer = build_tokenizer(args)
+    else:
+        tokenizer = build_new_tokenizer(args)
 
     for key in args.json_keys:
         output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,

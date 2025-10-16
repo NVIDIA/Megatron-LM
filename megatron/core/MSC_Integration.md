@@ -10,16 +10,19 @@ This guide will walk you through how to:
 
 ### Installation
 
-To install the Multi-Storage Client package:
+MSC is vended as `the multi-storage-client` package on PyPI.
+
+The base [client](https://nvidia.github.io/multi-storage-client/user_guide/concepts.html#term-client) supports POSIX file systems by default, but there are extras for each storage service which provide the necessary package dependencies for its corresponding storage provider.
 
 ```bash
+# POSIX file systems.
 pip install multi-storage-client
-```
 
-For S3 access, you'll also need to install boto3:
+# AWS S3 and S3-compatible object stores.
+pip install "multi-storage-client[boto3]"
 
-```bash
-pip install multi-storage-client[boto3]
+# Google Cloud Storage (GCS).
+pip install "multi-storage-client[google-cloud-storage]"
 ```
 
 ### Configuration File
@@ -45,11 +48,8 @@ profiles:
         secret_key: ${AWS_SECRET_KEY}
 
 cache:
-  # Maximum cache size
-  size: 500G
-  cache_backend:
-    # Cache directory on filesystem
-    cache_path: /tmp/msc_cache
+  size: 500G               # Maximum cache size
+  location: /tmp/msc_cache # Cache directory on filesystem
 ```
 
 To tell MSC where to find this file, set the following environment variable before running your Megatron-LM script:
@@ -160,16 +160,15 @@ Example:
 ```
 cache:
   size: 500G
-  cache_backend:
-    cache_path: /tmp/msc_cache
+  location: /tmp/msc_cache
 ```
 
-Make sure this cache directory is located on a fast local disk (e.g., NVMe SSD) for optimal performance.
+For optimal performance, configure the cache directory on a high-speed local storage device such as an NVMe SSD.
 
 ### Additional Resources and Advanced Configuration
 
-Refer to the [MSC Configuration Documentation](https://nvidia.github.io/multi-storage-client/config/index.html) for complete documentation on MSC configuration options, including detailed information about supported storage providers, credentials management, and advanced caching strategies.
+Refer to the [MSC Configuration Documentation](https://nvidia.github.io/multi-storage-client/references/configuration.html) for complete documentation on MSC configuration options, including detailed information about supported storage providers, credentials management, and advanced caching strategies.
 
-MSC also supports collecting observability metrics and traces to help monitor and debug data access patterns during training. These metrics can help you identify bottlenecks in your data loading pipeline, optimize caching strategies, and monitor resource utilization when training with large datasets in object storage.
+MSC supports collecting observability metrics and traces to help monitor and debug data access patterns during training. These metrics can help you identify bottlenecks in your data loading pipeline, optimize caching strategies, and monitor resource utilization when training with large datasets in object storage. For more information about MSC's observability features, see the [MSC Observability Documentation](https://nvidia.github.io/multi-storage-client/user_guide/telemetry.html).
 
-For more information about MSC's observability features, see the [MSC Observability Documentation](https://nvidia.github.io/multi-storage-client/config/index.html#opentelemetry).
+MSC offers an experimental Rust client that bypasses Python's Global Interpreter Lock (GIL) to significantly improve performance for multi-threaded I/O operations. The Rust client supports AWS S3, SwiftStack, and Google Cloud Storage, enabling true concurrent execution for much better performance compared to the Python implementation. To enable it, add `rust_client: {}` to your storage provider configuration. For more details, see the [MSC Rust Client Documentation](https://nvidia.github.io/multi-storage-client/user_guide/rust.html).

@@ -378,15 +378,14 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        if use_te_op_fuser:
-            return ModuleSpec(module=TEFusedMLP)
-        elif backend.fuse_layernorm_and_linear():
+        module = TEFusedMLP if use_te_op_fuser else MLP
+        if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
             linear_fc1 = backend.column_parallel_linear()
         return ModuleSpec(
-            module=MLP,
+            module=module,
             submodules=MLPSubmodules(
                 linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
             ),
@@ -408,6 +407,7 @@ def get_gpt_decoder_block_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -487,17 +487,17 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     if config.pipeline_model_parallel_layout is not None:
         local_layer_specs = [
             layer_specs[layer_id]
             for layer_id in config.pipeline_model_parallel_layout.get_layer_id_list(
-                layer_type=LayerType.decoder, vp_stage=vp_stage
+                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
             )
         ]
     else:
-        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
@@ -513,6 +513,7 @@ def get_gpt_mtp_block_spec(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     use_transformer_engine: bool,
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
@@ -528,7 +529,7 @@ def get_gpt_mtp_block_spec(
             else LocalSpecProvider()
         )
     return get_gpt_mtp_block_spec_for_backend(
-        config=config, spec=spec, backend=backend, vp_stage=vp_stage
+        config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )
 
 
@@ -537,9 +538,10 @@ def get_gpt_mtp_block_spec_for_backend(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     backend: BackendSpecProvider,
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage)
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
     if num_layers_to_build == 0:
         return None
 

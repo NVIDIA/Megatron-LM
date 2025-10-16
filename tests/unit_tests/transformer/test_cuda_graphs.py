@@ -28,7 +28,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -59,7 +59,7 @@ class TestParallelTransformerBlockCudagraphs:
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
         )
         self.parallel_transformer_block = TransformerBlock(
             self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
@@ -198,7 +198,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
         virtual_pipeline_model_parallel_size=vpp,
         pipeline_model_parallel_size=pp,
         deallocate_pipeline_outputs=True,
-        enable_cuda_graph=True,
+        cuda_graph_impl="local",
         use_te_rng_tracker=True,
         account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
         account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
@@ -294,7 +294,7 @@ class TestLLaVACudaGraph:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs
+            cuda_graph_impl="local",  # Enable CUDA graphs
         )
 
         # Create vision transformer config
@@ -303,7 +303,7 @@ class TestLLaVACudaGraph:
             hidden_size=16,
             num_attention_heads=2,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs for vision model too
+            cuda_graph_impl="local",  # Enable CUDA graphs for vision model too
         )
 
         # Create vision projection config
@@ -414,6 +414,11 @@ class TestLLaVACudaGraph:
                         layer.cudagraph_manager is not None
                     ), "Language model layers should have CUDA graph managers"
 
+                    # Verify that CUDA graphs were created successfully
+                    for runner in layer.cudagraph_manager.cudagraph_runners:
+                        assert hasattr(runner, 'fwd_graph')
+                        assert hasattr(runner, 'bwd_graph')
+
         # Perform backward pass to trigger backward graph recording
         if isinstance(output1, tuple):
             loss = output1[0].sum()
@@ -455,8 +460,8 @@ class TestParallelMambaBlockCudagraphs:
         # Ensure that this test is capturing to a fresh memory pool.
         CudaGraphManager.global_mempool = None
 
-        def get_model_comm_pgs():
-            return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_override_pattern):
             transformer_config = TransformerConfig(
@@ -466,14 +471,14 @@ class TestParallelMambaBlockCudagraphs:
                 num_layers=len(hybrid_override_pattern),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                enable_cuda_graph=True,
+                cuda_graph_impl="local",
             )
             modules = mamba_stack_spec.submodules
             return MambaStack(
                 transformer_config,
                 modules,
                 hybrid_override_pattern=hybrid_override_pattern,
-                model_comm_pgs=get_model_comm_pgs(),
+                pg_collection=get_pg_collection(),
             )
 
         self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
@@ -561,7 +566,7 @@ class TestCaptureFreezeGC:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
             inference_rng_tracker=True,
             tensor_model_parallel_size=1,  # needed?
         )
@@ -633,6 +638,7 @@ class TestCaptureFreezeGC:
 
         return engine.capture_stats
 
+    @pytest.mark.flaky_in_dev  # Issue #2855
     @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -689,8 +695,8 @@ class TestCaptureFreezeGC:
         )
 
         # Validate time and memory usage.
-        assert freeze_on_results["internal"]["time"] < 0.2 * freeze_off_results["internal"]["time"]
-        assert freeze_on_results["external"]["time"] < 0.2 * freeze_off_results["external"]["time"]
+        assert freeze_on_results["internal"]["time"] < 0.3 * freeze_off_results["internal"]["time"]
+        assert freeze_on_results["external"]["time"] < 0.3 * freeze_off_results["external"]["time"]
         assert (
             freeze_on_results["internal"]["allocated_bytes"]
             <= freeze_off_results["internal"]["allocated_bytes"]

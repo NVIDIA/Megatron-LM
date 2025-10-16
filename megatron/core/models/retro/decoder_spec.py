@@ -3,6 +3,7 @@
 """Specs for Retro decoder."""
 
 import typing
+from typing import Optional
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -123,7 +124,10 @@ def get_retro_decoder_layer_local_spec(
 
 
 def get_retro_decoder_block_spec(
-    config: RetroConfig, use_transformer_engine: bool
+    config: RetroConfig,
+    use_transformer_engine: bool,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """Retro decoder block spec.
 
@@ -138,6 +142,8 @@ def get_retro_decoder_block_spec(
     Args:
         config (RetroConfig): Retro config.
         use_transformer_engine (bool): If True, use Transformer Engine (instead of local modules.
+        vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         Transformer block submodules for the given spec.
@@ -152,7 +158,7 @@ def get_retro_decoder_block_spec(
     ), "retro does not currently support virtual pipeline parallelism."
 
     # Num layers.
-    num_layers = get_num_layers_to_build(config)
+    num_layers = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     # Retro layer numbers.
     retro_layer_start = 6 if num_layers <= 15 else 9

@@ -6,7 +6,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -42,7 +42,8 @@ def switch_load_balancing_loss_func(
     fused: bool = False,
 ):
     """Calculate the auxiliary loss for load balancing.
-    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961) for details.
+    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
+    and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
 
     ### Detailed explanation of the auxiliary loss #######
 
@@ -72,10 +73,10 @@ def switch_load_balancing_loss_func(
         T is the total number of tokens in the global batch B
 
     Note:
-    To calculate the auxiliary loss at different levels (micro-batch or each sequence):
+    To calculate the auxiliary loss at different levels (micro-batch or global batch):
     - probs: Should always be from the local batch being processed
     - tokens_per_expert: Should represent token counts at the desired level
-      (either micro-batch or each sequence)
+      (either micro-batch or global batch)
     - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
 
     #########################################################
@@ -94,7 +95,7 @@ def switch_load_balancing_loss_func(
     """
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
-            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.6.0.")
+            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
@@ -375,8 +376,20 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    # Scatter add the permuted_input back to the original positions
-    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    if torch.are_deterministic_algorithms_enabled():
+        # Use index_add which is deterministic when deterministic algorithms are enabled
+        # and is CUDA graph compatible
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+        # and is CUDA graph compatible unlike scatter_add
+        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+    else:
+        # Scatter add the permuted_input back to the original positions
+        output_tokens.scatter_add_(
+            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+        )
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -588,9 +601,21 @@ def topk_routing_with_score_function(
     if scaling_factor:
         probs = probs * scaling_factor
 
-    # TODO Try using element-wise operations instead of scatter?
-    routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    if torch.are_deterministic_algorithms_enabled():
+        # build [num_tokens, num_experts] from [num_tokens, topk]
+        routing_probs = torch.zeros_like(logits)
+        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+        routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map.index_put_(
+            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+        )
+        routing_map = routing_map.bool()
+    else:
+        # TODO Try using element-wise operations instead of scatter?
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     return routing_probs, routing_map
 
@@ -917,11 +942,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+    def forward(
+        ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+    ):
         """
         Forward pass of the RouterGatingLinearFunction function.
         """
-        ctx.save_for_backward(inp, weight)
+        ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -929,10 +956,14 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
-        else:
+        elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+        else:
+            output = torch.addmm(
+                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
+            )
 
         output = output.view(*inp_shape[:-1], -1)
         return output
@@ -942,7 +973,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         """
         Backward pass of the RouterGatingLinearFunction function.
         """
-        inp, weight = ctx.saved_tensors
+        inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
         grad_shape = grad_output.shape
         inp = inp.view(-1, inp_shape[-1])
@@ -961,33 +992,39 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
+        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, None
+        return grad_input, grad_weight, grad_bias, None
 
 
-def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+def router_gating_linear(
+    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+):
     """
     Customized linear layer for router gating.
     This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, router_dtype)
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Initialize process groups with the global parallel_state.
-def get_default_model_comm_pgs():
+def get_default_pg_collection():
     """Get the default process groups for MoE.
 
     Returns:
-        ModelCommProcessGroups: The default process groups for MoE.
+        ProcessGroupCollection: The default process groups for MoE.
     """
-    model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
-    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
-    model_comm_pgs.cp = parallel_state.get_context_parallel_group()
-    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
-    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
-    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
-    return model_comm_pgs
+    pg_collection = ProcessGroupCollection()
+    pg_collection.ep = parallel_state.get_expert_model_parallel_group()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
+    return pg_collection

@@ -173,6 +173,7 @@ class _CudagraphGlobalRecord:
     """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and
     'record_bwd_graph."""
     cudagraph_record = []
+    cudagraph_inference_record = []
 
     @classmethod
     def record_fwd_graph(cls, runner, args, kwargs):
@@ -259,7 +260,7 @@ class _CudagraphGlobalRecord:
             if HAVE_TQDM:
                 progress_bar.set_description(progress_str)
             elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
-                print(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+                logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
 
             if optimize_transformer_layer_graph_buffers:
                 if graph_type == 'fwd':
@@ -309,7 +310,7 @@ class _CudagraphGlobalRecord:
                 - mem_stats_start["reserved_bytes.all.current"]
             ),
         }
-        print(
+        logger.info(
             "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
             "allocated %s, reserved %s."
             % (
@@ -408,7 +409,7 @@ class _CudagraphRecordNode(torch.autograd.Function):
 
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
-    cudagraph io and fp8 if used."""
+    cudagraph io and fp8/fp4 if used."""
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -430,7 +431,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
-        if runner.fp8_enabled:
+        if runner.fp8_enabled or runner.fp4_enabled:
             for m in runner.base_module.modules():
                 if isinstance(m, TransformerEngineBaseModule):
                     m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
@@ -481,8 +482,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.bwd_graph.replay()
         runner.status = _GraphStatus.FWD_READY
 
-        # Update FP8 scale factors if needed
-        if runner.fp8_enabled and ctx.is_first_fp8_module:
+        # Update FP8/FP4 scale factors if needed
+        if (runner.fp8_enabled or runner.fp4_enabled) and ctx.is_first_fp8_module:
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
 
         # If using gradient_accumulation_fusion, whenever `main_grad` is calculated
@@ -547,17 +548,25 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fuse_wgrad_accumulation = False
         self.backward_retain_grad = False
         self.fp8_enabled = False
+        self.fp4_enabled = False
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 2
         if isinstance(self.base_module.config, TransformerConfig):
             self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.fp8_enabled = self.base_module.config.fp8 is not None
+            self.fp4_enabled = self.base_module.config.fp4 is not None
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+            if self.fp4_enabled:
+                from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
+
+                self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
         # Decide whether to reuse the input and output buffer, and if so,
@@ -587,29 +596,20 @@ class _CudaGraphRunner(torch.nn.Module):
 
         return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
 
-    def run_module_forward(self, args, kwargs, *, graph=None, pool=None):
-        """Run module forward, using given graph and memory pool."""
+    def get_fp4_context(self):
+        """Return a new fp4 context in cudagraph mode."""
+        from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
 
-        inference_context = kwargs.get("inference_context", None)
+        return get_fp4_context(self.base_module.config, self.base_module.layer_number - 1)
 
-        # Initialize inference context.
-        if inference_context and inference_context.is_dynamic_batching():
-            num_warmup_requests = kwargs["hidden_states"].size(0)
-            inference_context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
-
-        context = (
-            torch.cuda.graph(cuda_graph=graph, pool=pool) if graph is not None else nullcontext()
-        )
-
-        # Module forward.
-        with context:
-            outputs = self.base_module.forward(*args, **kwargs)
-
-        # Reset inference context.
-        if inference_context and inference_context.is_dynamic_batching():
-            inference_context.reset()
-
-        return outputs
+    def get_quantization_context(self):
+        """Return appropriate quantization context (FP8 or FP4) in cudagraph mode."""
+        if self.fp8_enabled:
+            return self.get_fp8_context()
+        elif self.fp4_enabled:
+            return self.get_fp4_context()
+        else:
+            return nullcontext()
 
     def create_fwd_graph(self, args, kwargs, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
@@ -628,6 +628,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, 'main_grad')
             ]
 
+        saved_fp8_tensors = None
+
         if self.fp8_enabled:
             if is_te_min_version("1.13.0"):
                 saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp8_recipe)
@@ -635,6 +637,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 saved_fp8_tensors = save_fp8_tensors(
                     [self.base_module], self.fp8_recipe.amax_history_len
                 )
+        elif self.fp4_enabled:
+            if is_te_min_version("2.7.0.dev0"):
+                saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp4_recipe)
+            else:
+                raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
         if clone_inputs:
             args, kwargs = self.zero_out_tensors(args, kwargs)
@@ -650,8 +657,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
-            with self.get_fp8_context():
-                outputs = self.run_module_forward(args, kwargs)
+            with self.get_quantization_context():
+                outputs = self.base_module.forward(*args, **kwargs)
             if self.training and torch.is_grad_enabled():
                 if isinstance(outputs, torch.Tensor):
                     outputs = (outputs,)
@@ -666,11 +673,12 @@ class _CudaGraphRunner(torch.nn.Module):
                     allow_unused=True,
                 )
 
-        with self.get_fp8_context():
+        with self.get_quantization_context():
             torch.cuda.synchronize()
-            outputs = self.run_module_forward(
-                args, kwargs, graph=self.fwd_graph, pool=self.fwd_mempool
-            )
+            with torch.cuda.graph(
+                self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
+            ):
+                outputs = self.base_module.forward(*args, **kwargs)
 
         # save cudagraph output buffer
         if isinstance(outputs, torch.Tensor):
@@ -694,12 +702,19 @@ class _CudaGraphRunner(torch.nn.Module):
                     ), "Error restoring grads while cudagraphing!"
                     param.main_grad.copy_(saved_grad)
 
-        if self.fp8_enabled:
+        if self.fp8_enabled or self.fp4_enabled:
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
         # Unfreeze GC.
         if freeze_gc:
             gc.unfreeze()
+
+            # gc.collect() drops references to unreachable tensors created during capture,
+            # returning their storage to the allocator to avoid a slowdown during replay. However,
+            # it forces expensive global garbage collection, so must be done only on the last layer
+            # per-device to avoid slowing down graph creation.
+            if self.is_last_layer:
+                gc.collect()
 
     def create_bwd_graph(self, static_grad_outputs=None):
         """Create a bwd cudagraph for this runner. Should be called inside
@@ -727,7 +742,9 @@ class _CudaGraphRunner(torch.nn.Module):
                 static_grad_outputs = (static_grad_outputs,)
 
         torch.cuda.synchronize()
-        with torch.cuda.graph(self.bwd_graph, pool=self.bwd_mempool):
+        with torch.cuda.graph(
+            self.bwd_graph, pool=self.bwd_mempool, capture_error_mode="thread_local"
+        ):
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -767,6 +784,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # Unfreeze GC.
         if freeze_gc:
             gc.unfreeze()
+
+            if self.is_first_layer:
+                gc.collect()
 
     def get_input_grads_with_dummy_flags(self):
         """Get the inputs grads that are returned by the bwd cudagraph call. If using grad accum
@@ -813,7 +833,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
-            if not self.is_first_layer:
+            if self.is_transformer_decoder_layer and not self.is_first_layer:
                 # transformer layers hidden_states are already saved as the output of the previous
                 # layer's cudagraph so avoid saving again
                 kwargs_copy = dict(kwargs)
@@ -1015,7 +1035,7 @@ class CudaGraphManager(torch.nn.Module):
 
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
-                pooling, graph retention, gradient accumulation, FP8, and warmup steps.
+                pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
             share_cudagraph_io_buffers (bool, optional): (DEPRECATED, will be replaced by
                 config.cuda_graph_share_io_buffers) If None (default) or True, enables
                 buffer reuse optimizations for transformer and mamba layers. If False,
@@ -1038,13 +1058,14 @@ class CudaGraphManager(torch.nn.Module):
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
 
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-                "a crash due to illegal memory access or other undefined behaviour."
-            )
+        assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+            "a crash due to illegal memory access or other undefined behaviour."
+        )
 
         self.cudagraph_runners = []
+        self.inference_cudagraphs_lookup_table = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
         # Without pipeline parallelism, microbatches execute one at a time.
@@ -1078,6 +1099,14 @@ class CudaGraphManager(torch.nn.Module):
         # capture, so change to a side stream.
         self.stream = torch.cuda.current_stream()
         torch.cuda.set_stream(torch.cuda.Stream())
+
+    def set_is_first_microbatch(self, is_first_microbatch: bool):
+        """Update the is_first_microbatch flag for weight caching.
+
+        Args:
+            is_first_microbatch (bool): Whether this is the first microbatch in the step.
+        """
+        self.is_first_microbatch = is_first_microbatch
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -1119,15 +1148,27 @@ class CudaGraphManager(torch.nn.Module):
             bwd_mempool = CudaGraphManager.bwd_mempool
 
         if self.reuse_cudagraphs:
-            runner = next(
-                (
-                    r
-                    for r in self.cudagraph_runners
-                    if r.status == _GraphStatus.FWD_READY
-                    and not r.get_mismatch_errors(args, kwargs)
-                ),
-                None,
-            )
+            is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            if is_inference_mode:
+                batch_size = kwargs['hidden_states'].shape[0]
+                is_decode_only = kwargs["inference_context"].is_decode_only()
+                # Attempt to retrieve the corresponding runner from the lookup table.
+                # The table is keyed on (batch_size, is_decode_only).
+                # It returns None if no match is found, in which case a new runner is created
+                # and cached in the lookup table.
+                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+            else:
+                # Todo: For training, we could also cache runners based on input shape.
+                runner = next(
+                    (
+                        r
+                        for r in self.cudagraph_runners
+                        if r.status == _GraphStatus.FWD_READY
+                        and not r.get_mismatch_errors(args, kwargs)
+                    ),
+                    None,
+                )
+
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
                     assert False
@@ -1141,6 +1182,11 @@ class CudaGraphManager(torch.nn.Module):
                         self.share_cudagraph_io_buffers,
                     )
                     self.cudagraph_runners.append(runner)
+                    if is_inference_mode:
+                        # Cache the newly created runner in the inference lookup table.
+                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                            runner
+                        )
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1169,8 +1215,10 @@ class CudaGraphManager(torch.nn.Module):
             args (tuple):  The positional args to be passed to the module.
 
             kwargs (dict):  The keyword args to be passed to the module.
-
         """
+        # Set the is_first_microbatch flag on the megatron module if it's the first microbatch
+        if self.is_first_microbatch and hasattr(megatron_module, 'set_is_first_microbatch'):
+            megatron_module.set_is_first_microbatch()
 
         if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
@@ -1192,10 +1240,49 @@ class CudaGraphManager(torch.nn.Module):
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
-                # Inference generation mode
+                # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
                 runner.eval()
-                out = runner.record_graph_capture(args, kwargs)
+
+                if not runner.fwd_graph_recorded:
+                    # Reuse graph input-output buffers for inference
+                    local_args, local_kwargs = args, kwargs
+                    if runner.reuse_input_output_buffer and not runner.is_first_layer:
+                        # Find previous layer's runner in the global record
+                        try:
+                            previous_runner = next(
+                                r
+                                for r in _CudagraphGlobalRecord.cudagraph_inference_record
+                                if (
+                                    r[0].base_module.layer_number
+                                    == runner.base_module.layer_number - 1
+                                    and r[0].fwd_graph is not None
+                                    and ArgMetadata(r[3]['hidden_states'])
+                                    == ArgMetadata(kwargs['hidden_states'])
+                                )
+                            )
+                            # Replace the hidden states from previous layer's output buffer
+                            local_kwargs = dict(kwargs)
+                            local_kwargs['hidden_states'] = previous_runner[0].fwd_graph_outputs[0]
+                        except StopIteration:
+                            # No match found for previous layer, continue with no buffer reuse
+                            pass
+
+                    clone_inputs = not (
+                        runner.reuse_input_output_buffer and not runner.is_first_layer
+                    )
+                    runner.create_fwd_graph(local_args, local_kwargs, clone_inputs=clone_inputs)
+                    runner.fwd_graph_recorded = True
+                    runner.cudagraph_created = True
+
+                    # Record this to the global execution record
+                    _CudagraphGlobalRecord.cudagraph_inference_record.append(
+                        (runner, "fwd", args, kwargs)
+                    )
+
+                # Now replay the graph
+                out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+
             elif self.training:
                 # Training mode
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
@@ -1225,15 +1312,20 @@ def _layer_is_graphable(layer, config):
     """
 
     # import modules here to avoid a circular import
+    from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
+    if isinstance(layer, MambaLayer) and config.cuda_graph_scope == "full":
+        # mamba layer.
+        return True
     if isinstance(layer, TransformerLayer):
         if config.cuda_graph_scope == 'attn':
             if not (
                 isinstance(layer.self_attention, IdentityOp)
                 and isinstance(layer.cross_attention, IdentityOp)
             ):
+                # attn layer.
                 return True
         else:
             return True
@@ -1251,10 +1343,16 @@ class TECudaGraphHelper:
 
     def __init__(self, model, config, seq_length, micro_batch_size, optimizers=[]):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
+        assert (
+            config.cuda_graph_impl == "transformer_engine"
+        ), "Option cuda_graph_impl=transformer_engine not enabled."
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+            "a crash due to illegal memory access or other undefined behaviour."
+        )
         assert config.cuda_graph_scope != "full_iteration", (
-            "full_iteration cuda graph is not supported for --external-cuda-graph. "
-            "Please use --enable-cuda-graph instead."
+            "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
+            "Please use cuda_graph_impl=local instead."
         )
         assert config.cuda_graph_scope in [
             'full',
@@ -1266,16 +1364,15 @@ class TECudaGraphHelper:
         self.seq_length = seq_length
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
-
-        # Get the number of models chunks and microbatches.
         self.num_model_chunks = len(model)
-        self.num_microbatches = get_num_microbatches()
 
         # Get callables with captureable layers.
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
         self.callables_per_chunk = []
+        self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
+        self.flattened_callables_is_mtp = []
         for chunk_number, model_chunk in enumerate(model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -1284,9 +1381,11 @@ class TECudaGraphHelper:
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
-                    logger,
-                    logging.DEBUG,
-                    f'Rank {torch.distributed.get_rank()}: '
+                    logger=logger,
+                    tp_group=None,
+                    dp_cp_group=None,
+                    level=logging.DEBUG,
+                    msg=f'Rank {torch.distributed.get_rank()}: '
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
@@ -1296,21 +1395,25 @@ class TECudaGraphHelper:
                 else:
                     num_mtp_layers = 0
                 num_graphable_layers = 0
-                callables = []
+                callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
                     if _layer_is_graphable(layer, config):
                         num_graphable_layers += 1
                         callables.append(layer)
+                        callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
                     if _layer_is_graphable(layer, config):
                         num_graphable_layers += 1
                         callables.append(layer)
+                        callables_is_mtp.append(True)
                 log_on_each_pipeline_stage(
-                    logger,
-                    logging.DEBUG,
-                    f'Rank {torch.distributed.get_rank()}: '
+                    logger=logger,
+                    tp_group=None,
+                    dp_cp_group=None,
+                    level=logging.DEBUG,
+                    msg=f'Rank {torch.distributed.get_rank()}: '
                     f'{num_decoder_layers} decoder layers and {num_mtp_layers} MTP layers in '
                     f'model chunk {chunk_number}. {num_graphable_layers} graphable layers.',
                 )
@@ -1319,16 +1422,21 @@ class TECudaGraphHelper:
                     self.chunks_with_decoder.append(chunk_with_decoder)
                     self.num_layers_per_chunk.append(num_graphable_layers)
                     self.callables_per_chunk.append(callables)
+                    self.callables_per_chunk_is_mtp.append(callables_is_mtp)
                     self.flattened_callables.extend(callables)
+                    self.flattened_callables_is_mtp.extend(callables_is_mtp)
                 else:
                     self.chunks_with_decoder.append(None)
                     self.num_layers_per_chunk.append(0)
                     self.callables_per_chunk.append([])
+                    self.callables_per_chunk_is_mtp.append([])
 
         log_on_each_pipeline_stage(
-            logger,
-            logging.INFO,
-            f'Rank {torch.distributed.get_rank()}: '
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
@@ -1363,26 +1471,36 @@ class TECudaGraphHelper:
             if chunk_with_decoder is None:
                 continue
             layers = self.callables_per_chunk[chunk_number]
-            for _ in range(self.num_microbatches):
+            for _ in range(get_num_microbatches()):
                 for layer in layers:
                     static_inputs = layer.get_layer_static_inputs(
                         self.seq_length, self.micro_batch_size
+                    )
+
+                    from megatron.core.transformer.identity_op import IdentityOp
+                    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+                    contains_self_attn = isinstance(layer, TransformerLayer) and not isinstance(
+                        layer.self_attention, IdentityOp
                     )
                     if is_te_min_version("1.10.0"):
                         # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                         hidden_states = static_inputs.pop("hidden_states")
                         sample_args.append((hidden_states,))
-                        rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
-                        if rotary_pos_emb is not None:
-                            static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                        if contains_self_attn:
+                            rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
+                            if rotary_pos_emb is not None:
+                                static_inputs["rotary_pos_emb"] = rotary_pos_emb
                         sample_kwargs.append(static_inputs)
-                    else:
+                    elif contains_self_attn:
                         sample_args.append(
                             (
                                 static_inputs.pop("hidden_states"),
                                 static_inputs.pop("attention_mask"),
                             )
                         )
+                    else:
+                        sample_args.append((static_inputs.pop("hidden_states"),))
 
         # Get the PP and VPP scheduling order.
         from megatron.core.pipeline_parallel.schedules import (
@@ -1392,13 +1510,13 @@ class TECudaGraphHelper:
         )
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-            self.num_microbatches,
+            get_num_microbatches(),
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
             False,
         )
         schedule_table = get_schedule_table(
-            self.num_microbatches,
+            get_num_microbatches(),
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
         )
@@ -1406,7 +1524,11 @@ class TECudaGraphHelper:
             num_warmup_microbatches, self.num_model_chunks, schedule_table
         )
         log_on_each_pipeline_stage(
-            logger, logging.DEBUG, f'Rank {torch.distributed.get_rank()}: ORDER {order}'
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.DEBUG,
+            msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
 
         def get_make_graphed_callables_kwargs():
@@ -1414,21 +1536,45 @@ class TECudaGraphHelper:
 
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
-                # of layers per chunk and optimizes the graph memory usage.
+                # of layers per chunk.
                 kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
+            if is_te_min_version("2.7.0"):
+                # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
+                # by reusing input/output data buffers between graphs.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
 
+            from megatron.core.fp4_utils import get_fp4_recipe
             from megatron.core.fp8_utils import get_fp8_recipe
 
-            if self.config.fp8:
-                kwargs['fp8_enabled'] = True
-                kwargs['fp8_recipe'] = get_fp8_recipe(self.config)
-                # fp8 weight caching will be ignored by TE if cudagraph doesn't capture attn,
-                # even if we set it to True in the arguments. So we just pass a False in this case.
-                kwargs['fp8_weight_caching'] = 'attn' in self.config.cuda_graph_scope
+            if self.config.fp8 or self.config.fp4:
+                # FP4 and FP8 are mutually exclusive, so use fp8_* kwargs for FP4 too
+                # since TE currently uses fp8_autocast for both FP8 and FP4 quantization
+
+                def _get_fp8_enabled():
+                    if is_te_min_version("2.8.0"):
+                        from megatron.core.fp8_utils import is_first_last_bf16_layer
+
+                        fp8_enabled = []
+                        for callable, is_mtp in zip(
+                            self.flattened_callables, self.flattened_callables_is_mtp
+                        ):
+                            fp8_enabled.append(
+                                not is_first_last_bf16_layer(
+                                    self.config, callable.layer_number - 1 if not is_mtp else -1
+                                )
+                            )
+                        return tuple(fp8_enabled)
+                    else:
+                        return True
+
+                kwargs['fp8_enabled'] = _get_fp8_enabled()
+                kwargs['fp8_recipe'] = (
+                    get_fp8_recipe(self.config) if self.config.fp8 else get_fp4_recipe(self.config)
+                )
+                kwargs['fp8_weight_caching'] = True
                 if is_te_min_version("1.14.0") and parallel_state.model_parallel_is_initialized():
                     kwargs['fp8_group'] = parallel_state.get_amax_reduction_group(
                         with_context_parallel=True, tp_only_amax_red=self.config.tp_only_amax_red
@@ -1440,17 +1586,40 @@ class TECudaGraphHelper:
         kwargs = get_make_graphed_callables_kwargs()
         return sample_args, kwargs
 
-    def _finish_capturing(self):
+    def _start_capturing(self):
+        """
+        Start capturing CUDA Graphs.
+        """
+        torch.distributed.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        _set_capture_start()
+        log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
+        return time.time()
+
+    def _finish_capturing(self, start_time):
         """
         Finish capturing CUDA Graphs and clean up the related state.
         """
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Time spent in CUDA Graphs capture on rank {torch.distributed.get_rank()}: '
+            f'{time.time() - start_time}s',
+        )
+        _set_capture_end()
+
+        from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
         from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 
+        torch.distributed.barrier()
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         clear_aux_losses_tracker()
+        reset_model_temporary_tensors(self.config, self.model)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1458,14 +1627,7 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
-        _set_capture_start()
-
-        # Set back to the default stream. Graph will still be captured on a side stream in
-        # make_graphed_callables().
-        torch.cuda.set_stream(torch.cuda.default_stream())
-        torch.distributed.barrier()
-        start = time.time()
-        log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
+        start_time = self._start_capturing()
 
         # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
         sample_args, kwargs = self._get_cuda_graph_input_data()
@@ -1476,26 +1638,17 @@ class TECudaGraphHelper:
         for layers in self.callables_per_chunk:
             for layer_number, layer in enumerate(layers):
                 layer.cuda_graphs = []
-                for batch_number in range(self.num_microbatches):
+                for batch_number in range(get_num_microbatches()):
                     layer.cuda_graphs.append(
                         graphs[
-                            num_layers_accumulated * self.num_microbatches
+                            num_layers_accumulated * get_num_microbatches()
                             + batch_number * len(layers)
                             + layer_number
                         ]
                     )
             num_layers_accumulated += len(layers)
 
-        # Finish CUDA Graph capturing.
-        torch.distributed.barrier()
-        log_single_rank(
-            logger,
-            logging.INFO,
-            f'Time spent in CUDA Graphs capture on rank {torch.distributed.get_rank()}: '
-            f'{time.time() - start}s',
-        )
-        self._finish_capturing()
-        _set_capture_end()
+        self._finish_capturing(start_time)
 
     def cuda_graph_set_manual_hooks(self):
         """

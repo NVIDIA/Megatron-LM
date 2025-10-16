@@ -12,6 +12,7 @@ from torch import Tensor
 
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.transformer import TransformerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow (float, optional): Slow beta value for Yarn RoPE. Defaults to 1.
         mscale (float, optional): Mscale value for Yarn RoPE. Defaults to 1.
         mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
+        correction_range_round_to_int (bool): Whether to round dim range bounds to integer.
+            Defaults to True
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Defaults to None.
     """
@@ -105,6 +108,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow: float = 1.0,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        correction_range_round_to_int: bool = True,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.dim = kv_channels
@@ -115,6 +119,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
+        self.correction_range_round_to_int = correction_range_round_to_int
 
         device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
 
@@ -129,13 +134,13 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
             )
             super().__init__(
-                kv_channels,
-                rotary_percent,
-                rotary_interleaved,
-                seq_len_interpolation_factor,
-                rotary_base,
-                use_cpu_initialization,
-                cp_group,
+                kv_channels=kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                use_cpu_initialization=use_cpu_initialization,
+                cp_group=cp_group,
             )
 
             self._set_cos_sin_cache(
@@ -171,6 +176,27 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             offset,
             packed_seq,
         )
+        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, self.dim // 2).to(
+            device=self.inv_freq_extra.device, dtype=torch.float32
+        )
+        inv_freq = self.inv_freq_inter * (1 - inv_freq_mask) + self.inv_freq_extra * inv_freq_mask
+
+        seq = (
+            torch.arange(
+                max_seq_len, device=self.inv_freq_extra.device, dtype=self.inv_freq_extra.dtype
+            )
+            + offset
+        )
+
+        freqs = torch.outer(seq, inv_freq)
+
+        _mscale = _yarn_get_concentration_factor(
+            self.scaling_factor, self.mscale, self.mscale_all_dim
+        )
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        # emb [seq_length, .., dim]
+        emb = emb[:, None, None, :]
         if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
@@ -221,9 +247,13 @@ def _yarn_find_correction_range(
     dim: int,
     rotary_base: float = 10000,
     max_position_embeddings: int = 2048,
+    round_to_int: bool = True,
 ) -> tuple[int, int]:
-    low = math.floor(_yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings))
-    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings))
+    low = _yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings)
+    if round_to_int:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
@@ -240,3 +270,26 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+@lru_cache(maxsize=8)
+def _yarn_get_concentration_factor(
+    scaling_factor: float, mscale: float, mscale_all_dim: float
+) -> float:
+    """
+    Get the concentration factor (factor multiplied to the sine and cosine components of the
+    embedding). This factor is also known as attention factor, and sometimes homonymously known as
+    "mscale"
+    """
+    return float(
+        _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim)
+    )
+
+
+def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> float:
+    fields = ["yarn_rotary_scaling_factor", "yarn_mscale", "yarn_mscale_all_dim"]
+    if all(hasattr(config, f) for f in fields):
+        return _yarn_get_concentration_factor(
+            config.yarn_rotary_scaling_factor, config.yarn_mscale, config.yarn_mscale_all_dim
+        )
+    return 1.0

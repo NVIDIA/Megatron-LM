@@ -105,6 +105,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 25
+  --dist-ckpt-optim-fully-reshardable: true
   # Add initialization args
   --init-method-std: 0.02
   # Add logging args
@@ -118,8 +119,9 @@ MODEL_ARGS:
   --logging-level: 40
   --tensorboard-dir: ${TENSORBOARD_PATH}
   # CUDA Graph args
-  --external-cuda-graph: true
+  --cuda-graph-impl: transformer_engine
   --cuda-graph-scope: attn
+  --cuda-graph-warmup-steps: 0
   --te-rng-tracker: true
   # Add mixed precision args
   --bf16: true

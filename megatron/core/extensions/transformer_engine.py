@@ -1,12 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import inspect
 import io
 import os
 import pickle
 import warnings
-from collections.abc import Generator
-from typing import Any, Callable, List, Optional, Tuple, Type
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +14,6 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -27,7 +26,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -39,8 +38,12 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    is_layer_window_attention,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -846,7 +849,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -879,25 +882,23 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
-        if model_comm_pgs is None:
-            # For backward compatibility, remove in v0.14 and raise error
-            # raise ValueError("TEDotProductAttention was called without ModelCommProcessGroups")
-            model_comm_pgs = ModelCommProcessGroups(
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
             assert hasattr(
-                model_comm_pgs, "tp"
-            ), "TEDotProductAttention model_comm_pgs must have tp pg"
+                pg_collection, "tp"
+            ), "TEDotProductAttention pg_collection must have tp pg"
             assert hasattr(
-                model_comm_pgs, "cp"
-            ), "TEDotProductAttention model_comm_pgs must have cp pg"
+                pg_collection, "cp"
+            ), "TEDotProductAttention pg_collection must have cp pg"
             if cp_comm_type == "a2a+p2p":
                 assert hasattr(
-                    model_comm_pgs, "hcp"
-                ), "TEDotProductAttention model_comm_pgs must have hierarchical cp pg"
+                    pg_collection, "hcp"
+                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -914,9 +915,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
-            extra_kwargs["cp_group"] = model_comm_pgs.cp
+            extra_kwargs["cp_group"] = pg_collection.cp
             extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
-                model_comm_pgs.cp
+                pg_collection.cp
             )
             extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
             if is_te_min_version("1.10.0"):
@@ -942,7 +943,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     f"Currently set to: {os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', 'not set')}."
                 )
 
-        if config.window_size is not None:
+        if is_layer_window_attention(
+            config.window_size, config.window_attn_skip_freq, layer_number
+        ):
             # Check version
             assert is_te_min_version("1.2.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
@@ -960,6 +963,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             extra_kwargs["softmax_scale"] = softmax_scale
         else:
             kv_channels = self.config.kv_channels
+
+        if self.config.softmax_type != "vanilla":
+            assert is_te_min_version("2.8.0"), (
+                f"Transformer-Engine v{get_te_version()} must be >= 2.8.0 to support"
+                "`softmax_type`."
+            )
+            extra_kwargs["softmax_type"] = self.config.softmax_type
 
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
@@ -990,7 +1000,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             get_rng_state_tracker=(
                 get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
             ),
-            tp_group=model_comm_pgs.tp,
+            tp_group=pg_collection.tp,
             layer_number=layer_number,
             **extra_kwargs,
         )
@@ -1023,6 +1033,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 core_attention_bias_type="post_scale_bias", core_attention_bias=attention_bias
             )
 
+        if attn_mask_type == AttnMaskType.no_mask and self.config.window_size is not None:
+            if (qkv_format == "bshd" and query.size(1) == 1) or (
+                qkv_format == "sbhd" and query.size(0) == 1
+            ):
+                #  need to change mask type for SWA inference decode stage.
+                attn_mask_type = AttnMaskType.causal_bottom_right
         if self.te_forward_mask_type:
             if qkv_format == "thd" and is_te_min_version("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
@@ -1472,216 +1488,285 @@ else:
 
 if HAVE_TE and is_te_min_version("1.13.0"):
 
-    class TEFusedMLP(te.pytorch.ops.Sequential):
-        """A fused MLP implementation using Transformer Engine's operation-based API."""
+    class TEFusedMLP(MLP):
+        """MLP wrapper using Transformer Engine's operation-based API."""
 
-        # Mapping from (activation_func, gated_linear_unit) to TE
-        # activation operation
-        _activation_types: dict[tuple[Callable, bool], te.pytorch.ops.FusibleOperation] = {
-            (F.gelu, False): te.pytorch.ops.GELU,
-            (F.gelu, True): te.pytorch.ops.GEGLU,
-            (F.silu, True): te.pytorch.ops.SwiGLU,
-            (F.relu, False): te.pytorch.ops.ReLU,
-            (F.relu, True): te.pytorch.ops.ReGLU,
-        }
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
 
-        def __init__(
-            self,
-            config: TransformerConfig,
-            *,
-            is_expert: bool = False,
-            input_size: Optional[int] = None,
-            ffn_hidden_size: Optional[int] = None,
-            tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        ):
-            self.config: TransformerConfig = config
+            # Fused implementation
+            self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
 
-            # MoE is not supported
-            # Note: This option is for compatibility with MLP class
-            if is_expert:
-                raise ValueError(
-                    "Transformer Engine operation-based API does not support mixture-of-experts"
-                )
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Construct fused module matching MLP."""
 
-            # Tensor-parallel group
-            tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+            # Container for fusible ops
+            fused_impl = te.pytorch.ops.Sequential()
+
+            # Tensor parallelism configuration
             tp_world_size = get_tensor_model_parallel_world_size()
+            tp_group = None
+            if tp_world_size > 1:
+                tp_group = get_tensor_model_parallel_group()
 
-            # Layer sizes
-            if ffn_hidden_size is None:
-                warnings.warn(
-                    "MLP requires ffn_hidden_size, but it was not provided. Using "
-                    "config.ffn_hidden_size by default.",
-                    DeprecationWarning,
-                    stacklevel=2,
+            # RNG state
+            rng_state_tracker_function = None
+            if get_cuda_rng_tracker().is_initialized():
+                rng_state_tracker_function = get_cuda_rng_tracker
+
+            # Check submodule types
+            if not isinstance(self.linear_fc1, te.pytorch.LayerNormLinear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC1 to be "
+                    "Transformer Engine LayerNormLinear, but found "
+                    f"{self.linear_fc1.__class__.__name__}."
                 )
-                ffn_hidden_size = config.ffn_hidden_size
-            fc1_in_size = input_size if input_size != None else config.hidden_size
-            fc1_out_size = 2 * ffn_hidden_size if config.gated_linear_unit else ffn_hidden_size
-            fc2_in_size = ffn_hidden_size
-            fc2_out_size = fc1_in_size
+            if not isinstance(self.linear_fc2, te.pytorch.Linear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC1 to be "
+                    "Transformer Engine Linear, but found "
+                    f"{self.linear_fc2.__class__.__name__}."
+                )
 
-            # Linear ops
-            fc1_op = te.pytorch.ops.Linear(
-                in_features=fc1_in_size,
-                out_features=fc1_out_size,
+            # Norm op
+            norm_type = self.linear_fc1.normalization
+            norm_shape = self.linear_fc1.weight.size(1)
+            kwargs = {
+                "eps": self.linear_fc1.eps,
+                "device": "meta",
+                "dtype": self.linear_fc1.layer_norm_weight.dtype,
+                "zero_centered_gamma": self.linear_fc1.zero_centered_gamma,
+            }
+            op = None
+            if norm_type == "LayerNorm":
+                op = te.pytorch.ops.LayerNorm(norm_shape, **kwargs)
+                op.weight = self.linear_fc1.layer_norm_weight
+                op.bias = self.linear_fc1.layer_norm_bias
+            elif norm_type == "RMSNorm":
+                op = te.pytorch.ops.RMSNorm(norm_shape, **kwargs)
+                op.weight = self.linear_fc1.layer_norm_weight
+            else:
+                raise ValueError(f"Unsupported normalization ({norm_type})")
+            fused_impl.append(op)
+
+            # FC1 linear op
+            weight = self.linear_fc1.weight
+            userbuffers_options = None
+            if self.linear_fc1.config.tp_comm_overlap and self.linear_fc1.ub_name is not None:
+                userbuffers_options = {"comm_name": self.linear_fc1.ub_name}
+            op = te.pytorch.ops.BasicLinear(
+                weight.size(1),
+                weight.size(0) * tp_world_size,
+                device="meta",
+                dtype=weight.dtype,
                 tensor_parallel_mode="column" if tp_world_size > 1 else None,
                 tensor_parallel_group=tp_group,
-                sequence_parallel=config.sequence_parallel,
-                rng_state_tracker_function=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-                ),
-                bias=config.add_bias_linear,
+                sequence_parallel=self.linear_fc1.sequence_parallel,
+                rng_state_tracker_function=rng_state_tracker_function,
+                accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+                userbuffers_options=userbuffers_options,
             )
-            fc2_op = te.pytorch.ops.Linear(
-                in_features=fc2_in_size,
-                out_features=fc2_out_size,
-                tensor_parallel_mode="row" if tp_world_size > 1 else None,
-                tensor_parallel_group=tp_group,
-                sequence_parallel=config.sequence_parallel,
-                rng_state_tracker_function=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-                ),
-                bias=config.add_bias_linear,
-            )
+            op.weight = weight
+            fused_impl.append(op)
 
-            # Normalization op
-            norm_type: Type[te.pytorch.ops.FusibleOperation]
-            if config.normalization == "LayerNorm":
-                norm_type = te.pytorch.ops.LayerNorm
-            elif config.normalization == "RMSNorm":
-                norm_type = te.pytorch.ops.RMSNorm
-            else:
-                raise ValueError(f"Unsupported normalization: {config.normalization}")
-            norm_op = norm_type(
-                fc1_in_size,
-                eps=config.layernorm_epsilon,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-            )
+            # FC1 bias op
+            bias = self.linear_fc1.bias
+            if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+                bias = None
+            if bias is not None:
+                op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
+                op.bias = bias
+                fused_impl.append(op)
 
             # Activation op
-            activation_type = TEFusedMLP._activation_types.get(
-                (config.activation_func, config.gated_linear_unit)
+            op = self._make_activation_op(
+                self.activation_func,
+                self.config.gated_linear_unit,
+                self.config.activation_func_fp8_input_store,
             )
-            if activation_type is None:
+            fused_impl.append(op)
+
+            # FC2 linear op
+            weight = self.linear_fc2.weight
+            userbuffers_options = None
+            if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
+                userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
+            op = te.pytorch.ops.BasicLinear(
+                weight.size(1),
+                weight.size(0),
+                device="meta",
+                dtype=weight.dtype,
+                rng_state_tracker_function=rng_state_tracker_function,
+                accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+                userbuffers_options=userbuffers_options,
+            )
+            op.weight = weight
+            fused_impl.append(op)
+            if tp_world_size > 1:
+                if self.linear_fc2.sequence_parallel:
+                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+                else:
+                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
+
+            # FC2 bias op
+            if not self.linear_fc2.te_return_bias:
+                bias = self.linear_fc2.bias
+                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+                    bias = None
+                if bias is not None:
+                    op = te.pytorch.ops.Bias(bias.numel(), device="meta", dtype=bias.dtype)
+                    op.bias = bias
+                    fused_impl.append(op)
+
+            # Emulate submodule forward hooks if needed
+            self._register_hooks_on_fused_impl(fused_impl)
+
+            return fused_impl
+
+        def _make_activation_op(
+            self, activation_func: Callable, gated_linear_unit: bool, cache_quantized_input: bool
+        ) -> te.pytorch.ops.FusibleOperation:
+            """Construct activation op."""
+
+            # Get op type
+            op_type = None
+            if (activation_func, gated_linear_unit) == (F.gelu, False):
+                op_type = te.pytorch.ops.GELU
+            elif (activation_func, gated_linear_unit) == (F.gelu, True):
+                op_type = te.pytorch.ops.GEGLU
+            elif (activation_func, gated_linear_unit) == (F.silu, False):
+                if not is_te_min_version("2.8.0"):
+                    raise NotImplementedError("SiLU activation requires Transformer Engine 2.8+")
+                op_type = te.pytorch.ops.SiLU
+            elif (activation_func, gated_linear_unit) == (F.silu, True):
+                op_type = te.pytorch.ops.SwiGLU
+            elif (activation_func, gated_linear_unit) == (F.relu, False):
+                op_type = te.pytorch.ops.ReLU
+            elif (activation_func, gated_linear_unit) == (F.relu, True):
+                op_type = te.pytorch.ops.ReGLU
+
+            # Could not find corresponding activation op
+            if op_type is None:
                 raise NotImplementedError(
                     "Transformer Engine operation-based API does not support "
-                    f"activation_func={config.activation_func}, "
-                    f"gated_linear_unit={config.gated_linear_unit}"
+                    f"activation_func={activation_func}, "
+                    f"gated_linear_unit={gated_linear_unit}"
                 )
-            activation_kwargs = {}
+
+            # Construct op
+            kwargs = {}
             if is_te_min_version("2.3"):
-                activation_kwargs["cache_quantized_input"] = config.activation_func_fp8_input_store
-            activation_op = activation_type(**activation_kwargs)
+                kwargs["cache_quantized_input"] = cache_quantized_input
+            return op_type(**kwargs)
 
-            # Construct layers
-            super().__init__(norm_op, fc1_op, activation_op, fc2_op)
+        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
+            """Attempt to emulate submodule callback hooks.
 
-            # Register hooks to ensure checkpoint compatibility with unfused MLP
-            self._register_state_dict_compatibility_hooks()
-
-        def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
-            """Forward."""
-            out = super().forward(hidden_states)
-            bias = self[-1].bias  # Bias from last layer
-            return out, bias
-
-        def _register_state_dict_compatibility_hooks(self) -> None:
-            """Register hooks to ensure checkpoint compatibility with unfused MLP.
-
-            PyTorch modules automatically insert an "_extra_state" key
-            if a subclass overrides `get_extra_state` or
-            `set_extra_state`, even if the extra state is trivial.
-            Since the fused and unfused MLP modules have different
-            submodule structures, this means that their state dicts
-            are not strictly compatible. We work around by
-            manipulating the state dict to match the unfused MLP
-            module.
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
 
             """
 
-            def unfused_extra_state_keys(prefix: str) -> tuple[str, ...]:
-                """Extra state keys corresponding to unfused MLP state dict."""
-                return (f"{prefix}linear_fc1._extra_state", f"{prefix}linear_fc2._extra_state")
+            # Get submodule hooks
+            forward_pre_hooks = []
+            forward_post_hooks = []
+            backward_pre_hooks = []
+            backward_post_hooks = []
+            for submodule in self.modules():
+                for hook in submodule._forward_pre_hooks.values():
+                    forward_pre_hooks.append((submodule, hook))
+                for hook in submodule._forward_hooks.values():
+                    forward_post_hooks.append((submodule, hook))
+                for hook in submodule._backward_pre_hooks.values():
+                    backward_pre_hooks.append((submodule, hook))
+                for hook in submodule._backward_hooks.values():
+                    backward_post_hooks.append((submodule, hook))
 
-            def fused_extra_state_keys(module: TEFusedMLP, prefix: str) -> Generator[str]:
-                """Extra state keys corresponding to fused MLP state dict"""
-                for op_id, op in enumerate(module):
-                    if op.is_fused_op:
-                        for basic_op_id in range(len(op.basic_ops)):
-                            yield f"{prefix}{op_id}.basic_ops.{basic_op_id}._extra_state"
-                    else:
-                        yield f"{prefix}{op_id}._extra_state"
+            # Pre-forward hooks
+            # Note: DDP pre-forward hooks are safe since they do not
+            # interact with input tensor.
+            if forward_pre_hooks:
+                from megatron.core.distributed import distributed_data_parallel
 
-            def state_dict_post_hook(
-                module: TEFusedMLP, state_dict: dict[str, Any], prefix: str, local_metadata: dict
-            ) -> None:
-                """Convert state dict from fused MLP format to unfused MLP format."""
+                if any(
+                    inspect.getmodule(hook) != distributed_data_parallel
+                    for _, hook in forward_pre_hooks
+                ):
+                    warnings.warn(
+                        "TEFusedMLP module has a submodule with a pre-forward hook. "
+                        "TEFusedMLP module does not expose intermediate tensors, "
+                        "so the hook may have incorrect behavior if it attempts to "
+                        "access the input tensor."
+                    )
 
-                # Remove extra state keys for fused module
-                for key in fused_extra_state_keys(module, prefix):
-                    if key in state_dict:
-                        del state_dict[key]
+                def forward_pre_hook(module, *_) -> None:
+                    for submodule, hook in forward_pre_hooks:
+                        # Assume that hook does not interact with input
+                        ret = hook(submodule, None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                "TEFusedMLP module does not expose intermediate tensors, but "
+                                "submodule has pre-forward hook that modifies input tensor."
+                            )
 
-                # Add extra state keys for unfused module
-                for key in unfused_extra_state_keys(prefix):
-                    if key not in state_dict:
-                        state_dict[key] = None
+                fused_impl.register_forward_pre_hook(forward_pre_hook)
 
-            def load_state_dict_pre_hook(
-                module: TEFusedMLP,
-                state_dict: dict[str, Any],
-                prefix: str,
-                local_metadata: dict,
-                strict: bool,
-                missing_keys: list[str],
-                unexpected_keys: list[str],
-                error_msgs: list[str],
-            ) -> None:
-                """Convert state dict from unfused MLP format to fused MLP format"""
+            # Post-forward hooks
+            if forward_post_hooks:
+                warnings.warn(
+                    "TEFusedMLP module has a submodule with a post-forward hook. "
+                    "TEFusedMLP module does not expose intermediate tensors, "
+                    "so the hook may have incorrect behavior if it attempts to "
+                    "access the input or output tensors."
+                )
 
-                # Remove extra state keys for unfused module
-                for key in unfused_extra_state_keys(prefix):
-                    if key in state_dict:
-                        del state_dict[key]
-                    else:
-                        missing_keys.append(key)
+                def forward_post_hook(module, *_) -> None:
+                    for submodule, hook in forward_post_hooks:
+                        # Assume that hook does not interact with input or output
+                        ret = hook(submodule, None, None)
+                        if ret is not None:
+                            raise RuntimeError(
+                                "TEFusedMLP module does not expose intermediate tensors, but "
+                                "submodule has post-forward hook that modifies output tensor."
+                            )
 
-                # Add extra state keys for fused module
-                for key in fused_extra_state_keys(module, prefix):
-                    if key in state_dict:
-                        unexpected_keys.append(key)
-                    else:
-                        state_dict[key] = None
+                fused_impl.register_forward_hook(forward_post_hook)
 
-            # Register hooks
-            self.register_state_dict_post_hook(state_dict_post_hook)
-            self.register_load_state_dict_pre_hook(load_state_dict_pre_hook)
+            # Backward hooks
+            if backward_pre_hooks:
+                raise RuntimeError(
+                    "TEFusedMLP module does not support submodules with pre-backward hooks"
+                )
+            if backward_post_hooks:
+                raise RuntimeError(
+                    "TEFusedMLP module does not support submodules with post-backward hooks"
+                )
 
-        def sharded_state_dict(
-            self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
-        ) -> ShardedStateDict:
-            """FC1 is sharded along axis 0, FC2 is sharded along axis 1."""
+        def forward(self, hidden_states: torch.Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+            """Forward."""
 
-            # Get sharded state dict
-            state_dict = self.state_dict(prefix="", keep_vars=True)
-            sharded_state_dict = make_sharded_tensors_for_checkpoint(
-                state_dict,
-                prefix,
-                {"1.basic_ops.0.weight": 0, "1.basic_ops.1.bias": 0, "3.basic_ops.0.weight": 1},
-                sharded_offsets,
-            )
+            # Construct fused impl if needed
+            # Note: We initialize during the first forward pass in
+            # case the params are modified after the constructor.
+            # Note: The fused impl is stored in a tuple to avoid
+            # registering as a submodule.
+            if self._fused_impl is None:
+                self._fused_impl = (self._make_fused_impl(),)
 
-            # For gated activations, we split FC1 into two parts and
-            # shard separately
-            if self.config.gated_linear_unit:
-                from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+            # Apply fused impl
+            out = self._fused_impl[0](hidden_states)
 
-                for k, v in sharded_state_dict.items():
-                    if k in (f"{prefix}1.basic_ops.0.weight", f"{prefix}1.basic_ops.1.bias"):
-                        sharded_state_dict[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
+            # Return bias tensor if requested
+            bias = None
+            if self.linear_fc2.te_return_bias:
+                bias = self.linear_fc2.bias
+                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+                    bias = None
 
-            return sharded_state_dict
+            return out, bias
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
@@ -1799,13 +1884,23 @@ try:
     )
 
     def get_cpu_offload_context(
-        enabled, num_layers, model_layers, activation_offloading, weight_offloading
+        enabled,
+        num_layers,
+        model_layers,
+        activation_offloading,
+        weight_offloading,
+        double_buffering,
     ):
         """Get CPU offload context and sync function."""
         if is_te_min_version("2.5.0"):
             # Enables the additional double buffering switch for activations during LLM training
             context, sync_func = _get_cpu_offload_context(
-                enabled, num_layers, model_layers, activation_offloading, weight_offloading, True
+                enabled,
+                num_layers,
+                model_layers,
+                activation_offloading,
+                weight_offloading,
+                double_buffering,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(

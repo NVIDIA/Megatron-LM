@@ -340,11 +340,12 @@ def mcore_to_pyt_state_dict(
                 if sh_ten.allow_shape_mismatch and is_loading:
                     sh_ten.data.zero_()
 
-        if not sh_tens[0].has_regular_grid:
-            if not is_torch_min_version("2.6a0"):
-                raise CheckpointingException(
-                    f"Uneven sharding not supported for PyTorch version {get_torch_version()}"
-                )
+        is_pre_mcore_014_sh_ten = (
+            sh_tens[0].prepend_axis_num or sh_tens[0].flattened_range is not None
+        )
+        if (
+            not is_pre_mcore_014_sh_ten or not sh_tens[0].has_regular_grid
+        ) and is_torch_min_version("2.6a0"):
             assert sh_tens[0].flattened_range is None
             if len(sh_tens) > 1:
                 return LocalShardsContainer(
@@ -353,6 +354,10 @@ def mcore_to_pyt_state_dict(
             else:
                 return CheckpointableShardedTensor.from_sh_ten(sh_tens[0])
         else:
+            if not sh_tens[0].has_regular_grid and not is_torch_min_version("2.6a0"):
+                raise CheckpointingException(
+                    f"Uneven sharding not supported for PyTorch version {get_torch_version()}"
+                )
             torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(
                 sh_tens, rank, load_legacy_1d_flatten_tensors
             )
@@ -453,6 +458,15 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+@dataclass
+class MCoreMetadata(Metadata):
+    """Metadata with mcore specific data."""
+
+    # holds data related to flattened_range
+    # TODO: remove when flattened_range is properly removed
+    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
+
+
 @dataclass(frozen=True)
 class MCoreSavePlan(SavePlan):
     """SavePlan with MCore specific data."""
@@ -525,9 +539,10 @@ class MCoreSavePlanner(DefaultSavePlanner):
     def create_global_plan(self, all_plans: List[MCoreSavePlan]) -> Tuple[List[SavePlan], Metadata]:
         """Merges MCore data for all plans."""
         global_plan, metadata = super().create_global_plan(all_plans)
-        metadata.mcore_data = dict(
+        mcore_data = dict(
             ChainMap(*(plan.mcore_data for plan in all_plans))  # type: ignore[arg-type]
         )
+        metadata = MCoreMetadata(mcore_data=mcore_data, **vars(metadata))
         return global_plan, metadata
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
@@ -825,7 +840,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
-            torch.distributed.barrier()
 
         return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 

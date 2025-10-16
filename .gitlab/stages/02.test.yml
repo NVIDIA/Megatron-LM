@@ -36,7 +36,7 @@ wait_for_resources:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export NUM_CONCURRENT_JOBS
-    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
+    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID --target-branch $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
   rules:
     - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       when: never
@@ -76,7 +76,7 @@ test:unit_tests_configure:
         "--test-cases all"
         "--cluster dgxh100_coreweave"
         "--platform dgx_h100"
-        "--partition batch_short,batch"
+        "--partition batch"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job test:unit_tests_configure"
@@ -163,6 +163,12 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
     ENVIRONMENT: dev
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: never
+    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
+      when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -177,6 +183,12 @@ test:unit_tests_pyt(LTS)_mcore(legacy):
     ENVIRONMENT: lts
     TAG: legacy
   rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: never
+    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
+      when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -212,7 +224,12 @@ test:unit_tests_notify:
     - team/megatron
   script:
     - env
-    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
+        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
+      else
+        export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+      fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
@@ -228,7 +245,7 @@ test:unit_tests_notify:
     paths:
       - scripts
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
       when: always
     - when: never
 
@@ -397,7 +414,7 @@ test:safe_imports:
     - python -m pip install --no-cache-dir click
     - python .gitlab/scripts/check_imports.py --package-name megatron.core
   rules:
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'dev'
       when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true

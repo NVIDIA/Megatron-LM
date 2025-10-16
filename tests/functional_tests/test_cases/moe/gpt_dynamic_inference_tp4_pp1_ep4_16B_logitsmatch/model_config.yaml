@@ -64,7 +64,7 @@ MODEL_ARGS:
   --use-checkpoint-args: true
   --no-use-tokenizer-model-from-checkpoint-args: true
   --no-load-optim: true
-  --deterministic-mode: true
+  --deterministic-mode: true # moe will use different ops for determinism for inference
   --save-interval: 2000
   --temperature: 1.0
   --top_k: 1
