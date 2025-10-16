@@ -6,6 +6,7 @@ from itertools import cycle, repeat
 from typing import List, Tuple
 
 import torch
+import time
 
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -179,6 +180,8 @@ class DataParallelInferenceCoordinator:
             request: DynamicInferenceRequest = self.requests[request_id]
             # Handle chunked prefill similar to the engine logic
             if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
+                if request.timestamp_of_first_token is None:
+                    request.timestamp_of_first_token = time.perf_counter()
                 request.generated_tokens.append(token)
 
                 if request_log_probs is not None:
