@@ -68,6 +68,14 @@ def add_modelopt_args(parser):
         default=None,
         help='Path to distillation configuration yaml file.',
     )
+
+    group.add_argument(
+        '--teacher-model-config',
+        type=str,
+        default=None,
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+    )
+
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,

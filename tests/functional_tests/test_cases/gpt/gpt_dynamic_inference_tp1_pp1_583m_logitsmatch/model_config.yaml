@@ -54,6 +54,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 128 # originally 512
   --incoming-requests-per-step: 32
   --termination-id: -1
+  --use-flashinfer-fused-rope: true
 METRICS:
   - "generated_tokens"
   - "logprobs"

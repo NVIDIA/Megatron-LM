@@ -29,8 +29,11 @@ ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
-RUN bash -ex <<"EOF"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    bash -ex <<"EOF"
+    export NVTE_CUDA_ARCHS="90;100"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+    uv sync --only-group build
     uv sync --extra dev --extra mlm --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
@@ -48,7 +51,26 @@ RUN bash -ex <<"EOF"
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
 EOF
+
+# Install DeepEP
+COPY docker/patches/deepep.patch /workspace/deepep.patch
+RUN bash -ex <<"EOF"
+    cd /workspace
+    uv pip install nvidia-nvshmem-cu13
+    pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
+        ln -s libnvshmem_host.so.3 libnvshmem_host.so
+    popd
+
+    git clone --branch v1.2.1 https://github.com/deepseek-ai/DeepEP.git
+    pushd DeepEP
+        patch -p1 < /workspace/deepep.patch
+    popd
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
+    rm -rf DeepEP
+EOF
+
 COPY assets/ /opt/data/
+ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ##### For NVIDIANS only #####
 FROM main as jet

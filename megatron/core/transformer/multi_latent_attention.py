@@ -197,6 +197,7 @@ class MultiLatentAttention(Attention):
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
+        rotary_pos_cos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
         position_ids=None,
@@ -210,6 +211,7 @@ class MultiLatentAttention(Attention):
         assert (
             rotary_pos_cos is None and rotary_pos_sin is None
         ), "MLA does not support Flash Decoding"
+        assert not rotary_pos_cos_sin, "Flash-infer rope has not been tested with MLA."
         assert not (
             self.training and self.cache_mla_latents
         ), "cache_mla_latents conflicts with training."

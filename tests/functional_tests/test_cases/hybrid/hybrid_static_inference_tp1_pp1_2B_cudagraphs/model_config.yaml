@@ -65,7 +65,7 @@ MODEL_ARGS:
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
   --inference-max-requests: 1
-  --enable-cuda-graph: true
+  --cuda-graph-impl: local
   --te-rng-tracker: true
   --inference-rng-tracker: true
   --output-path: ${TENSORBOARD_PATH}

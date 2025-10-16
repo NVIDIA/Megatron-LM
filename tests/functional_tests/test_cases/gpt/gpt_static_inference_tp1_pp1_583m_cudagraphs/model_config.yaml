@@ -42,7 +42,7 @@ MODEL_ARGS:
   --return-log-probs: true
   --num-tokens-to-generate: 30
   --flash-decode: true
-  --enable-cuda-graph: true
+  --cuda-graph-impl: local
   --te-rng-tracker: true
   --inference-rng-tracker: true
   --inference-max-requests: 1
