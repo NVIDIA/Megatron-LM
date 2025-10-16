@@ -252,38 +252,12 @@ def get_synthetic_requests(args: Namespace, tokenizer: Any) -> list[Request]:
     prompt_tokens_list = [ max_prompt_tokens[:l] for l in prompt_lengths ]
     prompt_texts = [ tokenizer.detokenize(tt) for tt in prompt_tokens_list ]
 
-    # >>>
-    # pax({
-    #     "args.num_tokens_to_prompt" : args.num_tokens_to_prompt,
-    # }, "max_prompt_length, max_prompt_text, max_prompt_tokens", {
-    #     "prompt_lengths" : "%d / %s" % (len(prompt_lengths), prompt_lengths),
-    #     "prompt_tokens_list" : [
-    #         "%d[%d] / '%s' ... %s" % (prompt_lengths[i], len(tt), prompt_texts[i], tt)
-    #         for i, tt in enumerate(prompt_tokens_list)
-    #     ],
-    # })
-    # <<<
-
     # Init requests.
-    # >>>
-    # requests = [
-    #     Request("hi " * random.randint(*args.num_tokens_to_prompt), t, tokenizer)
-    #     for t in time_offsets
-    # ]
-    # +++
     assert len(prompt_texts) == len(time_offsets)
     requests = [
         Request(t, o, tokenizer)
         for t, o in zip(prompt_texts, time_offsets)
     ]
-    # <<<
-
-    # >>>
-    # pax("requests", {
-    #     "requests / 0" : requests[0],
-    #     "tokens" : [ "%d, '%s'" % (i, tokenizer.detokenize([i])) for i in requests[0].prompt_tokens ],
-    # })
-    # <<<
 
     return requests
 
@@ -390,10 +364,7 @@ def build_dynamic_engine_setup_prefix(
 
     # Buffer limits config
     buffer_limits_str = (
-        # >>>
-        # f"bf: {args.inference_dynamic_batching_active_buffer_size_gb:.0f} gb, "
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_active_buffer_size_gb*1024**3)}, "
-        # <<<
         f"{context.chunk_allocator.active_count} chunks "
         f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )

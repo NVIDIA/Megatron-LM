@@ -61,15 +61,6 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-# >>>
-from lutil import pax as _pax, get_mem_stats_str
-import builtins
-builtins.pax = _pax
-
-# def print_mem(key):
-#     print(f"+++++++++++ {key} ........... {get_mem_stats_str()}.")
-# <<<
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -135,82 +126,6 @@ def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> in
     return active_buffer_size_bytes
 
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# # >>>
-# @torch.inference_mode()
-# def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
-# # def get_inference_context_max_tokens(controller: torch.nn.Module) -> int:
-# # <<<
-#     """Estimate `max_tokens` for the context.
-
-#     This function performs a binary search over the number of input tokens and
-#     analyzes the latency to find the 'knee of the curve'.
-#     """
-
-#     import time
-
-#     # args = get_args()
-#     # model = GPTInferenceWrapper(model, args, inference_context="not-actually-set") # None)
-
-#     num_tokens_step = 1000
-#     num_tokens_min = num_tokens_step
-#     num_tokens_max = 24000 # 1000000
-#     time_map = {}
-#     # >>>
-#     # tbar = tqdm(range(num_tokens_min, num_tokens_max, num_tokens_step))
-#     tbar = tqdm([ 16384 ])
-#     # <<<
-#     # tbar = tqdm((3000,))
-#     # tbar = tqdm((3072,))
-#     # tbar = tqdm((1000,))
-#     # num_tokens_list = list(
-#     for num_tokens in tbar:
-#         tbar.set_description(f"num_tokens {num_tokens}")
-#         input_ids = torch.full(
-#             (num_tokens,),
-#             0,
-#             dtype=torch.long,
-#             device=torch.cuda.current_device(),
-#         ).unsqueeze(0)
-#         # position_ids = torch.arange(
-#         #     num_tokens,
-#         position_ids = torch.zeros(
-#             (num_tokens,),
-#             dtype=torch.long,
-#             device=torch.cuda.current_device(),
-#         ).unsqueeze(0)
-#         # result = model.run_one_forward_step(
-#         #     {
-#         #         "tokens": input_ids,
-#         #         "position_ids": position_ids,
-#         #         "attention_mask": None,
-#         #     }
-#         # )
-#         t = time.time()
-#         for _ in range(3):
-#             mem0 = torch.cuda.memory_stats()
-#             with torch.inference_mode():
-#                 result = model(
-#                     input_ids,
-#                     position_ids,
-#                     attention_mask=None,
-#                     inference_context=None,
-#                     runtime_gather_output=True,  # Inference should always gather the logits
-#                 )
-#             mem1 = torch.cuda.memory_stats()
-#             pax("mem0, mem1", {
-#                 "peak / 0" : mem0["allocated_bytes.all.peak"],
-#                 "peak / 1" : mem1["allocated_bytes.all.peak"],
-#             })
-#         t = time.time() - t
-#         time_map[num_tokens] = t
-#     print("~~ x ~~")
-#     [ print(x) for x in time_map.keys() ]
-#     print("~~ y ~~")
-#     [ print(y) for y in time_map.values() ]
-#     raise Exception("matplotlib.")
-#     return max_tokens
-# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
     """Estimate `max_tokens` for the context.
 
@@ -219,7 +134,6 @@ def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
     correlation between `max_tokens` and request throughput.
     """
     return 16384
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 def get_inference_context(
@@ -239,10 +153,6 @@ def get_inference_context(
         max_sequence_length = max_context_length + max_gen_length
     else:
         max_sequence_length = args.inference_max_seq_length
-    # >>>
-    # pax("max_context_length, max_gen_length",
-    #     "calculate_max_sequence_length_from_requests, max_sequence_length")
-    # <<<
 
     # Active buffer size & max tokens.
     active_buffer_size_bytes = get_inference_context_active_buffer_size_bytes(model)
@@ -438,10 +348,6 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
-    # >>>
-    # print_mem("initialize_megatron()")
-    # <<<
-
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
@@ -465,9 +371,6 @@ def main():
     model = get_model()
     requests = build_requests(args, tokenizer)
     context = get_inference_context(requests, sampling_params, model)
-    # >>>
-    # pax({"requests / len": len(requests)})
-    # <<<
     controller = get_inference_controller(model, context)
 
     # Validate all context_length's <= max_tokens.
@@ -489,11 +392,6 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
     )
-
-    # >>>
-    # print_mem("engine")
-    # exit()
-    # <<<
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
@@ -604,16 +502,6 @@ def main():
         if engine.capture_stats else
         "--"
     )
-    # >>>
-    # print(
-    #     f"{setup_prefix} … "
-    #     f"capture {capture_str} … "
-    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-    #     f"total time: {total_time:.3f}s … "
-    #     f"steps: {engine.step_count:d} … "
-    #     f"throughput: {throughput:.3f} tok/s"
-    # )
-    # +++
     print(" … ".join((
         f"{setup_prefix}",
         f"throughput: {throughput:.3f} tok/s",
@@ -622,7 +510,6 @@ def main():
         f"steps: {engine.step_count:d}",
         f"capture {capture_str}",
     )))
-    # <<<
     print("~~~")
 
     # Stop Nsight profiler.

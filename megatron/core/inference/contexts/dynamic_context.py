@@ -300,12 +300,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
-        # >>>
-        # pax({
-        #     "max_sequence_length" : self.max_sequence_length,
-        #     "max_kv_chunk_count" : self.max_kv_chunk_count,
-        # })
-        # <<<
         self.request_to_kv_chunk_ids = torch.full(
             (self.max_total_requests, self.max_kv_chunk_count),
             -1,
@@ -1195,44 +1189,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_chunk_count_avail = self.chunk_allocator.get_active_avail()
-            # >>>
-            # pax("active_chunk_count_avail")
-            # <<<
-
             paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
             paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
             paused_chunk_counts += 1 # +1 for newly added chunk
             paused_chunk_counts_cumsum = paused_chunk_counts.cumsum(dim=0)
-            # >>>
-            # resume_request_count = torch.nonzero(
-            #     paused_chunk_counts_cumsum <= active_chunk_count_avail
-            # ).numel()
-            # +++
             resume_request_count = min(
                 torch.nonzero(
                     paused_chunk_counts_cumsum <= active_chunk_count_avail
                 ).numel(),
                 self.chunk_allocator.total_avail,
             )
-            # <<<
-            # >>>
-            # if resume_request_count > self.chunk_allocator.total_avail:
-            #     pax({
-            #         "chunk_allocator" : self.chunk_allocator,
-            #         "active_used" : "%d / %d" % (
-            #             self.chunk_allocator.get_active_used(),
-            #             self.chunk_allocator.active_count,
-            #         ),
-            #         "paused_used" : "%d / %d" % (
-            #             self.chunk_allocator.get_paused_used(),
-            #             self.chunk_allocator.paused_count,
-            #         ),
-            #     }, "resume_request_count")
-            # <<<
-
-        # >>>
-        # newly_resumed_request_ids = self.request_ids[(self.paused_request_count - resume_request_count):self.paused_request_count]
-        # <<<
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
@@ -1245,9 +1211,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # requests are newly paused during this update.
         if newly_paused_request_ids is not None and resume_request_count > 0:
             newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
-            # >>>
-            # newly_resumed_request_ids = newly_resumed_request_ids[-resume_request_count:]
-            # <<<
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         # All these active requests are in decode phase, so they need only 1 token per request
@@ -1284,10 +1247,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 == 0
             ), "The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. "
 
-            # >>>
-            if resume_request_count > self.chunk_allocator.total_avail:
-                pax({"chunk_allocator": self.chunk_allocator}, "resume_request_count")
-            # <<<
+            assert resume_request_count <= self.chunk_allocator.total_avail
             chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,
@@ -1319,44 +1279,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_chunk[: self.active_token_count] = (
             self.request_last_kv_chunk_offset[self.paused_request_count : self.total_request_count]
         )
-
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # def get_request_str(i):
-        #     r = self.request_ids[i].item()
-        #     q = self.request_query_lengths[i].item()
-        #     kv = self.request_kv_length_offsets[i].item()
-        #     # pax("request_id")
-        #     return "%d[%d:%d]" % (r, q, kv)
-        # request_strs = [
-        #     get_request_str(i)
-        #     for i in range(self.total_request_count + finished_request_count)
-        # ]
-        # # pax("request_strs")
-        # request_str = "requests: %s -- %s -- %s" % (
-        #     ", ".join(request_strs[:self.paused_request_count]),
-        #     ", ".join(request_strs[self.paused_request_count:self.total_request_count]),
-        #     ", ".join(request_strs[self.total_request_count:(self.total_request_count + finished_request_count)]),
-        # )
-        # newly_str = "paused: %s, resumed: %s, finished: %s" % (
-        #     "--" if newly_paused_request_ids is None else newly_paused_request_ids.tolist(),
-        #     newly_resumed_request_ids.tolist(),
-        #     self.request_ids[self.total_request_count:(self.total_request_count + finished_request_count)].tolist(),
-        # )
-        # # alloc_str = "alloc: t %d/%d [ p %d/%d, a %d/%d ]" % (
-        # alloc_str = "alloc: t %d/%d [ a %d/%d ]" % (
-        #     self.chunk_allocator.total_count - self.chunk_allocator.total_avail - 1,
-        #     self.chunk_allocator.total_count - 1,
-        #     # self.chunk_allocator.get_paused_used(self),
-        #     # self.chunk_allocator.paused_count,
-        #     self.chunk_allocator.get_active_used(),
-        #     self.chunk_allocator.active_count,
-        # )
-        # print("++++++++++ %s" % " ..... ".join((
-        #     request_str,
-        #     # newly_str,
-        #     alloc_str,
-        # )))
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         return newly_paused_request_ids
 
