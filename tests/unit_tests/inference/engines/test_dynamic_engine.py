@@ -268,7 +268,6 @@ class TestDynamicInferenceEngine:
         if test_config.fp8:
             transformer_config.fp8 = "hybrid"
             transformer_config.fp8_recipe = "tensorwise"
-            # transformer_config.fp8_param = True
             layer_spec = get_gpt_layer_with_transformer_engine_spec()
         else:
             layer_spec = get_gpt_layer_local_spec()
