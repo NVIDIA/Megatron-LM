@@ -64,6 +64,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
 
 
     use_te = args.transformer_impl == "transformer_engine"
+
+    mtp_block_spec = None
     if args.mtp_num_layers is not None:
         assert args.spec is not None
         assert args.mtp_hybrid_override_pattern is not None, "We need to set the override hybrid pattern for MTP layers!"
