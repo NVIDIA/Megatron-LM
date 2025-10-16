@@ -420,7 +420,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @contextmanager
     @staticmethod
-    def suspend_resume_ctx(key: str, *, unified_memory_level: int, newline: bool = True) -> None:
+    def suspend_resume_ctx(key: str, *, unified_memory_level: int) -> None:
         """Context manager for of suspending and resuming the engine.
 
         This context manager records the time and memory usage when suspending
@@ -429,7 +429,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Args:
             key (str): Key that identifies caller (e.g., 'suspend' or 'resume').
-            newline (bool): Print newline at end of printout below.
 
         Return:
             None.
@@ -460,14 +459,17 @@ class DynamicInferenceEngine(AbstractEngine):
 
             process = psutil.Process()
             mem_info = process.memory_info()
-            total_mem_str = f"cpu: {mem_info.rss / 1024**3:.1f} gb, gpu: alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
-            print(
+            total_mem_str = ", ".join((
+                f"cpu: {mem_info.rss / 1024**3:.1f} gb",
+                f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
+                f"res {end_mem_res / 1024**3:.1f} gb",
+            ))
+            logging.info(
                 f"[rank {rank_str}] dynamic engine {key}, "
                 f"unified {unified_memory_level}, "
                 f"{dir_str} "
                 f"{relative_mem_str} in {relative_time_str} ... "
-                f"abs mem usage: {total_mem_str}",
-                end=".\n" if newline else "",
+                f"abs mem usage: {total_mem_str}"
             )
 
     def suspend(self):
@@ -502,7 +504,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
-            "resumed", unified_memory_level=self.unified_memory_level, newline=False
+            "resumed", unified_memory_level=self.unified_memory_level
         ):
 
             # Maintain references to requests before reset.
@@ -564,9 +566,11 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).
-        print(
-            f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f} capture {capture_time:.3f}."
-        )
+        logging.info(", ".join((
+            f"    > inner timing: alloc {alloc_time:.3f}",
+            f"add {add_time:.3f}",
+            f"capture {capture_time:.3f}.",
+        )))
 
         return futures
 
