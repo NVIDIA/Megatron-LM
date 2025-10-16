@@ -235,15 +235,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize chunk allocator.
         active_chunk_count_total = active_buffer_size_bytes // self.chunk_size_bytes
-        self.chunk_allocator = ChunkAllocator(
-            context=self,
-            active_count=active_chunk_count_total,
-        )
-        del active_chunk_count_total # use self.chunk_allocator.active_count
+        self.chunk_allocator = ChunkAllocator(context=self, active_count=active_chunk_count_total)
+        del active_chunk_count_total  # use self.chunk_allocator.active_count
         active_buffer_size_bytes = self.chunk_allocator.active_count * self.chunk_size_bytes
 
         # Set max_requests, max_tokens.
-        self.max_total_requests = self.chunk_allocator.total_count - 1 # -1 for dummy chunk
+        self.max_total_requests = self.chunk_allocator.total_count - 1  # -1 for dummy chunk
         self.max_active_requests = self.chunk_allocator.active_count
         self.max_tokens = max_tokens
 
@@ -251,9 +248,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = params_dtype
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
-        assert has_unified_memory, (
-            "CUDA unified memory must be available to use `DynamicInferenceContext`."
-        )
+        assert (
+            has_unified_memory
+        ), "CUDA unified memory must be available to use `DynamicInferenceContext`."
         self.unified_memory_mempool = create_unified_mempool()
 
         self.total_request_count = 0
@@ -350,7 +347,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.cuda_graph_token_counts = [self.max_active_requests]
             else:
                 self.cuda_graph_token_counts = list(
-                    range(self.cuda_graph_step_size, self.max_active_requests, self.cuda_graph_step_size)
+                    range(
+                        self.cuda_graph_step_size,
+                        self.max_active_requests,
+                        self.cuda_graph_step_size,
+                    )
                 )
                 if self.cuda_graph_token_counts[-1] != self.max_active_requests:
                     self.cuda_graph_token_counts.append(self.max_active_requests)
@@ -408,10 +409,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
 
         # Print info.
-        print("DynamicInferenceContext: allocated context with active buffer size %s (%d chunks)." % (
-            get_mem_size_str(active_buffer_size_bytes),
-            self.chunk_allocator.active_count,
-        ))
+        print(
+            "DynamicInferenceContext: allocated context with active buffer size %s (%d chunks)."
+            % (get_mem_size_str(active_buffer_size_bytes), self.chunk_allocator.active_count)
+        )
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
@@ -757,7 +758,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 math.ceil(active_token_count / self.cuda_graph_step_size)
                 * self.cuda_graph_step_size
             )
-            self.padded_active_token_count = min(self.padded_active_token_count, self.max_active_requests)
+            self.padded_active_token_count = min(
+                self.padded_active_token_count, self.max_active_requests
+            )
             assert (
                 self.padded_active_token_count in self.cuda_graph_token_counts_set
             ), f"padded_active_token_count: {self.padded_active_token_count} not in cuda_graph_token_counts_set: {self.cuda_graph_token_counts_set}"
@@ -1279,8 +1282,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if active_requests_requiring_new_chunk_count > 0:
                 newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_chunk)
-                    + self.paused_request_count
+                    torch.nonzero(active_requests_requiring_new_chunk) + self.paused_request_count
                 ]
 
             # Swap unfinished active requests on the left side with paused requests on the right side
@@ -1326,14 +1328,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_chunk_count_avail = self.chunk_allocator.get_active_avail()
-            paused_chunk_counts = self.request_kv_chunk_counts[:self.paused_request_count]
+            paused_chunk_counts = self.request_kv_chunk_counts[: self.paused_request_count]
             paused_chunk_counts = paused_chunk_counts.flip(dims=[0])
-            paused_chunk_counts += 1 # +1 for newly added chunk
+            paused_chunk_counts += 1  # +1 for newly added chunk
             paused_chunk_counts_cumsum = paused_chunk_counts.cumsum(dim=0)
             resume_request_count = min(
-                torch.nonzero(
-                    paused_chunk_counts_cumsum <= active_chunk_count_avail
-                ).numel(),
+                torch.nonzero(paused_chunk_counts_cumsum <= active_chunk_count_avail).numel(),
                 self.chunk_allocator.total_avail,
             )
 
