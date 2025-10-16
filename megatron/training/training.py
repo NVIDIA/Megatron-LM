@@ -106,6 +106,7 @@ from megatron.core.parallel_state import (
 )
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDataLoaderWrapper
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
