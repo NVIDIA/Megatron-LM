@@ -136,6 +136,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.unified_memory_level = unified_memory_level
         self.capture_stats = None
+        self.is_suspended = False
 
         # Deprecate `enable_cuda_graph`.
         if enable_cuda_graph is not None:
@@ -472,6 +473,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
 
+        # Skip if already suspended, which can happen when using the inference
+        # coordinator.
+        if self.is_suspended:
+            return
+        self.is_suspended = True
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -487,6 +494,13 @@ class DynamicInferenceEngine(AbstractEngine):
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
+        # Skip if not suspended, which can happen when using the inference
+        # coordinator.
+        if not self.is_suspended:
+            return
+        self.is_suspended = False
+
+        # Resume.
         with self.__class__.suspend_resume_ctx(
             "resumed", unified_memory_level=self.unified_memory_level, newline=False
         ):
@@ -1164,8 +1178,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
                 if self.paused:
+                    # >>>
+                    print("+++++++++++++++ suspend.")
+                    self.suspend()
+                    # <<<
                     await asyncio.sleep(0.02)
                     continue
+
+                # >>>
+                else:
+                    print("+++++++++++++++ resume.")
+                    self.resume()
+                # <<<
 
                 if (
                     self.context.get_active_request_count() == 0

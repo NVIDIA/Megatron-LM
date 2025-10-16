@@ -71,7 +71,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
             await asyncio.sleep(0)
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
-        
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
@@ -107,7 +106,6 @@ if __name__ == "__main__":
     # check for it.
     with torch.inference_mode():
         initialize_megatron(
-            #parsed_args=args
             extra_args_provider=add_dynamic_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
