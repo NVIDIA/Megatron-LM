@@ -498,6 +498,11 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        if packed_seq_params is not None:
+            assert (
+                packed_seq_params.local_cp_size is None
+            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
+            Please disable hybrid_context_parallel."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -514,11 +519,13 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len, packed_seq_params=packed_seq_params
+            )
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq_params=packed_seq_params
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -527,9 +534,11 @@ class MLASelfAttention(MultiLatentAttention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                rotary_pos_emb, mscale = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq_params=packed_seq_params
+                )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
                 cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
             else:
