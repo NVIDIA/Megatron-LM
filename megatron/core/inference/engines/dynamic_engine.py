@@ -527,10 +527,22 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs = []
                     # If the request log probs span > 1 token we are in prefill
                     if len(request_log_probs) > 1:
-                        request.prompt_log_probs.extend(request_log_probs[:-1])
-                        request.generated_log_probs.append(request_log_probs[-1])
+                        request.prompt_log_probs.extend(request_log_probs)
                     else:
-                        request.generated_log_probs.extend(request_log_probs)
+                        if (
+                            # If it is a chunked prefill request
+                            len(request.prompt_log_probs) > 0
+                            # And we are missing the last token for prefill
+                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
+                            # And we need to track full prefill
+                            and not self.context.materialize_only_last_token_logits
+                        ):
+                            assert (
+                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
+                            request.prompt_log_probs.extend(request_log_probs)
+                        else:
+                            request.generated_log_probs.extend(request_log_probs)
 
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)

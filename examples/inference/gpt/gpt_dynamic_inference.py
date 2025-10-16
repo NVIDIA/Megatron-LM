@@ -394,16 +394,15 @@ def main():
     controller = get_inference_controller(model, context)
 
     # Validate all context_length's <= max_tokens.
-    """
-    invalid_prompt_length_map = {}
-    for request_idx, request in enumerate(requests):
-        if len(request.prompt_tokens) > context.max_tokens:
-            invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-    assert not invalid_prompt_length_map, (
-        "request idxs with prompts longer than context.max_tokens: "
-        ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
-    )
-    """
+    if args.disable_chunked_prefill:
+        invalid_prompt_length_map = {}
+        for request_idx, request in enumerate(requests):
+            if len(request.prompt_tokens) > context.max_tokens:
+                invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+        assert not invalid_prompt_length_map, (
+            "request idxs with prompts longer than context.max_tokens: "
+            ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+        )
 
     # Inference engine.
     engine = DynamicInferenceEngine(
@@ -527,10 +526,17 @@ def main():
         #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
         #     f"count [ p {p_count}, d {d_count} ]."
         # )
+        capture_str = (
+            f"{engine.capture_stats["time"]:.2f} sec"
+            if engine.capture_stats else
+            "--"
+        )
         print(
             f"{setup_prefix} … "
+            f"capture {capture_str} … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"total time: {total_time:.3f}s … "
+            f"steps: {engine.step_count:d} … "
             f"throughput: {throughput:.3f} tok/s"
         )
         print("~~~")
