@@ -398,7 +398,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
                     (
-                        self.attention_num_layers,
+                        self.num_attention_layers,
                         chunk_count_total,
                         self.chunk_size_tokens,
                         kv_reduced_dim,
