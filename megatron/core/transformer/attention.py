@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
+from packaging.version import parse
 
 import torch
 from torch import Tensor
@@ -344,15 +345,15 @@ class Attention(MegatronModule, ABC):
                     inference_context.key_value_memory_dict[self.layer_number]
                 )
 
-        if not self.training and (
-            not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0
-        ):
+        if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
-            # Note: in ModelOpt, we may use inference_context for speculative decoding
-            # in training. In that case, we do not want to turn off masking as we need
-            # customized attention mask for speculative decoding.
-            attn_mask_type = AttnMaskType.no_mask
+            import transformer_engine  # pylint: disable=unused-import
+            if parse(transformer_engine.__version__) < parse("2.8") or not self.training:
+                # Note: in ModelOpt, we may use inference_context for speculative decoding
+                # in training. In that case, we do not want to turn off masking as we need
+                # customized attention mask for speculative decoding.
+                attn_mask_type = AttnMaskType.no_mask
 
         if inference_context.is_static_batching():
             batch_start = inference_context.batch_size_offset
