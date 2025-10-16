@@ -996,8 +996,8 @@ class Attention(MegatronModule, ABC):
 
     def clip_qk(self):
         """
-        QK Clipping is a technique to clip the query and key attention scores to prevent the attention
-        scores from exploding.
+        QK Clipping is a technique to clip the query and key attention scores to prevent the
+        attention scores from exploding.
         """
         raise NotImplementedError("clip_qk is not implemented.")
 

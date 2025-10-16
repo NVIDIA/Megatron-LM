@@ -940,9 +940,9 @@ class MLASelfAttention(MultiLatentAttention):
 
     def clip_qk(self):
         """
-        QK Clipping is a technique to clip the query and key attention scores to prevent the attention
-        scores from exploding. Per MuonClip usage, we update the weight by calling this function
-        after Muon optimizer step.
+        QK Clipping is a technique to clip the query and key attention scores to prevent the
+        attention scores from exploding. Per MuonClip usage, we update the weight by calling this
+        function after Muon optimizer step.
         """
 
         if not self.config.qk_clip:
@@ -996,7 +996,9 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Reshape to (n, a + b, -1)
             weight_reshaped = weight.view(
-                self.num_attention_heads_per_partition, self.config.qk_head_dim + self.config.qk_pos_emb_head_dim, -1
+                self.num_attention_heads_per_partition,
+                self.config.qk_head_dim + self.config.qk_pos_emb_head_dim,
+                -1,
             )
 
             # Split into qk_head_dim and qk_pos_emb_head_dim parts: (n, a, -1) and (n, b, -1)
@@ -1012,7 +1014,9 @@ class MLASelfAttention(MultiLatentAttention):
             # Concatenate back and reshape to original shape
             weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
             weight_q_updated = weight_q_updated.view(
-                self.num_attention_heads_per_partition * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim), -1
+                self.num_attention_heads_per_partition
+                * (self.config.qk_head_dim + self.config.qk_pos_emb_head_dim),
+                -1,
             )
 
             # Apply the updated weights
@@ -1032,7 +1036,9 @@ class MLASelfAttention(MultiLatentAttention):
 
             # shape: (n, qk_head_dim + v_head_dim, kv_lora_rank)
             weight_reshaped = weight_kv.view(
-                self.num_attention_heads_per_partition, self.config.qk_head_dim + self.config.v_head_dim, -1
+                self.num_attention_heads_per_partition,
+                self.config.qk_head_dim + self.config.v_head_dim,
+                -1,
             )
 
             # Split into qk_head_dim and v_head_dim parts: (n, a, -1) and (n, b, -1)
@@ -1047,7 +1053,9 @@ class MLASelfAttention(MultiLatentAttention):
             # Concatenate back and reshape to original shape
             weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
             weight_kv_updated = weight_kv_updated.view(
-                self.num_attention_heads_per_partition * (self.config.qk_head_dim + self.config.v_head_dim), -1
+                self.num_attention_heads_per_partition
+                * (self.config.qk_head_dim + self.config.v_head_dim),
+                -1,
             )
 
             # Apply the updated weights
