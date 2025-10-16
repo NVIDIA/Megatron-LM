@@ -30,7 +30,17 @@ class TestAlltoAllDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion, deterministic, monkeypatch):
+        if deterministic:
+            # We only need to exercise the deterministic branches in moe_utils.
+            # Enabling global determinism (torch.use_deterministic_algorithms(True))
+            # would require CUBLAS_WORKSPACE_CONFIG and can slow other tests.
+            # Monkeypatching here is per-test scoped and avoids global side effects.
+            monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+            # Deterministic branch is exercised on the unfused path
+            if permute_fusion:
+                pytest.skip("Deterministic path tested only for unfused (permute_fusion=False)")
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,

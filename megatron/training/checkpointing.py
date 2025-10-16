@@ -1292,7 +1292,7 @@ def load_args_from_checkpoint(
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
-    _set_arg('moe_token_dispatcher_type', force=True)
+    _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)

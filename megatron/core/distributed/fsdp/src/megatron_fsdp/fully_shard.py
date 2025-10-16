@@ -202,11 +202,22 @@ def fully_shard_model(
 
     # Register a state dict post-hook to add Torch DCP metadata for writing checkpoints.
     if preproc_state_dict_for_dcp_ckpt and zero_dp_strategy != "no_shard":
-        # Store a reference to the model state dict to avoid an infinite loop
-        # when registering the state dict post-hook to the model.
-        model_state_dict = model.state_dict()
+
+        def remove_te_extra_state(state_dict):
+            # Megatron-FSDP does not support FP8 extra state checkpointing in TE.
+            extra_state_keys = [k for k in state_dict.keys() if k.endswith("_extra_state")]
+            for key in extra_state_keys:
+                state_dict.pop(key)
+
+        def preprocess_dcp_and_te_extra_state(state_dict):
+            # Preprocess the state dict for uneven DTensor checkpointing.
+            remove_te_extra_state(state_dict)
+            return preprocess_state_dict_for_uneven_dtensor(state_dict)
+
         model._register_state_dict_hook(
-            lambda *args, **kwargs: preprocess_state_dict_for_uneven_dtensor(model_state_dict)
+            lambda module, state_dict, prefix, local_metadata: preprocess_dcp_and_te_extra_state(
+                state_dict
+            )
         )
 
     # Return the wrapped Megatron-FSDP model.

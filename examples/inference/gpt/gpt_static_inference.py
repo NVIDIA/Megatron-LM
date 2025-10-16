@@ -49,7 +49,6 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
-
 def add_static_inference_args(parser):
     """Static inference arguments."""
 
@@ -94,6 +93,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
         fp8=args.fp8,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
 
     inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
@@ -276,8 +276,16 @@ def main():
             latency,
         )
     )
+    # Force immediate process exit to bypass torchrun's atexit NCCL teardown when
+    # CUDA graphs have captured collectives (see PyTorch issue #115388).  This can
+    # sometimes lead to hangs in the atexit handler.
+    # We do this only when CUDA graphs are enabled.
+    if args.cuda_graph_impl != "none":
+        print(f"[main] rank {torch.distributed.get_rank()}: finished", flush=True)
+        os._exit(0)
+    else:
+        torch.distributed.destroy_process_group()
 
-    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
