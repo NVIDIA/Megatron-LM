@@ -1137,7 +1137,7 @@ def validate_args(args, defaults={}):
 
     if args.inference_dynamic_batching:
         assert args.inference_dynamic_batching_buffer_size_gb is not None
-        assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
+        assert args.inference_dynamic_batching_chunk_size % 256 == 0, "chunk size should be a multiple of 256"
         assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
 
     # MoE upcycling check
@@ -1431,18 +1431,18 @@ def _add_inference_args(parser):
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Total buffer size (GB) allocated for the block-level KV '
+                       help='Total buffer size (GB) allocated for the chunked KV '
                        'memory.')
-    group.add_argument('--inference-dynamic-batching-block-size',
+    group.add_argument('--inference-dynamic-batching-chunk-size',
                        type=int, default=256,
-                       help='KV cache block size. '
+                       help='KV cache chunk size. '
                        'It should be a multiple of 256')
     group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
                        type=float, default=0.2,
                        help='Space is reserved within the inference context '
                        'memory buffer to guarantee that a minimum number of '
                        'active requests will always be able to run to '
-                       'completion. This is to avoid the context being deadlocked '
+                       'completion. This is to avoid the context being blocked '
                        'by paused requests.')
     group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
                        type=float, default=None,

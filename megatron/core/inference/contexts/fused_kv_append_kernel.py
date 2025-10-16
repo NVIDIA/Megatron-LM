@@ -12,7 +12,7 @@ def _append_kv_cache_kernel(
     value_ptr,
     key_cache_ptr,
     value_cache_ptr,
-    block_idx_ptr,
+    chunk_idx_ptr,
     local_kv_seq_idx_ptr,
     # --- Strides for Tensor Memory Layout ---
     stride_key_token,
@@ -21,7 +21,7 @@ def _append_kv_cache_kernel(
     stride_value_token,
     stride_value_head,
     stride_value_hdim,
-    stride_cache_block,
+    stride_cache_chunk,
     stride_cache_pos,
     stride_cache_head,
     stride_cache_hdim,
@@ -38,7 +38,7 @@ def _append_kv_cache_kernel(
     Each program instance handles one head of one token. The grid is 2D: (n_tokens, num_heads).
 
     1. It identifies which token and head it is responsible for using `tl.program_id`.
-    2. It loads the `block_idx` and `local_pos` for that token.
+    2. It loads the `chunk_idx` and `local_pos` for that token.
     3. It loads the `h_dim` vector for its assigned key/value head.
     4. It calculates the destination address in the 4D cache slices.
     5. It writes (scatters) the head vector to its destination in the cache.
@@ -51,7 +51,7 @@ def _append_kv_cache_kernel(
         return
 
     # --- Load destination indices for the current token ---
-    block_idx = tl.load(block_idx_ptr + token_idx)
+    chunk_idx = tl.load(chunk_idx_ptr + token_idx)
     local_pos = tl.load(local_kv_seq_idx_ptr + token_idx)
 
     # --- Load the key and value data for the current head of the current token ---
@@ -66,7 +66,7 @@ def _append_kv_cache_kernel(
 
     # --- Calculate destination pointers in the 4D KV cache slices ---
     dest_offset = (
-        block_idx * stride_cache_block + local_pos * stride_cache_pos + head_idx * stride_cache_head
+        chunk_idx * stride_cache_chunk + local_pos * stride_cache_pos + head_idx * stride_cache_head
     )
 
     key_dest_ptr = key_cache_ptr + dest_offset
@@ -83,8 +83,8 @@ def triton_append_key_value_cache(
     value: Tensor,
     memory_buffer: Tensor,
     padded_active_token_count: int,
-    token_to_block_idx: Tensor,
-    token_to_local_position_within_kv_block: Tensor,
+    token_to_chunk_idx: Tensor,
+    token_to_local_position_within_kv_chunk: Tensor,
 ) -> None:
     """
     Append to KV cache using a high-performance, standalone Triton kernel.
@@ -95,10 +95,10 @@ def triton_append_key_value_cache(
         value (Tensor): Value tensor of shape (batch_size, 1, num_heads, h_dim).
         memory_buffer (Tensor): The 6D KV cache tensor to write to.
         padded_active_token_count (int): The number of active tokens to process.
-        token_to_block_idx (Tensor): Tensor mapping token index to its block index in
+        token_to_chunk_idx (Tensor): Tensor mapping token index to its chunk index in
         the cache.
-        token_to_local_position_within_kv_block (Tensor): Tensor mapping token index
-        to its position within a block.
+        token_to_local_position_within_kv_chunk (Tensor): Tensor mapping token index
+        to its position within a chunk.
     """
     # --- Input Validation and Preparation ---
     assert (
@@ -124,8 +124,8 @@ def triton_append_key_value_cache(
 
     key_to_cache = key[:n_tokens]
     value_to_cache = value[:n_tokens]
-    block_idx_active = token_to_block_idx[:n_tokens]
-    local_kv_seq_idx_active = token_to_local_position_within_kv_block[:n_tokens]
+    chunk_idx_active = token_to_chunk_idx[:n_tokens]
+    local_kv_seq_idx_active = token_to_local_position_within_kv_chunk[:n_tokens]
 
     assert (
         key_cache.dim() == 4 and value_cache.dim() == 4
@@ -137,7 +137,7 @@ def triton_append_key_value_cache(
         h_dim == key_cache.shape[-1]
     ), f"Head dimension mismatch. Key/Value has {h_dim} but cache expects {key_cache.shape[-1]}."
 
-    block_idx_active = block_idx_active.contiguous()
+    chunk_idx_active = chunk_idx_active.contiguous()
     local_kv_seq_idx_active = local_kv_seq_idx_active.contiguous()
 
     grid = (n_tokens, num_heads)
@@ -151,7 +151,7 @@ def triton_append_key_value_cache(
         value_to_cache,
         key_cache,
         value_cache,
-        block_idx_active,
+        chunk_idx_active,
         local_kv_seq_idx_active,
         # Strides for 3D key/value tensors
         key_to_cache.stride(0),

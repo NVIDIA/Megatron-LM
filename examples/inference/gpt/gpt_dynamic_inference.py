@@ -143,7 +143,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             if args.cuda_graph_impl == "local"
             else None
         ),
-        block_size_tokens=args.inference_dynamic_batching_block_size,
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
@@ -168,7 +168,7 @@ def get_inference_controller(
 
     Args:
         model (MegatronModule): Megatron GPT model.
-        context (DynamicInferenceContext): Context for managing KV cache blocks.
+        context (DynamicInferenceContext): Context for managing KV cache.
 
     Return:
         (TextGenerationController) Inference text generation controller.
