@@ -456,10 +456,10 @@ def is_causal_conv1d_min_version(version, check_equality=True):
 
 def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
     """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
-    if not is_causal_conv1d_min_version("1.5.0.post8"):
-        return False, "causal_conv1d >= 1.5.0.post8 is required"
-    elif not is_mamba_min_version("2.2.4"):
-        return False, "mamba_ssm >= 2.2.4 is required"
+    if not is_causal_conv1d_min_version("1.5.3.post1"):
+        return False, "causal_conv1d >= 1.5.3.post1 is required"
+    elif not is_mamba_min_version("2.2.6.post3"):
+        return False, "mamba_ssm >= 2.2.6.post3 is required"
     return True, None
 
 
