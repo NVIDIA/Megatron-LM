@@ -120,6 +120,7 @@ def main(
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
             },
+            "retry": {"max": 2, "when": ["stuck_or_timeout_failure", "runner_system_failure"]},
         }
 
     else:
@@ -200,6 +201,7 @@ def main(
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
                 "allow_failure": test_case["spec"]["model"] == "gpt-nemo",
+                "retry": {"max": 2, "when": ["stuck_or_timeout_failure", "runner_system_failure"]},
             }
 
     with open(output_path, 'w') as outfile:
