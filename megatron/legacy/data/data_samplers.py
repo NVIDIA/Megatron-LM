@@ -129,6 +129,12 @@ class MegatronPretrainingSampler:
             yield batch[start_idx:end_idx]
 
 class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+    """
+    Data sampler for hybrid context parallel (Hybrid CP) format.
+    This data sampler pulls in the entire global batch at once across all data parallel ranks.
+    This helps provide the Hybrid CP Dataloader Wrapper to schedule and load balance sub-samples
+    of the entire global batch.
+    """
 
     def __init__(self, total_samples, consumed_samples, micro_batch_size, global_batch_size,
                  data_parallel_rank, data_parallel_size, drop_last=True):

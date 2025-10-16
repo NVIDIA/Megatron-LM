@@ -11,38 +11,6 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 
-
-class HybridCPDatasetWrapper:
-    """
-    A wrapper class that wraps around any existing dataset.
-    It adds batch_idx to the sample and returns the sample.
-
-    This is required if certains DP ranks need the dataset idx
-    to access the appropriate sub-sample assigned to them from
-    the file system even if it was not originally assigned to them.
-
-    Args:
-        dataset: The original dataset to wrap around
-    """
-
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx) -> Any:
-        """
-        Get the next item from the dataset, add batch_idx and return it.
-        """
-        sample = self.dataset[idx]
-        sample["batch_idx"] = idx
-        assert (
-            "cu_seqlens" in sample
-        ), "cu_seqlens must be in the sample to use hybrid context parallel"
-        return sample
-
-
 class HybridCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.

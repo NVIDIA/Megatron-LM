@@ -18,7 +18,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.utils import (
@@ -74,65 +74,9 @@ def get_batch(data_iterator, vp_stage=None):
     elif local_cp_size is None:  # Packed THD format
         cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
-
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens,
-            cu_seqlens_kv_padded=cu_seqlens,
-            max_seqlen_q=int(max_seqlen[0].item()),
-            max_seqlen_kv=int(max_seqlen[0].item()),
-        )
-
-        cp_size = get_context_parallel_world_size()
-        if cp_size > 1:  # slice batch along sequence dimension for context parallelism
-            assert tex is not None and is_te_min_version("1.10.0"), (
-                "Please update Transformer Engine to >= 1.10 to use "
-                "Context Parallel with THD format data"
-            )
-            cp_rank = get_context_parallel_rank()
-            index = tex.thd_get_partitioned_indices(
-                cu_seqlens,
-                batch['tokens'].size(1),
-                cp_size,
-                cp_rank,
-            )
-            for key, data in batch.items():
-                if key in {'attention_mask'}:
-                    continue
-                batch[key] = data.index_select(1, index)
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, max_seqlen)
     else: # Hybrid CP format
-        assert local_cp_size is not None
-        if local_cp_size > 1:
-            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
-        else:
-            cp_group = None
-        
-        # Convert [seqlen] to [1, seqlen] similar to default collate_fn
-        # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
-        for key, data in batch.items():
-            if key in ['attention_mask']:
-                continue
-            batch[key] = torch.stack([data], 0)
-        sample_length = batch['tokens'].shape[1]
-        # Create packed_seq_params for SBHD format with cp group information.
-        packed_seq_params = PackedSeqParams(
-            qkv_format="sbhd",
-            cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-            cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-            cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-            cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
-            max_seqlen_q=sample_length,
-            max_seqlen_kv=sample_length,
-            local_cp_size=local_cp_size,
-            cp_group=cp_group,
-        )
-
-        if cp_group is not None and cp_group.size() > 1:
-            # When using hybrid_context_parallel, each sub-sample of a packed sample is 
-            # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
-            batch = get_batch_on_this_cp_rank(batch, cp_group.size(), torch.distributed.get_rank(group=cp_group))
+        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
     
     return (*batch.values(), packed_seq_params)
 
