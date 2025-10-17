@@ -29,6 +29,8 @@ def resolve_cluster_config(cluster: str) -> str:
         return "draco-oci-ord"
     if cluster == "dgxh100_coreweave":
         return "coreweave"
+    if cluster == "ghci":
+        return "ghci"
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
