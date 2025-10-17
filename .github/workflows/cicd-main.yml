@@ -105,9 +105,7 @@ jobs:
       - name: Download test data
         shell: bash
         env:
-          GH_TOKEN: ${{ inputs.PAT }}
-          TIMEOUT: ${{ inputs.timeout }}
-          IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           echo "::group::Download test data"
           pip install --no-cache-dir pygithub click
