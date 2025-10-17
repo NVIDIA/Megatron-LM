@@ -117,6 +117,7 @@ jobs:
         with:
           file: ./docker/Dockerfile.ci.dev
           push: true
+          context: .
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
