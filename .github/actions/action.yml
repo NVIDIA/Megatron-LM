@@ -46,66 +46,15 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Copy data
-      shell: bash
-      if: inputs.is_unit_test == 'false'
-      env:
-        SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
-        TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
-        MODEL: ${{ inputs.model }}
-      run: |
-        mkdir -p $TARGET_DIR/text/data/
-
-        if [[ "$MODEL" == "bert" ]]; then
-          mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
-          cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/data/
-        elif [[ "$MODEL" == "gpt" ]] || [[ "$MODEL" == "moe" ]]; then
-          cp -a $SOURCE_DIR/text/the_pile/shard00/. $TARGET_DIR/text/data/
-        fi
-
-    - name: Install curl, sudo
-      shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y curl uuid-runtime
-
     - name: Checkout repository
       uses: actions/checkout@v2
       with:
         path: ${{ github.workspace }}/Megatron-LM
 
-    # - name: Cache uv
-    #   uses: actions/cache@v4
-    #   id: cache
-    #   with:
-    #     path: cache-mount
-    #     key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
-    #     restore-keys: |
-    #       ${{ runner.os }}-uv-
-
-    # - name: Restore Docker cache mounts
-    #   uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361
-    #   with:
-    #     cache-dir: cache-mount
-    #     dockerfile: docker/Dockerfile.ci.dev
-    #     skip-extraction: ${{ steps.cache.outputs.cache-hit }}
-
-    # - name: Setup python
-    #   uses: actions/setup-python@v5
-    #   with:
-    #     python-version: 3.12
-
-    # # - name: Download test data
-    # #   shell: bash
-    # #   env:
-    # #     GH_TOKEN: ${{ inputs.PAT }}
-    # #     TIMEOUT: ${{ inputs.timeout }}
-    # #     IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
-    # #   run: |
-    # #     echo "::group::Download test data"
-    # #     pip install --no-cache-dir pygithub click
-    # #     python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
-    # #     echo "::endgroup::"
+    - name: Setup python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
 
     - name: Create run-script (unit test)
       shell: bash
@@ -187,6 +136,15 @@ runs:
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
+        echo "::endgroup::"
+
+    - name: Rename container
+      shell: bash
+      if: inputs.is_unit_test == 'false'
+      run: |
+        echo "::group::Rename container"
+        docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+        docker tag 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }} megatron-core
         echo "::endgroup::"
 
     - name: Set timeout
