@@ -948,8 +948,8 @@ class MLASelfAttention(MultiLatentAttention):
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
 
-        if self.core_attention.max_attention_score is None:
-            raise ValueError("max_attention_score is None")
+        if self.core_attention.current_max_attn_scores is None:
+            raise ValueError("current_max_attn_scores is None")
 
         # Check if we're in absorption mode
         if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
@@ -959,28 +959,28 @@ class MLASelfAttention(MultiLatentAttention):
                 "preparation."
             )
 
-        assert self.core_attention.max_attention_score.shape == (
+        assert self.core_attention.current_max_attn_scores.shape == (
             self.num_attention_heads_per_partition,
-        ), f"max_attention_score shape is not ({self.num_attention_heads_per_partition}, ) \
-                    but {self.core_attention.max_attention_score.shape}"
+        ), f"current_max_attn_scores shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_scores.shape}"
 
         # only update the weight if any head has
-        # max_attention_score > qk_clip_balancing_threshold
+        # current_max_attn_scores > qk_clip_balancing_threshold
         if torch.any(
-            self.core_attention.max_attention_score > self.config.qk_clip_balancing_threshold
+            self.core_attention.current_max_attn_scores > self.config.qk_clip_balancing_threshold
         ):
             # Use num_attention_heads_per_partition for tensor parallel scenarios
 
             # qk_clip_balancing_eta (n, 1, 1)
-            assert self.core_attention.max_attention_score.shape == (
+            assert self.core_attention.current_max_attn_scores.shape == (
                 self.num_attention_heads_per_partition,
-            ), f"max_attention_score shape is not ({self.num_attention_heads_per_partition},) \
-                but {self.core_attention.max_attention_score.shape}"
-            self.qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_balancing_threshold / self.core_attention.max_attention_score,
+            ), f"current_max_attn_scores shape is not ({self.num_attention_heads_per_partition},) \
+                but {self.core_attention.current_max_attn_scores.shape}"
+            qk_clip_balancing_eta = torch.clamp(
+                self.config.qk_clip_balancing_threshold / self.core_attention.current_max_attn_scores,
                 max=1.0,
             ).view(self.num_attention_heads_per_partition, 1, 1)
-            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+            assert torch.all(qk_clip_balancing_eta <= 1.0)
 
             # Update q side weight, keep qk_pos_emb_head_dim side weight unchanged
             if self.config.q_lora_rank is None:
@@ -1007,9 +1007,9 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Clipping
             weight_q_nope = weight_q_nope * torch.pow(
-                self.qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha
+                qk_clip_balancing_eta, self.config.qk_clip_balancing_alpha
             )
-            weight_q_pe = weight_q_pe * self.qk_clip_balancing_eta
+            weight_q_pe = weight_q_pe * qk_clip_balancing_eta
 
             # Concatenate back and reshape to original shape
             weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
@@ -1047,7 +1047,7 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Clipping
             weight_k = weight_k * torch.pow(
-                self.qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha
+                qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha
             )
 
             # Concatenate back and reshape to original shape
@@ -1064,5 +1064,5 @@ class MLASelfAttention(MultiLatentAttention):
             else:
                 kv_proj_weight.data.copy_(weight_kv_updated)
 
-        # reset max_attention_score
-        self.core_attention.max_attention_score = None
+        # reset current_max_attn_scores
+        self.core_attention.current_max_attn_scores = None
