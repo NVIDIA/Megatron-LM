@@ -977,7 +977,8 @@ class MLASelfAttention(MultiLatentAttention):
             ), f"current_max_attn_scores shape is not ({self.num_attention_heads_per_partition},) \
                 but {self.core_attention.current_max_attn_scores.shape}"
             qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_balancing_threshold / self.core_attention.current_max_attn_scores,
+                self.config.qk_clip_balancing_threshold
+                / self.core_attention.current_max_attn_scores,
                 max=1.0,
             ).view(self.num_attention_heads_per_partition, 1, 1)
             assert torch.all(qk_clip_balancing_eta <= 1.0)
