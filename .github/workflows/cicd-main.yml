@@ -90,7 +90,7 @@ jobs:
           echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
 
   cicd-container-build:
-    needs: [pre-flight]
+    needs: [pre-flight, cicd-wait-in-queue]
     runs-on: nvidia-ci-aws-gpu-x8
     environment: nemo-ci
     steps:
@@ -101,6 +101,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.12
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
 
       - name: Download test data
         shell: bash
@@ -122,10 +127,10 @@ jobs:
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
             766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
-            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           no-cache: false
           tags: |
-            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           target: main
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
@@ -167,7 +172,7 @@ jobs:
 
   cicd-parse-functional-tests:
     runs-on: ubuntu-latest
-    needs: [pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     outputs:
       functional-tests: ${{ steps.main.outputs.functional-tests }}
     steps:
