@@ -13,7 +13,8 @@ from tests.test_utils.python_scripts import common
 @click.option("--test-case", required=True, type=str, help="Test case of the workload")
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
-def main(scope, model, test_case, environment, platform):
+@click.option("--container-image", required=True, type=str, help="Container image of the workload")
+def main(scope, model, test_case, environment, platform, container_image):
     workloads = common.load_workloads(
         container_image="none",
         scope=scope,
@@ -49,7 +50,7 @@ def main(scope, model, test_case, environment, platform):
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
 
     executor = run.DockerExecutor(
-        container_image="megatron-core",
+        container_image=container_image,
         num_gpus=-1,
         runtime="nvidia",
         ipc_mode="host",

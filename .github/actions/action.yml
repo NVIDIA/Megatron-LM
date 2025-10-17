@@ -129,6 +129,11 @@ runs:
         echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
 
+    - name: Get PR info
+      id: get-pr-info
+      if: startsWith(github.ref, 'refs/heads/pull-request/')
+      uses: nv-gha-runners/get-pr-info@main
+
     - name: Create run-script (e2e test)
       shell: bash
       if: inputs.is_unit_test == 'false'
@@ -147,7 +152,8 @@ runs:
           --model ${{ inputs.model }} \
           --test-case ${{ inputs.test_case }} \
           --environment dev \
-          --platform dgx_h100
+          --platform dgx_h100 \
+          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
         RUN_TEST_EOF
         )
