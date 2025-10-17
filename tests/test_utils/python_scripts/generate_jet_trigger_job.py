@@ -119,8 +119,8 @@ def main(
                 "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
+                "retry": {"max": 2, "when": ["stuck_or_timeout_failure", "runner_system_failure"]},
             },
-            "retry": {"max": 2, "when": ["stuck_or_timeout_failure", "runner_system_failure"]},
         }
 
     else:
