@@ -92,6 +92,7 @@ jobs:
   cicd-container-build:
     needs: [pre-flight]
     runs-on: nvidia-ci-aws-gpu-x8
+    environment: nemo-ci
     steps:
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -102,8 +103,6 @@ jobs:
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
             766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
-            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
-          cache-to: |
             766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
           no-cache: false
           tags: |
