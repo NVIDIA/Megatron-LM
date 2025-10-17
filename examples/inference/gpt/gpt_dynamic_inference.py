@@ -281,6 +281,7 @@ def run_inference(
         step_id += 1
 
         # Test suspending and resuming engine.
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         if (
             args.suspend_resume_interval is not None
             and
@@ -288,9 +289,22 @@ def run_inference(
         ):
             active_token_count_0 = engine.context.active_token_count
             engine.suspend()
+            # >>>
+            # if num_requests_added < num_requests_total:
+            #     _add_request()
+            # <<<
             engine.resume()
             active_token_count_1 = engine.context.active_token_count
-            print("**** suspend + resume [ active tokens %d -> %d ]." % (active_token_count_0, active_token_count_1))
+            print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
+                engine.step_count,
+                active_token_count_0,
+                active_token_count_1,
+            ))
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        # if engine.step_count == 8:
+        # engine.suspend()
+        # engine.resume()
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
