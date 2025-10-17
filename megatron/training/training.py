@@ -1285,7 +1285,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
                 if hasattr(transformer_layer.self_attention, 'clip_qk'):
-                    log_max_attention_score = max(log_max_attention_score, torch.max(transformer_layer.self_attention.core_attention.max_attention_score).item())
+                    log_max_attention_score = max(
+                        log_max_attention_score, 
+                        torch.max(
+                            transformer_layer.self_attention.core_attention.current_max_attn_scores
+                        ).item()
+                    )
                     transformer_layer.self_attention.clip_qk()
             
     timers('optimizer').stop()
