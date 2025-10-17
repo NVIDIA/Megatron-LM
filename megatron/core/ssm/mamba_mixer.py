@@ -702,20 +702,20 @@ class MambaMixer(MegatronModule):
             xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
         else:
             assert self.activation in ["silu", "swish"]
-            causal_conv1d_kwargs = {
-                "x": xBC,
-                "weight": rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                "bias": self.cp.get_conv1d_bias(),
-                "activation": self.activation,
-            }
-            if is_dynamic_batching:
-                causal_conv1d_kwargs["seq_idx"] = seq_idx
-            elif is_chunked_prefill:
-                causal_conv1d_kwargs["initial_states"] = (
+            if is_chunked_prefill:
+                initial_conv_state = (
                     conv_state[:, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
                 )
-            xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
-            del causal_conv1d_kwargs
+            else:
+                initial_conv_state = None
+            xBC = causal_conv1d_fn(
+                x=xBC,
+                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=self.cp.get_conv1d_bias(),
+                activation=self.activation,
+                seq_idx=seq_idx,
+                initial_states=initial_conv_state,
+            )
 
         # transpose b pd l --> b l pd
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -745,36 +745,35 @@ class MambaMixer(MegatronModule):
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
+        if is_chunked_prefill:
+            initial_ssm_state = ssm_state
+        else:
+            initial_ssm_state = None
+
         # Note that both `seq_idx` and `cu_seqlens` must be passed in
         # for variable length generation.
         # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
-        mamba_chunk_scan_combined_args = [x, dt, A, B, C, self.chunk_size]
-        mamba_chunk_scan_combined_kwargs = {
-            "D": (
+        y = mamba_chunk_scan_combined(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.chunk_size,
+            D=(
                 rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                 if self.D_has_hdim
                 else self.cp.get_D()
             ),
-            "z": z if not self.rmsnorm else None,
-            "dt_bias": self.cp.get_dt_bias().float(),
-            "dt_softplus": True,
-            "return_final_states": ssm_state is not None,
-        }
-        if is_dynamic_batching:
-            mamba_chunk_scan_combined_kwargs.update(
-                {
-                    "seq_idx": seq_idx,
-                    "cu_seqlens": cu_seqlens,
-                    "return_varlen_states": return_varlen_states,
-                }
-            )
-        elif is_chunked_prefill:
-            mamba_chunk_scan_combined_kwargs["initial_states"] = ssm_state
-        y = mamba_chunk_scan_combined(
-            *mamba_chunk_scan_combined_args, **mamba_chunk_scan_combined_kwargs
+            z=z if not self.rmsnorm else None,
+            dt_bias=self.cp.get_dt_bias().float(),
+            dt_softplus=True,
+            return_final_states=ssm_state is not None,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            return_varlen_states=return_varlen_states,
+            initial_states=initial_ssm_state,
         )
-        del mamba_chunk_scan_combined_args
-        del mamba_chunk_scan_combined_kwargs
 
         if ssm_state is not None:
             if return_varlen_states:
