@@ -149,7 +149,8 @@ runs:
           --test-case ${{ inputs.test_case }} \
           --environment dev \
           --platform dgx_h100 \
-          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha }}
+          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha }} \
+          --data-dir $TARGET_DIR/
 
         RUN_TEST_EOF
         )

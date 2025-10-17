@@ -14,7 +14,8 @@ from tests.test_utils.python_scripts import common
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
-def main(scope, model, test_case, environment, platform, container_image):
+@click.option("--data-dir", required=True, type=str, help="Data directory of the workload")
+def main(scope, model, test_case, environment, platform, container_image, data_dir):
     workloads = common.load_workloads(
         container_image="none",
         scope=scope,
@@ -43,7 +44,7 @@ def main(scope, model, test_case, environment, platform, container_image):
 
     artifacts = [
         "{host_path}:{mount_path}".format(
-            mount_path=mount_path, host_path=str(pathlib.Path("/root") / host_path)
+            mount_path=mount_path, host_path=str(pathlib.Path(data_dir) / host_path)
         )
         for mount_path, host_path in workload.spec["artifacts"].items()
     ]
