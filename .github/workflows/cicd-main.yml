@@ -94,6 +94,26 @@ jobs:
     runs-on: nvidia-ci-aws-gpu-x8
     environment: nemo-ci
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+
+      - name: Download test data
+        shell: bash
+        env:
+          GH_TOKEN: ${{ inputs.PAT }}
+          TIMEOUT: ${{ inputs.timeout }}
+          IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+        run: |
+          echo "::group::Download test data"
+          pip install --no-cache-dir pygithub click
+          python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+          echo "::endgroup::"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:

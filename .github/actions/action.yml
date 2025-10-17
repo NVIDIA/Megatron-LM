@@ -157,7 +157,6 @@ runs:
     - name: Start container
       shell: bash
       if: inputs.is_unit_test == 'true'
-
       run: |
         echo "::group::Start test container"
         set -x
@@ -185,6 +184,15 @@ runs:
 
         echo "$cmd" | tee "retry_job.sh"
         bash retry_job.sh
+        echo "::endgroup::"
+
+    - name: Rename container
+      shell: bash
+      if: inputs.is_unit_test == 'false'
+      run: |
+        echo "::group::Rename container"
+        docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+        docker tag 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }} megatron-core
         echo "::endgroup::"
 
     - name: Set timeout
