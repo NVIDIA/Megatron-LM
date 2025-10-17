@@ -2,8 +2,8 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
 from packaging.version import parse
+from typing import NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
