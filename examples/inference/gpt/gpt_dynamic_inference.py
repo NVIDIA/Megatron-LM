@@ -276,6 +276,7 @@ def run_inference(
         result = engine.step_modern(sampling_params, verbose=True)
 
         # Test suspending and resuming engine.
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         if (
             args.suspend_resume_interval is not None
             and
@@ -283,9 +284,22 @@ def run_inference(
         ):
             active_token_count_0 = engine.context.active_token_count
             engine.suspend()
+            # >>>
+            # if num_requests_added < num_requests_total:
+            #     _add_request()
+            # <<<
             engine.resume()
             active_token_count_1 = engine.context.active_token_count
-            print("**** suspend + resume [ active tokens %d -> %d ]." % (active_token_count_0, active_token_count_1))
+            print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
+                engine.step_count,
+                active_token_count_0,
+                active_token_count_1,
+            ))
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        # if engine.step_count == 8:
+        # engine.suspend()
+        # engine.resume()
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
         is_decode_only = engine.is_decode_only 

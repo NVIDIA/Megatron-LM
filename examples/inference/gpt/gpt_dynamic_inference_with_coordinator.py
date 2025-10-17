@@ -48,8 +48,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     # <<<
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     args = get_args()
-    # test_suspend_resume = args.suspend_resume_interval is not None
-    # if test_suspend_resume:
     if args.suspend_resume_interval is not None:
         # Since the client doesn't directly call engine.async_step here, we test
         # the suspend-resume system ~4 times.
@@ -63,20 +61,14 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
             min(len(requests), i + suspend_resume_interval // 2)
             for i in suspend_idxs
         )
-        # pax("suspend_idxs, resume_idxs")
+        # >>>
+        suspend_idxs = set([33])
+        resume_idxs = set([67])
+        # <<<
     else:
-        # suspend_resume_interval = None
         suspend_idxs = set()
         resume_idxs = set()
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-    # >>>
-    # n_iters = 0
-    # pax("test_suspend_resume")
-    # pax("requests", {
-    #     "num_tokens_to_generate" : args.num_tokens_to_generate,
-    #     "suspend_resume_interval" : args.suspend_resume_interval,
-    # })
-    # <<<
     if dist.get_rank() == 0: 
         client = InferenceClient(port) # submits requests to the inference coordinator
         await client.start()
@@ -86,11 +78,7 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        #tbar = tqdm(total=num_requests_total)
         while True:
-            # >>>
-            # n_iters += 1
-            # <<<
             current_time = time.time_ns() / 10**9
             # Only add requests that have arrived at the current time.
             while num_requests_added < num_requests_total and requests[num_requests_added].time_arrival <= current_time:
@@ -102,34 +90,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                                                         sampling_params))
                 num_requests_added += 1
                 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # if num_requests_added % args.suspend_resume_interval == 0:
-                #     pax({"suspend_resume_interval": args.suspend_resume_interval}, "num_requests_added")
-                # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-                # if suspend_resume_interval is not None:
-                #     if num_requests_added % suspend_resume_interval == 0:
-                #         print("++++++ suspend ... r %d / %d, s %d." % (
-                #             num_requests_added,
-                #             num_requests_total,
-                #             suspend_resume_interval,
-                #         ))
-                #         client.pause_engines()
-                #     # if (num_requests_added - suspend_resume_interval // 2) % suspend_resume_interval == 0:
-                #     if (
-                #         (
-                #             num_requests_added >= suspend_resume_interval
-                #             and
-                #             (num_requests_added - suspend_resume_interval // 2) % suspend_resume_interval == 0
-                #         )
-                #         or
-                #         num_requests_added == num_requests_total
-                #     ):
-                #         print("------ resume ... r %d / %d, s %d." % (
-                #             num_requests_added,
-                #             num_requests_total,
-                #             suspend_resume_interval,
-                #         ))
-                #         client.unpause_engines()
-                # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                 # >>>
                 def print_suspend_resume(key):
                     print("++++++ %s ... r %d / %d, s %d." % (
@@ -142,22 +102,17 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
 
                 if num_requests_added in suspend_idxs:
                     print_suspend_resume("suspend")
-                    # client.pause_engines()
+                    client.pause_engines()
                 if num_requests_added in resume_idxs:
                     print_suspend_resume("resume")
-                    # client.unpause_engines()
+                    client.unpause_engines()
                 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-                #tbar.update(1)
             if num_requests_added == num_requests_total:
                 break
             # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 
             await asyncio.sleep(0)
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
-
-    # >>>
-    # pax("n_iters")
-    # <<<
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
