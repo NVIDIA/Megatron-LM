@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
 from packaging.version import parse
-import transformer_engine
 
 import torch
 from torch import Tensor
