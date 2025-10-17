@@ -1471,6 +1471,9 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--decode-only-cuda-graphs',
+                       action='store_true', default=False,
+                       help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '

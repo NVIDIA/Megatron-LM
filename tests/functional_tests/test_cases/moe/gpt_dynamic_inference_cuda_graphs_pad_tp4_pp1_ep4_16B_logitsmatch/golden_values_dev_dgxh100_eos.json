@@ -1,8 +1,8 @@
 {
-    "0": {
-     "input_prompt": "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies.",
-     "generated_text": " Wait for the moment when the music stops, and the lights come up, and the DJ says, \"I'm going to play a song for you",
-     "generated_tokens": [
+  "0": {
+    "input_prompt": "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies.",
+    "generated_text": " Wait for the moment when the music stops, and the lights come up, and the DJ says, \"I'm going to play a song for you",
+    "generated_tokens": [
       32844,
       1394,
       1278,
@@ -33,9 +33,9 @@
       6947,
       1394,
       1636
-     ],
-     "latency": 2.0423662662506104,
-     "cuda_graph_request_count_map": {
+    ],
+    "latency": 2.0423662662506104,
+    "cuda_graph_request_count_map": {
       "6584": 0,
       "6240": 0,
       "5824": 0,
@@ -52,9 +52,9 @@
       "1248": 0,
       "832": 0,
       "416": 29
-     },
-     "step_count": 30,
-     "logprobs": [
+    },
+    "step_count": 30,
+    "logprobs": [
       -10.737512588500977,
       -3.724862575531006,
       -2.833397388458252,
@@ -172,6 +172,7 @@
       -1.2551532983779907,
       -1.256169080734253,
       -0.49199968576431274
-     ]
-    }
-   }
+    ]
+  },
+  "throughput": 25.35687538450034
+}

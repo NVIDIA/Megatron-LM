@@ -81,6 +81,7 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--termination-id", type=int, default=None,
         help="Termination ID that overrides `tokenizer.eod`."
     )
+    group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
 
     return parser
 
@@ -154,6 +155,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+        use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
@@ -381,15 +383,20 @@ def main():
     print(setup_prefix)
     print("~~~")
 
-    # Run and time test.
-    t = get_curr_time()
-    result = run_inference(requests, sampling_params, engine)
-    step_times = result["step_times"]
-    add_times = result["add_times"]
-    output_times = result["output_times"]
-    total_output_tokens = result["total_output_tokens"]
-    torch.cuda.synchronize()
-    total_time = get_curr_time() - t
+    # Run and time test, optionally `args.inference_repeat_n` times.
+    throughputs = []
+    for _ in range(args.inference_repeat_n):
+        t = get_curr_time()
+        result = run_inference(requests, sampling_params, engine)
+        step_times = result["step_times"]
+        add_times = result["add_times"]
+        output_times = result["output_times"]
+        total_output_tokens = result["total_output_tokens"]
+        torch.cuda.synchronize()
+        total_time = get_curr_time() - t
+        stats = torch.cuda.memory_stats()
+        throughput = total_output_tokens / total_time
+        throughputs.append(throughput)
 
     # Validate all requests finished.
     for request in requests:
@@ -441,25 +448,28 @@ def main():
             json_results = {}
 
             # Write every 'n' requests, plus the final request.
-            for req in [ *requests[::args.output_every_n_results], requests[-1] ]:
-                result_dict = {
-                    "input_prompt": req.prompt_text,
-                    "generated_text": req.output_text,
-                    "generated_tokens": req.output_tokens,
-                    "latency": req.time_end - req.time_start,
-                    "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
-                    "step_count" : engine.step_count,
-                }
-                if sampling_params.return_log_probs:
-                    response_logprobs = req.log_probs
-                    result_dict["logprobs"] = response_logprobs
-                json_results[req.request_id] = result_dict
+            for i, req in enumerate(requests):
+                if i % args.output_every_n_results == 0 or i == len(requests) - 1:
+                    result_dict = {
+                        "input_prompt": req.prompt_text,
+                        "generated_text": req.output_text,
+                        "generated_tokens": req.output_tokens,
+                        "latency": req.time_end - req.time_start,
+                        "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
+                        "step_count" : engine.step_count,
+                    }
+                    if sampling_params.return_log_probs:
+                        response_logprobs = req.log_probs
+                        result_dict["logprobs"] = response_logprobs
+                    json_results[req.request_id] = result_dict
+
+            # Track system-level throughput as a test / debug metric
+            json_results["throughput"] = throughputs
+
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
     # Timing results.
-    stats = torch.cuda.memory_stats()
-    throughput = total_output_tokens / total_time
     print("~~~")
     peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
     peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
