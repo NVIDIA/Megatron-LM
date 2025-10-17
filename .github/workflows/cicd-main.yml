@@ -140,8 +140,8 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
-            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
             766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
           no-cache: false
           tags: |
             766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
