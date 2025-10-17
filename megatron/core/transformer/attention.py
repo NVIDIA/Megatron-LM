@@ -2,10 +2,10 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from packaging.version import parse
 from typing import NoReturn, Optional, Tuple, Union
 
 import torch
+from packaging.version import parse
 from torch import Tensor
 
 from megatron.core import tensor_parallel
