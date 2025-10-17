@@ -54,18 +54,20 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
         # Since the client doesn't directly call engine.async_step here, we test
         # the suspend-resume system ~4 times.
         suspend_resume_interval = max(1, len(requests) // 4)
-        # suspend_idxs = set(range(
-        #     suspend_resume_interval,
-        #     len(requests) + 1,
-        #     suspend_resume_interval,
-        # ))
-        # resume_idxs = set(
-        #     min(len(requests), i + suspend_resume_interval // 2)
-        #     for i in suspend_idxs
-        # )
+        suspend_idxs = set(range(
+            suspend_resume_interval,
+            len(requests) + 1,
+            suspend_resume_interval,
+        ))
+        resume_idxs = set(
+            min(len(requests), i + suspend_resume_interval // 2)
+            for i in suspend_idxs
+        )
         # pax("suspend_idxs, resume_idxs")
     else:
-        suspend_resume_interval = None
+        # suspend_resume_interval = None
+        suspend_idxs = set()
+        resume_idxs = set()
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     # >>>
     # n_iters = 0
@@ -99,35 +101,52 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 futures.append(client.add_request(request.prompt_text, 
                                                         sampling_params))
                 num_requests_added += 1
-                # >>>
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
                 # if num_requests_added % args.suspend_resume_interval == 0:
                 #     pax({"suspend_resume_interval": args.suspend_resume_interval}, "num_requests_added")
-
-                if suspend_resume_interval is not None:
-                    if num_requests_added % suspend_resume_interval == 0:
-                        print("++++++ suspend ... r %d / %d, s %d." % (
-                            num_requests_added,
-                            num_requests_total,
-                            suspend_resume_interval,
-                        ))
-                        client.pause_engines()
-                    # if (num_requests_added - suspend_resume_interval // 2) % suspend_resume_interval == 0:
-                    if (
-                        (
-                            num_requests_added >= suspend_resume_interval
-                            and
-                            (num_requests_added - suspend_resume_interval // 2) % suspend_resume_interval == 0
-                        )
-                        or
-                        num_requests_added == num_requests_total
-                    ):
-                        print("------ resume ... r %d / %d, s %d." % (
-                            num_requests_added,
-                            num_requests_total,
-                            suspend_resume_interval,
-                        ))
-                        client.unpause_engines()
+                # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                # if suspend_resume_interval is not None:
+                #     if num_requests_added % suspend_resume_interval == 0:
+                #         print("++++++ suspend ... r %d / %d, s %d." % (
+                #             num_requests_added,
+                #             num_requests_total,
+                #             suspend_resume_interval,
+                #         ))
+                #         client.pause_engines()
+                #     # if (num_requests_added - suspend_resume_interval // 2) % suspend_resume_interval == 0:
+                #     if (
+                #         (
+                #             num_requests_added >= suspend_resume_interval
+                #             and
+                #             (num_requests_added - suspend_resume_interval // 2) % suspend_resume_interval == 0
+                #         )
+                #         or
+                #         num_requests_added == num_requests_total
+                #     ):
+                #         print("------ resume ... r %d / %d, s %d." % (
+                #             num_requests_added,
+                #             num_requests_total,
+                #             suspend_resume_interval,
+                #         ))
+                #         client.unpause_engines()
+                # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                # >>>
+                def print_suspend_resume(key):
+                    print("++++++ %s ... r %d / %d, s %d." % (
+                        key,
+                        num_requests_added,
+                        num_requests_total,
+                        suspend_resume_interval,
+                    ))
                 # <<<
+
+                if num_requests_added in suspend_idxs:
+                    print_suspend_resume("suspend")
+                    # client.pause_engines()
+                if num_requests_added in resume_idxs:
+                    print_suspend_resume("resume")
+                    # client.unpause_engines()
+                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
                 #tbar.update(1)
             if num_requests_added == num_requests_total:
                 break
