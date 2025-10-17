@@ -162,7 +162,8 @@ jobs:
   cicd-functional-tests-latest:
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.cicd-parse-functional-tests.outputs.functional-tests) }}
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-functional-tests.outputs.functional-tests) }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
