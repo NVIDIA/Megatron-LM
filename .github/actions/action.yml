@@ -74,21 +74,21 @@ runs:
       with:
         path: ${{ github.workspace }}/Megatron-LM
 
-    - name: Cache uv
-      uses: actions/cache@v4
-      id: cache
-      with:
-        path: cache-mount
-        key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-uv-
+    # - name: Cache uv
+    #   uses: actions/cache@v4
+    #   id: cache
+    #   with:
+    #     path: cache-mount
+    #     key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
+    #     restore-keys: |
+    #       ${{ runner.os }}-uv-
 
-    - name: Restore Docker cache mounts
-      uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361
-      with:
-        cache-dir: cache-mount
-        dockerfile: docker/Dockerfile.ci.dev
-        skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+    # - name: Restore Docker cache mounts
+    #   uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361
+    #   with:
+    #     cache-dir: cache-mount
+    #     dockerfile: docker/Dockerfile.ci.dev
+    #     skip-extraction: ${{ steps.cache.outputs.cache-hit }}
 
     - name: Setup python
       uses: actions/setup-python@v5
