@@ -140,6 +140,7 @@ runs:
         #!/bin/bash
 
         export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
         pip install --no-cache-dir uv
         uv sync --only-group test 
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
