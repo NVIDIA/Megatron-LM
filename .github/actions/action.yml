@@ -154,17 +154,10 @@ runs:
         echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
 
-    - name: Build container
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.PAT }}
-      run: |
-        echo "::group::Build test container"
-        docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.09-py3" --target=main -t megatron-core .
-        echo "::endgroup::"
-
     - name: Start container
       shell: bash
+      if: inputs.is_unit_test == 'true'
+
       run: |
         echo "::group::Start test container"
         set -x
@@ -185,7 +178,7 @@ runs:
           -v /home/runner/_work/TestData/megatron-lm/artifacts/text/data/:/workspace/data \
           --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
           $VOLUME_ARGS \
-          megatron-core \
+          766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }} \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
         RUN_TEST_EOF
         )

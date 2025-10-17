@@ -89,6 +89,29 @@ jobs:
           echo "Running CI tests"
           echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
 
+  cicd-container-build:
+    needs: [pre-flight]
+    runs-on: nvidia-ci-aws-gpu-x8
+    steps:
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          file: ./docker/Dockerfile.ci.dev
+          push: true
+          build-args: |
+            FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
+          cache-from: |
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+          cache-to: |
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+          no-cache: false
+          tags: |
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }}
+          target: main
+          secrets: |
+            GH_TOKEN=${{ secrets.PAT }}
+
   cicd-unit-tests-latest:
     strategy:
       fail-fast: false
@@ -100,7 +123,7 @@ jobs:
           - bucket: "unit_tests/dist_checkpointing/models/"
           - bucket: "unit_tests/transformer/*.py"
           - bucket: "unit_tests/transformer/moe"
-    needs: [pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
