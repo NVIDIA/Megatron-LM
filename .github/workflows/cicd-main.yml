@@ -127,8 +127,8 @@ jobs:
 
       - name: Pull cache
         run: |
-          docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
-          docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main || true
+          docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
 
       - name: Build and push
         uses: docker/build-push-action@v5
