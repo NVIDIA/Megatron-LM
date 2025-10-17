@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
 from packaging.version import parse
+import transformer_engine
 
 import torch
 from torch import Tensor
@@ -348,7 +349,6 @@ class Attention(MegatronModule, ABC):
         if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
-            import transformer_engine  # pylint: disable=unused-import
 
             if parse(transformer_engine.__version__) < parse("2.2") or not self.training:
                 # Note: in ModelOpt, we may use inference_context for speculative decoding
