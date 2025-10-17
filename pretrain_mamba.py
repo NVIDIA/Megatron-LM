@@ -67,10 +67,11 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
 
     mtp_block_spec = None
     if args.mtp_num_layers is not None:
-        assert args.spec is not None
+        assert args.mtp_spec is not None
         assert args.mtp_hybrid_override_pattern is not None, "We need to set the override hybrid pattern for MTP layers!"
+        mtp_mamba_stack_spec = import_module(args.mtp_spec)
         mtp_block_spec = get_mamba_mtp_block_spec(
-            config, mamba_stack_spec, use_transformer_engine=use_te, vp_stage=vp_stage
+            config, mtp_mamba_stack_spec, use_transformer_engine=use_te, vp_stage=vp_stage
         )
     
     model = MambaModel(

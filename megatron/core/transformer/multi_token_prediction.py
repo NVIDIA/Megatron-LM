@@ -426,10 +426,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
         )
         if self.config.mtp_num_layers is not None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-            # We do not need pre and post process stage for MTP layer, given they are handled in the 
-            # MultiTokenPredictionLayer itself.
-            self.mtp_model_layer = build_module(
+            if self.mtp_hybrid_override_pattern is not None:
+                model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+                # We do not need pre and post process stage for MTP layer, given they are handled in the 
+                # MultiTokenPredictionLayer itself.
+                self.mtp_model_layer = build_module(
                     self.submodules.mtp_model_layer,
                     self.config,
                     pre_process=False, 
@@ -438,7 +439,12 @@ class MultiTokenPredictionLayer(MegatronModule):
                     dtype=self.config.params_dtype,
                     model_comm_pgs=model_comm_pgs,
                     vp_stage=self.vp_stage
-            )
+                )
+            else:
+                # Uses the transformer block spec for MTP layer. This option is only implemented for the 
+                # GPT model. In hybrid model, we model transformer block spec for MTP layers with the hybrid
+                # override pattern.
+                self.mtp_model_layer = build_module(self.submodules.mtp_model_layer, config=self.config, vp_stage=self.vp_stage)
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
@@ -541,15 +547,32 @@ class MultiTokenPredictionLayer(MegatronModule):
             # so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_rng_context, transformer_layer_fp8_context:
                 if self.config.mtp_num_layers is not None:
-                    # Since pre-process is set to False, we need to set the input tensor manually.
-                    self.mtp_model_layer.set_input_tensor(hidden_states)
-                    hidden_states = self.mtp_model_layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
-                        inference_context=context,
-                    )
+                    # MTP hybrid model.
+                    if self.mtp_hybrid_override_pattern is not None:
+                        # Since pre-process is set to False, we need to set the input tensor manually.
+                        self.mtp_model_layer.set_input_tensor(hidden_states)
+                        hidden_states = self.mtp_model_layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            inference_params=inference_params,
+                            inference_context=context,
+                        )
+                    else:
+                        # Usual transformer layer spec for MTP layer.
+                        hidden_states, _ = self.mtp_model_layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            attention_bias=attention_bias,
+                            inference_params=inference_params,
+                            packed_seq_params=packed_seq_params,
+                            sequence_len_offset=sequence_len_offset,
+                        )
 
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)
