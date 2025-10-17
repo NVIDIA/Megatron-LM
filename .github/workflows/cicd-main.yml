@@ -125,6 +125,11 @@ jobs:
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
+      - name: Pull cache
+        run: |
+          docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
+          docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
