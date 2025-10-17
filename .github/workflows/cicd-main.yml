@@ -139,7 +139,7 @@ jobs:
           no-cache: false
           tags: |
             766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          target: main
+            766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
