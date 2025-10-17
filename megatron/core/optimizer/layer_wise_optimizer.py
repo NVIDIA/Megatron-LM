@@ -84,7 +84,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             param_groups += optimizer.param_groups
         for group in param_groups:
             params_this_rank = []
-            if group["is_expert_parallel"]:
+            if group.get("is_expert_parallel", False):
                 for p in group["params"]:
                     if expt_dp_idx == get_pg_rank(self.pg_collection.expt_dp):
                         params_this_rank.append(p)
