@@ -139,6 +139,7 @@ runs:
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
+        export PYTHONPATH=$(pwd)
         pip install --no-cache-dir uv
         uv sync --only-group test 
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
