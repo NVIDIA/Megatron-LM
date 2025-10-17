@@ -66,6 +66,7 @@ def main(scope, model, test_case, environment, platform, container_image):
     with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
         _ = exp.add([inline_script], tail_logs=False, name="task-1")
 
+        exp.dryrun(log=True)
         exp.run(detach=False, tail_logs=True, sequential=False)
 
 
