@@ -124,22 +124,49 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
 
+  cicd-parse-functional-tests:
+    runs-on: ubuntu-latest
+    needs: [cicd-functional-tests-latest]
+    outputs:
+      functional-tests: ${{ steps.parse-functional-tests.outputs.functional-tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse functional tests
+        run: |
+          export PYTHONPATH=$(pwd)
+          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+            --scope mr \
+            --n-repeat 5 \
+            --time-limit 2700 \
+            --test-cases all \
+            --container-image mcore_ci_dev \
+            --container-tag latest \
+            --dependent-job functional:configure \
+            --record-checkpoints false \
+            --slurm-account gh \
+            --no-enable-warmup \
+            --environment dev \
+            --platform dgx_h100 \
+            --enable-lightweight-mode \
+            --cluster ghci \
+            --output-path functional-tests.yaml
+
+          cat functional-tests.yaml | \
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key})' | jq -c  > functional-tests.json
+
+          echo "functional-tests=$(cat functional-tests.json)" | tee -a "$GITHUB_OUTPUT"
+
   cicd-functional-tests-latest:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - model: "gpt"
-            test_case: "gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G"
-          - model: "gpt"
-            test_case: "gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G"
-          - model: "moe"
-            test_case: "gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer"
-          - model: "moe"
-            test_case: "gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed"
+        include: ${{ fromJSON(needs.cicd-parse-functional-tests.outputs.functional-tests) }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
+      - cicd-parse-functional-tests
       # - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
