@@ -186,7 +186,10 @@ jobs:
 
   cicd-parse-functional-tests:
     runs-on: ubuntu-latest
-    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      # - cicd-container-build
     outputs:
       functional-tests: ${{ steps.main.outputs.functional-tests }}
     steps:

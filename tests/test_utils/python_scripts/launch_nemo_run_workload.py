@@ -49,6 +49,7 @@ def main(scope, model, test_case, environment, platform, container_image, data_d
         for mount_path, host_path in workload.spec["artifacts"].items()
     ]
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
+    artifacts.append(f"{pathlib.Path(data_dir)}:/mnt/artifacts")
 
     executor = run.DockerExecutor(
         container_image=container_image,

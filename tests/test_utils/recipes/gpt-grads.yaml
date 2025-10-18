@@ -11,7 +11,7 @@ spec:
   n_repeat: 1
   platforms: dgx_h100
   artifacts:
-    /workspace/data/gpt3_data: text/the_pile/shard00
+    /mnt/artifacts/text/the_pile/shard00: text/the_pile/shard00
     /workspace/checkpoints/gpt3_mr_mcore_reruns_resume_check_grads_dev: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
     /workspace/checkpoints/gpt3_mr_mcore_reruns_resume_check_grads_lts: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
     /workspace/checkpoints/gpt_teacher: model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher
@@ -47,7 +47,7 @@ spec:
     # Note: This test is very expensive, so we hardcode N_REPEAT=1
 
     ARGUMENTS=(
-        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_PATH=/mnt/artifacts/text/the_pile/shard00"
         "DATA_CACHE_PATH=/workspace/data/cache"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"

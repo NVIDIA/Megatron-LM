@@ -11,7 +11,7 @@ spec:
   n_repeat: 5
   platforms: dgx_a100
   artifacts:
-    /workspace/data/gpt3_data: text/the_pile/shard00
+    /mnt/artifacts/text/the_pile/shard00: text/the_pile/shard00
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
@@ -40,7 +40,7 @@ spec:
     cd /opt/megatron-lm
 
     ARGUMENTS=(
-        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_PATH=/mnt/artifacts/text/the_pile/shard00"
         "DATA_CACHE_PATH=/workspace/data/cache"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
