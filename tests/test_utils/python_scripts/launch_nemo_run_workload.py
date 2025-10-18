@@ -60,6 +60,7 @@ def main(scope, model, test_case, environment, platform, container_image, data_d
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": "true",
+            "N_REPEAT": "1",
         },
         packager=run.Packager(),
         volumes=artifacts,
