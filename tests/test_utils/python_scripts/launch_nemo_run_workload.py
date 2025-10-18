@@ -1,3 +1,4 @@
+import logging
 import os
 import pathlib
 import sys
@@ -6,6 +7,9 @@ import click
 import nemo_run as run
 
 from tests.test_utils.python_scripts import common
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @click.command()
@@ -69,6 +73,7 @@ def main(scope, model, test_case, environment, platform, container_image, data_d
         result_dict = exp.status(return_dict=True)
         _, job_dict = list(result_dict.items())[0]
 
+        logger.info(f"Job status: {job_dict["status"]}")
         sys.exit(0 if str(job_dict["status"]) == "SUCCEEDED" else 1)
 
 
