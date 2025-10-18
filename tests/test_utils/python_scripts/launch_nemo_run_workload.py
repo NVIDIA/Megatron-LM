@@ -1,6 +1,7 @@
 import os
 import pathlib
 import sys
+
 import click
 import nemo_run as run
 
@@ -64,7 +65,7 @@ def main(scope, model, test_case, environment, platform, container_image, data_d
 
         exp.dryrun(log=True)
         exp.run(detach=False, tail_logs=True, sequential=False)
-        
+
         result_dict = exp.status(return_dict=True)
         _, job_dict = list(result_dict.items())[0]
 
