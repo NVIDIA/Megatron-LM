@@ -87,6 +87,7 @@ runs:
         echo "::group::Create run-script"
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
+        set -euxo pipefail
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
