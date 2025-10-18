@@ -146,6 +146,13 @@ runs:
         echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
 
+    - name: Pull container
+      shell: bash
+      run: |
+        echo "::group::Pull container"
+        docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
+        echo "::endgroup::"
+
     - name: Run main script
       uses: nick-fields/retry@v3
       id: run-main-script
