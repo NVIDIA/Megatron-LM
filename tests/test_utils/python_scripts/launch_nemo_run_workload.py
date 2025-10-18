@@ -42,12 +42,13 @@ def main(scope, model, test_case, environment, platform, container_image, data_d
 
     inline_script = run.Script(inline=workload.spec["script"])
 
-    artifacts = [
-        "{host_path}:{mount_path}".format(
-            mount_path=mount_path, host_path=str(pathlib.Path(data_dir) / host_path)
-        )
-        for mount_path, host_path in workload.spec["artifacts"].items()
-    ]
+    # artifacts = [
+    #     "{host_path}:{mount_path}".format(
+    #         mount_path=mount_path, host_path=str(pathlib.Path(data_dir) / host_path)
+    #     )
+    #     for mount_path, host_path in workload.spec["artifacts"].items()
+    # ]
+    artifacts = []
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
     artifacts.append(f"{pathlib.Path(data_dir)}:/mnt/artifacts")
 
