@@ -228,7 +228,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-functional-tests
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
@@ -332,7 +332,7 @@ jobs:
       && !cancelled()
     strategy:
       matrix:
-        flag: [unit-test, e2e]
+        flag: [unit-test]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
