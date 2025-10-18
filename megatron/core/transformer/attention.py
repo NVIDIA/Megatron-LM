@@ -349,12 +349,11 @@ class Attention(MegatronModule, ABC):
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
 
-            #if (
-            #    not hasattr(transformer_engine, "__version__")
-            #    or parse(transformer_engine.__version__) < parse("2.2")
-            #    or not self.training
-            #):
-            if not self.training:
+            if (
+                not hasattr(transformer_engine, "__version__")
+                or parse(transformer_engine.__version__) < parse("2.2")
+                or not self.training
+            ):
                 # Note: in ModelOpt, we may use inference_context for speculative decoding
                 # in training. In that case, we do not want to turn off masking as we need
                 # customized attention mask for speculative decoding.
