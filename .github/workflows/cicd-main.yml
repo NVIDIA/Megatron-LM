@@ -201,7 +201,7 @@ jobs:
         run: |
           export PYTHONPATH=$(pwd)
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-            --scope mr-slim \
+            --scope mr \
             --n-repeat 5 \
             --time-limit 2700 \
             --test-cases all \
