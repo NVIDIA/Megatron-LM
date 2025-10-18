@@ -155,15 +155,8 @@ runs:
         echo "::endgroup::"
 
     - name: Run main script
-      uses: nick-fields/retry@v3
-      id: run-main-script
-      with:
-        timeout_seconds: ${{ steps.timeout_in_seconds.outputs.main }}
-        max_attempts: 3
-        shell: bash
-        retry_on: any
-        command: /bin/bash job.sh
-        on_retry_command: /bin/bash retry_job.sh
+      shell: bash -x -e -u -o pipefail {0}
+      run: /bin/bash job.sh
 
     # - name: Check result
     #   id: check
