@@ -98,7 +98,7 @@ runs:
           --test-case ${{ inputs.test_case }} \
           --environment dev \
           --platform dgx_h100 \
-          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main \
+          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864 \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts
 
         RUN_TEST_EOF
@@ -150,7 +150,7 @@ runs:
       shell: bash
       run: |
         echo "::group::Pull container"
-        docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
+        docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864
         echo "::endgroup::"
 
     - name: Run main script
