@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
-def main(scope, model, test_case, environment, platform, container_image, data_dir: Optional[str] = None):
+def main(
+    scope, model, test_case, environment, platform, container_image, data_dir: Optional[str] = None
+):
     workloads = recipe_parser.load_workloads(
         container_image="none",
         scope=scope,
