@@ -166,7 +166,7 @@ runs:
           echo Test did not finish successfully.
           exit 1
         else
-          coverage report -i
+          uv run coverage report -i
         fi
 
         exit $EXIT_CODE
@@ -188,9 +188,3 @@ runs:
         name: ${{ steps.check.outputs.logs_report }}
         path: logs
         include-hidden-files: true
-
-    - name: Container shutdown
-      if: always()
-      shell: bash
-      run: |
-        docker container rm -f test_container_${{ github.run_id }} || true
