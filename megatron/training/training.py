@@ -2620,8 +2620,6 @@ def train(
     # a persistent async worker if persistent ckpt worker is enabled
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
-    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
-        ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
 
     if args.log_energy:
         energy_monitor.lap()
