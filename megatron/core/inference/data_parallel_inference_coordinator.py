@@ -180,8 +180,7 @@ class DataParallelInferenceCoordinator:
             request: DynamicInferenceRequest = self.requests[request_id]
             # Handle chunked prefill similar to the engine logic
             if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
-                if request.timestamp_of_first_token is None:
-                    request.timestamp_of_first_token = time.perf_counter()
+                request.generation_timestamps.append(time.perf_counter())
                 request.generated_tokens.append(token)
 
                 if request_log_probs is not None:
@@ -229,7 +228,10 @@ class DataParallelInferenceCoordinator:
                 request = self.requests.pop(fid)
                 request.generated_length = len(request.generated_tokens)
                 request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
-
+                request.tpot = []
+                for i,gen_timestamp in enumerate(request.generation_timestamps):
+                    prev_timestamp = request.arrival_time if i == 0 else request.generation_timestamps[i-1]
+                    request.tpot.append(gen_timestamp - prev_timestamp)
                 client_identity = self.request_id_to_client_id[fid]
                 client_request_identity = self.request_id_to_client_request_id[fid]
                 del self.request_id_to_client_id[fid]
