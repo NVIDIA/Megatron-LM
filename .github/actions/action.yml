@@ -48,8 +48,6 @@ runs:
   steps:
     - name: Checkout repository
       uses: actions/checkout@v2
-      with:
-        path: ${{ github.workspace }}/Megatron-LM
 
     - name: Setup python
       uses: actions/setup-python@v5
