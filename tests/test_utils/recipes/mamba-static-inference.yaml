@@ -49,7 +49,7 @@ spec:
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/generations_{environment}_$CLUSTER.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=false"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
