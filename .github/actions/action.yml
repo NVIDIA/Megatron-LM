@@ -55,13 +55,13 @@ runs:
         python-version: 3.12
 
     - name: Install uuidgen
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       run: |
         apt-get update
         apt-get install -y uuid-runtime
 
     - name: Create run-script (unit test)
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'true'
       run: |
         echo "::group::Create run-script"
@@ -87,7 +87,7 @@ runs:
         echo "::endgroup::"
 
     - name: Create run-script (e2e test)
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'false'
       env:
         MODEL: ${{ inputs.model }}
@@ -116,7 +116,7 @@ runs:
         echo "::endgroup::"
 
     - name: Set timeout
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       id: timeout_in_seconds
       run: |
         echo "::group::Set timeout"
@@ -124,7 +124,7 @@ runs:
         echo "::endgroup::"
 
     - name: Pull container
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       run: |
         echo "::group::Pull container"
         docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864
@@ -132,11 +132,16 @@ runs:
 
     - name: Run main script
       shell: bash -x -e -u -o pipefail {0}
-      run: /bin/bash job.sh
+      id: run-main-script
+      run: |
+        echo "::group::Run main script"
+        /bin/bash job.sh || EXIT_CODE=$?
+        echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+        echo "::endgroup::"
 
     - name: Check result
       id: check
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
@@ -163,7 +168,9 @@ runs:
         if [[ "$IS_SUCCESS" == "false" ]]; then
           echo Test did not finish successfully.
           exit 1
-        else
+        fi
+
+        if [[ "$coverage_report" != "none" ]]; then
           uv run coverage report -i
         fi
 
