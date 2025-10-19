@@ -15,6 +15,9 @@ name: "Test Template"
 description: "Template for running NeMo tests in a containerized environment"
 
 inputs:
+  container-image:
+    description: "Container image to use for test"
+    required: true
   timeout:
     description: "Max runtime of test in minutes"
     required: false
@@ -79,7 +82,7 @@ runs:
           --environment dev \
           --platform dgx_h100 \
           --tag ${{ inputs.tag }} \
-          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864
+          --container-image ${{ inputs.container-image }}
 
         RUN_TEST_EOF
         )
@@ -107,7 +110,7 @@ runs:
           --test-case ${{ inputs.test_case }} \
           --environment dev \
           --platform dgx_h100 \
-          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864 \
+          --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts
 
         RUN_TEST_EOF
@@ -127,7 +130,7 @@ runs:
       shell: bash -x -e -u -o pipefail {0}
       run: |
         echo "::group::Pull container"
-        docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864
+        docker pull ${{ inputs.container-image }}
         echo "::endgroup::"
 
     - name: Run main script
@@ -138,6 +141,7 @@ runs:
         EXIT_CODE=0
         /bin/bash job.sh || EXIT_CODE=$?
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+        exit $EXIT_CODE
         echo "::endgroup::"
 
     - name: Check result
