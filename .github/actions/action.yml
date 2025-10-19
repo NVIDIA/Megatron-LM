@@ -56,6 +56,12 @@ runs:
       with:
         python-version: 3.12
 
+    - name: Install uuidgen
+      shell: bash
+      run: |
+        apt-get update
+        apt-get install -y uuid-runtime
+
     - name: Create run-script (unit test)
       shell: bash
       if: inputs.is_unit_test == 'true'
