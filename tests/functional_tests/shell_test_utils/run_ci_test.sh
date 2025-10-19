@@ -103,6 +103,10 @@ if [[ "$MODE" == "pretraining" && "$TEST_TYPE" != "release" ]]; then
         TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
             /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "100"')
     fi
+elif [[ "$MODE" == "inference" && "$TEST_TYPE" != "release" ]]; then
+    if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+        /usr/local/bin/yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
+    fi
 fi
 
 if [[ "$MODE" == "pretraining" && "$TEST_TYPE" = "release" ]]; then

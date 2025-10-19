@@ -11,7 +11,7 @@ MODEL_ARGS:
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
   --timing-log-level: 2
-  --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/checkpoints
+  --load: ${CHECKPOINT_LOAD_PATH}/deepseek_16b_pyt/checkpoints
   --tokenizer-model: ${DATA_PATH}/deepseek_16b_pyt/tokenizer/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
   --tiktoken-pattern: v2
