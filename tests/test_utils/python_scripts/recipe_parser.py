@@ -254,7 +254,6 @@ def load_workloads(
 
     if workloads and test_cases != "all":
         workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
-    print(workloads)
 
     if workloads and test_case:
         workloads = [filter_by_test_case(workload_manifests=workloads, test_case=test_case)]
