@@ -131,17 +131,18 @@ class DynamicInferenceRequest(InferenceRequest):
 
     request_id: int
     generated_tokens: List[int] = field(default_factory=list)
+    generation_timestamps: List[float] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
-    timestamp_of_first_token: Optional[float] = None
     finished_chunk_token_count = 0
 
     def __post_init__(self):
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+        self.arrival_time = time.perf_counter()
 
     @property
     def remaining_prompt_length(self):
