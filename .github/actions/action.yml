@@ -64,14 +64,17 @@ runs:
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
-        docker exec -t test_container_${{ github.run_id }} bash -c '
-          set -e
-          bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
-            --tag ${{ inputs.tag }} \
-            --environment dev \
-            --bucket '\''${{ inputs.test_case }}'\'' \
-            --log-dir /opt/megatron-lm/outputs/logs
-        '
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        pip install --no-cache-dir uv
+        uv sync --only-group test 
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          --scope unit-tests \
+          --model unit-tests \
+          --test-case ${{ inputs.test_case }} \
+          --environment dev \
+          --platform dgx_h100 \
+          --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864
 
         RUN_TEST_EOF
         )
@@ -105,38 +108,6 @@ runs:
         RUN_TEST_EOF
         )
         echo "$cmd" | tee "job.sh"        
-        echo "::endgroup::"
-
-    - name: Start container
-      shell: bash
-      if: inputs.is_unit_test == 'true'
-      run: |
-        echo "::group::Start test container"
-        set -x
-
-        cmd=$(cat <<RUN_TEST_EOF
-        #!/bin/bash
-        docker container rm -f test_container_${{ github.run_id }} || true
-        docker run \
-          --rm \
-          -d \
-          --name test_container_${{ github.run_id }} \
-          --runtime=nvidia --gpus all \
-          --shm-size=64g \
-          --ipc=host \
-          -e NCCL_IB_DISABLE=1 \
-          -e NCCL_P2P_LEVEL=NVL \
-          --workdir /opt/megatron-lm/ \
-          -v /home/runner/_work/TestData/megatron-lm/artifacts/text/data/:/workspace/data \
-          --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
-          $VOLUME_ARGS \
-          766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha || 0 }} \
-          bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
-        RUN_TEST_EOF
-        )
-
-        echo "$cmd" | tee "retry_job.sh"
-        bash retry_job.sh
         echo "::endgroup::"
 
     - name: Set timeout

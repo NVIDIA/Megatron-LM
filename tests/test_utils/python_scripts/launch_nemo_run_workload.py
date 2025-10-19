@@ -2,11 +2,12 @@ import logging
 import os
 import pathlib
 import sys
+from typing import Optional
 
 import click
 import nemo_run as run
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,9 +20,9 @@ logger = logging.getLogger(__name__)
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
-@click.option("--data-dir", required=True, type=str, help="Data directory of the workload")
-def main(scope, model, test_case, environment, platform, container_image, data_dir):
-    workloads = common.load_workloads(
+@click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
+def main(scope, model, test_case, environment, platform, container_image, data_dir: Optional[str] = None):
+    workloads = recipe_parser.load_workloads(
         container_image="none",
         scope=scope,
         model=model,
@@ -48,7 +49,8 @@ def main(scope, model, test_case, environment, platform, container_image, data_d
 
     artifacts = []
     artifacts.append(f"{os.getcwd()}:/opt/megatron-lm")
-    artifacts.append(f"{pathlib.Path(data_dir)}:/mnt/artifacts")
+    if data_dir:
+        artifacts.append(f"{pathlib.Path(data_dir)}:/mnt/artifacts")
 
     executor = run.DockerExecutor(
         container_image=container_image,
