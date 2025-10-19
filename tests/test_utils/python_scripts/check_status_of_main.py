@@ -72,6 +72,9 @@ def main(target_branch: str, continuous: bool):
         time.sleep(60)
 
     if not is_sucess(target_branch=target_branch):
+        logger.error(
+            "Main is broken, we're therefore blocking your merge. Please wait until main is fixed again by checking the repo's front page. If the status is green again, you can re-attempt the merge. Feel free to ping the team if you have any questions."
+        )
         sys.exit(1)
 
     sys.exit(0)

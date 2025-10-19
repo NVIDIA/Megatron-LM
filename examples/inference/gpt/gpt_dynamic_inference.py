@@ -83,6 +83,7 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--termination-id", type=int, default=None,
         help="Termination ID that overrides `tokenizer.eod`."
     )
+    group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
 
     return parser
 
@@ -172,7 +173,7 @@ def get_inference_context(
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-        use_cuda_graphs_for_non_decode_steps=layer_type_list is None,
+        use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
@@ -421,15 +422,20 @@ def main():
         print(setup_prefix)
         print("~~~")
 
-    # Run and time test.
-    t = get_curr_time()
-    result = run_inference(requests, sampling_params, engine)
-    step_times = result["step_times"]
-    add_times = result["add_times"]
-    output_times = result["output_times"]
-    total_output_tokens = result["total_output_tokens"]
-    torch.cuda.synchronize()
-    total_time = get_curr_time() - t
+    # Run and time test, optionally `args.inference_repeat_n` times.
+    throughputs = []
+    for _ in range(args.inference_repeat_n):
+        t = get_curr_time()
+        result = run_inference(requests, sampling_params, engine)
+        step_times = result["step_times"]
+        add_times = result["add_times"]
+        output_times = result["output_times"]
+        total_output_tokens = result["total_output_tokens"]
+        torch.cuda.synchronize()
+        total_time = get_curr_time() - t
+        stats = torch.cuda.memory_stats()
+        throughput = total_output_tokens / total_time
+        throughputs.append(throughput)
 
     # Validate all requests finished.
     for request in requests:
@@ -438,50 +444,50 @@ def main():
         )
 
     # Print unique prompts + outputs.
-    if torch.distributed.get_rank() == 0:
 
-        def escape_str(s):
-            return s.replace("\n", "\\n")
+    def escape_str(s):
+        return s.replace("\n", "\\n")
 
-        print("~~~~ Unique prompts + outputs. ~~~~")
+    print("~~~~ Unique prompts + outputs. ~~~~")
 
-        # Map requests by their prompt.
-        unique_prompt_map = defaultdict(list)
-        for request_idx, request in enumerate(requests):
-            unique_prompt_map[request.prompt_text].append(request_idx)
+    # Map requests by their prompt.
+    unique_prompt_map = defaultdict(list)
+    for request_idx, request in enumerate(requests):
+        unique_prompt_map[request.prompt_text].append(request_idx)
 
-        # Print unique prompts + outputs.
-        for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-            # ---- Prompt summary line ----
-            prompt_len = len(requests[request_idxs[0]].prompt_tokens)
-            escaped_prompt_text = escape_str(prompt_text)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+    # Print unique prompts + outputs.
+    for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
+        # ---- Prompt summary line ----
+        prompt_len = len(requests[request_idxs[0]].prompt_tokens)
+        escaped_prompt_text = escape_str(prompt_text)
+        print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
-            # ---- Group all outputs for this prompt ----
-            output_map = defaultdict(list)
-            for idx in request_idxs:
-                req = requests[idx]
-                output_map[req.output_text].append(idx)
+        # ---- Group all outputs for this prompt ----
+        output_map = defaultdict(list)
+        for idx in request_idxs:
+            req = requests[idx]
+            output_map[req.output_text].append(idx)
 
-            # ---- Print each unique output ----
-            for output_text, output_request_idxs in output_map.items():
-                if output_text is not None:
-                    o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
-                    o_len = len(requests[output_request_idxs[0]].output_tokens)
-                    escaped_output_text = escape_str(output_text)
-                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
-                else:
-                    o_hash = "--"
-                    o_len = 0
-                    escaped_output_text = "--"
-                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+        # ---- Print each unique output ----
+        for output_text, output_request_idxs in output_map.items():
+            if output_text is not None:
+                o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                o_len = len(requests[output_request_idxs[0]].output_tokens)
+                escaped_output_text = escape_str(output_text)
+                print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
+            else:
+                o_hash = "--"
+                o_len = 0
+                escaped_output_text = "--"
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
 
-        # Write results to JSON. Primarily used for functional testing.
-        if args.output_path:
-            json_results = {}
+    # Write results to JSON. Primarily used for functional testing.
+    if args.output_path:
+        json_results = {}
 
-            # Write every 'n' requests, plus the final request.
-            for req in [ *requests[::args.output_every_n_results], requests[-1] ]:
+        # Write every 'n' requests, plus the final request.
+        for i, req in enumerate(requests):
+            if i % args.output_every_n_results == 0 or i == len(requests) - 1:
                 result_dict = {
                     "input_prompt": req.prompt_text,
                     "generated_text": req.output_text,
@@ -494,52 +500,54 @@ def main():
                     response_logprobs = req.log_probs
                     result_dict["logprobs"] = response_logprobs
                 json_results[req.request_id] = result_dict
-            with open(args.output_path, "w") as fp:
-                json.dump(json_results, fp, indent=1)
 
-        # Timing results.
-        stats = torch.cuda.memory_stats()
-        throughput = total_output_tokens / total_time
-        print("~~~")
-        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
-        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+        # Track system-level throughput as a test / debug metric
+        json_results["throughput"] = throughputs
 
-        p_times = step_times["prefill"]
-        d_times = step_times["decode"]
+        with open(args.output_path, "w") as fp:
+            json.dump(json_results, fp, indent=1)
 
-        p_total = sum(p_times)
-        d_total = sum(d_times)
+    # Timing results.
+    print("~~~")
+    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
 
-        p_count = len(p_times)
-        d_count = len(d_times)
+    p_times = step_times["prefill"]
+    d_times = step_times["decode"]
 
-        p_mean = p_total / p_count
-        d_mean = d_total / d_count
+    p_total = sum(p_times)
+    d_total = sum(d_times)
 
-        # Commented out for now as the step/add/output times are not calculated correctly.
-        # print(
-        #     f"{setup_prefix} … "
-        #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        #     f"total time: {step_total:.3f}s … "
-        #     f"step time: total {step_total:.3f}s "
-        #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
-        #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
-        #     f"count [ p {p_count}, d {d_count} ]."
-        # )
-        capture_str = (
-            f"{engine.capture_stats["time"]:.2f} sec"
-            if engine.capture_stats else
-            "--"
-        )
-        print(
-            f"{setup_prefix} … "
-            f"capture {capture_str} … "
-            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-            f"total time: {total_time:.3f}s … "
-            f"steps: {engine.step_count:d} … "
-            f"throughput: {throughput:.3f} tok/s"
-        )
-        print("~~~")
+    p_count = len(p_times)
+    d_count = len(d_times)
+
+    p_mean = p_total / p_count
+    d_mean = d_total / d_count
+
+    # Commented out for now as the step/add/output times are not calculated correctly.
+    # print(
+    #     f"{setup_prefix} … "
+    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+    #     f"total time: {step_total:.3f}s … "
+    #     f"step time: total {step_total:.3f}s "
+    #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+    #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+    #     f"count [ p {p_count}, d {d_count} ]."
+    # )
+    capture_str = (
+        f"{engine.capture_stats["time"]:.2f} sec"
+        if engine.capture_stats else
+        "--"
+    )
+    print(
+        f"{setup_prefix} … "
+        f"capture {capture_str} … "
+        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        f"total time: {total_time:.3f}s … "
+        f"steps: {engine.step_count:d} … "
+        f"throughput: {throughput:.3f} tok/s"
+    )
+    print("~~~")
 
     # Stop Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):

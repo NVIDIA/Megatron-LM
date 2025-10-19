@@ -89,7 +89,6 @@ def add_modelopt_args(parser):
         help="Checkpoint format of teacher model, if different from student's.",
     )
 
-
     # Finetuning
     group.add_argument(
         "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
@@ -117,19 +116,11 @@ def add_modelopt_args(parser):
         help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
     )
 
+    # Global state
+    group.add_argument(
+        '--modelopt-enabled',
+        action="store_true",
+        help='Will be set automatically when loading a ModelOpt checkpoint.',
+    )
+
     return parser
-
-
-def modelopt_args_enabled(args):
-    """Check if any modelopt-related arguments are provided."""
-    key_args_and_defaults = {
-        "export_real_quant_cfg": "None",
-        "export_quant_cfg": None,
-        "export_kd_teacher_load": None,
-        "export_num_medusa_heads": 0,
-        "export_num_eagle_layers": 0,
-    }
-    for key, default in key_args_and_defaults.items():
-        if hasattr(args, key) and getattr(args, key) != default:
-            return True
-    return False
