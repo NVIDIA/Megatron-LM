@@ -245,9 +245,7 @@ def run_inference(
     step_times = {"prefill": [], "decode": []}
     add_times = []
     output_times = []
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        tbar = tqdm(total=num_requests_total)
+    tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
     if args.cuda_graph_impl == "local":
         cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
@@ -269,8 +267,7 @@ def run_inference(
         _request.time_start = get_curr_time()
         _request.state = "started"
         num_requests_added += 1
-        if rank == 0:
-            tbar.update(1)
+        tbar.update(1)
 
     while True:
         # Add requests.
@@ -416,11 +413,10 @@ def main():
         enable_chunked_prefill=not args.disable_chunked_prefill,
     )
 
-    if torch.distributed.get_rank() == 0:
-        setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
-        print("~~~")
-        print(setup_prefix)
-        print("~~~")
+    setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
+    print("~~~")
+    print(setup_prefix)
+    print("~~~")
 
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
@@ -445,67 +441,68 @@ def main():
 
     # Print unique prompts + outputs.
 
-    def escape_str(s):
-        return s.replace("\n", "\\n")
+    if torch.distributed.get_rank() == 0:
+        def escape_str(s):
+            return s.replace("\n", "\\n")
 
-    print("~~~~ Unique prompts + outputs. ~~~~")
+        print("~~~~ Unique prompts + outputs. ~~~~")
 
-    # Map requests by their prompt.
-    unique_prompt_map = defaultdict(list)
-    for request_idx, request in enumerate(requests):
-        unique_prompt_map[request.prompt_text].append(request_idx)
+        # Map requests by their prompt.
+        unique_prompt_map = defaultdict(list)
+        for request_idx, request in enumerate(requests):
+            unique_prompt_map[request.prompt_text].append(request_idx)
 
-    # Print unique prompts + outputs.
-    for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-        # ---- Prompt summary line ----
-        prompt_len = len(requests[request_idxs[0]].prompt_tokens)
-        escaped_prompt_text = escape_str(prompt_text)
-        print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+        # Print unique prompts + outputs.
+        for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
+            # ---- Prompt summary line ----
+            prompt_len = len(requests[request_idxs[0]].prompt_tokens)
+            escaped_prompt_text = escape_str(prompt_text)
+            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
-        # ---- Group all outputs for this prompt ----
-        output_map = defaultdict(list)
-        for idx in request_idxs:
-            req = requests[idx]
-            output_map[req.output_text].append(idx)
+            # ---- Group all outputs for this prompt ----
+            output_map = defaultdict(list)
+            for idx in request_idxs:
+                req = requests[idx]
+                output_map[req.output_text].append(idx)
 
-        # ---- Print each unique output ----
-        for output_text, output_request_idxs in output_map.items():
-            if output_text is not None:
-                o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
-                o_len = len(requests[output_request_idxs[0]].output_tokens)
-                escaped_output_text = escape_str(output_text)
-                print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
-            else:
-                o_hash = "--"
-                o_len = 0
-                escaped_output_text = "--"
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+            # ---- Print each unique output ----
+            for output_text, output_request_idxs in output_map.items():
+                if output_text is not None:
+                    o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                    o_len = len(requests[output_request_idxs[0]].output_tokens)
+                    escaped_output_text = escape_str(output_text)
+                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
+                else:
+                    o_hash = "--"
+                    o_len = 0
+                    escaped_output_text = "--"
+                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
 
-    # Write results to JSON. Primarily used for functional testing.
-    if args.output_path:
-        json_results = {}
+        # Write results to JSON. Primarily used for functional testing.
+        if args.output_path:
+            json_results = {}
 
-        # Write every 'n' requests, plus the final request.
-        for i, req in enumerate(requests):
-            if i % args.output_every_n_results == 0 or i == len(requests) - 1:
-                result_dict = {
-                    "input_prompt": req.prompt_text,
-                    "generated_text": req.output_text,
-                    "generated_tokens": req.output_tokens,
-                    "latency": req.time_end - req.time_start,
-                    "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
-                    "step_count" : engine.step_count,
-                }
-                if sampling_params.return_log_probs:
-                    response_logprobs = req.log_probs
-                    result_dict["logprobs"] = response_logprobs
-                json_results[req.request_id] = result_dict
+            # Write every 'n' requests, plus the final request.
+            for i, req in enumerate(requests):
+                if i % args.output_every_n_results == 0 or i == len(requests) - 1:
+                    result_dict = {
+                        "input_prompt": req.prompt_text,
+                        "generated_text": req.output_text,
+                        "generated_tokens": req.output_tokens,
+                        "latency": req.time_end - req.time_start,
+                        "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
+                        "step_count" : engine.step_count,
+                    }
+                    if sampling_params.return_log_probs:
+                        response_logprobs = req.log_probs
+                        result_dict["logprobs"] = response_logprobs
+                    json_results[req.request_id] = result_dict
 
-        # Track system-level throughput as a test / debug metric
-        json_results["throughput"] = throughputs
+            # Track system-level throughput as a test / debug metric
+            json_results["throughput"] = throughputs
 
-        with open(args.output_path, "w") as fp:
-            json.dump(json_results, fp, indent=1)
+            with open(args.output_path, "w") as fp:
+                json.dump(json_results, fp, indent=1)
 
     # Timing results.
     print("~~~")
