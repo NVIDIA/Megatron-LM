@@ -12,7 +12,6 @@ spec:
   platforms: dgx_a100
   artifacts:
     /workspace/data/model/mcore_mistral: model/mcore_mistral/nemo_minitron-0.5b/v1
-    /workspace/data/model/mcore_mistral: model/mcore_mistral/nemo_minitron-0.5b/v1
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
