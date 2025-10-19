@@ -135,6 +135,7 @@ runs:
       id: run-main-script
       run: |
         echo "::group::Run main script"
+        EXIT_CODE=0
         /bin/bash job.sh || EXIT_CODE=$?
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
