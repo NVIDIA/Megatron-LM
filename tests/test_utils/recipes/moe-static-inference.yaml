@@ -40,7 +40,7 @@ spec:
     cd /opt/megatron-lm
 
     ARGUMENTS=(
-        "CHECKPOINT_LOAD_PATH=/worksmnt/artifacts/model"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts/model"
         "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
         "DATA_PATH=/mnt/artifacts/data"
         "DATA_CACHE_PATH=/workspace/data/cache"
