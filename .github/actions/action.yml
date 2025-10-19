@@ -74,6 +74,7 @@ runs:
           --test-case ${{ inputs.test_case }} \
           --environment dev \
           --platform dgx_h100 \
+          --tag ${{ inputs.tag }} \
           --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864
 
         RUN_TEST_EOF
@@ -102,7 +103,6 @@ runs:
           --test-case ${{ inputs.test_case }} \
           --environment dev \
           --platform dgx_h100 \
-          --tag latest \
           --container-image 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864 \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts
 
