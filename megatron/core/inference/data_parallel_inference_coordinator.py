@@ -1,12 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import time
 from collections import deque
 from itertools import cycle, repeat
 from typing import List, Tuple
 
 import torch
-import time
 
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -229,8 +229,10 @@ class DataParallelInferenceCoordinator:
                 request.generated_length = len(request.generated_tokens)
                 request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
                 request.tpot = []
-                for i,gen_timestamp in enumerate(request.generation_timestamps):
-                    prev_timestamp = request.arrival_time if i == 0 else request.generation_timestamps[i-1]
+                for i, gen_timestamp in enumerate(request.generation_timestamps):
+                    prev_timestamp = (
+                        request.arrival_time if i == 0 else request.generation_timestamps[i - 1]
+                    )
                     request.tpot.append(gen_timestamp - prev_timestamp)
                 client_identity = self.request_id_to_client_id[fid]
                 client_request_identity = self.request_id_to_client_request_id[fid]
