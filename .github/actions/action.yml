@@ -200,5 +200,5 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ steps.check.outputs.logs_report }}
-        path: logs
+        path: assets_dir/logs
         include-hidden-files: true

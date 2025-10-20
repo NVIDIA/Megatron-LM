@@ -14,7 +14,7 @@ cd $SCRIPT_PATH/../../
 # Default values
 UNIT_TEST_REPEAT=1
 UNIT_TEST_TIMEOUT=10
-LOG_DIR=$(pwd)/logs
+LOG_DIR=$(pwd)/assets_dir/logs
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -137,6 +137,8 @@ while IFS= read -r test_case; do
 done <<<"$IGNORE_TEST_CASES"
 
 echo "------ARGUMENTS for SLURM ---"
+export LOG_DIR=$LOG_DIR/logs
+mkdir -p $LOG_DIR
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
