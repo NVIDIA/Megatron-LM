@@ -59,7 +59,6 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --num-query-groups: 8
   --seq-length: 512
   --kv-channels: 128
-  --ffn-hidden-size: 8192
   --group-query-attention: true
   --normalization: RMSNorm
   --swiglu: true
@@ -90,7 +89,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --load: ${CHECKPOINT_LOAD_PATH}
   # data settings
   --data-cache-path: ${DATA_CACHE_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
   --vocab-file: ${DATA_PATH}/bpe/vocab.json
   --merge-file: ${DATA_PATH}/bpe/merges.txt
   # logging settings

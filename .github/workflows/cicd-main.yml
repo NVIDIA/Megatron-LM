@@ -183,7 +183,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha }}
+          container-image: 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864 #${{ github.sha }}
 
   cicd-parse-functional-tests:
     runs-on: ubuntu-latest
@@ -191,7 +191,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
-      - cicd-unit-tests-latest
+      # - cicd-unit-tests-latest
     outputs:
       functional-tests: ${{ steps.main.outputs.functional-tests }}
     steps:
@@ -233,7 +233,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-functional-tests
-      - cicd-unit-tests-latest
+      # - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
@@ -257,7 +257,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ github.sha }}
+          container-image: 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:1864 # ${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:

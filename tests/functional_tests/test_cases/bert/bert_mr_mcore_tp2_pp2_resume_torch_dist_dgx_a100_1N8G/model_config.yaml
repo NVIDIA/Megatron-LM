@@ -22,7 +22,7 @@ MODEL_ARGS:
   --lr-decay-iters: 990000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/my-bert_00_text_sentence
+  --data-path: ${DATA_PATH}/text/the_pile/bert_shard00/my-bert_00_text_sentence
   --vocab-file: ${DATA_PATH}/vocab.txt
   --split: 949,50,1
   --distributed-backend: nccl
@@ -42,6 +42,6 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --ckpt-format: torch
-  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --attention-backend: unfused
 TEST_TYPE: ckpt-resume
