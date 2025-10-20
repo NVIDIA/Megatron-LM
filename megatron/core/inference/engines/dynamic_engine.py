@@ -82,7 +82,7 @@ class DynamicInferenceEngine(AbstractEngine):
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
-            batching and a dynamic chunked KV cache (similar to paged attention).
+            batching and a dynamic block-level KV cache (similar to paged attention).
         termination_id (int): Token ID to mark end-of-sequence.
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
