@@ -21,8 +21,8 @@ spec:
     git init
     git remote add origin $MCORE_REPO
     git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
-    git fetch origin $MCORE_MR_COMMIT
-    git checkout $MCORE_MR_COMMIT
+    git fetch origin $MCORE_COMMIT
+    git checkout $MCORE_COMMIT
     git rev-parse HEAD
 
     # Checkout backwards-ref
@@ -56,37 +56,37 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [bert_mr_mcore_tp2_pp2_dgx_a100_1N8G]
+  - test_case: [bert_mcore_tp2_pp2]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G]
+  - test_case: [bert_mcore_tp2_pp2_local_spec]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G]
+  - test_case: [bert_mcore_tp2_pp2_resume_torch_dist]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G]
+  - test_case: [bert_mcore_tp2_pp2_resume_torch_dist_local_spec]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
+  - test_case: [bert_mcore_tp1_pp2]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2]
+  - test_case: [bert_mcore_tp1_pp4_vp2]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
+  - test_case: [bert_mcore_tp4_pp1]
     products:
       - environment: [dev]
         scope: [nightly]
