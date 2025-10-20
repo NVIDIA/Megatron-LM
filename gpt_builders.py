@@ -40,8 +40,10 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             transformer_layer_spec = import_module(args.spec)
         else:
             use_te = args.transformer_impl == "transformer_engine"
+            use_inference_optimized_layers = args.use_inference_optimized_layers
 
             if args.num_experts:
+                assert not use_inference_optimized_layers
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -51,12 +53,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
                     vp_stage=vp_stage,
                 )
             elif args.heterogeneous_layers_config_path is not None:
+                assert not use_inference_optimized_layers
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
-                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
+                transformer_layer_spec = _get_transformer_layer_spec(use_te, config, use_inference_optimized_layers)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
+            assert not use_inference_optimized_layers
             if (
                 hasattr(transformer_layer_spec, 'layer_specs')
                 and len(transformer_layer_spec.layer_specs) == 0
@@ -94,7 +98,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
     return model
 
 
-def _get_transformer_layer_spec(use_te, config):
+def _get_transformer_layer_spec(use_te, config, use_inference_optimized_layers: bool = False) :
     """Get transformer layer specification based on configuration.
 
     Args:
@@ -115,6 +119,7 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_inference_optimized_layers=use_inference_optimized_layers,
         )
     else:
         return get_gpt_layer_local_spec(

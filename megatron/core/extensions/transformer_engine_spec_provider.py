@@ -16,6 +16,10 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.tensor_parallel.inference_layers import (
+    InferenceLayerNormColumnParallelLinear,
+    InferenceRowParallelLinear,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
@@ -93,3 +97,13 @@ class TESpecProvider(BackendSpecProvider):
     def activation_func(self) -> type:
         """Which module to use for activation function"""
         return TEActivationOp
+
+
+class InferenceSpecProvider(TESpecProvider):
+    """A protocol for providing the submodules used in Spec building for inference."""
+
+    def column_parallel_layer_norm_linear(self):
+        return InferenceLayerNormColumnParallelLinear
+
+    def row_parallel_linear(self):
+        return InferenceRowParallelLinear

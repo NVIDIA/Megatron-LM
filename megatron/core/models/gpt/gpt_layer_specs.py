@@ -37,7 +37,10 @@ try:
     import transformer_engine as te  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+    from megatron.core.extensions.transformer_engine_spec_provider import (
+        InferenceSpecProvider,
+        TESpecProvider,
+    )
 
     HAVE_TE = True
 except ImportError:
@@ -80,6 +83,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    use_inference_optimized_layers: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -112,6 +116,8 @@ def get_gpt_layer_with_transformer_engine_spec(
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
+    elif use_inference_optimized_layers:
+        backend = InferenceSpecProvider()
     else:
         backend = TESpecProvider()
 
