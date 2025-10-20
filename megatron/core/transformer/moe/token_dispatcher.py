@@ -1228,7 +1228,6 @@ class _DeepepManager(_DispatchManager):
         self.handle = None
         return hidden_states
 
-    @jit_fuser
     def _pad_routing_map(
         self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
