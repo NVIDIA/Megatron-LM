@@ -223,7 +223,7 @@ jobs:
             --output-path functional-tests.yaml
 
           cat functional-tests.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key})' | jq -c  > functional-tests.json
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > functional-tests.json
 
           echo "functional-tests=$(cat functional-tests.json)" | tee -a "$GITHUB_OUTPUT"
 
