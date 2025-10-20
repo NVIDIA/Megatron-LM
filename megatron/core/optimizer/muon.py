@@ -289,7 +289,7 @@ def get_megatron_muon_optimizer(
             for p in group['params']:
                 if len(opt.state[p]) == 0:
                     opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
-    
+
     def adam_init_state_fn(opt, config=None):
         for group in opt.param_groups:
             for p in group['params']:
@@ -342,5 +342,11 @@ def get_megatron_muon_optimizer(
         log_single_rank(logger, logging.INFO, 'Using LayerWiseDistributedOptimizer for Muon')
         if reset_config_bf16:
             config.bf16 = True
-        return LayerWiseDistributedOptimizer(optimizers, config, pg_collection, muon_init_state_fn=muon_init_state_fn, adam_init_state_fn=adam_init_state_fn)
+        return LayerWiseDistributedOptimizer(
+            optimizers,
+            config,
+            pg_collection,
+            muon_init_state_fn=muon_init_state_fn,
+            adam_init_state_fn=adam_init_state_fn,
+        )
     return ChainedOptimizer(optimizers)
