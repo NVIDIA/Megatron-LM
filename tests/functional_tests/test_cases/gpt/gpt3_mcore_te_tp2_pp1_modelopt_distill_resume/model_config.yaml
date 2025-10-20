@@ -67,4 +67,4 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
-TEST_TYPE: ckpt-resume
+TEST_TYPE: frozen-resume
