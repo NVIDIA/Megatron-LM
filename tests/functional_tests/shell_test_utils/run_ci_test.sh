@@ -304,7 +304,7 @@ for i in $(seq 1 $N_REPEAT); do
         fi
 
         # For inference jobs
-        if [[ "$MODE" == "inference" ]]; then
+        if [[ "$MODE" == "inference" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
