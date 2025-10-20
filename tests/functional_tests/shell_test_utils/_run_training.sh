@@ -8,7 +8,7 @@
 
 set -euxo pipefail
 
-echo "------ARGUMENTS LIST --------"
+set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -18,7 +18,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(

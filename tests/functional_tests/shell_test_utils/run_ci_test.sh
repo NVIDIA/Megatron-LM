@@ -8,9 +8,7 @@ ulimit -Sn $(ulimit -Hn)
 # Increase soft limit for number of processes to match hard limit
 ulimit -Su $(ulimit -Hu)
 
-echo "------ARGUMENTS LIST --------"
-# Use eval to properly handle quoted arguments
-eval "set -- $@"
+set +x
 for ARGUMENT in "$@"; do
     # Split on first = only, preserving any subsequent = signs in the value
     KEY="${ARGUMENT%%=*}"
@@ -26,7 +24,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$(eval echo $VALUE)"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
