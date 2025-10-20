@@ -29,7 +29,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import SFTDataset, MockSFTDataset
 from model_provider import model_provider
 from gpt_builders import gpt_builder
 
@@ -237,6 +237,8 @@ def core_gpt_dataset_config_from_args(args):
         sequence_parallel_size=args.tensor_model_parallel_size*args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
+        sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
+        sft_sequence_packing=args.sft_sequence_packing,
     )
 
 
@@ -251,7 +253,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     config = core_gpt_dataset_config_from_args(args)
 
     if args.sft:
-        dataset_type = SFTDataset
+        if args.mock_data:
+            dataset_type = MockSFTDataset
+        else:
+            dataset_type = SFTDataset
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
