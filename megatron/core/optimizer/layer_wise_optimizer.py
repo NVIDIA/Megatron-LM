@@ -4,6 +4,13 @@ from typing import List, Optional
 
 import torch
 
+from .optimizer import ChainedOptimizer, MegatronOptimizer, Float16OptimizerWithFloat16Params
+from .optimizer_config import OptimizerConfig
+from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -163,3 +170,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def load_state_dict_from_file(self, filename: str) -> None:
         """Load the parameter state of the optimizer."""
         super().load_state_dict(torch.load(filename))
+    
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
+    ):
+        sharded_state_dict = super().sharded_state_dict(model_sharded_state_dict, is_loading, **kwargs)
+
+        for sh_base in nested_values(sharded_state_dict):
+            if isinstance(sh_base, ShardedTensor):
+                sh_base.replica_id = 0
+        
+        return sharded_state_dict
+
+
