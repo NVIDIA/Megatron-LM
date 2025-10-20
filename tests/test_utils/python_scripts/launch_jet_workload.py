@@ -116,7 +116,7 @@ def launch_and_wait_for_completion(
                     },
                     "outputs": {
                         "enabled": True,
-                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
+                        "artifacts_storages": [recipe_parser.resolve_artifact_config(cluster)],
                     },
                 },
                 wait_for_validation=True,
