@@ -275,7 +275,9 @@ def load_workloads(
         workload.spec["artifacts"] = {
             key: value.replace(r"{platforms}", workload.spec["platforms"])
             for key, value in (
-                workload.spec["artifacts"].items() if "artifacts" in workload.spec else {}
+                workload.spec["artifacts"].items()
+                if "artifacts" in workload.spec and workload.spec["artifacts"] is not None
+                else {}
             )
         }
 
