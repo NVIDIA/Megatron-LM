@@ -2473,7 +2473,7 @@ linting = [
 ]
 test = [
     { name = "coverage" },
-    { name = "nemo-run" },
+    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d" },
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
@@ -2872,8 +2872,8 @@ wheels = [
 
 [[package]]
 name = "nemo-run"
-version = "0.6.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.7.0rc0.dev0"
+source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d#01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 dependencies = [
     { name = "catalogue" },
     { name = "cryptography" },
@@ -2890,10 +2890,6 @@ dependencies = [
     { name = "toml" },
     { name = "torchx" },
     { name = "typer" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/0a/161c5f9534946f096d7ba16e40874cf9ebbff17d57c1f88173b4b32cf067/nemo_run-0.6.0.tar.gz", hash = "sha256:8c2ec0a87a0e4df799ee527422fd2df366926cdc4cc8e0b666df98b550cd9bb7", size = 2284395, upload-time = "2025-10-09T16:07:25.718Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/2e/56750d75ec35a692e9eb0ac0f780da9f12c8e599b8273b9eabc33ae0ca30/nemo_run-0.6.0-py3-none-any.whl", hash = "sha256:7b6473aded379e9c793b7f1f64c7f44ce3ef70b4ea27dad95fd84523531ac403", size = 235439, upload-time = "2025-10-09T16:07:24.46Z" },
 ]
 
 [[package]]
