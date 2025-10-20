@@ -1210,9 +1210,6 @@ def validate_args(args, defaults={}):
         assert args.transformer_impl == 'transformer_engine', (
             "--use-inference-optimized-layers is only supported with transformer_engine implementation"
         )
-        assert args.tensor_model_parallel_size == 1, (
-            "--use-inference-optimized-layers is only supported when tensor model parallelism is disabled"
-        )
 
     # Print arguments.
     _print_args("arguments", args)
