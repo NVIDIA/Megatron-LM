@@ -47,24 +47,25 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         optimizers: List[MegatronOptimizer],
         config: OptimizerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        muon_init_state_fn: Optional[Callable] = None,
-        adam_init_state_fn: Optional[Callable] = None,
+        init_state_fn_list: Optional[List[Callable]] = None,
     ) -> None:
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
         # wrap optimizer after sharding to avoid unnecessary master weight creation
         # TODO(deyuf): check if underlying optimizer.config need to fixed and if so can use
         # that instead of passing
+        if init_state_fn_list is None:
+            init_state_fn_list = [None] * len(optimizers)
+        else:
+            assert len(init_state_fn_list) == len(optimizers), "init_state_fn_list must be the " \
+                "same length as optimizers if provided"
+
         if config.bf16:
             if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
                 raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
             optimizers = [
-                (
-                    Float16OptimizerWithFloat16Params(optim, config, None, muon_init_state_fn)
-                    if isinstance(optim, OrthogonalizedOptimizer)
-                    else Float16OptimizerWithFloat16Params(optim, config, None, adam_init_state_fn)
-                )
-                for optim in optimizers
+                Float16OptimizerWithFloat16Params(optim, config, None, init_state_fn_list[idx])
+                for idx, optim in enumerate(optimizers)
             ]
         super().__init__(optimizers)
 
@@ -185,10 +186,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
+        """
+        Sharded state dict for torch_dist format checkpointing.
+        For fixed DP usage only, set replica_id to 0 for all ShardedTensor.
+        """
         sharded_state_dict = super().sharded_state_dict(
             model_sharded_state_dict, is_loading, **kwargs
         )
 
+        # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if isinstance(sh_base, ShardedTensor):
                 sh_base.replica_id = 0
