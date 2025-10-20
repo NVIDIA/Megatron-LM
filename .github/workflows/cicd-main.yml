@@ -175,6 +175,10 @@ jobs:
       )
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -240,6 +244,10 @@ jobs:
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
     if: |
       (
         success() 
