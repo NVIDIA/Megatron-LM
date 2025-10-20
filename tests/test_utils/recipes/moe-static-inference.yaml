@@ -10,7 +10,6 @@ spec:
   gpus: 8
   n_repeat: 1
   platforms: dgx_a100
-  artifacts:
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc

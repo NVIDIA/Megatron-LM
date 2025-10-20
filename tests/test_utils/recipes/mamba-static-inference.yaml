@@ -10,8 +10,6 @@ spec:
   gpus: 1
   n_repeat: 1
   platforms: dgx_a100
-  artifacts:
-    /workspace/data/mamba_hybrid_2b: model/mamba_hybrid_2b/dcp/mcore-v1_bf16
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
