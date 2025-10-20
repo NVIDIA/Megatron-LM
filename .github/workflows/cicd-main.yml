@@ -160,7 +160,10 @@ jobs:
           - bucket: "unit_tests/dist_checkpointing/models/"
           - bucket: "unit_tests/transformer/*.py"
           - bucket: "unit_tests/transformer/moe"
-    needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      # - cicd-container-build
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
@@ -190,7 +193,7 @@ jobs:
     needs:
       - pre-flight
       - cicd-wait-in-queue
-      - cicd-container-build
+      # - cicd-container-build
       # - cicd-unit-tests-latest
     outputs:
       functional-tests: ${{ steps.main.outputs.functional-tests }}
