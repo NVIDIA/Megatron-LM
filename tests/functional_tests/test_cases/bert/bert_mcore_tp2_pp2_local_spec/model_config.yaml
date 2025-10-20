@@ -23,7 +23,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --data-path: ${DATA_PATH}/text/the_pile/bert_shard00/my-bert_00_text_sentence
-  --vocab-file: ${DATA_PATH}/vocab.txt
+  --vocab-file: ${DATA_PATH}/text/the_pile/bert_shard00/vocab.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.0001
