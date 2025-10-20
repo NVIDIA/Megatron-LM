@@ -60,43 +60,43 @@ products:
   #######################################################################
   # Nightly tests: Run both DEV and LTS unless something is flaky       #
   #######################################################################
-  - test_case: [gpt3_345m_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
+  - test_case: [gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_mcore_tp1_pp2]
+  - test_case: [gpt3_mcore_tp1_pp2]
     products:
       - environment: [lts]
         scope: [nightly]
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [gpt3_345m_mcore_tp1_pp2_resume_torch_dist]
+  - test_case: [gpt3_mcore_tp1_pp2_resume_torch_dist]
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_mcore_tp1_pp4]
+  - test_case: [gpt3_mcore_tp1_pp4]
     products:
       - environment: [lts]
         scope: [nightly]
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [gpt3_345m_mcore_tp1_pp4_resume_torch_dist]
+  - test_case: [gpt3_mcore_tp1_pp4_resume_torch_dist]
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_mcore_tp4_pp1_resume_torch]
+  - test_case: [gpt3_mcore_tp4_pp1_resume_torch]
     products:
       - environment: [lts]
         scope: [nightly]
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [gpt3_345m_mcore_tp4_pp1_resume_torch_dist]
+  - test_case: [gpt3_mcore_tp4_pp1_resume_torch_dist]
     products:
       - environment: [lts]
         scope: [nightly]
@@ -503,47 +503,47 @@ products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_a100, dgx_h100]
-  # - test_case: [gpt3_345m_weekly_dgx_b200_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_b200]
-  # - test_case: [gpt3_345m_weekly_dgx_b200_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_b200]
-  # - test_case: [gpt3_345m_weekly_dgx_b200_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_b200]
-  # - test_case: [gpt3_345m_weekly_dgx_b200_mcore_tp4_cp2_mxfp8_tp_sp_cp]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_mxfp8_tp_sp_cp]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_b200]
-  # - test_case: [gpt3_345m_weekly_dgx_b200_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_b200]
-  - test_case: [gpt3_345m_weekly_dgx_h100_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
+  - test_case: [gpt3_weekly_dgx_h100_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
     products:
       - environment: [dev]
         scope: [weekly]
         platforms: [dgx_h100]
-  # - test_case: [gpt3_345m_weekly_dgx_h100_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
+  # - test_case: [gpt3_weekly_dgx_h100_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_h100]
-  # - test_case: [gpt3_345m_weekly_dgx_h100_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
+  # - test_case: [gpt3_weekly_dgx_h100_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
   #   products:
   #     - environment: [dev]
   #       scope: [weekly]
   #       platforms: [dgx_h100]
-  - test_case: [gpt3_345m_weekly_dgx_h100_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
+  - test_case: [gpt3_weekly_dgx_h100_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
     products:
       - environment: [dev]
         scope: [weekly]
