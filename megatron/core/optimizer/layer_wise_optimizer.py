@@ -1,21 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
 try:
-    from emerging_optimizers.orthogonalized_optimizers import (
-        OrthogonalizedOptimizer,
-    )
+    from emerging_optimizers.orthogonalized_optimizers import OrthogonalizedOptimizer
+
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
-
-from .optimizer import ChainedOptimizer, MegatronOptimizer, Float16OptimizerWithFloat16Params
-from .optimizer_config import OptimizerConfig
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
@@ -64,9 +59,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
                 raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
             optimizers = [
-                Float16OptimizerWithFloat16Params(optim, config, None, muon_init_state_fn)
-                if isinstance(optim, OrthogonalizedOptimizer)
-                else Float16OptimizerWithFloat16Params(optim, config, None, adam_init_state_fn)
+                (
+                    Float16OptimizerWithFloat16Params(optim, config, None, muon_init_state_fn)
+                    if isinstance(optim, OrthogonalizedOptimizer)
+                    else Float16OptimizerWithFloat16Params(optim, config, None, adam_init_state_fn)
+                )
                 for optim in optimizers
             ]
         super().__init__(optimizers)
@@ -184,16 +181,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def load_state_dict_from_file(self, filename: str) -> None:
         """Load the parameter state of the optimizer."""
         super().load_state_dict(torch.load(filename))
-    
+
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
-        sharded_state_dict = super().sharded_state_dict(model_sharded_state_dict, is_loading, **kwargs)
+        sharded_state_dict = super().sharded_state_dict(
+            model_sharded_state_dict, is_loading, **kwargs
+        )
 
         for sh_base in nested_values(sharded_state_dict):
             if isinstance(sh_base, ShardedTensor):
                 sh_base.replica_id = 0
-        
+
         return sharded_state_dict
-
-

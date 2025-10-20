@@ -802,8 +802,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     ):
 
         if is_loading:
-            print(f"type: {type(self.optimizer)}")
-            print(f"type: {type(self.init_state_fn)}")
             self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
