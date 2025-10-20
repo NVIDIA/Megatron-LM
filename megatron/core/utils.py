@@ -40,6 +40,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from packaging.version import Version as PkgVersion

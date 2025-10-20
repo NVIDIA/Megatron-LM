@@ -34,8 +34,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
-        if args.hybrid_context_parallel:
-            batch_sampler = HybridCPMegatronPretrainingSampler(
+        if args.sft_sequence_packing:
+            batch_sampler = MegatronSFTSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
                 micro_batch_size=args.micro_batch_size,
@@ -128,7 +128,7 @@ class MegatronPretrainingSampler:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
 
-class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+class MegatronSFTSampler(MegatronPretrainingSampler):
     """
     Data sampler for hybrid context parallel (Hybrid CP) format.
     This data sampler pulls in the entire global batch at once across all data parallel ranks.
