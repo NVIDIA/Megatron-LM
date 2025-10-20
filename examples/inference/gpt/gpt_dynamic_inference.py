@@ -301,9 +301,10 @@ def run_inference(
                 active_token_count_1,
             ))
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # if engine.step_count == 8:
-        # engine.suspend()
-        # engine.resume()
+        # if engine.step_count == 10:
+        #     engine.suspend()
+        # if engine.step_count == 14:
+        #     engine.resume()
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Record cuda_graph_request_count.

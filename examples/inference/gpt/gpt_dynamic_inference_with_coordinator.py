@@ -62,8 +62,18 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
             for i in suspend_idxs
         )
         # >>>
-        suspend_idxs = set([33])
-        resume_idxs = set([67])
+        # suspend_idxs = set([33]) # ... good.
+        # resume_idxs = set([67])
+        # +++
+        # suspend_idxs = set([33, 80]) # ... good.
+        # resume_idxs = set([67, 90])
+        # +++
+        # suspend_idxs = set([33, 100]) # ... good.
+        # resume_idxs = set([67, 100])
+        # +++
+        # pax("suspend_idxs, resume_idxs")
+        # suspend_idxs = set([25, 50, 75, 100])
+        # resume_idxs = set([37, 62, 87, 100])
         # <<<
     else:
         suspend_idxs = set()
