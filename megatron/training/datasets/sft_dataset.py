@@ -1,8 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, Dict, Optional
+import json
+import math
+from typing import Any, Dict, Optional, List
 
 import numpy as np
+import pandas as pd
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
@@ -56,6 +59,8 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        # Pre-calculate padding divisor to avoid redundant computation in get_padding_size
+        self.padding_divisor = self._calculate_padding_divisor()
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -68,8 +73,29 @@ class SFTDataset(MegatronDataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def _calculate_padding_divisor(self) -> int:
+        """
+            Calculate the divisor used for sequence padding.
+            tp_pad = tp_size * 2 if tp_size > 1 else 1
+            cp_pad = cp_size * 2 if cp_size > 1 else 1
+            cp_pad = cp_pad * dp_size if hybrid_cp else cp_pad
+            divisor = cp_pad * tp_pad
+        """
+        cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
+        cp_pad = cp_pad * self.config.data_parallel_size if self.config.hybrid_context_parallel else cp_pad
+        tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
+        divisor = cp_pad * tp_pad
 
+        return divisor
+    
+    def get_padding_size(
+        self,
+        seq_len: int,
+    ) -> int:
+        return math.ceil(seq_len / self.padding_divisor) * self.padding_divisor
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sft_sequence_packing = self.config.sft_sequence_packing
         tokenizer = self.config.tokenizer
         max_seq_len = self.config.sequence_length
 
@@ -84,9 +110,13 @@ class SFTDataset(MegatronDataset):
             tokens = tokens[: max_seq_len - force_eod_length]
             target = target[: max_seq_len - force_eod_length]
 
-        # padding
+        # if use sequence packing, pad according to get_padding_size
+        # else pad to max_seq_len
         num_tokens = len(tokens) + force_eod_length
-        padding_len = max_seq_len - num_tokens
+        if sft_sequence_packing:
+            padding_len = self.get_padding_size(num_tokens) - num_tokens
+        else:
+            padding_len = max_seq_len - num_tokens
         assert padding_len >= 0
         filler = [tokenizer.eod] * force_eod_length + [tokenizer.pad] * (padding_len + 1)
 
@@ -98,9 +128,10 @@ class SFTDataset(MegatronDataset):
 
         tokens = tokens[:-1].contiguous()
         target = target[1:].contiguous()
+        seq_len = tokens.numel()
 
         loss_mask, position_ids, attention_mask = self._get_ltor_masks_and_position_ids(
-            max_seq_len, target, tokenizer.pad
+            seq_len, target, tokenizer.pad
         )
 
         if self.config.create_attention_mask:
@@ -119,6 +150,9 @@ class SFTDataset(MegatronDataset):
                 'position_ids': position_ids,
             }
 
+        if sft_sequence_packing:
+            ret['original_seq_len'] = num_tokens
+
         return ret
 
     def _get_ltor_masks_and_position_ids(self, max_seq_len, target, pad_token):
@@ -136,7 +170,7 @@ class SFTDataset(MegatronDataset):
 
         if self.config.create_attention_mask:
             attention_mask = torch.tril(
-                torch.ones((seq_length, seq_length), device=data.device)
+                torch.ones((max_seq_len, max_seq_len), device=target.device)
             ).unsqueeze(0)
             # Convert attention mask to binary:
             attention_mask = attention_mask < 0.5
@@ -144,3 +178,134 @@ class SFTDataset(MegatronDataset):
             attention_mask = None
 
         return loss_mask, position_ids, attention_mask
+
+class MockSFTLowLevelDataset:
+    """The low-level mock dataset for SFT
+
+    Args:
+        mock_config (dict): The config for mock dataset.
+    """
+
+    seed: int = 0
+    """The hard-coded random seed to use to set the NumPy RNG"""
+
+    size: int = 1000000
+    """The hard-coded number of sequence to generate"""
+    
+    # This is to maintain consistency with the SFT dataset that uses real data. In the real dataset, an element in the low-level dataset often contains multiple sequences. So here, each element in the mock low-level dataset also contains num_sequence_per_sample sequences. This will be made more reasonable in the future.
+    
+
+    def __init__(self, config: Dict) -> None:
+        np.random.seed(self.seed)
+        # either choose to load sequence lengths from external file, or generate random sequence lengths
+        
+        assert "mode" in config, f"mode must be set, either 'file' or 'distribution'"
+        
+        if config["mode"] == "file":
+            self.sequence_lengths = np.array(pd.read_csv(config["path"])).flatten()
+            self.size = len(self.sequence_lengths)
+        elif config["mode"] == "distribution":
+            min_seq_len = config["min_seq_len"]
+            max_seq_len = config["max_seq_len"]
+            mean_seq_len = config["mean_seq_len"]
+            if config["type"] == "lognormal":
+                lognormal_sigma = config["lognormal_sigma"]
+                self.sequence_lengths = self.generate_lognormal_samples(self.size, mean_seq_len,lognormal_sigma, min_seq_len, max_seq_len)
+            else:
+                raise ValueError(f"Unsupported sequence length distribution type {config['type']}")
+        
+    def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
+        mu = np.log(mean) - sigma**2 / 2
+        samples = np.random.lognormal(mu, sigma, size)
+        samples = np.clip(samples, min_seq_len, max_seq_len)
+        return samples.astype(int)   
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int) -> List[np.ndarray]:
+        length = self.sequence_lengths[idx % self.size]
+        # the length of sample is 'length', but only length-1 elements are generated here, 
+        # because an eod token will be appended at the end later in SFTDataset
+        sample = np.arange(1, length, dtype=np.int64)
+        return sample
+class MockSFTDataset(SFTDataset):
+    """The mock dataset used during SFT"""
+
+    def __init__(
+        self,
+        dataset: LowLevelDataset,
+        dataset_path: Optional[str],
+        indices: np.ndarray,
+        num_samples: Optional[int],
+        index_split: Split,
+        config: GPTDatasetConfig,
+    ) -> None:
+        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+        mock_config = json.loads(config.sft_mock_dataset_config_json)
+        return MockSFTLowLevelDataset(mock_config)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sft_sequence_packing = self.config.sft_sequence_packing
+        tokenizer = self.config.tokenizer
+        max_seq_len = self.config.sequence_length
+
+        tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
+        target = np.array(tokens, dtype=np.int64)
+        
+        force_eod_length = int(tokenizer.force_eod)
+
+        if len(tokens) > max_seq_len - force_eod_length:
+            tokens = tokens[: max_seq_len - force_eod_length]
+            target = target[: max_seq_len - force_eod_length]
+
+        # padding
+        num_tokens = len(tokens) + force_eod_length
+        if sft_sequence_packing:
+            padding_len = self.get_padding_size(num_tokens) - num_tokens
+        else:
+            padding_len = max_seq_len - num_tokens
+        assert padding_len >= 0
+        filler = [tokenizer.eod] * force_eod_length + [tokenizer.pad] * (padding_len + 1)
+
+        tokens = np.array(tokens.tolist() + filler, dtype=np.int64)
+        target = np.array(target.tolist() + filler, dtype=np.int64)
+
+        tokens = torch.tensor(tokens)
+        target = torch.tensor(target)
+
+        tokens = tokens[:-1].contiguous()
+        target = target[1:].contiguous()
+        seq_len = tokens.numel()
+
+        loss_mask, position_ids, attention_mask = self._get_ltor_masks_and_position_ids(
+            seq_len, target, tokenizer.pad
+        )
+
+        if self.config.create_attention_mask:
+            ret = {
+                'tokens': tokens,
+                'labels': target,
+                'attention_mask': attention_mask,
+                'loss_mask': loss_mask,
+                'position_ids': position_ids,
+            }
+        else:
+            ret = {
+                'tokens': tokens,
+                'labels': target,
+                'loss_mask': loss_mask,
+                'position_ids': position_ids,
+            }
+
+        if sft_sequence_packing:
+            # sequence packing need both original sequence length and padded length
+            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+
+        return ret

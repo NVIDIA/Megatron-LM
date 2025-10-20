@@ -148,6 +148,8 @@ class BlendedMegatronDatasetBuilder(object):
         ##
         if self.config.mock:
             split = self.config.split_matrix
+            # debugmtl
+            # print("for debug, building mock datasets, size is {self.sizes},split is {split}")
             try:
                 return self._build_megatron_dataset_splits(None, split, self.sizes)
             except Exception as error:

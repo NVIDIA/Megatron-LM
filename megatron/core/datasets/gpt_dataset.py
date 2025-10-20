@@ -67,6 +67,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     data parallel size * context parallel size * sequence parallel size * 2.
     """
 
+    sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
+
+    sft_sequence_packing: bool = False
+    """Option to enable sequence packing for SFT training."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()

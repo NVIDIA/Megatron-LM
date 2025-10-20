@@ -253,17 +253,12 @@ class HybridCPDataLoaderWrapper:
         """
         batch_unpacked = []
         for sample in batch:
-            for sub_sample in range(sample["cu_seqlens"].shape[0] - 1):
-                sub_sample_dict = {}
-                start_idx = sample["cu_seqlens"][sub_sample]
-                end_idx = sample["cu_seqlens"][sub_sample + 1]
-                if end_idx - start_idx == 0:
+            sample_dict = {}
+            for key in sample.keys():
+                if key in ["cu_seqlens", "batch_idx", "max_seqlen", "original_seq_len"]:
                     continue
-                for key in sample.keys():
-                    if key in ["cu_seqlens", "batch_idx", "max_seqlen"]:
-                        continue
-                    sub_sample_dict[key] = sample[key][start_idx:end_idx]
-                batch_unpacked.append(sub_sample_dict)
+                sample_dict[key] = sample[key]
+            batch_unpacked.append(sample_dict)
         return batch_unpacked
 
     def __next__(self) -> Any:
@@ -271,18 +266,13 @@ class HybridCPDataLoaderWrapper:
         Get the next item from the dataset, pull scheduling metadata and return it.
         """
         if self.data_iterator is None:
-            # TP0 reads from data_iterator, others receive via broadcast.
+            # TP-0 reads from data_iterator, others receive via broadcast.
             return None, None
         else:
             batch = next(self.data_iterator)
         subsample_seqlens = []
         for sample in batch:
-            subsample_seqlens.extend(
-                [
-                    int(sample["cu_seqlens"][i + 1] - sample["cu_seqlens"][i])
-                    for i in range(0, sample["cu_seqlens"].shape[0] - 1)
-                ]
-            )
+            subsample_seqlens.extend([sample["tokens"].numel()])
         subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
         subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
@@ -663,7 +653,7 @@ class BalancedCPScheduler:
             assert (
                 existing_group_sizes
             ), "There should be at least one group existing, cannot reditribute, "
-            "try to increase 'max-seqlen-per-cp-rank'."
+            "try to increase 'max-seqlen-per-dp-cp-rank'."
 
             min_group_size = min(existing_group_sizes)
             # We have Hybrid DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
