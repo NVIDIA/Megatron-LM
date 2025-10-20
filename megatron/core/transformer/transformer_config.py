@@ -682,6 +682,9 @@ class TransformerConfig(ModelParallelConfig):
     symmetric_ar_type: Optional[str] = None
     """Type of symmetric all reduce to use"""
 
+    use_inference_optimized_layers: bool = False
+    """If True, use inference optimized transformer layers during inference."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -1540,6 +1543,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"the number of layers ({self.num_layers})"
                 )
 
+        if self.use_inference_optimized_layers:
+            assert self.normalization == "RMSNorm"
+            assert not self.layernorm_zero_centered_gamma
+            assert not self.add_bias_linear
+            assert not self.add_qkv_bias
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):

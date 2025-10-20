@@ -38,11 +38,6 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-
-        assert config.normalization == "RMSNorm"
-        assert not config.layernorm_zero_centered_gamma
-        assert not bias
-
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -58,7 +53,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         )
 
         if self.tp_size > 1:
-            assert config.sequence_parallel
+            assert config.sequence_parallel, "--use-inference-optimized-layers requires sequence parallelism"
 
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -102,9 +97,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-
-        assert not bias
-
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -119,7 +111,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         )
 
         if self.tp_size > 1:
-            assert config.sequence_parallel
+            assert config.sequence_parallel, "--use-inference-optimized-layers requires sequence parallelism"
 
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.linear(input=x, weight=self.weight)
