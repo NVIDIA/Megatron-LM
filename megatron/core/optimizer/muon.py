@@ -346,7 +346,6 @@ def get_megatron_muon_optimizer(
             optimizers,
             config,
             pg_collection,
-            muon_init_state_fn=muon_init_state_fn,
-            adam_init_state_fn=adam_init_state_fn,
+            init_state_fn_list=[muon_init_state_fn, adam_init_state_fn],
         )
     return ChainedOptimizer(optimizers)
