@@ -52,6 +52,10 @@ runs:
     - name: Checkout repository
       uses: actions/checkout@v2
 
+    - name: Change ownership of /home/runner/
+      shell: bash
+      run: sudo chown -R $(whoami) /home/runner/
+
     - name: Setup python
       uses: actions/setup-python@v5
       with:
