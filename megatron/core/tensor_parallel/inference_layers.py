@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 from typing import Callable, Optional
 
 import torch
