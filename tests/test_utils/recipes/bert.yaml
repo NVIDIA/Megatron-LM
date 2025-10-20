@@ -21,8 +21,8 @@ spec:
     git init
     git remote add origin $MCORE_REPO
     git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
-    git fetch origin $MCORE_COMMIT
-    git checkout $MCORE_COMMIT
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
     git rev-parse HEAD
 
     # Checkout backwards-ref
