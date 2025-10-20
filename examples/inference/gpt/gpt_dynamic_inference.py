@@ -296,9 +296,10 @@ def run_inference(
                 active_token_count_1,
             ))
         # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # if engine.step_count == 8:
-        # engine.suspend()
-        # engine.resume()
+        # if engine.step_count == 10:
+        #     engine.suspend()
+        # if engine.step_count == 14:
+        #     engine.resume()
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine

@@ -32,6 +32,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 : ${NUM_CUDA_GRAPHS=16}
 
 # Miscellaneous.
+: ${USE_COORDINATOR=0}
 : ${ENGINE=dynamic}
 : ${EXTRA_ARGS=""}
 # NSIGHT_PREFIX=/path/to/nsight/profile
@@ -69,10 +70,7 @@ ARGS=" \
 "
 
 # Cuda graphs.
-# >>>
-# if [ "${CUDA_GRAPH_IMPL}" = "local" ]; then
 if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
-# <<<
     ARGS+=" \
         --cuda-graph-impl local \
         --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
@@ -95,8 +93,12 @@ else
 fi
 
 # Command.
-CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
-# CMD="python -um examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
+if [[ "${USE_COORDINATOR}" == "0" ]]; then
+    CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
+else
+    CMD="python -um examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
+fi
+
 if [[ -v NSIGHT_PREFIX ]]; then
     CMD="nsys profile -s none -t nvtx,cuda --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
 fi
