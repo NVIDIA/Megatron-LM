@@ -48,6 +48,8 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set -exo pipefail
+
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
