@@ -49,6 +49,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
     ) -> None:
+        """
+        Initialize LayerWiseDistributedOptimizer.
+
+        Args:
+            optimizers: List of MegatronOptimizers.
+            config: OptimizerConfig.
+            pg_collection: ProcessGroupCollection.
+            init_state_fn_list: List of init state functions.
+        """
+
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
         # wrap optimizer after sharding to avoid unnecessary master weight creation
