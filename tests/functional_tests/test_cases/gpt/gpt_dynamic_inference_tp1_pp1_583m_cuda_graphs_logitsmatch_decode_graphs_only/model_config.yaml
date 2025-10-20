@@ -18,7 +18,7 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --no-load-optim: true
   --no-use-tokenizer-model-from-checkpoint-args: true
-  --timing-log-level: 2
+  --timing-log-level: 0
   --load: ${CHECKPOINT_LOAD_PATH}/mcore_mistral/model
   --distributed-backend: nccl
   --log-interval: 1

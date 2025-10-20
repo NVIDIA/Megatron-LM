@@ -33,7 +33,7 @@ MODEL_ARGS:
   --untie-embeddings-and-output-weights: true
   --disable-bias-linear: true
   --train-iters: 100
-  --timing-log-level: 2
+  --timing-log-level: 0
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}

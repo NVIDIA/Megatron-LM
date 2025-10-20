@@ -94,7 +94,7 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
   # logging settings
   --tensorboard-dir: ${TENSORBOARD_PATH}
-  --timing-log-level: 2
+  --timing-log-level: 0
   --log-interval: 1
   --log-params-norm: true
   --log-num-zeros-in-grad: true

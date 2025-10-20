@@ -41,7 +41,7 @@ MODEL_ARGS:
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
-  --timing-log-level: 2
+  --timing-log-level: 0
   --log-interval: 1
   --save-interval: 10000
   --eval-interval: 1000

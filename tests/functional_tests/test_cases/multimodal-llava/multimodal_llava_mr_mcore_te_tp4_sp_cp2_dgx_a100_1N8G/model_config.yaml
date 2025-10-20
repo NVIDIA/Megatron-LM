@@ -21,7 +21,7 @@ MODEL_ARGS:
   --disable-vision-class-token: true
   --max-position-embeddings: 4096
   --train-iters: 50
-  --timing-log-level: 2
+  --timing-log-level: 0
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
