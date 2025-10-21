@@ -1492,6 +1492,12 @@ def _add_inference_args(parser):
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')  
+    group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
+                       type=int, default=None,
+                       help='Maximum number of tokens to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-max-prefill-requests',
+                       type=int, default=16,
+                       help='Maximum number of prefill requests to capture in a cuda graph.')
     return parser
 
 

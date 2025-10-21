@@ -1149,14 +1149,19 @@ class CudaGraphManager(torch.nn.Module):
 
         if self.reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            is_static_batching = kwargs['inference_context'].is_static_batching()
             if is_inference_mode:
                 batch_size = kwargs['hidden_states'].shape[0]
                 is_decode_only = kwargs["inference_context"].is_decode_only()
+                if not is_static_batching:
+                    current_graph_config = kwargs['inference_context'].padded_config
+                else:
+                    current_graph_config = None
                 # Attempt to retrieve the corresponding runner from the lookup table.
                 # The table is keyed on (batch_size, is_decode_only).
                 # It returns None if no match is found, in which case a new runner is created
                 # and cached in the lookup table.
-                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only, current_graph_config)]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 runner = next(
@@ -1184,7 +1189,7 @@ class CudaGraphManager(torch.nn.Module):
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
                         # Cache the newly created runner in the inference lookup table.
-                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only, current_graph_config)] = (
                             runner
                         )
         else:

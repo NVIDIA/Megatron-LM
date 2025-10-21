@@ -40,21 +40,21 @@ class MHAMetadata(MetadataBase):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        padded_active_token_count: int,
-        real_batch_size: int,
-        padded_active_request_count: Optional[int] = None,
+        real_config,
+        padded_config,
     ):
         """
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            padded_active_token_count: int
-            real_batch_size: int
-            padded_active_request_count: Optional[int]
+            real_config: Configuration object containing real batch settings
+            padded_config: Configuration object containing padded batch settings
         """
-        if padded_active_request_count is None:
-            padded_active_request_count = real_batch_size
+        # Extract values from configs
+        real_batch_size = real_config.req_count
+        padded_active_token_count = padded_config.token_count
+        padded_active_request_count = padded_config.req_count
 
         assert real_batch_size <= padded_active_request_count <= self.max_bs
         assert request_query_lengths.shape[0] == real_batch_size
@@ -145,26 +145,23 @@ class GraphMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        padded_active_token_count: int,
-        real_batch_size: int,
-        padded_active_request_count: Optional[int] = None,
+        real_config,
+        padded_config,
     ):
         """
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            padded_active_token_count: int
-            real_batch_size: int
-            padded_active_request_count: Optional[int]
+            real_config: Configuration object containing real batch settings
+            padded_config: Configuration object containing padded batch settings
         """
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
             request_to_kv_block_ids,
-            padded_active_token_count,
-            real_batch_size,
-            padded_active_request_count,
+            real_config,
+            padded_config,
         )
 
     def reset(self):
@@ -181,26 +178,23 @@ class NonGraphMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        padded_active_token_count: int,
-        real_batch_size: int,
-        padded_active_request_count: Optional[int] = None,
+        real_config,
+        padded_config,
     ):
         """
         Args:
             request_query_lengths: (>real_batch_size,)
             request_kv_length_offsets: (>real_batch_size,)
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            padded_active_token_count: int
-            real_batch_size: int
-            padded_active_request_count: Optional[int]
+            real_config: Configuration object containing real batch settings
+            padded_config: Configuration object containing padded batch settings
         """
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
             request_to_kv_block_ids,
-            padded_active_token_count,
-            real_batch_size,
-            padded_active_request_count,
+            real_config,
+            padded_config,
         )
         if len(self.state_data["query_lengths"]) > 0:
             self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
