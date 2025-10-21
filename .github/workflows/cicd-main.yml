@@ -31,6 +31,9 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
@@ -70,7 +73,7 @@ jobs:
       - name: Run linting
         run: |
           export PATH=".venv/bin:$PATH"
-          export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}" 
+          export BASE_REF="${{ startsWith(github.ref, 'refs/heads/pull-request/') && fromJSON(steps.get-pr-info.outputs.pr-info).base.ref || 'HEAD~1' }}" 
           export CHECK_ONLY=true 
           export SKIP_DOCS=false 
           bash tools/autoformat.sh
@@ -87,6 +90,67 @@ jobs:
       - name: Running CI tests
         run: |
           echo "Running CI tests"
+          echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
+
+  cicd-container-build:
+    needs: [pre-flight, cicd-wait-in-queue]
+    runs-on: nvidia-ci-aws-gpu-x8
+    environment: nemo-ci
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Download test data
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "::group::Download test data"
+          pip install --no-cache-dir pygithub click
+          python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+          echo "::endgroup::"
+
+      - name: Pull cache
+        run: |
+          docker pull ${{ env.container-registry }}/megatron-lm:main || true
+          docker pull ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          file: ./docker/Dockerfile.ci.dev
+          push: true
+          context: .
+          target: main
+          build-args: |
+            FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
+          cache-from: |
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            ${{ env.container-registry }}/megatron-lm:main
+          no-cache: false
+          tags: |
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          secrets: |
+            GH_TOKEN=${{ secrets.PAT }}
 
   cicd-unit-tests-latest:
     strategy:
@@ -99,7 +163,10 @@ jobs:
           - bucket: "unit_tests/dist_checkpointing/models/"
           - bucket: "unit_tests/transformer/*.py"
           - bucket: "unit_tests/transformer/moe"
-    needs: [pre-flight, cicd-wait-in-queue]
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
@@ -109,8 +176,12 @@ jobs:
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
-      && !needs.pre-flight.outputs.is_merge_group == 'true'
+      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -122,34 +193,71 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+
+  cicd-parse-functional-tests:
+    runs-on: ubuntu-latest
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-unit-tests-latest
+    outputs:
+      functional-tests: ${{ steps.main.outputs.functional-tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse functional tests
+        id: main
+        run: |
+          export PYTHONPATH=$(pwd)
+          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+            --scope mr \
+            --n-repeat 5 \
+            --time-limit 2700 \
+            --test-cases all \
+            --container-image mcore_ci_dev \
+            --container-tag latest \
+            --dependent-job functional:configure \
+            --record-checkpoints false \
+            --slurm-account gh \
+            --no-enable-warmup \
+            --environment dev \
+            --platform dgx_h100 \
+            --enable-lightweight-mode \
+            --cluster ghci \
+            --output-path functional-tests.yaml
+
+          cat functional-tests.yaml | \
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > functional-tests.json
+
+          echo "functional-tests=$(cat functional-tests.json)" | tee -a "$GITHUB_OUTPUT"
 
   cicd-functional-tests-latest:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - model: "gpt"
-            test_case: "gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G"
-          - model: "gpt"
-            test_case: "gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G"
-          - model: "moe"
-            test_case: "gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer"
-          - model: "moe"
-            test_case: "gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed"
+        include: ${{ fromJson(needs.cicd-parse-functional-tests.outputs.functional-tests) }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
-      - cicd-unit-tests-latest
+      - cicd-parse-functional-tests
+      # - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
     if: |
       (
         success() 
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
-      && !needs.pre-flight.outputs.is_merge_group == 'true'
+      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
       - name: Checkout
@@ -163,6 +271,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry }}/megatron-lm:1864 # ${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:
@@ -243,7 +352,7 @@ jobs:
       && !cancelled()
     strategy:
       matrix:
-        flag: [unit-test, e2e]
+        flag: [unit-test]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -8,7 +8,7 @@
 
 set -euxo pipefail
 
-echo "------ARGUMENTS LIST --------"
+set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -18,7 +18,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
@@ -39,9 +39,11 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set +x
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
+set -x
 
 # Pull env vars to export
 ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")

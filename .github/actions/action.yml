@@ -15,6 +15,9 @@ name: "Test Template"
 description: "Template for running NeMo tests in a containerized environment"
 
 inputs:
+  container-image:
+    description: "Container image to use for test"
+    required: true
   timeout:
     description: "Max runtime of test in minutes"
     required: false
@@ -46,83 +49,44 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Copy data
-      shell: bash
-      if: inputs.is_unit_test == 'false'
-      env:
-        SOURCE_DIR: /mnt/datadrive/TestData/megatron-lm/artifacts
-        TARGET_DIR: /home/runner/_work/TestData/megatron-lm/artifacts
-        MODEL: ${{ inputs.model }}
-      run: |
-        mkdir -p $TARGET_DIR/text/data/
-
-        if [[ "$MODEL" == "bert" ]]; then
-          mkdir -p $TARGET_DIR/text/the_pile/bert_shard00/
-          cp -a $SOURCE_DIR/text/the_pile/bert_shard00/. $TARGET_DIR/text/data/
-        elif [[ "$MODEL" == "gpt" ]] || [[ "$MODEL" == "moe" ]]; then
-          cp -a $SOURCE_DIR/text/the_pile/shard00/. $TARGET_DIR/text/data/
-        fi
-
-    - name: Install curl, sudo
-      shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y curl uuid-runtime
-
     - name: Checkout repository
       uses: actions/checkout@v2
-      with:
-        path: ${{ github.workspace }}/Megatron-LM
 
-    - name: Cache uv
-      uses: actions/cache@v4
-      id: cache
-      with:
-        path: cache-mount
-        key: ${{ runner.os }}-uv-${{ hashFiles('**/uv.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-uv-
-
-    - name: Restore Docker cache mounts
-      uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361
-      with:
-        cache-dir: cache-mount
-        dockerfile: docker/Dockerfile.ci.dev
-        skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+    - name: Change ownership of /home/runner/
+      shell: bash
+      run: sudo chown -R $(whoami) /home/runner/
 
     - name: Setup python
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
 
-    - name: Download test data
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.PAT }}
-        TIMEOUT: ${{ inputs.timeout }}
-        IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+    - name: Install uuidgen
+      shell: bash -x -e -u -o pipefail {0}
       run: |
-        echo "::group::Download test data"
-        pip install --no-cache-dir pygithub click
-        python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
-        echo "::endgroup::"
+        apt-get update
+        apt-get install -y uuid-runtime
 
     - name: Create run-script (unit test)
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'true'
       run: |
         echo "::group::Create run-script"
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
-        docker exec -t test_container_${{ github.run_id }} bash -c '
-          set -e
-          bash /opt/megatron-lm/tests/unit_tests/run_ci_test.sh \
-            --tag ${{ inputs.tag }} \
-            --environment dev \
-            --bucket '\''${{ inputs.test_case }}'\'' \
-            --log-dir /opt/megatron-lm/outputs/logs
-        '
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        pip install --no-cache-dir uv
+        uv sync --only-group test 
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          --scope unit-tests \
+          --model unit-tests \
+          --test-case '${{ inputs.test_case }}' \
+          --environment dev \
+          --platform dgx_h100 \
+          --tag ${{ inputs.tag }} \
+          --container-image ${{ inputs.container-image }}
 
         RUN_TEST_EOF
         )
@@ -130,7 +94,7 @@ runs:
         echo "::endgroup::"
 
     - name: Create run-script (e2e test)
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'false'
       env:
         MODEL: ${{ inputs.model }}
@@ -138,118 +102,65 @@ runs:
         echo "::group::Create run-script"
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
+        set -euxo pipefail
 
-
-
-        docker exec -t test_container_${{ github.run_id }} bash -c '
-
-          set -e
-          ls -al /workspace/data
-          
-          if [[ "${{ inputs.model }}" == "bert" ]]; then
-            TRAINING_SCRIPT_PATH=pretrain_bert.py
-          elif [[ "${{ inputs.model }}" == "gpt" ]] || [[ "${{ inputs.model }}" == "moe" ]]; then
-            TRAINING_SCRIPT_PATH=pretrain_gpt.py
-          fi
-          
-          ARGUMENTS=(
-            "DATA_PATH=/workspace/data"
-            "DATA_CACHE_PATH=/workspace/data/cache" 
-            "OUTPUT_PATH=$(pwd)/outputs/"
-            "TENSORBOARD_PATH=$(pwd)/tensorboard"
-            "CHECKPOINT_SAVE_PATH=$(pwd)/checkpoints"
-            "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
-            "TRAINING_SCRIPT_PATH=$TRAINING_SCRIPT_PATH"
-            "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/model_config.yaml"
-            "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/${{inputs.model}}/${{inputs.test_case}}/golden_values_dev_dgx_h100.json"
-            "N_REPEAT=5"
-            "ENABLE_LIGHTWEIGHT_MODE=false"
-            "RECORD_CHECKPOINTS=false"
-          )
-
-          bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${ARGUMENTS[@]}
-        '
+        export PYTHONPATH=$(pwd)
+        export NEMORUN_HOME=$(pwd)
+        pip install --no-cache-dir uv
+        uv sync --only-group test 
+        uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
+          --scope mr \
+          --model ${{ inputs.model }} \
+          --test-case ${{ inputs.test_case }} \
+          --environment dev \
+          --platform dgx_h100 \
+          --container-image ${{ inputs.container-image }} \
+          --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts
 
         RUN_TEST_EOF
         )
         echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
 
-    - name: Build container
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.PAT }}
-      run: |
-        echo "::group::Build test container"
-        docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.06-py3" --target=main -t megatron-core .
-        echo "::endgroup::"
-
-    - name: Start container
-      shell: bash
-      run: |
-        echo "::group::Start test container"
-        set -x
-
-        cmd=$(cat <<RUN_TEST_EOF
-        #!/bin/bash
-        docker container rm -f test_container_${{ github.run_id }} || true
-        docker run \
-          --rm \
-          -d \
-          --name test_container_${{ github.run_id }} \
-          --runtime=nvidia --gpus all \
-          --shm-size=64g \
-          --ipc=host \
-          -e NCCL_IB_DISABLE=1 \
-          -e NCCL_P2P_LEVEL=NVL \
-          --workdir /opt/megatron-lm/ \
-          -v /home/runner/_work/TestData/megatron-lm/artifacts/text/data/:/workspace/data \
-          --volume ${{ github.workspace }}/Megatron-LM:/opt/megatron-lm/ \
-          $VOLUME_ARGS \
-          megatron-core \
-          bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
-        RUN_TEST_EOF
-        )
-
-        echo "$cmd" | tee "retry_job.sh"
-        bash retry_job.sh
-        echo "::endgroup::"
-
     - name: Set timeout
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
       id: timeout_in_seconds
       run: |
         echo "::group::Set timeout"
         echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
 
+    - name: Pull container
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        echo "::group::Pull container"
+        docker pull ${{ inputs.container-image }}
+        echo "::endgroup::"
+
     - name: Run main script
-      uses: nick-fields/retry@v3
+      shell: bash -x -e -u -o pipefail {0}
       id: run-main-script
-      with:
-        timeout_seconds: ${{ steps.timeout_in_seconds.outputs.main }}
-        max_attempts: 3
-        shell: bash
-        retry_on: any
-        command: /bin/bash job.sh
-        on_retry_command: /bin/bash retry_job.sh
+      run: |
+        echo "::group::Run main script"
+        EXIT_CODE=0
+        /bin/bash job.sh || EXIT_CODE=$?
+        echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
+        exit $EXIT_CODE
+        echo "::endgroup::"
 
     - name: Check result
       id: check
-      shell: bash
+      shell: bash -x -e -u -o pipefail {0}
+      if: always()
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
         echo "::group::Check result"
 
-        docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/outputs/logs ./
         logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
 
         if [[ "$IS_UNIT_TEST" == "true" ]]; then
-          docker exec test_container_${{ github.run_id }} /opt/venv/bin/coverage xml
-          docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/.coverage .coverage
-          docker cp test_container_${{ github.run_id }}:/opt/megatron-lm/coverage.xml coverage.xml
           coverage_report=coverage-${{ inputs.is_unit_test == 'true' && 'unit-test' || 'e2e' }}-${{ github.run_id }}-$(uuidgen)
         else
           coverage_report=none
@@ -267,8 +178,10 @@ runs:
         if [[ "$IS_SUCCESS" == "false" ]]; then
           echo Test did not finish successfully.
           exit 1
-        else
-          docker exec -t test_container_${{ github.run_id }} /opt/venv/bin/coverage report -i
+        fi
+
+        if [[ "$coverage_report" != "none" ]]; then
+          uv run coverage report -i
         fi
 
         exit $EXIT_CODE
@@ -276,7 +189,7 @@ runs:
 
     - name: Upload coverage
       uses: actions/upload-artifact@v4
-      if: ${{ steps.check.outputs.coverage_report != 'none' }}
+      if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
       with:
         name: ${{ steps.check.outputs.coverage_report }}
         path: |
@@ -286,13 +199,8 @@ runs:
 
     - name: Upload logs
       uses: actions/upload-artifact@v4
+      if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
-        path: logs
+        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir/logs' }}
         include-hidden-files: true
-
-    - name: Container shutdown
-      if: always()
-      shell: bash
-      run: |
-        docker container rm -f test_container_${{ github.run_id }} || true
