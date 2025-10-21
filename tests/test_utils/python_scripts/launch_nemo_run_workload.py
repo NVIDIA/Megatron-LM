@@ -117,28 +117,27 @@ def main(
 
         result_dict = exp.status(return_dict=True)
         _, job_dict = list(result_dict.items())[0]
-        logger.info(f"Job status: {job_dict["status"]}")
         succeeded = str(job_dict["status"]) == "SUCCEEDED"
 
-        if not succeeded:
-            logger.error(f"Job failed with status: {job_dict["status"]}")
-            log_file_paths = pathlib.Path(os.getcwd()).glob(
-                "assets_dir/logs/*/attempt_0/*/std*.log"
-            )
-            all_ranks_all_logs = []
-            for log_file_path in log_file_paths:
-                with open(log_file_path, "r") as f:
-                    all_logs = f.readlines()
-                all_ranks_all_logs.extend(all_logs)
-            all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
-            if is_flaky_failure(all_ranks_all_logs_string):
-                logger.error(f"Detected flaky failure, attempt restart.")
-                n_attempts += 1
-                continue
+        if succeeded:
+            logger.info(f"Job succeeded with status: {job_dict["status"]}")
+            sys.exit(0)
 
-            sys.exit(1)
+        logger.error(f"Job failed with status: {job_dict["status"]}")
+        log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/attempt_0/*/std*.log")
+        print(log_file_paths)
+        all_ranks_all_logs = []
+        for log_file_path in log_file_paths:
+            with open(log_file_path, "r") as f:
+                all_logs = f.readlines()
+            all_ranks_all_logs.extend(all_logs)
+        all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
+        if is_flaky_failure(all_ranks_all_logs_string):
+            logger.error(f"Detected flaky failure, attempt restart.")
+            n_attempts += 1
+            continue
 
-        sys.exit(0)
+        sys.exit(1)
 
     sys.exit(1)
 
