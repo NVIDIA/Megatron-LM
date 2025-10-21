@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+from statistics import median
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +32,25 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
             f"Some IDs from groundtruth are missing in output, only the subset of ids in groundtruth will be tested: {output_groundtruth.keys()} vs {output_current.keys()}"
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
+
+    # Throughput assertions.
+    if "throughput" in output_groundtruth.keys():
+
+        # First warmup iteration is excluded from throughput statistics.
+        throughput_sampled = median(output_current["throughput"][1:])
+
+        # 5 token/seconds is empirically observed to be within run variance.
+        assert (
+            throughput_sampled >= output_groundtruth["throughput"] - 5.0
+        ), f"Throughput is slower than expected! Expected ~{output_groundtruth['throughput']} tok/s but benchmarked {output_current['throughput']} tok/s"
+
+        # If throughput is significantly improved (> 20%), update golden values accordingly.
+        assert (
+            throughput_sampled < output_groundtruth["throughput"] * 1.2
+        ), f"Throughput has been improved from expected ~{output_groundtruth['throughput']} tok/s to {output_current['throughput']} tok/s. Please update golden values in the functional tests."
+
+        output_groundtruth.pop('throughput')
+
     for request_id, groundtruth_results in output_groundtruth.items():
         current_results = output_current[request_id]
 

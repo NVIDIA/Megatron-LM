@@ -747,4 +747,5 @@ publish:merge_into_dev:
     - team/megatron
   rules:
     - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+      allow_failure: true
     - when: never

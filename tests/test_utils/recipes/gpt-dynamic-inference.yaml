@@ -73,3 +73,9 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_logitsmatch_decode_graphs_only]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  
