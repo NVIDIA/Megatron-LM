@@ -131,7 +131,6 @@ def main(
                 all_logs = f.readlines()
             all_ranks_all_logs.extend(all_logs)
         all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
-        print(all_ranks_all_logs_string)
         if is_flaky_failure(all_ranks_all_logs_string):
             logger.warning("Detected flaky failure, attempt restart.")
             n_attempts += 1
