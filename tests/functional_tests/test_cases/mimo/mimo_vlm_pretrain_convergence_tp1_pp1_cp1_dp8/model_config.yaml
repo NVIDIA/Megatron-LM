@@ -3,7 +3,6 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-  ARTIFACTS_ROOT: /workspace/checkpoints
 MODEL_ARGS:
   --num-layers: 32
   --hidden-size: 4096
@@ -20,7 +19,7 @@ MODEL_ARGS:
   --seq-length: 4096
   --max-position-embeddings: 4096
   --train-iters: 100
-  --timing-log-level: 2
+  --timing-log-level: 0
   --lr-decay-iters: 2200
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
@@ -48,8 +47,8 @@ MODEL_ARGS:
   --deterministic-mode: true
   --log-memory-to-tensorboard: true
   --dataloader-type: external
-  --data-path: ${DATA_PATH}
-  --language-model-checkpoint: ${ARTIFACTS_ROOT}/vicuna_7b_pyt/dcp/mcore-v1.5_fp32/weights
+  --data-path: ${DATA_PATH}/mixed/mcore_mimo_vlm/llava_pretrain_energon
+  --language-model-checkpoint: ${CHECKPOINT_LOAD_PATH}/model/vicuna_7b_pyt/dcp/mcore-v1.5_fp32/weights
   --auto-detect-ckpt-format: true
   --accumulate-allreduce-grads-in-fp32: true
   --position-embedding-type: rope

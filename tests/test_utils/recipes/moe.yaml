@@ -10,10 +10,6 @@ spec:
   gpus: 8
   n_repeat: 5
   platforms: dgx_a100
-  artifacts:
-    /workspace/data/gpt3_data: text/the_pile/shard00
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_{platforms}_1N8G_dev/28359448
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_{platforms}_1N8G_dev/28359448
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
@@ -44,12 +40,12 @@ spec:
     NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
 
     ARGUMENTS=(
-        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/workspace/data/cache"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
-        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_$CLUSTER.json"
@@ -64,52 +60,52 @@ products:
   #######################################################################
   # Nightly tests: Run both DEV and LTS unless something is flaky       #
   #######################################################################
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel]
+  - test_case: [gpt3_mcore_tp2_pp2_ep2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
+  - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
+  - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
+  - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
+  - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+  - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
     products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
+  - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+      - environment: [lts]
+        scope: [nightly]
+  # - test_case: [gpt3_mcore_tp2_pp2_resume_torch_dist_te_2experts]
   #   products: # non-determinism: #478
   #     - environment: [dev, lts]
   #       scope: [nightly]
@@ -120,69 +116,69 @@ products:
   # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
   #             some very important tests.                              #
   #######################################################################
-  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
+  # - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100] # hang: #513
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100] # hang: #513
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
+  # - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100] # hang: #513
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
     products:
       # - environment: [dev]
       #   scope: [mr]
       #   platforms: [dgx_h100] # hang: #513
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # TODO: The migration of custom fsdp causes EP + FSDP to be temporarily unavailable, which will be fixed in a subsequent MR.
-  # - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
+  # - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router]
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100]
   #     - environment: [lts]
   #       scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_moe_mr_mcore_te_ep8_resume_torch_dist_dist_optimizer]
+  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
@@ -190,12 +186,12 @@ products:
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+  # - test_case: [gpt3_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer]
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100]
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
+  # - test_case: [gpt3_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM]
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
@@ -203,7 +199,7 @@ products:
   ###########################
   # Merge train tests       #
   ###########################
-  - test_case: [gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
+  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
@@ -214,7 +210,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [dev]
         scope: [mr-slim]
