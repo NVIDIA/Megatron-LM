@@ -1132,6 +1132,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     #     "cuda_graph_request_count": cuda_graph_request_count,
                     # }
                     # <<<
+                    # finished_requests_serialized = []
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY_FINISHED.value,
@@ -1139,6 +1140,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             #     r.serializable()
                             #     for r in engine_output["finished_requests"]
                             # ],
+                            # [engine_output["finished_requests"][0].serializable()],
                             # [{"request_id": 0}],
                             [{
                                 "request_id" : r.request_id,

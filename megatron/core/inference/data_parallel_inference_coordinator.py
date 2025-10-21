@@ -9,7 +9,9 @@ from typing import List, Tuple
 import torch
 
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+# >>>
+# from megatron.core.inference.inference_request import DynamicInferenceRequest
+# <<<
 
 try:
     import zmq
@@ -64,8 +66,10 @@ class DataParallelInferenceCoordinator:
         request_id_to_client_request_id (dict): Maps server-side request IDs to the
             original request ID provided by the client.
         next_request_id (int): A counter for generating unique server-side request IDs.
-        requests (dict): A store for active `DynamicInferenceRequest` objects, keyed by
-            server-side request ID.
+        # >>>
+        # requests (dict): A store for active `DynamicInferenceRequest` objects, keyed by
+        #     server-side request ID.
+        # <<<
     """
 
     def __init__(
@@ -132,7 +136,7 @@ class DataParallelInferenceCoordinator:
 
         self.next_request_id = 0
         # >>>
-        self.requests = {}
+        # self.requests = {}
         # <<<
 
     def get_next_data_parallel_rank(self):
@@ -165,102 +169,102 @@ class DataParallelInferenceCoordinator:
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    def postprocess(
-        self,
-        request_ids: List[int],
-        finished_request_ids: List[int],
-        generated_tokens: List[int],
-        log_probs: List[int],
-        chunked_prefill_request_id: int = -1,
-        materialize_only_last_token_logits: bool = True,
-    ):
-        """
-        Processes replies from the engine, appending tokens and handling finished requests.
+    # def postprocess(
+    #     self,
+    #     request_ids: List[int],
+    #     finished_request_ids: List[int],
+    #     generated_tokens: List[int],
+    #     log_probs: List[int],
+    #     chunked_prefill_request_id: int = -1,
+    #     materialize_only_last_token_logits: bool = True,
+    # ):
+    #     """
+    #     Processes replies from the engine, appending tokens and handling finished requests.
 
-        For each generated token, this method appends it to the corresponding active
-        request. If a request is marked as finished, it detokenizes the full
-        sequence, sends the final result back to the original client, and cleans
-        up the request state.
+    #     For each generated token, this method appends it to the corresponding active
+    #     request. If a request is marked as finished, it detokenizes the full
+    #     sequence, sends the final result back to the original client, and cleans
+    #     up the request state.
 
-        Args:
-            request_ids (List[int]): A list of request IDs that have new tokens.
-            finished_request_ids (List[int]): A list of request IDs that have completed
-                generation in this step.
-            generated_tokens (List[int]): The list of new tokens, one for each ID in
-                `request_ids`.
-            log_probs (List[int]): Log probabilities for each token.
-            chunked_prefill_request_id (int): The request ID currently undergoing chunked prefill,
-                -1 if no chunked prefill is active.
-        """
-        # Todo [Siddharth]: This is duplicated logic from the engine.
-        # We should refactor this to avoid duplication.
-        log_probs_iter = log_probs if log_probs else repeat(None)
-        for request_id, token, request_log_probs in zip(
-            request_ids, generated_tokens, log_probs_iter
-        ):
-            request: DynamicInferenceRequest = self.requests[request_id]
-            # Handle chunked prefill similar to the engine logic
-            if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
-                request.generated_tokens.append(token)
+    #     Args:
+    #         request_ids (List[int]): A list of request IDs that have new tokens.
+    #         finished_request_ids (List[int]): A list of request IDs that have completed
+    #             generation in this step.
+    #         generated_tokens (List[int]): The list of new tokens, one for each ID in
+    #             `request_ids`.
+    #         log_probs (List[int]): Log probabilities for each token.
+    #         chunked_prefill_request_id (int): The request ID currently undergoing chunked prefill,
+    #             -1 if no chunked prefill is active.
+    #     """
+    #     # Todo [Siddharth]: This is duplicated logic from the engine.
+    #     # We should refactor this to avoid duplication.
+    #     log_probs_iter = log_probs if log_probs else repeat(None)
+    #     for request_id, token, request_log_probs in zip(
+    #         request_ids, generated_tokens, log_probs_iter
+    #     ):
+    #         request: DynamicInferenceRequest = self.requests[request_id]
+    #         # Handle chunked prefill similar to the engine logic
+    #         if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
+    #             request.generated_tokens.append(token)
 
-                if request_log_probs is not None:
-                    if not request.prompt_log_probs:
-                        request.prompt_log_probs = []
-                    if not request.generated_log_probs:
-                        request.generated_log_probs = []
-                    # If the request log probs span > 1 token we are in prefill
-                    if len(request_log_probs) > 1:
-                        request.prompt_log_probs.extend(request_log_probs)
-                    else:
-                        if (
-                            # If it is a chunked prefill request
-                            len(request.prompt_log_probs) > 0
-                            # And we are missing the last token for prefill
-                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
-                            # And we need to track full prefill
-                            and not materialize_only_last_token_logits
-                        ):
-                            assert (
-                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
-                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
-                            request.prompt_log_probs.extend(request_log_probs)
-                        else:
-                            request.generated_log_probs.extend(request_log_probs)
-            else:
-                # This is the chunked prefill request, handle log probs but don't append tokens
-                if request_log_probs is not None:
-                    if materialize_only_last_token_logits:
-                        # Here we discard intermediate log probs,
-                        # as we only materialize the last token log probs
-                        request.prompt_log_probs = []
-                        request.generated_log_probs = []
-                    else:
-                        # Otherwise, we gather log probs for all tokens
-                        if not request.prompt_log_probs:
-                            request.prompt_log_probs = []
-                        request.prompt_log_probs.extend(request_log_probs)
-                        request.generated_log_probs = []
+    #             if request_log_probs is not None:
+    #                 if not request.prompt_log_probs:
+    #                     request.prompt_log_probs = []
+    #                 if not request.generated_log_probs:
+    #                     request.generated_log_probs = []
+    #                 # If the request log probs span > 1 token we are in prefill
+    #                 if len(request_log_probs) > 1:
+    #                     request.prompt_log_probs.extend(request_log_probs)
+    #                 else:
+    #                     if (
+    #                         # If it is a chunked prefill request
+    #                         len(request.prompt_log_probs) > 0
+    #                         # And we are missing the last token for prefill
+    #                         and len(request.prompt_log_probs) < len(request.prompt_tokens)
+    #                         # And we need to track full prefill
+    #                         and not materialize_only_last_token_logits
+    #                     ):
+    #                         assert (
+    #                             len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+    #                         ), "Prompt log probs length is not equal to prompt tokens length - 1"
+    #                         request.prompt_log_probs.extend(request_log_probs)
+    #                     else:
+    #                         request.generated_log_probs.extend(request_log_probs)
+    #         else:
+    #             # This is the chunked prefill request, handle log probs but don't append tokens
+    #             if request_log_probs is not None:
+    #                 if materialize_only_last_token_logits:
+    #                     # Here we discard intermediate log probs,
+    #                     # as we only materialize the last token log probs
+    #                     request.prompt_log_probs = []
+    #                     request.generated_log_probs = []
+    #                 else:
+    #                     # Otherwise, we gather log probs for all tokens
+    #                     if not request.prompt_log_probs:
+    #                         request.prompt_log_probs = []
+    #                     request.prompt_log_probs.extend(request_log_probs)
+    #                     request.generated_log_probs = []
 
-        if finished_request_ids:
-            for fid in finished_request_ids:
-                if fid == chunked_prefill_request_id:
-                    continue  # skip chunked prefill request, this is not a finished request
-                request = self.requests.pop(fid)
-                request.generated_length = len(request.generated_tokens)
-                request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
+    #     if finished_request_ids:
+    #         for fid in finished_request_ids:
+    #             if fid == chunked_prefill_request_id:
+    #                 continue  # skip chunked prefill request, this is not a finished request
+    #             request = self.requests.pop(fid)
+    #             request.generated_length = len(request.generated_tokens)
+    #             request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
 
-                client_identity = self.request_id_to_client_id[fid]
-                client_request_identity = self.request_id_to_client_request_id[fid]
-                del self.request_id_to_client_id[fid]
-                del self.request_id_to_client_request_id[fid]
-                self.router_socket.send_multipart(
-                    [
-                        client_identity,
-                        msgpack.packb(
-                            [client_request_identity, request.serializable()], use_bin_type=True
-                        ),
-                    ]
-                )
+    #             client_identity = self.request_id_to_client_id[fid]
+    #             client_request_identity = self.request_id_to_client_request_id[fid]
+    #             del self.request_id_to_client_id[fid]
+    #             del self.request_id_to_client_request_id[fid]
+    #             self.router_socket.send_multipart(
+    #                 [
+    #                     client_identity,
+    #                     msgpack.packb(
+    #                         [client_request_identity, request.serializable()], use_bin_type=True
+    #                     ),
+    #                 ]
+    #             )
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def start(self):
@@ -335,9 +339,9 @@ class DataParallelInferenceCoordinator:
                 # <<<
 
                 # >>>
-                self.requests[request_id] = DynamicInferenceRequest(
-                    request_id=request_id, prompt=prompt, prompt_tokens=prompt_tokens
-                )
+                # self.requests[request_id] = DynamicInferenceRequest(
+                #     request_id=request_id, prompt=prompt, prompt_tokens=prompt_tokens
+                # )
                 # <<<
 
                 # >>>
