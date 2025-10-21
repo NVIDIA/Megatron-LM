@@ -4,17 +4,11 @@ import logging
 from collections import deque
 from itertools import cycle, repeat
 from multiprocessing import Event
-# >>>
-# from typing import List, Tuple
 from typing import List
-# <<<
 
 import torch
 
 from megatron.core.inference.headers import Headers
-# >>>
-# from megatron.core.inference.inference_request import DynamicInferenceRequest
-# <<<
 
 try:
     import zmq
@@ -29,11 +23,6 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
-
-
-# >>>
-myprint = lambda m: print(f"+++++++++++++++++++++++++ coordinator, {m}.")
-# <<<
 
 
 class DataParallelInferenceCoordinator:
@@ -59,9 +48,6 @@ class DataParallelInferenceCoordinator:
         from a client to all connected data parallel ranks.
 
     Attributes:
-        # >>>
-        # tokenizer: The tokenizer object for encoding prompts.
-        # <<<
         router_socket (zmq.Socket): The central ZMQ ROUTER socket for all communication.
         data_parallel_size (int): The number of data parallel workers to expect.
         identities_of_data_parallel_ranks (deque): A deque holding the ZMQ
@@ -71,17 +57,10 @@ class DataParallelInferenceCoordinator:
         request_id_to_client_request_id (dict): Maps server-side request IDs to the
             original request ID provided by the client.
         next_request_id (int): A counter for generating unique server-side request IDs.
-        # >>>
-        # requests (dict): A store for active `DynamicInferenceRequest` objects, keyed by
-        #     server-side request ID.
-        # <<<
     """
 
     def __init__(
         self,
-        # >>>
-        # tokenizer, # : Tokenizer,
-        # <<<
         inference_coordinator_port: int,
         data_parallel_size: int,
     ):
@@ -93,10 +72,6 @@ class DataParallelInferenceCoordinator:
         ranks to connect before proceeding.
 
         Args:
-            # >>>
-            # tokenizer: An object with `tokenize`, `detokenize`, and `bos` attributes,
-            #     used for processing text.
-            # <<<
             inference_coordinator_port (int): The TCP port number to bind the server to.
             data_parallel_size (int): The number of TP-coordinator workers that are
                 expected to connect.
@@ -110,9 +85,6 @@ class DataParallelInferenceCoordinator:
             "pip install msgpack"
         )
         self.context = zmq.Context()
-        # >>>
-        # self.tokenizer = tokenizer
-        # <<<
 
         # This is the central router socket
         # 1. data parallel ranks connect to this socket to register themselves
@@ -140,9 +112,6 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_request_id = {}
 
         self.next_request_id = 0
-        # >>>
-        # self.requests = {}
-        # <<<
 
     def get_next_data_parallel_rank(self):
         """
@@ -152,125 +121,6 @@ class DataParallelInferenceCoordinator:
             bytes: The ZMQ identity of the next data parallel rank to receive a request.
         """
         return next(self.data_parallel_rank_iterator)
-
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def tokenize_prompt(
-    #     self, prompt: str, add_BOS: bool = False
-    # ) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     """Utility to tokenize the input prompts
-
-    #     Args:
-    #         prompt (str): The input prompt
-
-    #     Returns:
-    #         torch.Tensor: Returns the tokenized prompt
-    #     """
-    #     prompt_tokens = self.tokenizer.tokenize(prompt)
-
-    #     if add_BOS:
-    #         prompt_tokens = [self.tokenizer.bos] + prompt_tokens
-
-    #     return prompt_tokens
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def postprocess(
-    #     self,
-    #     request_ids: List[int],
-    #     finished_request_ids: List[int],
-    #     generated_tokens: List[int],
-    #     log_probs: List[int],
-    #     chunked_prefill_request_id: int = -1,
-    #     materialize_only_last_token_logits: bool = True,
-    # ):
-    #     """
-    #     Processes replies from the engine, appending tokens and handling finished requests.
-
-    #     For each generated token, this method appends it to the corresponding active
-    #     request. If a request is marked as finished, it detokenizes the full
-    #     sequence, sends the final result back to the original client, and cleans
-    #     up the request state.
-
-    #     Args:
-    #         request_ids (List[int]): A list of request IDs that have new tokens.
-    #         finished_request_ids (List[int]): A list of request IDs that have completed
-    #             generation in this step.
-    #         generated_tokens (List[int]): The list of new tokens, one for each ID in
-    #             `request_ids`.
-    #         log_probs (List[int]): Log probabilities for each token.
-    #         chunked_prefill_request_id (int): The request ID currently undergoing chunked prefill,
-    #             -1 if no chunked prefill is active.
-    #     """
-    #     # Todo [Siddharth]: This is duplicated logic from the engine.
-    #     # We should refactor this to avoid duplication.
-    #     log_probs_iter = log_probs if log_probs else repeat(None)
-    #     for request_id, token, request_log_probs in zip(
-    #         request_ids, generated_tokens, log_probs_iter
-    #     ):
-    #         request: DynamicInferenceRequest = self.requests[request_id]
-    #         # Handle chunked prefill similar to the engine logic
-    #         if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
-    #             request.generated_tokens.append(token)
-
-    #             if request_log_probs is not None:
-    #                 if not request.prompt_log_probs:
-    #                     request.prompt_log_probs = []
-    #                 if not request.generated_log_probs:
-    #                     request.generated_log_probs = []
-    #                 # If the request log probs span > 1 token we are in prefill
-    #                 if len(request_log_probs) > 1:
-    #                     request.prompt_log_probs.extend(request_log_probs)
-    #                 else:
-    #                     if (
-    #                         # If it is a chunked prefill request
-    #                         len(request.prompt_log_probs) > 0
-    #                         # And we are missing the last token for prefill
-    #                         and len(request.prompt_log_probs) < len(request.prompt_tokens)
-    #                         # And we need to track full prefill
-    #                         and not materialize_only_last_token_logits
-    #                     ):
-    #                         assert (
-    #                             len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
-    #                         ), "Prompt log probs length is not equal to prompt tokens length - 1"
-    #                         request.prompt_log_probs.extend(request_log_probs)
-    #                     else:
-    #                         request.generated_log_probs.extend(request_log_probs)
-    #         else:
-    #             # This is the chunked prefill request, handle log probs but don't append tokens
-    #             if request_log_probs is not None:
-    #                 if materialize_only_last_token_logits:
-    #                     # Here we discard intermediate log probs,
-    #                     # as we only materialize the last token log probs
-    #                     request.prompt_log_probs = []
-    #                     request.generated_log_probs = []
-    #                 else:
-    #                     # Otherwise, we gather log probs for all tokens
-    #                     if not request.prompt_log_probs:
-    #                         request.prompt_log_probs = []
-    #                     request.prompt_log_probs.extend(request_log_probs)
-    #                     request.generated_log_probs = []
-
-    #     if finished_request_ids:
-    #         for fid in finished_request_ids:
-    #             if fid == chunked_prefill_request_id:
-    #                 continue  # skip chunked prefill request, this is not a finished request
-    #             request = self.requests.pop(fid)
-    #             request.generated_length = len(request.generated_tokens)
-    #             request.generated_text = self.tokenizer.detokenize(request.generated_tokens)
-
-    #             client_identity = self.request_id_to_client_id[fid]
-    #             client_request_identity = self.request_id_to_client_request_id[fid]
-    #             del self.request_id_to_client_id[fid]
-    #             del self.request_id_to_client_request_id[fid]
-    #             self.router_socket.send_multipart(
-    #                 [
-    #                     client_identity,
-    #                     msgpack.packb(
-    #                         [client_request_identity, request.serializable()], use_bin_type=True
-    #                     ),
-    #                 ]
-    #             )
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def start(self):
         """
@@ -285,22 +135,10 @@ class DataParallelInferenceCoordinator:
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
         known_clients = set()
         while True:
-            # >>>
-            myprint("start | 0")
-            # <<<
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
-            # >>>
-            myprint("start | 1")
-            # <<<
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
-            # >>>
-            myprint("header %s." % header.name)
-            # <<<
 
-            # >>>
-            myprint(f"{header.name} | 0")
-            # <<<
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:
                     logging.info(
@@ -335,17 +173,6 @@ class DataParallelInferenceCoordinator:
                 self.request_id_to_client_id[request_id] = sender_identity
                 self.request_id_to_client_request_id[request_id] = client_request_id
 
-                # >>>
-                # pax("prompt")
-                # <<<
-
-                # >>>
-                # # tokenize the prompt if it is a string.
-                # if isinstance(prompt, str):
-                #     prompt_tokens = self.tokenize_prompt(prompt)
-                # else:
-                #     prompt_tokens = prompt  # no error handling here as it is done in the engine.
-                # +++
                 # Serialize prompt.
                 if isinstance(prompt, (str, list)):
                     pass
@@ -353,17 +180,6 @@ class DataParallelInferenceCoordinator:
                     prompt = prompt.tolist()
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
-                # <<<
-
-                # >>>
-                # self.requests[request_id] = DynamicInferenceRequest(
-                #     request_id=request_id, prompt=prompt, prompt_tokens=prompt_tokens
-                # )
-                # <<<
-
-                # >>>
-                # pax("prompt")
-                # <<<
 
                 next_data_parallel_rank_identity = self.get_next_data_parallel_rank()
                 self.router_socket.send_multipart(
@@ -373,10 +189,7 @@ class DataParallelInferenceCoordinator:
                             [
                                 Headers.SUBMIT_REQUEST.value,
                                 request_id,
-                                # >>>
-                                # prompt_tokens,
                                 prompt,
-                                # <<<
                                 sampling_params,
                             ],
                             use_bin_type=True,
@@ -392,42 +205,12 @@ class DataParallelInferenceCoordinator:
                     self.router_socket.send_multipart(
                         [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
                     )
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # elif header == Headers.ENGINE_REPLY:
-            #     # This is the output of a single engine step on some data parallel rank.
-            #     assert sender_identity in self.identities_of_data_parallel_ranks
-            #     (
-            #         request_ids,
-            #         finished_request_ids,
-            #         generated_tokens,
-            #         logprobs,
-            #         chunked_prefill_request_id,
-            #         materialize_only_last_token_logits,
-            #     ) = deserialized_payload[1:]
-            #     self.postprocess(
-            #         request_ids,
-            #         finished_request_ids,
-            #         generated_tokens,
-            #         logprobs,
-            #         chunked_prefill_request_id,
-            #         materialize_only_last_token_logits,
-            #     )
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-            # >>>
-            # elif header == Headers.ENGINE_REPLY_FINISHED:
             elif header == Headers.ENGINE_REPLY:
-            # <<<
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 finished_requests = deserialized_payload[1]
 
-                # >>>
-                # pax("finished_requests")
-                # <<<
                 for finished_request in finished_requests:
-                    # >>>
-                    # pax("finished_request")
-                    # <<<
                     fid = finished_request["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
@@ -443,17 +226,10 @@ class DataParallelInferenceCoordinator:
                             ),
                         ]
                     )
-            # >>>
-            myprint(f"{header.name} | 1")
-            # <<<
-
     @classmethod
     def entrypoint(
         cls,
         ready_event: Event,
-        # >>>
-        # tokenizer,
-        # <<<
         inference_coordinator_port: int,
         data_parallel_size: int,
     ):
@@ -466,43 +242,16 @@ class DataParallelInferenceCoordinator:
         Args:
             ready_event (Event): A threading or multiprocessing event object that is set()
                 once the coordinator is ready to accept connections.
-            # >>>
-            # tokenizer: The tokenizer object.
-            # <<<
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
         """
-        # >>>
-        # pax("ready_event")
-        # <<<
-        # >>>
-        # tokenizer = tokenizer
-        # <<<
-        # >>>
-        myprint(0)
-        # <<<
-        # >>>
-        # coordinator = cls(tokenizer, inference_coordinator_port, data_parallel_size)
         coordinator = cls(inference_coordinator_port, data_parallel_size)
-        # <<<
         ready_event.set()
-        # >>>
-        myprint(1)
-        # <<<
         try:
-            # >>>
-            myprint(2)
-            # <<<
             coordinator.start()
-            # >>>
-            myprint(3)
-            # <<<
         except KeyboardInterrupt:
             logging.info("Coordinator process interrupted. Exiting...")
             coordinator.stop()
-        # >>>
-        myprint(4)
-        # <<<
 
     def stop(self):
         """
