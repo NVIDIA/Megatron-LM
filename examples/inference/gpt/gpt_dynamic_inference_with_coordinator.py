@@ -21,12 +21,6 @@ from megatron.training import get_args, get_tokenizer
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_args
 
-# >>>
-from lutil import pax as _pax
-import builtins
-builtins.pax = _pax
-# <<<
-
 async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling_params: SamplingParams, port: int):
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
