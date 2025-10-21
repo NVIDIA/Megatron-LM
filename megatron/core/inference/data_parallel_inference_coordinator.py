@@ -59,11 +59,7 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    def __init__(
-        self,
-        inference_coordinator_port: int,
-        data_parallel_size: int,
-    ):
+    def __init__(self, inference_coordinator_port: int, data_parallel_size: int):
         """
         Initializes the inference coordinator.
 
@@ -186,12 +182,7 @@ class DataParallelInferenceCoordinator:
                     [
                         next_data_parallel_rank_identity,
                         msgpack.packb(
-                            [
-                                Headers.SUBMIT_REQUEST.value,
-                                request_id,
-                                prompt,
-                                sampling_params,
-                            ],
+                            [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
                             use_bin_type=True,
                         ),
                     ]
@@ -221,17 +212,14 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [client_request_identity, finished_request],
-                                use_bin_type=True,
+                                [client_request_identity, finished_request], use_bin_type=True
                             ),
                         ]
                     )
+
     @classmethod
     def entrypoint(
-        cls,
-        ready_event: Event,
-        inference_coordinator_port: int,
-        data_parallel_size: int,
+        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
