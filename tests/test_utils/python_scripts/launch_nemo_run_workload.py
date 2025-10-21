@@ -125,15 +125,13 @@ def main(
 
         logger.error(f"Job failed with status: {job_dict["status"]}")
         log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/*/attempt_0/*/std*.log")
-        print(list(log_file_paths))
-        print(os.getcwd())
-        print(os.listdir(pathlib.Path(os.getcwd()) / "assets_dir" / "logs"))
         all_ranks_all_logs = []
         for log_file_path in log_file_paths:
             with open(log_file_path, "r") as f:
                 all_logs = f.readlines()
             all_ranks_all_logs.extend(all_logs)
         all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
+        print(all_ranks_all_logs_string)
         if is_flaky_failure(all_ranks_all_logs_string):
             logger.warning("Detected flaky failure, attempt restart.")
             n_attempts += 1
