@@ -55,7 +55,9 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         )
 
         if self.tp_size > 1:
-            assert config.sequence_parallel, "--use-inference-optimized-layers requires sequence parallelism"
+            assert (
+                config.sequence_parallel
+            ), "--use-inference-optimized-layers requires sequence parallelism"
 
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -113,7 +115,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         )
 
         if self.tp_size > 1:
-            assert config.sequence_parallel, "--use-inference-optimized-layers requires sequence parallelism"
+            assert (
+                config.sequence_parallel
+            ), "--use-inference-optimized-layers requires sequence parallelism"
 
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.linear(input=x, weight=self.weight)

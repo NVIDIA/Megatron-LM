@@ -1549,6 +1549,7 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
 
+
 @dataclass
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
