@@ -125,7 +125,7 @@ def main(
 
         logger.error(f"Job failed with status: {job_dict["status"]}")
         log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/attempt_0/*/std*.log")
-        print(log_file_paths)
+        print(list(log_file_paths))
         all_ranks_all_logs = []
         for log_file_path in log_file_paths:
             with open(log_file_path, "r") as f:
