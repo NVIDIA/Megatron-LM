@@ -124,7 +124,7 @@ def main(
             sys.exit(0)
 
         logger.error(f"Job failed with status: {job_dict["status"]}")
-        log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/attempt_0/*/std*.log")
+        log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/*/attempt_0/*/std*.log")
         print(list(log_file_paths))
         print(os.getcwd())
         print(os.listdir(pathlib.Path(os.getcwd()) / "assets_dir" / "logs"))
