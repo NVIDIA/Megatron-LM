@@ -1417,6 +1417,9 @@ def _add_inference_args(parser):
                        'whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, '
                        'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
