@@ -1337,6 +1337,10 @@ class TransformerConfig(ModelParallelConfig):
                         "apply_rope_fusion is not available. Please install TE >= 1.4."
                     )
 
+        if self.fused_single_qkv_rope:
+            if self.attention_output_gate:
+                raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
+
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 

@@ -1098,10 +1098,9 @@ class SelfAttention(Attention):
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
+        num_qkv_heads_per_group = num_query_heads_per_group + 2
         if output_gate:
-            num_qkv_heads_per_group = 2 * num_query_heads_per_group + 2
-        else:
-            num_qkv_heads_per_group = num_query_heads_per_group + 2
+            num_qkv_heads_per_group += num_query_heads_per_group
 
         # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]
@@ -1112,31 +1111,43 @@ class SelfAttention(Attention):
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
         # Split the tensor into query, gate, key, and value.
-        # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
-        # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
-        # If have output gate: [sq, b, ng, (2 * np/ng + 2) * hn]
-        # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-        split_arg_list = [
-            num_query_heads_per_group * self.hidden_size_per_attention_head,
-            num_query_heads_per_group * self.hidden_size_per_attention_head if output_gate else 0,
-            self.hidden_size_per_attention_head,
-            self.hidden_size_per_attention_head,
-        ]
+        if output_gate:
+            if not split_qkv:
+                raise ValueError("split_qkv not supported for gated attention yet.")
+            # If have output gate: [sq, b, ng, (2 * np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, np/ng * hn],
+            # [sq, b, ng, hn], [sq, b, ng, hn]
+            split_arg_list = [
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+            ]
 
-        # Return unsplit mixed_qkv and split_arg_list
-        if not split_qkv:
-            return mixed_qkv, split_arg_list
-
-        if SplitAlongDim is not None:
-            (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            if SplitAlongDim is not None:
+                (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            else:
+                (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
         else:
-            (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+            # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
+            split_arg_list = [
+                num_query_heads_per_group * self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+                self.hidden_size_per_attention_head,
+            ]
+
+            # Return unsplit mixed_qkv and split_arg_list
+            if not split_qkv:
+                return mixed_qkv, split_arg_list
+
+            if SplitAlongDim is not None:
+                (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+            else:
+                (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
-        if output_gate:
-            # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-            gate = gate.reshape(gate.size(0), gate.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
@@ -1148,7 +1159,10 @@ class SelfAttention(Attention):
             self.run_realtime_tests()
 
         if output_gate:
+            # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             return query, key, value, gate
+
         return query, key, value
 
     def backward_dw(self) -> NoReturn:
