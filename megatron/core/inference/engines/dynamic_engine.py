@@ -303,7 +303,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 args=(
                     coordinator_ready_event,
                     # >>>
-                    self.controller.tokenizer,
+                    # self.controller.tokenizer,
                     # <<<
                     inference_coordinator_port,
                     parallel_state.get_data_parallel_world_size(),

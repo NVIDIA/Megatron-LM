@@ -80,7 +80,7 @@ class DataParallelInferenceCoordinator:
     def __init__(
         self,
         # >>>
-        tokenizer, # : Tokenizer,
+        # tokenizer, # : Tokenizer,
         # <<<
         inference_coordinator_port: int,
         data_parallel_size: int,
@@ -111,7 +111,7 @@ class DataParallelInferenceCoordinator:
         )
         self.context = zmq.Context()
         # >>>
-        self.tokenizer = tokenizer
+        # self.tokenizer = tokenizer
         # <<<
 
         # This is the central router socket
@@ -447,7 +447,7 @@ class DataParallelInferenceCoordinator:
         cls,
         ready_event: Event,
         # >>>
-        tokenizer,
+        # tokenizer,
         # <<<
         inference_coordinator_port: int,
         data_parallel_size: int,
@@ -477,8 +477,8 @@ class DataParallelInferenceCoordinator:
         myprint(0)
         # <<<
         # >>>
-        coordinator = cls(tokenizer, inference_coordinator_port, data_parallel_size)
-        # coordinator = cls(inference_coordinator_port, data_parallel_size)
+        # coordinator = cls(tokenizer, inference_coordinator_port, data_parallel_size)
+        coordinator = cls(inference_coordinator_port, data_parallel_size)
         # <<<
         ready_event.set()
         # >>>
