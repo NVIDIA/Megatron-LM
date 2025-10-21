@@ -13,6 +13,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def is_flaky_failure(concat_allranks_logs: str) -> bool:
+    """Assumes that certain keywords hint towards intermittent failures."""
+    
+    return (
+        "The server socket has failed to listen on any local network address."
+        in concat_allranks_logs
+        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+        or "uncorrectable ECC error encountered" in concat_allranks_logs
+        or "illegal memory access" in concat_allranks_logs
+        or "illegal instruction" in concat_allranks_logs
+        or "torch.distributed.DistNetworkError" in concat_allranks_logs
+        or "Segmentation fault" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
+        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+        or "double free or corruption" in concat_allranks_logs
+        or "Call to CUDA function failed." in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
+        or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
+    )
+
+
 @click.command()
 @click.option("--scope", required=True, type=str, help="Scope of the workload")
 @click.option("--model", required=True, type=str, help="Model of the workload")
@@ -78,17 +106,41 @@ def main(
         packager=run.Packager(),
         volumes=artifacts,
     )
-    with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
-        _ = exp.add([inline_script], tail_logs=False, name="task-1")
 
-        exp.dryrun(log=True)
-        exp.run(detach=False, tail_logs=True, sequential=False)
+    n_attempts = 0
+    while n_attempts < 3:
+        with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
+            _ = exp.add([inline_script], tail_logs=False, name="task-1")
 
-    result_dict = exp.status(return_dict=True)
-    _, job_dict = list(result_dict.items())[0]
+            exp.dryrun(log=True)
+            exp.run(detach=False, tail_logs=True, sequential=False)
 
-    logger.info(f"Job status: {job_dict["status"]}")
-    sys.exit(0 if str(job_dict["status"]) == "SUCCEEDED" else 1)
+        result_dict = exp.status(return_dict=True)
+        _, job_dict = list(result_dict.items())[0]
+        logger.info(f"Job status: {job_dict["status"]}")
+        succeeded = str(job_dict["status"]) == "SUCCEEDED"
+
+        if not succeeded:
+            logger.error(f"Job failed with status: {job_dict["status"]}")
+            log_file_paths = pathlib.Path(os.getcwd()).glob(
+                "assets_dir/logs/*/attempt_0/*/std*.log"
+            )
+            all_ranks_all_logs = []
+            for log_file_path in log_file_paths:
+                with open(log_file_path, "r") as f:
+                    all_logs = f.readlines()
+                all_ranks_all_logs.extend(all_logs)
+            all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
+            if is_flaky_failure(all_ranks_all_logs_string):
+                logger.error(f"Detected flaky failure, attempt restart.")
+                n_attempts += 1
+                continue
+
+            sys.exit(1)
+
+        sys.exit(0)
+
+    sys.exit(1)
 
 
 if __name__ == "__main__":
