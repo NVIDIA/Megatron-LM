@@ -972,14 +972,14 @@ class DynamicInferenceEngine(AbstractEngine):
     ):
         """Continually steps the engine asynchronously."""
         # >>>
-        # n_steps = 0
+        n_steps = 0
         # <<<
         try:
             while True:
                 # >>>
-                # print("... engine | step %d." % n_steps)
-                # n_steps += 1
-                # await asyncio.sleep(0.02)
+                print("... engine | step %d." % n_steps)
+                n_steps += 1
+                await asyncio.sleep(0.02)
                 # <<<
                 self.schedule_requests()
                 if self.stopped:
@@ -1025,7 +1025,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if is_tp0_and_pp0 and engine_output is not None and engine_output["finished_requests"]:
                     payload = msgpack.packb(
                         [
-                            Headers.ENGINE_REPLY_FINISHED.value,
+                            # >>>
+                            # Headers.ENGINE_REPLY_FINISHED.value,
+                            Headers.ENGINE_REPLY.value,
+                            # <<<
                             # >>>
                             # [
                             #     r.serializable()

@@ -413,7 +413,10 @@ class DataParallelInferenceCoordinator:
             #         materialize_only_last_token_logits,
             #     )
             # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-            elif header == Headers.ENGINE_REPLY_FINISHED:
+            # >>>
+            # elif header == Headers.ENGINE_REPLY_FINISHED:
+            elif header == Headers.ENGINE_REPLY:
+            # <<<
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 finished_requests = deserialized_payload[1]
