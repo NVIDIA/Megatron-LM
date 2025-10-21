@@ -2,9 +2,8 @@
 
 import logging
 from collections import deque
-from itertools import cycle, repeat
+from itertools import cycle
 from multiprocessing import Event
-from typing import List
 
 import torch
 

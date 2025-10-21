@@ -959,13 +959,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
-        # >>>
+        # >>> [ todo(@lmcafee): remove ]
         n_steps = 0
         # <<<
         try:
             while True:
-                # >>>
-                print("... engine | step %d." % n_steps)
+                # >>> [ todo(@lmcafee): remove ]
+                logging.info("... engine | step %d." % n_steps)
                 n_steps += 1
                 # await asyncio.sleep(0.02)
                 # <<<
