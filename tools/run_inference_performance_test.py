@@ -124,7 +124,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
             max_requests_override=args.inference_dynamic_batching_max_requests_override,
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-            chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+            block_size_tokens=args.inference_dynamic_batching_block_size,
             tensor_model_parallel_size=args.tensor_model_parallel_size,
             materialize_only_last_token_logits=not args.return_log_probs,
             layer_type_list=layer_type_list,

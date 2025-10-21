@@ -14,7 +14,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
-    ChunkOverflowError,
+    BlockOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
@@ -82,7 +82,7 @@ class DynamicEngineTestConfig:
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
-    context_chunk_size_tokens: int = 256
+    context_block_size_tokens: int = 256
     context_buffer_guaranteed_fraction: float = 0.01
     context_buffer_overflow_factor: Optional[float] = None
     context_max_requests_override: Optional[int] = None
@@ -225,7 +225,7 @@ class TestDynamicInferenceEngine:
             use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
-            chunk_size_tokens=test_config.context_chunk_size_tokens,
+            block_size_tokens=test_config.context_block_size_tokens,
             buffer_overflow_factor=test_config.context_buffer_overflow_factor,
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
@@ -638,13 +638,13 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    def test_chunk_overflow(self, model_provider: str) -> None:
-        """Test token overflow."""
+    def test_block_overflow(self, model_provider: str) -> None:
+        """Test block overflow."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
-        chunk_size_bytes = context.chunk_size_bytes
-        buffer_size_gb = (chunk_size_bytes + 1) / 1024**3
+        block_size_bytes = context.block_size_bytes
+        buffer_size_gb = (block_size_bytes + 1) / 1024**3
         test_config = DynamicEngineTestConfig(
             context_buffer_size_gb=buffer_size_gb, model_provider=model_provider
         )
@@ -1015,7 +1015,7 @@ class TestDynamicInferenceEngine:
             num_requests=16,
             max_prompt_length=10,
             num_tokens_to_generate=32,
-            context_buffer_size_gb=0.001,  # 0.001, # 8 chunks
+            context_buffer_size_gb=0.001,  # 0.001, # 8 blocks
             context_max_requests_override=8,
             context_max_tokens_override=8,
             num_gap_steps=1,
@@ -1051,6 +1051,7 @@ class TestDynamicInferenceEngine:
     @torch.inference_mode()
     def test_chunked_prefill(self, model_provider: str):
         """Verify that chunked prefill output is equivalent to regular prefill."""
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         prompt_length = 1200
         num_tokens_to_generate = 16
@@ -1064,7 +1065,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             materialize_only_last_token_logits=False,
             model_provider=model_provider,
-            context_chunk_size_tokens=256,
+            context_block_size_tokens=256,
             context_max_tokens_override=300,
         )
 
@@ -1076,7 +1077,7 @@ if __name__ == "__main__":
     test.test_request_overflow()
     test.test_token_overflow_transient()
     # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
-    test.test_chunk_overflow()
+    test.test_block_overflow()
     test.test_multi_add()
     test.test_fixed_output_lengths()
     test.test_cuda_graph_request_counts()
