@@ -666,9 +666,6 @@ class DynamicInferenceEngine(AbstractEngine):
         sampling_params: SamplingParams,
         *,
         verbose: Optional[bool] = False,
-        # >>>
-        # post_process_requests_locally: bool = True,
-        # <<<
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -727,20 +724,11 @@ class DynamicInferenceEngine(AbstractEngine):
             [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
 
             # Add finished events.
-            # >>>
-            # if post_process_requests_locally:
             (active_requests, finished_requests) = self.post_process_requests(
                 active_request_ids, finished_request_ids, step_time, sample, log_probs
             )
-            # else:
-            #     return active_request_ids, finished_request_ids, sample, log_probs
-            # <<<
 
         else:
-            # >>>
-            # if not post_process_requests_locally:
-            #     return None
-            # <<<
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
 
@@ -1012,10 +1000,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 engine_output = await self.async_step(
                     sampling_params=sampling_params,
                     verbose=verbose,
-                    # >>>
-                    # post_process_requests_locally=False,
-                    # post_process_requests_locally=True, # ..................
-                    # <<<
                 )
 
                 is_tp0_and_pp0 = (
@@ -1025,10 +1009,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if is_tp0_and_pp0 and engine_output is not None and engine_output["finished_requests"]:
                     payload = msgpack.packb(
                         [
-                            # >>>
-                            # Headers.ENGINE_REPLY_FINISHED.value,
                             Headers.ENGINE_REPLY.value,
-                            # <<<
                             # >>>
                             # [
                             #     r.serializable()
