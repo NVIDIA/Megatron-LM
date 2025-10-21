@@ -12,40 +12,37 @@ from argparse import Namespace
 from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
-
-import numpy as np
 from time import time
 
+import numpy as np
 import torch
-from torch.distributed.checkpoint import default_planner, FileSystemReader
+from torch.distributed.checkpoint import FileSystemReader, default_planner
 
-from megatron.core import mpu, tensor_parallel, dist_checkpointing
+from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
-from megatron.core.dist_checkpointing.strategies.fully_parallel import \
-    FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
-from megatron.core.num_microbatches_calculator import update_num_microbatches
-from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
-from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.utils import is_torch_min_version, get_torch_version
-from .async_utils import schedule_async_save, is_empty_async_queue
-from .global_vars import get_args
-from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
-from ..core.dist_checkpointing.serialization import \
-    get_default_save_sharded_strategy
-from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from . import wandb_utils
-
-from . import ft_integration
-
+from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+    FullyParallelLoadStrategyWrapper,
+    FullyParallelSaveStrategyWrapper,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.num_microbatches_calculator import update_num_microbatches
+from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_torch_version, is_torch_min_version
+
+from ..core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+from . import ft_integration, wandb_utils
+from .async_utils import is_empty_async_queue, schedule_async_save
+from .global_vars import get_args
+from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
+from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
-        handle_swiglu_in_state_dict,
         handle_fp8_extra_state_case,
+        handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
     )
     HAVE_MEGATRON_FSDP = True
@@ -55,12 +52,7 @@ except ImportError:
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import (
-        save_modelopt_state,
-        save_sharded_modelopt_state,
-        restore_modelopt_state,
-        restore_sharded_modelopt_state,
-    )
+    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
@@ -1346,35 +1338,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    # Check for model-opt format loading
-    if hasattr(args, 'load_model_opt_format') and args.load_model_opt_format:
-        print_rank_0(f'Loading checkpoint using ModelOpt format from {load_dir}')
-        from megatron.post_training.checkpointing import load_modelopt_checkpoint
-
-        # Call the ModelOpt checkpoint loading function
-        load_modelopt_checkpoint(
-            ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            strict=strict,
-            load_arg=load_arg
-        )
-        
-        # Since load_modelopt_checkpoint doesn't return iteration count, we need to get it
-        if torch.distributed.is_initialized():
-            tracker_filename = get_checkpoint_tracker_filename(load_dir)
-            if os.path.isfile(tracker_filename):
-                iteration, release = read_metadata(tracker_filename)
-                if release:
-                    iteration = 0
-            else:
-                iteration = 0
-        else:
-            iteration = 0
-        
-        # We don't have a reliable way to get num_floating_point_operations_so_far from ModelOpt format
-        return iteration, 0
-
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
     if pretrained_dir is not None and not checkpoint_exists(load_dir):
@@ -1505,16 +1468,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             or ckpt_dp != run_dp
         ):
             print_rank_0("Job sharding has changed: Rerun state will be ignored")
-
-        # [ModelOpt]: IMPORTANT! Restoring modelopt_state (sharded or not) must be performed
-        # after the model instance has been created and before _load_base_checkpoint is called.
-        if has_nvidia_modelopt:
-            if ckpt_type == CheckpointType.LOCAL:
-                print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
-            elif ckpt_type == CheckpointType.GLOBAL:
-                restore_modelopt_state(model, state_dict)
-            else:
-                restore_sharded_modelopt_state(model, checkpoint_name)
 
         # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
         # will result in key mismatch with loss modules potentially containing parameters, since
