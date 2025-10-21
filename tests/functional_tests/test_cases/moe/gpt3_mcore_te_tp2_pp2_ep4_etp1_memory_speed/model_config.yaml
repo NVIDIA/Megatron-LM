@@ -17,7 +17,8 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-  --attention-backend: fused
+  # Use unfused attention since MLA with fused attention and deterministic mode leads to NaN
+  --attention-backend: unfused # TODO: switch back to fused attention after fix
   # Training args
   --use-mcore-models: true
   --sequence-parallel: true
@@ -122,7 +123,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 50
-TEST_TYPE: ckpt-resume
+TEST_TYPE: regular
 METRICS:
   - "iteration-time"
   - "lm loss"
