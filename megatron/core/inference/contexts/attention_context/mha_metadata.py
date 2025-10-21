@@ -13,15 +13,9 @@ class MHAMetadata(MetadataBase):
     """
 
     def __init__(
-        self,
-        block_count_total,
-        max_kv_block_count,
-        max_requests,
-        block_size_tokens,
-        max_seqlen,
-        debug=False,
+        self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
     ):
-        super().__init__(debug)
+        super().__init__()
         device = torch.cuda.current_device()
         self.device = device
         self.max_blocks = block_count_total
@@ -140,21 +134,10 @@ class GraphMHAMetadata(MHAMetadata):
     """
 
     def __init__(
-        self,
-        block_count_total,
-        max_kv_block_count,
-        max_requests,
-        block_size_tokens,
-        max_seqlen,
-        debug=False,
+        self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
     ):
         super().__init__(
-            block_count_total,
-            max_kv_block_count,
-            max_requests,
-            block_size_tokens,
-            max_seqlen,
-            debug,
+            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
         )
 
     def update(

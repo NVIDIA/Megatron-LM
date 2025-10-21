@@ -7,11 +7,10 @@ class MetadataBase:
     Base class for attention metadata.
     """
 
-    def __init__(self, debug):
+    def __init__(self):
         """
         Initialize the metadata.
         """
-        self.debug = debug
         self.state_data = {}
 
     def update(self, *args, **kwargs):
@@ -44,7 +43,7 @@ class MetadataBase:
             tensor: The tensor to copy.
             real_batch_size: The real batch size.
             graph_batch_size: Padded boundary of the tensor.
-            is_cumulative_tensor: Whether the tensor is cumulative.
+            is_cumulative_tensor: Whether the tensor is cumulative. If True, we pad use the last value of the tensor.
         """
         assert real_batch_size <= graph_batch_size
         assert tensor_buf.shape[0] >= graph_batch_size
@@ -60,9 +59,8 @@ class MetadataBase:
         tensor_buf[real_batch_size:graph_batch_size] = value
         return tensor_buf
 
-    def print_all_data(self):
+    def __str__(self):
         """
-        Print all the data in the metadata.
+        Return a string representation of the metadata.
         """
-        for key, value in self.state_data.items():
-            logging.info(f"{key}: {value}")
+        return "\n".join([f"{key}: {value}" for key, value in self.state_data.items()])

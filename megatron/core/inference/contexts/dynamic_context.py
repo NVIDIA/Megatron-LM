@@ -411,7 +411,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
-            debug=False,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAMetadata(
@@ -420,7 +419,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
-            debug=False,
         )
 
         # Guaranteed active requests.
@@ -746,9 +744,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Reset state used within attention, after each step."""
         # Attention metadata reset is now handled by MHAMetadata.reset()
         for attn_metadata in self.non_graph_attn_metadata.values():
-            attn_metadata["mha_metadata"].reset()
+            attn_metadata.reset()
         for attn_metadata in self.graph_attn_metadata.values():
-            attn_metadata["mha_metadata"].reset()
+            attn_metadata.reset()
         self.active_attn_metadata = None
 
     def using_cuda_graph_this_step(self) -> bool:
