@@ -392,25 +392,27 @@ class DataParallelInferenceCoordinator:
                     self.router_socket.send_multipart(
                         [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
                     )
-            elif header == Headers.ENGINE_REPLY:
-                # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                (
-                    request_ids,
-                    finished_request_ids,
-                    generated_tokens,
-                    logprobs,
-                    chunked_prefill_request_id,
-                    materialize_only_last_token_logits,
-                ) = deserialized_payload[1:]
-                self.postprocess(
-                    request_ids,
-                    finished_request_ids,
-                    generated_tokens,
-                    logprobs,
-                    chunked_prefill_request_id,
-                    materialize_only_last_token_logits,
-                )
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # elif header == Headers.ENGINE_REPLY:
+            #     # This is the output of a single engine step on some data parallel rank.
+            #     assert sender_identity in self.identities_of_data_parallel_ranks
+            #     (
+            #         request_ids,
+            #         finished_request_ids,
+            #         generated_tokens,
+            #         logprobs,
+            #         chunked_prefill_request_id,
+            #         materialize_only_last_token_logits,
+            #     ) = deserialized_payload[1:]
+            #     self.postprocess(
+            #         request_ids,
+            #         finished_request_ids,
+            #         generated_tokens,
+            #         logprobs,
+            #         chunked_prefill_request_id,
+            #         materialize_only_last_token_logits,
+            #     )
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             elif header == Headers.ENGINE_REPLY_FINISHED:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks

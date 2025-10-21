@@ -292,9 +292,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        # >>>
-        # raise Exception("hi.")
-        # <<<
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
             spawn_context = multiprocessing.get_context('spawn')
             coordinator_ready_event = spawn_context.Event()
@@ -302,9 +299,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
                     coordinator_ready_event,
-                    # >>>
-                    # self.controller.tokenizer,
-                    # <<<
                     inference_coordinator_port,
                     parallel_state.get_data_parallel_world_size(),
                 ),
@@ -672,7 +666,9 @@ class DynamicInferenceEngine(AbstractEngine):
         sampling_params: SamplingParams,
         *,
         verbose: Optional[bool] = False,
-        post_process_requests_locally: bool = True,
+        # >>>
+        # post_process_requests_locally: bool = True,
+        # <<<
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -731,16 +727,20 @@ class DynamicInferenceEngine(AbstractEngine):
             [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
 
             # Add finished events.
-            if post_process_requests_locally:
-                (active_requests, finished_requests) = self.post_process_requests(
-                    active_request_ids, finished_request_ids, step_time, sample, log_probs
-                )
-            else:
-                return active_request_ids, finished_request_ids, sample, log_probs
+            # >>>
+            # if post_process_requests_locally:
+            (active_requests, finished_requests) = self.post_process_requests(
+                active_request_ids, finished_request_ids, step_time, sample, log_probs
+            )
+            # else:
+            #     return active_request_ids, finished_request_ids, sample, log_probs
+            # <<<
 
         else:
-            if not post_process_requests_locally:
-                return None
+            # >>>
+            # if not post_process_requests_locally:
+            #     return None
+            # <<<
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
 
@@ -920,9 +920,6 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
-                # >>>
-                # pax("request_id, prompt, sampling_params")
-                # <<<
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(
                     request_id,
@@ -970,90 +967,19 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # async def run_engine_with_coordinator(
-    #     self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
-    # ):
-    #     """Continually steps the engine asynchronously."""
-    #     try:
-    #         while True:
-    #             # >>>
-    #             print("... engine.")
-    #             await asyncio.sleep(0.02)
-    #             # <<<
-    #             self.schedule_requests()
-    #             if self.stopped:
-    #                 self.stop()
-    #                 return
-
-    #             # for the cases below (engine is paused or no active requests),
-    #             # do not use asyncio.sleep(0)
-    #             # as tp-rank=0 will flood the num_messages publisher
-    #             # with "0" repeatedly. This causes some packets to drop.
-    #             # Instead be nice, and sleep
-    #             # for a short time.
-    #             # The minimum sleep time needed is ~100us i.e. the time
-    #             # needed to send one message on an IPC socket. However
-    #             # just to be safe, we use 20ms here.
-
-    #             # todo [Siddharth]: Can this hardcoded sleep be avoided
-    #             # with asyncio zmq sockets?
-    #             if self.paused:
-    #                 await asyncio.sleep(0.02)
-    #                 continue
-
-    #             if (
-    #                 self.context.get_active_request_count() == 0
-    #                 and len(self.waiting_request_ids) == 0
-    #             ):
-    #                 await asyncio.sleep(0.02)
-    #                 continue
-
-    #             engine_output = await self.async_step(
-    #                 sampling_params=sampling_params,
-    #                 verbose=verbose,
-    #                 post_process_requests_locally=False,
-    #             )
-
-    #             is_tp0_and_pp0 = (
-    #                 parallel_state.get_tensor_model_parallel_rank() == 0
-    #                 and parallel_state.get_pipeline_model_parallel_rank() == 0
-    #             )
-    #             if is_tp0_and_pp0 and engine_output is not None:
-    #                 # return the engine output to the coordinator. The coordinator will take
-    #                 # care of the post-processing.
-    #                 request_ids, finished_request_ids, sample, logprobs = engine_output
-    #                 # Include chunked prefill request id, use -1 if None
-    #                 chunked_prefill_id = self.context.chunked_prefill_request_id
-    #                 materialize_only_last_token_logits = (
-    #                     self.context.materialize_only_last_token_logits
-    #                 )
-    #                 payload = msgpack.packb(
-    #                     [
-    #                         Headers.ENGINE_REPLY.value,
-    #                         request_ids.tolist(),
-    #                         finished_request_ids.tolist(),
-    #                         sample.tolist(),
-    #                         logprobs,
-    #                         chunked_prefill_id,
-    #                         materialize_only_last_token_logits,
-    #                     ],
-    #                     use_bin_type=True,
-    #                 )
-    #                 self.socket_for_receiving_requests.send(payload)
-
-    #     except asyncio.CancelledError:
-    #         pass
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     async def run_engine_with_coordinator(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
+        # >>>
+        # n_steps = 0
+        # <<<
         try:
             while True:
                 # >>>
-                print("... engine.")
-                await asyncio.sleep(0.02)
+                # print("... engine | step %d." % n_steps)
+                # n_steps += 1
+                # await asyncio.sleep(0.02)
                 # <<<
                 self.schedule_requests()
                 if self.stopped:
@@ -1088,7 +1014,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     verbose=verbose,
                     # >>>
                     # post_process_requests_locally=False,
-                    post_process_requests_locally=True, # ..................
+                    # post_process_requests_locally=True, # ..................
                     # <<<
                 )
 
@@ -1096,68 +1022,28 @@ class DynamicInferenceEngine(AbstractEngine):
                     parallel_state.get_tensor_model_parallel_rank() == 0
                     and parallel_state.get_pipeline_model_parallel_rank() == 0
                 )
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # if is_tp0_and_pp0 and engine_output is not None:
-                #     # return the engine output to the coordinator. The coordinator will take
-                #     # care of the post-processing.
-                #     request_ids, finished_request_ids, sample, logprobs = engine_output
-                #     # Include chunked prefill request id, use -1 if None
-                #     chunked_prefill_id = self.context.chunked_prefill_request_id
-                #     materialize_only_last_token_logits = (
-                #         self.context.materialize_only_last_token_logits
-                #     )
-                #     payload = msgpack.packb(
-                #         [
-                #             Headers.ENGINE_REPLY.value,
-                #             request_ids.tolist(),
-                #             finished_request_ids.tolist(),
-                #             sample.tolist(),
-                #             logprobs,
-                #             chunked_prefill_id,
-                #             materialize_only_last_token_logits,
-                #         ],
-                #         use_bin_type=True,
-                #     )
-                #     self.socket_for_receiving_requests.send(payload)
-                # ++++++++++++++++++++++++++++++++
                 if is_tp0_and_pp0 and engine_output is not None and engine_output["finished_requests"]:
-                    # >>>
-                    print("... engine | send finished.")
-                    # <<<
-                    # >>>
-                    # return {
-                    #     "active_requests": active_requests,
-                    #     "finished_requests": finished_requests,
-                    #     "step_time": step_time,
-                    #     "cuda_graph_request_count": cuda_graph_request_count,
-                    # }
-                    # <<<
-                    # finished_requests_serialized = []
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY_FINISHED.value,
+                            # >>>
                             # [
                             #     r.serializable()
                             #     for r in engine_output["finished_requests"]
                             # ],
-                            # [engine_output["finished_requests"][0].serializable()],
-                            # [{"request_id": 0}],
+                            # +++
                             [{
                                 "request_id" : r.request_id,
                                 "prompt_tokens" : r.prompt_tokens.tolist(),
-                                "generated_tokens" : r.generated_tokens, # .tolist(),
+                                "generated_tokens" : r.generated_tokens,
                                 "prompt" : self.controller.tokenizer.detokenize(r.prompt_tokens.tolist()),
                                 "generated_text" : self.controller.tokenizer.detokenize(r.generated_tokens),
                             } for r in engine_output["finished_requests"]],
+                            # <<<
                         ],
                         use_bin_type=True,
                     )
                     self.socket_for_receiving_requests.send(payload)
-                    # >>>
-                    print("... engine | sent finished.")
-                    # <<<
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         except asyncio.CancelledError:
             pass
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
