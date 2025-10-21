@@ -1143,6 +1143,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             [{
                                 "request_id" : r.request_id,
                                 "prompt_tokens" : r.prompt_tokens.tolist(),
+                                "generated_tokens" : r.generated_tokens, # .tolist(),
+                                "prompt" : self.controller.tokenizer.detokenize(r.prompt_tokens.tolist()),
+                                "generated_text" : self.controller.tokenizer.detokenize(r.generated_tokens),
                             } for r in engine_output["finished_requests"]],
                         ],
                         use_bin_type=True,
