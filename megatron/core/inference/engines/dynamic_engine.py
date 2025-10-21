@@ -662,10 +662,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Note that we do not need to continue check the queue, as the tokens are full
 
     async def async_step(
-        self,
-        sampling_params: SamplingParams,
-        *,
-        verbose: Optional[bool] = False,
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -998,15 +995,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     continue
 
                 engine_output = await self.async_step(
-                    sampling_params=sampling_params,
-                    verbose=verbose,
+                    sampling_params=sampling_params, verbose=verbose
                 )
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
                     and parallel_state.get_pipeline_model_parallel_rank() == 0
                 )
-                if is_tp0_and_pp0 and engine_output is not None and engine_output["finished_requests"]:
+                if (
+                    is_tp0_and_pp0
+                    and engine_output is not None
+                    and engine_output["finished_requests"]
+                ):
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
@@ -1016,13 +1016,20 @@ class DynamicInferenceEngine(AbstractEngine):
                             #     for r in engine_output["finished_requests"]
                             # ],
                             # +++
-                            [{
-                                "request_id" : r.request_id,
-                                "prompt_tokens" : r.prompt_tokens.tolist(),
-                                "generated_tokens" : r.generated_tokens,
-                                "prompt" : self.controller.tokenizer.detokenize(r.prompt_tokens.tolist()),
-                                "generated_text" : self.controller.tokenizer.detokenize(r.generated_tokens),
-                            } for r in engine_output["finished_requests"]],
+                            [
+                                {
+                                    "request_id": r.request_id,
+                                    "prompt_tokens": r.prompt_tokens.tolist(),
+                                    "generated_tokens": r.generated_tokens,
+                                    "prompt": self.controller.tokenizer.detokenize(
+                                        r.prompt_tokens.tolist()
+                                    ),
+                                    "generated_text": self.controller.tokenizer.detokenize(
+                                        r.generated_tokens
+                                    ),
+                                }
+                                for r in engine_output["finished_requests"]
+                            ],
                             # <<<
                         ],
                         use_bin_type=True,
