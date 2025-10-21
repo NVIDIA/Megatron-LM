@@ -299,7 +299,10 @@ class MambaStack(MegatronModule):
 
         if (
             (
-                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                (
+                    self.config.cuda_graph_impl == "local"
+                    and self.config.cuda_graph_scope != "full_iteration"
+                )
                 or self.config.flash_decode
             )
             and inference_context

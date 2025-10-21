@@ -4,7 +4,7 @@
 import os
 import torch
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 from model_provider import model_provider
 from mamba_builders import mamba_builder
@@ -24,23 +24,17 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
 from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tokenizers import MegatronTokenizer
-
 from megatron.training.datasets.sft_dataset import SFTDataset
 
 # modelopt distillation
 try:
-    from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
+    from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
     has_nvidia_modelopt = True
 except ImportError:
@@ -82,9 +76,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             the data parallel ranks
     """
     args = get_args()
-    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
-
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
@@ -121,7 +114,6 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             fatal=False,
         )
 
-
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
@@ -152,7 +144,6 @@ def forward_step(data_iterator, model: MambaModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
-
 
 
 def is_dataset_built_on_rank(vp_stage=None):

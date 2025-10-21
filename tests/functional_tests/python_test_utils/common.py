@@ -235,7 +235,8 @@ def pipeline(
                 golden = np.array(golden_value_list)
 
                 # Tolerance check
-                is_close = np.isclose(actual, golden, rtol=0.10, atol=0)
+                rtol = 0 if test.type_of_test_result == TypeOfTestResult.DETERMINISTIC else 0.10
+                is_close = np.isclose(actual, golden, rtol=rtol, atol=0)
 
                 num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
                 passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
