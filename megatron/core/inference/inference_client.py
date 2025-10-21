@@ -137,16 +137,10 @@ class InferenceClient:
         Sends a CONNECT signal and waits for an ACK reply to ensure the
         connection is established and acknowledged by the coordinator.
         """
-        # >>>
-        print("~~~~~~~~ client, connecting 0.")
-        # <<<
         payload = [Headers.CONNECT.value]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
         assert Headers(reply) == Headers.ACK
-        # >>>
-        print("~~~~~~~~ client, connecting 1.")
-        # <<<
 
     async def start(self):
         """
@@ -159,9 +153,6 @@ class InferenceClient:
         print("Client: Connecting to InferenceCoordinator...")
         self._connect_with_inference_coordinator()
         self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
-        # >>>
-        print("~~~~~~~~ client, started.")
-        # <<<
 
     def _send_signal_to_engines(self, signal):
         """

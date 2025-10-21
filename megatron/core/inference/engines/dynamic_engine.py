@@ -967,7 +967,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # >>>
                 print("... engine | step %d." % n_steps)
                 n_steps += 1
-                await asyncio.sleep(0.02)
+                # await asyncio.sleep(0.02)
                 # <<<
                 self.schedule_requests()
                 if self.stopped:

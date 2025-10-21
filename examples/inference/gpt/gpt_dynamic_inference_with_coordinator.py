@@ -146,9 +146,6 @@ if __name__ == "__main__":
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill
         )
-        # >>>
-        # pax("engine")
-        # <<<
 
         
         if dist.get_rank() == 0:
