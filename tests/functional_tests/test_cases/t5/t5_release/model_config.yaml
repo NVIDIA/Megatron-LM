@@ -55,7 +55,7 @@ MODEL_ARGS:
   --log-num-zeros-in-grad: true
   --log-params-norm: true
   --log-validation-ppl-to-tensorboard: true
-  --timing-log-level: 2
+  --timing-log-level: 0
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
 METRICS:

@@ -173,6 +173,7 @@ runs:
     - name: Check result
       id: check
       shell: bash -x -e -u -o pipefail {0}
+      if: always()
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
@@ -210,7 +211,7 @@ runs:
 
     - name: Upload coverage
       uses: actions/upload-artifact@v4
-      if: ${{ steps.check.outputs.coverage_report != 'none' }}
+      if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
       with:
         name: ${{ steps.check.outputs.coverage_report }}
         path: |
@@ -220,6 +221,7 @@ runs:
 
     - name: Upload logs
       uses: actions/upload-artifact@v4
+      if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
         path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir' }}

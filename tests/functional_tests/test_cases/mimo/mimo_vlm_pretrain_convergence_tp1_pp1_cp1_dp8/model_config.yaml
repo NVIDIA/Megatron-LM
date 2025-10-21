@@ -19,7 +19,7 @@ MODEL_ARGS:
   --seq-length: 4096
   --max-position-embeddings: 4096
   --train-iters: 100
-  --timing-log-level: 2
+  --timing-log-level: 0
   --lr-decay-iters: 2200
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
