@@ -541,7 +541,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_q"],
         )
 
-    def cu_kv_lengths(self) -> Tensor:
+    def cu_kv_lengths(self) -> Tuple[Tensor, Tensor, int]:
         """Cumulative key/value sequence lengths."""
         return (
             self.active_attn_metadata["mha_metadata"].state_data["cu_kv_seq_lengths"],
@@ -745,8 +745,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
         # Attention metadata reset is now handled by MHAMetadata.reset()
-        if self.active_attn_metadata is not None:
-            self.active_attn_metadata["mha_metadata"].reset()
+        for attn_metadata in self.non_graph_attn_metadata.values():
+            attn_metadata["mha_metadata"].reset()
+        for attn_metadata in self.graph_attn_metadata.values():
+            attn_metadata["mha_metadata"].reset()
+        self.active_attn_metadata = None
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""

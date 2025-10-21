@@ -39,7 +39,6 @@ class MHAMetadata(MetadataBase):
         )
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
-        self.effective_batch_size = 0
         self.state_data = {}
 
     def update(
@@ -69,7 +68,10 @@ class MHAMetadata(MetadataBase):
         assert request_to_kv_block_ids.shape[0] == real_batch_size
 
         self.tensor_copy_and_pad(
-            self._query_lengths_buf, request_query_lengths, real_batch_size, padded_active_request_count
+            self._query_lengths_buf,
+            request_query_lengths,
+            real_batch_size,
+            padded_active_request_count,
         )
         self._cu_query_seq_lengths_buf[0] = 0
         self.tensor_copy_and_pad(
@@ -109,13 +111,14 @@ class MHAMetadata(MetadataBase):
 
         self.state_data = {
             "query_lengths": self._query_lengths_buf[:padded_active_request_count],
-            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: padded_active_request_count + 1],
+            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[
+                : padded_active_request_count + 1
+            ],
             "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: padded_active_request_count + 1],
             "kv_seq_lengths": self._kv_seq_lengths_buf[:padded_active_request_count],
             "block_table": self._block_table_buf[0:padded_active_request_count, :],
             "max_seqlen_q": self._max_seqlen_q,
             "max_seqlen_k": self._max_seqlen_k,
-            "effective_batch_size": self.effective_batch_size,
         }
 
     def reset(self):
@@ -129,7 +132,6 @@ class MHAMetadata(MetadataBase):
         self._block_table_buf.fill_(0)
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
-        self.effective_batch_size = 0
 
 
 class GraphMHAMetadata(MHAMetadata):
@@ -217,5 +219,9 @@ class NonGraphMHAMetadata(MHAMetadata):
             real_batch_size,
             padded_active_request_count,
         )
-        self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
-        self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
+        if len(self.state_data["query_lengths"]) > 0:
+            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
+            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
+        else:
+            self.state_data["max_seqlen_q"] = 1
+            self.state_data["max_seqlen_k"] = 1
