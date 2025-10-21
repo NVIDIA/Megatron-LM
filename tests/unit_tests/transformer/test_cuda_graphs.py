@@ -717,15 +717,17 @@ class TestCaptureFreezeGC:
 
 if __name__ == "__main__":
 
-    test = TestParallelTransformerBlockCudagraphs()
-    test.setup_method(method=None)
-    test.test_gpu_cudagraph()
-    test.teardown_method(method=None)
+    # >>>
+    # test = TestParallelTransformerBlockCudagraphs()
+    # test.setup_method(method=None)
+    # test.test_gpu_cudagraph()
+    # test.teardown_method(method=None)
 
-    llava_test = TestLLaVACudaGraph()
-    llava_test.setup_method(method=None)
-    llava_test.test_llava_cudagraph_is_last_layer_logic()
-    llava_test.teardown_method(method=None)
+    # llava_test = TestLLaVACudaGraph()
+    # llava_test.setup_method(method=None)
+    # llava_test.test_llava_cudagraph_is_last_layer_logic()
+    # llava_test.teardown_method(method=None)
+    # <<<
 
     test = TestCaptureFreezeGC()
     test.test_capture_freeze_gc()
