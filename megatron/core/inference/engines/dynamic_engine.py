@@ -292,6 +292,9 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
+        # >>>
+        # raise Exception("hi.")
+        # <<<
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
             spawn_context = multiprocessing.get_context('spawn')
             coordinator_ready_event = spawn_context.Event()
@@ -299,7 +302,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
                     coordinator_ready_event,
+                    # >>>
                     self.controller.tokenizer,
+                    # <<<
                     inference_coordinator_port,
                     parallel_state.get_data_parallel_world_size(),
                 ),
@@ -915,6 +920,9 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
+                # >>>
+                # pax("request_id, prompt, sampling_params")
+                # <<<
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(
                     request_id,
@@ -968,6 +976,10 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously."""
         try:
             while True:
+                # >>>
+                print("... engine.")
+                await asyncio.sleep(0.02)
+                # <<<
                 self.schedule_requests()
                 if self.stopped:
                     self.stop()

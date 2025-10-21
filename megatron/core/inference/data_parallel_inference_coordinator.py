@@ -3,6 +3,7 @@
 import logging
 from collections import deque
 from itertools import cycle, repeat
+from multiprocessing import Event
 from typing import List, Tuple
 
 import torch
@@ -23,6 +24,11 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+
+# >>>
+myprint = lambda m: print(f"+++++++++++++++++++++++++ coordinator, {m}.")
+# <<<
 
 
 class DataParallelInferenceCoordinator:
@@ -62,7 +68,14 @@ class DataParallelInferenceCoordinator:
             server-side request ID.
     """
 
-    def __init__(self, tokenizer, inference_coordinator_port: int, data_parallel_size: int):
+    def __init__(
+        self,
+        # >>>
+        tokenizer, # : Tokenizer,
+        # <<<
+        inference_coordinator_port: int,
+        data_parallel_size: int,
+    ):
         """
         Initializes the inference coordinator.
 
@@ -71,8 +84,10 @@ class DataParallelInferenceCoordinator:
         ranks to connect before proceeding.
 
         Args:
-            tokenizer: An object with `tokenize`, `detokenize`, and `bos` attributes,
-                used for processing text.
+            # >>>
+            # tokenizer: An object with `tokenize`, `detokenize`, and `bos` attributes,
+            #     used for processing text.
+            # <<<
             inference_coordinator_port (int): The TCP port number to bind the server to.
             data_parallel_size (int): The number of TP-coordinator workers that are
                 expected to connect.
@@ -86,7 +101,9 @@ class DataParallelInferenceCoordinator:
             "pip install msgpack"
         )
         self.context = zmq.Context()
+        # >>>
         self.tokenizer = tokenizer
+        # <<<
 
         # This is the central router socket
         # 1. data parallel ranks connect to this socket to register themselves
@@ -114,7 +131,9 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_request_id = {}
 
         self.next_request_id = 0
+        # >>>
         self.requests = {}
+        # <<<
 
     def get_next_data_parallel_rank(self):
         """
@@ -125,6 +144,7 @@ class DataParallelInferenceCoordinator:
         """
         return next(self.data_parallel_rank_iterator)
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def tokenize_prompt(
         self, prompt: str, add_BOS: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -239,6 +259,7 @@ class DataParallelInferenceCoordinator:
                         ),
                     ]
                 )
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def start(self):
         """
@@ -253,11 +274,23 @@ class DataParallelInferenceCoordinator:
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
         known_clients = set()
         while True:
+            # >>>
+            myprint("start | 0")
+            # <<<
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
+            # >>>
+            myprint("start | 1")
+            # <<<
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
+            # >>>
+            myprint("header %s." % header.name)
+            # <<<
 
             if header == Headers.CONNECT:
+                # >>>
+                myprint("connect | 0")
+                # <<<
                 if sender_identity in known_clients:
                     logging.info(
                         f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
@@ -269,8 +302,14 @@ class DataParallelInferenceCoordinator:
                 self.router_socket.send_multipart(
                     [sender_identity, msgpack.packb([Headers.ACK.value], use_bin_type=True)]
                 )
+                # >>>
+                myprint("connect | 1")
+                # <<<
 
             elif header == Headers.SUBMIT_REQUEST:
+                # >>>
+                myprint("submit_request | 0")
+                # <<<
                 # ToDo [Siddharth]: We might want to tokenize the prompt on the
                 # assigned data parallel rank for this process instead
                 # of the coordinator.
@@ -291,6 +330,7 @@ class DataParallelInferenceCoordinator:
                 self.request_id_to_client_id[request_id] = sender_identity
                 self.request_id_to_client_request_id[request_id] = client_request_id
 
+                # >>>
                 # tokenize the prompt if it is a string.
                 if isinstance(prompt, str):
                     prompt_tokens = self.tokenize_prompt(prompt)
@@ -300,6 +340,11 @@ class DataParallelInferenceCoordinator:
                 self.requests[request_id] = DynamicInferenceRequest(
                     request_id=request_id, prompt=prompt, prompt_tokens=prompt_tokens
                 )
+                # <<<
+
+                # >>>
+                # pax("prompt")
+                # <<<
 
                 next_data_parallel_rank_identity = self.get_next_data_parallel_rank()
                 self.router_socket.send_multipart(
@@ -309,14 +354,22 @@ class DataParallelInferenceCoordinator:
                             [
                                 Headers.SUBMIT_REQUEST.value,
                                 request_id,
+                                # >>>
                                 prompt_tokens,
+                                # <<<
                                 sampling_params,
                             ],
                             use_bin_type=True,
                         ),
                     ]
                 )
+                # >>>
+                myprint("submit_request | 1")
+                # <<<
             elif header in [Headers.PAUSE, Headers.UNPAUSE, Headers.STOP]:
+                # >>>
+                myprint("pause/unpause/stop | 0")
+                # <<<
                 # control signals for the engine
                 # broadcast to all data parallel ranks
                 if sender_identity not in known_clients:
@@ -325,7 +378,13 @@ class DataParallelInferenceCoordinator:
                     self.router_socket.send_multipart(
                         [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
                     )
+                # >>>
+                myprint("pause/unpause/stop | 1")
+                # <<<
             elif header == Headers.ENGINE_REPLY:
+                # >>>
+                myprint("engine_reply | 0")
+                # <<<
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 (
@@ -344,10 +403,19 @@ class DataParallelInferenceCoordinator:
                     chunked_prefill_request_id,
                     materialize_only_last_token_logits,
                 )
+                # >>>
+                myprint("engine_reply | 1")
+                # <<<
 
     @classmethod
     def entrypoint(
-        cls, ready_event, tokenizer, inference_coordinator_port: int, data_parallel_size: int
+        cls,
+        ready_event: Event,
+        # >>>
+        tokenizer,
+        # <<<
+        inference_coordinator_port: int,
+        data_parallel_size: int,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -356,20 +424,45 @@ class DataParallelInferenceCoordinator:
         that it is fully initialized and listening, and then starts the main event loop.
 
         Args:
-            ready_event: A threading or multiprocessing event object that is set()
+            ready_event (Event): A threading or multiprocessing event object that is set()
                 once the coordinator is ready to accept connections.
-            tokenizer: The tokenizer object.
+            # >>>
+            # tokenizer: The tokenizer object.
+            # <<<
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
         """
-        tokenizer = tokenizer
+        # >>>
+        # pax("ready_event")
+        # <<<
+        # >>>
+        # tokenizer = tokenizer
+        # <<<
+        # >>>
+        myprint(0)
+        # <<<
+        # >>>
         coordinator = cls(tokenizer, inference_coordinator_port, data_parallel_size)
+        # coordinator = cls(inference_coordinator_port, data_parallel_size)
+        # <<<
         ready_event.set()
+        # >>>
+        myprint(1)
+        # <<<
         try:
+            # >>>
+            myprint(2)
+            # <<<
             coordinator.start()
+            # >>>
+            myprint(3)
+            # <<<
         except KeyboardInterrupt:
             logging.info("Coordinator process interrupted. Exiting...")
             coordinator.stop()
+        # >>>
+        myprint(4)
+        # <<<
 
     def stop(self):
         """
