@@ -4,7 +4,10 @@ import logging
 from collections import deque
 from itertools import cycle, repeat
 from multiprocessing import Event
-from typing import List, Tuple
+# >>>
+# from typing import List, Tuple
+from typing import List
+# <<<
 
 import torch
 
@@ -56,7 +59,9 @@ class DataParallelInferenceCoordinator:
         from a client to all connected data parallel ranks.
 
     Attributes:
-        tokenizer: The tokenizer object for encoding prompts.
+        # >>>
+        # tokenizer: The tokenizer object for encoding prompts.
+        # <<<
         router_socket (zmq.Socket): The central ZMQ ROUTER socket for all communication.
         data_parallel_size (int): The number of data parallel workers to expect.
         identities_of_data_parallel_ranks (deque): A deque holding the ZMQ
@@ -149,23 +154,23 @@ class DataParallelInferenceCoordinator:
         return next(self.data_parallel_rank_iterator)
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    def tokenize_prompt(
-        self, prompt: str, add_BOS: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Utility to tokenize the input prompts
+    # def tokenize_prompt(
+    #     self, prompt: str, add_BOS: bool = False
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     """Utility to tokenize the input prompts
 
-        Args:
-            prompt (str): The input prompt
+    #     Args:
+    #         prompt (str): The input prompt
 
-        Returns:
-            torch.Tensor: Returns the tokenized prompt
-        """
-        prompt_tokens = self.tokenizer.tokenize(prompt)
+    #     Returns:
+    #         torch.Tensor: Returns the tokenized prompt
+    #     """
+    #     prompt_tokens = self.tokenizer.tokenize(prompt)
 
-        if add_BOS:
-            prompt_tokens = [self.tokenizer.bos] + prompt_tokens
+    #     if add_BOS:
+    #         prompt_tokens = [self.tokenizer.bos] + prompt_tokens
 
-        return prompt_tokens
+    #     return prompt_tokens
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -331,11 +336,23 @@ class DataParallelInferenceCoordinator:
                 self.request_id_to_client_request_id[request_id] = client_request_id
 
                 # >>>
-                # tokenize the prompt if it is a string.
-                if isinstance(prompt, str):
-                    prompt_tokens = self.tokenize_prompt(prompt)
+                # pax("prompt")
+                # <<<
+
+                # >>>
+                # # tokenize the prompt if it is a string.
+                # if isinstance(prompt, str):
+                #     prompt_tokens = self.tokenize_prompt(prompt)
+                # else:
+                #     prompt_tokens = prompt  # no error handling here as it is done in the engine.
+                # +++
+                # Serialize prompt.
+                if isinstance(prompt, (str, list)):
+                    pass
+                elif isinstance(prompt, torch.Tensor):
+                    prompt = prompt.tolist()
                 else:
-                    prompt_tokens = prompt  # no error handling here as it is done in the engine.
+                    raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
                 # <<<
 
                 # >>>
@@ -357,7 +374,8 @@ class DataParallelInferenceCoordinator:
                                 Headers.SUBMIT_REQUEST.value,
                                 request_id,
                                 # >>>
-                                prompt_tokens,
+                                # prompt_tokens,
+                                prompt,
                                 # <<<
                                 sampling_params,
                             ],
