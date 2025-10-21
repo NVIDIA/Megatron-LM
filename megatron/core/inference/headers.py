@@ -15,3 +15,7 @@ class Headers(Enum):
     PAUSE = 4
     UNPAUSE = 5
     STOP = 6
+    # >>>
+    # ENGINE_REPLY_FINISHED_ONLY = 7
+    ENGINE_REPLY_FINISHED = 7
+    # <<<

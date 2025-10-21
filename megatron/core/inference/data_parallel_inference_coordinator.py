@@ -162,7 +162,9 @@ class DataParallelInferenceCoordinator:
             prompt_tokens = [self.tokenizer.bos] + prompt_tokens
 
         return prompt_tokens
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def postprocess(
         self,
         request_ids: List[int],
@@ -287,10 +289,10 @@ class DataParallelInferenceCoordinator:
             myprint("header %s." % header.name)
             # <<<
 
+            # >>>
+            myprint(f"{header.name} | 0")
+            # <<<
             if header == Headers.CONNECT:
-                # >>>
-                myprint("connect | 0")
-                # <<<
                 if sender_identity in known_clients:
                     logging.info(
                         f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
@@ -302,14 +304,8 @@ class DataParallelInferenceCoordinator:
                 self.router_socket.send_multipart(
                     [sender_identity, msgpack.packb([Headers.ACK.value], use_bin_type=True)]
                 )
-                # >>>
-                myprint("connect | 1")
-                # <<<
 
             elif header == Headers.SUBMIT_REQUEST:
-                # >>>
-                myprint("submit_request | 0")
-                # <<<
                 # ToDo [Siddharth]: We might want to tokenize the prompt on the
                 # assigned data parallel rank for this process instead
                 # of the coordinator.
@@ -336,7 +332,9 @@ class DataParallelInferenceCoordinator:
                     prompt_tokens = self.tokenize_prompt(prompt)
                 else:
                     prompt_tokens = prompt  # no error handling here as it is done in the engine.
+                # <<<
 
+                # >>>
                 self.requests[request_id] = DynamicInferenceRequest(
                     request_id=request_id, prompt=prompt, prompt_tokens=prompt_tokens
                 )
@@ -363,13 +361,7 @@ class DataParallelInferenceCoordinator:
                         ),
                     ]
                 )
-                # >>>
-                myprint("submit_request | 1")
-                # <<<
             elif header in [Headers.PAUSE, Headers.UNPAUSE, Headers.STOP]:
-                # >>>
-                myprint("pause/unpause/stop | 0")
-                # <<<
                 # control signals for the engine
                 # broadcast to all data parallel ranks
                 if sender_identity not in known_clients:
@@ -378,13 +370,7 @@ class DataParallelInferenceCoordinator:
                     self.router_socket.send_multipart(
                         [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
                     )
-                # >>>
-                myprint("pause/unpause/stop | 1")
-                # <<<
             elif header == Headers.ENGINE_REPLY:
-                # >>>
-                myprint("engine_reply | 0")
-                # <<<
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 (
@@ -403,9 +389,36 @@ class DataParallelInferenceCoordinator:
                     chunked_prefill_request_id,
                     materialize_only_last_token_logits,
                 )
+            elif header == Headers.ENGINE_REPLY_FINISHED:
+                # This is the output of a single engine step on some data parallel rank.
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                finished_requests = deserialized_payload[1]
+
                 # >>>
-                myprint("engine_reply | 1")
+                # pax("finished_requests")
                 # <<<
+                for finished_request in finished_requests:
+                    # >>>
+                    # pax("finished_request")
+                    # <<<
+                    fid = finished_request["request_id"]
+                    client_identity = self.request_id_to_client_id[fid]
+                    client_request_identity = self.request_id_to_client_request_id[fid]
+                    del self.request_id_to_client_id[fid]
+                    del self.request_id_to_client_request_id[fid]
+
+                    self.router_socket.send_multipart(
+                        [
+                            client_identity,
+                            msgpack.packb(
+                                [client_request_identity, finished_request],
+                                use_bin_type=True,
+                            ),
+                        ]
+                    )
+            # >>>
+            myprint(f"{header.name} | 1")
+            # <<<
 
     @classmethod
     def entrypoint(
