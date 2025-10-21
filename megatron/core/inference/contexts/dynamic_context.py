@@ -843,7 +843,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         real_req_batch_size = (
             self.total_request_count - self.paused_request_count
         )  # how many requests are indeed active
-        graph_req_batch_size = self.padded_active_request_count
         self.active_attn_metadata = (
             self.graph_attn_metadata
             if self.using_cuda_graph_this_step()
@@ -861,7 +860,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             request_to_kv_block_ids=request_to_kv_block_ids_view,
             padded_active_token_count=self.padded_active_token_count,
             real_batch_size=real_req_batch_size,
-            graph_batch_size=graph_req_batch_size,
+            padded_active_request_count=self.padded_active_request_count,
         )
         # All attention metadata calculations are now handled by MHAMetadata.update()
 

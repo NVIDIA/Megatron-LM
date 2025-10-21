@@ -49,7 +49,7 @@ class MHAMetadata(MetadataBase):
         request_to_kv_block_ids: torch.Tensor,
         padded_active_token_count: int,
         real_batch_size: int,
-        graph_batch_size: Optional[int] = None,
+        padded_active_request_count: Optional[int] = None,
     ):
         """
         Args:
@@ -58,38 +58,38 @@ class MHAMetadata(MetadataBase):
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             padded_active_token_count: int
             real_batch_size: int
-            graph_batch_size: Optional[int]
+            padded_active_request_count: Optional[int]
         """
-        if graph_batch_size is None:
-            graph_batch_size = real_batch_size
+        if padded_active_request_count is None:
+            padded_active_request_count = real_batch_size
 
-        assert real_batch_size <= graph_batch_size <= self.max_bs
+        assert real_batch_size <= padded_active_request_count <= self.max_bs
         assert request_query_lengths.shape[0] == real_batch_size
         assert request_kv_length_offsets.shape[0] == real_batch_size
         assert request_to_kv_block_ids.shape[0] == real_batch_size
 
         self.tensor_copy_and_pad(
-            self._query_lengths_buf, request_query_lengths, real_batch_size, graph_batch_size
+            self._query_lengths_buf, request_query_lengths, real_batch_size, padded_active_request_count
         )
         self._cu_query_seq_lengths_buf[0] = 0
         self.tensor_copy_and_pad(
             self._cu_query_seq_lengths_buf[1:],
             torch.cumsum(request_query_lengths, dim=0),
             real_batch_size,
-            graph_batch_size,
+            padded_active_request_count,
             is_cumulative_tensor=True,
         )
         self.tensor_copy_and_pad(
             self._kv_seq_lengths_buf,
             request_kv_length_offsets + request_query_lengths,
             real_batch_size,
-            graph_batch_size,
+            padded_active_request_count,
         )
         self.tensor_copy_and_pad(
             self._block_table_buf,
             request_to_kv_block_ids,
             real_batch_size,
-            graph_batch_size,
+            padded_active_request_count,
             pad_value=torch.tensor(self.max_kv_blocks, dtype=torch.int32, device=self.device).fill_(
                 -1
             ),
@@ -99,20 +99,20 @@ class MHAMetadata(MetadataBase):
             self._cu_kv_seq_lengths_buf[1:],
             torch.cumsum(self._kv_seq_lengths_buf, dim=0),
             real_batch_size,
-            graph_batch_size,
+            padded_active_request_count,
             is_cumulative_tensor=True,
         )
         self._max_seqlen_q = padded_active_token_count
-        if torch.all(self._query_lengths_buf[:graph_batch_size] <= 1):
+        if torch.all(self._query_lengths_buf[:padded_active_request_count] <= 1):
             self._max_seqlen_q = 1
         self._max_seqlen_k = self.max_seqlen
 
         self.state_data = {
-            "query_lengths": self._query_lengths_buf[:graph_batch_size],
-            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: graph_batch_size + 1],
-            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: graph_batch_size + 1],
-            "kv_seq_lengths": self._kv_seq_lengths_buf[:graph_batch_size],
-            "block_table": self._block_table_buf[0:graph_batch_size, :],
+            "query_lengths": self._query_lengths_buf[:padded_active_request_count],
+            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: padded_active_request_count + 1],
+            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: padded_active_request_count + 1],
+            "kv_seq_lengths": self._kv_seq_lengths_buf[:padded_active_request_count],
+            "block_table": self._block_table_buf[0:padded_active_request_count, :],
             "max_seqlen_q": self._max_seqlen_q,
             "max_seqlen_k": self._max_seqlen_k,
             "effective_batch_size": self.effective_batch_size,
@@ -162,7 +162,7 @@ class GraphMHAMetadata(MHAMetadata):
         request_to_kv_block_ids: torch.Tensor,
         padded_active_token_count: int,
         real_batch_size: int,
-        graph_batch_size: Optional[int] = None,
+        padded_active_request_count: Optional[int] = None,
     ):
         """
         Args:
@@ -171,7 +171,7 @@ class GraphMHAMetadata(MHAMetadata):
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             padded_active_token_count: int
             real_batch_size: int
-            graph_batch_size: Optional[int]
+            padded_active_request_count: Optional[int]
         """
         super().update(
             request_query_lengths,
@@ -179,7 +179,7 @@ class GraphMHAMetadata(MHAMetadata):
             request_to_kv_block_ids,
             padded_active_token_count,
             real_batch_size,
-            graph_batch_size,
+            padded_active_request_count,
         )
 
     def reset(self):
@@ -198,7 +198,7 @@ class NonGraphMHAMetadata(MHAMetadata):
         request_to_kv_block_ids: torch.Tensor,
         padded_active_token_count: int,
         real_batch_size: int,
-        graph_batch_size: Optional[int] = None,
+        padded_active_request_count: Optional[int] = None,
     ):
         """
         Args:
@@ -207,7 +207,7 @@ class NonGraphMHAMetadata(MHAMetadata):
             request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
             padded_active_token_count: int
             real_batch_size: int
-            graph_batch_size: Optional[int]
+            padded_active_request_count: Optional[int]
         """
         super().update(
             request_query_lengths,
@@ -215,7 +215,7 @@ class NonGraphMHAMetadata(MHAMetadata):
             request_to_kv_block_ids,
             padded_active_token_count,
             real_batch_size,
-            graph_batch_size,
+            padded_active_request_count,
         )
         self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
         self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
