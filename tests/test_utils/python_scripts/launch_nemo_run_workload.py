@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 def is_flaky_failure(concat_allranks_logs: str) -> bool:
     """Assumes that certain keywords hint towards intermittent failures."""
-    
+
     return (
         "The server socket has failed to listen on any local network address."
         in concat_allranks_logs
