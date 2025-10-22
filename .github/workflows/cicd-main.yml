@@ -128,6 +128,12 @@ jobs:
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
+      - name: Install GH CLI
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y gh
+
       - name: Pull cache
         run: |
           docker pull ${{ env.container-registry }}/megatron-lm:main || true
