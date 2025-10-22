@@ -169,7 +169,7 @@ class TestMultiModulePipelineCommunicator:
         # Create process group grids for each module
         image_encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=2, dp=1)
         audio_encoder_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=1, dp=1)
-        llm_grid = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=2, dp=1)
+        llm_grid = create_hypercomm_grid(offset=4, tp=1, cp=1, pp=4, dp=1)
 
         # Set up module-grid mapping and topology
         module_to_grid_map = {
@@ -198,13 +198,18 @@ class TestMultiModulePipelineCommunicator:
             mllm_comm.send_forward(output_dict)
         if mllm_comm.is_current_rank_in_grid(llm_grid):
             output_dict = {'llm': torch.randn(2, 32, 128).cuda()}
-            if dist.get_rank() == 4 or dist.get_rank() == 5:
+            if dist.get_rank() == 4:
                 # LLM stage receives both image and audio outputs
                 input_dict = mllm_comm.recv_forward()
                 assert input_dict['image_encoder'].shape == (2, 8, 128)
                 assert input_dict['audio_encoder'].shape == (2, 16, 128)
                 mllm_comm.send_forward(output_dict)
-            else:
+            elif dist.get_rank() == 5 or dist.get_rank() == 6:
+                # LLM stage receives concatenated LLM outputs
+                input_dict = mllm_comm.recv_forward(tensor_shape=(2, 32, 128))
+                assert input_dict['llm'].shape == (2, 32, 128)
+                mllm_comm.send_forward(output_dict)
+            elif dist.get_rank() == 7:
                 # LLM stage receives concatenated LLM outputs
                 input_dict = mllm_comm.recv_forward(tensor_shape=(2, 32, 128))
                 assert input_dict['llm'].shape == (2, 32, 128)
