@@ -37,6 +37,7 @@ env:
 jobs:
   is-external-contributor:
     runs-on: ubuntu-latest
+    environment: nemo-ci
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
     env:
@@ -102,6 +103,7 @@ jobs:
           fi
 
   pre-flight:
+    needs: [is-external-contributor]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
 
   linting:
