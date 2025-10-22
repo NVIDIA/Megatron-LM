@@ -26,6 +26,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from .attention_context.mha_metadata import GraphMHAMetadata, NonGraphMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
+from ..kv_cache import KVCacheBase, KVCacheLayout, MLACache, create_mhagqa_cache
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -335,34 +336,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
-        # Memory buffer.
+        # Memory buffer - now a list of cache objects, one per layer.
+        # Determine layout based on backend
+        if cache_mla_latent:
+            layout = None  # MLA uses single canonical layout
+        elif attention_backend in [AttnBackend.flashinfer_fa2,
+                                   AttnBackend.flashinfer_fa3,
+                                   AttnBackend.flashinfer_trt]:
+            layout = KVCacheLayout.M_N2HCD  # NOT Triton-compatible
+        else:  # Flash backend
+            layout = KVCacheLayout.M_2NCHD  # Triton-compatible
+
         ctx_manager = (
             torch.cuda.use_mem_pool(self.unified_memory_mempool)
             if self.unified_memory_level > 0
             else nullcontext()
         )
+
+        self.memory_buffer: List[KVCacheBase] = []
         with ctx_manager:
-            if cache_mla_latent:
-                self.memory_buffer = torch.full(
-                    (self.num_layers, block_count_total, self.block_size_tokens, kv_reduced_dim),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                self.memory_buffer = torch.full(
-                    (
-                        2,  # key and value
-                        self.num_layers,
-                        block_count_total,
-                        self.block_size_tokens,
-                        num_attention_kv_heads_per_partition,
-                        hidden_size_per_attention_head,
-                    ),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
+            for layer_idx in range(self.num_layers):
+                if cache_mla_latent:
+                    cache = MLACache(
+                        num_chunks=block_count_total,
+                        chunk_size=self.block_size_tokens,
+                        kv_reduced_dim=kv_reduced_dim,
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                else:
+                    cache = create_mhagqa_cache(
+                        layout=layout,
+                        num_chunks=block_count_total,
+                        chunk_size=self.block_size_tokens,
+                        num_kv_heads=num_attention_kv_heads_per_partition,
+                        head_dim=hidden_size_per_attention_head,
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                self.memory_buffer.append(cache)
 
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
@@ -684,44 +696,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
-        if triton_append_key_value_cache is not None and not self.cache_mla_latent:
-            # currently does not support MLA latent cache
+        cache = self.memory_buffer[layer_number - 1]
+
+        # Use Triton kernel for M_2NCHD and S_NCHD layouts only
+        if (triton_append_key_value_cache is not None
+            and not self.cache_mla_latent
+            and cache.supports_triton()):
             return triton_append_key_value_cache(
-                layer_number=layer_number,
                 key=key,
                 value=value,
-                memory_buffer=self.memory_buffer,
+                cache=cache,
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.token_to_block_idx,
                 token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
             )
 
-        block_idx = self.token_to_block_idx[: self.padded_active_token_count]
-        local_kv_seq_idx = self.token_to_local_position_within_kv_block[
-            : self.padded_active_token_count
-        ]
-
-        if not self.cache_mla_latent:
-            assert key.size(1) == 1 and value.size(1) == 1
-
-        key = key.squeeze(1)
-        # There is no value cache in FlashMLA/absorption
-        if not self.cache_mla_latent:
-            value = value.squeeze(1)
-
-        if self.cache_mla_latent:
-            # We pass the kv_concat as the key in cache_mla_latent
-            kv_concat = key
-            self.memory_buffer[layer_number - 1, block_idx, local_kv_seq_idx] = kv_concat[
-                : self.padded_active_token_count
-            ]
-        else:
-            self.memory_buffer[0, layer_number - 1, block_idx, local_kv_seq_idx] = key[
-                : self.padded_active_token_count
-            ]
-            self.memory_buffer[1, layer_number - 1, block_idx, local_kv_seq_idx] = value[
-                : self.padded_active_token_count
-            ]
+        # Fallback: use cache's append method for all layouts
+        cache.append(
+            key=key,
+            value=value,
+            padded_active_token_count=self.padded_active_token_count,
+            token_to_block_idx=self.token_to_block_idx,
+            token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
+        )
 
     def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Read from KV cache.
@@ -730,21 +727,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             layer_number (int): Layer number.
 
         Return:
-            (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
-            to blocks within the block-level memory buffer.
+            (Tuple[Tensor, Optional[Tensor], Tensor]) The key cache, value cache (or None for MLA),
+            and block table tensor.
         """
+        cache = self.memory_buffer[layer_number - 1]
+        cache_content = cache.get_content()
+        block_table = self.active_attn_metadata["mha_metadata"].state_data["block_table"]
+
         if self.cache_mla_latent:
-            return (
-                self.memory_buffer[layer_number - 1],
-                None,
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
+            # MLA: cache_content is single tensor
+            return (cache_content, None, block_table)
+        elif isinstance(cache_content, tuple):
+            # Separate K/V caches
+            k_cache, v_cache = cache_content
+            return (k_cache, v_cache, block_table)
         else:
-            return (
-                self.memory_buffer[0, layer_number - 1],
-                self.memory_buffer[1, layer_number - 1],
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
+            # Merged cache: slice [0] for K, [1] for V
+            return (cache_content[0], cache_content[1], block_table)
 
     def apply_fused_qk_rotary_emb(
         self, query: Tensor, key: Tensor, cos_sin_emb: Tensor, config: TransformerConfig
