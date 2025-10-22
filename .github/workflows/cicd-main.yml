@@ -43,7 +43,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
-      ISSUE_AUTHOR: ${{ github.event_name == 'push' && inputs.issue_author || github.event.issue.user.login }}
+      ISSUE_AUTHOR: ${{ github.event_name == 'push' && inputs.issue_author || github.actor }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
