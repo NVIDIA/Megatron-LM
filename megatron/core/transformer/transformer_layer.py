@@ -5,6 +5,7 @@ import warnings
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
+from contextlib import nullcontext
 
 import torch
 import torch.distributed
