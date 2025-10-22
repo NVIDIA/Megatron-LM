@@ -150,9 +150,40 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     
     # Get pg collections for modules that should be initialized on this rank
     pg_collection = get_pg_collections_for_rank(module_to_grid_map)
-    
+    print(f"for debug: Rank {dist.get_rank()}: pg_collection: {pg_collection}")
     all_losses = []
     
+    from megatron.core.optimizer.optimizer_config import OptimizerConfig
+    from megatron.core.optimizer import get_megatron_optimizer
+    # Create optimizer config
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.001,
+        weight_decay=0.01,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1e-8,
+    )
+
+    if mimo_model.modality_submodules is not None and mimo_model.modality_submodules['images'] is not None:
+        print(f"for debug: Rank {dist.get_rank()}, create optimizer for modality_submodules['images']")
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[mimo_model.modality_submodules['images']],
+            use_gloo_process_groups=False,  # Required when using custom process groups
+            pg_collection=pg_collection[0],
+        )
+    elif mimo_model.language_model is not None:
+        print(f"for debug: Rank {dist.get_rank()}, create optimizer for language_model")
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[mimo_model.language_model],
+            use_gloo_process_groups=False,  # Required when using custom process groups
+            pg_collection=pg_collection[0],
+        )
+    else:
+        raise ValueError(f"for debug: Rank {dist.get_rank()}, no model created")
+
     for iteration in range(num_iterations):
         # Start profiling if enabled
         if enable_profiling and profile_start_step is not None and iteration == profile_start_step:
@@ -167,10 +198,14 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
             pg_collection=pg_collection, 
             **common_args
         )
-        
+
         all_losses.append(losses_reduced)
         logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Losses: {losses_reduced}")
-        
+
+        # Update parameters.
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        print(f"for debug: Rank {dist.get_rank()}, at iteration {iteration}, update_successful: {update_successful}, grad_norm: {grad_norm}, num_zeros_in_grad: {num_zeros_in_grad}")
+
         zero_grad_buffer_for_multimodule(module_to_grid_tuple)
         
         # Stop profiling if enabled

@@ -364,15 +364,15 @@ def _create_transformer_block(
     return block
 
 
-def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
+def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, ep=1, etp=1):
     """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
     # Set up environment for world size 8 if not already set
     if "WORLD_SIZE" not in os.environ:
         os.environ["WORLD_SIZE"] = "8"
 
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1],
-        dim_names=["tp", "cp", "pp", "dp", "ep"],
+        shape=[tp, cp, pp, dp, ep, etp], # 需要加上etp吗
+        dim_names=["tp", "cp", "pp", "dp", "ep", "etp"],
         rank_offset=offset,
         backend="nccl",
     )
@@ -380,8 +380,14 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     _ = grid.create_pg(["cp"])
     _ = grid.create_pg(["pp"])
     _ = grid.create_pg(["dp"])
-    _ = grid.create_pg(["dp", "cp"])
     _ = grid.create_pg(["ep"])
+    # _ = grid.create_pg(["etp"])
+    # _ = grid.create_pg(["edp"])
+    _ = grid.create_pg(["tp", "pp"])
+    _ = grid.create_pg(["dp", "cp"])
+    _ = grid.create_pg(["tp", "cp"])
+    _ = grid.create_pg(["tp", "dp", "cp"])
+    _ = grid.create_pg(["tp", "ep", "pp"])
     return grid
 
 
@@ -395,6 +401,13 @@ def _get_pg_collection_from_grid(grid):
     dp_cp_group = grid.get_pg(["dp", "cp"])
     pg_collection.dp = dp_group
     pg_collection.dp_cp = dp_cp_group
+    pg_collection.mp = grid.get_pg(["tp", "pp"])
+    pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
+    pg_collection.tp_cp = grid.get_pg(["tp", "cp"])
+    pg_collection.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
+    pg_collection.expt_tp = None
+    pg_collection.expt_dp = None
     return pg_collection
 
 

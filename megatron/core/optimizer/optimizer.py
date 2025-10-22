@@ -152,11 +152,21 @@ class MegatronOptimizer(ABC):
                 grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+            is_not_tp_duplicate = self.param_is_not_tensor_parallel_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
 
         return grads_for_norm
+
+    def param_is_not_tensor_parallel_duplicate(self, param):
+        """Returns true if the passed-in parameter is not a duplicate parameter
+        on another TP rank."""
+        # [TODO by shifangx]
+        # need to pass in the pg_collection to the optimizer, and then check if the param is a duplicate parameter on another TP rank.
+        temp_without_TP = False
+        return (hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel) or (
+            temp_without_TP
+        )
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
