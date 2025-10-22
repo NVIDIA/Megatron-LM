@@ -487,7 +487,6 @@ def gen_offloading_plan(
     # Create expert_offloading_map with shape (num_home_experts, num_spare_experts)
     # expert_offloading_map[i][j] indicates if home expert i is offloaded to spare expert j
     export_offloading_map = matched_assignment > 0
-    
     offloaded_tokens, token_dist_after_offloading, leftover_spare_space = breadth_first_allocation(tokens_per_expert_from_ep_rank, matched_assignment)
     offloaded_tokens2, token_dist_after_offloading = depth_first_allocation(token_dist_after_offloading, leftover_spare_space)
     rerouting_map, rerouted_probs = reroute_tokens_triton(routing_map, 
@@ -496,3 +495,91 @@ def gen_offloading_plan(
                                                          (offloaded_tokens+offloaded_tokens2)[ep_rank].int().squeeze(), 
                                                          export_offloading_map)
     return rerouting_map, rerouted_probs, export_offloading_map
+
+
+
+def gen_assignment(
+    tokens_per_expert_from_ep_rank: torch.Tensor,
+    ep_rank: Union[torch.Tensor, int],
+    ep: int,
+    spare_expert_per_ep_rank: int = 1,
+    threshold_multiplier: float = 0.0,
+    index_dtype: torch.dtype = torch.int32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Phase 1: calculate how many tokens need to be offloaded from home experts
+    device = tokens_per_expert_from_ep_rank.device
+    num_tokens_to_expert = tokens_per_expert_from_ep_rank.sum(dim=0).to(index_dtype)
+    num_token_to_ep_rank = num_tokens_to_expert.view(ep, -1).sum(dim=1)
+    avg_token_to_ep_rank = num_token_to_ep_rank.sum() // ep
+    deviation = num_token_to_ep_rank - avg_token_to_ep_rank
+    spare_space = torch.relu(-deviation)
+
+    # sort the local experts by token count and place smaller token chunk first
+    local_exp_sorted_token_count, local_exp_sorted_idx = num_tokens_to_expert.view(ep, -1).sort(dim=1)
+    spillover_tokens_per_exp_sorted_cumsum = (local_exp_sorted_token_count.cumsum(dim=1) - avg_token_to_ep_rank).clamp(min=0)
+    spillover_tokens_per_exp_sorted = torch.cat([spillover_tokens_per_exp_sorted_cumsum[:, :1], torch.diff(spillover_tokens_per_exp_sorted_cumsum, dim=1)], dim=1)
+    spillover_tokens_per_exp = torch.scatter(torch.empty_like(spillover_tokens_per_exp_sorted), 1, local_exp_sorted_idx, spillover_tokens_per_exp_sorted).view(-1)
+    # import pdb; pdb.set_trace()
+    # Sort spillover_tokens_per_exp in descending order and spare_space in descending order
+    spillover_sorted, spillover_sort_indices = torch.sort(spillover_tokens_per_exp, descending=True)
+    spare_space_sorted, spare_space_sort_indices = torch.sort(spare_space, descending=True)
+    # [num_home_experts, num_spare_experts]
+    # assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
+    assignment_sorted = one_shot_greedy_assignment(spillover_sorted, spare_space_sorted)
+
+    # Find top spare_expert_per_ep_rank token chunks for each EP rank (on sorted assignment)
+    spare_bucket_max, spare_bucket_max_index = torch.topk(assignment_sorted, k=spare_expert_per_ep_rank, dim=0)
+    num_columns = assignment_sorted.shape[1]
+    
+    # Map row_indices back to original spillover order
+    row_indices_sorted = spare_bucket_max_index.transpose(0, 1).flatten()
+    row_indices = spillover_sort_indices[row_indices_sorted]
+    
+    # Map col_indices back to original spare_space order
+    # Original col_indices in sorted space
+    ep_rank_indices = torch.arange(num_columns, device=device).repeat_interleave(spare_expert_per_ep_rank)
+    spare_slot_indices = torch.arange(spare_expert_per_ep_rank, device=device).repeat(num_columns)
+    # Map ep_rank back to original order
+    original_ep_rank_indices = spare_space_sort_indices[ep_rank_indices]
+    col_indices = original_ep_rank_indices * spare_expert_per_ep_rank + spare_slot_indices
+    
+    values = spare_bucket_max.transpose(0, 1).flatten()
+    
+    # [num_home_experts, num_spare_experts]
+    # matched_assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
+    matched_assignment = torch.zeros(spillover_tokens_per_exp.shape[0], num_columns * spare_expert_per_ep_rank, device=device, dtype=assignment_sorted.dtype)
+    matched_assignment[row_indices, col_indices] = values
+    # Create expert_offloading_map with shape (num_home_experts, num_spare_experts)
+    # expert_offloading_map[i][j] indicates if home expert i is offloaded to spare expert j
+
+    # Apply threshold-based offloading expert selection
+    if threshold_multiplier > 0:
+        matched_assignment = reclaim_spare_experts(
+            num_token_to_ep_rank, avg_token_to_ep_rank, matched_assignment, threshold_multiplier
+        )
+    return matched_assignment, spillover_tokens_per_exp, spare_space
+
+
+def gen_intermediate(
+    tokens_per_expert_from_ep_rank: torch.Tensor,
+    ep_rank: Union[torch.Tensor, int],
+    ep: int,
+    spare_expert_per_ep_rank: int = 1,
+    threshold_multiplier: float = 0.0,
+    index_dtype: torch.dtype = torch.int32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Phase 1: calculate how many tokens need to be offloaded from home experts
+    device = tokens_per_expert_from_ep_rank.device
+    num_tokens_to_expert = tokens_per_expert_from_ep_rank.sum(dim=0).to(index_dtype)
+    num_token_to_ep_rank = num_tokens_to_expert.view(ep, -1).sum(dim=1)
+    avg_token_to_ep_rank = num_token_to_ep_rank.sum() // ep
+    deviation = num_token_to_ep_rank - avg_token_to_ep_rank
+    spare_space = torch.relu(-deviation)
+
+    # sort the local experts by token count and place smaller token chunk first
+    local_exp_sorted_token_count, local_exp_sorted_idx = num_tokens_to_expert.view(ep, -1).sort(dim=1)
+    spillover_tokens_per_exp_sorted_cumsum = (local_exp_sorted_token_count.cumsum(dim=1) - avg_token_to_ep_rank).clamp(min=0)
+    spillover_tokens_per_exp_sorted = torch.cat([spillover_tokens_per_exp_sorted_cumsum[:, :1], torch.diff(spillover_tokens_per_exp_sorted_cumsum, dim=1)], dim=1)
+    spillover_tokens_per_exp = torch.scatter(torch.empty_like(spillover_tokens_per_exp_sorted), 1, local_exp_sorted_idx, spillover_tokens_per_exp_sorted).view(-1)
+    
+    return spillover_tokens_per_exp, spare_space
