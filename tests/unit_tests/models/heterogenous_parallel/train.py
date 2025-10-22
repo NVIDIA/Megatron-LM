@@ -164,25 +164,21 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         adam_beta2=0.999,
         adam_eps=1e-8,
     )
-
-    if mimo_model.modality_submodules is not None and mimo_model.modality_submodules['images'] is not None:
-        print(f"for debug: Rank {dist.get_rank()}, create optimizer for modality_submodules['images']")
-        optimizer = get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=[mimo_model.modality_submodules['images']],
-            use_gloo_process_groups=False,  # Required when using custom process groups
-            pg_collection=pg_collection[0],
-        )
-    elif mimo_model.language_model is not None:
-        print(f"for debug: Rank {dist.get_rank()}, create optimizer for language_model")
-        optimizer = get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=[mimo_model.language_model],
-            use_gloo_process_groups=False,  # Required when using custom process groups
-            pg_collection=pg_collection[0],
-        )
-    else:
-        raise ValueError(f"for debug: Rank {dist.get_rank()}, no model created")
+    model_chunks = []
+    if mimo_model.modality_submodules is not None:
+        for submodule in mimo_model.modality_submodules.values():
+            if submodule is not None:
+                model_chunks.append(submodule)
+    if mimo_model.language_model is not None:
+        if mimo_model.language_model is not None:
+            model_chunks.append(mimo_model.language_model)
+    # print(f"for debug: Rank {dist.get_rank()}, model_chunks used to create optimizer: {model_chunks}")
+    optimizer = get_megatron_optimizer(
+        config=optimizer_config,
+        model_chunks=model_chunks,
+        use_gloo_process_groups=False,  # Required when using custom process groups
+        pg_collection=pg_collection[0],
+    )
 
     for iteration in range(num_iterations):
         # Start profiling if enabled
