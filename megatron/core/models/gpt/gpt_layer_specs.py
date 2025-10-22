@@ -33,18 +33,18 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
+#try:
+import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
-    from megatron.core.extensions.transformer_engine_spec_provider import (
-        InferenceSpecProvider,
-        TESpecProvider,
-    )
+from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+from megatron.core.extensions.transformer_engine_spec_provider import (
+    InferenceSpecProvider,
+    TESpecProvider,
+)
 
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+HAVE_TE = True
+# except ImportError:
+#     HAVE_TE = False
 
 try:
     import nvidia_kitchen  # pylint: disable=unused-import

@@ -11,6 +11,8 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.parallel_state import get_global_symmetric_memory_buffer
+from megatron.core.inference.communication.torch_symm_triton import multimem_all_gather, multimem_reduce_scatter
 
 try:
     import transformer_engine.pytorch.cpp_extensions as tex
@@ -81,6 +83,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             assert (
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
+        self.symmetric_memory_comms = True
+
 
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,7 +93,18 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         x = _te_rms_norm(x=x, weight=self.layer_norm_weight, eps=self.eps)
 
         if self.tp_size > 1:
-            x, _ = gather_along_first_dim(x, process_group=self.tp_group)
+            if self.symmetric_memory_comms:
+                assert x.dtype == torch.bfloat16
+                dim_size = list(x.size())
+                dim_size[0] *= self.tp_size
+                symm_mem_buff, symm_mem_handle = get_global_symmetric_memory_buffer().get_tensor(dim_size, x.dtype)
+                if symm_mem_buff is not None:
+                    multimem_all_gather(symm_mem_buff, x, symm_mem_handle)
+                    x = symm_mem_buff
+                else:
+                    x, _ = gather_along_first_dim(x, process_group=self.tp_group)    
+            else:
+                x, _ = gather_along_first_dim(x, process_group=self.tp_group)
         x = torch.matmul(x, self.weight.t())
         return x
 
@@ -141,11 +156,33 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
+        self.symmetric_memory_comms = True
+
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.matmul(x, self.weight.t())
+        if self.tp_size > 1 and self.symmetric_memory_comms:
+            # write output of matmul directly onto symmetric memory buffer
+            assert x.dtype == torch.bfloat16
+            dim_size = list(x.size())
+            dim_size[-1] = self.weight.size(0)  
+            symm_mem_buff, symm_mem_handle = get_global_symmetric_memory_buffer().get_tensor(dim_size, x.dtype)
+            if symm_mem_buff is not None:
+                torch.matmul(x, self.weight.t(), out=symm_mem_buff)
+                x = symm_mem_buff
+            else:
+                x = torch.matmul(x, self.weight.t())
+        else:
+            x = torch.matmul(x, self.weight.t())
+        
         if self.tp_size > 1:
-            x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
+            if self.symmetric_memory_comms and symm_mem_buff is not None: 
+                dim_size = list(x.size()) 
+                dim_size[0] //= self.tp_size 
+                reduce_scatter_output = torch.empty(dim_size, dtype=x.dtype, device=x.device)
+                multimem_reduce_scatter(reduce_scatter_output, x, symm_mem_handle)
+                x = reduce_scatter_output
+            else:
+                x = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
