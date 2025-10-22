@@ -261,7 +261,7 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        with nvtx.range("MultiModulePipelineCommunicator.recv_forward_rank:{self.current_rank}"):
+        with nvtx.range(f"MultiModulePipelineCommunicator.recv_forward_rank:{self.current_rank}"):
             input_dict = {}
             for module_name, rank_module_info in self.rank_module_map.items():
 
@@ -296,7 +296,7 @@ class MultiModulePipelineCommunicator:
         Args:
             output_dict: A dictionary mapping module names to tensors.
         """
-        with nvtx.range("MultiModulePipelineCommunicator.send_forward_rank:{self.current_rank}"):
+        with nvtx.range(f"MultiModulePipelineCommunicator.send_forward_rank:{self.current_rank}"):
             for module_name, rank_module_info in self.rank_module_map.items():
                 if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
                     # If last stage, and has outgoing modules, send forward activation
@@ -333,7 +333,7 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        with nvtx.range("MultiModulePipelineCommunicator.send_forward_recv_backward_rank:{self.current_rank}"):
+        with nvtx.range(f"MultiModulePipelineCommunicator.send_forward_recv_backward_rank:{self.current_rank}"):
             grad_dict = {}
             for module_name, rank_module_info in self.rank_module_map.items():
                 if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
@@ -374,7 +374,7 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        with nvtx.range("MultiModulePipelineCommunicator.send_backward_recv_forward_rank:{self.current_rank}"):
+        with nvtx.range(f"MultiModulePipelineCommunicator.send_backward_recv_forward_rank:{self.current_rank}"):
             input_dict = {}
             for module_name, rank_module_info in self.rank_module_map.items():
                 if rank_module_info.pp_stage == 0:
@@ -411,7 +411,7 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        with nvtx.range("MultiModulePipelineCommunicator.recv_backward_rank:{self.current_rank}"):
+        with nvtx.range(f"MultiModulePipelineCommunicator.recv_backward_rank:{self.current_rank}"):
             grad_dict = {}
             for module_name, rank_module_info in self.rank_module_map.items():
                 if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
@@ -441,7 +441,7 @@ class MultiModulePipelineCommunicator:
         Args:
             grad_dict: A dictionary mapping module names to tensors.
         """
-        with nvtx.range("MultiModulePipelineCommunicator.send_backward_rank:{self.current_rank}"):
+        with nvtx.range(f"MultiModulePipelineCommunicator.send_backward_rank:{self.current_rank}"):
             for module_name, rank_module_info in self.rank_module_map.items():
                 if rank_module_info.pp_stage == 0:
                     # If first stage, and has incoming modules, send backward activation
