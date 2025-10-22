@@ -35,7 +35,109 @@ env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
+  is-not-external-contributor:
+    runs-on: ubuntu-latest
+    environment: nemo-ci
+    outputs:
+      is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ env.GITHUB_TOKEN }}
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Check membership
+        id: check-membership
+        run: |
+          PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
+
+          echo "Checking if $PR_AUTHOR is a repo collaborator..."
+          API_URL="https://api.github.com/repos/$REPO/collaborators/$PR_AUTHOR"
+          REPO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            $API_URL)
+
+          echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA-NeMo..."
+          API_URL="https://api.github.com/orgs/NVIDIA-NeMo/members/$PR_AUTHOR"
+          ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            $API_URL)
+
+          echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA..."
+          API_URL="https://api.github.com/orgs/NVIDIA/members/$PR_AUTHOR"
+          ORG_NVIDIA_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            $API_URL)
+
+          if [ "$REPO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_MEMBERSHIP_RESPONSE" -eq 204 ]; then
+            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
+          else
+            echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Find Comment
+        uses: peter-evans/find-comment@v4
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        id: fc
+        with:
+          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          repository: ${{ github.repository }}
+          body-includes: "<!--external-contributor-comment-->"
+
+      - name: Delete comment
+        uses: actions/github-script@v7
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.fc.outputs.comment-id != ''
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.deleteComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ steps.fc.outputs.comment-id }}
+            })
+
+      - name: Write pull request comment
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          repository: ${{ github.repository }}
+          body: |
+            <!--external-contributor-comment-->
+
+            Thank you for your contribution!
+
+            NVIDIA Megatron-LM is currently transitioning to development on Github. We will aim to review your PR after we complete our transition and stabilize our Github development process.
+
+            Thank you for your understanding.
+
+      - name: exit
+        run: |
+          if [ "${{ steps.check-membership.outputs.is_maintainer }}" == "true" ]; then
+            exit 0
+          else
+            exit 1
+          fi
+
   pre-flight:
+    needs: [is-not-external-contributor]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
 
   linting:
@@ -128,10 +230,38 @@ jobs:
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
+      - name: Install GH CLI
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y gh
+
       - name: Pull cache
         run: |
           docker pull ${{ env.container-registry }}/megatron-lm:main || true
           docker pull ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
+
+      - name: Get last merged PR
+        id: cache_from
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST_PRS=$(gh api graphql -f query='
+            query {
+              repository(owner: "NVIDIA", name: "Megatron-LM") {
+                pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number
+                  }
+                }
+              }
+            }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
+              echo "${{ env.container-registry }}/megatron-lm:$number"
+            done)
+
+          echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
+          echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
+          echo "EOF" | tee -a $GITHUB_OUTPUT
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -143,11 +273,12 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
             ${{ env.container-registry }}/megatron-lm:main
+            ${{ steps.cache_from.outputs.LAST_PRS }}
           no-cache: false
           tags: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
             ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
