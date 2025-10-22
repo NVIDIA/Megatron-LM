@@ -99,8 +99,7 @@ jobs:
         id: fc
         with:
           issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          owner: ${{ github.repository_owner }}
-          repo: ${{ github.repository }}
+          repository: ${{ github.repository }}
           body-includes: "<!--external-contributor-comment-->"
 
       - name: Delete comment
