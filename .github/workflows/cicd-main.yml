@@ -110,8 +110,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             await github.rest.issues.deleteComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              repository: context.repo.repo,
               comment_id: ${{ steps.fc.outputs.comment-id }}
             })
 
@@ -120,8 +119,7 @@ jobs:
         uses: peter-evans/create-or-update-comment@v5
         with:
           issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          owner: ${{ github.repository_owner }}
-          repo: ${{ github.repository }}
+          repository: ${{ github.repository }}
           body: |
             <!--external-contributor-comment-->
 
