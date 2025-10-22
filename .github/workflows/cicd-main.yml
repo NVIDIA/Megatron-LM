@@ -83,14 +83,19 @@ jobs:
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
 
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Write pull request comment
         uses: actions/github-script@v6
-        if: steps.check-membership.outputs.is_maintainer == 'false'
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
         with:
           github-token: ${{ env.GITHUB_TOKEN }}
           script: |
             await github.rest.issues.createComment({
-              issue_number: context.issue.number,
+              issue_number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }},
               body: 'Thank you for your contribution! \n\nPlease note that for now only NVIDIA employees and NVIDIA-NeMo collaborators are allowed to run the CI pipeline.'
             });
 
