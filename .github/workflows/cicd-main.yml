@@ -157,9 +157,9 @@ jobs:
               echo "${{ env.container-registry }}/megatron-lm:$number"
             done)
 
-          echo "LAST_PRS<<EOF" >> $GITHUB_OUTPUT
-          echo "$LAST_PRS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
+          echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
+          echo "EOF" | tee -a $GITHUB_OUTPUT
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -171,12 +171,12 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON('{}').number || 0 }}
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
             ${{ env.container-registry }}/megatron-lm:main
             ${{ steps.cache_from.outputs.LAST_PRS }}
           no-cache: false
           tags: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON('{}').number || 0 }}
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
             ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
