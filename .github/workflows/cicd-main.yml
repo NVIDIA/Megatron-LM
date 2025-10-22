@@ -133,6 +133,28 @@ jobs:
           docker pull ${{ env.container-registry }}/megatron-lm:main || true
           docker pull ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
 
+      - name: Get last merged PR
+        id: cache_from
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST_PRS=$(gh api graphql -f query='
+            query {
+              repository(owner: "NVIDIA", name: "Megatron-LM") {
+                pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number
+                  }
+                }
+              }
+            }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
+              echo "${{ env.container-registry }}/megatron-lm:$number"
+            done)
+
+          echo "LAST_PRS<<EOF" >> $GITHUB_OUTPUT
+          echo "$LAST_PRS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -143,11 +165,12 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
             ${{ env.container-registry }}/megatron-lm:main
+            ${{ steps.cache_from.outputs.LAST_PRS }}
           no-cache: false
           tags: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
             ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
