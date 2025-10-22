@@ -95,6 +95,8 @@ jobs:
           github-token: ${{ env.GITHUB_TOKEN }}
           script: |
             await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
               issue_number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }},
               body: 'Thank you for your contribution! \n\nPlease note that for now only NVIDIA employees and NVIDIA-NeMo collaborators are allowed to run the CI pipeline.'
             });
