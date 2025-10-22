@@ -177,7 +177,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         config=optimizer_config,
         model_chunks=model_chunks,
         use_gloo_process_groups=False,  # Required when using custom process groups
-        pg_collection=pg_collection[0],
+        pg_collection=pg_collection[0], # [TODO by shifangx] check if the pg_collection is correct
     )
 
     for iteration in range(num_iterations):
@@ -237,11 +237,18 @@ if __name__ == "__main__":
     special_token_ids = {"images": 32000}
 
     # Model parallelisms (CP and EP are hardcoded to 1 in model_specs.py)
-    vision_tp, vision_pp, vision_dp = 2, 2, 1
-    language_tp, language_pp, language_dp = 2, 2, 1
+    vision_tp, vision_pp, vision_dp = 1, 2, 1
+    language_tp, language_pp, language_dp = 1, 2, 2
     
     # Training parameters
-    batch_size = 2
+    rank = dist.get_rank()
+    global_batch_size = 2
+    if rank < vision_tp*vision_pp*vision_dp:
+        batch_size = global_batch_size//vision_dp
+        print(f"for debug: Rank {rank}, is in vision module, batch_size: {batch_size}")
+    else:
+        batch_size = global_batch_size//language_dp
+        print(f"for debug: Rank {rank}, is in language module, batch_size: {batch_size}")
     num_microbatches = 16
  
     losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
