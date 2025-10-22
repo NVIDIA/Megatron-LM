@@ -109,7 +109,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             await github.rest.issues.deleteComment({
-              repository: context.repo.repo,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
               comment_id: ${{ steps.fc.outputs.comment-id }}
             })
 
