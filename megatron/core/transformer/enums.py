@@ -65,3 +65,6 @@ class AttnBackend(enum.Enum):
     unfused = 3
     local = 4
     auto = 5
+    flashinfer_fa2 = 6
+    flashinfer_fa3 = 7
+    flashinfer_trt = 8

@@ -20,6 +20,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -131,6 +132,13 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_sequence_length = args.inference_max_seq_length
 
     # Inference context.
+    # Use smaller block size for flashinfer backends
+    block_size = (
+        16
+        if hasattr(args, 'attention_backend') and args.attention_backend in [AttnBackend.flashinfer_fa2, AttnBackend.flashinfer_fa3, AttnBackend.flashinfer_trt]
+        else args.inference_dynamic_batching_block_size
+    )
+
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
         num_layers=args.num_layers,
@@ -145,7 +153,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             if args.cuda_graph_impl == "local"
             else None
         ),
-        block_size_tokens=args.inference_dynamic_batching_block_size,
+        block_size_tokens=block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
@@ -161,6 +169,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_max_prefill_requests=args.inference_dynamic_batching_cuda_graph_max_prefill_requests,
+        attention_backend=getattr(args, 'attention_backend', AttnBackend.flash),
     )
 
     return context

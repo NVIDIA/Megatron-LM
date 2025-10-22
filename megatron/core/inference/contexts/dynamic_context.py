@@ -13,6 +13,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.inference.utils import CUDAGraphConfig
 from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.inference.utils import tensor_swap
@@ -177,6 +178,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
         If None, defaults to using flash-infer if available.
+        attention_backend (AttnBackend): Attention backend to use. Defaults to AttnBackend.flash.
     """
 
     def __init__(
@@ -205,9 +207,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         unified_memory_level: Optional[int] = 0,
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_max_prefill_requests: Optional[int] = 16,
+        attention_backend: AttnBackend = AttnBackend.flash,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
+        self.attention_backend = attention_backend
         self.cache_mla_latent = cache_mla_latent
         if self.cache_mla_latent:
             assert (
