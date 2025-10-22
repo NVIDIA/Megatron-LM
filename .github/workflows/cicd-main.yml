@@ -40,6 +40,9 @@ jobs:
     environment: nemo-ci
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
+    permissions:
+      issues: write
+      pull-requests: write
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
