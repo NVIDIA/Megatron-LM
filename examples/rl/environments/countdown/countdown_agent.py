@@ -1,12 +1,13 @@
 import random
 from typing import Any, Iterable
 
-from megatron.rl.agent.reward_only_agent import PassAtEvaluationAgent
+from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationAgent
+from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
 from .countdown import compute_score, test_dataset, train_dataset
 
 
-class CountdownAgent(PassAtEvaluationAgent):
+class CountdownAgent(RewardOnlyAgent):
     env_id: str = "countdown"
 
     def make_prefix(self, target, nums) -> str:

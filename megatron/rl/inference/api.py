@@ -17,6 +17,7 @@ class InferenceRequest(Request):
 
 class ChatInferenceRequest(InferenceRequest):
     prompt: list[list[LLMChatMessage]]
+    tools: list[dict] | None = None
 
 
 class GroupedInferenceRequest(InferenceRequest):
