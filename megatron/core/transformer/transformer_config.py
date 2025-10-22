@@ -1241,8 +1241,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.enable_cuda_graph:
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
-            if self.recompute_granularity:
-                raise ValueError("CUDA graphs not supported with activation recomputation.")
 
         if self.moe_token_dispatcher_type in ['allgather']:
             if self.variable_seq_lengths is True:

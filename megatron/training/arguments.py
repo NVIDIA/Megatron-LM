@@ -1373,8 +1373,11 @@ def _add_inference_args(parser):
                        help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
                        help='Use CUDA graph capture and replay.')
-    group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
+    group.add_argument("--cuda-graph-warmup-steps", type=int, default=1,
                        help="Number of CUDA graph warmup steps")
+    group.add_argument('--cuda-graph-enable-single-mempool', action='store_true',
+                       help='Cudagraph in a single mempool, each microbatch is mapped '
+                       'is a unique cudagraph is pipeline parallelism is used')
     group.add_argument('--external-cuda-graph', action='store_true',
                        help='Use CUDA graph capture and replay. The CUDA graphs are'
                        'manually captured in the training script.')

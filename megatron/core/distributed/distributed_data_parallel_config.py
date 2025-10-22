@@ -117,6 +117,11 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
    """
 
+    enable_cuda_graph: bool = False
+    """If true, if using 'reuse_grad_buf_for_mxfp8_param_ag', cudagraph the copy from
+      the grad to the param buffer
+    """
+
     def __post_init__(self):
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:

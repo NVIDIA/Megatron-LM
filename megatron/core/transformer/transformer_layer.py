@@ -416,7 +416,27 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     assert (
                         self.config.flash_decode
                     ), "--flash-decode is required to use CUDA graphs during inference"
-                self.cudagraph_manager = CudaGraphManager(config, base_module=self)
+                if not self.is_moe_layer:
+                    self.cudagraph_manager = CudaGraphManager(config, base_module=self)
+                else:
+                    params = \
+                        list(self.pre_mlp_layernorm.parameters()) \
+                        + list(self.mlp.shared_experts.parameters()) \
+                        + list(self.mlp.fc1_latent_proj.parameters()) \
+                        + list(self.mlp.router.parameters())
+                    CudaGraphManager(
+                        config, self,
+                        function_name="_forward_mlp_moe_preprocess", 
+                        params_to_calculate_wgrads=params, 
+                        need_backward=True,
+                    )
+                    CudaGraphManager(
+                        config, self,
+                        function_name="_forward_mlp_moe_postprocess", 
+                        params_to_calculate_wgrads=list(self.mlp.fc2_latent_proj.parameters()),
+                        need_backward=True,
+                    )
+
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
                 # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -431,6 +451,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 # all-gather overlap with forward compute.
                 self.cuda_graph_manual_hooks = []
                 self.current_microbatch = -1
+
+        self.moe_layer_recompute = (
+            config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
+        )
 
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
@@ -454,14 +478,24 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
 
-        # Return right here if we are partially capturing the MoE.
-        need_early_return = self.is_moe_layer \
-            and self.training \
-            and is_graph_capturing()
-        if need_early_return and self.config.enable_cuda_graph:
-            return output
+        if self.is_moe_layer:
+            if self.moe_layer_recompute:
+                if self.config.fp8:
+                    from megatron.core.extensions.transformer_engine import te_checkpoint
+                    output = te_checkpoint(
+                        self._forward_mlp_moe,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        parallel_state.get_tensor_model_parallel_group(),
+                        hidden_states,
+                    )
+                else:
+                    output = tensor_parallel.checkpoint(self._forward_mlp_moe, False, hidden_states)
+            else:
+                output = self._forward_mlp_moe(hidden_states, kwargs.get("inference_context", None))
+        else:
+            output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
 
         return output, context
 
@@ -575,6 +609,98 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
 
         return hidden_states, context
+
+
+    def _forward_mlp_moe_preprocess(self, hidden_states):
+        # Optional Layer norm post the cross-attention.
+        if self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+        if self.mlp.shared_expert_compute_before_router:
+            shared_expert_output = self.mlp._shared_experts_compute(pre_mlp_layernorm_output)
+        else:
+            shared_expert_output = None
+
+        probs, routing_map = self.mlp.router(pre_mlp_layernorm_output)
+
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        # Shared expert computation is still performed in hidden dimension with the 'residual' tensor.
+        mlp_residual = pre_mlp_layernorm_output
+
+        if self.mlp.config.moe_latent_size:
+            assert not self.mlp.shared_expert_overlap, "Shared expert overlap not supported when MoE latent projections are used."
+            hidden_states, _ = self.mlp.fc1_latent_proj(pre_mlp_layernorm_output)
+        else:
+            hidden_states = pre_mlp_layernorm_output
+
+        return hidden_states, probs, routing_map, shared_expert_output, mlp_residual
+
+
+    def _forward_mlp_moe_postprocess(self, hidden_states, shared_expert_output, mlp_bias, residual):
+        # Project the output back from latent dimension to hidden dimension.
+        if self.mlp.config.moe_latent_size:
+            hidden_states, _ = self.mlp.fc2_latent_proj(hidden_states)
+
+        if shared_expert_output is not None:
+            hidden_states = hidden_states + shared_expert_output
+
+        mlp_output_with_bias = (hidden_states, mlp_bias)
+        return self._forward_post_mlp(mlp_output_with_bias, residual)
+
+
+    def _forward_mlp_moe(self, hidden_states, inference_context=None):
+        """Forward pass for the MoE layer.
+
+        The forward pass comprises four main steps:
+        1. Routing & Preprocessing: Route tokens to the assigned experts and prepare for dispatch.
+        2. Dispatch: Tokens are sent to the expert devices using communication collectives.
+        3. Expert Computation: Experts process the dispatched tokens.
+        4. Combine: The outputs from the experts are combined and returned.
+
+        Args:
+            hidden_states (torch.Tensor): The input tensor to the MoE layer.
+
+        Returns:
+            A tuple containing the output tensor and the MLP bias, if any.
+        """
+        if self.training and self.mlp.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                "are enabled without also enabling sequence parallelism."
+            )
+
+        # MoE forward: router -> dispatch -> compute -> combine
+
+        # Residual connection
+        residual = hidden_states
+    
+        hidden_states, probs, routing_map, shared_expert_output, mlp_residual = self._forward_mlp_moe_preprocess(
+            hidden_states=hidden_states)
+
+        nvtx_range_push(suffix="mlp")
+        hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+        hidden_states, mlp_bias, shared_expert_output =  self.mlp.dispatch_compute_combine(
+            hidden_states,
+            probs,
+            mlp_residual,
+            shared_expert_output,
+        )
+        nvtx_range_pop(suffix="mlp")
+
+        out = self._forward_mlp_moe_postprocess(
+            hidden_states=hidden_states,
+            shared_expert_output=shared_expert_output,
+            mlp_bias=mlp_bias,
+            residual=residual,
+        )
+
+        return out
+
 
     def _forward_mlp(self, hidden_states, inference_context=None):
         """
@@ -806,68 +932,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if context is not None:
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
-
-
-    def cuda_graph_fwd_capture_post_hook(self):
-        if 'moe_preprocess' in self.config.cuda_graph_scope and self.is_moe_layer:
-            outputs = []
-            for attr_name in self.mlp.token_dispatcher.valid_cudagraph_attrs:
-                attr = getattr(self.mlp.token_dispatcher, attr_name)
-                if isinstance(attr, torch.Tensor):
-                    outputs.append(attr)
-
-            return outputs
-        return None
-
-
-    def cuda_graph_fwd_replay_post_hook(self, cuda_graph_outputs, extra_cuda_graph_attrs):
-        # No early return, so do nothing
-        if not self.is_moe_layer:
-            return cuda_graph_outputs
-
-        # Entire MoE layer was cudagraphed so no early return, so do nothing
-        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
-            self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
-        ):
-            assert cuda_graph_outputs
-        elif self.is_moe_layer and 'moe_router' in self.config.cuda_graph_scope:
-            # CUDA Graph partially captures the MoE.
-            # The rest of the layer runs in eager mode.
-            if 'moe_preprocess' in self.config.cuda_graph_scope:
-                if self.mlp.shared_expert_compute_before_router:
-                    hidden_states, probs, residual, shared_expert_output, mlp_residual = cuda_graph_outputs
-                else:
-                    hidden_states, probs, residual, mlp_residual = cuda_graph_outputs
-                    shared_expert_output = None
-
-                attr_outputs = extra_cuda_graph_attrs
-                valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
-
-                assert len(attr_outputs) == len(
-                    valid_cudagraph_attrs
-                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
-                for i, attr_name in enumerate(valid_cudagraph_attrs):
-                    hier_attr_name = attr_name.split('.')
-                    attr = self.mlp.token_dispatcher
-                    for name in hier_attr_name[:-1]:
-                        attr = getattr(attr, name)
-                    setattr(attr, hier_attr_name[-1], attr_outputs[i])
-            else:
-                if self.mlp.shared_expert_compute_before_router:
-                    hidden_states, probs, routing_map, shared_expert_output, mlp_residual = cuda_graph_outputs
-                else:
-                    hidden_states, probs, routing_map, mlp_residual = cuda_graph_outputs
-                    shared_expert_output = None
-
-                hidden_states, probs, residual = self.mlp.preprocess(hidden_states, probs, routing_map)
-
-            mlp_output_with_bias = self.mlp.dispatch_compute_combine(
-                hidden_states, probs, residual, shared_expert_output
-            )
-            out = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
-
-            context = None
-            return out, context
 
     def _cuda_graph_replay(self, *args, **kwargs):
         """

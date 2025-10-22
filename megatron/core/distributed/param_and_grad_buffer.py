@@ -252,6 +252,12 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+        if ddp_config.enable_cuda_graph:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+            ddp_config.cuda_graph_use_single_mempool = True
+            CudaGraphManager(ddp_config, self, "copy_params_from_grad_buffer", need_backward=False)
+
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -349,6 +355,16 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = None
         self.param_gather_dispatched = True
 
+    def copy_params_from_grad_buffer(self):
+        for bucket in self.buckets:
+            for param in bucket.params:
+                param_start, param_end = bucket.param_to_index[param]
+                param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                param.data.copy_(param_slice.view(param.data.shape))
+            # All-gathered params are not needed after being copied to param.data.
+            # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
+            bucket.param_data.zero_()
+
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
         Finishes param sync communication operation for this bucket. Dispatches
@@ -394,14 +410,7 @@ class _ParamAndGradBucketGroup:
                 self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
                 and self.ddp_config.overlap_param_gather
             ):
-                for bucket in self.buckets:
-                    for param in bucket.params:
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
-                    bucket.param_data.zero_()
+                self.copy_params_from_grad_buffer()
 
     def start_grad_sync(self):
         """

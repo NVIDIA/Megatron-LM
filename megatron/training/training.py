@@ -2128,6 +2128,12 @@ def train(
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
+
+    if config.enable_cuda_graph and should_disable_forward_pre_hook(args):
+        enable_forward_pre_hook(model)
+        config.param_sync_func = param_sync_func
+        pre_hook_enabled = True
+        
     # Run training iterations till done.
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
@@ -2217,7 +2223,7 @@ def train(
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
                 # `forward_backward_func`.
-                if should_disable_forward_pre_hook(args):
+                if not config.enable_cuda_graph and should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
