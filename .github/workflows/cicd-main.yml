@@ -87,15 +87,14 @@ jobs:
             $API_URL)
 
           if [ "$REPO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_MEMBERSHIP_RESPONSE" -eq 204 ]; then
-            #echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
-            echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
+            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
           else
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
 
       - name: Find Comment
         uses: peter-evans/find-comment@v4
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
         id: fc
         with:
           issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
@@ -104,7 +103,7 @@ jobs:
 
       - name: Delete comment
         uses: actions/github-script@v7
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false' && steps.fc.outputs.comment-id != ''
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.fc.outputs.comment-id != ''
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
