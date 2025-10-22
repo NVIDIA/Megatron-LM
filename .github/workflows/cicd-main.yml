@@ -35,7 +35,7 @@ env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
-  is-external-contributor:
+  is-not-external-contributor:
     runs-on: ubuntu-latest
     environment: nemo-ci
     outputs:
@@ -103,7 +103,7 @@ jobs:
           fi
 
   pre-flight:
-    needs: [is-external-contributor]
+    needs: [is-not-external-contributor]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
 
   linting:
