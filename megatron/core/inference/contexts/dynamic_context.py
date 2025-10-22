@@ -143,7 +143,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         params_dtype (torch.dtype): Dtype used for KV cache.
         num_layers (int): Number of layers.
         kv_channels (int): Hidden dimension per attention head.
-        num_attention_heads (int): Number of attention heads.
+        num_attention_kv_heads (int): Number of key/value attention heads.
+        num_attention_qo_heads (int): Number of query/output attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
         buffer_size_gb (float): Total buffer size (GB), shared by main and
@@ -184,7 +185,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         params_dtype: torch.dtype,
         num_layers: int,
         kv_channels: int,
-        num_attention_heads: int,
+        num_attention_kv_heads: int,
+        num_attention_qo_heads: int,
         max_sequence_length: int,
         buffer_size_gb: float,
         buffer_guaranteed_fraction: float,
@@ -213,13 +215,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
         # Per partition num heads and hidden size.
-        projection_size = kv_channels * num_attention_heads
+        projection_size = kv_channels * num_attention_qo_heads
         if tensor_model_parallel_size is None:
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        hidden_size_per_attention_head = core_divide(projection_size, num_attention_qo_heads)
+        num_attention_kv_heads_per_partition = core_divide(num_attention_kv_heads, tp_size)
         # Block size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.block_size_tokens = block_size_tokens
@@ -236,7 +238,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.block_size_tokens
-                * num_attention_heads_per_partition
+                * num_attention_kv_heads_per_partition
                 * hidden_size_per_attention_head
             )
 
@@ -350,7 +352,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         self.num_layers,
                         block_count_total,
                         self.block_size_tokens,
-                        num_attention_heads_per_partition,
+                        num_attention_kv_heads_per_partition,
                         hidden_size_per_attention_head,
                     ),
                     -1,
