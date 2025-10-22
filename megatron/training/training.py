@@ -104,6 +104,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.benchmark_utils import disable_megatron_fsdp_communication
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -919,6 +920,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     ):
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
+
+    if args.use_megatron_fsdp and args.no_mfsdp_comm:
+        model.fake_fsdp_hooks = disable_megatron_fsdp_communication(model)
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
