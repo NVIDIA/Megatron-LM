@@ -283,15 +283,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Unified memory.
         self.unified_memory_level = unified_memory_level
         if unified_memory_level > 0:
-            # >>>
-            # if not has_unified_memory and torch.distributed.get_rank() == 0:
-            #     warnings.warn(
-            #         "Unified memory requested but not available; defaulting to GPU memory."
-            #     )
-            #     self.unified_memory_level = 0
-            # else:
-            #     self.unified_memory_mempool = create_unified_mempool()
-            # +++
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -300,7 +291,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
-            # <<<
 
         # Request and token counts.
         self.total_request_count = 0

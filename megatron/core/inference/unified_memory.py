@@ -19,25 +19,15 @@ except ImportError:
     _has_mem_pool = False
 
 
-# Avoid linting errors.
-_alloc = None
-# >>>
-# _has_unified_memory = False
-# _compilation_attempted = False
-# +++
 class CompilationState(Enum):
     UNATTEMPTED = auto()
     FAILURE = auto()
     SUCCESS = auto()
 
 
+# Avoid linting errors.
+_alloc = None
 _compilation_state = CompilationState.UNATTEMPTED
-# <<<
-# >>>
-# print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-# print("PYTHONPATH: %s." % os.environ["PYTHONPATH"])
-# exit()
-# <<<
 
 
 class UnifiedMemoryUnsupportedError(Exception):
@@ -47,18 +37,10 @@ class UnifiedMemoryUnsupportedError(Exception):
 def compile_allocator():
     """Attempt to compile UVM allocator."""
 
-    # >>>
-    # global _compilation_attempted, _has_unified_memory
-
-    # if _compilation_attempted:
-    #     return
-    # _compilation_attempted = True
-    # +++
     global _compilation_state
 
     if _compilation_state != CompilationState.UNATTEMPTED:
         return
-    # <<<
         
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
@@ -116,16 +98,10 @@ def compile_allocator():
             )
             _so_path = Path(_mod.__file__).as_posix()
             _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
-            # >>>
-            # _has_unified_memory = True
-            # import abcxyzijk
             _compilation_state = CompilationState.SUCCESS
-            # <<<
         except (RuntimeError, ImportError, OSError):
             warnings.warn("Failed to create unified memory mempool.")
-            # >>>
             _compilation_state = CompilationState.FAILURE
-            # <<<
 
 
 def create_unified_mempool() -> MemPool:
