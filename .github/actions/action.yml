@@ -144,7 +144,7 @@ runs:
           --platform dgx_h100 \
           --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
-          --enable-lightweight-mode $ENABLE_LIGHTWEIGHT_MODE
+          $ENABLE_LIGHTWEIGHT_MODE
 
         RUN_TEST_EOF
         )
