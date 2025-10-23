@@ -23,6 +23,9 @@ jobs:
   approve-queue:
     runs-on: ubuntu-latest
     environment: main
+    strategy:
+      matrix:
+        branch: [main, dev]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -78,8 +81,8 @@ jobs:
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
-          queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
-          in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
+          queued_workflow_runs = make_request("actions/runs?status=queued&branch=${{ matrix.branch }}").get("workflow_runs", [])
+          in_progress_workflow_runs = make_request("actions/runs?status=in_progress&branch=${{ matrix.branch }}").get("workflow_runs", [])
 
           # Count running and queued workflows
           queued_workflows = sum(1 for run in queued_workflow_runs if run["name"] == "CICD Megatron-LM")
@@ -97,7 +100,7 @@ jobs:
 
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
-          pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
+          pending_workflows = make_request("actions/runs?status=waiting&branch=${{ matrix.branch }}").get("workflow_runs", [])
           pending_workflows = [run for run in pending_workflows if run["name"] == "CICD Megatron-LM"]
 
           # Sort deployments by creation date (oldest first)
