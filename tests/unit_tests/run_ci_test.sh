@@ -88,9 +88,9 @@ fi
 ENVIRONMENT=$(echo "$ENVIRONMENT" | tr '[:upper:]' '[:lower:]')
 
 if [[ "$TAG" == "latest" ]]; then
-    TEST_PATH="/opt/megatron-lm"
+    TEST_PATH="/opt/Megatron-LM"
 else
-    TEST_PATH="/opt/megatron-lm-legacy/"
+    TEST_PATH="/opt/Megatron-LM-legacy/"
 fi
 
 cd $TEST_PATH
@@ -114,6 +114,7 @@ for element in "${MARKER[@]:1}"; do
 done
 
 export BUCKET
+ALL_TEST_CASES=$(cat tests/test_utils/recipes/unit-tests.yaml | yq eval '.products[].test_case[]' -)
 OTHER_TEST_CASES=$(echo "$ALL_TEST_CASES" | grep -vF "$BUCKET")
 
 echo "Other test cases:"
