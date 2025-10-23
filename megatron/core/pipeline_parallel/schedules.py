@@ -646,8 +646,8 @@ def forward_backward_no_pipelining(
         config.timers('forward-backward').stop()
 
     if (
-        hasattr(config, 'enable_cuda_graph')
-        and config.enable_cuda_graph
+        hasattr(config, 'cuda_graph_impl')
+        and config.cuda_graph_impl == "local"
         and config.cuda_graph_scope != "full_iteration"
     ):
         create_cudagraphs()
@@ -1910,8 +1910,8 @@ def forward_backward_pipelining_with_interleaving(
         config.timers('forward-backward').stop()
 
     if (
-        hasattr(config, 'enable_cuda_graph')
-        and config.enable_cuda_graph
+        hasattr(config, 'cuda_graph_impl')
+        and config.cuda_graph_impl == "local"
         and config.cuda_graph_scope != "full_iteration"
     ):
         create_cudagraphs()
@@ -2294,8 +2294,8 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward').stop()
 
     if (
-        hasattr(config, 'enable_cuda_graph')
-        and config.enable_cuda_graph
+        hasattr(config, 'cuda_graph_impl')
+        and config.cuda_graph_impl == "local"
         and config.cuda_graph_scope != "full_iteration"
     ):
         create_cudagraphs()

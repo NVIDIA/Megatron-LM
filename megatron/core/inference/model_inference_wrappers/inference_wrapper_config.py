@@ -44,6 +44,12 @@ class InferenceWrapperConfig:
     choices (1) 'e4m3' uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
 
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    """Some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router
+    will switch to dropping and padding during decode time which does not have a D2H sync. The 
+    capacity factor is set to the max that an expert could see during inference so no tokens are
+    actually dropped. """
+
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to inference params
 

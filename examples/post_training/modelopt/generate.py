@@ -29,7 +29,7 @@ def add_generate_args(parser):
     group.add_argument("--draft-length", type=int, default=0, help="Only used in EAGLE.")
     group.add_argument("--draft-topk", type=int, default=1, help="Only used in EAGLE.")
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
 
     add_modelopt_args(parser)
     return parser
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     unwrapped_model.eval()
 
     for idx, example in enumerate(dataset):
-        if idx > args.percentage * len(dataset):
+        if idx > args.fraction * len(dataset):
             break
         ref_conversations = get_conversations(example)
         new_conversations = []
@@ -150,9 +150,10 @@ if __name__ == "__main__":
                 input_ids = tokenizer.apply_chat_template(
                     new_conversations, return_tensors="pt", add_generation_prompt=True
                 )
-                output_ids = simple_generate(
-                    unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
-                )
+                with torch.no_grad():
+                    output_ids = simple_generate(
+                        unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
+                    )
                 output_texts = tokenizer.batch_decode(output_ids)[0]
                 print_rank_0("{}".format(output_texts))
                 new_conversations.append({"role": "assistant", "content": output_texts})

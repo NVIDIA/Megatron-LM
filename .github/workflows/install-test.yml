@@ -20,13 +20,14 @@ name: Installation Test
 on:
   push:
     branches:
+      - dev
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.53.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
 
   pip-test-pytorch:
     needs: [pre-flight]

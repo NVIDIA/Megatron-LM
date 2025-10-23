@@ -133,7 +133,7 @@ if __name__ == "__main__":
             controller,
             context,
             termination_id=tokenizer.eod,
-            enable_cuda_graph=args.enable_cuda_graph,
+            enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill
         )

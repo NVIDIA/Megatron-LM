@@ -123,6 +123,8 @@ See [Adanvanced Topics](ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 
 
 ### ⭐ Pruning
 
+Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/TensorRT-Model-Optimizer/tree/main/examples/pruning).
+
 Pruning is supported for GPT and Mamba models. Available pruning options are:
 - `TARGET_FFN_HIDDEN_SIZE`
 - `TARGET_HIDDEN_SIZE`
@@ -133,13 +135,19 @@ Pruning is supported for GPT and Mamba models. Available pruning options are:
 - `TARGET_NUM_LAYERS`
 - `LAYERS_TO_DROP` (comma separated, 1-indexed list of layer numbers to directly drop)
 
+Example for depth pruning Qwen3-8B from 36 to 24 layers:
+
 ```sh
 PP=1 \
 TARGET_NUM_LAYERS=24 \
 HF_MODEL_CKPT=<pretrained_model_name_or_path> \
-MLM_MODEL_SAVE=/tmp/Qwen3-8B-DPruned \
+MLM_MODEL_SAVE=Qwen3-8B-Pruned \
 ./prune.sh qwen/Qwen3-8B
 ```
+
+> [!TIP]
+> If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven
+> PP by setting `MLM_EXTRA_ARGS="--decoder-first-pipeline-num-layers <X> --decoder-last-pipeline-num-layers <Y>"`
 
 ## Advanced Usage
 TBD

@@ -79,7 +79,7 @@ if _has_mem_pool:
         _so_path = Path(_mod.__file__).as_posix()
         _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
         has_unified_memory = True
-    except (RuntimeError, ImportError):
+    except (RuntimeError, ImportError, OSError):
         warnings.warn("Failed to create unified memory mempool.")
 
 

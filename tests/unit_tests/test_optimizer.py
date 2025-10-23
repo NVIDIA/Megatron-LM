@@ -420,10 +420,16 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     mp_mesh = device_mesh["pp", "tp"]
     mp_group = mp_mesh._flatten().get_group()
 
+    # Create intra_dist_opt group
+    # It has the same ranks as dp_cp group when num_distributed_optimizer_instances is not > 1
+    intra_dist_opt_mesh = device_mesh["dp", "cp"]
+    intra_dist_opt_group = intra_dist_opt_mesh._flatten().get_group()
+
     # Create process group configurations
     pg_collection = ProcessGroupCollection()
     pg_collection.dp = dp_group
     pg_collection.dp_cp = dp_cp_group
+    pg_collection.intra_dist_opt = intra_dist_opt_group
     pg_collection.expt_dp = None  # Not using expert parallelism in this test
 
     pg_collection.tp = tp_group
@@ -547,12 +553,19 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             pg_collection=pg_collection_no_expt_dp,
         )
 
-    # Test 4: Missing mp attribute in pg_collection
+    # Test 4: Missing intra_dist_opt and mp attribute in pg_collection
     pg_collection_complete = ProcessGroupCollection()
     pg_collection_complete.dp = torch.distributed.new_group()
     pg_collection_complete.expt_dp = None  # Explicitly set to None as allowed
-    # Missing required 'mp' attribute
 
+    # Missing required 'intra_dist_opt' attribute
+    with pytest.raises(ValueError, match="intra_dist_opt process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+        )
+
+    pg_collection_complete.intra_dist_opt = None  # Explicitly set to None as allowed
+    # Missing required 'mp' attribute
     with pytest.raises(ValueError, match="mp process group is required"):
         get_megatron_optimizer(
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete

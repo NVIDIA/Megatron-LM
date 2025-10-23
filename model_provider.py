@@ -11,7 +11,6 @@ from megatron.core.models.mamba import MambaModel
 from megatron.training import get_args, print_rank_0
 
 try:
-    from megatron.post_training.arguments import modelopt_args_enabled
     from megatron.post_training.model_provider import model_provider as model_provider_modelopt
 
     has_nvidia_modelopt = True
@@ -41,7 +40,7 @@ def model_provider(
     """
     args = get_args()
 
-    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         return model_provider_modelopt(pre_process, post_process)
 
     if args.record_memory_history:

@@ -163,7 +163,7 @@ class MambaLayer(GraphableMegatronModule):
         """
         assert kwargs.get('inference_context') is None, (
             "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
-            "For inference cuda graph, please use enable_cuda_graph instead."
+            "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
         return super()._te_cuda_graph_replay(*args, **kwargs)
 

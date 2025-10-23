@@ -90,7 +90,7 @@ ARGS=" \
 # Enable cuda graphs.
 if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
     ARGS+="  \
-      --enable-cuda-graph \
+      --cuda-graph-impl local \
       --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
     "
 fi

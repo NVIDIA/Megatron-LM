@@ -22,17 +22,6 @@ def get_gitlab_handle():
     return gitlab.Gitlab(f"https://{GITLAB_ENDPOINT}", private_token=os.getenv("RO_API_TOKEN"))
 
 
-def extract_surrounding_text(text, keyword="error", context=400, fallback_length=800):
-    index = text.rfind(keyword)  # Find the last occurrence
-    if index == -1:
-        return text[-fallback_length:]  # Return last 800 chars if keyword is not found
-
-    start = max(0, index - context)  # Ensure we don't go below 0
-    end = min(len(text), index + len(keyword))  # Ensure we don't exceed the text length
-
-    return text[start:end]
-
-
 def get_jobs_per_bridge(pipeline_id: int, type_of_job: str):
     bridge = {}
     for pipeline_bridge in (
