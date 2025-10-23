@@ -111,7 +111,7 @@ runs:
         GH_TOKEN: ${{ github.token }}
       run: |
         PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-        HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")')
+        HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
         echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
     - name: Create run-script (e2e test)
