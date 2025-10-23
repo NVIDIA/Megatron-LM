@@ -242,14 +242,15 @@ if __name__ == "__main__":
     
     # Training parameters
     rank = dist.get_rank()
-    global_batch_size = 2
+    global_batch_size = 32
+    num_microbatches = 16
     if rank < vision_tp*vision_pp*vision_dp:
-        batch_size = global_batch_size//vision_dp
+        batch_size = global_batch_size//num_microbatches//vision_dp
         print(f"for debug: Rank {rank}, is in vision module, batch_size: {batch_size}")
     else:
-        batch_size = global_batch_size//language_dp
+        batch_size = global_batch_size//num_microbatches//language_dp
         print(f"for debug: Rank {rank}, is in language module, batch_size: {batch_size}")
-    num_microbatches = 16
+    
  
     losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         vision_num_layers=vision_num_layers,
