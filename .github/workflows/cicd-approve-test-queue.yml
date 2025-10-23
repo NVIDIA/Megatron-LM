@@ -54,7 +54,7 @@ jobs:
           # GitHub API configuration
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
-          MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"])
+          MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
           API_BASE = f"https://api.github.com/repos/{REPO}"
 
           # Headers for GitHub API
