@@ -125,13 +125,6 @@ runs:
         #!/bin/bash
         set -euxo pipefail
 
-        HAS_RUN_TESTS_LABEL=${{ steps.has-run-tests-label.outputs.HAS_RUN_TESTS_LABEL }}
-        if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
-          ENABLE_LIGHTWEIGHT_MODE="--enable-lightweight-mode"
-        else
-          ENABLE_LIGHTWEIGHT_MODE=""
-        fi
-
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         pip install --no-cache-dir uv
@@ -144,7 +137,7 @@ runs:
           --platform dgx_h100 \
           --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
-          $ENABLE_LIGHTWEIGHT_MODE
+          --enable-lightweight-mode
 
         RUN_TEST_EOF
         )
