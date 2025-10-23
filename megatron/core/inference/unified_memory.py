@@ -26,9 +26,10 @@ class CompilationState(Enum):
     SUCCESS = auto()
 
 
-# Avoid linting errors.
-_alloc = None
+# Compilation vars.
 _compilation_state = CompilationState.UNATTEMPTED
+_alloc = None # must remain global until process exit.
+_mod = None # must remain global until process exit.
 
 
 class UnifiedMemoryUnsupportedError(Exception):
@@ -38,7 +39,7 @@ class UnifiedMemoryUnsupportedError(Exception):
 def compile_allocator():
     """Attempt to compile UVM allocator."""
 
-    global _compilation_state
+    global _compilation_state, _alloc, _mod
 
     if _compilation_state != CompilationState.UNATTEMPTED:
         return
