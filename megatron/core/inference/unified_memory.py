@@ -37,7 +37,7 @@ def compile_allocator():
     if _compilation_attempted:
         return
     _compilation_attempted = True
-        
+
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
     #include <cstddef>
