@@ -46,6 +46,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
+      SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -61,6 +62,11 @@ jobs:
         id: check-membership
         run: |
           PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
+
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ]; then
+            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
+            exit 0
+          fi
 
           echo "Checking if $PR_AUTHOR is a repo collaborator..."
           API_URL="https://api.github.com/repos/$REPO/collaborators/$PR_AUTHOR"
@@ -339,12 +345,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Has Run tests label
+        id: has-run-tests-label
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")')
+          echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
       - name: Parse functional tests
         id: main
+        env:
+          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.HAS_RUN_TESTS_LABEL }}
         run: |
           export PYTHONPATH=$(pwd)
+
+          if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
+            ARGS=(
+              --scope mr
+              --enable-lightweight-mode
+            )
+          else
+            ARGS=(
+              --scope mr-s
+            )
+          fi
+
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-            --scope mr \
             --n-repeat 5 \
             --time-limit 2700 \
             --test-cases all \
@@ -356,8 +387,8 @@ jobs:
             --no-enable-warmup \
             --environment dev \
             --platform dgx_h100 \
-            --enable-lightweight-mode \
             --cluster ghci \
+            --${ARGS[@]}
             --output-path functional-tests.yaml
 
           cat functional-tests.yaml | \
