@@ -4,6 +4,7 @@ import os
 import warnings
 from enum import Enum, auto
 from pathlib import Path
+
 from torch.cuda.memory import CUDAPluggableAllocator
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
@@ -21,6 +22,8 @@ except ImportError:
 
 # Avoid linting errors.
 _alloc = None
+
+
 # >>>
 # _has_unified_memory = False
 # _compilation_attempted = False
@@ -54,7 +57,7 @@ def compile_allocator():
     if _compilation_state != CompilationState.UNATTEMPTED:
         return
     # <<<
-        
+
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
     #include <cstddef>
@@ -136,6 +139,7 @@ def create_unified_mempool() -> MemPool:
     # global _has_unified_memory
     # >>>
     from lutil import pax
+
     # pax("_has_unified_memory")
     pax("_compilation_state")
     # <<<
