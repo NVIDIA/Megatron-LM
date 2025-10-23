@@ -9,6 +9,9 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
+
+import transformer_engine as te
+
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -20,7 +23,7 @@ from .mappings import (
 _compiled_rms_norm = torch.compile(F.rms_norm)
 
 
-class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
+class InferenceLayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
     Inference optimized version of TELayerNormColumnParallelLinear.
     """
@@ -41,17 +44,11 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(
-            input_size=input_size,
-            output_size=output_size,
-            config=config,
+            in_features=input_size,
+            out_features=output_size,
             init_method=init_method,
-            gather_output=gather_output,
-            bias=bias,
-            skip_bias_add=skip_bias_add,
-            is_expert=is_expert,
-            skip_weight_param_allocation=skip_weight_param_allocation,
-            tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group,
+            eps=config.layernorm_epsilon,
+            normalization="RMSNorm"
         )
 
         if self.tp_size > 1:
@@ -77,12 +74,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         if self.training:
             # Training mode -> fallback to TE
-            return super().forward(x)
+            return super().forward(x), None
         else:
-            return self._inference_forward(x)
+            return super().forward(x), None
 
 
-class InferenceRowParallelLinear(TERowParallelLinear):
+class InferenceRowParallelLinear(te.pytorch.Linear):
     """
     Inference optimized version of TERowParallelLinear.
     """
@@ -102,16 +99,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(
-            input_size=input_size,
-            output_size=output_size,
-            config=config,
+            in_features=input_size,
+            out_features=output_size,
             init_method=init_method,
-            bias=bias,
-            input_is_parallel=input_is_parallel,
-            skip_bias_add=skip_bias_add,
-            is_expert=is_expert,
-            tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group,
+            bias=bias
         )
 
         if self.tp_size > 1:
@@ -120,10 +111,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.linear(input=x, weight=self.weight)
+        x = super().forward(x)
         if self.tp_size > 1:
             x = reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group)
-        return x, None
+        return x
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -132,7 +123,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.training:
             # Training mode -> fallback to TE
-            return super().forward(x)
+            return super().forward(x), None
         else:
             # Inference mode -> custom fw pass can be implemented here
-            return self._inference_forward(x)
+            return super().forward(x), None 
