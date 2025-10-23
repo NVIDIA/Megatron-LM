@@ -54,6 +54,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
     "--enable-lightweight-mode",
     required=False,
     default=False,
+    is_flag=True,
     type=bool,
     help="Enable lightweight mode",
 )
