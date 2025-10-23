@@ -325,7 +325,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
-    enable_deepep = layer.config.moe_enable_deepep
+    enable_deepep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "deepep"
+    )
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
