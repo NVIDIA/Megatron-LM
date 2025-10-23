@@ -22,8 +22,8 @@ MODEL_ARGS:
   --lr-decay-iters: 990000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/my-bert_00_text_sentence
-  --vocab-file: ${DATA_PATH}/vocab.txt
+  --data-path: ${DATA_PATH}/text/the_pile/bert_shard00/my-bert_00_text_sentence
+  --vocab-file: ${DATA_PATH}/text/the_pile/bert_shard00/vocab.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.0001
@@ -35,13 +35,14 @@ MODEL_ARGS:
   --eval-iters: 10
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
+  --spec: local
   --deterministic-mode: true
   --use-checkpoint-args: true
   --use-checkpoint-opt_param-scheduler: true
   --no-gradient-accumulation-fusion: true
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --ckpt-format: torch
-  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
-  --attention-backend: unfused
-TEST_TYPE: frozen-resume
+  --attention-backend: local
+TEST_TYPE: ckpt-resume

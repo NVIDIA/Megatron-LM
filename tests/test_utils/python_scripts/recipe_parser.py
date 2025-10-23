@@ -1,11 +1,15 @@
 import copy
 import itertools
+import logging
 import pathlib
 from typing import List, Optional
 
+import click
 import yaml
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+
+logger = logging.getLogger(__name__)
 
 
 class dotdict(dict):
@@ -25,6 +29,8 @@ def resolve_cluster_config(cluster: str) -> str:
         return "draco-oci-ord"
     if cluster == "dgxh100_coreweave":
         return "coreweave"
+    if cluster == "ghci":
+        return "ghci"
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
@@ -95,15 +101,15 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if workload_manifest.spec["test_case"] == test_case
+        if workload_manifest["spec"]["test_case"] == test_case
     )
 
     if len(workload_manifests) > 1:
-        print("Duplicate test_case found!")
+        logger.info("Duplicate test_case found!")
         return None
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return None
 
     return workload_manifests[0]
@@ -118,7 +124,7 @@ def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdi
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -136,7 +142,7 @@ def filter_by_environment(workload_manifests: List[dotdict], environment: str) -
     )
 
     if len(workload_manifests_copy) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests_copy
@@ -153,7 +159,7 @@ def filter_by_platform(workload_manifests: List[dotdict], platform: str) -> List
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -168,7 +174,7 @@ def filter_by_model(workload_manifests: List[dotdict], model: str) -> List[dotdi
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -184,7 +190,7 @@ def filter_by_tag(workload_manifests: List[dotdict], tag: str) -> List[dotdict]:
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -200,7 +206,7 @@ def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> 
     )
 
     if len(workload_manifests) == 0:
-        print("No test_case found!")
+        logger.info("No test_case found!")
         return []
 
     return workload_manifests
@@ -269,7 +275,9 @@ def load_workloads(
         workload.spec["artifacts"] = {
             key: value.replace(r"{platforms}", workload.spec["platforms"])
             for key, value in (
-                workload.spec["artifacts"].items() if "artifacts" in workload.spec else {}
+                workload.spec["artifacts"].items()
+                if "artifacts" in workload.spec and workload.spec["artifacts"] is not None
+                else {}
             )
         }
 
@@ -288,9 +296,16 @@ def load_workloads(
     return workloads
 
 
-if __name__ == "__main__":
-    workflows = load_workloads(container_tag="main")
+@click.command()
+@click.option("--model", required=False, type=str, default=None, help="Model to select")
+@click.option("--test-case", required=False, type=str, default=None, help="Test case to select")
+def main(model: Optional[str], test_case: Optional[str]):
+    workflows = load_workloads(container_tag="main", model=model, test_case=test_case)
     # Save workflows to YAML file
     output_file = "workflows.yaml"
     with open(output_file, "w") as f:
         yaml.dump([dict(workflow) for workflow in workflows], f)
+
+
+if __name__ == "__main__":
+    main()

@@ -17,31 +17,30 @@ MODEL_ARGS:
   --global-batch-size: 128
   --seq-length: 512
   --max-position-embeddings: 512
-  --train-iters: 100
+  --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 990000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/my-bert_00_text_sentence
-  --vocab-file: ${DATA_PATH}/vocab.txt
+  --data-path: ${DATA_PATH}/text/the_pile/bert_shard00/my-bert_00_text_sentence
+  --vocab-file: ${DATA_PATH}/text/the_pile/bert_shard00/vocab.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.0001
   --min-lr: 0.00001
   --lr-warmup-fraction: 0.01
   --log-interval: 1
-  --save-interval: 50
+  --save-interval: 10000
   --eval-interval: 1000
   --eval-iters: 10
-  --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 2
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 4
+  --num-layers-per-virtual-pipeline-stage: 2
   --deterministic-mode: true
-  --use-checkpoint-args: true
-  --use-checkpoint-opt_param-scheduler: true
   --no-gradient-accumulation-fusion: true
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --ckpt-format: torch
-  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --attention-backend: unfused
-TEST_TYPE: ckpt-resume
+  --legacy-tokenizer: true
+TEST_TYPE: regular

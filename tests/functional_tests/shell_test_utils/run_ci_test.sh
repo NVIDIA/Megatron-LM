@@ -48,6 +48,8 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set -exo pipefail
+
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
@@ -64,7 +66,7 @@ else
 fi
 
 mkdir -p $CHECKPOINT_SAVE_PATH
-mkdir -p $CHECKPOINT_LOAD_PATH
+mkdir -p $CHECKPOINT_LOAD_PATH || true
 _CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH
 _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
 
@@ -102,6 +104,10 @@ if [[ "$MODE" == "pretraining" && "$TEST_TYPE" != "release" ]]; then
         /usr/local/bin/yq -i '.MODEL_ARGS."--exit-interval" = .MODEL_ARGS."--train-iters"' $TRAINING_PARAMS_PATH
         TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
             /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "100"')
+    fi
+elif [[ "$MODE" == "inference" && "$TEST_TYPE" != "release" ]]; then
+    if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+        /usr/local/bin/yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
     fi
 fi
 

@@ -21,7 +21,7 @@ MODEL_ARGS:
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
   --vocab-file: ${DATA_PATH}/bpe/vocab.json
   --merge-file: ${DATA_PATH}/bpe/merges.txt
   --split: 949,50,1
@@ -44,7 +44,7 @@ MODEL_ARGS:
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
-  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true
