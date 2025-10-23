@@ -98,6 +98,12 @@ runs:
       if: startsWith(github.ref, 'refs/heads/pull-request/')
       uses: nv-gha-runners/get-pr-info@main
 
+    - name: Install GH CLI
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        apt-get update
+        apt-get install -y gh
+
     - name: Has Run tests label
       shell: bash -x -e -u -o pipefail {0}
       id: has-run-tests-label
