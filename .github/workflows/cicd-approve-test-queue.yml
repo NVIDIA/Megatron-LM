@@ -101,7 +101,7 @@ jobs:
 
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
-          pending_workflows = make_request("actions/runs?status=waiting&branch=${{ matrix.branch }}").get("workflow_runs", [])
+          pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
           pending_workflows = [run for run in pending_workflows if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}"]
 
           # Sort deployments by creation date (oldest first)
