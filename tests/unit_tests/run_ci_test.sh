@@ -149,10 +149,11 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
     --node_rank $NODE_RANK
     --log-dir $LOG_DIR
-    --tee "0:3"
-    --redirects "3"
+
 )
 
+    # --tee "0:3"
+    # --redirects "3"
 # Reduce memory usage by NCCL
 export NCCL_MAX_NCHANNELS=1
 export NCCL_NVLS_ENABLE=0
