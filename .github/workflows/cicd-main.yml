@@ -17,6 +17,7 @@ on:
     - cron: "0 */2 * * *"
   push:
     branches:
+      - dev
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
