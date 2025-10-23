@@ -114,27 +114,38 @@ for element in "${MARKER[@]:1}"; do
 done
 
 export BUCKET
-IGNORE_TEST_CASES=$(
-    cat $SCRIPT_PATH/../test_utils/recipes/unit-tests.yaml |
-        yq eval '
-    with(.products[].test_case; del(.[] | select(. == env(BUCKET)))) 
-    | .products[].test_case[]
-    ' |
-        tr " " "\n"
-)
+OTHER_TEST_CASES=$(echo "$ALL_TEST_CASES" | grep -vF "$BUCKET")
 
-IGNORE_ARGS=()
+echo "Other test cases:"
+echo "$OTHER_TEST_CASES"
+echo ""
+
+# Expand wildcards in other test cases to get files to exclude
+EXCLUDE_FILES=""
 while IFS= read -r test_case; do
-    if [[ $test_case == *\** ]]; then
-        FILES=($(ls $test_case))
-        echo ${FILES[@]}
-        for file in "${FILES[@]}"; do
-            IGNORE_ARGS+=("--ignore='$file'")
+    [[ -z "$test_case" ]] && continue
+    if [[ "$test_case" == *"*"* ]]; then
+        # Expand wildcard
+        for file in $test_case; do
+            [[ -f "$file" ]] && EXCLUDE_FILES="$EXCLUDE_FILES$file "
         done
     else
-        IGNORE_ARGS+=("--ignore=$test_case")
+        # Add as-is
+        EXCLUDE_FILES="$EXCLUDE_FILES$test_case "
     fi
-done <<<"$IGNORE_TEST_CASES"
+done <<< "$OTHER_TEST_CASES"
+
+echo "Files to exclude:"
+echo "$EXCLUDE_FILES"
+echo ""
+
+# Build IGNORE_ARGS array
+IGNORE_ARGS=()
+while IFS= read -r file; do
+    if ! echo "$EXCLUDE_FILES" | grep -qF "$file"; then
+        IGNORE_ARGS+=("--ignore=$file")
+    fi
+done < <(find tests/unit_tests/dist_checkpointing/ -maxdepth 1 -name "*.py" -type f)
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
