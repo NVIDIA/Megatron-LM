@@ -61,10 +61,13 @@ jobs:
 
       - name: Check membership
         id: check-membership
+        env:
+          IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
+          IS_DEV_BRANCH: ${{ github.ref == 'refs/heads/dev' }}
         run: |
           PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
 
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ]; then
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
