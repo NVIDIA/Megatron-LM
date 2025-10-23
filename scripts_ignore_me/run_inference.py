@@ -4,6 +4,7 @@
 # # For debugging.
 # RUN apt-get update && apt-get install -y gdb strace && apt-get install -y vim
 
+# pip install transformers
 # torchrun --nproc_per_node=1 -m ...
 # python -m scripts_ignore_me.run_inference -e mcore-dynamic -m 357m -c
 
@@ -29,6 +30,11 @@ except Exception as e:
 # USER_DIR = "/lustre/fs11/portfolios/adlr/users/lmcafee"
 USER_DIR = "/lustre/fsw/portfolios/adlr/users/lmcafee"
 
+# >>>
+# print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+# print("PYTHONPATH: %s." % os.environ["PYTHONPATH"])
+# exit()
+# <<<
 from lutil import pax
 
 get_curr_time = time.time

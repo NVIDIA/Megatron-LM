@@ -33,6 +33,11 @@ class CompilationState(Enum):
 
 _compilation_state = CompilationState.UNATTEMPTED
 # <<<
+# >>>
+# print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+# print("PYTHONPATH: %s." % os.environ["PYTHONPATH"])
+# exit()
+# <<<
 
 
 class UnifiedMemoryUnsupportedError(Exception):
@@ -113,6 +118,7 @@ def compile_allocator():
             _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
             # >>>
             # _has_unified_memory = True
+            # import abcxyzijk
             _compilation_state = CompilationState.SUCCESS
             # <<<
         except (RuntimeError, ImportError, OSError):
@@ -133,13 +139,7 @@ def create_unified_mempool() -> MemPool:
     compile_allocator()
 
     # Return mempool.
-    # global _has_unified_memory
-    # >>>
-    from lutil import pax
-    # pax("_has_unified_memory")
-    pax("_compilation_state")
-    # <<<
-    if not _has_unified_memory:
+    if _compilation_state != CompilationState.SUCCESS:
         raise UnifiedMemoryUnsupportedError()
     else:
         return MemPool(allocator=_alloc)
