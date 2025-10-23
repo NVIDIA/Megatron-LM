@@ -43,7 +43,7 @@ def compile_allocator():
 
     if _compilation_state != CompilationState.UNATTEMPTED:
         return
-        
+
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
     #include <cstddef>
