@@ -34,6 +34,7 @@ spec:
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
     ls
+
     cd /opt/megatron-lm
 
     torchrun \

@@ -10,8 +10,6 @@ spec:
   gpus: 8
   n_repeat: 1
   platforms: dgx_h100
-  artifacts:
-    /mnt/artifacts/text/the_pile/shard00: text/the_pile/shard00
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
@@ -61,7 +59,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt3_mr_mcore_reruns_resume_check_grads]
+  - test_case: [gpt3_mcore_reruns_resume_check_grads]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
