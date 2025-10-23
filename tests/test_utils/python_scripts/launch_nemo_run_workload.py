@@ -52,11 +52,12 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
     "--enable-lightweight-mode",
+    is_flag=True,
     show_default=True,
     required=False,
     type=bool,
     default=False,
-    help="Wandb experiment (only relevant for release tests)",
+    help="To enable lightweight mode",
 )
 def main(
     scope,
