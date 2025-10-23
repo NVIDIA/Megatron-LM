@@ -153,6 +153,9 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     print(f"for debug: Rank {dist.get_rank()}: pg_collection: {pg_collection}")
     all_losses = []
     
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter()
+
     from megatron.core.optimizer.optimizer_config import OptimizerConfig
     from megatron.core.optimizer import get_megatron_optimizer
     # Create optimizer config
@@ -196,6 +199,9 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         )
 
         all_losses.append(losses_reduced)
+        for idx, loss in enumerate(losses_reduced):
+            writer.add_scalar('training loss', loss['lm loss'][0], iteration)
+            writer.add_scalar('num tokens', loss['lm loss'][1], iteration)
         logging.info(f"Rank {dist.get_rank()}: Iteration {iteration} - Losses: {losses_reduced}")
 
         # Update parameters.
@@ -209,6 +215,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
             logging.info(f"Rank {dist.get_rank()}: Stopping profiler at iteration {iteration}")
             torch.cuda.cudart().cudaProfilerStop()
     
+    writer.flush()
     logging.info(f"Rank {dist.get_rank()}: Training completed. All losses: {all_losses}")
     
     return all_losses
