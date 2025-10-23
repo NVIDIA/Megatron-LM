@@ -28,8 +28,8 @@ class CompilationState(Enum):
 
 # Compilation vars.
 _compilation_state = CompilationState.UNATTEMPTED
-_alloc = None # must remain global until process exit.
-_mod = None # must remain global until process exit.
+_alloc = None  # must remain global until process exit.
+_mod = None  # must remain global until process exit.
 
 
 class UnifiedMemoryUnsupportedError(Exception):
