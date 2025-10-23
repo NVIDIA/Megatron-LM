@@ -102,7 +102,7 @@ runs:
       shell: bash -x -e -u -o pipefail {0}
       id: has-run-tests-label
       env:
-        GH_TOKEN: ${{ secrets.PAT }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
         HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")')
