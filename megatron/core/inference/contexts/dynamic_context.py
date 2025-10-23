@@ -16,7 +16,10 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.unified_memory import create_unified_mempool, UnifiedMemoryUnsupportedError
+from megatron.core.inference.unified_memory import (
+    UnifiedMemoryUnsupportedError,
+    create_unified_mempool,
+)
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
