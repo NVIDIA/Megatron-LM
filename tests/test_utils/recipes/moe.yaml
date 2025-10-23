@@ -86,7 +86,7 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
     products:
       - environment: [dev]
         scope: [mr]
@@ -96,12 +96,12 @@ products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100] # hang: #513
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_dgx_a100]
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4_dgx_a100]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
@@ -119,7 +119,7 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [gpt3_moe_mr_mcore_te_ep8_resume_torch_dist_dist_optimizer]
+  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
@@ -156,7 +156,7 @@ products:
       - environment: [dev]
         scope: [mr-slim]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
     products:
       - environment: [dev]
         scope: [mr]
