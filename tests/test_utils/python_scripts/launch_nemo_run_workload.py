@@ -78,7 +78,6 @@ def main(
         container_tag="none",
         platform=platform,
         tag=tag,
-        enable_lightweight_mode=enable_lightweight_mode,
     )
 
     workloads = [workload for workload in workloads if workload.type != "build"]
@@ -110,7 +109,7 @@ def main(
         env_vars={
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
-            "ENABLE_LIGHTWEIGHT_MODE": "true",
+            "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": "1",
         },
         packager=run.Packager(),
