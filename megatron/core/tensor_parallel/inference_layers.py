@@ -4,12 +4,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-
-from megatron.core.extensions.transformer_engine import (
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
-
 import transformer_engine as te
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -48,7 +42,7 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             out_features=output_size,
             init_method=init_method,
             eps=config.layernorm_epsilon,
-            normalization="RMSNorm"
+            normalization="RMSNorm",
         )
 
         if self.tp_size > 1:
@@ -99,10 +93,7 @@ class InferenceRowParallelLinear(te.pytorch.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(
-            in_features=input_size,
-            out_features=output_size,
-            init_method=init_method,
-            bias=bias
+            in_features=input_size, out_features=output_size, init_method=init_method, bias=bias
         )
 
         if self.tp_size > 1:
@@ -126,4 +117,4 @@ class InferenceRowParallelLinear(te.pytorch.Linear):
             return super().forward(x), None
         else:
             # Inference mode -> custom fw pass can be implemented here
-            return super().forward(x), None 
+            return super().forward(x), None
