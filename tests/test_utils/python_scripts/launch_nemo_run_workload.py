@@ -111,6 +111,7 @@ def main(
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": "1",
+            "CLUSTER": "dxgc",
         },
         packager=run.Packager(),
         volumes=artifacts,
