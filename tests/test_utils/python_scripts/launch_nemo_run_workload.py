@@ -50,6 +50,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
+@click.option("--enable-lightweight-mode", required=False, default=False, type=bool, help="Enable lightweight mode")
 def main(
     scope,
     model,
@@ -59,6 +60,7 @@ def main(
     container_image,
     data_dir: Optional[str] = None,
     tag: Optional[str] = None,
+    enable_lightweight_mode: Optional[bool] = False,
 ):
     workloads = recipe_parser.load_workloads(
         container_image="none",
@@ -69,6 +71,7 @@ def main(
         container_tag="none",
         platform=platform,
         tag=tag,
+        enable_lightweight_mode=enable_lightweight_mode,
     )
 
     workloads = [workload for workload in workloads if workload.type != "build"]
