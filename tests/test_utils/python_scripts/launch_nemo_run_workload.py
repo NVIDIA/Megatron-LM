@@ -50,7 +50,13 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
-@click.option("--enable-lightweight-mode", required=False, default=False, type=bool, help="Enable lightweight mode")
+@click.option(
+    "--enable-lightweight-mode",
+    required=False,
+    default=False,
+    type=bool,
+    help="Enable lightweight mode",
+)
 def main(
     scope,
     model,
