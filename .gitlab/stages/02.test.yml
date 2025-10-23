@@ -287,7 +287,7 @@ test:linting_formatting:
   rules:
     - if: $PUBLISH == "yes"
       when: never
-    - if: $CI_PIPELINE_SOURCE == 'push'
+    - if: $CI_PIPELINE_SOURCE == 'push' || $CI_PIPELINE_SOURCE == 'schedule'
       when: never
     - when: on_success
   script:
@@ -318,6 +318,10 @@ test:linting_copyright:
       when: never
     - when: on_success
   script:
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
+        exit 0
+      fi
     - git fetch origin main
     - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
     - bash tools/copyright.sh
