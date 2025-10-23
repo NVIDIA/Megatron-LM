@@ -22,7 +22,6 @@ import torch.nn as nn
 from megatron.core import parallel_state
 
 
-
 def get_config_logger_path(config):
     """Get the path to the config logger directory."""
     return getattr(config, 'config_logger_dir', '')
