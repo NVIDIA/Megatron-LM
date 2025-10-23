@@ -34,7 +34,7 @@ else
     source ${MLM_ENV_SETUP}
 fi
 
-if [ -z ${MLM_EXTRA_ARGS} ]; then
+if [[ -z ${MLM_EXTRA_ARGS} ]]; then
     printf "${MLM_WARNING} Use ${PURPLE}MLM_EXTRA_ARGS${WHITE} to provide additional arguments!\n"
 fi
 
@@ -50,7 +50,7 @@ fi
 
 if [ -z ${ETP} ]; then
     ETP=${TP}
-    printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} not set! (default: ${ETP})\n"
+    printf "${MLM_WARNING} Variable ${PURPLE}ETP${WHITE} not set! (default: ${ETP})\n"
 fi
 
 if [ -z ${EP} ]; then
@@ -63,6 +63,11 @@ if [ -z ${PP} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}PP${WHITE} not set! (default: ${PP})\n"
 fi
 
+if [ -z ${CP} ]; then
+    CP=1
+    printf "${MLM_WARNING} Variable ${PURPLE}CP${WHITE} not set! (default: ${CP})\n"
+fi
+
 if [ -z ${DP} ]; then
     DP=1
     printf "${MLM_WARNING} Variable ${PURPLE}DP${WHITE} not set! (default: ${DP})\n"
@@ -70,7 +75,7 @@ fi
 
 
 if [ -z ${LAUNCH_SCRIPT} ]; then
-    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((TP * EP * PP * DP))"
+    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((ETP * EP * PP * CP * DP))"
 fi
 
 # Install TensorRT Model Optimizer if haven't.

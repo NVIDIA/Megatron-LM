@@ -15,11 +15,11 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_provider import model_provider
-from megatron.post_training.utils import report_current_memory_info
+from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('once')
 
 
 def add_generate_args(parser):
@@ -29,7 +29,7 @@ def add_generate_args(parser):
     group.add_argument("--draft-length", type=int, default=0, help="Only used in EAGLE.")
     group.add_argument("--draft-topk", type=int, default=1, help="Only used in EAGLE.")
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
 
     add_modelopt_args(parser)
     return parser
@@ -82,6 +82,25 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    # Meta device initialization for ParallelLinear only works if using cpu initialization.
+    # Meta device initialization is used such that models can be materialized in low-precision
+    # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
+    # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
+    if args.init_model_with_meta_device:
+        args.use_cpu_initialization = True
+    else:
+        warnings.warn(
+            "--init-model-with-meta-device is not set. If you would like to resume the "
+            "model in low-bit directly (low-memory initialization and skipping 16-bit), "
+            "--init-model-with-meta-device must be set.",
+            UserWarning,
+        )
+
+    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    report_current_memory_info()
+
+    unwrapped_model = unwrap_model(model)[0]
+
     default_conversations = [
         {
             "role": "user",
@@ -100,9 +119,7 @@ if __name__ == "__main__":
         dataset = load_dataset(args.finetune_hf_dataset, split=args.finetune_data_split)
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
 
-    report_current_memory_info()
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
@@ -112,7 +129,7 @@ if __name__ == "__main__":
     unwrapped_model.eval()
 
     for idx, example in enumerate(dataset):
-        if idx > args.percentage * len(dataset):
+        if idx > args.fraction * len(dataset):
             break
         ref_conversations = get_conversations(example)
         new_conversations = []
@@ -133,9 +150,10 @@ if __name__ == "__main__":
                 input_ids = tokenizer.apply_chat_template(
                     new_conversations, return_tensors="pt", add_generation_prompt=True
                 )
-                output_ids = simple_generate(
-                    unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
-                )
+                with torch.no_grad():
+                    output_ids = simple_generate(
+                        unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
+                    )
                 output_texts = tokenizer.batch_decode(output_ids)[0]
                 print_rank_0("{}".format(output_texts))
                 new_conversations.append({"role": "assistant", "content": output_texts})

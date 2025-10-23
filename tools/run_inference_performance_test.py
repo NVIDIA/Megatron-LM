@@ -3,14 +3,15 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 import argparse
-from pretrain_gpt import model_provider as gpt_model_provider
-from pretrain_mamba import model_provider as mamba_model_provider
 import random
 import torch
 import sys
 import time
 import tqdm
 import warnings
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -35,6 +36,7 @@ from megatron.core import mpu
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model, get_tokenizer
 import asyncio
+from functools import partial
 from typing import AsyncIterator, List, Union
 
 REQUEST_ID = 0
@@ -107,6 +109,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
 
     if args.engine_type == "static":
@@ -132,7 +135,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
             max_requests_override=args.inference_dynamic_batching_max_requests_override,
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-            chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+            block_size_tokens=args.inference_dynamic_batching_block_size,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             model, inference_wrapper_config, inference_context=context
@@ -147,7 +150,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             text_generation_controller,
             context,
             termination_id=-1,
-            enable_cuda_graph=args.enable_cuda_graph,
+            enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
         )
 
@@ -170,7 +173,7 @@ async def generate(
         tokenizer = get_tokenizer()
         prompts = [tokenizer.detokenize(request.prompt_tokens) for request in inference_requests]
 
-    request_ids: List[str] = [
+    request_ids: List[int] = [
         inference_engine.add_request(
             prompt=prompt,
             inference_request=inference_request,
@@ -244,9 +247,8 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        active_requests, finished_requests, step_time = inference_engine.step(
-            sampling_params, verbose=False
-        )
+        result = inference_engine.step(sampling_params, verbose=False)
+        finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
             latency = time.perf_counter() - start_time
@@ -279,11 +281,11 @@ def main():
 
     # Set up model and load checkpoint
     if args.model_provider == "gpt":
-        model_provider = gpt_model_provider
+        model_builder = gpt_builder
     elif args.model_provider == "mamba":
-        model_provider = mamba_model_provider
+        model_builder = mamba_builder
 
-    model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
     tokenizer = get_tokenizer()
     load_checkpoint(model, None, None)
     model = model[0]
@@ -331,7 +333,7 @@ def main():
                 )
             )
 
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")
         warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
         warmup_sampling_params.add_attributes({"no_early_termination": True})

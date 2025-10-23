@@ -63,16 +63,16 @@ def common_test_parallel_reconfiguration_e2e(
     dst_tp_pp_kwargs=None,
     src_model_init_kwargs=None,
     dst_model_init_kwargs=None,
+    metadata=None,
 ):
     """Test model saving and loading with different TP/PP"""
     src_model_init_kwargs = src_model_init_kwargs or {}
     dst_model_init_kwargs = dst_model_init_kwargs or {}
     Utils.initialize_model_parallel(*src_tp_pp, **(src_tp_pp_kwargs or {}), order=load_order)
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B,
+    ):
         # Save checkpoint A
         gpt_model_A = initialize_model_fn(
             1,
@@ -88,7 +88,7 @@ def common_test_parallel_reconfiguration_e2e(
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
                 True,
             )
-        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, save_strategy)
+        save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
@@ -108,7 +108,7 @@ def common_test_parallel_reconfiguration_e2e(
         else:
             load_strategy = None
         state_dict, missing_keys, unexpected_keys = load(
-            gpt_model_B.sharded_state_dict(),
+            gpt_model_B.sharded_state_dict(metadata=metadata),
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
@@ -117,7 +117,7 @@ def common_test_parallel_reconfiguration_e2e(
         assert all('_extra_state' in k for k in missing_keys)
         assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model_B.load_state_dict(state_dict)
-        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
+        save(gpt_model_B.sharded_state_dict(metadata=metadata), ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
@@ -144,11 +144,10 @@ def common_test_state_dict_comparison(initialize_model_fn, tmp_path_dist_ckpt):
     tp = 2
     pp = 4
     Utils.initialize_model_parallel(tp, pp)
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_state_dict_comparison_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_state_dict_comparison_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_B') as ckpt_dir_B,
+    ):
         gpt_model_A = initialize_model_fn(
             1, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
         )
@@ -188,11 +187,10 @@ def common_test_vocab_size_padding_change(
         'embedding.word_embeddings.weight',
     }
 
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_vocab_size_padding_change_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_vocab_size_padding_change_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_vocab_size_padding_change_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_vocab_size_padding_change_B') as ckpt_dir_B,
+    ):
         # Save checkpoint A
         Utils.initialize_model_parallel(*src_tp_pp)
         gpt_model_A = initialize_model_fn(

@@ -100,7 +100,7 @@ def get_grad_norm_fp32(
 
     else:
         if norm_type == 2.0:
-            dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+            dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
@@ -112,7 +112,7 @@ def get_grad_norm_fp32(
                     False,  # no per-parameter norm
                 )
             else:
-                grad_norm = torch.tensor([0], dtype=torch.float, device='cuda')
+                grad_norm = torch.zeros(1, dtype=torch.float, device='cuda')
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
             total_norm = grad_norm**norm_type
@@ -171,7 +171,7 @@ def clip_grad_by_total_norm_fp32(
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
         multi_tensor_applier(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )
@@ -203,9 +203,18 @@ def count_zeros_fp32(
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
-    total_num_zeros = torch.tensor([0.0], dtype=torch.float, device='cuda')
+    total_num_zeros = torch.zeros(1, dtype=torch.float, device='cuda')
     data_parallel_group = None
+    use_megatron_fsdp = False
     for param in parameters:
+        if getattr(param, "__fsdp_param__", False) and param.grad is not None:
+            # If the parameter is managed by Megatron FSDP, we need to handle it differently.
+            use_megatron_fsdp = True
+            grad = param.grad._local_tensor
+            num_zeros = grad.numel() - torch.count_nonzero(grad)
+            total_num_zeros += num_zeros
+            continue
+
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         is_not_shared = param_is_not_shared(param)
@@ -216,6 +225,12 @@ def count_zeros_fp32(
             grad = to_local_if_dtensor(grad_obj).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
+
+    if use_megatron_fsdp and data_parallel_group is not None:
+        raise ValueError(
+            "Unexpected use of Megatron FSDP with data parallel group. "
+            "Please ensure that the parameters are properly managed by Megatron FSDP."
+        )
 
     # Sum across all data-parallel GPUs if using FSDP.
     if data_parallel_group:

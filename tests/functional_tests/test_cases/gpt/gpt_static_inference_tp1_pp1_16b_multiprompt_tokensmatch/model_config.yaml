@@ -10,10 +10,10 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
-  --timing-log-level: 2
+  --timing-log-level: 0
   # See the mount paths defined in the top level tests/test_utils/recipes/gpt-static-inference.yaml
-  --load: ${CHECKPOINT_LOAD_PATH}/deepseek_16b_pyt/model/checkpoints
-  --tokenizer-model: ${DATA_PATH}/deepseek_16b_pyt/tokenizer/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
   --tiktoken-pattern: v2
   --distributed-backend: nccl
@@ -54,6 +54,7 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --inference-max-requests: 1
   --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
   --ckpt-fully-parallel-save: true
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true
@@ -76,5 +77,6 @@ MODEL_ARGS:
   --inference-max-seq-length: 4096
   --output-path: ${TENSORBOARD_PATH}
   --prompt-file: ./tests/functional_tests/test_cases/gpt/gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch/test_prompts.jsonl
+  --incoming-requests-per-sec: -1 # all requests arrive up front.
 METRICS:
   - "generated_text"

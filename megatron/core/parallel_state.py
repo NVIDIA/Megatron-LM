@@ -2,6 +2,7 @@
 
 """Model and data parallel groups."""
 
+import logging
 import os
 import warnings
 from datetime import timedelta
@@ -12,12 +13,16 @@ import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
+logger = logging.getLogger(__name__)
+
 try:
     import einops
 
     HAVE_EINOPS = True
 except ImportError:
     HAVE_EINOPS = False
+
+logger = logging.getLogger(__name__)
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -127,6 +132,11 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
+# List of all process groups
+# Used for updating the timeout for all process groups
+# None represents the default process group
+_global_process_group_list = None
+
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -163,6 +173,35 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         return None
 
 
+def update_pg_timeout(
+    timeout: timedelta, pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None
+):
+    """Update the timeout for all process groups or a specific process group.
+       Synchronize the process groups before updating the timeout.
+    Args:
+        timeout(datetime.timedelta): The timeout to set for the process group(s)
+        pg(Optional[torch._C._distributed_c10d.ProcessGroup], default=None):
+            The process group to update the timeout for.
+            If None, all process groups are updated.
+    """
+    if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
+        torch.distributed.barrier(pg)
+        torch.cuda.synchronize()
+        try:
+            if pg is None:
+                global _global_process_group_list
+                for group in _global_process_group_list:
+                    torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+            else:
+                torch.distributed.distributed_c10d._set_pg_timeout(timeout, pg)
+        except Exception as e:
+            logger.error(f"Error updating pg timeout: {e}")
+            logger.error(f"Process group: {pg}")
+            logger.error(f"Timeout: {timeout}")
+            logger.error(f"Global process group list: {_global_process_group_list}")
+            raise e
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -190,7 +229,14 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
-    return torch.distributed.new_group(**kwargs)
+    group = torch.distributed.new_group(**kwargs)
+    global _global_process_group_list
+    if _global_process_group_list is None:
+        # None stands for the default process group
+        _global_process_group_list = [None]
+    if torch.distributed.get_rank() in ranks:
+        _global_process_group_list.append(group)
+    return group
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -483,6 +529,7 @@ def initialize_model_parallel(
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
+    sharp_enabled_group: Optional[str] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -591,6 +638,12 @@ def initialize_model_parallel(
             overlapped with other computation kernels.
             Example: initialize_parallel_groups(..., high_priority_stream_groups=['dp_cp','ep_dp'])
 
+        sharp_enabled_group (str, default = None):
+            Specify which communicator group should use SHARP communication.
+            This option is only valid when use_sharp is True.
+            By default (None), it is enabled from dp group.
+            Available options (choose one): [dp, dp_replica]
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -607,6 +660,27 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    # NCCL restricts IB SHARP usage to a single communicator group—the first one created
+    # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
+    # set to 0 for subsequent groups.
+    if "NCCL_COLLNET_ENABLE" in os.environ:
+        del os.environ["NCCL_COLLNET_ENABLE"]
+
+    if use_sharp:
+        if sharp_enabled_group is None:
+            # By default, SHARP is enabled from dp group.
+            sharp_enabled_group = "dp"
+        else:
+            # Currently, only dp and dp_replica groups are supported for SHARP.
+            assert sharp_enabled_group in ["dp", "dp_replica"], "Invalid sharp_enabled_group"
+            if sharp_enabled_group == "dp_replica":
+                assert (
+                    num_distributed_optimizer_instances > 1
+                ), "dp_replica group requires num_distributed_optimizer_instances > 1"
+    else:
+        assert (
+            sharp_enabled_group is None
+        ), "sharp_enabled_group is only valid when use_sharp is True"
 
     if get_embedding_ranks is None:
         get_embedding_ranks = default_embedding_ranks
@@ -721,6 +795,10 @@ def initialize_model_parallel(
         data_parallel_size * context_parallel_size
     ) // num_distributed_optimizer_instances
 
+    # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp group.
+    if sharp_enabled_group == "dp":
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+
     # In case of using SHARP, the dp-cp group requires to use NCCL COLLNET feature.
     # Due to the hardware limitation, only the initially created communication group
     # is eligible for using the NCCL COLLNET feature.
@@ -779,10 +857,10 @@ def initialize_model_parallel(
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
-    # Apply SHARP to DP process groups
-    if use_sharp:
+    # Apply SHARP to the dp group.
+    if sharp_enabled_group == "dp":
         if rank == 0:
-            print(
+            logger.info(
                 "The number of process groups to use SHARP with depends on the type "
                 "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
                 "process groups and QM2 supports up to 256 process groups. We apply "
@@ -792,12 +870,16 @@ def initialize_model_parallel(
                 "will fall back to non-SHARP operators. To enable SHARP, "
                 "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
             )
+        # PyTorch is performing lazy initialization of the communicator group.
+        # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         torch.distributed.barrier(
             group=get_data_parallel_group(with_context_parallel=True),
             device_ids=[torch.cuda.current_device()],
         )
-        # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
-        os.environ["NCCL_COLLNET_ENABLE"] = "0"
+        torch.cuda.synchronize()
+        # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
+        if "NCCL_COLLNET_ENABLE" in os.environ:
+            del os.environ["NCCL_COLLNET_ENABLE"]
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1136,6 +1218,10 @@ def initialize_model_parallel(
         if num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
+
+            # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
+            if sharp_enabled_group == "dp_replica":
+                os.environ["NCCL_COLLNET_ENABLE"] = "1"
             hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
                 rank,
                 ranks,
@@ -1152,6 +1238,19 @@ def initialize_model_parallel(
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
                 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
+
+            if sharp_enabled_group == "dp_replica":
+                # PyTorch is performing lazy initialization of the communicator group.
+                # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+                if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:
+                    torch.distributed.barrier(
+                        group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
+                        device_ids=[torch.cuda.current_device()],
+                    )
+                    torch.cuda.synchronize()
+                # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
+                if "NCCL_COLLNET_ENABLE" in os.environ:
+                    del os.environ["NCCL_COLLNET_ENABLE"]
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
@@ -1336,17 +1435,19 @@ def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False
             return _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_tensor_and_data_parallel_group(with_context_parallel=False):
+def get_tensor_and_data_parallel_group(check_initialized=True, with_context_parallel=False):
     """Get the tensor- and data-parallel group the caller rank belongs to."""
     if with_context_parallel:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), "tensor and data parallel group is not initialized"
+        if check_initialized:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+            ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     else:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-        ), "tensor and data parallel group is not initialized"
+        if check_initialized:
+            assert (
+                _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+            ), 'tensor and data parallel group is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 
@@ -1793,23 +1894,25 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
         return 0
 
 
-def get_intra_distributed_optimizer_instance_group():
+def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group of all GPUs in a distributed optimizer instance."""
-    assert (
-        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
-    ), "Intra distributed optimizer instance group is not initialized"
+    if check_initialized:
+        assert (
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
+        ), "Intra distributed optimizer instance group is not initialized"
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
-def get_inter_distributed_optimizer_instance_group():
+def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
     inter_partial_expert_data_parallel_group, and return it at here.
     """
-    assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-        "Attention and MLP/Expert share same inter distributed optimize instance group, "
-        "which has not been initialized"
-    )
+    if check_initialized:
+        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
+            "Attention and MLP/Expert share same inter distributed optimize instance group, "
+            "which has not been initialized"
+        )
     return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
 
@@ -1989,3 +2092,6 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _global_process_group_list
+    _global_process_group_list = None

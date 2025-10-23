@@ -75,9 +75,9 @@ def validate_yaml(args, defaults={}):
     args.data_parallel_size = args.world_size // (model_parallel_size * args.model_parallel.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {} '
+              'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.model_parallel.context_parallel_size,
                   args.model_parallel.tensor_model_parallel_size,
@@ -335,9 +335,6 @@ def validate_yaml(args, defaults={}):
     # Load retro args (used by both Retro & GPT).
     if getattr(args, 'retro_project_dir', None) is not None:
         raise Exception("Retro untested for yaml args. See arguments.py.")
-
-    if args.language_model.rotary_interleaved and args.language_model.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:

@@ -11,8 +11,9 @@ from transformer_engine.pytorch.fp8 import fp8_autocast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
 
@@ -365,3 +366,227 @@ def test_optimizer_reload_model_params():
             torch.testing.assert_close(
                 main_param, torch.empty_like(main_param).fill_(3.0), atol=0, rtol=0
             )
+
+
+@pytest.mark.skipif(
+    not is_torch_min_version("2.4.0"),
+    reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
+)
+@pytest.mark.parametrize(
+    "world_size, tp_size, cp_size, dp_size",
+    [
+        (1, 1, 1, 1),  # Single GPU, no parallelism
+        (2, 1, 2, 1),  # 2 GPUs, 1 TP, 2 CP
+        (2, 2, 1, 1),  # 2 GPUs, 2 TP, 1 CP
+        (8, 8, 1, 1),  # 8 GPUs, 8 TP, 1 CP
+        (8, 2, 4, 1),  # 8 GPUs, 2 TP, 4 CP
+        (8, 4, 2, 1),  # 8 GPUs, 4 TP, 2 CP
+        (8, 1, 1, 8),  # 8 GPUs, 1 TP, 1 CP, 8 DP
+        (8, 2, 1, 4),  # 8 GPUs, 2 TP, 1 CP, 4 DP
+        (8, 2, 2, 2),  # 8 GPUs, 2 TP, 2 CP, 2 DP
+    ],
+)
+def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, cp_size, dp_size):
+    """
+    Test that get_megatron_optimizer works correctly with custom process groups
+    provided via pg_collection parameters.
+    """
+    # Skip if world size doesn't match available GPUs
+    actual_world_size = torch.cuda.device_count()
+    if actual_world_size != world_size:
+        pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
+
+    # Initialize model parallel with default settings first
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+    )
+
+    # Create device mesh for custom process groups
+    device_mesh = torch.distributed.init_device_mesh(
+        "cuda", (1, dp_size, 1, cp_size, tp_size), mesh_dim_names=("pp", "dp", "ep", "cp", "tp")
+    )
+
+    # Create custom process groups from device mesh
+    dp_group = device_mesh.get_group(mesh_dim="dp")
+    cp_group = device_mesh.get_group(mesh_dim="cp")
+    tp_group = device_mesh.get_group(mesh_dim="tp")
+    pp_group = device_mesh.get_group(mesh_dim="pp")
+
+    # Create dp_cp group
+    dp_cp_mesh = device_mesh["dp", "cp"]
+    dp_cp_group = dp_cp_mesh._flatten().get_group()
+
+    # Create model parallel group (tp + pp)
+    mp_mesh = device_mesh["pp", "tp"]
+    mp_group = mp_mesh._flatten().get_group()
+
+    # Create intra_dist_opt group
+    # It has the same ranks as dp_cp group when num_distributed_optimizer_instances is not > 1
+    intra_dist_opt_mesh = device_mesh["dp", "cp"]
+    intra_dist_opt_group = intra_dist_opt_mesh._flatten().get_group()
+
+    # Create process group configurations
+    pg_collection = ProcessGroupCollection()
+    pg_collection.dp = dp_group
+    pg_collection.dp_cp = dp_cp_group
+    pg_collection.intra_dist_opt = intra_dist_opt_group
+    pg_collection.expt_dp = None  # Not using expert parallelism in this test
+
+    pg_collection.tp = tp_group
+    pg_collection.cp = cp_group
+    pg_collection.pp = pp_group
+    pg_collection.mp = mp_group
+    pg_collection.tp_ep_pp = None  # Not using expert parallelism in this test
+
+    # Create a simple model for testing
+    model = torch.nn.Linear(100, 100, bias=False, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    for param in model.parameters():
+        assert param.requires_grad
+    model_chunks = [model]
+
+    # Create optimizer config
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.001,
+        weight_decay=0.01,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1e-8,
+    )
+
+    # Test 1: Create optimizer with custom process groups
+    optimizer = get_megatron_optimizer(
+        config=optimizer_config,
+        model_chunks=model_chunks,
+        use_gloo_process_groups=False,  # Required when using custom process groups
+        pg_collection=pg_collection,
+    )
+
+    # Verify optimizer was created successfully
+    assert optimizer is not None, "Optimizer should not be None"
+    assert hasattr(optimizer, 'param_groups'), "Optimizer should have param_groups"
+    assert len(optimizer.param_groups) > 0, "Optimizer should have at least one parameter group"
+
+    # Test 2: Verify optimizer can perform forward and backward pass
+    input_tensor = torch.randn(32, 100, device='cuda', requires_grad=True)
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    # Test 3: Optimizer step should work
+    optimizer.zero_grad()
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    # Store original parameters
+    original_weight = model.module.weight.data.clone()
+    original_bias = model.module.bias.data.clone() if model.module.bias is not None else None
+
+    # Perform optimizer step
+    optimizer.step()
+
+    # Verify parameters were updated
+    assert not torch.equal(
+        model.module.weight.data, original_weight
+    ), "Weight should be updated after optimizer step"
+    if model.module.bias is not None:
+        assert not torch.equal(
+            model.module.bias.data, original_bias
+        ), "Bias should be updated after optimizer step"
+
+    # Test 4: Compare with default process groups optimizer (if world_size allows)
+    if world_size == 1:  # Only test on single GPU to avoid complex setup
+        # Create optimizer with default process groups
+        default_optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks
+        )
+
+        # Both optimizers should have the same structure
+        assert len(optimizer.param_groups) == len(
+            default_optimizer.param_groups
+        ), "Custom and default optimizers should have same number of parameter groups"
+
+
+def test_get_megatron_optimizer_custom_process_groups_validation():
+    """
+    Test validation logic for custom process groups in get_megatron_optimizer.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    # Create a simple model
+    model = torch.nn.Linear(100, 100, bias=False, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    for param in model.parameters():
+        assert param.requires_grad
+    model_chunks = [model]
+    optimizer_config = OptimizerConfig(optimizer='adam', lr=0.001)
+
+    # Test 2: Missing dp process group in pg_collection
+    pg_collection_no_dp = ProcessGroupCollection()
+
+    with pytest.raises(ValueError, match="dp process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_no_dp
+        )
+
+    # Test 3: Missing expt_dp attribute in pg_collection
+    pg_collection_no_expt_dp = ProcessGroupCollection()
+    pg_collection_no_expt_dp.dp = torch.distributed.new_group()
+    # Missing required 'expt_dp' attribute
+
+    with pytest.raises(ValueError, match="expt_dp process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            pg_collection=pg_collection_no_expt_dp,
+        )
+
+    # Test 4: Missing intra_dist_opt and mp attribute in pg_collection
+    pg_collection_complete = ProcessGroupCollection()
+    pg_collection_complete.dp = torch.distributed.new_group()
+    pg_collection_complete.expt_dp = None  # Explicitly set to None as allowed
+
+    # Missing required 'intra_dist_opt' attribute
+    with pytest.raises(ValueError, match="intra_dist_opt process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+        )
+
+    pg_collection_complete.intra_dist_opt = None  # Explicitly set to None as allowed
+    # Missing required 'mp' attribute
+    with pytest.raises(ValueError, match="mp process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+        )
+
+    # Test 5: Missing tp_ep_pp attribute in pg_collection
+    pg_collection_complete.mp = None  # Explicitly set to None as allowed
+
+    with pytest.raises(ValueError, match="tp_ep_pp process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+        )
+
+    # Test 6: Gloo process groups should not be used with custom process groups
+    pg_collection_complete.mp = None  # Explicitly set to None as allowed
+    pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
+
+    with pytest.raises(ValueError, match="Gloo process groups are not supported"):
+        get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=model_chunks,
+            use_gloo_process_groups=True,  # Should be False when using custom groups
+            pg_collection=pg_collection_complete,
+        )

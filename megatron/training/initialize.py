@@ -128,7 +128,7 @@ def initialize_megatron(
             args.data_parallel_random_init,
             args.te_rng_tracker,
             args.inference_rng_tracker,
-            use_cudagraphable_rng=args.enable_cuda_graph,
+            use_cudagraphable_rng=args.cuda_graph_impl != "none",
         )
 
         # Setup MoE aux loss scale value.
@@ -269,7 +269,21 @@ def _initialize_tp_communicators():
             args.hidden_size,
         ]
 
-    if is_te_min_version("1.9.0"):
+
+    if is_te_min_version("2.7.0"):
+        UserBufferQuantizationMode = te_module.base.UserBufferQuantizationMode
+        quantization_modes = [UserBufferQuantizationMode.FP8 if args.fp8 else UserBufferQuantizationMode.NONE]
+        if args.fp8 is not None and args.first_last_layers_bf16 and (args.num_layers_at_start_in_bf16 > 0 or args.num_layers_at_end_in_bf16 > 0):
+            quantization_modes.append(UserBufferQuantizationMode.NONE)
+        # The process group with the target bootstrap backend is created in Transformer Engine.
+        te_module.base.initialize_ub(
+            shape=input_shape,
+            tp_size=args.tensor_model_parallel_size,
+            quantization_modes=quantization_modes,
+            ub_cfgs=ub_cfgs,
+            bootstrap_backend=args.tp_comm_bootstrap_backend,
+        )
+    elif is_te_min_version("1.9.0"):
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(
             shape=input_shape,
@@ -321,7 +335,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.external_cuda_graph:
+        if args.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
         # Call the init process
@@ -360,6 +374,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.enable_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
+                sharp_enabled_group=args.sharp_enabled_group,
             )
             if args.rank == 0:
                 print(

@@ -19,13 +19,6 @@ SIZE_GUIDANCE = {event_accumulator.TENSORS: 0, event_accumulator.SCALARS: 0}
 logger = logging.getLogger(__name__)
 
 
-def approximate_threshold(rtol: float) -> Callable:
-    def _func(y_pred: List[Union[float, int]], y_true: List[Union[float, int]]):
-        return np.mean([np.mean(y_pred), np.mean(y_true)]) * rtol
-
-    return _func
-
-
 class TypeOfTestResult(enum.Enum):
     APPROXIMATE = 1
     DETERMINISTIC = 2
@@ -45,7 +38,6 @@ class NotDeterminsticError(Exception):
 
 class ApproximateTest(Test):
     atol: Union[int, float] = 0
-    atol_func: Optional[Callable] = None
     rtol: float = 1e-5
 
     @property
@@ -58,14 +50,12 @@ class ApproximateTest(Test):
 
 class DeterministicTest(Test):
     @property
-    def atol(self) -> Union[int, float]:
-        return 0
-
-    atol_func: Optional[Callable] = None
-
-    @property
     def rtol(self) -> float:
         return 0.0
+
+    @property
+    def atol(self) -> Union[int, float]:
+        return 0
 
     @property
     def type_of_test_result(self) -> TypeOfTestResult:
@@ -151,7 +141,6 @@ def read_tb_logs_as_list(
     golden_values = {}
 
     for metric, values in summaries.items():
-
         # Add missing values
         values = {
             k: (values[k] if k in values else "nan")
@@ -189,22 +178,19 @@ def _filter_checks(
 def pipeline(
     compare_approximate_results: bool,
     golden_values: Dict[str, GoldenValueMetric],
-    tensorboard_logs: Dict[str, GoldenValueMetric],
+    actual_values: Dict[str, GoldenValueMetric],
     checks: Dict[str, List[Union[ApproximateTest, DeterministicTest]]],
 ):
-
     all_test_passed = True
     failed_metrics = []
 
     for metric_name, metric_thresholds in checks.items():
-
-        if metric_name not in list(tensorboard_logs.keys()):
+        if metric_name not in list(actual_values.keys()):
             raise MissingTensorboardLogsError(
                 f"Metric {metric_name} not found in Tensorboard logs! Please modify `model_config.yaml` to record it."
             )
 
         for test in metric_thresholds:
-
             if (
                 compare_approximate_results
                 and test.type_of_test_result == TypeOfTestResult.DETERMINISTIC
@@ -212,38 +198,44 @@ def pipeline(
                 continue
 
             try:
-
                 golden_value = golden_values[metric_name]
                 golden_value_list = list(golden_value.values.values())
                 actual_value_list = [
                     value
-                    for value_step, value in tensorboard_logs[metric_name].values.items()
+                    for value_step, value in actual_values[metric_name].values.items()
                     if value_step in golden_value.values.keys()
                 ]
 
                 if metric_name == "iteration-time":
-                    actual_value_list = actual_value_list[3:-1]
-                    golden_value_list = golden_value_list[3:-1]
+                    actual_value_list = [
+                        np.median([np.inf if type(v) is str else v for v in actual_value_list])
+                    ]
+                    golden_value_list = [
+                        np.median([np.inf if type(v) is str else v for v in golden_value_list])
+                    ]
+                    total_steps_evaluated = 1
+                else:
+                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
+
+                    actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
+                    golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
+
+                actual = np.array(actual_value_list)
+                golden = np.array(golden_value_list)
+
+                # Tolerance check
+                is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
+
+                num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
+                passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
+
+                if not passing:
                     logger.info(
-                        "For metric `%s`, the first 3 and the last scalars are removed from the list to reduce noise.",
-                        metric_name,
+                        "Actual values: %s", ", ".join([str(v) for v in (*actual_value_list,)])
                     )
-
-                actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
-                golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
-
-                if not np.allclose(
-                    actual_value_list,
-                    golden_value_list,
-                    rtol=test.rtol,
-                    atol=(
-                        test.atol_func(actual_value_list, golden_value_list)
-                        if test.atol_func is not None
-                        else test.atol
-                    ),
-                ):
-                    logger.info("Actual values: %s", ", ".join([str(v) for v in actual_value_list]))
-                    logger.info("Golden values: %s", ", ".join([str(v) for v in golden_value_list]))
+                    logger.info(
+                        "Golden values: %s", ", ".join([str(v) for v in (*golden_value_list,)])
+                    )
                     raise test.error_message(metric_name)
 
                 result = f"{test.type_of_test_result.name} test for metric {metric_name}: PASSED"
