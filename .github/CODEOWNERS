@@ -1,6 +1,4 @@
-megatron/core @NVIDIA/core-adlr
-
-megatron/core @NVIDIA/core-nemo
+megatron/core @NVIDIA/core-adlr @NVIDIA/core-nemo
 
 megatron/core/models/gpt/ @NVIDIA/gpt
 
@@ -20,8 +18,7 @@ megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
 
 megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/transformer/moe/ @NVIDIA/core-adlr 
-megatron/core/transformer/moe/ @NVIDIA/core-devtech
+megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-devtech
 
 # megatron/core/inference/ @NVIDIA/inference
 
@@ -44,7 +41,6 @@ tests/functional_tests/test_cases/ @NVIDIA/ci
 tests/functional_tests/recipes/ @NVIDIA/ci
 tests/unit_tests/ @NVIDIA/ci
 
-megatron/rl/ @NVIDIA/reinforcement-learning
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
 test/unit_tests/test_rl_utils.py @NVIDIA/reinforcement-learning
