@@ -245,10 +245,14 @@ if __name__ == "__main__":
     global_batch_size = 32
     num_microbatches = 16
     if rank < vision_tp*vision_pp*vision_dp:
-        batch_size = global_batch_size//num_microbatches//vision_dp
+        assert global_batch_size%(num_microbatches * vision_dp)==0, \
+            f"global_batch_size ({global_batch_size}) should be divisible by (num_microbatches ({num_microbatches}) * vision_dp ({vision_dp}))"
+        batch_size = global_batch_size//(num_microbatches * vision_dp)
         print(f"for debug: Rank {rank}, is in vision module, batch_size: {batch_size}")
     else:
-        batch_size = global_batch_size//num_microbatches//language_dp
+        assert global_batch_size%(num_microbatches*language_dp)==0, \
+            f"global_batch_size ({global_batch_size}) should be divisible by (num_microbatches ({num_microbatches}) * language_dp ({language_dp}))"
+        batch_size = global_batch_size// (num_microbatches*language_dp)
         print(f"for debug: Rank {rank}, is in language module, batch_size: {batch_size}")
     
  
