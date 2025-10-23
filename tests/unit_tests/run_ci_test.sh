@@ -88,9 +88,9 @@ fi
 ENVIRONMENT=$(echo "$ENVIRONMENT" | tr '[:upper:]' '[:lower:]')
 
 if [[ "$TAG" == "latest" ]]; then
-    TEST_PATH="/opt/Megatron-LM"
+    TEST_PATH="/opt/megatron-lm"
 else
-    TEST_PATH="/opt/Megatron-LM-legacy/"
+    TEST_PATH="/opt/megatron-lm-legacy/"
 fi
 
 cd $TEST_PATH
