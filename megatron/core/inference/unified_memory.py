@@ -2,8 +2,8 @@
 
 import os
 import warnings
+from enum import Enum, auto
 from pathlib import Path
-
 from torch.cuda.memory import CUDAPluggableAllocator
 from torch.utils.cpp_extension import CUDA_HOME, load_inline
 
@@ -20,9 +20,19 @@ except ImportError:
 
 
 # Avoid linting errors.
-_has_unified_memory = False
 _alloc = None
-_compilation_attempted = False
+# >>>
+# _has_unified_memory = False
+# _compilation_attempted = False
+# +++
+class CompilationState(Enum):
+    UNATTEMPTED = auto()
+    FAILURE = auto()
+    SUCCESS = auto()
+
+
+_compilation_state = CompilationState.UNATTEMPTED
+# <<<
 
 
 class UnifiedMemoryUnsupportedError(Exception):
@@ -32,11 +42,18 @@ class UnifiedMemoryUnsupportedError(Exception):
 def compile_allocator():
     """Attempt to compile UVM allocator."""
 
-    global _compilation_attempted, _has_unified_memory
+    # >>>
+    # global _compilation_attempted, _has_unified_memory
 
-    if _compilation_attempted:
+    # if _compilation_attempted:
+    #     return
+    # _compilation_attempted = True
+    # +++
+    global _compilation_state
+
+    if _compilation_state != CompilationState.UNATTEMPTED:
         return
-    _compilation_attempted = True
+    # <<<
         
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
@@ -94,9 +111,15 @@ def compile_allocator():
             )
             _so_path = Path(_mod.__file__).as_posix()
             _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
-            _has_unified_memory = True
+            # >>>
+            # _has_unified_memory = True
+            _compilation_state = CompilationState.SUCCESS
+            # <<<
         except (RuntimeError, ImportError, OSError):
             warnings.warn("Failed to create unified memory mempool.")
+            # >>>
+            _compilation_state = CompilationState.FAILURE
+            # <<<
 
 
 def create_unified_mempool() -> MemPool:
@@ -110,10 +133,11 @@ def create_unified_mempool() -> MemPool:
     compile_allocator()
 
     # Return mempool.
-    global _has_unified_memory
+    # global _has_unified_memory
     # >>>
-    # from lutil import pax
+    from lutil import pax
     # pax("_has_unified_memory")
+    pax("_compilation_state")
     # <<<
     if not _has_unified_memory:
         raise UnifiedMemoryUnsupportedError()
