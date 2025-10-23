@@ -303,6 +303,7 @@ jobs:
           - bucket: "unit_tests"
           - bucket: "unit_tests/data/"
           - bucket: "unit_tests/dist_checkpointing/*.py"
+          - bucket: "unit_tests/dist_checkpointing/test_optimizer.py"
           - bucket: "unit_tests/dist_checkpointing/models/"
           - bucket: "unit_tests/transformer/*.py"
           - bucket: "unit_tests/transformer/moe"
