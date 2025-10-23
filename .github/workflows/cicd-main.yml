@@ -47,7 +47,6 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
-      SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,10 +62,12 @@ jobs:
         id: check-membership
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
           PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
 
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ]; then
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -147,7 +148,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
 
   linting:
     runs-on: ubuntu-latest

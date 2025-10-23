@@ -23,6 +23,9 @@ jobs:
   approve-queue:
     runs-on: ubuntu-latest
     environment: main
+    strategy:
+      matrix:
+        branch: [main, dev]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -50,7 +53,7 @@ jobs:
           # GitHub API configuration
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
-          MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"])
+          MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY"]) // 2
           API_BASE = f"https://api.github.com/repos/{REPO}"
 
           # Headers for GitHub API
@@ -82,8 +85,8 @@ jobs:
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
           # Count running and queued workflows
-          queued_workflows = sum(1 for run in queued_workflow_runs if run["name"] == "CICD Megatron-LM")
-          in_progress_workflows = sum(1 for run in in_progress_workflow_runs if run["name"] == "CICD Megatron-LM")
+          queued_workflows = sum(1 for run in queued_workflow_runs if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}")
+          in_progress_workflows = sum(1 for run in in_progress_workflow_runs if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}")
 
           total_workflows = queued_workflows + in_progress_workflows
           print(f"Current queued workflows: {queued_workflows}")
@@ -98,7 +101,7 @@ jobs:
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
           pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
-          pending_workflows = [run for run in pending_workflows if run["name"] == "CICD Megatron-LM"]
+          pending_workflows = [run for run in pending_workflows if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}"]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
