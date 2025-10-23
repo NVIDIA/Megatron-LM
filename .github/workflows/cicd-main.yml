@@ -337,8 +337,8 @@ jobs:
     needs:
       - pre-flight
       - cicd-wait-in-queue
-      - cicd-container-build
-      - cicd-unit-tests-latest
+      # - cicd-container-build
+      # - cicd-unit-tests-latest
     outputs:
       functional-tests: ${{ steps.main.outputs.functional-tests }}
     steps:
@@ -388,7 +388,7 @@ jobs:
             --environment dev \
             --platform dgx_h100 \
             --cluster ghci \
-            --${ARGS[@]}
+            ${ARGS[@]} \
             --output-path functional-tests.yaml
 
           cat functional-tests.yaml | \
