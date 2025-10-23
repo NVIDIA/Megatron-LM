@@ -18,7 +18,7 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --no-load-optim: true
   --no-use-tokenizer-model-from-checkpoint-args: true
-  --timing-log-level: 2
+  --timing-log-level: 0
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1
   --distributed-backend: nccl
   --log-interval: 1
