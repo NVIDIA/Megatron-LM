@@ -11,8 +11,10 @@ include:
 wait_for_resources:
   extends: [.test_rules]
   needs:
-    - test:linting_formatting
-    - test:linting_copyright
+    - job: test:linting_formatting
+      optional: true
+    - job: test:linting_copyright
+      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:build_image
@@ -127,8 +129,10 @@ test:unit_tests_configure:
 
 .unit_tests_run:
   needs:
-    - test:linting_formatting
-    - test:linting_copyright
+    - job: test:linting_formatting
+      optional: true
+    - job: test:linting_copyright
+      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:unit_tests_configure
@@ -280,6 +284,12 @@ test:linting_formatting:
   needs: [test:build_image]
   variables:
     GIT_STRATEGY: "clone"
+  rules:
+    - if: $PUBLISH == "yes"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'push'
+      when: never
+    - when: on_success
   script:
     - |
       if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
@@ -301,6 +311,12 @@ test:linting_copyright:
     - team/megatron
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
+  rules:
+    - if: $PUBLISH == "yes"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'push'
+      when: never
+    - when: on_success
   script:
     - git fetch origin main
     - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
