@@ -361,6 +361,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
 
+    # Attempt to de-fragment memory before saving checkpoint to reduce likelihood of OOMs.
+    torch.cuda.empty_cache()
+
     # Prepare E2E metrics at start of save checkpoint
     productive_metrics = on_save_checkpoint_start(args.async_save)
 
