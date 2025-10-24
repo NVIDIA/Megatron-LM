@@ -44,8 +44,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
+        shell: python
         run: |
-          python - <<EOF
           import os
           import requests
 
@@ -79,18 +79,42 @@ jobs:
                       print(f"Response: {e.response.text}")
                   return None
 
+          def is_pr_targeting_main(workflow_run):
+              """Check if a workflow run belongs to a PR targeting main branch."""
+              # Check if it's a pull_request event
+              if workflow_run.get("event") != "pull_request":
+                  return False
+              
+              # Get the head branch and base branch from pull_requests
+              pull_requests = workflow_run.get("pull_requests", [])
+              if not pull_requests:
+                  return False
+              
+              # Check if any PR is targeting main
+              for pr in pull_requests:
+                  if pr.get("base", {}).get("ref") == "main":
+                      return True
+              
+              return False
+
           # Get current running and queued workflows
           print("Fetching workflow runs...")
           queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
+          # Filter for workflows belonging to PRs targeting main
+          queued_workflow_runs = [run for run in queued_workflow_runs 
+                                  if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
+          in_progress_workflow_runs = [run for run in in_progress_workflow_runs 
+                                      if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
+
           # Count running and queued workflows
-          queued_workflows = sum(1 for run in queued_workflow_runs if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}")
-          in_progress_workflows = sum(1 for run in in_progress_workflow_runs if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}")
+          queued_workflows = len(queued_workflow_runs)
+          in_progress_workflows = len(in_progress_workflow_runs)
 
           total_workflows = queued_workflows + in_progress_workflows
-          print(f"Current queued workflows: {queued_workflows}")
-          print(f"Current running workflows: {in_progress_workflows}")
+          print(f"Current queued workflows (PRs targeting main): {queued_workflows}")
+          print(f"Current running workflows (PRs targeting main): {in_progress_workflows}")
           print(f"Total workflows: {total_workflows}")
           print(f"Max concurrency: {MAX_CONCURRENCY}")
 
@@ -101,14 +125,15 @@ jobs:
           # Get waiting CI workflows for test environment
           print("Fetching deployments...")
           pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
-          pending_workflows = [run for run in pending_workflows if run["name"] == "CICD Megatron-LM" and run["head_branch"] == "${{ matrix.branch }}"]
+          pending_workflows = [run for run in pending_workflows 
+                              if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
           pending_workflows = sorted(pending_workflows, key=lambda x: x["created_at"])
 
           # Process each deployment
-          print("Processing ...")
+          print(f"Processing {len(pending_workflows)} pending workflows...")
           for workflow in pending_workflows:
               if total_workflows >= MAX_CONCURRENCY:
                   print("Maximum concurrency reached, stopping approvals")
@@ -116,7 +141,9 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
-              print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
+              pr_info = workflow.get("pull_requests", [{}])[0]
+              pr_number = pr_info.get("number", "unknown")
+              print(f"Approving workflow {workflow_name} (PR #{pr_number}) with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
               deployment = make_request(deployment_url)[0]
@@ -135,8 +162,6 @@ jobs:
               else:
                   print(f"Failed to approve deployment {deployment['id']}")
                   exit(1)
-
-          EOF
   notify:
     if: failure()
     runs-on: ubuntu-latest
