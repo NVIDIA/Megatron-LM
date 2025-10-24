@@ -154,6 +154,8 @@ default:
     when: runner_system_failure
 
 variables:
+  BUILD:
+    value: "yes"
   UNIT_TEST:
     value: "yes"
     options:
