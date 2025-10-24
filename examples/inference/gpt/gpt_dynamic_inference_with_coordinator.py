@@ -82,10 +82,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
         else:
             print("Results:")
             for req in results:
-                # >>>
-                from lutil import pax
-                pax("req")
-                # <<<
                 print(f"rid: {req.request_id}\nprompt: {req.prompt!r}\noutput: {req.generated_text!r}\n\n")
  
         # kill the engines and suspend the client

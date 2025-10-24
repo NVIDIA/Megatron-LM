@@ -960,9 +960,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
-        # >>> [ todo(@lmcafee): remove ]
-        verbose = True
-        # <<<
         try:
             while True:
                 self.schedule_requests()
