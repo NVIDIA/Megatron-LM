@@ -296,21 +296,41 @@ jobs:
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
-  cicd-unit-tests-latest:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - bucket: "unit_tests"
-          - bucket: "unit_tests/data/"
-          - bucket: "unit_tests/dist_checkpointing/*.py"
-          - bucket: "unit_tests/dist_checkpointing/models/"
-          - bucket: "unit_tests/transformer/*.py"
-          - bucket: "unit_tests/transformer/moe"
+  cicd-parse-unit-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}]' | jq -c > unit-tests.json
+          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
@@ -332,12 +352,12 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          test_case: tests/${{ matrix.bucket }}
+          test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:1909 #${{ github.sha }}
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
@@ -414,7 +434,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
