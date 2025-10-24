@@ -283,7 +283,9 @@ test:linting_formatting:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  needs: [test:build_image]
+  needs:
+    - job: test:build_image
+      optional: true
   variables:
     GIT_STRATEGY: "clone"
   rules:
@@ -314,7 +316,9 @@ test:linting_copyright:
     - purpose/utility
     - team/megatron
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  needs: [test:build_image]
+  needs:
+    - job: test:build_image
+      optional: true
   rules:
     - if: $BUILD == "no"
       when: never
