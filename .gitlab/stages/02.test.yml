@@ -287,6 +287,8 @@ test:linting_formatting:
   variables:
     GIT_STRATEGY: "clone"
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $PUBLISH == "yes"
       when: never
     - if: $CI_PIPELINE_SOURCE == 'push' || $CI_PIPELINE_SOURCE == 'schedule'
@@ -314,6 +316,8 @@ test:linting_copyright:
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $PUBLISH == "yes"
       when: never
     - if: $CI_PIPELINE_SOURCE == 'push'
