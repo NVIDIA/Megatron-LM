@@ -1241,7 +1241,7 @@ def setup_model_and_optimizer(
         # set dense model related args in to global args before getting dense model
         args.num_experts = None
         args.expert_model_parallel_size = 1
-        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity 
+        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
@@ -1838,7 +1838,8 @@ def save_checkpoint_and_time(
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
-    energy_monitor.pause()
+    if args.log_energy:
+        energy_monitor.pause()
 
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
@@ -1880,7 +1881,9 @@ def save_checkpoint_and_time(
         )
 
     # Recover timing
-    energy_monitor.resume()
+    if args.log_energy:
+        energy_monitor.resume()
+
     timers('interval-time', log_level=0).start(barrier=True)
 
 
@@ -2791,7 +2794,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-        
+
     if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
@@ -2807,7 +2810,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-    
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -2925,7 +2928,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
         )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-        
+
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
 
@@ -3000,7 +3003,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
     if valid_dataloaders is not None:
         # when using full validation, we need to override eval iters with the correct
-        # number of iterations on tp rank 0 so that it can be distributed to the other 
+        # number of iterations on tp rank 0 so that it can be distributed to the other
         # ranks later
         if args.full_validation:
             if args.multiple_validation_sets:
