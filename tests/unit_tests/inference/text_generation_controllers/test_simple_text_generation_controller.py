@@ -237,7 +237,7 @@ class TestTextGenerationController:
             (SamplingParams(top_k=3), [0, 3, 2]),
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(top_k=5), [11, 5, 8]),
-            #(SamplingParams(top_k=5, top_p=0.7), [11, 5, 8]), # uncomment for FlashInfer sampling
+            # (SamplingParams(top_k=5, top_p=0.7), [11, 5, 8]), # uncomment for FlashInfer sampling
             (SamplingParams(temperature=2.0), [9, 6, 10]),
         ]
         rev_sampling_map: List[SamplingParams] = [None] * batch_size
@@ -245,11 +245,9 @@ class TestTextGenerationController:
             for idx in indices:
                 rev_sampling_map[idx] = sampling_params
 
-        last_token_logits = (
-            torch.arange(0, self.vocab_size).repeat(batch_size, 1).float().cuda()
-        )
+        last_token_logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).float().cuda()
         sampled_logits, _ = self.text_generation_controller.sample_from_dynamic_logits(
-            last_token_logits, active_sampling_map, vocab_size = self.vocab_size
+            last_token_logits, active_sampling_map, vocab_size=self.vocab_size
         )
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_map]).cuda().unsqueeze(1)
         top_k_values[top_k_values == 0] = self.vocab_size
@@ -268,7 +266,6 @@ class TestTextGenerationController:
         assert torch.all(
             sampled_logits >= expected_min_values
         ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
-
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(

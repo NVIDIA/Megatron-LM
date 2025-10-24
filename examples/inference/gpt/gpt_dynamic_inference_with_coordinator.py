@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from megatron.core.inference.inference_client import InferenceClient
 from examples.inference.gpt.utils import add_common_inference_args
 import asyncio
