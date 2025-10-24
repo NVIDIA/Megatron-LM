@@ -25,7 +25,7 @@ jobs:
     environment: main
     strategy:
       matrix:
-        branch: [main, ${{ matrix.branch }}]
+        branch: [main, dev]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
