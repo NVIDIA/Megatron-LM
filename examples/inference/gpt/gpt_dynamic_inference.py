@@ -11,7 +11,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from tqdm import tqdm
@@ -119,7 +119,7 @@ def get_model() -> MegatronModule:
 
 def get_inference_context(
     requests: List[Request],
-    sampling_params: SamplingParams,
+    sampling_params: Optional[SamplingParams] = None,
     calculate_max_sequence_length_from_requests: bool = True
 ):
     """The inference context manages the KV cache and other inference state."""
@@ -202,17 +202,27 @@ def get_inference_controller(
 
 
 def run_inference(
-    requests: List[Request], engine: DynamicInferenceEngine
+    requests: List[Request],
+    engine: DynamicInferenceEngine,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
 
     Args:
         requests (List[Request]): Requests that are to be added and processed.
         engine (DynamicInferenceEngine): Inference engine that manages generating tokens.
+        sampling_params (SamplingParams): Deprecated as of megatron-core 0.16.
 
     Return:
         A dictionary of step times with `prefill` and `decode` keys.
     """
+
+    if sampling_params is not None:
+        warnings.warn(
+            "The `sampling_params` argument is deprecated. "
+            "Sampling parameters are specified per request.",
+            DeprecationWarning,
+        )
 
     args = get_args()
 

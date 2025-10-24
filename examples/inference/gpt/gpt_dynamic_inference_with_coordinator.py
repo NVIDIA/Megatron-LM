@@ -20,7 +20,18 @@ import json
 from megatron.training.arguments import parse_args
 from megatron.core import parallel_state
 
-async def main(engine: DynamicInferenceEngine, requests: List[Request], port: int):
+async def main(
+    engine: DynamicInferenceEngine,
+    requests: List[Request],
+    port: int,
+    sampling_params: SamplingParams | None = None,
+):
+    if sampling_params is not None:
+        warnings.warn(
+            "The `sampling_params` argument is deprecated. "
+            "Sampling parameters are specified per request.",
+            DeprecationWarning,
+        )
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
