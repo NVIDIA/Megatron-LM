@@ -300,6 +300,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -314,12 +326,11 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
-
     needs:
       - pre-flight
       - cicd-wait-in-queue
+      - cicd-container-build
       - cicd-parse-unit-tests
-      # - cicd-container-build
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
@@ -423,7 +434,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
