@@ -27,8 +27,13 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 
-import transformer_engine.pytorch.cpp_extensions as tex
-from transformer_engine.pytorch.constants import TE_DType
+try:
+    import transformer_engine as te
+    import transformer_engine.pytorch.cpp_extensions as tex
+    from transformer_engine.pytorch.constants import TE_DType
+    HAVE_TE=True 
+except ImportError:
+    HAVE_TE=False
 
 def _te_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float):
     out , _, _ = tex.rmsnorm_fwd(
@@ -81,6 +86,7 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.Linear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        assert HAVE_TE, "--use-inference-optimized-layers requires transformer engine"
         super().__init__(
             in_features=input_size, out_features=output_size, init_method=init_method, bias=bias
         )
