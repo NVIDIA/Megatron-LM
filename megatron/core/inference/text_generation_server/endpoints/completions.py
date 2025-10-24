@@ -11,6 +11,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 bp = Blueprint('completions_api', __name__)
 
+logger = logging.getLogger(__name__)
+
 
 @bp.route('/completions', methods=['POST'])
 @bp.route('/v1/completions', methods=['POST'])
@@ -95,7 +97,7 @@ async def completions():
     except Exception as e:
         return f"Error during inference: {e}", 500
 
-    logging.info(
+    logger.info(
         f"Batch of {len(tasks)} requests processed in {time.perf_counter() - start_time:.2f}s"
     )
 

@@ -8,7 +8,7 @@ import torch
 pytest.importorskip("flask")
 pytest.importorskip("flask_restful")
 
-from megatron.core.inference.text_generation_server import MegatronServer
+from megatron.core.inference.text_generation_server import run_text_generation_server
 from megatron.training import tokenizer
 from tests.unit_tests.inference.engines.test_static_engine import StaticInferenceEngineTestHarness
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
@@ -53,37 +53,7 @@ def client(app):
     return app.test_client()
 
 
-@unittest.mock.patch(
-    'megatron.core.inference.text_generation_server.text_generation_server.send_do_generate'
-)
-def test_generations_endpoint(mock_send_do_generate, client, gpt2_tiktoken_tokenizer):
-    Utils.initialize_distributed()
-
-    prompts = ["twinkle twinkle little star, how I wonder what you are"]
-    request_data = {"prompts": prompts, "tokens_to_generate": 10, "logprobs": True}
-
-    response = client.put('/api', json=request_data)
-
-    assert response.status_code == 200
-    assert response.is_json
-    json_data = response.get_json()
-    assert 'text' in json_data
-    assert 'logprobs' in json_data
-    assert len(json_data['text']) == len(prompts)
-    assert len(json_data['logprobs']) == len(prompts)
-
-    # Verify that beam search does not work
-    request_data["beam_width"] = 1
-    response = client.put('/api', json=request_data)
-    assert response.status_code == 400  # Bad Request
-
-    mock_send_do_generate.assert_called_once()
-
-
-@unittest.mock.patch(
-    "megatron.core.inference.text_generation_server.endpoints.completions.send_do_generate"
-)
-def test_completions_endpoint(mock_send_do_generate, client, gpt2_tiktoken_tokenizer):
+def test_completions_endpoint(client, gpt2_tiktoken_tokenizer):
     Utils.initialize_distributed()
 
     twinkle = ("twinkle twinkle little star,", " how I wonder what you are")
@@ -115,5 +85,3 @@ def test_completions_endpoint(mock_send_do_generate, client, gpt2_tiktoken_token
     # Test for unsupported HTTP methods
     response = client.put('/completions', json=request_data)
     assert response.status_code == 405  # Method Not Allowed
-
-    mock_send_do_generate.assert_called_once()

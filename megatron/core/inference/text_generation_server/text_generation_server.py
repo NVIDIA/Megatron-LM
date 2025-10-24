@@ -1,48 +1,34 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+from typing import Optional
 
 import torch
 
-from examples.inference.gpt.gpt_dynamic_inference import (
-    get_inference_context,
-    get_inference_controller,
-    get_model,
-)
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.flask_server import run_flask_server
-from megatron.training import get_args, get_tokenizer
+from megatron.training import get_tokenizer
 
 
-async def run_text_generation_server():
-    """Runs the Flask server from rank 0 and initializes the DynamicInferenceEngine on all ranks."""
+async def run_text_generation_server(
+    engine: DynamicInferenceEngine,
+    coordinator_port: int,
+    flask_port: int,
+    default_sampling_params: Optional[SamplingParams] = None,
+):
+    """Runs the Flask server from rank 0 and initializes the DynamicInferenceEngine on all ranks.
 
-    args = get_args()
+    Args:
+        engine (DynamicInferenceEngine): The dynamic inference engine.
+        coordinator_port (int): The network port for the dynamic inference DP coordinator.
+        flask_port (int): The network for port the frontend Flask server.
+        defualt_sampling_params (SamplingParams): The default sampling params.
+            This will be deprecated once we have per-request sampling params.
+    """
+
     tokenizer = get_tokenizer()
     rank = torch.distributed.get_rank()
-
-    model = get_model()
-    context = get_inference_context(None, None, calculate_max_sequence_length_from_requests=False)
-    controller = get_inference_controller(model, context)
-
-    engine = DynamicInferenceEngine(
-        controller,
-        context,
-        termination_id=-1,
-        enable_cuda_graph=args.cuda_graph_impl == "local",
-        random_seed=args.seed,
-    )
-
-    default_sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        return_log_probs=args.return_log_probs,
-        num_tokens_to_generate=args.num_tokens_to_generate,
-    )
-
-    coordinator_port = args.inference_coordinator_port
 
     await engine.start_listening_to_data_parallel_coordinator(
         default_sampling_params,
@@ -57,7 +43,7 @@ async def run_text_generation_server():
                 coordinator_port=coordinator_port,
                 tokenizer=tokenizer,
                 rank=rank,
-                flask_port=args.port,
+                flask_port=flask_port,
             )
         )
     engine_task = engine.engine_loop_task

@@ -14,6 +14,9 @@ except ImportError as e:
 
 import megatron.core.inference.text_generation_server.endpoints as endpoints
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.utils import temp_log_level
+
+logger = logging.getLogger(__name__)
 
 
 async def run_flask_server(coordinator_port: int, tokenizer, rank: int, flask_port: int):
@@ -23,12 +26,13 @@ async def run_flask_server(coordinator_port: int, tokenizer, rank: int, flask_po
 
     try:
         hostname = socket.gethostname()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Could not get hostname: {e}")
         hostname = "0.0.0.0"
 
     inference_client = InferenceClient(coordinator_port)
     await inference_client.start()
-    logging.info(f"Rank {rank}: InferenceClient connected.")
+    logger.info(f"Rank {rank}: InferenceClient connected.")
 
     app = Flask(__name__)
 
@@ -47,10 +51,12 @@ async def run_flask_server(coordinator_port: int, tokenizer, rank: int, flask_po
     config = Config()
     config.bind = [f"0.0.0.0:{flask_port}"]
 
-    logging.info(f"Rank {rank}: Starting Flask server on http://{hostname}:{flask_port}")
+    # Force logging level to INFO to ensure that hostname is printed
+    with temp_log_level(logging.INFO, logger):
+        logger.info(f"Starting Flask server on http://{hostname}:{flask_port}")
 
     try:
         await serve(app, config)
     finally:
         await inference_client.stop()
-        logging.info(f"Rank {rank}: Flask server and client shut down.")
+        logger.info(f"Rank {rank}: Flask server and client shut down.")

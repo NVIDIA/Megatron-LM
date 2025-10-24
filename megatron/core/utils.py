@@ -707,6 +707,18 @@ def log_on_each_pipeline_stage(
         logger.log(*args, **kwargs)
 
 
+@contextmanager
+def temp_log_level(level, logger=None):
+    """Enables temporarily overriding the logging level."""
+    logger = logger or logging.getLogger()
+    old_level = logger.level
+    logger.setLevel(level)
+    try:
+        yield
+    finally:
+        logger.setLevel(old_level)
+
+
 def check_param_hashes_across_dp_replicas(
     model: List[torch.nn.Module], cross_check: bool = False
 ) -> bool:
