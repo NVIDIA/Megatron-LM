@@ -82,7 +82,7 @@ runs:
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
-          --test-case '${{ inputs.test_case }}' \
+          --test-case "${{ inputs.test_case }}" \
           --environment dev \
           --platform dgx_h100 \
           --tag ${{ inputs.tag }} \
