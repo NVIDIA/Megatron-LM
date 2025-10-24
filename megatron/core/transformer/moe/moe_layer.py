@@ -8,9 +8,12 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+from megatron.core.transformer.moe.moe_utils import (
+    MoELayerEarlyReturnException,
+    get_default_pg_collection,
+    maybe_skip_or_early_return_by_cudagraph,
+)
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -167,72 +170,32 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-    def router_and_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        probs: Optional[torch.Tensor] = None,
-        routing_map: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
-    ):
-        """Compute and preprocess token routing for dispatch.
+        # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
+        self.cudagraph_tensor_store = {}
+
+    @maybe_skip_or_early_return_by_cudagraph("route")
+    def route(self, hidden_states: torch.Tensor):
+        """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
-        producing routing probabilities and a mapping. It then preprocesses the
-        hidden states and probabilities for the token dispatcher. The original
-        hidden states are returned as a residual connection.
+        producing routing probabilities and a mapping.
         """
-        # If probs is given, the router should have been called. Skip it.
-        if probs is None:
-            assert (
-                routing_map is None and residual is None
-            ), "both routing_map and residual must be None if probs is None"
-            probs, routing_map = self.router(hidden_states)
-        else:
-            assert (
-                routing_map is not None or residual is not None
-            ), "either routing_map or residual must be given if probs is given"
+        probs, routing_map = self.router(hidden_states)
+        return probs, routing_map
 
-        # Return right here if we are capturing the MoE router.
-        if self.cuda_graph_early_return("router"):
-            self.early_returned = True
-            outputs = [hidden_states, probs, routing_map]
-            return outputs
+    @maybe_skip_or_early_return_by_cudagraph("preprocess")
+    def preprocess(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ):
+        """Preprocess token routing for dispatch.
 
-        # If residual is given, the token dispatcher preprocess should have been called.
-        # Skip it.
-        if residual is None:
-            residual = hidden_states
-            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs
-            )
-        else:
-            assert probs is not None, "probs must not be None if residual is not None"
-            assert routing_map is None, "routing_map must be None if residual is not None"
-
-        # Return right here if we are capturing the MoE preprocess.
-        if self.cuda_graph_early_return("preprocess"):
-            self.early_returned = True
-            outputs = [hidden_states, probs, residual]
-            valid_cudagraph_attrs = []
-            for attr_name in self.token_dispatcher.cudagraph_attrs:
-                hier_attr_name = attr_name.split('.')
-                attr = self.token_dispatcher
-                for name in hier_attr_name:
-                    attr = getattr(attr, name, None)
-                    if attr is None:
-                        break
-                if isinstance(attr, torch.Tensor):
-                    outputs.append(attr)
-                    valid_cudagraph_attrs.append(attr_name)
-            if self.token_dispatcher.valid_cudagraph_attrs is None:
-                self.token_dispatcher.valid_cudagraph_attrs = valid_cudagraph_attrs
-            else:
-                assert self.token_dispatcher.valid_cudagraph_attrs == valid_cudagraph_attrs, (
-                    "valid_cudagraph_attrs mismatch: "
-                    f"{self.token_dispatcher.valid_cudagraph_attrs} != {valid_cudagraph_attrs}"
-                )
-            return outputs
-
+        This method preprocesses the hidden states and probabilities for the token dispatcher.
+        The original hidden states are returned as a residual connection.
+        """
+        residual = hidden_states
+        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs
+        )
         return hidden_states, probs, residual
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -244,6 +207,7 @@ class MoELayer(BaseMoELayer):
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
+    @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
 
@@ -302,14 +266,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        probs: Optional[torch.Tensor] = None,
-        routing_map: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
-        shared_expert_output: Optional[torch.Tensor] = None,
-    ):
+    def forward(self, hidden_states: torch.Tensor):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -320,13 +277,6 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor to the MoE layer.
-            probs (Optional[torch.Tensor]): The probabilities of the tokens to the experts. Router
-                will be skipped if this is given.
-            routing_map (Optional[torch.Tensor]): The routing map.
-            residual (Optional[torch.Tensor]): The residual connection from router_and_preprocess.
-                router_and_preprocess will be skipped if this is given.
-            shared_expert_output (Optional[torch.Tensor]): The output of the shared experts. Shared
-                expert computation will be skipped if this is given.
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -338,26 +288,14 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(
-            hidden_states,
-            probs: Optional[torch.Tensor] = None,
-            routing_map: Optional[torch.Tensor] = None,
-            residual: Optional[torch.Tensor] = None,
-            shared_expert_output: Optional[torch.Tensor] = None,
-        ):
-            if shared_expert_output is None:
+        def custom_forward(hidden_states):
+            try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
+                probs, routing_map = self.route(hidden_states)
+                hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
+            except MoELayerEarlyReturnException as e:
+                return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
-            self.early_returned = False
-            outputs = self.router_and_preprocess(
-                hidden_states, probs=probs, routing_map=routing_map, residual=residual
-            )
-            if self.early_returned:
-                if shared_expert_output is not None:
-                    outputs.append(shared_expert_output)
-                return outputs
-
-            hidden_states, probs, residual = outputs
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
@@ -371,25 +309,11 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
-                    probs,
-                    routing_map,
-                    residual,
-                    shared_expert_output,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(
-                    custom_forward,
-                    False,
-                    hidden_states,
-                    probs,
-                    routing_map,
-                    residual,
-                    shared_expert_output,
-                )
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
-            outputs = custom_forward(
-                hidden_states, probs, routing_map, residual, shared_expert_output
-            )
+            outputs = custom_forward(hidden_states)
 
         return outputs
 
@@ -408,20 +332,21 @@ class MoELayer(BaseMoELayer):
 
             set_save_original_input(self.shared_experts.linear_fc1)
 
-    def cuda_graph_early_return(self, return_condition):
-        """Check if the MoE layer should early return for CUDA graph capture."""
-        if (
-            self.config.cuda_graph_impl == "transformer_engine"
-            and self.training
-            and is_graph_capturing()
-        ):
-            if return_condition == "router":
-                if (
-                    'moe_router' in self.config.cuda_graph_scope
-                    and 'moe_preprocess' not in self.config.cuda_graph_scope
-                ):
-                    return True
-            elif return_condition == "preprocess":
-                if 'moe_preprocess' in self.config.cuda_graph_scope:
-                    return True
-        return False
+    def set_cudagraph_tensor_store(
+        self,
+        hidden_states: Optional[torch.Tensor] = None,
+        probs: Optional[torch.Tensor] = None,
+        routing_map: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        shared_expert_output: Optional[torch.Tensor] = None,
+    ):
+        """Set the cudagraph tensor store for the MoE layer."""
+        self.cudagraph_tensor_store['hidden_states'] = hidden_states
+        self.cudagraph_tensor_store['probs'] = probs
+        self.cudagraph_tensor_store['routing_map'] = routing_map
+        self.cudagraph_tensor_store['residual'] = residual
+        self.cudagraph_tensor_store['shared_expert_output'] = shared_expert_output
+
+    def clear_cudagraph_tensor_store(self):
+        """Clear the cudagraph tensor store for the MoE layer."""
+        self.cudagraph_tensor_store.clear()
