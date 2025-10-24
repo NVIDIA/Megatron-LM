@@ -323,6 +323,7 @@ test:linting_copyright:
         exit 0
       fi
     - git fetch origin main
+    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
     - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
     - bash tools/copyright.sh
 
