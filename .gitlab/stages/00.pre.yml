@@ -379,10 +379,10 @@ pre:approve_merge_gate:
 
       gh api "repos/$REPO/actions/runs?status=waiting" --jq '.workflow_runs[].id' \
         | while read run_id; do
-            HEAD_BRANCH=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.head_branch')
+            HEAD_BRANCH=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.head_branch' 2>/dev/null) || continue
             PR_NUMBER="${HEAD_BRANCH##*/}"
             if [ -n "$PR_NUMBER" ]; then
-                PR_BASE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref')
+                PR_BASE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref' 2>/dev/null) || continue
                 if [ "$PR_BASE" = "$TARGET_BRANCH" ]; then
                     gh api \
                       --method POST "repos/$REPO/actions/runs/$run_id/pending_deployments" \
