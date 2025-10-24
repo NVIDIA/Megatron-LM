@@ -150,6 +150,8 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
+              pr_info = workflow.get("pull_requests", [{}])[0]
+              pr_number = pr_info.get("number", "unknown")
               print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
