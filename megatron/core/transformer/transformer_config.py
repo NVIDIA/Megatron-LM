@@ -191,11 +191,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to clip the query and key weights. Introduced in TE 2.9.0. Needed for Muon LLM 
     training."""
 
-    qk_clip_balancing_alpha: float = 0.5
+    qk_clip_alpha: float = 0.5
     """The balancing alpha for qk-clip. Q = Q * (eta ** alpha)"""
 
-    qk_clip_balancing_threshold: float = 100
-    """The balancing threshold for qk-clip. eta = min(threshold / max_attention_score, 1.0)"""
+    qk_clip_threshold: float = 100
+    """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
 
     test_mode: bool = False
     """Whether to run real-time tests."""

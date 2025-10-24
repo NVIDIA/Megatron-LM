@@ -1280,15 +1280,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # get max attention score for logging and run clip_qk()
     # Part of MuonClip Optimizer step
-    log_max_attention_score = 0
+    log_max_attention_logit = 0
     if args.qk_clip:
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
                 if hasattr(transformer_layer.self_attention, 'clip_qk'):
-                    log_max_attention_score = max(
-                        log_max_attention_score, 
+                    log_max_attention_logit = max(
+                        log_max_attention_logit, 
                         torch.max(
-                            transformer_layer.self_attention.core_attention.current_max_attn_scores
+                            transformer_layer.self_attention.core_attention.current_max_attn_logits
                         ).item()
                     )
                     transformer_layer.self_attention.clip_qk()
@@ -1364,9 +1364,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             exit_code,
             grad_norm,
             num_zeros_in_grad,
-            log_max_attention_score,
+            log_max_attention_logit,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_score
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
 def training_log(
@@ -1381,7 +1381,7 @@ def training_log(
     grad_norm,
     params_norm,
     num_zeros_in_grad,
-    max_attention_score,
+    max_attention_logit,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1527,10 +1527,10 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
-        if args.log_max_attention_score:
-            writer.add_scalar('max_attention_score', max_attention_score, iteration)
+        if args.log_max_attention_logit:
+            writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
-                wandb_writer.log({'max_attention_score': max_attention_score}, iteration)
+                wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2229,7 +2229,7 @@ def train(
             exit_code,
             grad_norm,
             num_zeros_in_grad,
-            max_attention_score,
+            max_attention_logit,
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
@@ -2315,7 +2315,7 @@ def train(
             grad_norm,
             params_norm,
             num_zeros_in_grad,
-            max_attention_score,
+            max_attention_logit,
         )
 
         # Evaluation.
