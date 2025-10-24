@@ -357,7 +357,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:1909 #${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
@@ -462,7 +462,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:1864 # ${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:
