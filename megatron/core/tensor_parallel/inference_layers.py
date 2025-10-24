@@ -9,26 +9,22 @@ import transformer_engine as te
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.parallel_state import get_tensor_model_parallel_group
-
-from .mappings import (
-    gather_from_sequence_parallel_region,
-    reduce_scatter_to_sequence_parallel_region,
-)
+from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TERowParallelLinear
 
 try:
-    import transformer_engine as te
     import transformer_engine.pytorch.cpp_extensions as tex
     from transformer_engine.pytorch.constants import TE_DType
-    from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TERowParallelLinear
+    from transformer_engine.pytorch.distributed import gather_along_first_dim, reduce_scatter_along_first_dim
     HAVE_TE=True 
 except ImportError:
     HAVE_TE = False
-    
 
-def _te_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float):
+
+def _te_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    x_shape = x.shape
+    x = x.view(-1, x.size(-1))
     out , _, _ = tex.rmsnorm_fwd(
-            input,
+            x,
             weight,
             eps,
             None,
@@ -37,7 +33,8 @@ def _te_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float):
             16, # sm-margin
             False, # zero centered gamma
         )
-    return out.to(input.dtype)
+    out = out.view(*x_shape[:-1], -1)
+    return out.to(x.dtype)
 
 # def _te_gemm(input: torch.Tensor, weight: torch.Tensor):
 #     output_shape = list(input.shape) 
@@ -96,22 +93,21 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             assert (
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
-        assert self.tp_size == 1
+        
 
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         # make x 2D but restore original shape at the end
-        x_shape = x.shape
-        x = x.view(-1, x.size(-1))
+        
         x = _te_rms_norm(
-            input=x, weight=self.layer_norm_weight, eps=self.eps
+            x=x, weight=self.layer_norm_weight, eps=self.eps
         )
+
         if self.tp_size > 1:
-            x = gather_from_sequence_parallel_region(
-                x, group=self.tp_group, tensor_parallel_output_grad=False
+            x, _ = gather_along_first_dim(
+                x, process_group=self.tp_group
             )
         x = torch.matmul(x, self.weight.t())
-        x = x.view(*x_shape[:-1], -1)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -162,15 +158,13 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
-        assert self.tp_size == 1
-
+    @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.matmul(x, self.weight.t())
         if self.tp_size > 1:
-            x = reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group)
+            x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward
