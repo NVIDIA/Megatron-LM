@@ -4,18 +4,23 @@
 from typing import Callable, Optional
 
 import torch
-import torch.nn.functional as F
-import transformer_engine as te
 
+from megatron.core.extensions.transformer_engine import (
+    TELayerNormColumnParallelLinear,
+    TERowParallelLinear,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TERowParallelLinear
 
 try:
     import transformer_engine.pytorch.cpp_extensions as tex
     from transformer_engine.pytorch.constants import TE_DType
-    from transformer_engine.pytorch.distributed import gather_along_first_dim, reduce_scatter_along_first_dim
-    HAVE_TE=True 
+    from transformer_engine.pytorch.distributed import (
+        gather_along_first_dim,
+        reduce_scatter_along_first_dim,
+    )
+
+    HAVE_TE = True
 except ImportError:
     HAVE_TE = False
 
@@ -23,36 +28,19 @@ except ImportError:
 def _te_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
-    out , _, _ = tex.rmsnorm_fwd(
-            x,
-            weight,
-            eps,
-            None,
-            None,
-            TE_DType[torch.bfloat16],
-            16, # sm-margin
-            False, # zero centered gamma
-        )
+    out, _, _ = tex.rmsnorm_fwd(
+        x,
+        weight,
+        eps,
+        None,
+        None,
+        TE_DType[torch.bfloat16],
+        16,  # sm-margin
+        False,  # zero centered gamma
+    )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
 
-# def _te_gemm(input: torch.Tensor, weight: torch.Tensor):
-#     output_shape = list(input.shape) 
-#     output_shape[-1] = weight.size(0)
-#     output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-#     tex.general_gemm(
-#             weight,
-#             input,
-#             get_workspace(),
-#             out_dtype=input.dtype,
-#             quantization_params=None,
-#             alpha=1.0,
-#             beta=None,
-#             accumulate=False,
-#             out=output,
-#             bias=None,
-#             use_split_accumulator=_2X_ACC_FPROP,
-#         )
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
     """
@@ -86,27 +74,22 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             is_expert=is_expert,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group
+            tp_group=tp_group,
         )
 
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
-        
 
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         # make x 2D but restore original shape at the end
-        
-        x = _te_rms_norm(
-            x=x, weight=self.layer_norm_weight, eps=self.eps
-        )
+
+        x = _te_rms_norm(x=x, weight=self.layer_norm_weight, eps=self.eps)
 
         if self.tp_size > 1:
-            x, _ = gather_along_first_dim(
-                x, process_group=self.tp_group
-            )
+            x, _ = gather_along_first_dim(x, process_group=self.tp_group)
         x = torch.matmul(x, self.weight.t())
         return x
 
@@ -150,7 +133,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             skip_bias_add=skip_bias_add,
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group
+            tp_group=tp_group,
         )
 
         if self.tp_size > 1:
