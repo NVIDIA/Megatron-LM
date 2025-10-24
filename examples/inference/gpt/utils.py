@@ -13,6 +13,8 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.transformer.module import MegatronModule
 
+from megatron.core.inference.sampling_params import SamplingParams
+
 
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -130,6 +132,16 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
+def get_default_sampling_params(termination_id: int = None):
+    return SamplingParams(
+    temperature=1.0,
+    top_k=1,
+    top_p=0.0,
+    return_log_probs=False,
+    num_tokens_to_generate=30,
+    termination_id = termination_id,
+)
+
 def get_curr_time() -> float:
     """Get synchronized time across ranks."""
     curr_time = torch.cuda.LongTensor([time.time_ns()])
@@ -153,7 +165,7 @@ class Request:
         tokenizer (Any): Tokenizer for tokenizing the prompt.
     """
 
-    def __init__(self, prompt_text: str, time_offset: float, tokenizer: Any):
+    def __init__(self, prompt_text: str, time_offset: float, tokenizer: Any, sampling_params: SamplingParams = None):
         self.prompt_text = prompt_text
         self.prompt_tokens = tokenizer.tokenize(prompt_text)
         self.output_text = None
@@ -163,6 +175,7 @@ class Request:
         self.time_start = None
         self.time_end = None
         self.state = "not-started"
+        self.sampling_params: SamplingParams = sampling_params if sampling_params is not None else get_default_sampling_params(tokenizer.eod)
 
     def __str__(self) -> str:
         return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
@@ -231,7 +244,9 @@ def get_cli_requests(args: Namespace, tokenizer: Any) -> list[Request]:
     return requests
 
 
-def get_synthetic_requests(args: Namespace, tokenizer: Any) -> list[Request]:
+def get_synthetic_requests(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
     """Get example requests."""
 
     # Get time offsets.
@@ -251,7 +266,9 @@ def get_synthetic_requests(args: Namespace, tokenizer: Any) -> list[Request]:
     return requests
 
 
-def get_requests_from_file(args: Namespace, tokenizer: Any) -> list[Request]:
+def get_requests_from_file(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
     """Get requests from a file."""
     if not args.prompt_file:
         raise ValueError("Prompt file is required to read requests from a file.")
@@ -275,23 +292,25 @@ def get_requests_from_file(args: Namespace, tokenizer: Any) -> list[Request]:
 
     # Init requests.
     requests = [
-        Request(p, t, tokenizer)
+        Request(p, t, tokenizer, sampling_params)
         for p, t in tqdm(zip(prompts, time_offsets), "init requests", total=len(prompts))
     ]
 
     return requests
 
 
-def build_requests(args: Namespace, tokenizer: Any) -> list[Request]:
+def build_requests(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
     # Check if we have any prompts (from command line or JSONL)
     if args.prompts:
         if args.prompt_file:
             raise ValueError("Cannot use both --prompts and --prompt-file")
         return get_cli_requests(args, tokenizer)
     elif args.prompt_file:
-        return get_requests_from_file(args, tokenizer)
+        return get_requests_from_file(args, tokenizer, sampling_params)
     else:
-        return get_synthetic_requests(args, tokenizer)
+        return get_synthetic_requests(args, tokenizer, sampling_params)
 
 
 def get_model_size_str(model):
