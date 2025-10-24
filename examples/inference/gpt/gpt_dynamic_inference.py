@@ -294,6 +294,14 @@ def run_inference(
             # Append output tokens.
             output_start = get_curr_time()
             for finished_request in finished_requests:
+                # >>>
+                import msgpack
+                j0 = dict(sorted(finished_request.serializable().items()))
+                # j1 = json.loads(json.dumps(j0))
+                j1 = msgpack.packb(j0, use_bin_type=True)
+                from lutil import pax
+                pax("finished_request, j0, j1")
+                # <<<
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
                 total_output_tokens += len(request.output_tokens)
@@ -403,6 +411,13 @@ def main():
         assert request.state == "finished", (
             f"request.state == '{request.state}' != 'finished'."
         )
+
+    # >>>
+    from lutil import pax
+    pax("requests", {
+        "requests / 0" : requests[0],
+    })
+    # <<<
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
