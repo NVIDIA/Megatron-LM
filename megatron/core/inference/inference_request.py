@@ -18,20 +18,12 @@ def serialize_tensor(tensor):
     torch.save(tensor, buffer)
     buffer.seek(0)
     tensor_bytes = buffer.read()
-    # >>>
-    # from lutil import pax
-    # pax("tensor, tensor_bytes")
-    # <<<
     return tensor_bytes
 
 
 def deserialize_tensor(tensor_bytes):
     buffer = io.BytesIO(tensor_bytes)
     tensor = torch.load(buffer)
-    # >>>
-    from lutil import pax
-    pax("tensor_bytes, tensor")
-    # <<<
     return tensor
 
 
@@ -93,7 +85,7 @@ class InferenceRequest:
         obj = asdict(self)
         obj["status"] = self.status.name if self.status else None
 
-        # Serialize all tensors.
+        # Serialize tensors.
         # >>>
         # obj = {
         #     k : (v.tolist() if isinstance(v, torch.Tensor) else v)
@@ -122,12 +114,21 @@ class InferenceRequest:
         Returns:
             (InferenceRequest) Deserialized request.
         """
+
+        # Initialize request.
         req = cls(**obj)
         req.status = None if obj["status"] is None else Status[obj["status"]]
+
+        # Deserialize tensors.
+        for k, v in obj.items():
+            if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
+                setattr(req, k, deserialize_tensor(v[1]))
+
         # >>>
         from lutil import pax
         pax("obj, req")
         # <<<
+
         return req
 
 
