@@ -249,20 +249,10 @@ def test_precision_aware_optimizer(
     rtol, atol = 1.6e-2, 1e-5
 
     # Compare grad norms - allow small difference due to precision
-    torch.testing.assert_close(
-        test_grad_norm,
-        baseline_grad_norm,
-        atol=atol,
-        rtol=rtol,
-    )
+    torch.testing.assert_close(test_grad_norm, baseline_grad_norm, atol=atol, rtol=rtol)
 
     # Compare losses - allow small difference due to precision
-    torch.testing.assert_close(
-        test_loss,
-        baseline_loss,
-        atol=atol,
-        rtol=rtol,
-    )
+    torch.testing.assert_close(test_loss, baseline_loss, atol=atol, rtol=rtol)
 
     # Save and reload state dict for the test model
     state_dict = test_optim.state_dict()
