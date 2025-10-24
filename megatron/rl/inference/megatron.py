@@ -154,15 +154,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _kill_engine: bool = PrivateAttr(False)
 
     async def base_generate(self, request: InferenceRequest):
-
         tokenizer = get_tokenizer()
-
-        if tokenizer.bos is None:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
-            )
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=request.generation_args.max_tokens or 1024,
@@ -195,6 +187,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
         args = get_args()
+        tokenizer = get_tokenizer()
+
+        if tokenizer.bos is None:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
+            )
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model)
         coordinator = DynamicEngineCoordinator(
