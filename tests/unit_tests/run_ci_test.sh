@@ -150,7 +150,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
         -m pytest \
         -xvs \
         ${IGNORE_ARGS[@]} \
-        -m "'not experimental and ${MARKER_ARG}'" $(echo $BUCKET | sed 's|/\*\*/\*\.py$||'))
+        -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
     eval "$CMD"
 
     if [[ "$TAG" == "latest" ]]; then
@@ -158,7 +158,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
             -xvs \
             --experimental \
              ${IGNORE_ARGS[@]} \
-            -m "'experimental and ${MARKER_ARG}'" $(echo $BUCKET | sed 's|/\*\*/\*\.py$||'))
+            -m "'experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
 
         eval "$CMD"
     fi
