@@ -252,7 +252,6 @@ def test_precision_aware_optimizer(
         baseline_grad_norm,
         atol=atol,
         rtol=rtol,
-        msg=f"Grad norm mismatch: baseline={baseline_grad_norm}, test={test_grad_norm}",
     )
 
     # Compare losses - allow small difference due to precision
@@ -261,7 +260,6 @@ def test_precision_aware_optimizer(
         baseline_loss,
         atol=atol,
         rtol=rtol,
-        msg=f"Loss mismatch: baseline={baseline_loss}, test={test_loss}",
     )
 
     # Save and reload state dict for the test model
