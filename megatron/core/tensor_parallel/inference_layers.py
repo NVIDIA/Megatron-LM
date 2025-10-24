@@ -27,10 +27,41 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 
-_compiled_rms_norm = torch.compile(F.rms_norm)
+import transformer_engine.pytorch.cpp_extensions as tex
+from transformer_engine.pytorch.constants import TE_DType
 
+def _te_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float):
+    out , _, _ = tex.rmsnorm_fwd(
+            input,
+            weight,
+            eps,
+            None,
+            None,
+            TE_DType[torch.bfloat16],
+            16, # sm-margin
+            False, # zero centered gamma
+        )
+    return out.to(input.dtype)
 
-class InferenceLayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
+def _te_gemm(input: torch.Tensor, weight: torch.Tensor):
+    output_shape = list(input.shape) 
+    output_shape[-1] = weight.size(0)
+    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+    tex.general_gemm(
+            weight,
+            input,
+            get_workspace(),
+            out_dtype=input.dtype,
+            quantization_params=None,
+            alpha=1.0,
+            beta=None,
+            accumulate=False,
+            out=output,
+            bias=None,
+            use_split_accumulator=_2X_ACC_FPROP,
+        )
+
+class InferenceLayerNormColumnParallelLinear(te.pytorch.Linear):
     """
     Inference optimized version of TELayerNormColumnParallelLinear.
     """
@@ -51,11 +82,7 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(
-            in_features=input_size,
-            out_features=output_size,
-            init_method=init_method,
-            eps=config.layernorm_epsilon,
-            normalization="RMSNorm",
+            in_features=input_size, out_features=output_size, init_method=init_method, bias=bias
         )
 
         if self.tp_size > 1:
@@ -63,17 +90,25 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
+        self.layer_norm_weight = torch.nn.Parameter(torch.empty(input_size))
+        self.eps = config.layernorm_epsilon
+    
+
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _compiled_rms_norm(
-            input=x, normalized_shape=(x.size(-1),), weight=self.layer_norm_weight, eps=self.eps
+        # make x 2D but restore original shape at the end
+        x_shape = x.shape
+        x = x.view(-1, x.size(-1))
+        x = _te_rms_norm(
+            input=x, weight=self.layer_norm_weight, eps=self.eps
         )
         if self.tp_size > 1:
             x = gather_from_sequence_parallel_region(
                 x, group=self.tp_group, tensor_parallel_output_grad=False
             )
-        x = F.linear(input=x, weight=self.weight)
-        return x, None
+        x = torch.matmul(x, self.weight.t())
+        x = x.view(*x_shape[:-1], -1)
+        return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -83,7 +118,7 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             # Training mode -> fallback to TE
             return super().forward(x), None
         else:
-            return super().forward(x), None
+            return self._inference_forward(x), None
 
 
 class InferenceRowParallelLinear(te.pytorch.Linear):
@@ -115,7 +150,7 @@ class InferenceRowParallelLinear(te.pytorch.Linear):
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = super().forward(x)
+        x = torch.matmul(x, self.weight.t())
         if self.tp_size > 1:
             x = reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group)
         return x
