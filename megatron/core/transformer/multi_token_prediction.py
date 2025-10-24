@@ -514,6 +514,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             bias=False,
             skip_bias_add=False,
             is_expert=False,
+            tp_comm_buffer_name="mtp_eh_proj"
         )
         if self.config.mtp_num_layers is not None:
             if self.mtp_hybrid_override_pattern is not None:
