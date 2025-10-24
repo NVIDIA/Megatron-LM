@@ -128,7 +128,10 @@ class OptimizerConfig:
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
 
-    muon_use_nesterov: bool = True
+    muon_split_qkv: bool = True
+    """Whether to split QKV parameters for Muon optimizer."""
+
+    muon_use_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"

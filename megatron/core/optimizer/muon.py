@@ -3,8 +3,7 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from functools import partial
-from typing import Callable, List, Literal, Optional
+from typing import Any, Callable, List, Literal, Optional
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -65,35 +64,36 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
 
-        orthogonalize_fn = partial(
-            newton_schulz_tp,
-            steps=num_ns_steps,
-            coefficient_type=coefficient_type,
-            mode="duplicated" if mode == "blockwise" else mode,
-        )
-        scale_factor_fn = partial(
-            get_muon_scale_factor, mode=scale_mode, extra_scale_factor=extra_scale_factor
-        )
-
-        def orthogonalize_fn_tp(
-            x: torch.Tensor,
+        def scaled_orthogonalize_fn(
+            grad: torch.Tensor,
             tp_group: torch.distributed.ProcessGroup,
             partition_dim: int | None = None,
         ) -> torch.Tensor:
-            return orthogonalize_fn(x, tp_group=tp_group, partition_dim=partition_dim)
-
-        def scale_factor_fn_tp(
-            size_out: int, size_in: int, partition_dim: int | None = None
-        ) -> float:
-            if partition_dim is None:
-                return scale_factor_fn(size_out, size_in)
-
-            size = [size_out, size_in]
-            size[partition_dim] *= get_pg_size(pg_collection.tp) if pg_collection else 1
-            return scale_factor_fn(*size)
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'Orthogonalizing grad with {num_ns_steps} steps, {coefficient_type} coefficient, '
+                f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
+            )
+            size = [grad.size(-2), grad.size(-1)]
+            if partition_dim:
+                size[partition_dim] *= get_pg_size(tp_group)
+            orth_grad = newton_schulz_tp(
+                grad,
+                steps=num_ns_steps,
+                coefficient_type=coefficient_type,
+                tp_group=tp_group,
+                partition_dim=partition_dim,
+                mode="duplicated" if mode == "blockwise" else mode,
+            )
+            scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
+            return orth_grad * scale_factor * extra_scale_factor
 
         self.pg_collection = pg_collection
         self.mode = mode
+        self.split_qkv = split_qkv
+        self.is_qkv_fn = is_qkv_fn
+        self.qkv_split_shapes = qkv_split_shapes
 
         super().__init__(
             params,
@@ -102,15 +102,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             use_nesterov,
             weight_decay,
             use_decoupled_weight_decay,
-            split_qkv,
-            is_qkv_fn,
-            qkv_split_shapes,
             fp32_matmul_prec,
-            orthogonalize_fn_tp,
-            scale_factor_fn_tp,
+            scaled_orthogonalize_fn,
         )
 
-    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
         Args:
@@ -122,6 +118,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (
                 self.pg_collection.expt_tp
@@ -135,27 +132,33 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # llm-shower use different default value for partition_dim than TE.
             # Because -1 is a valid index for ndarray, we decided to not overload it.
             partition_dim = None
+
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             # split grouped attention parameters (e.g., QKV, GQA, etc.)
-            qkv_grads = torch.split(grad, self.qkv_split_shapes, dim=0)
+            grad_shape = grad.shape
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'qkv split grad shape {grad_shape}, split shapes {self.qkv_split_shapes}',
+            )
+            num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
+            qkv_grads = torch.split(
+                grad.view(num_query_groups, sum(self.qkv_split_shapes), -1),
+                self.qkv_split_shapes,
+                dim=1,
+            )
+            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
 
-            # Apply Newton-Schulz to each component
-            qkv_whitened = [
-                self.orthogonalize_fn(g, tp_group=tp_group, partition_dim=partition_dim)
+            # Apply Newton-Schulz and scales to each component, concat back
+            qkv_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                    num_query_groups, -1, grad_shape[-1]
+                )
                 for g in qkv_grads
             ]
-            qkv_scales = [
-                self.scale_factor_fn(g.size(0), g.size(1), partition_dim) for g in qkv_grads
-            ]
-
-            # Apply individual scales to each component and concatenate
-            grad = torch.cat(
-                [whitened * scale for whitened, scale in zip(qkv_whitened, qkv_scales)]
-            )
+            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
         else:
-            grad = self.orthogonalize_fn(
-                grad, tp_group=tp_group, partition_dim=partition_dim
-            ) * self.scale_factor_fn(grad.size(0), grad.size(1), partition_dim)
+            grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
 
 
@@ -206,7 +209,18 @@ def get_megatron_muon_optimizer(
     # record list of non/linear params
     linear_params = []
     nonlinear_params = []
+
     for model_chunk in model_chunks:
+        # use config to determine qkv split shapes.
+        # no need to check tp since tp splits by head and this is per head(group) dimension
+        num_attention_heads = model_chunk.config.num_attention_heads
+        num_query_groups = model_chunk.config.num_query_groups
+        kv_channels = model_chunk.config.kv_channels
+        qkv_split_shapes = [
+            num_attention_heads // num_query_groups * kv_channels,
+            kv_channels,
+            kv_channels,
+        ]
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -215,6 +229,10 @@ def get_megatron_muon_optimizer(
             # change in optimizer
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
+            # add flag for qkv parameter
+            # TODO(deyuf): support MLA
+            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                param.is_qkv = True
             # TODO(deyuf): might not be sufficient for future algorithm. revisit this conditioning
             if not getattr(param, 'is_embedding_or_output_parameter', False) and not (
                 len(param.shape) == 1
@@ -238,7 +256,6 @@ def get_megatron_muon_optimizer(
         decoupled_min_lr=config.decoupled_min_lr,
     )
 
-    # TODO(deyuf): support qkv split
     optimizer = TensorParallelMuon(
         linear_param_groups,
         lr=config.lr,
@@ -248,8 +265,9 @@ def get_megatron_muon_optimizer(
         fp32_matmul_prec=config.muon_fp32_matmul_prec,
         num_ns_steps=config.muon_num_ns_steps,
         scale_mode=config.muon_scale_mode,
-        split_qkv=False,
-        qkv_split_shapes=None,
+        split_qkv=config.muon_split_qkv,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=qkv_split_shapes,
         extra_scale_factor=config.muon_extra_scale_factor,
         pg_collection=pg_collection,
         mode=config.muon_tp_mode,
