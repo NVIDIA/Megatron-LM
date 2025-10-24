@@ -114,39 +114,7 @@ for element in "${MARKER[@]:1}"; do
 done
 
 export BUCKET
-ALL_TEST_CASES=$(cat tests/test_utils/recipes/unit-tests.yaml | yq eval '.products[].test_case[]' -)
-OTHER_TEST_CASES=$(echo "$ALL_TEST_CASES" | grep -vF "$BUCKET")
-
-echo "Other test cases:"
-echo "$OTHER_TEST_CASES"
-echo ""
-
-# Expand wildcards in other test cases to get files to exclude
-EXCLUDE_FILES=""
-while IFS= read -r test_case; do
-    [[ -z "$test_case" ]] && continue
-    if [[ "$test_case" == *"*"* ]]; then
-        # Expand wildcard
-        for file in $test_case; do
-            [[ -f "$file" ]] && EXCLUDE_FILES="$EXCLUDE_FILES$file "
-        done
-    else
-        # Add as-is
-        EXCLUDE_FILES="$EXCLUDE_FILES$test_case "
-    fi
-done <<< "$OTHER_TEST_CASES"
-
-echo "Files to exclude:"
-echo "$EXCLUDE_FILES"
-echo ""
-
-# Build IGNORE_ARGS array
-IGNORE_ARGS=()
-while IFS= read -r file; do
-    if ! echo "$EXCLUDE_FILES" | grep -qF "$file"; then
-        IGNORE_ARGS+=("--ignore=$file")
-    fi
-done < <(find tests/unit_tests/dist_checkpointing/ -maxdepth 1 -name "*.py" -type f)
+IGNORE_ARGS=("${(@f)$(python tests/unit_tests/find_test_cases.py "$BUCKET")}")
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
