@@ -303,7 +303,7 @@ jobs:
     needs:
       - pre-flight
       - cicd-wait-in-queue
-      - cicd-container-build
+      # - cicd-container-build
     if: |
       (
         success() 
@@ -329,7 +329,7 @@ jobs:
     needs:
       - pre-flight
       - cicd-wait-in-queue
-      - cicd-container-build
+      # - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
