@@ -957,15 +957,10 @@ class DynamicInferenceEngine(AbstractEngine):
     ):
         """Continually steps the engine asynchronously."""
         # >>> [ todo(@lmcafee): remove ]
-        n_steps = 0
+        verbose = True
         # <<<
         try:
             while True:
-                # >>> [ todo(@lmcafee): remove ]
-                logging.info("... engine | step %d." % n_steps)
-                n_steps += 1
-                # await asyncio.sleep(0.02)
-                # <<<
                 self.schedule_requests()
                 if self.stopped:
                     self.stop()
@@ -1010,27 +1005,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
-                            # >>>
-                            # [
-                            #     r.serializable()
-                            #     for r in engine_output["finished_requests"]
-                            # ],
-                            # +++
                             [
-                                {
-                                    "request_id": r.request_id,
-                                    "prompt_tokens": r.prompt_tokens.tolist(),
-                                    "generated_tokens": r.generated_tokens,
-                                    "prompt": self.controller.tokenizer.detokenize(
-                                        r.prompt_tokens.tolist()
-                                    ),
-                                    "generated_text": self.controller.tokenizer.detokenize(
-                                        r.generated_tokens
-                                    ),
-                                }
+                                r.serializable()
                                 for r in engine_output["finished_requests"]
                             ],
-                            # <<<
                         ],
                         use_bin_type=True,
                     )

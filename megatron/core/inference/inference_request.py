@@ -66,27 +66,17 @@ class InferenceRequest:
             dict: A dictionary representation of the instance suitable for serialization.
         """
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # return asdict(self)
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        # Dataclass to dict.
         obj = asdict(self)
-
         obj["status"] = self.status.name if self.status else None
+
+        # Serialize all tensors.
         obj = {
             k : (v.tolist() if isinstance(v, torch.Tensor) else v)
             for k, v in obj.items()
         }
 
-        # >>>
-        # from lutil import pax
-        # pax({
-        #     "before" : asdict(self),
-        #     "after" : obj, # dict(sorted(obj.items())),
-        # })
-        # <<<
-
         return obj
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 class DynamicInferenceEventType(Enum):
@@ -140,15 +130,18 @@ class DynamicInferenceEvent:
         payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def serialize(self):
         """
         Converts the instance into a serializable dictionary.
         Returns:
             dict: A dictionary representation of the instance suitable for serialization.
         """
+
+        # Dataclass to dict.
         obj = asdict(self)
         obj["type"] = self.type.name
+
+        # Serialize payload.
         if self.payload:
             assert isinstance(self.payload, Exception)
             obj["payload"] = {
@@ -157,17 +150,7 @@ class DynamicInferenceEvent:
                 "is_transient" : self.payload.is_transient,
             }
 
-        # >>>
-        # if self.payload:
-        #     import msgpack
-        #     from lutil import pax
-        #     pax("obj", {
-        #         "packed" : msgpack.packb(obj, use_bin_type=True),
-        #     })
-        # <<<
-
         return obj
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
@@ -210,36 +193,15 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def serializable(self):
         """
         Converts the instance into a serializable dictionary.
         Returns:
             dict: A dictionary representation of the instance suitable for serialization.
         """
-        # >>>
-        from .contexts import RequestOverflowError
-        self.add_event_error_transient(RequestOverflowError(0, "i errored", is_transient=True))
-        # <<<
-
         obj = super().serializable()
         obj["events"] = [ e.serialize() for e in self.events ]
-
-        # >>>
-        import msgpack
-        from lutil import pax
-        # pax({
-        #     "obj" : dict(sorted(obj.items())),
-        #     "events" : obj["events"],
-        # })
-        # pax(dict(enumerate(obj["events"])))
-        pax("obj", {
-            "packed" : msgpack.packb(obj, use_bin_type=True),
-        })
-        # <<<
-
         return obj
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""
