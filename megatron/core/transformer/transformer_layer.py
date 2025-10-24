@@ -433,21 +433,23 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 else:
                     params = \
                         list(self.pre_mlp_layernorm.parameters()) \
-                        + list(self.mlp.shared_experts.parameters()) \
-                        + list(self.mlp.fc1_latent_proj.parameters()) \
-                        + list(self.mlp.router.parameters())
+                        + list(self.mlp.shared_experts.parameters())
+                    if config.moe_latent_size is not None:
+                        params += list(self.mlp.fc1_latent_proj.parameters())
+                    params += list(self.mlp.router.parameters())
                     CudaGraphManager(
                         config, self,
                         function_name="_forward_mlp_moe_preprocess", 
                         params_to_calculate_wgrads=params, 
                         need_backward=True,
                     )
-                    CudaGraphManager(
-                        config, self,
-                        function_name="_forward_mlp_moe_postprocess", 
-                        params_to_calculate_wgrads=list(self.mlp.fc2_latent_proj.parameters()),
-                        need_backward=True,
-                    )
+                    if config.moe_latent_size is not None:
+                        CudaGraphManager(
+                            config, self,
+                            function_name="_forward_mlp_moe_postprocess",
+                            params_to_calculate_wgrads=list(self.mlp.fc2_latent_proj.parameters()),
+                            need_backward=True,
+                        )
 
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
