@@ -78,7 +78,7 @@ ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
 RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
-    python -m venv /opt/jet 
+    python -m venv /opt/jet
     /opt/jet/bin/pip install --no-cache-dir $JET_INDEX_URLS \
         jet-api==$JET_API_VERSION
 EOF
@@ -89,6 +89,6 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
     uv pip install --no-cache-dir --upgrade "setuptools<80.0.0"
-    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=3.0" 
+    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=3.0"
 EOF
 ###
