@@ -7,6 +7,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -912,7 +913,7 @@ class RandomSTE(torch.autograd.Function):
         """
         Forward pass returns random logits with rank-specific seed.
         """
-        if RandomSTE.random_logits is not None:
+        if is_graph_capturing() and RandomSTE.random_logits is not None:
             return RandomSTE.random_logits
 
         if RandomSTE.generator is None:
