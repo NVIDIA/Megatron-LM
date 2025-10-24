@@ -262,15 +262,6 @@ wheels = [
 ]
 
 [[package]]
-name = "annotated-doc"
-version = "0.0.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c4/92/2974dba489541ed4af531d00a4df075bc3a455557d3b54fd6932c51c95cc/annotated_doc-0.0.2.tar.gz", hash = "sha256:f25664061aee278227abfaec5aeb398298be579b934758c16205d48e896e149c", size = 4452, upload-time = "2025-10-22T18:38:52.597Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bd/ee/cc5109cdd46a6ccd3d923db3c5425383abe51b5c033647aad1b5e2452e82/annotated_doc-0.0.2-py3-none-any.whl", hash = "sha256:2188cb99e353fcb5c20f23b8bc6f5fa7c924b213fac733d4b44883f9edffa090", size = 4056, upload-time = "2025-10-22T18:38:51.24Z" },
-]
-
-[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1161,7 +1152,7 @@ wheels = [
 
 [[package]]
 name = "datasets"
-version = "4.3.0"
+version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dill" },
@@ -1179,9 +1170,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "xxhash" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2a/47/325206ac160f7699ed9f1798afa8f8f8d5189b03bf3815654859ac1d5cba/datasets-4.3.0.tar.gz", hash = "sha256:bc9118ed9afd92346c5be7ed3aaa00177eb907c25467f9d072a0d22777efbd2b", size = 582801, upload-time = "2025-10-23T16:31:51.547Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/70/48/0186fbc4b86a4f9ecaf04eb01e877e78b53bfa0b03be9c84b2298431ba33/datasets-4.2.0.tar.gz", hash = "sha256:8333a7db9f3bb8044c1b819a35d4e3e2809596c837793b0921382efffdc36e78", size = 582256, upload-time = "2025-10-09T16:10:15.534Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ca/51/409a8184ed35453d9cbb3d6b20d524b1115c2c2d117b85d5e9b06cd70b45/datasets-4.3.0-py3-none-any.whl", hash = "sha256:0ea157e72138b3ca6c7d2415f19a164ecf7d4c4fa72da2a570da286882e96903", size = 506846, upload-time = "2025-10-23T16:31:49.965Z" },
+    { url = "https://files.pythonhosted.org/packages/91/9e/0bbbd09b116fd8ee2d3617e28e6598551d2f0f24d3a2ce99cc87ec85aeb0/datasets-4.2.0-py3-none-any.whl", hash = "sha256:fdc43aaf4a73b31f64f80f72f195ab413a1141ed15555d675b2fd17926f8b026", size = 506316, upload-time = "2025-10-09T16:10:13.375Z" },
 ]
 
 [[package]]
@@ -1324,17 +1315,16 @@ wheels = [
 
 [[package]]
 name = "fastapi"
-version = "0.120.0"
+version = "0.119.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "annotated-doc" },
     { name = "pydantic" },
     { name = "starlette" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/0e/7f29e8f7219e4526747db182e1afb5a4b6abc3201768fb38d81fa2536241/fastapi-0.120.0.tar.gz", hash = "sha256:6ce2c1cfb7000ac14ffd8ddb2bc12e62d023a36c20ec3710d09d8e36fab177a0", size = 337603, upload-time = "2025-10-23T20:56:34.743Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a6/f4/152127681182e6413e7a89684c434e19e7414ed7ac0c632999c3c6980640/fastapi-0.119.1.tar.gz", hash = "sha256:a5e3426edce3fe221af4e1992c6d79011b247e3b03cc57999d697fe76cbf8ae0", size = 338616, upload-time = "2025-10-20T11:30:27.734Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/60/7a639ceaba54aec4e1d5676498c568abc654b95762d456095b6cb529b1ca/fastapi-0.120.0-py3-none-any.whl", hash = "sha256:84009182e530c47648da2f07eb380b44b69889a4acfd9e9035ee4605c5cfc469", size = 108243, upload-time = "2025-10-23T20:56:33.281Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/26/e6d959b4ac959fdb3e9c4154656fc160794db6af8e64673d52759456bf07/fastapi-0.119.1-py3-none-any.whl", hash = "sha256:0b8c2a2cce853216e150e9bd4faaed88227f8eb37de21cb200771f491586a27f", size = 108123, upload-time = "2025-10-20T11:30:26.185Z" },
 ]
 
 [[package]]
@@ -2436,7 +2426,7 @@ requires-dist = [
     { name = "torch" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.9" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.8" },
     { name = "transformers", marker = "extra == 'lts'" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -2479,7 +2469,7 @@ linting = [
 ]
 test = [
     { name = "coverage" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d" },
+    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=8ca8f7952a597f944985f1f1368a7acb9aa3a6c2" },
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
@@ -2897,7 +2887,7 @@ wheels = [
 [[package]]
 name = "nemo-run"
 version = "0.7.0rc0.dev0"
-source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d#01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
+source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=8ca8f7952a597f944985f1f1368a7acb9aa3a6c2#8ca8f7952a597f944985f1f1368a7acb9aa3a6c2" }
 dependencies = [
     { name = "catalogue" },
     { name = "cryptography" },
@@ -6036,8 +6026,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.9.0+739c6565"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.9#739c6565b10f8c70f9e0c6e86e50f027384999f5" }
+version = "2.8.0+40c69e75"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.8#40c69e751a47ec87786283e125c5eb264101270f" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata", version = "8.6.1", source = { registry = "https://pypi.org/simple" } },
