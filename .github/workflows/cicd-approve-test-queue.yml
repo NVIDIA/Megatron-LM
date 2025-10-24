@@ -25,7 +25,7 @@ jobs:
     environment: main
     strategy:
       matrix:
-        branch: [main, dev]
+        branch: [main, ${{ matrix.branch }}]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -110,19 +110,19 @@ jobs:
           queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
-          # Filter for workflows belonging to PRs targeting dev
+          # Filter for workflows belonging to PRs targeting ${{ matrix.branch }}
           queued_workflow_runs = [run for run in queued_workflow_runs 
-                                  if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "dev")]
+                                  if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
           in_progress_workflow_runs = [run for run in in_progress_workflow_runs 
-                                      if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "dev")]
+                                      if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
           in_progress_workflows = len(in_progress_workflow_runs)
 
           total_workflows = queued_workflows + in_progress_workflows
-          print(f"Current queued workflows (PRs targeting dev): {queued_workflows}")
-          print(f"Current running workflows (PRs targeting dev): {in_progress_workflows}")
+          print(f"Current queued workflows (PRs targeting ${{ matrix.branch }}): {queued_workflows}")
+          print(f"Current running workflows (PRs targeting ${{ matrix.branch }}): {in_progress_workflows}")
           print(f"Total workflows: {total_workflows}")
           print(f"Max concurrency: {MAX_CONCURRENCY}")
 
@@ -135,7 +135,7 @@ jobs:
           pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
           print("Pending workflows:", len(pending_workflows))
           pending_workflows = [run for run in pending_workflows 
-                              if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "dev")]
+                              if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
