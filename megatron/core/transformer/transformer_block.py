@@ -563,6 +563,10 @@ class TransformerBlock(MegatronModule):
         else:
             rng_context = nullcontext()
 
+        if self.config.enable_cuda_graph:
+            from megatron.core.transformer import cuda_graphs
+            cuda_graphs.Cudagraph_VPP_Stage = self.vp_stage
+
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level
         # if we are using other fp8 recipes, then the context manager enter&exit are free

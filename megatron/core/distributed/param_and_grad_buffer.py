@@ -255,8 +255,7 @@ class _ParamAndGradBucketGroup:
         if ddp_config.enable_cuda_graph:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
             ddp_config.cuda_graph_use_single_mempool = True
-            CudaGraphManager(ddp_config, self, "copy_params_from_grad_buffer", need_backward=False)
-
+            CudaGraphManager(ddp_config, self, "copy_params_from_grad_buffer", need_backward=False, num_warmup_steps=0)
 
     def reset(self):
         """

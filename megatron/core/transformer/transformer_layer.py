@@ -432,7 +432,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         self.config.flash_decode
                     ), "--flash-decode is required to use CUDA graphs during inference"
                 if not self.is_moe_layer:
-                    self.cudagraph_manager = CudaGraphManager(config, base_module=self)
+                    self.cudagraph_manager = CudaGraphManager(config, num_warmup_steps=self.config.cuda_graph_warmup_steps)
                 else:
                     params = \
                         list(self.pre_mlp_layernorm.parameters()) \
@@ -445,6 +445,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         function_name="_forward_mlp_moe_preprocess", 
                         params_to_calculate_wgrads=params, 
                         need_backward=True,
+                        num_warmup_steps=self.config.cuda_graph_warmup_steps,
                     )
                     if config.moe_latent_size is not None:
                         CudaGraphManager(
@@ -452,6 +453,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                             function_name="_forward_mlp_moe_postprocess",
                             params_to_calculate_wgrads=list(self.mlp.fc2_latent_proj.parameters()),
                             need_backward=True,
+                            num_warmup_steps=self.config.cuda_graph_warmup_steps,
                         )
 
             else:

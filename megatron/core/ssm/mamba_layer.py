@@ -81,7 +81,7 @@ class MambaLayer(MegatronModule):
                 config.enable_cuda_graph and config.external_cuda_graph
             ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
             if config.enable_cuda_graph:
-                self.cudagraph_manager = CudaGraphManager(config)
+                self.cudagraph_manager = CudaGraphManager(config, num_warmup_steps=self.config.cuda_graph_warmup_steps)
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
                 # the number of microbatches. Multiple CUDA graphs per layer is required to support
