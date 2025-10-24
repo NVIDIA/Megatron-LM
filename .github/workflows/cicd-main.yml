@@ -301,13 +301,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - bucket: "unit_tests/**/*.py"
-          - bucket: "unit_tests/data/**/*.py"
-          - bucket: "unit_tests/dist_checkpointing/**/*.py"
-          - bucket: "unit_tests/dist_checkpointing/test_optimizer.py"
-          - bucket: "unit_tests/dist_checkpointing/models/**/*.py"
-          - bucket: "unit_tests/transformer/**/*.py"
-          - bucket: "unit_tests/transformer/moe/**/*.py"
+          - bucket: unit_tests/**/*.py
+          - bucket: unit_tests/data/**/*.py
+          - bucket: unit_tests/dist_checkpointing/**/*.py
+          - bucket: unit_tests/dist_checkpointing/test_optimizer.py
+          - bucket: unit_tests/dist_checkpointing/models/**/*.py
+          - bucket: unit_tests/transformer/**/*.py
+          - bucket: unit_tests/transformer/moe/**/*.py
     needs:
       - pre-flight
       - cicd-wait-in-queue
