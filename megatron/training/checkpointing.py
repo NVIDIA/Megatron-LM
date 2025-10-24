@@ -1650,11 +1650,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
-    print(f"optimizeraas")
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            print(f"load: {state_dict['optimizer']}")
             if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
 

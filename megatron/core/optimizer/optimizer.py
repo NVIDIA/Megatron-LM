@@ -1223,11 +1223,6 @@ class ChainedOptimizer(MegatronOptimizer):
         if isinstance(state_dict, dict):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
-            # if optimizer.config.optimizer == 'muon':
-            #     print(f"muon: {state.keys()}, {state['optimizer'].keys()}")
-            #     continue
-            # else:
-            #     print(f"adam: {state.keys()}, {state['optimizer'].keys()}")
             optimizer.load_state_dict(state)
         self._synchronize_steps()
 
