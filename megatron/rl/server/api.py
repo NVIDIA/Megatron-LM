@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from pydantic import BaseModel, Field
 from typing_extensions import Self, Type

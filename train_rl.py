@@ -1,5 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
-"""Train GPT with rl."""
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
 import os

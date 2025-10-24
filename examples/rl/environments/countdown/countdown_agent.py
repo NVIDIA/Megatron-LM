@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import random
 from typing import Any, Iterable
 
