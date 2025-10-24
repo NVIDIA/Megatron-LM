@@ -104,9 +104,9 @@ jobs:
 
           # Filter for workflows belonging to PRs targeting ${{ matrix.branch }}
           queued_workflow_runs = [run for run in queued_workflow_runs 
-                                  if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
+                                  if run["name"] == "CICD Megatron-LM" and is_pr_targeting_${{ matrix.branch }}(run)]
           in_progress_workflow_runs = [run for run in in_progress_workflow_runs 
-                                      if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
+                                      if run["name"] == "CICD Megatron-LM" and is_pr_targeting_${{ matrix.branch }}(run)]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
@@ -126,7 +126,7 @@ jobs:
           print("Fetching deployments...")
           pending_workflows = make_request("actions/runs?status=waiting").get("workflow_runs", [])
           pending_workflows = [run for run in pending_workflows 
-                              if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
+                              if run["name"] == "CICD Megatron-LM" and is_pr_targeting_${{ matrix.branch }}(run)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
