@@ -102,6 +102,7 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
 
 
 class ContextErrorFactory:
+    """Factory class for serializing/deserializing context errors."""
 
     @classmethod
     def serialize(cls, error: ContextOverflowError) -> dict:
@@ -115,10 +116,10 @@ class ContextErrorFactory:
         """
         assert isinstance(error, ContextOverflowError)
         return {
-            "type" : type(error).__name__,
-            "request_id" : error.request_id,
-            "message" : error.message,
-            "is_transient" : error.is_transient,
+            "type": type(error).__name__,
+            "request_id": error.request_id,
+            "message": error.message,
+            "is_transient": error.is_transient,
         }
 
     @classmethod
@@ -132,15 +133,15 @@ class ContextErrorFactory:
             (ContextOverflowError) Deserialized error.
         """
         error_cls = {
-            "ContextOverflowError" : ContextOverflowError,
-            "RequestOverflowError" : RequestOverflowError,
-            "TokenOverflowError" : TokenOverflowError,
-            "MaxSequenceLengthOverflowError" : MaxSequenceLengthOverflowError,
-            "BlockOverflowError" : BlockOverflowError,
-            "ActiveRequestCountOverflowError" : ActiveRequestCountOverflowError,
+            "ContextOverflowError": ContextOverflowError,
+            "RequestOverflowError": RequestOverflowError,
+            "TokenOverflowError": TokenOverflowError,
+            "MaxSequenceLengthOverflowError": MaxSequenceLengthOverflowError,
+            "BlockOverflowError": BlockOverflowError,
+            "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
         }[obj["type"]]
-        error = ContextOverflowError(**{k:v for k,v in obj.items() if k!="type"})
-        error.__class__ = error_cls # todo (@lmcafe): better/safer alternative?
+        error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
+        error.__class__ = error_cls  # todo (@lmcafe): better/safer alternative?
         return error
 
 

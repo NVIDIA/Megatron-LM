@@ -1006,10 +1006,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
-                            [
-                                r.serializable()
-                                for r in engine_output["finished_requests"]
-                            ],
+                            [r.serializable() for r in engine_output["finished_requests"]],
                         ],
                         use_bin_type=True,
                     )

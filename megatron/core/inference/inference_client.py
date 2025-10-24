@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 import os
 import time
 from typing import List, Union
@@ -150,7 +151,7 @@ class InferenceClient:
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """
-        print("Client: Connecting to InferenceCoordinator...")
+        logging.info("Client: Connecting to InferenceCoordinator...")
         self._connect_with_inference_coordinator()
         self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
 

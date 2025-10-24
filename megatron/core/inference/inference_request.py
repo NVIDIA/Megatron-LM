@@ -3,15 +3,18 @@
 import copy
 import io
 import time
-import torch
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
+import torch
+
 from megatron.core.inference.sampling_params import SamplingParams
 
+
 def serialize_tensor(tensor):
+    """Serialize tensor to bytes."""
     buffer = io.BytesIO()
     torch.save(tensor, buffer)
     buffer.seek(0)
@@ -20,6 +23,7 @@ def serialize_tensor(tensor):
 
 
 def deserialize_tensor(tensor_bytes):
+    """Deserialize tensor from bytes."""
     buffer = io.BytesIO(tensor_bytes)
     tensor = torch.load(buffer)
     return tensor
@@ -85,11 +89,7 @@ class InferenceRequest:
 
         # Serialize tensors.
         obj = {
-            k : (
-                ("tensor", serialize_tensor(v))
-                if isinstance(v, torch.Tensor) else
-                v
-            )
+            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
             for k, v in obj.items()
         }
 
@@ -182,7 +182,8 @@ class DynamicInferenceEvent:
 
         # Serialize payload.
         if self.payload:
-            from .contexts.dynamic_context import ContextErrorFactory # avoid circular import.
+            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+
             obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
         return obj
@@ -199,14 +200,12 @@ class DynamicInferenceEvent:
         """
 
         # Initialize event.
-        event = cls(**{
-            **obj,
-            "type" : DynamicInferenceEventType[obj["type"]],
-        })
+        event = cls(**{**obj, "type": DynamicInferenceEventType[obj["type"]]})
 
         # Deserialize payload.
         if obj["payload"]:
-            from .contexts.dynamic_context import ContextErrorFactory # avoid circular import.
+            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+
             event.payload = ContextErrorFactory.deserialize(obj["payload"])
 
         return event
@@ -260,7 +259,7 @@ class DynamicInferenceRequest(InferenceRequest):
             dict: A dictionary representation of the instance suitable for serialization.
         """
         obj = super().serializable()
-        obj["events"] = [ e.serialize() for e in self.events ]
+        obj["events"] = [e.serialize() for e in self.events]
         return obj
 
     @classmethod
@@ -274,7 +273,7 @@ class DynamicInferenceRequest(InferenceRequest):
             (DynamicInferenceRequest) Deserialized request.
         """
         request = super().deserialize(obj)
-        request.events = [ DynamicInferenceEvent.deserialize(e) for e in obj["events"] ]
+        request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
         return request
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
