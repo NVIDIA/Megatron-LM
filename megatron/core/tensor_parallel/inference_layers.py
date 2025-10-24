@@ -1,16 +1,4 @@
-# Copyright (c) 2019-2025, NVIDIA CORPORATION.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import Callable, Optional
@@ -21,6 +9,7 @@ import transformer_engine as te
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.parallel_state import get_tensor_model_parallel_group
 
 from .mappings import (
     gather_from_sequence_parallel_region,
@@ -31,9 +20,11 @@ try:
     import transformer_engine as te
     import transformer_engine.pytorch.cpp_extensions as tex
     from transformer_engine.pytorch.constants import TE_DType
+    from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TERowParallelLinear
     HAVE_TE=True 
 except ImportError:
-    HAVE_TE=False
+    HAVE_TE = False
+    
 
 def _te_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float):
     out , _, _ = tex.rmsnorm_fwd(
@@ -48,25 +39,25 @@ def _te_rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float):
         )
     return out.to(input.dtype)
 
-def _te_gemm(input: torch.Tensor, weight: torch.Tensor):
-    output_shape = list(input.shape) 
-    output_shape[-1] = weight.size(0)
-    output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
-    tex.general_gemm(
-            weight,
-            input,
-            get_workspace(),
-            out_dtype=input.dtype,
-            quantization_params=None,
-            alpha=1.0,
-            beta=None,
-            accumulate=False,
-            out=output,
-            bias=None,
-            use_split_accumulator=_2X_ACC_FPROP,
-        )
+# def _te_gemm(input: torch.Tensor, weight: torch.Tensor):
+#     output_shape = list(input.shape) 
+#     output_shape[-1] = weight.size(0)
+#     output = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+#     tex.general_gemm(
+#             weight,
+#             input,
+#             get_workspace(),
+#             out_dtype=input.dtype,
+#             quantization_params=None,
+#             alpha=1.0,
+#             beta=None,
+#             accumulate=False,
+#             out=output,
+#             bias=None,
+#             use_split_accumulator=_2X_ACC_FPROP,
+#         )
 
-class InferenceLayerNormColumnParallelLinear(te.pytorch.Linear):
+class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
     """
     Inference optimized version of TELayerNormColumnParallelLinear.
     """
@@ -88,17 +79,24 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.Linear):
     ):
         assert HAVE_TE, "--use-inference-optimized-layers requires transformer engine"
         super().__init__(
-            in_features=input_size, out_features=output_size, init_method=init_method, bias=bias
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            gather_output=gather_output,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group
         )
 
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
-
-        self.layer_norm_weight = torch.nn.Parameter(torch.empty(input_size))
-        self.eps = config.layernorm_epsilon
-    
+        assert self.tp_size == 1
 
     @torch.no_grad()
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -122,12 +120,12 @@ class InferenceLayerNormColumnParallelLinear(te.pytorch.Linear):
         """
         if self.training:
             # Training mode -> fallback to TE
-            return super().forward(x), None
+            return super().forward(x)
         else:
             return self._inference_forward(x), None
 
 
-class InferenceRowParallelLinear(te.pytorch.Linear):
+class InferenceRowParallelLinear(TERowParallelLinear):
     """
     Inference optimized version of TERowParallelLinear.
     """
@@ -147,13 +145,24 @@ class InferenceRowParallelLinear(te.pytorch.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(
-            in_features=input_size, out_features=output_size, init_method=init_method, bias=bias
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            input_is_parallel=input_is_parallel,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group
         )
 
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
             ), "--use-inference-optimized-layers requires sequence parallelism"
+
+        assert self.tp_size == 1
 
     def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.matmul(x, self.weight.t())
@@ -168,7 +177,7 @@ class InferenceRowParallelLinear(te.pytorch.Linear):
         """
         if self.training:
             # Training mode -> fallback to TE
-            return super().forward(x), None
+            return super().forward(x)
         else:
             # Inference mode -> custom fw pass can be implemented here
-            return super().forward(x), None
+            return self._inference_forward(x), None
