@@ -16,6 +16,9 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import LayerType
@@ -692,6 +695,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inner_quantization_context = nullcontext()
                     else:
                         inner_quantization_context = nullcontext()
+
+                    if self.config.fine_grained_activation_offloading:
+                        fine_grained_offloading_set_last_layer(
+                            l_no == self.num_layers_per_pipeline_rank - 1
+                        )
 
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(

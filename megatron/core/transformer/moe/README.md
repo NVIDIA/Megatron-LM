@@ -210,6 +210,20 @@ Enable A2A overlap across different batches inspired by the DSv3 DualPipe implme
 --delay-wgrad-compute
 ```
 
+### Fine-grained Activation Offloading (collaborated with rednote)
+Offload the input activation at the granularity of modules
+
+**Usage**
+```bash
+# Enable fine-grained activation offloading
+--fine-grained-activation-offloading
+
+# Specify which modules are going to offload its input
+# Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
+--offload-modules expert_fc1
+```
+For more details, please refer to the ```docs/source/api-guide/fine_grained_activation_offloading.md```
+
 ### MoE Related Arguments
 | Item | Description |
 | --- | --- |

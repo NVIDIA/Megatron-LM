@@ -27,6 +27,11 @@ from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_qui
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
+)
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -825,6 +830,16 @@ class TEGroupedMLP(MegatronModule):
             tp_group=pg_collection.expt_tp,
         )
 
+        self.offload_expert_fc1 = (
+            self.config.fine_grained_activation_offloading
+            and "expert_fc1" in self.config.offload_modules
+        )
+
+        self.offload_moe_act = (
+            self.config.fine_grained_activation_offloading
+            and "moe_act" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -833,6 +848,12 @@ class TEGroupedMLP(MegatronModule):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
+
+        # This is to avoid the CPU overhead of multiple d2h copies
+        if self.offload_expert_fc1 and not (self.config.fp8 or self.config.fp4):
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input(self.linear_fc1)
 
         if self.config.fp8 or self.config.fp4:
             assert HAVE_TE, "FP8 and FP4 requires TE."
@@ -898,9 +919,21 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        intermediate_parallel, bias_parallel = self.linear_fc1(
-            permuted_local_hidden_states, tokens_per_expert
-        )
+        if self.offload_expert_fc1:
+            permuted_local_hidden_states = fine_grained_offloading_group_start(
+                permuted_local_hidden_states, name="expert_fc1"
+            )
+        with get_fine_grained_offloading_context(self.offload_expert_fc1):
+            fc1_output, bias_parallel = self.linear_fc1(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+        if self.offload_expert_fc1:
+            fc1_output, bias_parallel = fine_grained_offloading_group_commit(
+                fc1_output,
+                bias_parallel,
+                name="expert_fc1",
+                forced_released_tensors=[permuted_local_hidden_states],
+            )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
@@ -960,18 +993,26 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
+        if self.offload_moe_act:
+            fc1_output = fine_grained_offloading_group_start(fc1_output, name="moe_act")
+
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            intermediate_parallel = self.activation_checkpoint.checkpoint(
-                bias_act_func, intermediate_parallel, bias_parallel, permuted_probs
-            )
-            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
-            self.activation_checkpoint.discard_output_and_register_recompute(output)
+            with get_fine_grained_offloading_context(self.offload_moe_act):
+                bias_act_output = self.activation_checkpoint.checkpoint(
+                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+                )
         else:
-            intermediate_parallel = bias_act_func(
-                intermediate_parallel, bias_parallel, permuted_probs
+            with get_fine_grained_offloading_context(self.offload_moe_act):
+                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+
+        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
+        if self.activation_recompute:
+            self.activation_checkpoint.discard_output_and_register_recompute(output)
+        if self.offload_moe_act:
+            (output,) = fine_grained_offloading_group_commit(
+                output, name="moe_act", forced_released_tensors=[fc1_output]
             )
-            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
