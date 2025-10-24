@@ -432,6 +432,7 @@ jobs:
         include: [{"model":"gpt","test_case":"gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer"}]
     needs:
       - pre-flight
+      - cicd-container-build
       # - cicd-wait-in-queue
       # - cicd-parse-integration-tests
       # - cicd-unit-tests-latest
