@@ -216,11 +216,6 @@ class DynamicInferenceEvent:
             from .contexts.dynamic_context import ContextErrorFactory # avoid circular import.
             event.payload = ContextErrorFactory.deserialize(obj["payload"])
 
-            # >>>
-            from lutil import pax
-            pax("event")
-            # <<<
-
         return event
 
 
@@ -293,7 +288,7 @@ class DynamicInferenceRequest(InferenceRequest):
         req.events = [ DynamicInferenceEvent.deserialize(e) for e in obj["events"] ]
         # >>>
         from lutil import pax
-        pax("req")
+        pax("req", {"events": req.events})
         # <<<
         return req
 

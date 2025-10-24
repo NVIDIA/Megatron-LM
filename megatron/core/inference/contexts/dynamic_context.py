@@ -141,10 +141,6 @@ class ContextErrorFactory:
         }[obj["type"]]
         error = ContextOverflowError(**{k:v for k,v in obj.items() if k!="type"})
         error.__class__ = error_cls # todo (@lmcafe): better/safer alternative?
-        # >>>
-        from lutil import pax
-        pax("obj, error")
-        # <<<
         return error
 
 
