@@ -135,6 +135,8 @@ workflow:
         FUNCTIONAL_TEST: "no"
         PUBLISH: "no"
 
+    - if: $CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main'
+
     - when: never
 
   auto_cancel:
