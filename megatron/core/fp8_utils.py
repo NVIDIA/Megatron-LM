@@ -407,6 +407,11 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
 
 
 def post_all_gather_processing(model_params):
+    """
+    Post-processing after all-gather for weights in distributed optimizer.
+    - tensorwise: may need to create a transposed view to match backend GEMM.
+    - blockwise: create column-wise storage.
+    """
     try:
         from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
 

@@ -121,7 +121,6 @@ class TestFP8Param:
 
         if use_cuda_graph:
             args.external_cuda_graph = True
-            args.cuda_graph_scope = "attn"
             args.cuda_graph_warmup_steps = 0
 
         for key, value in kwargs.items():
