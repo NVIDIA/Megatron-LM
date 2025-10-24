@@ -2,6 +2,8 @@
   rules:
     - if: $PUBLISH == "yes"
       when: never
+    - if: $BUILD == "no"
+      when: never
     - when: on_success
   stage: test
 

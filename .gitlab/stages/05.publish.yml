@@ -1,6 +1,8 @@
 .publish_common_freeze:
   stage: publish
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: ($CI_COMMIT_BRANCH == "main") && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
