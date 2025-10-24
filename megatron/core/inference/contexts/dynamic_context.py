@@ -56,8 +56,10 @@ class ContextOverflowError(Exception):
         self, request_id: Optional[int], message: Optional[str] = None, *, is_transient: bool = True
     ):
         request_str = '--' if request_id is None else str(request_id)
-        message = "" if message is None else f" | {message}"
-        super().__init__(f"request {request_str}{message}")
+        _message = "" if message is None else f" | {message}"
+        super().__init__(f"request {request_str}{_message}")
+        self.request_id = request_id
+        self.message = message
         self.is_transient = is_transient
 
 
@@ -97,6 +99,19 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
             "active_request_count (%d) > max_request_count (%d)."
             % (active_request_count, max_request_count),
         )
+
+
+class ContextErrorFactory:
+
+    @classmethod
+    def serialize(cls, error):
+        assert isinstance(error, ContextOverflowError)
+        return {
+            "type" : type(error).__name__,
+            "request_id" : error.request_id,
+            "message" : error.message,
+            "is_transient" : error.is_transient,
+        }
 
 
 class WarmupEngineMode(Enum):

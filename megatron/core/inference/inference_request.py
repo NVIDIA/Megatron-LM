@@ -3,15 +3,13 @@
 import copy
 import io
 import time
+import torch
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
-import torch
-
 from megatron.core.inference.sampling_params import SamplingParams
-
 
 def serialize_tensor(tensor):
     buffer = io.BytesIO()
@@ -124,11 +122,6 @@ class InferenceRequest:
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(req, k, deserialize_tensor(v[1]))
 
-        # >>>
-        from lutil import pax
-        pax("obj, req")
-        # <<<
-
         return req
 
 
@@ -164,8 +157,8 @@ class DynamicInferenceEvent:
     def __post_init__(self):
 
         # Timestamp.
-        assert self.timestamp is None, "timestamp automatically set."
-        self.timestamp = time.time()
+        if self.timestamp is None:
+            self.timestamp = time.time()
 
         # Validate type.
         assert isinstance(self.type, DynamicInferenceEventType)
@@ -196,14 +189,53 @@ class DynamicInferenceEvent:
 
         # Serialize payload.
         if self.payload:
-            assert isinstance(self.payload, Exception)
-            obj["payload"] = {
-                "type" : type(self.payload).__name__,
-                "args" : self.payload.args,
-                "is_transient" : self.payload.is_transient,
-            }
+            # >>>
+            # from .contexts import ContextOverflowError # avoid circular import.
+            # assert isinstance(self.payload, ContextOverflowError)
+            # obj["payload"] = {
+            #     "type" : type(self.payload).__name__,
+            #     "args" : self.payload.args,
+            #     "is_transient" : self.payload.is_transient,
+            # }
+            # +++
+            from .contexts.dynamic_context import ContextErrorFactory # avoid circular import.
+            obj["payload"] = ContextErrorFactory.serialize(self.payload)
+            # <<<
+            # >>>
+            from lutil import pax
+            pax({
+                "payload" : self.payload,
+                "payload'" : obj["payload"],
+            })
+            # <<<
 
         return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceEvent":
+        """Deserialize event.
+
+        Args:
+            obj (dict): Serialized event data.
+
+        Returns:
+            (DynamicInferenceEvent) Deserialized event.
+        """
+
+        # Initialize event.
+        event = cls({
+            **obj,
+            "type" : DynamicInferenceEventType[obj["type"]],
+        })
+
+        # Deserialize payload.
+        # >>>
+        from lutil import pax
+        pax("event")
+        # <<<
+
+        return event
+
 
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
@@ -252,6 +284,10 @@ class DynamicInferenceRequest(InferenceRequest):
         Returns:
             dict: A dictionary representation of the instance suitable for serialization.
         """
+        # >>>
+        from .contexts import RequestOverflowError
+        self.add_event_error_transient(RequestOverflowError(0, "i errored", is_transient=True))
+        # <<<
         obj = super().serializable()
         obj["events"] = [ e.serialize() for e in self.events ]
         return obj
