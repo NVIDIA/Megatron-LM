@@ -123,7 +123,10 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequest(**reply))
+                # >>>
+                # completion_future.set_result(DynamicInferenceRequest(**reply))
+                completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
+                # <<<
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue

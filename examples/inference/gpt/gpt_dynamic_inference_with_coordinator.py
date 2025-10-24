@@ -96,22 +96,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     await asyncio.gather(engine.engine_loop_task)
 
 if __name__ == "__main__":
-    # >>>
-    import io
-    from lutil import pax
-
-    tensor = torch.tensor([[1, 2], [3, 4]], dtype=torch.bfloat16)
-    buffer = io.BytesIO()
-    torch.save(tensor, buffer)
-    buffer.seek(0)
-    tensor_bytes = buffer.read()
-    # pax("tensor, tensor_bytes")
-
-    buffer = io.BytesIO(tensor_bytes)
-    tensor = torch.load(buffer)
-    pax("tensor")
-
-    # <<<
     # enable inference mode in the very beginning as some fp-8 optimizations 
     # check for it.
     with torch.inference_mode():

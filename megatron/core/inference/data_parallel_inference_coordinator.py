@@ -199,10 +199,6 @@ class DataParallelInferenceCoordinator:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 finished_requests = deserialized_payload[1]
-                # >>>
-                from lutil import pax
-                pax("finished_requests")
-                # <<<
 
                 for finished_request in finished_requests:
                     fid = finished_request["request_id"]

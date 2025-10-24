@@ -84,12 +84,6 @@ class InferenceRequest:
         obj["status"] = self.status.name if self.status else None
 
         # Serialize tensors.
-        # >>>
-        # obj = {
-        #     k : (v.tolist() if isinstance(v, torch.Tensor) else v)
-        #     for k, v in obj.items()
-        # }
-        # +++
         obj = {
             k : (
                 ("tensor", serialize_tensor(v))
@@ -98,7 +92,6 @@ class InferenceRequest:
             )
             for k, v in obj.items()
         }
-        # <<<
 
         return obj
 
@@ -114,15 +107,15 @@ class InferenceRequest:
         """
 
         # Initialize request.
-        req = cls(**obj)
-        req.status = None if obj["status"] is None else Status[obj["status"]]
+        request = cls(**obj)
+        request.status = None if obj["status"] is None else Status[obj["status"]]
 
         # Deserialize tensors.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
-                setattr(req, k, deserialize_tensor(v[1]))
+                setattr(request, k, deserialize_tensor(v[1]))
 
-        return req
+        return request
 
 
 class DynamicInferenceEventType(Enum):
@@ -266,10 +259,6 @@ class DynamicInferenceRequest(InferenceRequest):
         Returns:
             dict: A dictionary representation of the instance suitable for serialization.
         """
-        # >>>
-        from .contexts import RequestOverflowError
-        self.add_event_error_transient(RequestOverflowError(0, "i errored", is_transient=True))
-        # <<<
         obj = super().serializable()
         obj["events"] = [ e.serialize() for e in self.events ]
         return obj
@@ -284,13 +273,9 @@ class DynamicInferenceRequest(InferenceRequest):
         Returns:
             (DynamicInferenceRequest) Deserialized request.
         """
-        req = super().deserialize(obj)
-        req.events = [ DynamicInferenceEvent.deserialize(e) for e in obj["events"] ]
-        # >>>
-        from lutil import pax
-        pax("req", {"events": req.events})
-        # <<<
-        return req
+        request = super().deserialize(obj)
+        request.events = [ DynamicInferenceEvent.deserialize(e) for e in obj["events"] ]
+        return request
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""

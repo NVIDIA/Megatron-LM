@@ -544,6 +544,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     finished_request = self.requests.pop(request_id)
+                    if finished_request.prompt is None:
+                        finished_request.prompt = self.controller.tokenizer.detokenize(
+                            finished_request.prompt_tokens.tolist()
+                        )
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_requests.append(finished_request)
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
