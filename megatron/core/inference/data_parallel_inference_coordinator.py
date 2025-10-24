@@ -200,6 +200,8 @@ class DataParallelInferenceCoordinator:
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 finished_requests = deserialized_payload[1]
                 # >>>
+                from lutil import pax
+                pax("finished_requests")
                 # <<<
 
                 for finished_request in finished_requests:

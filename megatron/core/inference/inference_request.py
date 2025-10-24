@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import io
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -10,6 +11,28 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
+
+
+def serialize_tensor(tensor):
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer)
+    buffer.seek(0)
+    tensor_bytes = buffer.read()
+    # >>>
+    # from lutil import pax
+    # pax("tensor, tensor_bytes")
+    # <<<
+    return tensor_bytes
+
+
+def deserialize_tensor(tensor_bytes):
+    buffer = io.BytesIO(tensor_bytes)
+    tensor = torch.load(buffer)
+    # >>>
+    from lutil import pax
+    pax("tensor_bytes, tensor")
+    # <<<
+    return tensor
 
 
 # class syntax
@@ -71,12 +94,41 @@ class InferenceRequest:
         obj["status"] = self.status.name if self.status else None
 
         # Serialize all tensors.
+        # >>>
+        # obj = {
+        #     k : (v.tolist() if isinstance(v, torch.Tensor) else v)
+        #     for k, v in obj.items()
+        # }
+        # +++
         obj = {
-            k : (v.tolist() if isinstance(v, torch.Tensor) else v)
+            k : (
+                ("tensor", serialize_tensor(v))
+                if isinstance(v, torch.Tensor) else
+                v
+            )
             for k, v in obj.items()
         }
+        # <<<
 
         return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "InferenceRequest":
+        """Deserialize request.
+
+        Args:
+            obj (dict): Serialized request data.
+
+        Returns:
+            (InferenceRequest) Deserialized request.
+        """
+        req = cls(**obj)
+        req.status = None if obj["status"] is None else Status[obj["status"]]
+        # >>>
+        from lutil import pax
+        pax("obj, req")
+        # <<<
+        return req
 
 
 class DynamicInferenceEventType(Enum):
@@ -202,6 +254,24 @@ class DynamicInferenceRequest(InferenceRequest):
         obj = super().serializable()
         obj["events"] = [ e.serialize() for e in self.events ]
         return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceRequest":
+        """Deserialize request.
+
+        Args:
+            obj (dict): Serialized request data.
+
+        Returns:
+            (DynamicInferenceRequest) Deserialized request.
+        """
+        req = super().deserialize(obj)
+        req.events = [ DynamicInferenceEvent.deserialize(e) for e in obj["events"] ]
+        # >>>
+        from lutil import pax
+        pax("req")
+        # <<<
+        return req
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""

@@ -294,6 +294,20 @@ def run_inference(
             # Append output tokens.
             output_start = get_curr_time()
             for finished_request in finished_requests:
+                # >>>
+                import msgpack
+                from megatron.core.inference.inference_request import DynamicInferenceRequest
+                buf = msgpack.packb(
+                    finished_request.serializable(),
+                    use_bin_type=True,
+                )
+                req = msgpack.unpackb(buf, raw=False)
+                req = DynamicInferenceRequest.deserialize(req)
+
+                from lutil import pax
+                # pax("finished_request, j0, j1")
+                pax("req")
+                # <<<
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
                 total_output_tokens += len(request.output_tokens)
@@ -403,6 +417,13 @@ def main():
         assert request.state == "finished", (
             f"request.state == '{request.state}' != 'finished'."
         )
+
+    # >>>
+    from lutil import pax
+    pax("requests", {
+        "requests / 0" : requests[0],
+    })
+    # <<<
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
