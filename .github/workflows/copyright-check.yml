@@ -31,9 +31,7 @@ jobs:
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.65.6
-    with:
-      from-year: 2019
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.65.7
 
   copyright-check-summary:
     needs: [pre-flight, copyright-check]
