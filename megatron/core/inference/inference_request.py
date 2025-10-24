@@ -189,25 +189,8 @@ class DynamicInferenceEvent:
 
         # Serialize payload.
         if self.payload:
-            # >>>
-            # from .contexts import ContextOverflowError # avoid circular import.
-            # assert isinstance(self.payload, ContextOverflowError)
-            # obj["payload"] = {
-            #     "type" : type(self.payload).__name__,
-            #     "args" : self.payload.args,
-            #     "is_transient" : self.payload.is_transient,
-            # }
-            # +++
             from .contexts.dynamic_context import ContextErrorFactory # avoid circular import.
             obj["payload"] = ContextErrorFactory.serialize(self.payload)
-            # <<<
-            # >>>
-            from lutil import pax
-            pax({
-                "payload" : self.payload,
-                "payload'" : obj["payload"],
-            })
-            # <<<
 
         return obj
 
@@ -223,16 +206,20 @@ class DynamicInferenceEvent:
         """
 
         # Initialize event.
-        event = cls({
+        event = cls(**{
             **obj,
             "type" : DynamicInferenceEventType[obj["type"]],
         })
 
         # Deserialize payload.
-        # >>>
-        from lutil import pax
-        pax("event")
-        # <<<
+        if obj["payload"]:
+            from .contexts.dynamic_context import ContextErrorFactory # avoid circular import.
+            event.payload = ContextErrorFactory.deserialize(obj["payload"])
+
+            # >>>
+            from lutil import pax
+            pax("event")
+            # <<<
 
         return event
 

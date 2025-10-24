@@ -104,7 +104,15 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
 class ContextErrorFactory:
 
     @classmethod
-    def serialize(cls, error):
+    def serialize(cls, error: ContextOverflowError) -> dict:
+        """Serialize error.
+
+        Args:
+            error (ContextOverflowError): Error.
+
+        Returns:
+            (dict) Serialized error data.
+        """
         assert isinstance(error, ContextOverflowError)
         return {
             "type" : type(error).__name__,
@@ -112,6 +120,32 @@ class ContextErrorFactory:
             "message" : error.message,
             "is_transient" : error.is_transient,
         }
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> ContextOverflowError:
+        """Deserialize error.
+
+        Args:
+            obj (dict): Serialized error data.
+
+        Returns:
+            (ContextOverflowError) Deserialized error.
+        """
+        error_cls = {
+            "ContextOverflowError" : ContextOverflowError,
+            "RequestOverflowError" : RequestOverflowError,
+            "TokenOverflowError" : TokenOverflowError,
+            "MaxSequenceLengthOverflowError" : MaxSequenceLengthOverflowError,
+            "BlockOverflowError" : BlockOverflowError,
+            "ActiveRequestCountOverflowError" : ActiveRequestCountOverflowError,
+        }[obj["type"]]
+        error = ContextOverflowError(**{k:v for k,v in obj.items() if k!="type"})
+        error.__class__ = error_cls # todo (@lmcafe): better/safer alternative?
+        # >>>
+        from lutil import pax
+        pax("obj, error")
+        # <<<
+        return error
 
 
 class WarmupEngineMode(Enum):
