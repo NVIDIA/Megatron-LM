@@ -114,7 +114,7 @@ jobs:
           queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
-          # Filter for workflows belonging to PRs targeting dev
+          # Filter for workflows belonging to PRs targeting ${{ matrix.branch }}
           queued_workflow_runs = [run for run in queued_workflow_runs 
                                   if run["name"] == "CICD Megatron-LM" and is_pr_targeting_branch(run, "${{ matrix.branch }}")]
           in_progress_workflow_runs = [run for run in in_progress_workflow_runs 
