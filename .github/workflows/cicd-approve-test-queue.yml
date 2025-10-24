@@ -79,8 +79,8 @@ jobs:
                       print(f"Response: {e.response.text}")
                   return None
 
-          def is_pr_targeting_main(workflow_run):
-              """Check if a workflow run belongs to a PR targeting main branch."""
+          def is_pr_targeting_${{ matrix.branch }}(workflow_run):
+              """Check if a workflow run belongs to a PR targeting ${{ matrix.branch }} branch."""
               # Check if it's a pull_request event
               if workflow_run.get("event") != "pull_request":
                   return False
@@ -90,9 +90,9 @@ jobs:
               if not pull_requests:
                   return False
               
-              # Check if any PR is targeting main
+              # Check if any PR is targeting ${{ matrix.branch }}
               for pr in pull_requests:
-                  if pr.get("base", {}).get("ref") == "main":
+                  if pr.get("base", {}).get("ref") == "${{ matrix.branch }}":
                       return True
               
               return False
@@ -102,7 +102,7 @@ jobs:
           queued_workflow_runs = make_request("actions/runs?status=queued").get("workflow_runs", [])
           in_progress_workflow_runs = make_request("actions/runs?status=in_progress").get("workflow_runs", [])
 
-          # Filter for workflows belonging to PRs targeting main
+          # Filter for workflows belonging to PRs targeting ${{ matrix.branch }}
           queued_workflow_runs = [run for run in queued_workflow_runs 
                                   if run["name"] == "CICD Megatron-LM" and is_pr_targeting_main(run)]
           in_progress_workflow_runs = [run for run in in_progress_workflow_runs 
