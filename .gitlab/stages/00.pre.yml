@@ -363,6 +363,12 @@ pre:approve_merge_gate:
     - |
       set -eoux pipefail
       EXIT_CODE=0
+      apk add python3
+      python -m venv .venv
+      source .venv/bin/activate
+      pip install --no-cache-dir python-gitlab click
+      export GITLAB_ENDPOINT
+      export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
       python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
 
       export GH_TOKEN=$GH_TOKEN
