@@ -15,6 +15,8 @@ CHECK_ONLY=${CHECK_ONLY:-false}
 SKIP_DOCS=${SKIP_DOCS:-false}
 
 BASE_REF=${BASE_REF:-main}
+git remote set-url origin "https://${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+git fetch origin ${BASE_REF}
 CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
