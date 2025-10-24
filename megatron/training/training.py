@@ -2525,11 +2525,6 @@ def train(
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
-        # if args.log_max_attention_score and args.qk_clip:
-        #     # Get max attention score from model, only when qk_clip is enabled
-        #     max_attention_score = model[0].module.module.decoder.layers[0].self_attention.core_attention.max_attention_score
-        #     for i in range(len(model[0].module.module.decoder.layers)):
-        #         max_attention_score = max(max_attention_score, model[0].module.module.decoder.layers[i].self_attention.core_attention.max_attention_score)
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
