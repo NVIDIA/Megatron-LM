@@ -310,6 +310,7 @@ class GPTModel(LanguageModule):
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
         padding_mask: Optional[Tensor] = None,
+        **kwargs,
     ):
         """Preprocesses inputs for the transformer decoder.
 
@@ -522,6 +523,7 @@ class GPTModel(LanguageModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Tensor]] = None,
         output_processor_context: Optional[Any] = None,
+        **kwargs,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -555,6 +557,7 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            **kwargs,
         )
 
         (
@@ -604,6 +607,7 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            **kwargs,
         )
 
     def _postprocess(
@@ -628,6 +632,7 @@ class GPTModel(LanguageModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        **kwargs,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
