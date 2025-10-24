@@ -150,7 +150,7 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
-              print(f"Approving workflow {workflow_name} (PR #{pr_number}) with Run Id: {workflow_id}")
+              print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
               deployment = make_request(deployment_url)[0]
