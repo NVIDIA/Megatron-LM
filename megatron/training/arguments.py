@@ -1007,9 +1007,9 @@ def validate_args(args, defaults={}):
         # TODO: add is_te_min_version("2.9.0") before merge
         # assert is_te_min_version("2.9.0"), \
         #     '--qk-clip is only supported with TE >= 2.9.0.'
-        # assert 0.0 < args.qk_clip_balancing_alpha < 1.0, \
-        #     '--qk-clip-balancing-alpha must be between 0.0 and 1.0 when using --qk-clip.'
-        assert args.qk_clip_balancing_threshold > 0, \
+        assert 0.0 < args.qk_clip_alpha < 1.0, \
+            '--qk-clip-balancing-alpha must be between 0.0 and 1.0 when using --qk-clip.'
+        assert args.qk_clip_threshold > 0, \
             '--qk-clip-balancing-threshold must be greater than 0 when using --qk-clip.'
 
     # Retro checks.
@@ -1913,8 +1913,8 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
-    group.add_argument('--log-max-attention-score', action='store_true',
-                       help='Enable max attention score logging to tensorboard.')
+    group.add_argument('--log-max-attention-logit', action='store_true',
+                       help='Enable max attention logit logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-entity', type=str, default='',
@@ -2284,9 +2284,9 @@ def _add_training_args(parser):
                        dest='add_qkv_bias')
     group.add_argument('--qk-clip', action='store_true',
                        help='Whether to use qk-clip for training stabilization, strongly recommended for Muon.')
-    group.add_argument('--qk-clip-balancing-alpha', type=float, default=0.5,
+    group.add_argument('--qk-clip-alpha', type=float, default=0.5,
                        help='The balancing alpha for qk-clip.')
-    group.add_argument('--qk-clip-balancing-threshold', type=float, default=100,
+    group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon'],

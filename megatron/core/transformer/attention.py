@@ -996,8 +996,8 @@ class Attention(MegatronModule, ABC):
 
     def clip_qk(self):
         """
-        QK Clipping is a technique to clip the query and key attention scores to prevent the
-        attention scores from exploding.
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding.
         """
         raise NotImplementedError("clip_qk is not implemented.")
 
@@ -1238,39 +1238,39 @@ class SelfAttention(Attention):
 
     def clip_qk(self):
         """
-        QK Clipping is a technique to clip the query and key attention scores to prevent the
-        attention scores from exploding. This function is experimental on GQA.
+        QK Clipping is a technique to clip the query and key attention logits to prevent the
+        attention logits from exploding. This function is experimental on GQA.
         """
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
 
-        if self.core_attention.current_max_attn_scores is None:
-            raise ValueError("current_max_attn_scores is None")
+        if self.core_attention.current_max_attn_logits is None:
+            raise ValueError("current_max_attn_logits is None")
 
-        assert self.core_attention.current_max_attn_scores.shape == (
+        assert self.core_attention.current_max_attn_logits.shape == (
             self.num_attention_heads_per_partition,
-        ), f"current_max_attn_scores shape is not ({self.num_attention_heads_per_partition}, ) \
-                    but {self.core_attention.current_max_attn_scores.shape}"
+        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+                    but {self.core_attention.current_max_attn_logits.shape}"
 
-        grouped_max_attn_scores = torch.max(
-            self.core_attention.current_max_attn_scores.view(
+        grouped_max_attn_logits = torch.max(
+            self.core_attention.current_max_attn_logits.view(
                 self.num_query_groups_per_partition, -1
             ),
             dim=1,
         ).values
 
         # only update the weight if any head has
-        # current_max_attn_scores > qk_clip_balancing_threshold
-        if torch.any(grouped_max_attn_scores > self.config.qk_clip_balancing_threshold):
+        # current_max_attn_logits > qk_clip_threshold
+        if torch.any(grouped_max_attn_logits > self.config.qk_clip_threshold):
             # Use num_query_groups_per_partition for tensor parallel scenarios
 
             # qk_clip_balancing_eta (g, 1, 1)
-            assert grouped_max_attn_scores.shape == (
+            assert grouped_max_attn_logits.shape == (
                 self.num_query_groups_per_partition,
-            ), f"current_max_attn_scores shape is not ({self.num_query_groups_per_partition},) \
-                but {grouped_max_attn_scores.shape}"
+            ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
+                but {grouped_max_attn_logits.shape}"
             qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_balancing_threshold / grouped_max_attn_scores, max=1.0
+                self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
             ).view(self.num_query_groups_per_partition, 1, 1)
             assert torch.all(qk_clip_balancing_eta <= 1.0)
 
@@ -1315,10 +1315,10 @@ class SelfAttention(Attention):
 
             # Clipping
             weight_q = weight_q * torch.pow(
-                qk_clip_balancing_eta_extended, self.config.qk_clip_balancing_alpha
+                qk_clip_balancing_eta_extended, self.config.qk_clip_alpha
             )
             weight_k = weight_k * torch.pow(
-                qk_clip_balancing_eta, 1 - self.config.qk_clip_balancing_alpha
+                qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha
             )
 
             # Concatenate back and reshape to original shape
@@ -1333,8 +1333,8 @@ class SelfAttention(Attention):
             else:
                 self.linear_qkv.weight.data.copy_(weight_updated)
 
-        # reset current_max_attn_scores
-        self.core_attention.current_max_attn_scores = None
+        # reset current_max_attn_logits
+        self.core_attention.current_max_attn_logits = None
 
 
 class CrossAttention(Attention):
