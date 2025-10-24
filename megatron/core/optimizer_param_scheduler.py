@@ -53,6 +53,7 @@ class OptimizerParamScheduler:
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
+        use_independent_wd: Optional[bool] = False,
     ) -> None:
 
         # Class values.
@@ -90,6 +91,8 @@ class OptimizerParamScheduler:
             assert not self.use_checkpoint_opt_param_scheduler, (
                 'both override and ' 'use-checkpoint are set.'
             )
+
+        self.use_independent_wd = use_independent_wd
 
         # Set the learning rate
         self.step(0)
@@ -213,8 +216,10 @@ class OptimizerParamScheduler:
         for param_group in self.optimizer.param_groups:
             new_lr = self.get_lr(param_group)
             param_group['lr'] = new_lr * param_group.get('lr_mult', 1.0)
-            param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0)
-
+            if self.use_independent_wd:
+                param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0) / param_group.get('max_lr', 1.0)
+            else:
+                param_group['weight_decay'] = new_wd * param_group.get('wd_mult', 1.0)
     def state_dict(self) -> dict:
         """Return the state dict."""
         state_dict = {

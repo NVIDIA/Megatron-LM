@@ -1801,6 +1801,8 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--use-independent-wd', action='store_true',
+                       help='If set, use independent weight decay for adamW optimizer.')
     group.add_argument('--start-weight-decay', type=float,
                        help='Initial weight decay coefficient for L2 regularization.')
     group.add_argument('--end-weight-decay', type=float,
