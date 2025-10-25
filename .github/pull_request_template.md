@@ -26,35 +26,17 @@ flowchart LR
 
 ### Code review
 
+The following process is enforced via the CODEOWNERS file for changes into `megatron/core`. For changes outside of `megatron/core`, it is up to the PR author whether or not to tag the Final Reviewer team.
+
 <details>
 <summary>For MRs into `main` branch</summary>
 
 #### (Step 1): Add PR label `Expert Review`
 
-#### (Step 2): Assign expert reviewers
+#### (Step 2): Collect the expert reviewers reviews
 
-Assign the expert reviewers that correspond to the areas the PR touches (if no match, assign someone from `DEFAULT`):
-
-- Model:
-  - [ ] Bert: `aot@nvidia.com`  
-  - [ ] GPT: `ksanthanam@nvidia.com`
-  - [ ] MoE: `akhattar@nvidia.com`, `vkorthikanti@nvidia.com`, `ykarnati@nvidia.com`, `shiqingf@nvidia.com`, `xiny@nvidia.com`, `zijiey@nvidia.com`
-  - [ ] Multimodal: `trintamaki@nvidia.com`
-  - [ ] Retro: `lmcafee@nvidia.com`
-  - [ ] T5: `huvu@nvidia.com`
-- Distributed:
-  - [ ] Distributed Checkpointing: `skierat@nvidia.com`, `mblaz@nvidia.com`, `dpykhtar@nvidia.com`
-  - [ ] Distributed optimizer: `slym@nvidia.com`
-- [ ] Inference: `vkorthikanti@nvidia.com`
-- [ ] Quantization and Inference (QAT): `chenhany@nvidia.com`
-- Parallelism:
-  - [ ] Context Parallelism: `boxiangw@nvidia.com`, `xren@nvidia.com`
-  - [ ] Pipeline Parallelism: `xren@nvidia.com`  
-- Transformer: `ksanthanam@nvidia.com`
-- Post-training: `chenhany@nvidia.com`, `aanoosheh@nvidia.com`, `kmorabia@nvidia.com`
-- [ ] Datasets: `jkamalu@nvidia.com`
-- [ ] Tests:  okoenig, donghyukc, pagaray, chtruong
-- [ ] __DEFAULT__: shanmugamr jcasper eharper okoenig
+1. Attach the `Expert Review` label when your PR is ready for review.
+2. GitHub auto-assigns expert reviewers based on your changes. They will get notified and pick up your PR soon.
 
 :warning: Only proceed to the next step once all reviewers have approved, merge-conflict are resolved and the CI is passing.  
 Final Review might get declined if these requirements are not fulfilled.
@@ -62,10 +44,7 @@ Final Review might get declined if these requirements are not fulfilled.
 #### (Step 3): Final Review
 
 1. Add `Final Review` label
-2. Assign
-
-- ADLR: `jcasper@nvidia.com` || `dnarayanan@nvidia.com` || `vkorthikanti@nvidia.com`
-- NeMo: `eharper@nvidia.com` || `shanmugamr@nvidia.com` || `ansubramania@nvidia.com` || `yuya@nvidia.com`
+2. GitHub auto-assigns final reviewers based on your changes. They will get notified and pick up your PR soon.
 
 #### (Optional Step 4): Cherry-pick into release branch
 
