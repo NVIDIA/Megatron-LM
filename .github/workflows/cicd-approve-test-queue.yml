@@ -25,7 +25,7 @@ jobs:
     environment: main
     strategy:
       matrix:
-        branch: [main, dev]
+        branch: [main, dev, others]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -99,7 +99,10 @@ jobs:
                   return False
 
               base_branch = pr_info.get("base", {}).get("ref")
-              if base_branch == target_branch:
+              if (
+                (base_branch == target_branch) or 
+                (target_branch == "others")
+              ):
                   print(f"PR #{pr_number} targets {target_branch}")
                   return True
 
