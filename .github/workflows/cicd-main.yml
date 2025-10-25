@@ -149,7 +149,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
 
   linting:
     runs-on: ubuntu-latest
