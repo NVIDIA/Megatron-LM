@@ -342,39 +342,41 @@ class MambaModel(LanguageModule):
         if self.mtp_process:
             extra_block_kwargs = None
             packed_seq_params = None
-            decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = self._preprocess(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                decoder_input=decoder_input,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-            )
+            import transformer_engine as te
+            with te.pytorch.fp8_autocast(enabled=False):
+                decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = self._preprocess(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    decoder_input=decoder_input,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                )
 
-            # Get output weight for shared embeddings
-            output_weight = None
-            if self.share_embeddings_and_output_weights:
-                output_weight = self.shared_embedding_or_output_weight()            
+                # Get output weight for shared embeddings
+                output_weight = None
+                if self.share_embeddings_and_output_weights:
+                    output_weight = self.shared_embedding_or_output_weight()
 
-            hidden_states = self.mtp(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                labels=labels,
-                loss_mask=loss_mask,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                embedding=self.embedding,
-                output_layer=self.output_layer,
-                output_weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                compute_language_model_loss=self.compute_language_model_loss,
-                **(extra_block_kwargs or {}),
-            )
+                hidden_states = self.mtp(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    embedding=self.embedding,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    **(extra_block_kwargs or {}),
+                )
 
         if not self.post_process:
             return hidden_states

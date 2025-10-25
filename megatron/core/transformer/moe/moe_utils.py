@@ -389,12 +389,15 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
+    # print('permuted tokens original dtype before upcast', permuted_tokens.dtype)
+    permuted_tokens = permuted_tokens.to(torch.float32)
     # Create an output tensor filled with zeros
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     # Scatter add the permuted_input back to the original positions
     output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    permuted_tokens = permuted_tokens.to(input_dtype)
     return output_tokens.to(dtype=input_dtype)
 
 

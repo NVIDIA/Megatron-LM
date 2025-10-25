@@ -369,6 +369,18 @@ def print_rank_0(message):
         print(message, flush=True)
 
 
+def warn_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, warn only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            warnings.warn(message)
+    elif torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            warnings.warn(message)
+    else:
+        warnings.warn(message)
+
+
 def is_rank0():
     """Returns true if called in the rank0, false otherwise"""
     return torch.distributed.is_initialized() and torch.distributed.get_rank() == 0

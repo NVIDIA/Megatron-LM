@@ -32,6 +32,9 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+from contextlib import nullcontext
+import transformer_engine as te
+
 logger = logging.getLogger(__name__)
 
 
@@ -648,7 +651,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         if self.mlp.config.moe_latent_size:
             assert not self.mlp.shared_expert_overlap, "Shared expert overlap not supported when MoE latent projections are used."
-            hidden_states, _ = self.mlp.fc1_latent_proj(pre_mlp_layernorm_output)
+            if self.config.keep_moe_latent_projections_in_bf16 and self.config.fp4_recipe is not None:
+                disable_low_precision = te.pytorch.fp8_autocast(enabled=False)
+            else:
+                disable_low_precision = nullcontext()
+            with disable_low_precision:
+                hidden_states, _ = self.mlp.fc1_latent_proj(pre_mlp_layernorm_output)
         else:
             hidden_states = pre_mlp_layernorm_output
 
@@ -658,7 +666,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     def _forward_mlp_moe_postprocess(self, hidden_states, shared_expert_output, mlp_bias, residual):
         # Project the output back from latent dimension to hidden dimension.
         if self.mlp.config.moe_latent_size:
-            hidden_states, _ = self.mlp.fc2_latent_proj(hidden_states)
+            # keep this latent projection in high precision
+            if self.config.keep_moe_latent_projections_in_bf16 and self.config.fp4_recipe is not None:
+                disable_low_precision = te.pytorch.fp8_autocast(enabled=False)
+            else:
+                disable_low_precision = nullcontext()
+
+            with disable_low_precision:
+                hidden_states, _ = self.mlp.fc2_latent_proj(hidden_states)
 
         if shared_expert_output is not None:
             hidden_states = hidden_states + shared_expert_output
@@ -692,7 +707,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Residual connection
         residual = hidden_states
-    
+
         hidden_states, probs, routing_map, shared_expert_output, mlp_residual = self._forward_mlp_moe_preprocess(
             hidden_states=hidden_states)
 

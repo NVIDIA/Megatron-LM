@@ -82,6 +82,25 @@ def _check_supported_type(arg):
         arg
     ), f"Cudagraphs recieved an arg of type {type(arg)} which is not supported."
 
+def _determine_if_transformer_decoder_layer(base_module):
+    """Determine if the given module is a transformer decoder layer."""
+    # import modules here to avoid a circular import
+    from megatron.core.ssm.mamba_layer import MambaLayer
+    from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+
+    is_potential_decoder_layer = isinstance(
+        base_module, (TransformerLayer, BaseTransformerLayer, MambaLayer)
+    )
+    if not is_potential_decoder_layer:
+        return False
+    if isinstance(base_module, TransformerLayer) and not isinstance(
+        base_module.cross_attention, IdentityOp
+    ):
+        # If the layer has a cross attention, it is not a decoder layer
+        return False
+    else:
+        # Otherwise it is a decoder layer
+        return True
 
 def is_moe_layer_with_early_return(module):
     from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -208,7 +227,7 @@ class _CudagraphRecordNode(torch.autograd.Function):
 
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
-    cudagraph io and fp8 if used."""
+    cudagraph io and fp8/fp4 if used."""
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -332,8 +351,15 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fuse_wgrad_accumulation = False
         self.backward_retain_grad = False
         self.fp8_enabled = False
+        self.fp4_enabled = False
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 2
+
+        # Decide whether to reuse the input and output buffer, and if so,
+        # whether this layer is the first layer (which needs an input buffer)
+        # or the last layer (which needs an output buffer)
+
+        self.is_transformer_decoder_layer = _determine_if_transformer_decoder_layer(base_module)
         self.grad_enabled = need_backward and torch.is_grad_enabled()
 
         if not self.grad_enabled or not isinstance(base_module, torch.nn.Module):
@@ -380,33 +406,56 @@ class _CudaGraphRunner(torch.nn.Module):
 
             layers_per_chunk = total_num_layers // vpp_size // pp_size
             self.is_first_layer = ((base_module.layer_number - 1) % layers_per_chunk) == 0
+            # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph replay
+            # so that way we only update the value of this flag in FP8GlobalStateManager when it changes, 
+            # which incurs an expensive HtoD sync
+            if self.is_first_layer:
+                self.fp8_param_cache_updated = None
 
         if hasattr(self.base_module, "config") and isinstance(self.base_module.config, TransformerConfig):
             self.fuse_wgrad_accumulation = self.base_module.config.gradient_accumulation_fusion
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.fp8_enabled = self.base_module.config.fp8 is not None
+            self.fp4_enabled = self.base_module.config.fp4 is not None
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(True)
-                # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph replay
-                # so that way we only update the value of this flag in FP8GlobalStateManager when it changes, 
-                # which incurs an expensive HtoD sync
-                if self.is_first_layer:
-                    self.fp8_param_cache_updated = None
+
+            if self.fp4_enabled:
+                from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
+
+                self.fp4_recipe = get_fp4_recipe(self.base_module.config)
+                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
         from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
 
+        return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
+
+    def get_fp4_context(self):
+        """Return a new fp4 context in cudagraph mode."""
+        from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+        return get_fp4_context(self.base_module.config, self.base_module.layer_number - 1)
+
+    def get_quantization_context(self):
+        """Return appropriate quantization context (FP8 or FP4) in cudagraph mode."""
+
         # TODO jiemingz: this is a temporary hack to disable grabbing the fp8 context outside of the 
         # transformer layer
         if not self.is_transformer_decoder_layer:
             return nullcontext()
-        
-        return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
+
+        if self.fp8_enabled:
+            return self.get_fp8_context()
+        elif self.fp4_enabled:
+            return self.get_fp4_context()
+        else:
+            return nullcontext()
 
     def create_fwd_graph(self, args, kwargs, outputs):
         """Create a fwd cudagraph for this runner. Should be called inside
@@ -420,6 +469,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, 'main_grad')
             ]
 
+            saved_fp8_tensors = None
             if self.fp8_enabled:
                 if is_te_min_version("1.13.0"):
                     saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp8_recipe)
@@ -473,7 +523,7 @@ class _CudaGraphRunner(torch.nn.Module):
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             for _ in range(self.num_warmup_steps):
-                with self.get_fp8_context():
+                with self.get_quantization_context():
                     warmup_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
@@ -492,7 +542,7 @@ class _CudaGraphRunner(torch.nn.Module):
                         allow_unused=True,
                     )
 
-            with self.get_fp8_context():
+            with self.get_quantization_context():
                 torch.cuda.synchronize()
                 with torch.cuda.graph(self.fwd_graph, pool=self.fwd_mempool):
                     fwd_graph_outputs = self.func(
@@ -535,6 +585,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     ), "Error restoring grads while cudagraphing!"
                     param.main_grad.copy_(saved_grad)
 
+        if self.fp8_enabled:
+            restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside

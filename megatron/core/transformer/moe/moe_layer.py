@@ -3,7 +3,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
-
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
@@ -202,7 +201,6 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and probabilities for the token dispatcher.
         The original hidden states are returned as a residual connection.
         """
-
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -297,7 +295,6 @@ class MoELayer(BaseMoELayer):
 
     def preprocess_and_dispatch_compute_combine(self, hidden_states, probs, routing_map, shared_expert_output):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
-        
         hidden_states, mlp_bias, shared_expert_output =  self.dispatch_compute_combine(
             hidden_states, probs, residual, shared_expert_output
         )

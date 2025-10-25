@@ -19,17 +19,21 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -245,18 +249,28 @@ class MambaStack(MegatronModule):
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        use_inner_context = (self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed) or self.config.fp4
+
 
         with outer_fp8_context:
-            for layer in self.layers:
-                inner_fp8_context = (
-                    get_fp8_context(self.config, layer.layer_number - 1)
-                    if use_inner_fp8_context
-                    else nullcontext()
-                )
-                with inner_fp8_context:
-                    if isinstance(layer, TransformerLayer):
+            for layer_no, layer in enumerate(self.layers):
+                if use_inner_context:
+                    if self.config.fp8:
+                        quantization_context = get_fp8_context(self.config, layer.layer_number - 1)
+                    elif self.config.fp4:
+                        quantization_context = get_fp4_context(self.config, layer.layer_number - 1)
+                    else:
+                        quantization_context = nullcontext()
+                else:
+                    quantization_context = nullcontext()
+
+                if isinstance(layer, TransformerLayer) and isinstance(layer.self_attention, SelfAttention):
+                    # Attention layer
+                    if self.config.keep_mamba_stack_attention_linear_in_bf16:
+                        quantization_context = nullcontext()
+
+                    with quantization_context:
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -264,12 +278,26 @@ class MambaStack(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
                         )
-                    else:  # MambaLayer
+                elif isinstance(layer, TransformerLayer) and isinstance(layer.mlp, MoELayer):
+                    # MoE layer
+                    with quantization_context:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                elif isinstance(layer, MambaLayer):
+                    # MambaLayer
+                    with quantization_context:
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,
                         )
+                else:
+                    raise ValueError(f"Unexpected layer type: {type(layer)}")
 
                 # The attention layer (currently a simplified transformer layer)
                 # outputs a tuple of (hidden_states, context). Context is intended

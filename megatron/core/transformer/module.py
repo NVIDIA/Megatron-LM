@@ -92,7 +92,11 @@ class MegatronModule(torch.nn.Module):
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
         """
-        if self.config.fp8 is not None or getattr(self.config, 'use_kitchen', False):
+        if (
+            self.config.fp8 is not None
+            or self.config.fp4 is not None
+            or getattr(self.config, 'use_kitchen', False)
+        ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():

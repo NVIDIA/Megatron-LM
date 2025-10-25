@@ -34,10 +34,12 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.utils import (
     get_torch_version,
+    is_te_min_version,
     is_torch_min_version,
 )
+
 from megatron.core.activations import squared_relu
-from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
+from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0, warn_rank_0
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 from megatron.core.quantization.utils import (
@@ -677,6 +679,16 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
+        if args.fp8_param_gather and is_te_min_version("2.0.0"):
+            args.fp8_param_gather = False
+            warn_rank_0(
+                'FSDP2 FP8 param gather is not supported yet in TE 2.0, will fallback to bf16'
+                'all_gather instead, turning off fp8_param_gather',
+                args.rank,
+            )
+        if args.fp4_param and not is_te_min_version("2.7.0.dev0"):
+            raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")   
+
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
@@ -704,6 +716,18 @@ def validate_args(args, defaults={}):
             assert args.reuse_grad_buf_for_mxfp8_param_ag, \
                 "--fp8-param-gather with mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag"
 
+    # FP4 and FP8 are mutually exclusive
+    if args.fp4 and args.fp8:
+        raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
+
+    # FP4 param requires FP4 mode
+    if args.fp4_param and not args.fp4:
+        raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
+    
+    # FP4 requires TE >= 2.7.0.dev0
+    if args.fp4 and not is_te_min_version("2.7.0.dev0"):
+        raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
+
     if args.use_custom_fsdp:
         assert args.use_distributed_optimizer, \
             '--use-custom-fsdp only supported with distributed optimizer'
@@ -719,6 +743,7 @@ def validate_args(args, defaults={}):
 
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1352,11 +1377,36 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    
+    # FP4 related arguments
+    group.add_argument('--fp4-format', default=None,
+                       choices=['e2m1'],
+                       help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
+                       dest='fp4')
+    group.add_argument('--fp4-recipe', default='nvfp4',
+                       choices=['nvfp4'],
+                       help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
+                       dest='fp4_recipe')
+    group.add_argument('--fp4-param-gather', action='store_true',
+                       help='Keep the compute param in fp4 (do not use any other intermediate '
+                            'dtype) and perform the param all-gather in fp4.',
+                       dest='fp4_param')
     group.add_argument('--te-rng-tracker', action='store_true', default=False,
                        help='Use the Transformer Engine version of the random number generator. '
                             'Required for CUDA graphs support.')
     group.add_argument('--inference-rng-tracker', action='store_true', default=False,
                        help='Use a random number generator configured for inference.')
+
+    group.add_argument('--keep-mamba-stack-attention-linear-in-bf16', action='store_true', default=False,
+                       dest='keep_mamba_stack_attention_linear_in_bf16',
+                       help='Keep the mamba stack attention linear in high precision.')
+
+    group.add_argument('--keep-mamba-out-proj-in-mxfp8', default=False, action="store_true",
+                       help='Keep the mamba output projection in MXFP8.')
+
+    group.add_argument('--keep-moe-latent-projections-in-bf16', action='store_true',
+                       help='Force moe latent projection layer to be bf16.')
+
     return parser
 
 def _add_inference_args(parser):
@@ -1802,6 +1852,10 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--wandb-resume', type=str, default='',
+                       help='Resume wandb run. Enable resume by setting to "allow". Ignore wandb by default.')
+    group.add_argument('--wandb-resume-id', type=str, default='',
+                       help='The wandb run id to resume. Ignore wandb by default.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
     return parser
@@ -2941,12 +2995,15 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
-    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+    group.add_argument('--moe-router-padding-for-quantization', action='store_true',
                        help='Pad the routing_map to make sure the number of tokens each expert received '
-                       'is a multiple of 16/32 for FP8 precision. It is suggested to enable this for '
-                       'dropless training with FP8 precision when num_local_experts > 1. This is a more '
-                       'efficient way to pad for FP8 which eliminates the explicit padding in the '
+                       'is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for '
+                       'dropless training with FP8/FP4 precision when num_local_experts > 1. This is a more '
+                       'efficient way to pad for FP8/FP4 which eliminates the explicit padding in the '
                        'GroupedMLP layer.')
+    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+                       help='[Compatibility alias for --moe-router-padding-for-quantization] '
+                       'Enabling this will also enable --moe-router-padding-for-quantization.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
@@ -3128,6 +3185,8 @@ def _add_experimental_args(parser):
                             'precision-aware-optimizer. This dtype is used for storing the '
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
+
+                        
     return parser
 
 

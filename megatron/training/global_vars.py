@@ -207,6 +207,19 @@ def _set_wandb_writer(args):
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
             'config': wandb_config}
+        
+         # If user specifies resume mode 'allow', they must also specify resume_id
+        if getattr(args, 'wandb_resume', '') and args.rank == (args.world_size - 1):
+            if args.wandb_resume == 'allow':
+                if args.wandb_resume_id == '':
+                    raise ValueError("Please specify the wandb resume_id!")
+                wandb_kwargs['resume'] = args.wandb_resume
+                wandb_kwargs['id'] = args.wandb_resume_id
+            elif args.wandb_resume == '':
+                pass # noop
+            else:
+                raise ValueError(f"Invalid wandb resume mode: {args.wandb_resume}. Please specify 'allow' to enable resume.")
+
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb

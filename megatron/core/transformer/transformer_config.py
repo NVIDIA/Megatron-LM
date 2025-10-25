@@ -371,6 +371,32 @@ class TransformerConfig(ModelParallelConfig):
     """Use the kitchen extension for transformer quantization."""
 
     ####################
+    # fp4 related
+    ####################
+    fp4: Optional[str] = None
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only 
+    supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
+
+    fp4_recipe: Optional[str] = "nvfp4"
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
+    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+
+    fp4_param: bool = False
+    """If set, keep the parameters in fp4 precision to save memory. This option must be used
+    together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
+    will be converted to fp4; for example, biases will remain unchanged."""
+
+    keep_mamba_stack_attention_linear_in_bf16: bool = False
+    """If True, keep the mamba stack attention linear in high precision."""
+
+    keep_mamba_out_proj_in_mxfp8: bool = False
+    """Keep the mamba output projection in high precision. """
+
+    keep_moe_latent_projections_in_bf16: bool = False
+    """Keep the moe latent output projections in high precision. """
+
+
+    ####################
     # MoE related
     ####################
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -412,10 +438,14 @@ class TransformerConfig(ModelParallelConfig):
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
+    moe_router_padding_for_quantization: Optional[bool] = False
+    """Whether to pad the routing_map to make sure the number of tokens each expert receives
+    is a multiple of 16/32 for quantized precision (e.g., FP8, FP4). This can remove the explicit
+    padding in the GroupedMLP layer."""
+
     moe_router_padding_for_fp8: Optional[bool] = False
-    """Whether to pad the routing_map to make sure the number of tokens each expert received
-    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
-    GroupedMLP layer."""
+    """[Compatibility alias for moe_router_padding_for_quantization]
+    Enabling this will also enable moe_router_padding_for_quantization."""
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
@@ -713,6 +743,13 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        # FP4 validation
+        if self.fp4_param and not self.fp4:
+            raise ValueError("fp4_param must be used together with fp4 mode.")
+
+        if self.fp4 and self.fp8:
+            raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
@@ -1221,13 +1258,23 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_router_padding_for_fp8:
-            if self.fp8 is None:
-                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
+            # enable moe_router_padding_for_quantization
+            warnings.warn(
+                "--moe-router-padding-for-fp8 is going to be deprecated. "
+                "Use --moe-router-padding-for-quantization instead."
+            )
+            self.moe_router_padding_for_quantization = True
+
+        if self.moe_router_padding_for_quantization:
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
+                )
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
-                    "moe_router_padding_for_fp8."
+                    "moe_router_padding_for_quantization."
                 )
 
         if (

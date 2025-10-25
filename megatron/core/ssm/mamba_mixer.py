@@ -10,6 +10,7 @@ import math
 import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Union
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -55,6 +56,13 @@ try:
     from einops import rearrange, repeat
 except ImportError:
     raise ImportError("einops is required by the Mamba model but cannot be imported")
+
+try:
+    import transformer_engine as te
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 logger = logging.getLogger(__name__)
@@ -236,7 +244,7 @@ class MambaMixer(MegatronModule):
             bias=bias,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name='fc1',
+            tp_comm_buffer_name='mamba_in_proj',
             tp_group=self.model_comm_pgs.tp,
         )
 
@@ -333,7 +341,7 @@ class MambaMixer(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
-            tp_comm_buffer_name='fc2',
+            tp_comm_buffer_name='mamba_out_proj',
             tp_group=self.model_comm_pgs.tp,
         )
 
@@ -519,7 +527,20 @@ class MambaMixer(MegatronModule):
                 z = self.cp.post_conv_ssm(z)
                 y = self.norm(y, z)
 
-        out, out_bias = self.out_proj(y)
+        if self.config.keep_mamba_out_proj_in_mxfp8 and self.config.fp4_recipe is not None:
+            assert HAVE_TE
+            # Use MXFP8 for higher o_proj precision.
+            fp8_format = te.common.recipe.Format.E4M3
+            mxfp8_recipe = te.common.recipe.MXFP8BlockScaling(
+                    fp8_format=fp8_format
+            )
+            disable_low_precision = te.pytorch.fp8_autocast(fp8_recipe=mxfp8_recipe)
+        else:
+            # Keep existing precision.
+            disable_low_precision = nullcontext()
+
+        with disable_low_precision:
+            out, out_bias = self.out_proj(y)
 
         return out, out_bias
 

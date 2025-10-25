@@ -164,7 +164,7 @@ class MambaLayer(MegatronModule):
             return hidden_states
 
         if self.mamba_layer_recompute:
-            if self.config.fp8:
+            if self.config.fp8 or self.config.fp4:
                 output = te_checkpoint(
                     custom_forward,
                     False,
