@@ -772,7 +772,11 @@ publish:approve_merge_gate:
 
       export GH_TOKEN=$GH_TOKEN
       export REPO=NVIDIA/Megatron-LM
-      export TARGET_BRANCH="$CI_COMMIT_BRANCH"
+      if [[ "$CI_COMMIT_BRANCH" == *main* ]]; then
+        export TARGET_BRANCH="main"
+      elif [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
+        export TARGET_BRANCH="dev"
+      fi
 
       if [[ $EXIT_CODE -eq 0 ]]; then
         export STATUS="approved"
