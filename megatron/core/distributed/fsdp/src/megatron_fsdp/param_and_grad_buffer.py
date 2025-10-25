@@ -83,13 +83,19 @@ try:
 except Exception:
     HAVE_TE = False
 
+NCCL_ALLOCATOR = None
+
 try:
     # Try to import the MCore NCCL nccl_allocator first.
     # If it fails, try to import the APEX NCCL nccl_allocator.
     import megatron.core.nccl_allocator as nccl_allocator
+
+    NCCL_ALLOCATOR = "MCORE"
 except ImportError:
     try:
         import apex.contrib.nccl_allocator as nccl_allocator
+
+        NCCL_ALLOCATOR = "APEX"
     except ImportError:
         nccl_allocator = None
 
@@ -1619,7 +1625,9 @@ class ParamAndGradBuffer:
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
-        self.mem_alloc_context = self.get_mem_alloc_context(groups=self.ubr_groups)
+        self.mem_alloc_context = self.get_mem_alloc_context(
+            groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
+        )
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
@@ -1647,7 +1655,7 @@ class ParamAndGradBuffer:
 
         self._log_parameter_groups()
 
-    def get_mem_alloc_context(self, groups=None):
+    def get_mem_alloc_context(self, groups=None, symmetric=True):
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
@@ -1660,22 +1668,43 @@ class ParamAndGradBuffer:
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-            if len(groups) == 1:
-                # register buffers to the default group directly using apex memory allocator
-                mem_alloc_context = functools.partial(
-                    nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
-                )
-            else:
-                if hasattr(nccl_allocator, "MultiGroupMemPoolAllocator"):
-                    # Case of MCore NCCL allocator
+
+            if NCCL_ALLOCATOR == "MCORE":
+                if len(groups) == 1:
+                    # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.MultiGroupMemPoolAllocator, NCCL_MEMORY_POOL, groups=groups
+                        nccl_allocator.nccl_mem,
+                        NCCL_MEMORY_POOL,
+                        group=groups[0],
+                        symmetric=symmetric,
                     )
                 else:
-                    # Case of APEX NCCL allocator.
+                    mem_alloc_context = functools.partial(
+                        nccl_allocator.MultiGroupMemPoolAllocator,
+                        NCCL_MEMORY_POOL,
+                        groups=groups,
+                        symmetric=symmetric,
+                    )
+            elif NCCL_ALLOCATOR == "APEX":
+                if symmetric:
+                    logging.warning(
+                        "Symmetric registration is not supported for APEX NCCL allocator."
+                        "falling back to non-symmetric registration. "
+                        "Please use Megatron Core NCCL allocator for symmetric registration."
+                    )
+
+                if len(groups) == 1:
+                    # register buffers to the default group directly using nccl memory allocator
+                    mem_alloc_context = functools.partial(
+                        nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
+                    )
+                else:
+                    # Supports multiple groups registration for APEX NCCL allocator.
                     mem_alloc_context = functools.partial(
                         MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
                     )
+            else:
+                raise ValueError(f"Invalid NCCL allocator: {NCCL_ALLOCATOR}")
             return mem_alloc_context
         else:
             return nullcontext

@@ -685,7 +685,10 @@ class _ParamAndGradBuffer:
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
             mem_alloc_context = functools.partial(
-                nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
+                nccl_allocator.nccl_mem,
+                pool,
+                group=self.data_parallel_group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
             )
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
