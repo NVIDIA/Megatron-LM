@@ -48,7 +48,6 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
-      SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -65,10 +64,12 @@ jobs:
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_DEV_BRANCH: ${{ github.ref == 'refs/heads/dev' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
           PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
 
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ]; then
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -326,17 +327,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - bucket: "unit_tests"
-          - bucket: "unit_tests/data/"
-          - bucket: "unit_tests/dist_checkpointing/*.py"
-          - bucket: "unit_tests/dist_checkpointing/models/"
-          - bucket: "unit_tests/transformer/*.py"
-          - bucket: "unit_tests/transformer/moe"
+        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
+      - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
@@ -358,7 +354,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          test_case: tests/${{ matrix.bucket }}
+          test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
@@ -448,7 +444,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
@@ -476,7 +472,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:1864 # ${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:
