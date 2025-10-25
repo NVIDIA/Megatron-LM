@@ -14,7 +14,7 @@
 name: CICD Megatron-LM
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: 0 0 * * *
   push:
     branches:
       - dev
@@ -23,6 +23,7 @@ on:
       - "deploy-release/*"
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -366,6 +367,14 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
     steps:
