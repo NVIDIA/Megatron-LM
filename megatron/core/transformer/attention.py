@@ -22,6 +22,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -186,6 +191,21 @@ class Attention(MegatronModule, ABC):
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
+        )
+
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -725,9 +745,16 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        qkv_output = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, split_qkv=split_qkv
-        )
+        if self.offload_qkv_linear:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
+        with get_fine_grained_offloading_context(self.offload_qkv_linear):
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states, key_value_states, split_qkv=split_qkv
+            )
+        if self.offload_qkv_linear:
+            qkv_output, _ = fine_grained_offloading_group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[hidden_states]
+            )
         attn_mask_type = self.attn_mask_type
         block_table = None
         if split_qkv:
@@ -873,17 +900,20 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         else:
+            if self.offload_core_attention and self.training:
+                query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                with get_fine_grained_offloading_context(self.offload_core_attention):
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
@@ -904,6 +934,10 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
+            if self.offload_core_attention and self.training:
+                (core_attn_out,) = fine_grained_offloading_group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -917,7 +951,14 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
+        with get_fine_grained_offloading_context(self.offload_attn_proj):
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output, bias = fine_grained_offloading_group_commit(
+                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
