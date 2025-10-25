@@ -101,7 +101,6 @@ class StaticInferenceEngine(AbstractEngine):
                     buffer_size_gb=buffer_size_gb,
                     num_cuda_graphs=1,
                 )
-                termination_id = self.controller.tokenizer.eod
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
                 self.controller.inference_wrapped_model.prep_model_for_inference()
 
@@ -109,7 +108,6 @@ class StaticInferenceEngine(AbstractEngine):
                     controller=self.controller,
                     random_seed=self.random_seed,
                     context=dynamic_context,
-                    termination_id=termination_id,
                     enable_cuda_graph=True,
                 )
         except Exception as e:
