@@ -690,7 +690,9 @@ class TestDynamicInferenceEngine:
         env.engine.controller.tokenize_prompt = mock_tokenize_prompt
 
         # Call the generate function.
-        finished_requests = env.engine.generate(prompts)
+        # It's safe to use request 0's sampling params here because all sampling
+        # params are identical as long as use_fixed_output_lengths == False.
+        finished_requests = env.engine.generate(prompts, env.requests[0].sampling_params)
 
         # Verify results
         assert len(finished_requests) == len(
