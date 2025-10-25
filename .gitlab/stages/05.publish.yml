@@ -540,10 +540,6 @@ publish:upload_statistics:
   stage: publish
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs:
-    - job: test:unit_tests_pyt(DEV)_mcore(legacy)
-      optional: true
-    - job: test:unit_tests_pyt(LTS)_mcore(legacy)
-      optional: true
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
     - job: functional:run_lts_dgx_a100
