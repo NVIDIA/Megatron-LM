@@ -79,3 +79,7 @@ The proposed review process for `dev` branch is under active discussion.
 
 MRs are mergable after one approval by either `eharper@nvidia.com` or `zijiey@nvidia.com`.
 </details>
+
+### Merging your PR
+
+Any member of [core-adlr](https://github.com/org/teams/NVIDIA/core-adlr) and [`core-nemo`](https://github.com/org/teams/NVIDIA/core-adlr) will be able to merge your PR.
