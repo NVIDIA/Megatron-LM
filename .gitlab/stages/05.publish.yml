@@ -1,6 +1,8 @@
 .publish_common_freeze:
   stage: publish
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: ($CI_COMMIT_BRANCH == "main") && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
@@ -748,4 +750,46 @@ publish:merge_into_dev:
   rules:
     - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
       allow_failure: true
+    - when: never
+
+publish:approve_merge_gate:
+  stage: publish
+  image: maniator/gh
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - |
+      set -eoux pipefail
+      EXIT_CODE=0
+      apk add python3
+      python -m venv .venv
+      source .venv/bin/activate
+      pip install --no-cache-dir python-gitlab click pygithub
+      export GITLAB_ENDPOINT
+      export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
+
+      export GH_TOKEN=$GH_TOKEN
+      export REPO=NVIDIA/Megatron-LM
+      export TARGET_BRANCH="$CI_COMMIT_BRANCH"
+
+      if [[ $EXIT_CODE -eq 0 ]]; then
+        export STATUS="approved"
+        export COMMENT="Main is healthy. Submitting PR."
+      else
+        export STATUS="rejected"
+        export COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
+      fi
+
+      python tests/test_utils/python_scripts/approve_merge_gate.py
+  retry:
+    max: 2
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
+      when: always
     - when: never
