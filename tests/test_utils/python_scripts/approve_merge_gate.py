@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
 """
 Approve pending deployments for workflow runs from PRs targeting a specific branch.
