@@ -85,6 +85,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    fallback_to_eager_attn: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -116,13 +117,15 @@ def get_gpt_layer_with_transformer_engine_spec(
 
     if use_kitchen:
         assert HAVE_KITCHEN
-        backend: BackendSpecProvider = KitchenSpecProvider(fallback=TESpecProvider())
+        backend: BackendSpecProvider = KitchenSpecProvider(
+            fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
+        )
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
-        backend = TESpecProvider()
+        backend = TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
 
     sharded_state_dict_keys_map = {}
 
@@ -499,6 +502,7 @@ def get_gpt_decoder_block_spec(
     if use_transformer_engine:
         layer_norm_impl = TENorm
         get_layer_spec_kwargs["use_te_activation_func"] = config.use_te_activation_func
+        get_layer_spec_kwargs['fallback_to_eager_attn'] = config.fallback_to_eager_attn
         get_layer_spec_fn = get_gpt_layer_with_transformer_engine_spec
     else:
         layer_norm_impl = LNImpl
@@ -633,9 +637,11 @@ def get_gpt_mtp_block_spec(
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
         backend: BackendSpecProvider = (
-            KitchenSpecProvider(fallback=TESpecProvider())
+            KitchenSpecProvider(
+                fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
+            )
             if config.use_kitchen
-            else TESpecProvider()
+            else TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
         )
     else:
         backend = (
