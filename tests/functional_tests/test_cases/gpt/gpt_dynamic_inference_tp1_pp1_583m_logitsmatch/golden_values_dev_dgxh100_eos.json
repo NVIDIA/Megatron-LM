@@ -132,7 +132,7 @@
    1784,
    1010
   ],
-  "latency": 9.500940799713135,
+  "latency": 10.056535482406616,
   "cuda_graph_request_count_map": null,
   "step_count": 6144,
   "logprobs": [
@@ -1132,7 +1132,7 @@
    9369,
    1046
   ],
-  "latency": 47.62603187561035,
+  "latency": 48.19877076148987,
   "cuda_graph_request_count_map": null,
   "step_count": 6144,
   "logprobs": [
@@ -1403,7 +1403,7 @@
    1049,
    1048
   ],
-  "latency": 85.72285866737366,
+  "latency": 86.85381531715393,
   "cuda_graph_request_count_map": null,
   "step_count": 6144,
   "logprobs": [
@@ -2225,7 +2225,7 @@
    5558,
    4318
   ],
-  "latency": 123.73716306686401,
+  "latency": 125.58511328697205,
   "cuda_graph_request_count_map": null,
   "step_count": 6144,
   "logprobs": [
@@ -2502,7 +2502,7 @@
    1855,
    2505
   ],
-  "latency": 152.44927835464478,
+  "latency": 154.75680470466614,
   "cuda_graph_request_count_map": null,
   "step_count": 6144,
   "logprobs": [
@@ -2696,8 +2696,8 @@
   ]
  },
  "throughput": [
-  93.1230491402662,
-  106.19720196336941,
-  107.22278382923312
+  92.85373905991672,
+  105.49771806099545,
+  105.39549236672089
  ]
 }
