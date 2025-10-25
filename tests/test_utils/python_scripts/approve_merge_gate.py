@@ -7,7 +7,7 @@ Requirements:
     pip install PyGithub
 
 Usage:
-    export GITHUB_TOKEN="ghp_..."
+    export GH_TOKEN="ghp_..."
     export REPO="NVIDIA/Megatron-LM"
     export TARGET_BRANCH="main"
     export STATUS="approved"
@@ -36,7 +36,7 @@ def main():
     comment = os.environ.get("COMMENT", "")
 
     if not all([github_token, repo_name, target_branch, status]):
-        print(
+        logger.error(
             "Error: GITHUB_TOKEN, REPO, TARGET_BRANCH, and STATUS environment variables must be set"
         )
         sys.exit(1)
@@ -47,7 +47,7 @@ def main():
     try:
         repo = g.get_repo(repo_name)
     except GithubException as e:
-        print(f"Error accessing repository: {e}")
+        logger.error(f"Error accessing repository: {e}")
         sys.exit(1)
 
     # Get merge-gate environment ID
@@ -62,10 +62,10 @@ def main():
                 break
 
         if not env_id:
-            print("Error: merge-gate environment not found")
+            logger.error("Error: merge-gate environment not found")
             sys.exit(1)
     except GithubException as e:
-        print(f"Error fetching environments: {e}")
+        logger.error(f"Error fetching environments: {e}")
         sys.exit(1)
 
     logger.info(f"merge-gate environment ID: {env_id}")
@@ -74,7 +74,7 @@ def main():
     try:
         workflow_runs = repo.get_workflow_runs(status="waiting")
     except GithubException as e:
-        print(f"Error fetching workflow runs: {e}")
+        logger.error(f"Error fetching workflow runs: {e}")
         sys.exit(1)
 
     logger.info(f"Found {workflow_runs.totalCount} waiting workflow runs")
@@ -84,25 +84,20 @@ def main():
         head_branch = run.head_branch
 
         # Extract PR number from branch pattern pull-request/(\d+)
-        match = re.search(r"pull-request/(\d+)", head_branch)
+        match = re.search(r"gh-readonly-queue/([^/]+)/pr-(\d+)-", head_branch)
         if not match:
             logger.info(f"Skipping Run #{run.id} on {head_branch}: not a PR branch")
             continue
 
-        pr_number = int(match.group(1))
-        print(f"Processing PR #{pr_number} from run {run.id}")
+        branch_name = match.group(1)
+        pr_number = int(match.group(2))
+        logger.info(f"Processing PR #{pr_number} from run {run.id}")
 
-        # Get PR details
-        try:
-            pr = repo.get_pull(pr_number)
-        except GithubException as e:
-            print(f"Error fetching PR #{pr_number}: {e}")
+        if branch_name != target_branch:
+            logger.info(f"Skipping run {run.id}: targets {branch_name}, not {target_branch}")
             continue
-
-        # Check if PR targets the correct branch
-        if pr.base.ref != target_branch:
-            print(f"Skipping PR #{pr_number}: targets {pr.base.ref}, not {target_branch}")
-            continue
+        
+        logger.info(f"Processing PR #{pr_number} from run {run.id} (branch: {branch_name})")
 
         # Approve pending deployment
         try:
@@ -113,9 +108,9 @@ def main():
                 f"{repo.url}/actions/runs/{run.id}/pending_deployments",
                 input={"environment_ids": [env_id], "state": status, "comment": comment},
             )
-            print(f"✓ Successfully updated deployment for run {run.id} (PR #{pr_number})")
+            logger.info(f"✓ Successfully updated deployment for run {run.id} (PR #{pr_number})")
         except GithubException as e:
-            print(f"✗ Failed to update deployment for run {run.id}: {e}", file=sys.stderr)
+            logger.info(f"✗ Failed to update deployment for run {run.id}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
