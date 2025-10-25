@@ -18,6 +18,8 @@ workflow:
     - if: $CI_PROJECT_NAMESPACE != "ADLR" || ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_PROJECT_PATH != "ADLR/megatron-lm")
       when: never
 
+    - if: $CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main'
+
     # ci-branches only for schedule
     - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
       when: never
@@ -154,6 +156,8 @@ default:
     when: runner_system_failure
 
 variables:
+  BUILD:
+    value: "yes"
   UNIT_TEST:
     value: "yes"
     options:

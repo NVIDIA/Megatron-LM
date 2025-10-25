@@ -2,6 +2,8 @@
   rules:
     - if: $PUBLISH == "yes"
       when: never
+    - if: $BUILD == "no"
+      when: never
     - when: on_success
   stage: test
 
@@ -281,10 +283,11 @@ test:linting_formatting:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  needs: [test:build_image]
   variables:
     GIT_STRATEGY: "clone"
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $PUBLISH == "yes"
       when: never
     - if: $CI_PIPELINE_SOURCE == 'push' || $CI_PIPELINE_SOURCE == 'schedule'
@@ -310,8 +313,9 @@ test:linting_copyright:
     - purpose/utility
     - team/megatron
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  needs: [test:build_image]
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $PUBLISH == "yes"
       when: never
     - if: $CI_PIPELINE_SOURCE == 'push'
