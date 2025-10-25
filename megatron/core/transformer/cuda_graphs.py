@@ -464,6 +464,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # save grads and other variables that may be affected by graph warmup
+        saved_fp8_tensors = None
         if self.grad_enabled:
             save_main_grads = [
                 param.main_grad.clone()
@@ -471,7 +472,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, 'main_grad')
             ]
 
-            saved_fp8_tensors = None
             if self.fp8_enabled:
                 if is_te_min_version("1.13.0"):
                     saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp8_recipe)
