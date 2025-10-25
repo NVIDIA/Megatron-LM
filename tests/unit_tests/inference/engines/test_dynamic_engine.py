@@ -164,8 +164,10 @@ class TestDynamicInferenceEngine:
                 sampling_params.add_attributes({"num_tokens_total": num_tokens_total})
             else:
                 sampling_params.num_tokens_total = num_tokens_total
+
+            config_entry = test_config.skip_prompt_log_probs_for_dynamic_inference
             sampling_params.add_attributes(
-                {"skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs}
+                {"skip_prompt_log_probs_for_dynamic_inference": config_entry}
             )
 
             # Request.
