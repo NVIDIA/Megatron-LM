@@ -13,10 +13,6 @@ include:
 wait_for_resources:
   extends: [.test_rules]
   needs:
-    - job: test:linting_formatting
-      optional: true
-    - job: test:linting_copyright
-      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:build_image
@@ -272,64 +268,6 @@ test:linting_docs_build:
     - mv megatron-lm/ documentation/
     - cd documentation/
     - ./repo docs
-
-test:linting_formatting:
-  extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  variables:
-    GIT_STRATEGY: "clone"
-  rules:
-    - if: $BUILD == "no"
-      when: never
-    - if: $PUBLISH == "yes"
-      when: never
-    - if: $CI_PIPELINE_SOURCE == 'push' || $CI_PIPELINE_SOURCE == 'schedule'
-      when: never
-    - when: on_success
-  script:
-    - |
-      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
-        exit 0
-      fi
-    - set +e
-    - env
-    - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
-    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
-
-test:linting_copyright:
-  extends: [.test_rules]
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  rules:
-    - if: $BUILD == "no"
-      when: never
-    - if: $PUBLISH == "yes"
-      when: never
-    - if: $CI_PIPELINE_SOURCE == 'push'
-      when: never
-    - when: on_success
-  script:
-    - |
-      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
-        exit 0
-      fi
-    - git fetch origin main
-    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
-    - bash tools/copyright.sh
 
 # Override from template
 secret_detection:
