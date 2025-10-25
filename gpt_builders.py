@@ -6,6 +6,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
+    get_gpt_decoder_layer_specs,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -57,18 +58,19 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
                 transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
-            if (
-                hasattr(transformer_layer_spec, 'layer_specs')
-                and len(transformer_layer_spec.layer_specs) == 0
-            ):
-                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+            # Get GPT decoder layer specs for the model.
+            if args.spec is not None:
+                mtp_transformer_layer_spec = import_module(args.spec)
             else:
-                transformer_layer_spec_for_mtp = transformer_layer_spec
+                # Define the decoder block spec
+                decoder_layer_specs = get_gpt_decoder_layer_specs(
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                )
+                mtp_transformer_layer_spec = decoder_layer_specs[-1]
+            # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config,
-                transformer_layer_spec_for_mtp,
+                mtp_transformer_layer_spec,
                 use_transformer_engine=use_te,
                 vp_stage=vp_stage,
             )
@@ -96,12 +98,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-
+    
     Args:
         use_te (bool): Whether to use Transformer Engine
         args: Training arguments
         config: Model configuration
-
+        
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
