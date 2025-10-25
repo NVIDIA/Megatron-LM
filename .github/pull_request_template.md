@@ -82,4 +82,4 @@ MRs are mergable after one approval by either `eharper@nvidia.com` or `zijiey@nv
 
 ### Merging your PR
 
-Any member of [core-adlr](https://github.com/org/teams/NVIDIA/core-adlr) and [`core-nemo`](https://github.com/org/teams/NVIDIA/core-adlr) will be able to merge your PR.
+Any member of [core-adlr](https://github.com/orgs/teams/NVIDIA/core-adlr) and [`core-nemo`](https://github.com/orgs/teams/NVIDIA/core-adlr) will be able to merge your PR.
