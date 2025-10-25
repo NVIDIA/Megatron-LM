@@ -26,6 +26,8 @@ flowchart LR
 
 ### Code review
 
+The following process is enforced via the CODEOWNERS file for changes into `megatron/core`. For changes outside of `megatron/core`, it is up to the PR author whether or not to tag the Final Reviewer team.
+
 <details>
 <summary>For MRs into `main` branch</summary>
 
