@@ -13,10 +13,6 @@ include:
 wait_for_resources:
   extends: [.test_rules]
   needs:
-    - job: test:linting_formatting
-      optional: true
-    - job: test:linting_copyright
-      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:build_image
@@ -78,7 +74,7 @@ test:unit_tests_configure:
         "--n-repeat ${UNIT_TEST_REPEAT}"
         "--time-limit $(( UNIT_TEST_TIMEOUT * 60 ))"
         "--test-cases all"
-        "--cluster dgxh100_coreweave"
+        "--cluster $H100_CLUSTER"
         "--platform dgx_h100"
         "--partition batch"
         "--container-image ${UTILITY_IMAGE}"
@@ -163,46 +159,6 @@ test:unit_tests_configure:
     - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
       when: on_success
 
-test:unit_tests_pyt(DEV)_mcore(legacy):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: dev
-    TAG: legacy
-  rules:
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
-      when: never
-    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
-      when: never
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
-      when: never
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
-      when: never
-    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
-      when: on_success
-
-test:unit_tests_pyt(LTS)_mcore(legacy):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: lts
-    TAG: legacy
-  rules:
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
-      when: never
-    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
-      when: never
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
-      when: never
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
-      when: never
-    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
-      when: on_success
-
 test:unit_tests_pyt(DEV)_mcore(latest):
   extends: [.unit_tests_run]
   variables:
@@ -272,64 +228,6 @@ test:linting_docs_build:
     - mv megatron-lm/ documentation/
     - cd documentation/
     - ./repo docs
-
-test:linting_formatting:
-  extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  variables:
-    GIT_STRATEGY: "clone"
-  rules:
-    - if: $BUILD == "no"
-      when: never
-    - if: $PUBLISH == "yes"
-      when: never
-    - if: $CI_PIPELINE_SOURCE == 'push' || $CI_PIPELINE_SOURCE == 'schedule'
-      when: never
-    - when: on_success
-  script:
-    - |
-      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
-        exit 0
-      fi
-    - set +e
-    - env
-    - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
-    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
-
-test:linting_copyright:
-  extends: [.test_rules]
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  rules:
-    - if: $BUILD == "no"
-      when: never
-    - if: $PUBLISH == "yes"
-      when: never
-    - if: $CI_PIPELINE_SOURCE == 'push'
-      when: never
-    - when: on_success
-  script:
-    - |
-      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
-        exit 0
-      fi
-    - git fetch origin main
-    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
-    - bash tools/copyright.sh
 
 # Override from template
 secret_detection:

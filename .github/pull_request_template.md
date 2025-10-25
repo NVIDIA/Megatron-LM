@@ -18,11 +18,11 @@ flowchart LR
 ### Pre-checks
 
 - [ ] I want this PR in a versioned release and have added the appropriate Milestone (e.g., `Core 0.8`)
-- [ ] I have added relevant unit tests [Unittest guidelines](https://adlr.gitlab-master-pages.nvidia.com/megatron-lm-wiki/testing_guide/unit_tests/)
-- [ ] I have added relevant functional tests [CI Test guidelines](https://adlr.gitlab-master-pages.nvidia.com/megatron-lm-wiki/testing_guide/functional_tests/)
+- [ ] I have added relevant unit tests
+- [ ] I have added relevant functional tests
 - [ ] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)
-- [ ] I have added relevant documentation [Documentation guidelines](https://adlr.gitlab-master-pages.nvidia.com/megatron-lm-wiki/documentation_guide/)
-- [ ] I have run the [autoformatter.sh](https://adlr.gitlab-master-pages.nvidia.com/megatron-lm-wiki/testing_guide/formatting/#autoformattersh) on my PR
+- [ ] I have added relevant documentation
+- [ ] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR
 
 ### Code review
 
