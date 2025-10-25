@@ -59,7 +59,7 @@ spec:
     cp coverage.xml {assets_dir}
 
 products:
-  - test_case: [tests/unit_tests/inference/**/*.py]
+  - test_case: [tests/unit_tests/test_parallel_state.py]
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
