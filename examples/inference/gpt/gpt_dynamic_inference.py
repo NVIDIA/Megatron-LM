@@ -217,7 +217,7 @@ def run_inference(
         A dictionary of step times with `prefill` and `decode` keys.
     """
 
-    if sampling_params is not None:
+    if sampling_params is not None and torch.distributed.get_rank() == 0:
         warnings.warn(
             "The `sampling_params` argument is deprecated. "
             "Sampling parameters are specified per request.",
