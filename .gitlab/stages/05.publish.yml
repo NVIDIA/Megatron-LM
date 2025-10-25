@@ -769,7 +769,7 @@ publish:approve_merge_gate:
       apk add python3
       python -m venv .venv
       source .venv/bin/activate
-      pip install --no-cache-dir python-gitlab click
+      pip install --no-cache-dir python-gitlab click pygithub
       export GITLAB_ENDPOINT
       export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
       python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
@@ -779,28 +779,14 @@ publish:approve_merge_gate:
       export TARGET_BRANCH="$CI_COMMIT_BRANCH"
 
       if [[ $EXIT_CODE -eq 0 ]]; then
-        STATUS="approved"
-        COMMENT="Main is healthy. Submitting PR."
+        export STATUS="approved"
+        export COMMENT="Main is healthy. Submitting PR."
       else
-        STATUS="rejected"
-        COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
+        export STATUS="rejected"
+        export COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
       fi
 
-      gh api "repos/$REPO/actions/runs?status=waiting" --jq '.workflow_runs[].id' \
-        | while read run_id; do
-            HEAD_BRANCH=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.head_branch' 2>/dev/null) || continue
-            PR_NUMBER="${HEAD_BRANCH##*/}"
-            if [ -n "$PR_NUMBER" ]; then
-                PR_BASE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref' 2>/dev/null) || continue
-                if [ "$PR_BASE" = "$TARGET_BRANCH" ]; then
-                    gh api \
-                      --method POST "repos/$REPO/actions/runs/$run_id/pending_deployments" \
-                      -F "environment_ids[]=$(gh api "repos/$REPO/environments" --jq '.environments[] | select(.name=="merge-gate") | .id')" \
-                      -f state="$STATUS" \
-                      -f comment="$COMMENT";
-                fi
-            fi
-        done
+      python tests/test_utils/python_scripts/approve_merge_gate.py
   retry:
     max: 2
   rules:
