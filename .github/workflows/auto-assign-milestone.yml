@@ -15,7 +15,7 @@ jobs:
       - name: Check if PR has milestone
         id: check_milestone
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           MILESTONE=$(gh pr view ${{ github.event.pull_request.number }} \
             --repo ${{ github.repository }} \
@@ -33,7 +33,7 @@ jobs:
         if: steps.check_milestone.outputs.has_milestone == 'false'
         id: get_milestone
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           # Get the most recent open milestone (sorted by due date, then by creation date)
           MILESTONE_NUMBER=$(gh api \
@@ -57,7 +57,7 @@ jobs:
       - name: Assign milestone to PR
         if: steps.check_milestone.outputs.has_milestone == 'false' && steps.get_milestone.outputs.milestone_found == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           gh pr edit ${{ github.event.pull_request.number }} \
             --repo ${{ github.repository }} \
@@ -68,7 +68,7 @@ jobs:
       - name: Comment on PR
         if: steps.check_milestone.outputs.has_milestone == 'false' && steps.get_milestone.outputs.milestone_found == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
             --repo ${{ github.repository }} \
