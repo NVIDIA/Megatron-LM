@@ -96,7 +96,7 @@ def main():
         if branch_name != target_branch:
             logger.info(f"Skipping run {run.id}: targets {branch_name}, not {target_branch}")
             continue
-        
+
         logger.info(f"Processing PR #{pr_number} from run {run.id} (branch: {branch_name})")
 
         # Approve pending deployment
