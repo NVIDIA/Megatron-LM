@@ -774,7 +774,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and self.config.cuda_graph_scope != "full_iteration"
+            and "full_iteration" not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")

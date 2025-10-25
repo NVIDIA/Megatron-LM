@@ -7,6 +7,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -1028,3 +1029,151 @@ def get_default_pg_collection():
         with_context_parallel=True
     )
     return pg_collection
+
+
+class MoELayerEarlyReturnException(Exception):
+    """Used to early-return from a MoE layer forward pass."""
+
+    def __init__(self, moe_layer, step, **kwargs):
+        self.moe_layer = moe_layer
+        self.step = step
+        self.kwargs = kwargs
+
+    def get_early_return_outputs(
+        self, hidden_states: torch.Tensor, shared_expert_output: torch.Tensor
+    ):
+        """Get the early return outputs for the MoE layer."""
+        if self.step == "route":
+            # Return right here if we are capturing the MoE router.
+            outputs = [hidden_states, self.kwargs['probs'], self.kwargs['routing_map']]
+        elif self.step == "preprocess":
+            # Return right here if we are capturing the MoE preprocess.
+            outputs = [self.kwargs['hidden_states'], self.kwargs['probs'], self.kwargs['residual']]
+            valid_cudagraph_attrs = []
+            for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
+                hier_attr_name = attr_name.split('.')
+                attr = self.moe_layer.token_dispatcher
+                for name in hier_attr_name:
+                    attr = getattr(attr, name, None)
+                    if attr is None:
+                        break
+                if isinstance(attr, torch.Tensor):
+                    outputs.append(attr)
+                    valid_cudagraph_attrs.append(attr_name)
+            if self.moe_layer.token_dispatcher.valid_cudagraph_attrs is None:
+                self.moe_layer.token_dispatcher.valid_cudagraph_attrs = valid_cudagraph_attrs
+            else:
+                assert (
+                    self.moe_layer.token_dispatcher.valid_cudagraph_attrs == valid_cudagraph_attrs
+                ), (
+                    "valid_cudagraph_attrs mismatch: "
+                    f"{self.moe_layer.token_dispatcher.valid_cudagraph_attrs} != "
+                    f"{valid_cudagraph_attrs}"
+                )
+        if shared_expert_output is not None:
+            outputs.append(shared_expert_output)
+        return outputs
+
+
+def maybe_skip_or_early_return_by_cudagraph(step_condition):
+    """
+    Decorator to skip certain codepaths in the MoE layer forward pass in CUDA graph replay,
+    or early return from the MoE layer forward pass in CUDA graph capture.
+
+    Args:
+        step_condition: The step condition to check. Can be "shared_experts_compute", "route",
+        or "preprocess". If "shared_experts_compute", the shared experts computation will be
+        skipped in replay if it is in the CUDA graph scope. If "route" or "preprocess", the
+        router or preprocess will be skipped in replay if it is in the CUDA graph scope, or
+        early return from the MoE layer forward pass if it is in CUDA graph capturing mode.
+
+    Returns:
+        A decorator function that wraps the MoE layer forward pass.
+    """
+
+    def maybe_raise_early_return(moe_layer, **kwargs):
+        """
+        Check if the MoE layer should early return for CUDA graph capture.
+        If so, raise a MoELayerEarlyReturnException.
+        """
+        if (
+            moe_layer.config.cuda_graph_impl == "transformer_engine"
+            and moe_layer.training
+            and is_graph_capturing()
+        ):
+            if step_condition == "route":
+                if (
+                    'moe_router' in moe_layer.config.cuda_graph_scope
+                    and 'moe_preprocess' not in moe_layer.config.cuda_graph_scope
+                ):
+                    raise MoELayerEarlyReturnException(moe_layer, "route", **kwargs)
+            elif step_condition == "preprocess":
+                if 'moe_preprocess' in moe_layer.config.cuda_graph_scope:
+                    raise MoELayerEarlyReturnException(moe_layer, "preprocess", **kwargs)
+
+    def decorator(func):
+        def wrapped_func(moe_layer, *args, **kwargs):
+            # The non-cudagraph codepath just calls the original function.
+            if not is_graph_capturing() and not moe_layer.cudagraph_tensor_store:
+                return func(moe_layer, *args, **kwargs)
+
+            assert (
+                not is_graph_capturing() or not moe_layer.cudagraph_tensor_store
+            ), "cudagraph_tensor_store cannot be used when it is capturing cuda graph."
+            if step_condition == "shared_experts_compute":
+                if moe_layer.cudagraph_tensor_store.get('shared_expert_output') is None:
+                    # Don't skip the shared expert computation.
+                    shared_expert_output = func(moe_layer, *args, **kwargs)
+                else:
+                    # Skip the shared expert computation and get value from store.
+                    shared_expert_output = moe_layer.cudagraph_tensor_store['shared_expert_output']
+                return shared_expert_output
+            elif step_condition == "route":
+                if moe_layer.cudagraph_tensor_store.get('probs') is None:
+                    # Don't skip the router.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.get('routing_map') is None
+                        and moe_layer.cudagraph_tensor_store.get('residual') is None
+                    ), "both routing_map and residual must be None if probs is None"
+                    probs, routing_map = func(moe_layer, *args, **kwargs)
+
+                    # Maybe early return after the router.
+                    maybe_raise_early_return(moe_layer, probs=probs, routing_map=routing_map)
+                else:
+                    # Skip the router and get value from store.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.get('routing_map') is not None
+                        or moe_layer.cudagraph_tensor_store.get('residual') is not None
+                    ), "either routing_map or residual must be given if probs is given"
+                    probs, routing_map = (
+                        moe_layer.cudagraph_tensor_store['probs'],
+                        moe_layer.cudagraph_tensor_store['routing_map'],
+                    )
+                return probs, routing_map
+            elif step_condition == "preprocess":
+                if moe_layer.cudagraph_tensor_store.get('residual') is None:
+                    # Don't skip the preprocess.
+                    hidden_states, probs, residual = func(moe_layer, *args, **kwargs)
+
+                    # Maybe early return after the preprocess.
+                    maybe_raise_early_return(
+                        moe_layer, hidden_states=hidden_states, probs=probs, residual=residual
+                    )
+                else:
+                    # Skip the preprocess and get value from store.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.get('probs') is not None
+                    ), "probs must not be None if residual is not None"
+                    assert (
+                        moe_layer.cudagraph_tensor_store.get('routing_map') is None
+                    ), "routing_map must be None if residual is not None"
+                    hidden_states, probs, residual = (
+                        moe_layer.cudagraph_tensor_store['hidden_states'],
+                        moe_layer.cudagraph_tensor_store['probs'],
+                        moe_layer.cudagraph_tensor_store['residual'],
+                    )
+                return hidden_states, probs, residual
+
+        return wrapped_func
+
+    return decorator
