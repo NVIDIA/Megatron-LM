@@ -6,6 +6,7 @@ jobs:
   check-approval:
     runs-on: ubuntu-latest
     if: github.event.review.state == 'approved'
+    environment: main
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
