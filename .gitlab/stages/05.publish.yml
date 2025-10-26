@@ -840,7 +840,7 @@ publish:sync_branches:
         
         # 3. Now you are on the correct local branch, ready to push.
         echo "Successfully on branch $BRANCH. Echoing push command:"
-        git push -u gitlab "$BRANCH" --force
+        git push -u gitlab HEAD:refs/heads/$BRANCH --force
         echo "-----------------------------------"
       done
   tags:
