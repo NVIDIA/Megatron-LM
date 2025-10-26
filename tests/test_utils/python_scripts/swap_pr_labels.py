@@ -10,13 +10,9 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import List
 
-import requests
 from github import Github
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -53,8 +49,9 @@ class PRReviewTracker:
         labels = {l.name for l in pr.labels}
         return self.FINAL_REVIEW if self.FINAL_REVIEW in labels else self.EXPERT_REVIEW
 
-    def swap_labels(self, pr):
+    def swap_labels(self):
         """Get filtered reviewer emails who haven't approved yet."""
+        pr = self.pr
         if self.stage == self.FINAL_REVIEW:
             logger.info(f"PR #{self.pr.number} is in the {self.stage} stage. No reviewers needed.")
             return
@@ -94,7 +91,7 @@ class PRReviewTracker:
         # 4. Filter pending teams based on the current stage
         teams_to_query = (
             pending_teams_slugs - self.EXCLUDED_TEAMS
-            if stage == self.EXPERT_REVIEW
+            if self.stage == self.EXPERT_REVIEW
             else pending_teams_slugs & self.EXCLUDED_TEAMS
         )
 
@@ -103,7 +100,7 @@ class PRReviewTracker:
         for slug in teams_to_query:
             try:
                 pending_team_members.update(
-                    m.login for m in org.get_team_by_slug(slug).get_members()
+                    m.login for m in self.org.get_team_by_slug(slug).get_members()
                 )
             except Exception as e:
                 logger.warning(f"Could not get members for team {slug} on PR #{pr.number}: {e}")
@@ -115,7 +112,7 @@ class PRReviewTracker:
 
         # 7. Final list (List A - List B):
         pending_reviewers = all_required_reviewers - approvers
-
+        logger.info(f"Pending reviewers: {pending_reviewers}")
         if len(pending_reviewers) == 0:
             try:
                 pr.remove_from_labels(self.EXPERT_REVIEW)
@@ -135,7 +132,7 @@ class PRReviewTracker:
 def main():
     token = os.environ.get("GH_TOKEN")
     repo = os.environ.get("REPO", "NVIDIA/Megatron-LM")
-    pr_number = os.environ.get("PR_NUMBER")
+    pr_number = int(os.environ.get("PR_NUMBER"))
 
     if not token:
         logger.error("GH_TOKEN environment variable is required")
