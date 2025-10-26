@@ -791,6 +791,6 @@ publish:approve_merge_gate:
   retry:
     max: 2
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" || ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
       when: always
     - when: never
