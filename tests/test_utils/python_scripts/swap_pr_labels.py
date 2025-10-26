@@ -41,15 +41,12 @@ class PRReviewTracker:
     FINAL_REVIEW = "Final Review"
     EXCLUDED_TEAMS = {"core-adlr", "core-nemo"}
 
-    def __init__(
-        self, token: str, repo_name: str, pr_number: str
-    ):
+    def __init__(self, token: str, repo_name: str, pr_number: str):
         self.github = Github(token)
         self.repo = self.github.get_repo(repo_name)
         self.pr = self.repo.get_pull(pr_number)
         self.stage = self.get_stage(self.pr)
         self.org = self.github.get_organization(self.repo.organization.login)
-
 
     def get_stage(self, pr):
         """Get current review stage."""
@@ -118,19 +115,22 @@ class PRReviewTracker:
 
         # 7. Final list (List A - List B):
         pending_reviewers = all_required_reviewers - approvers
-        
+
         if len(pending_reviewers) == 0:
             try:
                 pr.remove_from_labels(self.EXPERT_REVIEW)
                 logger.info(f'Removed "{self.EXPERT_REVIEW}" label from PR #{pr.number}')
             except Exception as e:
-                logger.warning(f'Failed to remove "{self.EXPERT_REVIEW}" label from PR #{pr.number}: {e}')
+                logger.warning(
+                    f'Failed to remove "{self.EXPERT_REVIEW}" label from PR #{pr.number}: {e}'
+                )
 
             try:
                 pr.add_to_labels(self.FINAL_REVIEW)
                 logger.info(f'Added "{self.FINAL_REVIEW}" label to PR #{pr.number}')
             except Exception as e:
                 logger.warning(f'Failed to add "{self.FINAL_REVIEW}" label to PR #{pr.number}: {e}')
+
 
 def main():
     token = os.environ.get("GH_TOKEN")
@@ -144,6 +144,7 @@ def main():
     logger.info(f"Starting PR review reminder for {repo}")
     tracker = PRReviewTracker(token, repo, pr_number)
     tracker.swap_labels()
+
 
 if __name__ == "__main__":
     main()
