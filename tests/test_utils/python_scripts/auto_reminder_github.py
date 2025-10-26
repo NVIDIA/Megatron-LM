@@ -32,6 +32,7 @@ class Reminder:
     total_review_time: int
     current_stage_time: int
     reviewers: List[str]
+    action_message: str
 
 
 class PRReviewTracker:
@@ -50,45 +51,36 @@ class PRReviewTracker:
         self.webhook_url = webhook_url
 
     def get_user_email(self, username: str):
-        """Get user's email from their recent commits in fork or main repo."""
+        """Get user's email, prioritizing public profile, then recent commits."""
         if username in self.email_cache:
             return self.email_cache[username]
 
         try:
             user = self.github.get_user(username)
-            repos = []
 
-            # Try user's fork first
+            # 1. Try public profile email first
+            if user.email and not user.email.endswith("@users.noreply.github.com"):
+                self.email_cache[username] = user.email
+                return user.email
+
+            # 2. If no public email, check recent commits on the main repo
             try:
-                repos.append(user.get_repo(self.repo.name))
-            except:
-                pass
-            repos.append(self.repo)
+                # Use get_commits(author=...) which is more direct than search_commits
+                for commit in self.repo.get_commits(author=user)[:10]:
+                    email = commit.commit.author.email
+                    if email and not email.endswith("@users.noreply.github.com"):
+                        self.email_cache[username] = email
+                        return email
+            except Exception as e:
+                logger.debug(f"Could not check commits for {username}: {e}")
 
-            # Search commits in fork then main repo
-            for repo in repos:
-                try:
-                    commits = self.github.search_commits(
-                        f"author:{username} repo:{repo.full_name}", sort="author-date", order="desc"
-                    )
-                    for commit in commits[:5]:
-                        try:
-                            email = repo.get_commit(commit.sha).commit.author.email
-                            if email and not email.endswith("@users.noreply.github.com"):
-                                self.email_cache[username] = email
-                                return email
-                        except:
-                            continue
-                except:
-                    continue
-
-            # Fallback to public email or noreply
+            # 3. Fallback to public email (even if noreply) or a constructed noreply
             email = user.email or f"{username}@users.noreply.github.com"
             self.email_cache[username] = email
             return email
 
         except Exception as e:
-            logger.warning(f"Could not get email for {username}: {e}")
+            logger.warning(f"Could not get user object for {username}: {e}")
             email = f"{username}@users.noreply.github.com"
             self.email_cache[username] = email
             return email
@@ -97,10 +89,8 @@ class PRReviewTracker:
         """Get Slack user ID from email."""
         if not self.slack_client:
             return email
-
         if email in self.slack_id_cache:
             return self.slack_id_cache[email]
-
         try:
             response = self.slack_client.users_lookupByEmail(email=email)
             user_id = response["user"]["id"]
@@ -134,58 +124,97 @@ class PRReviewTracker:
         return self.FINAL_REVIEW if self.FINAL_REVIEW in labels else self.EXPERT_REVIEW
 
     def get_reviewers(self, pr):
-        """Get filtered reviewer emails."""
+        """Get filtered reviewer emails who haven't approved yet."""
         stage = self.get_stage(pr)
-        teams = {t.slug for t in pr.get_review_requests()[1]}
+        org = self.github.get_organization(self.repo.organization.login)
 
-        teams = (
-            teams - self.EXCLUDED_TEAMS
+        # 1. Get the latest review state for everyone who has submitted a review
+        latest_reviews = {}
+        try:
+            for review in pr.get_reviews():
+                if not review.user:  # Handle rare cases of deleted users
+                    continue
+                # Only track 'APPROVED' or 'CHANGES_REQUESTED' as definitive states
+                if review.state in ("APPROVED", "CHANGES_REQUESTED"):
+                    if (
+                        review.user.login not in latest_reviews
+                        or review.submitted_at > latest_reviews[review.user.login].submitted_at
+                    ):
+                        latest_reviews[review.user.login] = review
+        except Exception as e:
+            logger.warning(f"Could not get reviews for PR #{pr.number}: {e}")
+
+        # 2. Separate reviewers into approvers (List B) and non-approvers
+        approvers = {user for user, review in latest_reviews.items() if review.state == "APPROVED"}
+        non_approving_reviewers = {
+            user for user, review in latest_reviews.items() if review.state == "CHANGES_REQUESTED"
+        }
+
+        # 3. Get all *currently pending* review requests
+        try:
+            pending_users_req, pending_teams_req = pr.get_review_requests()
+            pending_individuals = {r.login for r in pending_users_req}
+            pending_teams_slugs = {t.slug for t in pending_teams_req}
+        except Exception as e:
+            logger.warning(f"Could not get review requests for PR #{pr.number}: {e}")
+            pending_individuals = set()
+            pending_teams_slugs = set()
+
+        # 4. Filter pending teams based on the current stage
+        teams_to_query = (
+            pending_teams_slugs - self.EXCLUDED_TEAMS
             if stage == self.EXPERT_REVIEW
-            else teams & self.EXCLUDED_TEAMS
+            else pending_teams_slugs & self.EXCLUDED_TEAMS
         )
 
-        reviewers = set()
-        org = self.github.get_organization(self.repo.organization.login)
-        for slug in teams:
+        # 5. Get members from the required pending teams
+        pending_team_members = set()
+        for slug in teams_to_query:
             try:
-                reviewers.update(m.login for m in org.get_team_by_slug(slug).get_members())
-            except:
-                pass
-
-        reviewers.update(r.login for r in pr.get_review_requests()[0])
-        reviewer_emails = sorted([self.get_user_email(u) for u in reviewers])
-
-        # Edge case: Expert Review with no reviewers - assign to PR author
-        if len(reviewer_emails) == 0 and stage == self.EXPERT_REVIEW:
-            pr_author_email = self.get_user_email(pr.user.login)
-            reviewer_emails = [pr_author_email]
-
-        # Edge case: Final Review with no reviewers - get approvers from mcore-reviewers team
-        if len(reviewer_emails) == 0 and stage == self.FINAL_REVIEW:
-            try:
-                # Get all approvers (users who approved the PR)
-                approvers = {
-                    review.user.login for review in pr.get_reviews() if review.state == "APPROVED"
-                }
-
-                # Get mcore-reviewers team members
-                mcore_team = org.get_team_by_slug("mcore-reviewers")
-                mcore_members = {m.login for m in mcore_team.get_members()}
-
-                # Intersection: approvers who are in mcore-reviewers
-                valid_approvers = approvers & mcore_members
-                reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
+                pending_team_members.update(
+                    m.login for m in org.get_team_by_slug(slug).get_members()
+                )
             except Exception as e:
-                logger.warning(f"Could not get mcore-reviewers approvers for PR #{pr.number}: {e}")
+                logger.warning(f"Could not get members for team {slug} on PR #{pr.number}: {e}")
 
-        return reviewer_emails
+        # 6. "List A": Combine all users who *still need to review*
+        all_required_reviewers = (
+            pending_individuals | pending_team_members | non_approving_reviewers
+        )
+
+        # 7. Final list (List A - List B):
+        pending_reviewers = all_required_reviewers - approvers
+        reviewer_emails = sorted([self.get_user_email(u) for u in pending_reviewers])
+        action_message = "Please review the PR."
+
+        # 8. Handle the original edge cases
+        if len(reviewer_emails) == 0:
+            if stage == self.EXPERT_REVIEW:
+                # Assign to PR author
+                reviewer_emails = [self.get_user_email(pr.user.login)]
+                action_message = "All Expert Reviewers approved the PR. Please attach the Final Review label to proceed with the review."
+            elif stage == self.FINAL_REVIEW:
+                # Assign to mcore-reviewers who approved
+                try:
+                    mcore_team = org.get_team_by_slug("mcore-reviewers")
+                    mcore_members = {m.login for m in mcore_team.get_members()}
+                    valid_approvers = approvers & mcore_members
+                    reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
+                    action_message = "All Final Reviewers approved the PR. Please ping an Expert or Final Reviewer to merge the PR."
+
+                except Exception as e:
+                    logger.warning(
+                        f"Could not get mcore-reviewers approvers for PR #{pr.number}: {e}"
+                    )
+
+        return reviewer_emails, action_message
 
     def create_reminder(self, pr):
         """Create reminder for PR."""
         stage = self.get_stage(pr)
         stage_days = self.days_since(self.get_label_date(pr, stage))
         author_email = self.get_user_email(pr.user.login)
-        reviewer_emails = self.get_reviewers(pr)
+        reviewer_emails, action_message = self.get_reviewers(pr)
 
         return Reminder(
             id=pr.number,
@@ -197,6 +226,7 @@ class PRReviewTracker:
             total_review_time=self.days_since(self.get_label_date(pr, self.EXPERT_REVIEW)),
             current_stage_time=stage_days,
             reviewers=[self.get_slack_user_id(email) for email in reviewer_emails],
+            action_message=action_message,
         )
 
     def generate_reminders(self):
@@ -208,36 +238,43 @@ class PRReviewTracker:
 
         reminders = []
         for milestone in milestones:
-            for issue in self.repo.get_issues(state="open", milestone=milestone):
-                if not issue.pull_request:
-                    continue
-                labels = {l.name for l in issue.labels}
-                if self.EXPERT_REVIEW in labels or self.FINAL_REVIEW in labels:
+            # Find issues with the 'Expert Review' or 'Final Review' label
+            query = (
+                f'repo:"{self.repo.full_name}" '
+                f'milestone:"{milestone.title}" '
+                f'is:open is:pr '
+                f'label:"{self.EXPERT_REVIEW}","{self.FINAL_REVIEW}"'
+            )
+            try:
+                # Use search_issues for a more direct query instead of get_issues + filtering
+                issues = self.github.search_issues(query)
+                for issue in issues:
                     try:
-                        reminders.append(self.create_reminder(self.repo.get_pull(issue.number)))
+                        reminders.append(self.create_reminder(issue.as_pull_request()))
                         logger.info(f"Processed PR #{issue.number}")
                     except Exception as e:
                         logger.error(f"Failed to process PR #{issue.number}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to search issues for milestone {milestone.title}: {e}")
 
         return sorted(reminders, key=lambda r: (r.priority, -r.current_stage_time))
 
     def send_slack_notification(self, reminder: Reminder):
         """Send Slack notification via webhook."""
         if not self.webhook_url:
-            logger.warning("Slack webhook URL not configured, skipping notification")
             return
 
-        message = []
-        message.append(f"*PR*: {reminder.pr}")
-        message.append(f"*Milestone*: {reminder.milestone}")
-        message.append(f"*Author*: {reminder.author}")
-        message.append(f"*Priority*: {reminder.priority}")
-        message.append(f"*Review stage*: {reminder.review_stage}")
-        message.append(f"*Days in review*: {reminder.total_review_time}")
-        message.append(f"*Days in {reminder.review_stage}*: {reminder.current_stage_time}")
-        message.append(
-            f"*Reviewers*: {', '.join(reminder.reviewers) if reminder.reviewers else 'None'}"
-        )
+        reviewers_str = ', '.join(reminder.reviewers) if reminder.reviewers else 'None'
+        message = [
+            f"*PR*: {reminder.pr}",
+            f"*Milestone*: {reminder.milestone}",
+            f"*Author*: {reminder.author}",
+            f"*Priority*: {reminder.priority}",
+            f"*Review stage*: {reminder.review_stage}",
+            f"*Days in review*: {reminder.total_review_time}",
+            f"*Days in {reminder.review_stage}*: {reminder.current_stage_time}",
+            f"*Reviewers*: {reviewers_str}",
+        ]
 
         payload = {
             "text": f"PR Review Reminder: {reminder.priority} - PR #{reminder.id}",
@@ -245,7 +282,7 @@ class PRReviewTracker:
         }
 
         try:
-            response = requests.post(self.webhook_url, json=payload)
+            response = requests.post(self.webhook_url, json=payload, timeout=10)
             response.raise_for_status()
             logger.info(f"Sent Slack notification for PR #{reminder.id}")
         except requests.exceptions.RequestException as e:
@@ -267,17 +304,21 @@ def main():
     reminders = tracker.generate_reminders()
     logger.info(f"Generated {len(reminders)} reminders\n{'=' * 80}")
 
+    if not reminders:
+        logger.info("No reminders to send.")
+        return
+
     for r in reminders:
         logger.info(f"{r.priority} | PR #{r.id} | {r.milestone}")
         logger.info(f"   Author: {r.author} | Stage: {r.review_stage}")
-        logger.info(f"   Stage time: {r.current_stage_time}d | Total: {r.total_review_time}d")
+        logger.info(f"   Stage time: {r.current_stage_time}d | Total: {r.total_review_time}")
         logger.info(f"   Reviewers: {', '.join(r.reviewers) if r.reviewers else 'None'}")
-
-        # Send Slack notification via webhook
+        logger.info(f"   Action message: {r.action_message}")
+        logger.info("-" * 80)
         if webhook_url:
             tracker.send_slack_notification(r)
 
-    return reminders
+    logger.info("All reminders processed.")
 
 
 if __name__ == "__main__":
