@@ -800,3 +800,37 @@ publish:approve_merge_gate:
     - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
       when: always
     - when: never
+
+publish:sync_branches:
+  stage: publish
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  script:
+    - git remote add github https://github.com/NVIDIA/Megatron-LM.git || true
+    - git remote add gitlab https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/NVIDIA/Megatron-LM.git || true
+    - BRANCHES=("main" "dev")
+    - |
+      while IFS= read -r line; do
+        BRANCHES+=("$line") # Add each line to the array
+      done < <( \
+        git ls-remote --heads "https://token:${PAT}@github.com/NVIDIA/Megatron-LM.git" 'refs/heads/core_*' | \
+        cut -d'/' -f3- \
+      )
+    - |
+      for BRANCH in "${BRANCHES[@]}"; do
+        git fetch github $BRANCH
+        git checkout github/$BRANCH
+        echo git push -u gitlab $BRANCH --force
+      done
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  retry:
+    max: 2
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-sync-branches')
+      when: always
+    - when: never
