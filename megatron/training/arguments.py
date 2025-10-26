@@ -3132,16 +3132,12 @@ def _add_experimental_args(parser):
     # TODO(duncan): change this to hybrid-layer-pattern throughout code before merging into main?
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern.')
-    group.add_argument(
-        "--mtp-hybrid-override-pattern",
-        type=str,
-        default=None,
-        help='Force a specific hybrid layer pattern for MTP layers.'
-        'If a value greater than 0.0 is supplied to any of the hybrid ratio'
-        'arguments, then the number of each type of layer in the'
-        'override pattern must match number in the overidden'
-        'pattern',
-    )
+    group.add_argument("--mtp-hybrid-override-pattern", type=str, default=None,
+                       help='Force a specific hybrid layer pattern for MTP layers. '
+                       'If a value greater than 0.0 is supplied to any of the hybrid ratio '
+                       'arguments, then the number of each type of layer in the '
+                       'override pattern must match number in the overidden '
+                       'pattern')
     group.add_argument('--mtp-spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec for mtp layer to customize a model,' 
