@@ -23,7 +23,7 @@ cd Megatron-LM
 pip install --no-build-isolation .[mlm,dev]
 ```
 
-**→ [Complete Installation Guide](#installation)** - Docker, pip variants (dev,lts,etc.), source installation, and system requirements
+**→ [Complete Installation Guide](#installation)** - Docker, pip variants (dev,lts,etc.), and system requirements
 
 # Latest News
 
