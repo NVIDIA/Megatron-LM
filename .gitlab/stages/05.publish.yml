@@ -768,15 +768,16 @@ publish:approve_merge_gate:
       pip install --no-cache-dir python-gitlab click pygithub
       export GITLAB_ENDPOINT
       export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
-      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
-
-      export GH_TOKEN=$GH_TOKEN
-      export REPO=NVIDIA/Megatron-LM
       if [[ "$CI_COMMIT_BRANCH" == *main* ]]; then
         export TARGET_BRANCH="main"
       elif [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
         export TARGET_BRANCH="dev"
       fi
+
+      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
+
+      export GH_TOKEN=$GH_TOKEN
+      export REPO=NVIDIA/Megatron-LM
 
       if [[ $EXIT_CODE -eq 0 ]]; then
         export STATUS="approved"
