@@ -56,8 +56,7 @@ pip install --no-build-isolation .[mlm,dev]
   - [Megatron Core: Production Library](#megatron-core-production-library)
 - [Installation](#installation)
   - [Docker (Recommended)](#-docker-recommended)
-  - [Pip Installation](#-pip-installation)
-  - [Source Installation](#-source-installation)
+  - [Pip Installation](#pip-installation)
   - [System Requirements](#system-requirements)
 
 **Core Features**
@@ -86,7 +85,7 @@ pip install --no-build-isolation .[mlm,dev]
 - [Examples](./examples/) - Training scripts and tutorials
 - [Documentation](https://docs.nvidia.com/Megatron-Core/) - Official docs
 - [Roadmaps](#roadmaps) - Development roadmaps and feature tracking
-- [Community & Support](#-community--support) - Get help and contribute
+- [Community & Support](#community--support) - Get help and contribute
   - [Getting Help](#getting-help)
   - [Contributing](#contributing)
   - [Citation](#citation)
