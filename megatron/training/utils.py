@@ -38,7 +38,6 @@ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
-    is_torch_min_version,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -272,9 +271,6 @@ def report_memory(name):
     string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
     string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
     string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
-    if is_torch_min_version("2.6.0"):
-        # device usage is not supported in torch < 2.6.0
-        string += ' | device usage: {}'.format(torch.cuda.device_memory_used() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
