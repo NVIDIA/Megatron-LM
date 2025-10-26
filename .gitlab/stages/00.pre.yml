@@ -61,6 +61,7 @@ pre:create_ci_branches:
       - branch: ci-upgrade-dependencies
       - branch: ci-approve-main
       - branch: ci-approve-dev
+      - branch: ci-sync-branches
   tags:
     - arch/amd64
     - env/prod
