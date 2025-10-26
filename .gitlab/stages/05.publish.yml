@@ -774,7 +774,7 @@ publish:approve_merge_gate:
         export TARGET_BRANCH="dev"
       fi
 
-      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
+      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$TARGET_BRANCH" --once || EXIT_CODE=$?
 
       export GH_TOKEN=$GH_TOKEN
       export REPO=NVIDIA/Megatron-LM
