@@ -803,7 +803,7 @@ publish:approve_merge_gate:
 
 publish:sync_branches:
   stage: publish
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: python:3.10
   script:
     - git remote add github https://github.com/NVIDIA/Megatron-LM.git || true
     - git remote add gitlab https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/NVIDIA/Megatron-LM.git || true
