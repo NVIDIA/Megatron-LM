@@ -818,9 +818,30 @@ publish:sync_branches:
       )
     - |
       for BRANCH in "${BRANCHES[@]}"; do
-        git fetch github $BRANCH
-        git checkout $BRANCH
-        echo git push -u gitlab $BRANCH --force
+        # Define the full refspec for the branch
+        BRANCH_REF="refs/heads/$BRANCH"
+        
+        echo "--- Processing branch: $BRANCH ---"
+        
+        # 1. Explicitly fetch the branch ref from 'github'
+        # This avoids fetching a tag with the same name.
+        # It updates/creates the remote-tracking branch (e.g., 'refs/remotes/github/core_r0.10.0')
+        if ! git fetch github "$BRANCH_REF:refs/remotes/github/$BRANCH"; then
+            echo "Failed to fetch branch $BRANCH. Skipping."
+            continue
+        fi
+
+        # 2. Create or update the local branch from the remote-tracking branch we just fetched.
+        # The -B flag creates the branch if it doesn't exist or resets it if it does.
+        if ! git checkout -B "$BRANCH" "github/$BRANCH"; then
+            echo "Failed to checkout local branch $BRANCH. Skipping."
+            continue
+        fi
+        
+        # 3. Now you are on the correct local branch, ready to push.
+        echo "Successfully on branch $BRANCH. Echoing push command:"
+        echo git push -u gitlab "$BRANCH" --force
+        echo "-----------------------------------"
       done
   tags:
     - arch/amd64
