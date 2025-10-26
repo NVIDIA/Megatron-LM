@@ -69,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_linear_attention_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
@@ -319,10 +320,35 @@ def moe_freq_type(x):
       This allows defining arbitrary patterns of expert and dense layers.
       The pattern length must match the total number of transformer layers.
       Examples:
-          "([0]+[1]*23)": 1 dense layer followed by 23 experts layers
+          "([0]+[1]*23)": 1 dense layer followed by 23 expert layers
           "([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.
     """
     if isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        return _eval_pattern(x)
+    else:
+        # it's a single int but in str
+        return int(x)
+
+def la_freq_type(x):
+    """Frequency between LA (linear attention) layers and SDPA (scaled dot-product attention) layers.
+
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
+      where 1 indicates an LA layer and 0 indicates a SDPA layer.
+      This allows defining arbitrary patterns of LA and SDPA layers.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers
+          "([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.
+    """
+    if x is None or isinstance(x, int):
         return x
     assert isinstance(x, str)
     if '[' in x:
@@ -1150,6 +1176,13 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    # Muon optimizercheck
+    if 'muon' in args.optimizer:
+        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
+        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
+        assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format == "torch", "Muon optimizer only supports torch checkpoint format for now."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -1189,9 +1222,6 @@ def validate_args(args, defaults={}):
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
             + f"The supported position embedding types are rope and none."
         )
-
-    if args.cpu_offloading_num_layers > 0:
-        args.cpu_offloading = True
 
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
@@ -1420,9 +1450,6 @@ def _add_inference_args(parser):
                        'whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, '
                        'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
-    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
-                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
-                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -1574,6 +1601,8 @@ def _add_network_size_args(parser):
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
+    group.add_argument('--attention-output-gate', action='store_true',
+                       help='Whether to apply output gate to the attention.')
     group.add_argument('--softmax-type', type=str, default='vanilla',
                        choices=['learnable', 'vanilla', 'off-by-one'],
                        help='Type of softmax to use for the attention. Supports both a fixed offset and '
@@ -1892,6 +1921,12 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['qwen3_next'],
+                       help='Type of no weight decay condition. Choices: '
+                       'None (default): param no weight decay if and only if it is 1D; or it is bias; '
+                       'or it is embedding and embedding_init_method_std is not None. '
+                       '"qwen3_next": In addition to the default rules, '
+                       'apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -1905,6 +1940,25 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--muon-momentum', type=float, default=0.95,
+                       help='Momentum factor for Muon optimizer')
+    group.add_argument('--muon-no-use-nesterov', action='store_false', default=True,
+                       dest='muon_use_nesterov',
+                       help='Whether to use Nesterov-style momentum in the internal SGD')
+    group.add_argument('--muon-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for Muon optimizer')
+    group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
+                       help='Additional scale factor for the muon update')
+
     return parser
 
 
@@ -2062,8 +2116,6 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
-    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
-                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2203,7 +2255,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -2213,10 +2265,6 @@ def _add_training_args(parser):
                        help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
     group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
                        help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
-    group.add_argument('--dump-param-to-param-group-map', type=str, default=None,
-                        help="Path to a file containing parameter-to-parameter-group mapping. "
-                        "Provide a JSON file that specifies which parameters belong to which "
-                        "parameter group for global coordination.")
     group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
@@ -2894,6 +2942,20 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 or msc dataloader')
     group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
                        help='The sample surplus to build for the mid-level datasets(s)')
+    group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
+                       help='Whether to prevent pad tokens already present in the dataset '
+                       'from being masked out when the pad token incorrectly shares the same id '
+                       'with other special tokens in the tokenizer. Note that this argument has '
+                       'no effect when the tokenizer correctly provides a unique id for the pad. '
+                       'Masking out such ambiguous pad tokens results in training instability. '
+                       'Such a scenario is best resolved by fixing the tokenizer; leaving this '
+                       'option as False provides a workaround. '
+                       'When left to the default of False, any token ids that collide with the '
+                       'pad token id - as provided by the tokenizer - will not be masked out of '
+                       'the loss calculation: it cannot be determined whether they are truly pad. '
+                       'If instead this argument is set, the training flow will treat all tokens '
+                       'that share the same id as the pad token as true pad tokens, potentially '
+                       'causing severe training instability.')
     return parser
 
 
@@ -3054,7 +3116,7 @@ def _add_moe_args(parser):
                             '- A string containing a Python list expression that defines a custom pattern, e.g.: '
                             '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
                             'where 1 indicates an expert layer and 0 indicates a dense layer. '
-                            'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 experts layers, '
+                            'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 expert layers, '
                             '"([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.')
     group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
                        help='The hidden size of each expert\'s feed-forward network (ffn). '
@@ -3062,13 +3124,9 @@ def _add_moe_args(parser):
     group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
                        help='Shared expert total ffn hidden size. '
                        'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" if there are multiple shared experts. '
-                       'None means no shared expert. '
-                       'By default, the shared experts execute before the router. However, when '
-                       '--moe-shared-expert-overlap or --overlap-moe-expert-parallel-comm is set, '
-                       'the shared experts execute after the router, before the routed experts. '
-                       'This makes the gradients from the router and the shared experts added in '
-                       'different orders to the hidden_states, causing minor numerical differences '
-                       'in the hidden_states gradient.')
+                       'None means no shared expert.')
+    group.add_argument('--moe-shared-expert-gate', action='store_true',
+                       help='Enable gate for shared expert. Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-shared-expert-overlap', action='store_true',
                        help='Enable overlapping between shared expert computations and dispatcher communications. '
                        'Without this, the shared experts execute before the router. '
@@ -3125,12 +3183,15 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
-    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+    group.add_argument('--moe-router-padding-for-quantization', action='store_true',
                        help='Pad the routing_map to make sure the number of tokens each expert received '
-                       'is a multiple of 16/32 for FP8 precision. It is suggested to enable this for '
-                       'dropless training with FP8 precision when num_local_experts > 1. This is a more '
-                       'efficient way to pad for FP8 which eliminates the explicit padding in the '
+                       'is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for '
+                       'dropless training with FP8/FP4 precision when num_local_experts > 1. This is a more '
+                       'efficient way to pad for FP8/FP4 which eliminates the explicit padding in the '
                        'GroupedMLP layer.')
+    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+                       help='[Compatibility alias for --moe-router-padding-for-quantization] '
+                       'Enabling this will also enable --moe-router-padding-for-quantization.')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
@@ -3145,9 +3206,15 @@ def _add_moe_args(parser):
                        default='allgather',
                        help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-enable-deepep', action='store_true',
-                       help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
+                       help='DEPRECATED: Please use --moe-flex-dispatcher-backend=deepep instead.')
+    group.add_argument('--moe-flex-dispatcher-backend', type=str,
+                       choices=['deepep', 'hybridep'],
+                       default='deepep',
+                       help='The backend to use for flex token dispatcher. The default is "deepep". Options are "deepep" and "hybridep".')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
+                       help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
                        help='Fuse token rearrangement ops during token dispatching.')
     # Token dropping arguments
@@ -3195,6 +3262,31 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_linear_attention_args(parser):
+    group = parser.add_argument_group(title="la")
+    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net', 'mamba'], type=str,
+                       help='Type of linear attention to use. Currently support gated_delta_net and mamba.')
+    group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
+                       help='Frequency between LA (linear attention) layers and'
+                            ' SDPA (scaled dot-product attention) layers. Accepts either: '
+                            '- An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
+                            'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
+                            '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
+                       help='Conv kernel dimension for the gated delta net.')
+    group.add_argument('--linear-key-head-dim', default=128, type=int,
+                       help='Query and key head dimension for the gated delta net.')
+    group.add_argument('--linear-value-head-dim', default=128, type=int,
+                       help='Value and gate head dimension for the gated delta net.')
+    group.add_argument('--linear-num-key-heads', default=16, type=int,
+                       help='Number of query and key heads for the gated delta net.')
+    group.add_argument('--linear-num-value-heads', default=32, type=int,
+                       help='Number of value and gate heads for the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):
