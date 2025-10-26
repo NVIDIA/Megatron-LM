@@ -14,7 +14,7 @@
 name: CICD Megatron-LM
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: 0 0 * * *
   push:
     branches:
       - dev
@@ -23,6 +23,7 @@ on:
       - "deploy-release/*"
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -47,7 +48,6 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
-      SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -64,10 +64,12 @@ jobs:
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_DEV_BRANCH: ${{ github.ref == 'refs/heads/dev' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
           PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
 
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ]; then
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -148,7 +150,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
 
   linting:
     runs-on: ubuntu-latest
@@ -296,21 +298,41 @@ jobs:
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
-  cicd-unit-tests-latest:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - bucket: "unit_tests"
-          - bucket: "unit_tests/data/"
-          - bucket: "unit_tests/dist_checkpointing/*.py"
-          - bucket: "unit_tests/dist_checkpointing/models/"
-          - bucket: "unit_tests/transformer/*.py"
-          - bucket: "unit_tests/transformer/moe"
+  cicd-parse-unit-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
@@ -332,7 +354,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          test_case: tests/${{ matrix.bucket }}
+          test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
@@ -346,6 +368,14 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+    if: |
+      (
+        success() 
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
     steps:
@@ -414,7 +444,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
@@ -442,7 +472,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:1864 # ${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:
@@ -470,7 +500,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
           SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped")] | length') || echo 0

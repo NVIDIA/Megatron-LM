@@ -1,6 +1,8 @@
 .integration_tests_rules:
   stage: integration_tests
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $INTEGRATION_TEST == "yes"
       when: on_success
     - when: never

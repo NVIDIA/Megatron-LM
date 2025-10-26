@@ -1,6 +1,8 @@
 .functional_tests_rules:
   stage: functional_tests
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $FUNCTIONAL_TEST == "yes"
       when: on_success
     - when: never
