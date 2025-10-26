@@ -153,7 +153,7 @@ class PRReviewTracker:
                 pass
 
         reviewers.update(r.login for r in pr.get_review_requests()[0])
-        return sorted([self.get_user_email(u) for u in reviewers])
+        return sorted([self.get_user_email(u) for u in reviewers if u != pr.user.login])
 
     def create_reminder(self, pr):
         """Create reminder for PR."""
@@ -249,8 +249,8 @@ def main():
         logger.info(f"   Reviewers: {', '.join(r.reviewers) if r.reviewers else 'None'}")
 
         # Send Slack notification via webhook
-        if webhook_url:
-            tracker.send_slack_notification(r)
+        # if webhook_url:
+        #     tracker.send_slack_notification(r)
 
     return reminders
 
