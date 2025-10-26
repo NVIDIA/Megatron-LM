@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Generate launch scripts for local execution.
 
 This script allows to generate pre-filled launch scripts that allow for local execution of Megatron-LM functional tests inside containerized enviroments (i.e. Slurm enroot or Docker).
@@ -11,7 +13,7 @@ from typing import Optional
 import click
 import yaml
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 
 def load_script(config_path: str) -> str:
@@ -68,7 +70,7 @@ def main(
     enable_lightweight_mode: bool = False,
     record_checkpoints: bool = False,
 ):
-    workloads = common.load_workloads(
+    workloads = recipe_parser.load_workloads(
         container_image="none",
         scope=scope,
         model=model,
@@ -76,6 +78,8 @@ def main(
         environment=environment,
         container_tag="none",
     )
+
+    print(workloads)
 
     for workload in workloads:
         if workload.type == "build":
