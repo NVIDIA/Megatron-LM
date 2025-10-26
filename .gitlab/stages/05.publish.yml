@@ -819,7 +819,7 @@ publish:sync_branches:
     - |
       for BRANCH in "${BRANCHES[@]}"; do
         git fetch github $BRANCH
-        git checkout github/$BRANCH
+        git checkout $BRANCH
         echo git push -u gitlab $BRANCH --force
       done
   tags:
