@@ -782,12 +782,18 @@ publish:approve_merge_gate:
       if [[ $EXIT_CODE -eq 0 ]]; then
         export STATUS="approved"
         export COMMENT="Main is healthy. Submitting PR."
-      else
+      elif [[ $EXIT_CODE -eq 1 ]]; then
         export STATUS="rejected"
         export COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
+      elif [[ $EXIT_CODE -eq 2 ]]; then
+        echo "Main is running. We won't cancel the deployment."
+        exit 0
       fi
 
-      python tests/test_utils/python_scripts/approve_merge_gate.py
+      if [[ $EXIT_CODE -lt 2 ]]; then
+        python tests/test_utils/python_scripts/approve_merge_gate.py
+      fi
+
   retry:
     max: 2
   rules:
