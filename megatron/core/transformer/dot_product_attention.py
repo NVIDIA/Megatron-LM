@@ -126,8 +126,6 @@ class DotProductAttention(MegatronModule):
                     )
                 ),
             )
-            if config.perform_initialization:
-                self.softmax_offset = config.init_method(self.softmax_offset)
         else:
             raise ValueError("Softmax type not supported")
 

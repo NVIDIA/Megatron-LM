@@ -192,9 +192,6 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
-    attention_output_gate: bool = False
-    """Whether to apply output gate to the attention layers."""
-
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -214,38 +211,6 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
-
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios, 
-    16 SMs can generally achieve good bandwidth."""
-
-    ####################
-    # linear attention
-    ####################
-    linear_attention_type: Optional[str] = None
-    """Type of linear attention to use. Currently support gated_delta_net."""
-
-    linear_attention_freq: Optional[Union[int, List[int]]] = None
-    """Frequency between LA (linear attention) layers 
-    and SDPA (scaled dot-product attention) layers.
-    Accepts either:
-    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
-    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
-
-    linear_conv_kernel_dim: Optional[int] = None
-    """Conv kernel dimension for the gated delta net."""
-
-    linear_key_head_dim: Optional[int] = None
-    """Query and key head dimension for the gated delta net."""
-
-    linear_value_head_dim: Optional[int] = None
-    """Value and gate head dimension for the gated delta net."""
-
-    linear_num_key_heads: Optional[int] = None
-    """Number of query and key heads for the gated delta net."""
-
-    linear_num_value_heads: Optional[int] = None
-    """Number of value and gate heads for the gated delta net."""
 
     ####################
     # initialization
@@ -470,9 +435,6 @@ class TransformerConfig(ModelParallelConfig):
     different orders to the hidden_states, causing minor numerical differences
     in the hidden_states gradient."""
 
-    moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert."""
-
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared experts execute before the router."""
@@ -507,14 +469,10 @@ class TransformerConfig(ModelParallelConfig):
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
-    moe_router_padding_for_quantization: Optional[bool] = False
-    """Whether to pad the routing_map to make sure the number of tokens each expert receives
-    is a multiple of 16/32 for quantized precision (e.g., FP8, FP4). This can remove the explicit
-    padding in the GroupedMLP layer."""
-
     moe_router_padding_for_fp8: Optional[bool] = False
-    """[Compatibility alias for moe_router_padding_for_quantization]
-    Enabling this will also enable moe_router_padding_for_quantization."""
+    """Whether to pad the routing_map to make sure the number of tokens each expert received
+    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
+    GroupedMLP layer."""
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
@@ -599,11 +557,6 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
-
-    moe_flex_dispatcher_backend: str = "deepep"
-    """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
-    the MNNVL case."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -808,54 +761,6 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.linear_attention_type is not None:
-            supported_la_types = ["gated_delta_net", "mamba"]
-            assert self.linear_attention_type in supported_la_types, (
-                f"linear_attention_type ({self.linear_attention_type}) only support"
-                f" one of {supported_la_types}."
-            )
-            assert (
-                self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
-
-            if self.linear_attention_type == "gated_delta_net":
-                # Check required parameters
-                assert (
-                    self.linear_conv_kernel_dim is not None
-                ), "linear_conv_kernel_dim must be set for gated delta net."
-                assert (
-                    self.linear_key_head_dim is not None
-                ), "linear_key_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_value_head_dim is not None
-                ), "linear_value_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_num_key_heads is not None
-                ), "linear_num_key_heads must be set for gated delta net."
-                assert (
-                    self.linear_num_value_heads is not None
-                ), "linear_num_value_heads must be set for gated delta net."
-                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                    f"linear_num_key_heads ({self.linear_num_key_heads})."
-                )
-
-                # Check tensor parallelism compatibility
-                assert (
-                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-                assert (
-                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
-
-                # Do not support yet, but coming soon.
-                assert self.context_parallel_size == 1, (
-                    f"Gated delta net does not support context parallel for now,"
-                    f" but got {self.context_parallel_size=}."
-                )
-            elif self.linear_attention_type == "mamba":
-                raise NotImplementedError("Mamba is not supported yet.")
-
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
             if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
@@ -918,18 +823,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-            logging.warning(
-                "moe_enable_deepep is deprecated."
-                "Please use --moe-flex-dispatcher-backend=deepep instead."
-            )
 
         if self.moe_token_dispatcher_type == "flex":
-            if self.moe_pad_expert_input_to_capacity and (
-                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
-            ):
+            if self.moe_pad_expert_input_to_capacity:
                 raise ValueError(
-                    "Flex token dispatcher with deepep backend does not support "
-                    "moe_pad_expert_input_to_capacity"
+                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
                 )
 
         if self.moe_shared_expert_intermediate_size is not None:
@@ -1370,10 +1268,6 @@ class TransformerConfig(ModelParallelConfig):
                         "apply_rope_fusion is not available. Please install TE >= 1.4."
                     )
 
-        if self.fused_single_qkv_rope:
-            if self.attention_output_gate:
-                raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
-
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
@@ -1430,23 +1324,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_router_padding_for_fp8:
-            # enable moe_router_padding_for_quantization
-            warnings.warn(
-                "--moe-router-padding-for-fp8 is going to be deprecated. "
-                "Use --moe-router-padding-for-quantization instead."
-            )
-            self.moe_router_padding_for_quantization = True
-
-        if self.moe_router_padding_for_quantization:
-            if self.fp8 is None and self.fp4 is None:
-                raise ValueError(
-                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
-                )
+            if self.fp8 is None:
+                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
-                    "moe_router_padding_for_quantization."
+                    "moe_router_padding_for_fp8."
                 )
 
         if (
@@ -1722,9 +1606,6 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
-
-        if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (

@@ -1,11 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import logging
 import types
 from dataclasses import dataclass, field
 from typing import Tuple, Union
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -28,7 +25,6 @@ class ModuleSpec:
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
     submodules: type = None
-    metainfo: dict = field(default_factory=lambda: {})
 
 
 def import_module(module_path: Tuple[str]):
@@ -41,15 +37,12 @@ def import_module(module_path: Tuple[str]):
     try:
         module = __import__(base_path, globals(), locals(), [name])
     except ImportError as e:
-        logger.error(f"couldn't import module due to {e}")
+        print(f"couldn't import module due to {e}")
         return None
     return vars(module)[name]
 
 
 def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
-    """Retrieve the module class or function specified by a ModuleSpec or
-    return it as is if already provided.
-    """
     # If a module clas is already provided return it as is
     if isinstance(spec_or_module, (type, types.FunctionType)):
         return spec_or_module
@@ -63,7 +56,6 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
-    """Build a module from a ModuleSpec or return it as is if already provided."""
     # If the passed `spec_or_module` is
     # a `Function`, then return it as it is
     # NOTE: to support an already initialized module add the following condition
