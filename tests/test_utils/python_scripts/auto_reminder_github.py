@@ -153,7 +153,32 @@ class PRReviewTracker:
                 pass
 
         reviewers.update(r.login for r in pr.get_review_requests()[0])
-        return sorted([self.get_user_email(u) for u in reviewers if u != pr.user.login])
+        reviewer_emails = sorted([self.get_user_email(u) for u in reviewers])
+
+        # Edge case: Expert Review with no reviewers - assign to PR author
+        if len(reviewer_emails) == 0 and stage == self.EXPERT_REVIEW:
+            pr_author_email = self.get_user_email(pr.user.login)
+            reviewer_emails = [pr_author_email]
+
+        # Edge case: Final Review with no reviewers - get approvers from mcore-reviewers team
+        if len(reviewer_emails) == 0 and stage == self.FINAL_REVIEW:
+            try:
+                # Get all approvers (users who approved the PR)
+                approvers = {
+                    review.user.login for review in pr.get_reviews() if review.state == "APPROVED"
+                }
+
+                # Get mcore-reviewers team members
+                mcore_team = org.get_team_by_slug("mcore-reviewers")
+                mcore_members = {m.login for m in mcore_team.get_members()}
+
+                # Intersection: approvers who are in mcore-reviewers
+                valid_approvers = approvers & mcore_members
+                reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
+            except Exception as e:
+                logger.warning(f"Could not get mcore-reviewers approvers for PR #{pr.number}: {e}")
+
+        return reviewer_emails
 
     def create_reminder(self, pr):
         """Create reminder for PR."""
@@ -249,8 +274,8 @@ def main():
         logger.info(f"   Reviewers: {', '.join(r.reviewers) if r.reviewers else 'None'}")
 
         # Send Slack notification via webhook
-        # if webhook_url:
-        #     tracker.send_slack_notification(r)
+        if webhook_url:
+            tracker.send_slack_notification(r)
 
     return reminders
 
