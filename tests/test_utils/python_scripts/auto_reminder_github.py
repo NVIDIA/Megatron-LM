@@ -41,30 +41,45 @@ class PRReviewTracker:
         self.email_cache = {}
     
     def get_user_email(self, username: str):
-        """Get user's email address from GitHub API."""
+        """Get user's email from their recent commits in fork or main repo."""
         if username in self.email_cache:
             return self.email_cache[username]
         
         try:
             user = self.github.get_user(username)
-            email = user.email
+            repos = []
             
-            if not email:
-                events = list(user.get_events()[:10])
-                for event in events:
-                    if event.type == "PushEvent" and event.payload.get("commits"):
-                        for commit in event.payload["commits"]:
-                            if commit.get("author", {}).get("email"):
-                                email = commit["author"]["email"]
-                                break
-                        if email:
-                            break
+            # Try user's fork first
+            try:
+                repos.append(user.get_repo(self.repo.name))
+            except:
+                pass
+            repos.append(self.repo)
             
-            if not email:
-                email = f"{username}@users.noreply.github.com"
+            # Search commits in fork then main repo
+            for repo in repos:
+                try:
+                    commits = self.github.search_commits(
+                        f"author:{username} repo:{repo.full_name}",
+                        sort="author-date",
+                        order="desc"
+                    )
+                    for commit in commits[:5]:
+                        try:
+                            email = repo.get_commit(commit.sha).commit.author.email
+                            if email and not email.endswith("@users.noreply.github.com"):
+                                self.email_cache[username] = email
+                                return email
+                        except:
+                            continue
+                except:
+                    continue
             
+            # Fallback to public email or noreply
+            email = user.email or f"{username}@users.noreply.github.com"
             self.email_cache[username] = email
             return email
+            
         except Exception as e:
             logger.warning(f"Could not get email for {username}: {e}")
             email = f"{username}@users.noreply.github.com"
@@ -95,10 +110,7 @@ class PRReviewTracker:
         stage = self.get_stage(pr)
         teams = {t.slug for t in pr.get_review_requests()[1]}
         
-        if stage == self.EXPERT_REVIEW:
-            teams -= self.EXCLUDED_TEAMS
-        else:
-            teams &= self.EXCLUDED_TEAMS
+        teams = teams - self.EXCLUDED_TEAMS if stage == self.EXPERT_REVIEW else teams & self.EXCLUDED_TEAMS
         
         reviewers = set()
         org = self.github.get_organization(self.repo.organization.login)
@@ -159,14 +171,13 @@ def main():
     
     logger.info(f"Starting PR review reminder for {repo}")
     reminders = PRReviewTracker(token, repo).generate_reminders()
-    logger.info(f"Generated {len(reminders)} reminders")
+    logger.info(f"Generated {len(reminders)} reminders\n{'=' * 80}")
     
-    print("\n" + "=" * 80)
     for r in reminders:
-        print(f"\n{r.priority} | PR #{r.id} | {r.milestone}")
-        print(f"   Author: {r.author} | Stage: {r.review_stage}")
-        print(f"   Stage time: {r.current_stage_time}d | Total: {r.total_review_time}d")
-        print(f"   Reviewers: {', '.join(r.reviewers) if r.reviewers else 'None'}")
+        logger.info(f"{r.priority} | PR #{r.id} | {r.milestone}")
+        logger.info(f"   Author: {r.author} | Stage: {r.review_stage}")
+        logger.info(f"   Stage time: {r.current_stage_time}d | Total: {r.total_review_time}d")
+        logger.info(f"   Reviewers: {', '.join(r.reviewers) if r.reviewers else 'None'}")
     
     return reminders
 
