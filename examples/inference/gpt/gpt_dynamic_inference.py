@@ -283,7 +283,7 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
-        result = engine.step_modern(sampling_params, verbose=True)
+        result = engine.step_modern(verbose=True)
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
         is_decode_only = engine.is_decode_only 
         step_id += 1
