@@ -500,7 +500,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         if self.is_moe_layer:
             if self.moe_layer_recompute:
-                if self.config.fp8:
+                if self.config.fp8 or self.config.fp4:
                     from megatron.core.extensions.transformer_engine import te_checkpoint
                     output = te_checkpoint(
                         self._forward_mlp_moe,
