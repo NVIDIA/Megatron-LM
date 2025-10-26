@@ -805,6 +805,7 @@ publish:sync_branches:
   stage: publish
   image: python:3.10
   script:
+    - set -x
     - git remote add github https://github.com/NVIDIA/Megatron-LM.git || true
     - git remote add gitlab https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/NVIDIA/Megatron-LM.git || true
     - BRANCHES=("main" "dev")
