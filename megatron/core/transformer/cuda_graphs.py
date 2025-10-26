@@ -164,7 +164,7 @@ class _CudagraphGlobalRecord:
                 runner.create_fwd_graph(args, kwargs, out)
             else:
                 runner.create_bwd_graph()
- 
+
         for g in cls.cudagraph_record:
             runner = g[0]
             runner.cudagraph_created = True
@@ -420,6 +420,19 @@ class _CudaGraphRunner(torch.nn.Module):
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.fp8_enabled = self.base_module.config.fp8 is not None
             self.fp4_enabled = self.base_module.config.fp4 is not None
+
+            # TODO(kwyss): This solution is only OK in the context of pretrain_mamba.py; there is
+            # no check whether the parent module is a TransformerBlock or MambaBlock, and the flag
+            # is named with mamba_stack. Ideally a single source of truth could control both
+            # cuda graph and mamba_block.py logic on this flag.
+            if (
+                   isinstance(base_module, TransformerLayer)
+                   and self.base_module.config.keep_mamba_stack_attention_linear_in_bf16
+                   and not self.base_module.is_moe_layer
+               ):
+                self.fp8_enabled = False
+                self.fp4_enabled = False
+
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
 
             if self.fp8_enabled:
