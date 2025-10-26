@@ -6,7 +6,7 @@ jobs:
   check-approval:
     runs-on: ubuntu-latest
     if: github.event.review.state == 'approved'
-    environment: main
+    environment: nemo-ci
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
