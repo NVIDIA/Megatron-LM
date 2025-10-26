@@ -194,11 +194,13 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "tensor_model_parallel", True)
 
         # Output layernorm before projection
+        # set layernorm_zero_centered_gamma separatly in GatedDeltaNet
         self.out_norm = build_module(
             submodules.out_norm,
             config=self.config,
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
+            layernorm_zero_centered_gamma=self.config.zero_centered_gated_delta_norm,
         )
 
         self.out_proj = build_module(

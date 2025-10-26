@@ -206,19 +206,19 @@ class TENorm:
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5, layernorm_zero_centered_gamma=None):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
-
+        assert layernorm_zero_centered_gamma in [None, True, False], "layernorm_zero_centered_gamma must be None, True, or False"
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma if layernorm_zero_centered_gamma is None else layernorm_zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         elif config.normalization == "RMSNorm":
@@ -229,7 +229,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma if layernorm_zero_centered_gamma is None else layernorm_zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         else:

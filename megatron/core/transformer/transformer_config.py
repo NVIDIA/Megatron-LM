@@ -247,6 +247,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
 
+    zero_centered_gated_delta_norm: Optional[bool] = None
+    """Whether to use zero-centered gated delta norm."""
+
     ####################
     # initialization
     ####################

@@ -3243,6 +3243,9 @@ def _add_linear_attention_args(parser):
                        help='Number of query and key heads for the gated delta net.')
     group.add_argument('--linear-num-value-heads', default=32, type=int,
                        help='Number of value and gate heads for the gated delta net.')
+    group.add_argument('--zero-centered-gated-delta-norm', action='store_true',
+                       help='If set, the gated delta net uses zero-centered gated delta norm.')
+
     return parser
 
 def _add_heterogeneous_args(parser):
