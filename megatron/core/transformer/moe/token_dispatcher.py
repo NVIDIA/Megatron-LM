@@ -1376,6 +1376,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
@@ -1383,23 +1384,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
                 "Please set --moe-flex-dispatcher-backend=deepep or "
                 "--moe-flex-dispatcher-backend=hybridep"
             )
-
-        # Attributes that need to be captured in cudagraph. These attributes are returned
-        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
-        if isinstance(self._comm_manager, _DeepepManager):
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
-        else:
-            # TODO: more dispatcher types to be supported in the future.
-            assert (
-                config.cuda_graph_impl == "none"
-            ), "Cudagraphs are not supported for non-DeepEP flex token dispatchers."
-            self.cudagraph_attrs = []
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
