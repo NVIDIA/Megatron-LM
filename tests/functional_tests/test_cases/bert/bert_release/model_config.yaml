@@ -47,6 +47,7 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
   --exit-interval: 20000
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"
