@@ -18,6 +18,8 @@ workflow:
     - if: $CI_PROJECT_NAMESPACE != "ADLR" || ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_PROJECT_PATH != "ADLR/megatron-lm")
       when: never
 
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
+
     # ci-branches only for schedule
     - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
       when: never
@@ -31,7 +33,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev")
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^core_/)
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -39,7 +41,7 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
-        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        FUNCTIONAL_TEST_TIME_LIMIT: 3600
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
@@ -154,6 +156,8 @@ default:
     when: runner_system_failure
 
 variables:
+  BUILD:
+    value: "yes"
   UNIT_TEST:
     value: "yes"
     options:
