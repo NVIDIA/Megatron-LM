@@ -639,7 +639,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             assert (
                 not self.recompute_pre_mlp_layernorm
             ), "Recomputation is not supported for CUDA graph."
-            cudagraph_outputs = self.mlp.forward_for_partial_cudagraph(pre_mlp_layernorm_output)
+            cudagraph_outputs = self.mlp(pre_mlp_layernorm_output)
             return cudagraph_outputs + [residual]
         elif self.recompute_mlp:
             if self.config.fp8:
@@ -879,13 +879,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # Resume the MoELayer forward pass from the end of the CUDA graph scope.
             # The MoE layer will skip redundant computations when we pass in the calculated values
             # through the keyword arguments. See MoELayer.forward docstring for more details.
-            mlp_output_with_bias = self.mlp.forward_for_partial_cudagraph(
-                hidden_states,
+            nvtx_range_push(suffix="mlp")
+            self.mlp.set_cudagraph_tensor_store(
+                hidden_states=hidden_states,
                 probs=probs,
                 routing_map=routing_map,
                 residual=residual,
                 shared_expert_output=shared_expert_output,
             )
+            mlp_output_with_bias = self.mlp(hidden_states)
+            self.mlp.clear_cudagraph_tensor_store()
+            nvtx_range_pop(suffix="mlp")
+
             output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
         else:
             # CUDA Graph does not capture the MLP/MoE part at all.
