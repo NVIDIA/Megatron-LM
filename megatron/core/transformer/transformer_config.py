@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -28,6 +29,8 @@ try:
     HAVE_PACKAGING = True
 except ImportError:
     HAVE_PACKAGING = False
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
