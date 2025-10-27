@@ -134,13 +134,13 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
 def get_default_sampling_params(termination_id: int = None):
     return SamplingParams(
-    temperature=1.0,
-    top_k=1,
-    top_p=0.0,
-    return_log_probs=False,
-    num_tokens_to_generate=30,
-    termination_id = termination_id,
-)
+        temperature=1.0,
+        top_k=1,
+        top_p=0.0,
+        return_log_probs=False,
+        num_tokens_to_generate=30,
+        termination_id = termination_id,
+    )
 
 def get_curr_time() -> float:
     """Get synchronized time across ranks."""
@@ -259,7 +259,7 @@ def get_synthetic_requests(
 
     # Init requests.
     requests = [
-        Request("hi " * random.randint(*args.num_tokens_to_prompt), t, tokenizer)
+        Request("hi " * random.randint(*args.num_tokens_to_prompt), t, tokenizer, sampling_params)
         for t in time_offsets
     ]
 
