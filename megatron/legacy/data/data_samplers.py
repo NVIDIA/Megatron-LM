@@ -68,7 +68,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 args.dataloader_type))
 
     # Torch dataloader.
-    if args.hybrid_context_parallel:
+    if args.sft_sequence_packing:
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}

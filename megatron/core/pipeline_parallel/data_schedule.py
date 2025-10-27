@@ -3,8 +3,9 @@
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core import parallel_state
@@ -12,15 +13,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
-class HybridCPDataLoaderWrapper:
+def wrap_hybrid_cp_dataloader(
+    data_iterator, config, pg_collection: Optional[ProcessGroupCollection] = None
+):
     """
-    A wrapper class that wraps around an existing data_iterator.
-    For every __next__ call,
-    1. Each DP rank pulls a batch of packed samples.
-    2. Extracts the sequence lengths of each sub-sample and all-gathers across the DP group.
-    3. Schedules the sub-samples to the DPxCP ranks using the BalancedCPScheduler.
-    4. Based on the schedule, reroutes the sub-samples to the correct rank using all-to-all.
-    5. Returns the assigned sub-samples to this rank.
+    A wrapper function that wraps around an existing data_iterator
+    and return the num_micro_batches for sequence packing.
 
     Args:
         data_iterator: The original data_iterator to wrap around
@@ -28,33 +26,7 @@ class HybridCPDataLoaderWrapper:
         dp_cp_group: Data parallel context parallel group.
     """
 
-    def __init__(
-        self, data_iterator, config, pg_collection: Optional[ProcessGroupCollection] = None
-    ):
-        self.data_iterator = data_iterator
-        self.config = config
-        self.cp_balancing_scheduler = BalancedCPScheduler(
-            max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank
-        )
-        if pg_collection is None:
-            self.dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-            self.dp_group = parallel_state.get_data_parallel_group()
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        else:
-            self.dp_cp_group = pg_collection.dp_cp
-            self.dp_group = pg_collection.dp
-            self.tp_group = pg_collection.tp
-        assert (
-            self.dp_cp_group is not None and self.dp_group is not None and self.tp_group is not None
-        ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
-
-        self.total_hdp_gpus = self.dp_cp_group.size()
-
-    def __iter__(self):
-        """Return self as an iterator."""
-        return self
-
-    def get_global_seqlens(self, subsample_seqlens: torch.Tensor) -> List[int]:
+    def _get_global_seqlens(subsample_seqlens: torch.Tensor, dp_group) -> List[int]:
         """
         Gathers the sequence lengths of all subsamples from all DP ranks.
         Each DP rank loads the same number of microbatches but each microbatch
@@ -65,8 +37,8 @@ class HybridCPDataLoaderWrapper:
         """
         # Collect the number of subsamples from all ranks
         local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
-        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(self.dp_group.size())]
-        torch.distributed.all_gather(dp_subsample_count, local_len, group=self.dp_group)
+        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(dp_group.size())]
+        torch.distributed.all_gather(dp_subsample_count, local_len, group=dp_group)
 
         # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
         dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
@@ -85,11 +57,9 @@ class HybridCPDataLoaderWrapper:
 
         # Gather the subsample_seqlens from all ranks
         seqlens_gathered = [
-            torch.empty_like(subsample_seqlens_padded) for _ in range(self.dp_group.size())
+            torch.empty_like(subsample_seqlens_padded) for _ in range(dp_group.size())
         ]
-        torch.distributed.all_gather(
-            seqlens_gathered, subsample_seqlens_padded, group=self.dp_group
-        )
+        torch.distributed.all_gather(seqlens_gathered, subsample_seqlens_padded, group=dp_group)
 
         # Trim each seqlens_gathered to the length of the correct sample
         for dp_rank, seqlen in enumerate(seqlens_gathered):
@@ -104,7 +74,7 @@ class HybridCPDataLoaderWrapper:
 
         return seqlens_gathered, offsets
 
-    def get_global_id_seqlens(self, num_local_subsamples, offsets, seqlens_gathered):
+    def _get_global_id_seqlens(num_local_subsamples, offsets, seqlens_gathered, dp_group):
         """
         Calculates the global ID for each subsample.
 
@@ -114,7 +84,7 @@ class HybridCPDataLoaderWrapper:
         global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
         global_ids_this_rank: list of global IDs locally present on this rank.
         """
-        dp_rank = self.dp_group.rank()
+        dp_rank = dp_group.rank()
         global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
         # Create a list of (global_id, seqlen) tuples for scheduling
         global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
@@ -125,18 +95,25 @@ class HybridCPDataLoaderWrapper:
 
         return global_id_seqlens, global_ids_this_rank
 
-    def _gid_to_src_rank(self, gid: int, offsets: List[int]) -> int:
+    def _gid_to_src_rank(gid: int, offsets: List[int], dp_group, tp_group) -> int:
         dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
         # Since the torch.distributed.get_process_group_ranks
         # provides the global rank, we need to consider TP
         hdp_rank = (
-            torch.distributed.get_process_group_ranks(self.dp_group)[dp_src_rank]
-            // self.tp_group.size()
+            torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
         )
         return hdp_rank
 
-    def reroute_samples_to_hdp_ranks(
-        self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
+    def _reroute_samples_to_hdp_ranks(
+        batch,
+        global_ids_this_rank,
+        global_id_seqlens,
+        sample_id_groups,
+        offsets,
+        dp_group,
+        tp_group,
+        dp_cp_group,
+        total_hdp_gpus,
     ):
         """
         Reroutes the sub-samples to the correct rank after scheduling.
@@ -147,22 +124,22 @@ class HybridCPDataLoaderWrapper:
         to transfer data between matching CP ranks.
         """
         gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
-        hdp_rank = self.dp_cp_group.rank()
-        dp_ranks = torch.distributed.get_process_group_ranks(self.dp_group)
+        hdp_rank = dp_cp_group.rank()
+        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
         # Here we actually want to get the DP group's rank within the HDP group,
         # we need to consider TP
-        dp_ranks = [r // self.tp_group.size() for r in dp_ranks]
+        dp_ranks = [r // tp_group.size() for r in dp_ranks]
 
         data_keys = batch[0].keys()
 
         # Create the send plan
-        combined_sample_id_groups: List[List[int]] = [[] for _ in range(self.total_hdp_gpus)]
+        combined_sample_id_groups: List[List[int]] = [[] for _ in range(total_hdp_gpus)]
 
-        for d in range(self.total_hdp_gpus):
+        for d in range(total_hdp_gpus):
             for sample_id_group in sample_id_groups:
                 combined_sample_id_groups[d].extend(sample_id_group[d])
 
-        for dest_rank in range(self.total_hdp_gpus):
+        for dest_rank in range(total_hdp_gpus):
             combined_sample_id_groups[dest_rank].sort()
 
         # Filter out samples that are not present on this rank
@@ -172,10 +149,10 @@ class HybridCPDataLoaderWrapper:
             for gid in combined_sample_id_groups[d]
             if gid in global_ids_this_rank
         ]
-        # send_counts = [len(combined_sample_id_groups[d]) for d in range(self.total_hdp_gpus)]
+        # send_counts = [len(combined_sample_id_groups[d]) for d in range(total_hdp_gpus)]
 
-        send_lens_split = [0] * self.total_hdp_gpus
-        for dest_rank in range(self.total_hdp_gpus):
+        send_lens_split = [0] * total_hdp_gpus
+        for dest_rank in range(total_hdp_gpus):
             if dest_rank in dp_ranks:
                 send_lens_split[dest_rank] = sum(
                     [
@@ -189,21 +166,19 @@ class HybridCPDataLoaderWrapper:
                 send_lens_split[dest_rank] = 0
 
         # Create the recv plan
-        recv_sample_id_groups = [[] for _ in range(self.total_hdp_gpus)]
+        recv_sample_id_groups = [[] for _ in range(total_hdp_gpus)]
         for gid in combined_sample_id_groups[hdp_rank]:
-            src_rank = self._gid_to_src_rank(gid, offsets)
+            src_rank = _gid_to_src_rank(gid, offsets, dp_group, tp_group)
             recv_sample_id_groups[src_rank].append(gid)
 
-        recv_lens_split = [0] * self.total_hdp_gpus
-        for src_rank in range(self.total_hdp_gpus):
+        recv_lens_split = [0] * total_hdp_gpus
+        for src_rank in range(total_hdp_gpus):
             recv_lens_split[src_rank] = sum(
                 [global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]]
             )
 
-        recv_ids_sorted = [
-            gid for d in range(self.total_hdp_gpus) for gid in recv_sample_id_groups[d]
-        ]
-        recv_counts = [len(recv_sample_id_groups[d]) for d in range(self.total_hdp_gpus)]
+        recv_ids_sorted = [gid for d in range(total_hdp_gpus) for gid in recv_sample_id_groups[d]]
+        recv_counts = [len(recv_sample_id_groups[d]) for d in range(total_hdp_gpus)]
 
         recv_samples = [{k: None for k in data_keys} for _ in range(sum(recv_counts))]
 
@@ -211,7 +186,8 @@ class HybridCPDataLoaderWrapper:
             flattened_tensors = []
             for gid in send_ids_sorted:
                 t = batch[gid2local_id[gid]][key].to(torch.cuda.current_device(), non_blocking=True)
-                flattened_tensors.append(t)
+                # flattened_tensors.append(t)
+                flattened_tensors.append(t.reshape(-1))
             return (
                 torch.cat(flattened_tensors, dim=0)
                 if flattened_tensors
@@ -235,7 +211,7 @@ class HybridCPDataLoaderWrapper:
                 input=send_tensor,
                 output_split_sizes=recv_lens_split,
                 input_split_sizes=send_lens_split,
-                group=self.dp_cp_group,
+                group=dp_cp_group,
             )
             _unpack_sample_by_key(key, recv_tensor)
 
@@ -244,7 +220,7 @@ class HybridCPDataLoaderWrapper:
         }
         return recv_sample_with_id
 
-    def unpack_batch(self, batch):
+    def _unpack_batch(batch):
         """
         Unpacks the packed samples into a list of sub-samples.
         Since each sub-sample may be routed to different DPxCP ranks,
@@ -255,45 +231,168 @@ class HybridCPDataLoaderWrapper:
         for sample in batch:
             sample_dict = {}
             for key in sample.keys():
-                if key in ["cu_seqlens", "batch_idx", "max_seqlen", "original_seq_len"]:
+                if key in ["cu_seqlens", "batch_idx", "max_seqlen"]:
                     continue
                 sample_dict[key] = sample[key]
             batch_unpacked.append(sample_dict)
         return batch_unpacked
 
-    def __next__(self) -> Any:
-        """
-        Get the next item from the dataset, pull scheduling metadata and return it.
-        """
-        if self.data_iterator is None:
-            # TP-0 reads from data_iterator, others receive via broadcast.
-            return None, None
-        else:
-            batch = next(self.data_iterator)
+    def _broadcast(item):
+        if item is not None:
+            torch.distributed.broadcast(
+                item,
+                parallel_state.get_tensor_model_parallel_src_rank(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )
+
+    def _broadcast_num_samples_this_group(num_samples_this_group):
+        dev = torch.cuda.current_device()
+        # TODO(tailaim) do we need this barrier?
+        torch.distributed.barrier()
+
+        n = 0 if num_samples_this_group is None else int(num_samples_this_group.numel())
+        n = torch.tensor([n], dtype=torch.int64, device=dev)
+
+        _broadcast(n)
+        n = int(n.item())
+
+        assert n > 0, "there should be at least 1 sub samples in the group"
+        num_samples_this_group_broadcast = (
+            torch.empty(n, dtype=torch.int32, device=dev)
+            if num_samples_this_group is None
+            else num_samples_this_group
+        )
+        _broadcast(num_samples_this_group_broadcast)
+        return num_samples_this_group_broadcast
+
+    cp_balancing_scheduler = BalancedHybridCPScheduler(
+        max_seq_len_per_rank=config.max_seqlen_per_dp_cp_rank
+    )
+    if pg_collection is None:
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_group = parallel_state.get_data_parallel_group()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+    else:
+        dp_cp_group = pg_collection.dp_cp
+        dp_group = pg_collection.dp
+        tp_group = pg_collection.tp
+    assert (
+        dp_cp_group is not None and dp_group is not None and tp_group is not None
+    ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
+
+    total_hdp_gpus = dp_cp_group.size()
+    dev = torch.cuda.current_device()
+
+    # TODO(tailaim): handle the case when data_iterator is None
+    if data_iterator is None:
+        # TP-0 reads from data_iterator, others receive via broadcast.
+        sample_id_groups, batch = None, None, None
+        num_total_groups_broadcast = torch.tensor([0], dtype=torch.int32, device=dev)
+        _broadcast(num_total_groups_broadcast)
+        num_micro_batches = int(num_total_groups_broadcast.item())
+        return None, num_micro_batches
+    else:
+        batch = next(data_iterator)
         subsample_seqlens = []
         for sample in batch:
             subsample_seqlens.extend([sample["tokens"].numel()])
         subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
         subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
-        seqlens_gathered, offsets = self.get_global_seqlens(subsample_seqlens)
+        seqlens_gathered, offsets = _get_global_seqlens(subsample_seqlens, dp_group)
 
-        global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(
-            subsample_seqlens.shape[0], offsets, seqlens_gathered
+        global_id_seqlens, global_ids_this_rank = _get_global_id_seqlens(
+            subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group
         )
 
-        groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(
-            global_id_seqlens, self.config
+        groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(
+            global_id_seqlens, config
         )
 
-        batch = self.unpack_batch(batch)
-        samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(
-            batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
+        batch = _unpack_batch(batch)
+        samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
+            batch,
+            global_ids_this_rank,
+            global_id_seqlens,
+            sample_id_groups,
+            offsets,
+            dp_group,
+            tp_group,
+            dp_cp_group,
+            total_hdp_gpus,
         )
-        return samples_this_rank_with_id, sample_id_groups
+        batch, sample_id_groups = samples_this_rank_with_id, sample_id_groups
+
+        hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        num_micro_batches = len(sample_id_groups)
+        num_total_groups_broadcast = torch.tensor(
+            [num_micro_batches], dtype=torch.int32, device=dev
+        )
+        _broadcast(num_total_groups_broadcast)
+
+        # pack sequences in the same group and create a new data iterator
+        new_samples = []
+        for i in range(num_micro_batches):
+            sample_ids_this_group = sample_id_groups[i][hdp_rank]
+            samples = [batch[sub_sample_id] for sub_sample_id in sample_ids_this_group]
+            partner_cp_size = len(
+                [
+                    True
+                    for sample_ids in sample_id_groups[i]
+                    if sample_ids_this_group[0] in sample_ids
+                ]
+            )
+
+            def _pack_tensors(tensors):
+                return torch.cat([t.reshape(-1) for t in tensors], dim=0)
+
+            tokens = _pack_tensors([sample["tokens"] for sample in samples])
+            labels = _pack_tensors([sample["labels"] for sample in samples])
+            loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
+            position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
+
+            # TODO(tailaim): do we need attention_mask for sequence packing?
+            new_sample = {}
+            new_sample["tokens"] = tokens
+            new_sample["labels"] = labels
+            new_sample["loss_mask"] = loss_mask
+            new_sample["position_ids"] = position_ids
+            new_sample["local_cp_size"] = torch.tensor(
+                partner_cp_size, dtype=torch.int32, device=dev
+            )
+
+            # create cu_seqlens_padded
+            lengths_padding = np.fromiter(
+                (s["tokens"].numel() for s in samples), dtype=np.int32, count=len(samples)
+            )
+            cu_seqlens_padded = np.empty(len(samples) + 1, dtype=np.int32)
+            cu_seqlens_padded[0] = 0
+            np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
+            cu_seqlens_padded = torch.from_numpy(cu_seqlens_padded).to(
+                device=dev, non_blocking=True
+            )
+            new_sample["cu_seqlens_padded"] = cu_seqlens_padded
+
+            # create max_seqlen
+            max_seqlen = np.max(lengths_padding)
+            max_seqlen = torch.tensor(max_seqlen, device=dev, dtype=torch.int32)
+            new_sample["max_seqlen"] = max_seqlen
+
+            # create cu_seqlens without padding
+            lengths = torch.stack([s["original_seq_len"] for s in samples], dim=0)
+            cu_seqlens = torch.empty(lengths.numel() + 1, device=dev, dtype=torch.int32)
+            cu_seqlens[0] = 0
+            cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+            new_sample["cu_seqlens"] = cu_seqlens
+
+            new_samples.append(new_sample)
+
+        new_data_iterator = RerunDataIterator(iter(new_samples))
+
+        return new_data_iterator, num_micro_batches
 
 
-class BalancedCPScheduler:
+class BalancedHybridCPScheduler:
     """
     This class provides the functionality to form groups of sub-samples
     such that all DPxCP ranks have a roughly balanced workload in the group.
@@ -769,189 +868,3 @@ class BalancedCPScheduler:
             sample_id_groups.append(sample_ids)
 
         return groups, sample_id_groups
-
-
-def hybrid_context_parallel_forward_backward(
-    forward_step_func,
-    data_iterator,
-    model,
-    num_microbatches,
-    input_tensor,
-    output_tensor_grad,
-    forward_data_store,
-    config,
-    collect_non_loss_data,
-    first_val_step,
-    forward_only,
-    no_sync_func,
-    total_num_tokens,
-    check_first_val_step,
-    model_type,
-):
-    """
-    Scheduler for Hybrid Context Parallel.
-
-    This function performs the packed sample scheduling and determines
-    1. The number of microbatches to schedule for each CP rank
-    2. The number of groups each CP rank should execute
-    3. The number of sub-samples per group each CP rank should execute
-
-    A group is defined by a set of samples that can run across the CP domain without any barrier.
-    There are many reasons why we may not be able to run endless samples within a single group.
-    For example, if we have 8 GPUs,
-    if GPU 0-5 are assigned a long sample that requires CP6,
-    GPU 6-7 are assigned a short sample that requires CP2,
-    The next sample which requires CP4 can be assigned GPU 4-7.
-    But GPU 6-7 will finish first and get deadlocked if GPU 4-5 are not participating in the group.
-    """
-    from .schedules import backward_step, forward_step
-
-    def _broadcast(item):
-        if item is not None:
-            torch.distributed.broadcast(
-                item,
-                parallel_state.get_tensor_model_parallel_src_rank(),
-                group=parallel_state.get_tensor_model_parallel_group(),
-            )
-
-    def _broadcast_num_samples_this_group(num_samples_this_group):
-        dev = torch.cuda.current_device()
-        torch.distributed.barrier()
-
-        n = 0 if num_samples_this_group is None else int(num_samples_this_group.numel())
-        n = torch.tensor([n], dtype=torch.int64, device=dev)
-
-        _broadcast(n)
-        n = int(n.item())
-
-        assert n > 0, "there should be at least 1 sub samples in the group"
-        num_samples_this_group_broadcast = (
-            torch.empty(n, dtype=torch.int32, device=dev)
-            if num_samples_this_group is None
-            else num_samples_this_group
-        )
-        _broadcast(num_samples_this_group_broadcast)
-        return num_samples_this_group_broadcast
-
-    def _get_new_data_iterator(sample_id_in_group, group_id):
-        if is_first_tp_rank:
-            sub_sample_id = sample_ids_this_group[sample_id_in_group]
-            sample = batch[sub_sample_id]
-            partner_cp_size = len(
-                [True for sample_ids in sample_id_groups[group_id] if sub_sample_id in sample_ids]
-            )
-            sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-            new_data_iterator = RerunDataIterator(iter([sample]))
-            return new_data_iterator
-        else:
-            return None
-
-    # We get data once per global batch and schedule the sub-samples.
-    # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
-    hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
-
-    if is_first_tp_rank:
-        data = next(data_iterator)
-        sample_id_groups = data[1]
-        batch = data[0]
-    else:
-        data, sample_id_groups, batch = None, None, None
-
-    num_samples_this_group = None
-    if is_first_tp_rank:
-        num_samples_this_group = torch.tensor(
-            [len(group[hdp_rank]) for group in sample_id_groups], dtype=torch.int32, device='cuda'
-        )
-
-    num_samples_this_group = _broadcast_num_samples_this_group(num_samples_this_group)
-    num_samples_this_group = num_samples_this_group.cpu().numpy()
-    num_total_groups = num_samples_this_group.shape[0]
-
-    current_microbatch = 0
-
-    # Upto last group, we don't need any sync.
-    with no_sync_func():
-        for j in range(num_total_groups - 1):
-            sample_ids_this_group = sample_id_groups[j][hdp_rank] if is_first_tp_rank else None
-            for i in range(num_samples_this_group[j]):
-                # Call forward step for each sub-sample
-                new_data_iterator = _get_new_data_iterator(i, j)
-                # TODO: Find the usage of current_microbatch and is_first_microbatch and
-                # how that may affect my usage.
-                output_tensor, num_tokens = forward_step(
-                    forward_step_func,
-                    new_data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(
-                        first_val_step, forward_only, current_microbatch == 0
-                    ),
-                    current_microbatch=current_microbatch,
-                )
-                current_microbatch += 1
-                total_num_tokens += num_tokens.item()
-                if not forward_only:
-                    backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, model_type, config
-                    )
-
-            # Create a barrier at end of each group.
-            # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
-            # no rank is starting a sub-sample ahead of it's partner ranks.
-            torch.distributed.barrier(
-                parallel_state.get_data_parallel_group(with_context_parallel=True)
-            )
-
-    # For the last group, we need to run the last sub-sample out of the context handler.
-    with no_sync_func():
-        sample_ids_this_group = sample_id_groups[-1][hdp_rank] if is_first_tp_rank else None
-        for i in range(num_samples_this_group[-1] - 1):
-            new_data_iterator = _get_new_data_iterator(i, -1)
-            # Call forward step for each sub-sample
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                new_data_iterator,
-                model,
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(
-                    first_val_step, forward_only, current_microbatch == 0
-                ),
-                current_microbatch=current_microbatch,
-            )
-            current_microbatch += 1
-            total_num_tokens += num_tokens.item()
-            if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-
-    # The last sub-sample of the last group of the last microbatch is
-    # run out of the context handler.
-    new_data_iterator = _get_new_data_iterator(-1, -1)
-    # Call forward step for each sub-sample
-    output_tensor, num_tokens = forward_step(
-        forward_step_func,
-        new_data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(
-            first_val_step, forward_only, current_microbatch == 0
-        ),
-        current_microbatch=current_microbatch,
-    )
-    total_num_tokens += num_tokens.item()
-    if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-
-    return forward_data_store, total_num_tokens
