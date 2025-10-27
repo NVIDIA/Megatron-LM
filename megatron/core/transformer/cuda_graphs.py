@@ -1059,9 +1059,12 @@ class CudaGraphManager(torch.nn.Module):
         ), "RNG tracker does not support cudagraphs!"
 
         assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-            "a crash due to illegal memory access or other undefined behaviour."
+        assert (
+            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+        ), (
+            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
 
         self.cudagraph_runners = []
@@ -1355,9 +1358,12 @@ class TECudaGraphHelper:
         assert (
             config.cuda_graph_impl == "transformer_engine"
         ), "Option cuda_graph_impl=transformer_engine not enabled."
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-            "a crash due to illegal memory access or other undefined behaviour."
+        assert (
+            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+        ), (
+            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
         assert "full_iteration" not in config.cuda_graph_scope, (
             "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
