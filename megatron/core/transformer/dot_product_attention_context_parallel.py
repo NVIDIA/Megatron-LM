@@ -1,12 +1,18 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Some of this code was adopted from https://github.com/zhuzilin/ring-flash-attention/
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import einops
 import torch
 from torch.nn import functional as F
+
+try:
+    import einops
+
+    HAVE_EINOPS = True
+except ImportError:
+    HAVE_EINOPS = False
 
 
 @torch.no_grad
@@ -107,6 +113,8 @@ class AllGatherComm:
         self.handles = []
 
     def all_gather(self, output_tensor: torch.Tensor, input_tensor: torch.Tensor):
+        '''All gather the input tensor to the output tensor'''
+
         if self.group is None:
             output_tensor.copy_(input_tensor)
         else:
@@ -116,6 +124,8 @@ class AllGatherComm:
             self.handles.append(handle)
 
     def wait(self):
+        '''Wait for all gather operations to complete'''
+
         if self.group is not None:
             for handle in self.handles:
                 handle.wait()
@@ -123,6 +133,8 @@ class AllGatherComm:
 
 
 def to_zz_mask_attn_bias(attention_mask, cp_size, nheads, nheads_k, heads_k_stride, device, dtype):
+    '''Convert the attention mask to the attention bias'''
+
     if cp_size == 1:
         zz_mask = attention_mask
     else:
@@ -140,6 +152,12 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, attention_mask, attention_dropout, softmax_scale, pg):
+        '''Forward pass for the native attention function with context parallelism'''
+
+        # Assert einops exists
+        if not HAVE_EINOPS:
+            raise ImportError("einops is required by the attention CP but cannot be imported.")
+
         # Initialize communication group and constants
         cp_size = 1
         if pg is not None:
@@ -217,6 +235,8 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        '''Backward pass for the native attention function with context parallelism'''
+
         # Initialize or resume constants and communication group
         q, k, v, attention_mask, *rest = ctx.saved_tensors
         nheads = q.shape[2]
