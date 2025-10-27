@@ -27,7 +27,7 @@ jobs:
 
       - name: Run Auto Reminder Bot
         run: |
-          export SLACK_TOKEN=${{ secrets.SLACK_API_TOKEN }}
+          export SLACK_TOKEN=${{ secrets.SLACK_TOKEN }}
           export SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
           export GH_TOKEN=${{ secrets.PAT }}
           python tests/test_utils/python_scripts/auto_reminder_github.py
