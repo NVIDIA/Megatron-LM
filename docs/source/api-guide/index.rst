@@ -22,4 +22,3 @@ API Guide
    optimizer_cpu_offload
    multi_token_prediction
    tokenizers
-   fine_grained_activation_offloading

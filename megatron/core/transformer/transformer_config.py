@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
 from dataclasses import dataclass
@@ -772,25 +772,6 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
-    #####################################
-    # Fine-grained Activation Offloading
-    #####################################
-    fine_grained_activation_offloading: bool = False
-    """If True, offload the input of the specified modules to the CPU."""
-
-    offload_modules: Optional[list[str]] = None
-    """The submodules to offload its input.
-    choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
-    "attn_norm": offload the input of the normalization in the attention part.
-    "core_attn": offload the input of the core attention part.
-    "mlp_norm": offload the input of the normalization in the mlp part.
-    "attn_proj": offload the input of the attn linear projection part.
-    "expert_fc1": offload the input of the expert fc1 part.
-    "moe_act": offload the input of the moe act part.
-    """
-    min_offloaded_tensor_size: int = 1024 * 1024
-    """The minimum size of the tensor to be offloaded."""
-
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1135,28 +1116,6 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
-
-        if self.fine_grained_activation_offloading:
-            assert self.offload_modules is not None and len(self.offload_modules) > 0
-            allowed_modules = {
-                "core_attn",
-                "attn_proj",
-                "expert_fc1",
-                "moe_act",
-                "attn_norm",
-                "mlp_norm",
-            }
-            invalid_modules = set(self.offload_modules) - allowed_modules
-            assert not invalid_modules, (
-                f'Invalid choices for offload_modules: {invalid_modules}. '
-                f'Allowed modules are: {allowed_modules}'
-            )
-            if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
-                raise ValueError(
-                    "attn_proj cannot be set to offload_modules alone without core_attn "
-                    "because the input of attn_proj is the output of core_attn, "
-                    "which is needed in core_attn.backward()."
-                )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
