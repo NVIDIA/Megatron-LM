@@ -29,6 +29,8 @@ try:
 except ImportError:
     HAVE_PACKAGING = False
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TransformerConfig(ModelParallelConfig):
@@ -937,7 +939,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-            logging.warning(
+            logger.warning(
                 "moe_enable_deepep is deprecated."
                 "Please use --moe-flex-dispatcher-backend=deepep instead."
             )
