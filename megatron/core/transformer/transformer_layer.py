@@ -629,7 +629,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not isinstance(self.mlp, IdentityOp)
         )
 
-        if self.recompute_mlp:
+        if (
+            self.is_moe_layer
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.training
+            and is_graph_capturing()
+            and 'moe_router' in self.config.cuda_graph_scope
+        ):
+            assert (
+                not self.recompute_pre_mlp_layernorm
+            ), "Recomputation is not supported for CUDA graph."
+            cudagraph_outputs = self.mlp.forward_for_partial_cudagraph(pre_mlp_layernorm_output)
+            return cudagraph_outputs + [residual]
+        elif self.recompute_mlp:
             if self.config.fp8:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -658,7 +670,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             bias_chunks = [bias for _, bias in outputs if bias is not None]
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
-
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
@@ -669,16 +680,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
         nvtx_range_pop(suffix="mlp")
-
-        # Return right here if we are partially capturing the MoE.
-        if (
-            self.is_moe_layer
-            and self.config.cuda_graph_impl == "transformer_engine"
-            and self.training
-            and is_graph_capturing()
-            and 'moe_router' in self.config.cuda_graph_scope
-        ):
-            return mlp_output_with_bias + [residual]
 
         return self._forward_post_mlp(mlp_output_with_bias, residual)
 
@@ -878,7 +879,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # Resume the MoELayer forward pass from the end of the CUDA graph scope.
             # The MoE layer will skip redundant computations when we pass in the calculated values
             # through the keyword arguments. See MoELayer.forward docstring for more details.
-            mlp_output_with_bias = self.mlp(
+            mlp_output_with_bias = self.mlp.forward_for_partial_cudagraph(
                 hidden_states,
                 probs=probs,
                 routing_map=routing_map,
