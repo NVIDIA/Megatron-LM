@@ -19,14 +19,6 @@ SIZE_GUIDANCE = {event_accumulator.TENSORS: 0, event_accumulator.SCALARS: 0}
 logger = logging.getLogger(__name__)
 
 
-def approximate_threshold(rtol: float) -> Callable:
-    def _func(y_pred: List[Union[float, int]], y_true: List[Union[float, int]]):
-
-        return np.mean([np.mean(y_pred), np.mean(y_true)]) * rtol
-
-    return _func
-
-
 class TypeOfTestResult(enum.Enum):
     APPROXIMATE = 1
     DETERMINISTIC = 2
@@ -46,7 +38,6 @@ class NotDeterminsticError(Exception):
 
 class ApproximateTest(Test):
     atol: Union[int, float] = 0
-    atol_func: Optional[Callable] = None
     rtol: float = 1e-5
 
     @property
@@ -59,14 +50,12 @@ class ApproximateTest(Test):
 
 class DeterministicTest(Test):
     @property
-    def atol(self) -> Union[int, float]:
-        return 0
-
-    atol_func: Optional[Callable] = None
-
-    @property
     def rtol(self) -> float:
         return 0.0
+
+    @property
+    def atol(self) -> Union[int, float]:
+        return 0
 
     @property
     def type_of_test_result(self) -> TypeOfTestResult:
@@ -235,8 +224,7 @@ def pipeline(
                 golden = np.array(golden_value_list)
 
                 # Tolerance check
-                rtol = 0 if test.type_of_test_result == TypeOfTestResult.DETERMINISTIC else 0.10
-                is_close = np.isclose(actual, golden, rtol=rtol, atol=0)
+                is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
                 num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
                 passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)

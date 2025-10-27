@@ -11,8 +11,10 @@ include:
 wait_for_resources:
   extends: [.test_rules]
   needs:
-    - test:linting_formatting
-    - test:linting_copyright
+    - job: test:linting_formatting
+      optional: true
+    - job: test:linting_copyright
+      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:build_image
@@ -127,8 +129,10 @@ test:unit_tests_configure:
 
 .unit_tests_run:
   needs:
-    - test:linting_formatting
-    - test:linting_copyright
+    - job: test:linting_formatting
+      optional: true
+    - job: test:linting_copyright
+      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:unit_tests_configure
@@ -280,27 +284,20 @@ test:linting_formatting:
   needs: [test:build_image]
   variables:
     GIT_STRATEGY: "clone"
+  rules:
+    - if: $PUBLISH == "yes"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'push' || $CI_PIPELINE_SOURCE == 'schedule'
+      when: never
+    - when: on_success
   script:
     - |
       if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
         exit 0
       fi
     - set +e
-    - git fetch origin main:main
-    - |
-      if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
-        bash tools/autoformat.sh
-        set -e
-        git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-        git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-        git config --global user.email "mcore-bot@nvidia.com"
-        git config --global user.name "Mcore Bot"
-        git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
-        git add -A .
-        git commit -m "chore: Format files" || true
-        git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-      fi
     - env
+    - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
     - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
 test:linting_copyright:
@@ -314,8 +311,20 @@ test:linting_copyright:
     - team/megatron
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
+  rules:
+    - if: $PUBLISH == "yes"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == 'push'
+      when: never
+    - when: on_success
   script:
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
+        exit 0
+      fi
     - git fetch origin main
+    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - export GITLAB_ENDPOINT=gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}
     - bash tools/copyright.sh
 
 # Override from template

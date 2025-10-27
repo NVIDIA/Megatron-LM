@@ -56,6 +56,7 @@ except ImportError:
     HAVE_TE = False
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
+    "expert_tp": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -247,6 +248,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                     rank=get_pg_rank(self.tp_group),
                     world_size=get_pg_size(self.tp_group),
                 )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=1
+                )
         else:
             self.weight = Parameter(
                 torch.empty(
@@ -258,6 +263,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=1
+                )
 
     def forward(self, input_):
         """Forward.
@@ -857,6 +866,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         rank=rank,
                         world_size=world_size,
                     )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
+                    )
             else:
                 self.weight = Parameter(
                     torch.empty(
@@ -873,6 +886,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         partition_dim=0,
                         stride=stride,
                         is_expert=self.is_expert,
+                    )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
             setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
@@ -1169,6 +1186,10 @@ class RowParallelLinear(torch.nn.Module):
                     rank=rank,
                     world_size=world_size,
                 )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=1, stride=stride
+                )
         else:
             self.weight = Parameter(
                 torch.empty(
@@ -1185,6 +1206,10 @@ class RowParallelLinear(torch.nn.Module):
                     partition_dim=1,
                     stride=stride,
                     is_expert=self.is_expert,
+                )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 

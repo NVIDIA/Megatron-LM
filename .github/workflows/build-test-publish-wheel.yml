@@ -17,6 +17,7 @@ name: Build, test, and publish a PyPi wheel (to testpypi).
 on:
   push:
     branches:
+      - dev
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"

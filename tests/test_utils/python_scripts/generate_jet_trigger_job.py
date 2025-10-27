@@ -4,7 +4,7 @@ from typing import Optional
 import click
 import yaml
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
@@ -81,7 +81,7 @@ def main(
 ):
     list_of_test_cases = [
         test_case
-        for test_case in common.load_workloads(
+        for test_case in recipe_parser.load_workloads(
             scope=scope,
             container_tag=container_tag,
             environment=environment,
@@ -158,7 +158,7 @@ def main(
 
         for test_idx, test_case in enumerate(list_of_test_cases):
             job_tags = list(tags)
-            job_tags.append(f"cluster/{common.resolve_cluster_config(cluster)}")
+            job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "

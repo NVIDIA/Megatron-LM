@@ -8,6 +8,7 @@ import random
 import shutil
 import sys
 import threading
+import types
 from argparse import Namespace
 from enum import Enum, auto
 from logging import getLogger
@@ -476,6 +477,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
+
+    # LayerWiseDistributedOptimizer save
+    if getattr(args, "optimizer", "adam").startswith("dist_"):
+        dp_rank = mpu.get_data_parallel_rank()
+        optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
+        ensure_directory_exists(optim_checkpoint_name)
+        if not optimizer.is_stub_optimizer:
+            optimizer.save_state_dict_to_file(optim_checkpoint_name)
 
     async_save_request = None
     if args.async_save:
@@ -1378,18 +1387,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     ignore_rng_state = False
     ignore_rerun_state = True
     if ckpt_format == "torch_dist":
+        state_dict_args = (
+            state_dict.get('args', types.SimpleNamespace())
+            if state_dict is not None
+            else types.SimpleNamespace()
+        )
+        if not hasattr(state_dict_args, 'tensor_model_parallel_size'):
+            print_rank_0('WARNING: does not find TP size in checkpoint args, using 1 as default.')
+        if not hasattr(state_dict_args, 'pipeline_model_parallel_size'):
+            print_rank_0('WARNING: does not find PP size in checkpoint args, using 1 as default.')
         ckpt_tp_pp = (
-            state_dict['args'].tensor_model_parallel_size,
-            state_dict['args'].pipeline_model_parallel_size,
+            getattr(state_dict_args, 'tensor_model_parallel_size', 1),
+            getattr(state_dict_args, 'pipeline_model_parallel_size', 1),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,
             args.pipeline_model_parallel_size,
         )
 
-        ckpt_world_size = getattr(state_dict['args'], 'world_size', 0)
+        ckpt_world_size = getattr(state_dict_args, 'world_size', 0)
         run_world_size = getattr(args, 'world_size', 0)
-        ckpt_dp = getattr(state_dict['args'], 'data_parallel_size', 0)
+        ckpt_dp = getattr(state_dict_args, 'data_parallel_size', 0)
         run_dp = getattr(args, 'data_parallel_size', 0)
         mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
@@ -1397,7 +1415,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         # Determine if RNG state will be loaded
         if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
-                and not getattr(state_dict['args'], 'no_save_rng', False)):
+                and not getattr(state_dict_args, 'no_save_rng', False)):
             gen_sd_rng_state = get_rng_state(args.ckpt_format)  # we can load the rng state
         else:
             ignore_rng_state = True
@@ -1412,7 +1430,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
         # Determine if optimizer state will be loaded
         if (not release and not args.finetune and not args.no_load_optim
-                and not getattr(state_dict['args'], 'no_save_optim', False)):
+                and not getattr(state_dict_args, 'no_save_optim', False)):
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
@@ -1423,7 +1441,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
                     sharded_sd_metadata = {
                         'distrib_optim_sharding_type': ('fully_sharded_model_space'
-                                                        if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
+                                                        if getattr(state_dict_args, 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
                     }
                 if (
@@ -1607,7 +1625,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
+            if getattr(args, "optimizer", "adam").startswith("dist_"):
+                dp_rank = mpu.get_data_parallel_rank()
+                optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
+                optimizer.load_state_dict_from_file(optim_checkpoint_name)
+            elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.

@@ -10,8 +10,6 @@ spec:
   gpus: 8
   n_repeat: 5
   platforms: dgx_a100
-  artifacts:
-    /workspace/data/gpt3_data: text/the_pile/shard00
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
@@ -40,12 +38,12 @@ spec:
     cd /opt/megatron-lm
 
     ARGUMENTS=(
-        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/workspace/data/cache"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
-        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts/model/{name}"
         "TRAINING_SCRIPT_PATH=pretrain_mamba.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_$CLUSTER.json"
@@ -60,7 +58,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -76,7 +74,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -84,7 +82,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
