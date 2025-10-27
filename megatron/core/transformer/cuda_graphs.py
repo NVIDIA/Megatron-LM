@@ -493,6 +493,17 @@ class _CudaGraphRunner(torch.nn.Module):
                         [self.base_module], self.fp8_recipe.amax_history_len
                     )
 
+        # cache the moe aux loss if needed, this is needed because the moe aux loss is accumulated inside
+        # the transformer layer forward pass:
+        is_moe = self.is_transformer_decoder_layer and hasattr(self.base_module, "is_moe_layer") and self.base_module.is_moe_layer
+        if is_moe:
+            from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
+            tracker = get_moe_layer_wise_logging_tracker()
+            cached_aux_losses = {}
+            for name in tracker:
+                cached_aux_losses[name] = torch.clone(tracker[name]["values"])
+
+
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
@@ -602,6 +613,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if self.fp8_enabled:
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
+
+        if is_moe:
+            for name in tracker:
+                tracker[name]["values"].copy_(cached_aux_losses[name])
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
