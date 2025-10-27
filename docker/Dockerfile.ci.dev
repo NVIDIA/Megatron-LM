@@ -71,6 +71,7 @@ EOF
 
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
+COPY . /opt/megatron-lm/
 
 ##### For NVIDIANS only #####
 FROM main as jet
