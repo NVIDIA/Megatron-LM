@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
 )
+from megatron.core.pipeline_parallel.data_schedule import wrap_hybrid_cp_dataloader
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -35,7 +36,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -579,6 +579,30 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
+    # here we need to do something to data_iterator
+    # 这里我们需要返回一个new_data_iterator和num_microbatches
+
+    if config.sft_sequence_packing:
+        if config.hybrid_context_parallel:
+            data_iterator, num_microbatches = wrap_hybrid_cp_dataloader(
+                data_iterator, config, pg_collection=None
+            )
+        else:
+            if config.balanced_sequence_packing:
+                pass
+            else:
+                pass
+    else:
+        # if we want to enable hybrid-cp without sequence packing,
+        # then we need to pad sequence to multiple sizes otherwise
+        # all the sequence same length and hybrid-cp is meaningless.
+        # However, it's meaningless, why not use sequence packing directly?
+        if config.hybrid_context_parallel:
+            pass
+        else:
+            # 这就是最正常的bshd
+            pass
+
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
             forward_step_func,
@@ -596,24 +620,24 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
-    elif config.hybrid_context_parallel:
-        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            output_tensor_grad,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            first_val_step,
-            forward_only,
-            no_sync_func,
-            total_num_tokens,
-            check_first_val_step,
-            model_type,
-        )
+    # elif config.hybrid_context_parallel:
+    #     forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
+    #         forward_step_func,
+    #         data_iterator,
+    #         model,
+    #         num_microbatches,
+    #         input_tensor,
+    #         output_tensor_grad,
+    #         forward_data_store,
+    #         config,
+    #         collect_non_loss_data,
+    #         first_val_step,
+    #         forward_only,
+    #         no_sync_func,
+    #         total_num_tokens,
+    #         check_first_val_step,
+    #         model_type,
+    #     )
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):

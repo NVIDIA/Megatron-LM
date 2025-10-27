@@ -58,14 +58,24 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when using sft_sequence_packing.
     """
 
     hybrid_context_parallel: bool = False
     """
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    When enabling hybrid_context_parallel, sft_sequence_packing must be true.
+    """
+
+    sft_sequence_packing: bool = False
+    """
+    If true, enables sft sequence packing.
+    This is used to pack samples with variable sequence lengths
+    into a single sample. This is useful when we use hybrid_context_parallel.
+    If enable hybrid_context_parallel,
+    the max sequence length after packing would be controlled by max_seqlen_per_dp_cp_rank.
+    Else, it would be controlled by the maximum sequence length / context parallel size.
     """
 
     expert_model_parallel_size: int = 1

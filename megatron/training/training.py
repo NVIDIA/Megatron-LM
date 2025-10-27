@@ -98,7 +98,8 @@ from megatron.core.parallel_state import (
 )
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDataLoaderWrapper
+# debugmtl 
+# from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDataLoaderWrapper
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -1338,6 +1339,7 @@ def setup_model_and_optimizer(
 
 
 def dummy_train_step(data_iterator):
+    # TODO: debugmtl this need to be modified
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
     rerun_state_machine = get_rerun_state_machine()
@@ -2116,8 +2118,10 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+    # debugmtl 
+    # we don't need this after my changes
+    # if args.hybrid_context_parallel:
+    #     train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
