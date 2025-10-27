@@ -367,6 +367,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+    environment: nemo-ci
     if: |
       (
         success() 
