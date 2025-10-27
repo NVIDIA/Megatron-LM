@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -510,10 +510,11 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        inputs = ctx.saved_tensors
+        inputs = ctx.inputs
         outputs = ctx.outputs
         torch.autograd.backward(outputs, args)
         ctx.outputs = None
+        ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
         return (None, None) + grads
 
@@ -573,8 +574,9 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
+            inputs = self.ctx.saved_tensors
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
-                outputs = self.run_function(*self.ctx.saved_tensors)
+                outputs = self.run_function(*inputs)
 
         self.run_function = None
         self.rng_states = None
@@ -590,6 +592,7 @@ class CheckpointWithoutOutput(object):
                 output.untyped_storage().copy_(recomputation_output.untyped_storage())
 
         self.ctx.outputs = outputs
+        self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None
 
