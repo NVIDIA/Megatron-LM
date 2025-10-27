@@ -1170,7 +1170,7 @@ wheels = [
 [[package]]
 name = "emerging-optimizers"
 version = "0.1.0"
-source = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=fb1add873e7851ec34b48581ea1b15761b73d189#fb1add873e7851ec34b48581ea1b15761b73d189" }
+source = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=cf9909b777ffac18e05b67a6708282cadc000942#cf9909b777ffac18e05b67a6708282cadc000942" }
 dependencies = [
     { name = "absl-py" },
     { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -2264,6 +2264,8 @@ requires-dist = [
     { name = "causal-conv1d", marker = "extra == 'lts'", specifier = "~=1.5" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "einops", marker = "extra == 'lts'", specifier = "~=0.8" },
+    { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=cf9909b777ffac18e05b67a6708282cadc000942" },
+    { name = "flash-linear-attention", marker = "extra == 'dev'", specifier = "~=0.3.2" },
     { name = "flashinfer-python", marker = "extra == 'dev'" },
     { name = "flashinfer-python", marker = "extra == 'lts'" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
