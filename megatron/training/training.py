@@ -2365,12 +2365,13 @@ def train(
         # Capture CUDA Graphs.
         if (
             args.cuda_graph_impl == "transformer_engine"
-            and iteration == args.cuda_graph_warmup_steps
+            and not cuda_graph_helper.graphs_created()
+            and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
-            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
             cuda_graph_helper.create_cudagraphs()
-            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
@@ -2445,8 +2446,11 @@ def train(
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
                         args.cuda_graph_impl == "transformer_engine"
-                        and iteration == args.cuda_graph_warmup_steps
+                        and args.cuda_graph_warmup_steps == 0
                     ):
+                        assert (
+                            cuda_graph_helper.graphs_created()
+                        ), "CUDA Graphs should have been created."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1

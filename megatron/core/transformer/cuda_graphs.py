@@ -1451,6 +1451,16 @@ class TECudaGraphHelper:
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
+        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
+        # have been created.
+        self._graphs_created = False
+
+    def graphs_created(self):
+        """
+        Returns whether the CUDA Graphs have been created.
+        """
+        return self._graphs_created
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -1603,6 +1613,8 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
+        assert not self._graphs_created, "CUDA Graphs have already been created."
+
         torch.distributed.barrier()
         gc.collect()
         torch.cuda.empty_cache()
@@ -1635,6 +1647,8 @@ class TECudaGraphHelper:
         reset_model_temporary_tensors(self.config, self.model)
         gc.collect()
         torch.cuda.empty_cache()
+
+        self._graphs_created = True
 
     def create_cudagraphs(self):
         """
