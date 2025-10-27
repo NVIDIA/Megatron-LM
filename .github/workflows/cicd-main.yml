@@ -399,7 +399,7 @@ jobs:
       - name: Parse functional tests
         id: main
         env:
-          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.HAS_RUN_TESTS_LABEL }}
+          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
         run: |
           export PYTHONPATH=$(pwd)
 
