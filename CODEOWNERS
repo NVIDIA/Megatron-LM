@@ -79,5 +79,5 @@ tests/unit_tests/
 [RL] @mcore-reviewers/rl
 megatron/rl/
 examples/rl/
-test/unit_tests/test_rl_utils.py
+tests/unit_tests/test_rl_utils.py
 train_rl.py
