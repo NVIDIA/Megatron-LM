@@ -64,6 +64,12 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
+
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -290,10 +296,18 @@ def run_inference(
             active_token_count_0 = engine.context.active_token_count
             engine.suspend()
             # >>>
+            # print(".............. request_ids: %s." % str(engine.context.request_ids.tolist()))
+            print(".............. request_ids: %s." % str(list(engine.requests.keys())))
+            # <<<
+            # >>>
             # if num_requests_added < num_requests_total:
             #     _add_request()
             # <<<
             engine.resume()
+            # >>>
+            print(".............. request_ids: %s." % str(engine.context.request_ids[:engine.context.total_request_count].tolist()))
+            # print(".............. request_ids: %s." % str(list(engine.requests.keys())))
+            # <<<
             active_token_count_1 = engine.context.active_token_count
             print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
                 engine.step_count,
