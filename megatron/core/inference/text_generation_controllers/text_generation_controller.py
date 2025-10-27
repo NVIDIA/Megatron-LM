@@ -659,7 +659,7 @@ class TextGenerationController:
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = (
             model_config.cuda_graph_impl == "local"
-            and model_config.cuda_graph_scope != "full_iteration"
+            and "full_iteration" not in model_config.cuda_graph_scope
         )
 
         # Pad batch tokens if necessary

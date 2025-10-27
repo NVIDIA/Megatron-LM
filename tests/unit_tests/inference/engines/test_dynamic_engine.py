@@ -80,7 +80,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
-    cuda_graph_scope: str = "full_iteration"
+    cuda_graph_scope: List[str] = None
     force_build_cuda_graphs: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
@@ -110,6 +110,9 @@ class DynamicEngineTestConfig:
             # Enough room for all tokens.
             if self.context_max_tokens_override is None:
                 self.context_max_tokens_override = self.num_requests * self.max_sequence_length
+
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = ["full_iteration"]
 
 
 @dataclass
@@ -403,7 +406,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], ["full_iteration"]])
     def test_simple(self, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
 

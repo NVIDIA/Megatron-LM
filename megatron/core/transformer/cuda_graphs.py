@@ -1314,20 +1314,29 @@ def _layer_is_graphable(layer, config):
     # import modules here to avoid a circular import
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and config.cuda_graph_scope == "full":
+    if isinstance(layer, MambaLayer) and 'mamba' in config.cuda_graph_scope:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if config.cuda_graph_scope == 'attn':
-            if not (
-                isinstance(layer.self_attention, IdentityOp)
-                and isinstance(layer.cross_attention, IdentityOp)
-            ):
-                # attn layer.
-                return True
-        else:
+        if 'attn' in config.cuda_graph_scope and not (
+            isinstance(layer.self_attention, IdentityOp)
+            and isinstance(layer.cross_attention, IdentityOp)
+        ):
+            # attn layer.
+            return True
+        if (
+            'moe' in config.cuda_graph_scope
+            or 'moe_router' in config.cuda_graph_scope
+            or 'moe_preprocess' in config.cuda_graph_scope
+        ) and isinstance(layer.mlp, MoELayer):
+            # moe layer.
+            return True
+        if 'mlp' in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+            # mlp layer.
             return True
     return False
 
@@ -1350,14 +1359,10 @@ class TECudaGraphHelper:
             "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
             "a crash due to illegal memory access or other undefined behaviour."
         )
-        assert config.cuda_graph_scope != "full_iteration", (
+        assert "full_iteration" not in config.cuda_graph_scope, (
             "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
             "Please use cuda_graph_impl=local instead."
         )
-        assert config.cuda_graph_scope in [
-            'full',
-            'attn',
-        ], f"--cuda-graph-scope should be full or attn, got {config.cuda_graph_scope}."
 
         self.model = model
         self.config = config
@@ -1480,8 +1485,10 @@ class TECudaGraphHelper:
                     from megatron.core.transformer.identity_op import IdentityOp
                     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-                    contains_self_attn = isinstance(layer, TransformerLayer) and not isinstance(
-                        layer.self_attention, IdentityOp
+                    contains_self_attn = (
+                        isinstance(layer, TransformerLayer)
+                        and not isinstance(layer.self_attention, IdentityOp)
+                        and 'attn' in self.config.cuda_graph_scope
                     )
                     if is_te_min_version("1.10.0"):
                         # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
