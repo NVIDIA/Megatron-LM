@@ -70,6 +70,7 @@ RUN bash -ex <<"EOF"
 EOF
 
 COPY assets/ /opt/data/
+COPY . /opt/megatron-lm/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ##### For NVIDIANS only #####
