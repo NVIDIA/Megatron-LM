@@ -464,6 +464,9 @@ class DynamicInferenceEngine(AbstractEngine):
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_all_tensors()
+        # >>>
+        print("         SUSPEND request_ids: %s.\n" % str(list(self.requests.keys())))
+        # <<<
 
         # Delete cuda graphs when not using unified memory at all (level 0). For
         # levels 1 and 2, the context's tensors maintain static memory addresses,
@@ -504,6 +507,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.requests: Dict[int, DynamicInferenceRequest] = {}
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
 
+            # >>>
+            # if request_ids:
+            #     pax({"context": self.context})
+            # <<<
+
             # Create cuda graphs (before adding requests, to be in decode mode).
             # Only create cuda graphs when not using unified memory at all (level
             # 0). For levels 1 and 2, the context's tensors maintain static
@@ -539,6 +547,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     request_id,
                     tokens,
                     request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+                    # >>>
+                    debug=bool(request_ids),
+                    # <<<
                 )
             torch.cuda.synchronize()
             add_time = time.time() - add_time
@@ -549,6 +560,17 @@ class DynamicInferenceEngine(AbstractEngine):
             f"add {add_time:.3f}",
             f"capture {capture_time:.3f}.",
         )))
+        # >>>
+        print("         RESUME request_ids: %s.\n" % str(list(self.requests.keys())))
+        # <<<
+
+        # >>>
+        # if request_ids:
+        #     pax({
+        #         "engine requests" : str(request_ids),
+        #         "context requests" : str(self.context.request_ids[:self.context.total_request_count].tolist()),
+        #     })
+        # <<<
 
         return futures
 
@@ -563,6 +585,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _add_request(
         self, request: DynamicInferenceRequest
+        # >>>
+        , debug=False
+        # <<<
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
@@ -607,6 +632,9 @@ class DynamicInferenceEngine(AbstractEngine):
         prompt: Union[str, List[int], Tensor],
         num_tokens_to_generate: Optional[int] = None,
         num_tokens_total: Optional[int] = None,
+        # >>>
+        debug=False,
+        # <<<
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -653,7 +681,10 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Add request.
-        return self._add_request(request)
+        # >>>
+        # return self._add_request(request)
+        return self._add_request(request, debug=debug)
+        # <<<
 
     def post_process_requests(
         self,

@@ -176,7 +176,17 @@ class DataParallelInferenceCoordinator:
         for request_id, token, request_log_probs in zip(
             request_ids, generated_tokens, log_probs_iter
         ):
-            request: DynamicInferenceRequest = self.requests[request_id]
+            # >>>
+            # request: DynamicInferenceRequest = self.requests[request_id]
+            # +++
+            try:
+                request: DynamicInferenceRequest = self.requests[request_id]
+            except Exception as e:
+                raise Exception("request %d not found ... keys %s." % (
+                    request_id,
+                    list(self.requests.keys()),
+                ))
+            # <<<
             # Handle chunked prefill similar to the engine logic
             if chunked_prefill_request_id == -1 or request_id != chunked_prefill_request_id:
                 request.generated_tokens.append(token)
@@ -336,6 +346,9 @@ class DataParallelInferenceCoordinator:
                     chunked_prefill_request_id,
                     materialize_only_last_token_logits,
                 ) = deserialized_payload[1:]
+                # >>>
+                print("\n....... [coord] request_ids : %s.\n" % request_ids)
+                # <<<
                 self.postprocess(
                     request_ids,
                     finished_request_ids,
