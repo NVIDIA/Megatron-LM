@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 
 import pytest
@@ -543,7 +545,6 @@ def test_muon_optimizer_multiple_steps():
         ), f"Weight should change at step {i}"
 
 
-@pytest.mark.skip(reason="split qkv is not implemented yet")
 def test_muon_optimizer_qkv_split():
     """Test TensorParallelMuon optimizer with QKV splitting."""
     # Create a model with QKV-like parameter
