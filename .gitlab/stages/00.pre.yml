@@ -8,6 +8,7 @@ include:
       when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
       when: always
+
     - when: never
   stage: .pre
 
@@ -58,6 +59,8 @@ pre:create_ci_branches:
       - branch: ci-pre-release
       - branch: ci-review-reminder
       - branch: ci-upgrade-dependencies
+      - branch: ci-approve-main
+      - branch: ci-approve-dev
   tags:
     - arch/amd64
     - env/prod

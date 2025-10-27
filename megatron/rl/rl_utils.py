@@ -161,7 +161,7 @@ def get_environment_rollouts(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.enable_cuda_graph,
+            args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
@@ -800,7 +800,7 @@ def evaluate_and_print_results_rl(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.enable_cuda_graph,
+            args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
@@ -952,7 +952,7 @@ def calculate_grpo_loss(
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
-    enable_cuda_graph: bool,
+    cuda_graph_impl: str,
     reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
     offload_kv_cache_during_training: bool,
@@ -963,7 +963,7 @@ def megatron_rl_inference_mode(
     Args:
         model: model to prepare.
         optimizer: optimizer used to train the model.
-        enable_cuda_graph: use cuda graphs or not.
+        cuda_graph_impl: cuda graph implementation. "none" means not using cuda graphs.
         reset_cuda_graphs: rebuild cuda graphs for each inference stage or not.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
         offload_kv_cache_during_training: manually offload kv cache to host before training or not.
@@ -990,8 +990,8 @@ def megatron_rl_inference_mode(
             with nvtx_range("offload-optimizer-before-inference", time=True):
                 optimizer.offload_to_cpu()
 
-        if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, True, reset_cuda_graphs=reset_cuda_graphs)
+        if cuda_graph_impl == "local":
+            toggle_cuda_graphs(lang_module, "local", reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
 
@@ -1034,8 +1034,8 @@ def megatron_rl_inference_mode(
             elif remove_kv_cache_during_training:
                 inference_interface._coordinator.engine.context.memory_buffer = None
 
-        if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, False, reset_cuda_graphs=reset_cuda_graphs)
+        if cuda_graph_impl == "local":
+            toggle_cuda_graphs(lang_module, "none", reset_cuda_graphs=reset_cuda_graphs)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference", time=True):

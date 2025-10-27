@@ -286,12 +286,12 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
 
         encoder_input = numpy.array(encoder_input, dtype=numpy.int64)
         encoder_input = numpy.pad(
-            encoder_input, (0, length_pads_encoder), constant_values=self.config.tokenizer.pad
+            encoder_input, (0, length_pads_encoder), constant_values=self._pad_token_id
         )
 
         decoder_input = numpy.array(decoder_input, dtype=numpy.int64)
         decoder_input = numpy.pad(
-            decoder_input, (0, length_pads_decoder), constant_values=self.config.tokenizer.pad
+            decoder_input, (0, length_pads_decoder), constant_values=self._pad_token_id
         )
 
         # Create attention and history masks

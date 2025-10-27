@@ -132,6 +132,8 @@ class TestParallelAttention:
         self.parallel_attention.config.apply_rope_fusion = True
         if rotary_interleaved and not is_te_min_version("2.3.0"):
             pytest.skip("Only TE >= 2.3.0 supports interleaved fused RoPE.")
+        if fused_qkv_rope and self.parallel_attention.config.attention_output_gate:
+            pytest.skip("Fused QKV RoPE does not support gated attention for now.")
         if fused_qkv_rope and not HAVE_FUSED_QKV_ROPE:
             pytest.skip("Fused QKV RoPE not available.")
         self.parallel_attention.config.rotary_interleaved = rotary_interleaved
