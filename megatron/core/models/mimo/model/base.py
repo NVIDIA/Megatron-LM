@@ -119,7 +119,7 @@ class MimoModel(MegatronModule):
         device = reference_embeddings.device
         dtype = reference_embeddings.dtype
 
-        batch_size, seq_length = input_ids.size() # input_ids is [B, S]
+        batch_size, seq_length = input_ids.size()  # input_ids is [B, S]
         logger.debug(
             f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
         )
@@ -250,7 +250,7 @@ class MimoModel(MegatronModule):
         special_token_ids: Optional[Dict[str, int]] = None,
         packing_kwargs: Optional[dict] = None,
     ):
-        f"""Forward pass through the multimodal model.
+        """Forward pass through the multimodal model.
 
         Args:
             input_ids: Input token IDs. Shape: (B, S)
