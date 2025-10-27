@@ -87,6 +87,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 13000
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"
