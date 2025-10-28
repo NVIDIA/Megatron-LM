@@ -19,7 +19,10 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.dynamic_context import (
+    MaxSequenceLengthOverflowError,
+    WarmupEngineMode,
+)
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -412,49 +415,33 @@ class TextGenerationController:
         """
         return padded_batch_prompt_tokens[:original_batch_size]
 
-    @torch.inference_mode()
-    async def async_generate_output_tokens_dynamic_batch(
-        self, sampling_params: SamplingParams, termination_id: int
-    ) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
-        """Forward step the model and update the inference context.
+    def _dynamic_step_context_init(
+        self,
+        num_warmup_tokens: Optional[int] = None,
+        warmup_engine_mode: Optional[WarmupEngineMode] = None,
+    ):
+        """Initializes the inference context for dynamic batching.
 
         Args:
-            sampling_params (SamplingParams): Parameters for sampling logits.
+            num_warmup_tokens (Optional[int]): Number of tokens to use for
+                warming up cuda graphs. Must be less than or equal to
+                `max_requests`.
+            warmup_engine_mode (WarmupEngineMode): Denote whether to setup
+                for a decode or a non-decode cuda-graph warmup.
 
         Return:
-            (Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]) Current request IDs,
-                paused request IDs, finished request IDs, new sample.
+            input_ids (Tensor): The active input IDs.
+            position_ids (Tensor): The active position IDs.
         """
         context = self.inference_wrapped_model.inference_context
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # Remove Float16Module wrapper if it exists
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-        if sampling_params.return_log_probs:
-            skip_prompt_log_probs_for_dynamic_inference = getattr(
-                sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
-            )
-            assert (
-                skip_prompt_log_probs_for_dynamic_inference
-                or materialize_only_last_token_logits is False
-            ), "Materialize only last token logits must be false for returning log probs"
-
-        # No tokens?
-        if context.active_token_count == 0:
-            return None
+        model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
         context.initialize_attention_state()
-        cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
-        )
-
-        # Get flat tokens, position ids.
-        input_ids, position_ids = context.current_input_and_position_ids()
-
-        model_config = get_model_config(unwrapped_model)
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -479,7 +466,23 @@ class TextGenerationController:
                 # Turn off symmetric all reduces for prefill
                 unwrapped_model.set_symmetric_ar(None)
 
-        # Forward pass -> logits.
+        # Get flat tokens, position ids.
+        return context.current_input_and_position_ids()
+
+    def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
+        """Forward step the model to get logits for dynamic batching.
+
+        This also handles logits-broadcasting for pipeline parallelism.
+
+        Args:
+            input_ids (Tensor): The input token IDs.
+            position_ids (Tensor): The position IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
@@ -504,14 +507,28 @@ class TextGenerationController:
                 tensor=logits,
                 pp_group=self.pp_group,
             )
+        return logits
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        await asyncio.sleep(0)
+    def _dynamic_step_sample_bookkeeping(self, sampling_params: SamplingParams):
+        """Perform bookkeeping necessary to sample logits for dynamic batching."""
+        pass
+
+    def _dynamic_step_sample_logits(
+        self, logits: Tensor, sampling_params: SamplingParams
+    ) -> Tensor:
+        """Sample logits for dynamic batching.
+
+        Args:
+            logits (Tensor): The logits from the forward step.
+            sampling_params (SamplingParams): Parameters for sampling logits.
+
+        Returns:
+            new_sample (Tensor): The sampled tokens.
+        """
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # Last token logits.
         if materialize_only_last_token_logits:
@@ -525,9 +542,48 @@ class TextGenerationController:
         # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2.
         vocab_size = inference_wrapper_config.padded_vocab_size
-        new_sample = self.sample_from_logits(
+        return self.sample_from_logits(
             last_token_logits, sampling_params, vocab_size=vocab_size
         )
+
+    def _dynamic_step_log_probs_bookkeeping(self):
+        """Perform bookkeeping necessary to compute log probs for dynamic batching."""
+        pass
+
+    def _dynamic_step_calculate_log_probs(
+        self, logits: Tensor, new_sample: Tensor, sampling_params: SamplingParams,
+    ) -> Optional[Tensor]:
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        log_probs = None
+        if sampling_params.return_log_probs:
+            skip_prompt_log_probs_for_dynamic_inference = getattr(
+                sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
+            )
+            assert (
+                skip_prompt_log_probs_for_dynamic_inference
+                or materialize_only_last_token_logits is False
+            ), "Materialize only last token logits must be false for returning log probs"
+
+            log_probs = context.calculate_log_probs(
+                logits, new_sample, only_last_token_logits=materialize_only_last_token_logits
+            )
+        return log_probs
+
+    def _dynamic_step_context_bookkeeping(
+        self, new_sample: Tensor, termination_id: int
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Update the dynamic inference context after sampling.
+
+        Args:
+            new_sample (Tensor): The newly sampled tokens for each active request.
+            termination_id (int): The token ID that indicates termination.
+
+        Return:
+            Tuple[Tensor, Tensor, Tensor]: active / paused / finished request IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
 
         # Active sequence lengths.
         active_request_ids = context.request_ids[
@@ -549,12 +605,6 @@ class TextGenerationController:
         # New sample gets updated in update_requests, so we pass in a clone
         new_sample_copy = new_sample.clone()
 
-        log_probs = None
-        if sampling_params.return_log_probs:
-            log_probs = context.calculate_log_probs(
-                logits, new_sample_copy, only_last_token_logits=materialize_only_last_token_logits
-            )
-
         # Update requests.
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
 
@@ -562,15 +612,78 @@ class TextGenerationController:
             "active_request_ids": active_request_ids,
             "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
+        }
+
+    @torch.inference_mode()
+    async def async_generate_output_tokens_dynamic_batch(
+        self, sampling_params: SamplingParams, termination_id: int
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context.
+
+        Args:
+            sampling_params (SamplingParams): Parameters for sampling logits.
+
+        Return:
+            (Optional[Dict]): A dictionary containing:
+                1. active_request_ids (Tensor): Current active request IDs.
+                2. newly_paused_request_ids (Tensor): Newly paused request IDs.
+                3. finished_request_ids (Tensor): Finished request IDs.
+                4. sample (Tensor): New sample.
+                5. log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                6. cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        """
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+
+        # No tokens?
+        if context.active_token_count == 0:
+            return None
+
+        # This method only interacts with CPU tensors.
+        input_ids, position_ids = self._dynamic_step_context_init()
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
+
+        # This method only interacts with GPU tensors.
+        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        # This is the best place to yield control back to event loop.
+        # At this point we have enqueued FW pass GPU kernels asynchronously.
+        # While they are running, we can do other useful CPU work.
+        # Note: This can be moved further ahead if sampling can be made
+        # asynchronous.
+        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # NOTE [TDE]: This needs to happen after all GPU methods.
+        await asyncio.sleep(0)
+
+        # This method will only interact with CPU tensors in the future.
+        self._dynamic_step_sample_bookkeeping(sampling_params)
+        # This method will only interact with GPU tensors in the future.
+        new_sample = self._dynamic_step_sample_logits(logits, sampling_params)
+
+        # This method will only interact with CPU tensors in the future.
+        self._dynamic_step_log_probs_bookkeeping()
+        # This method will only interact with GPU tensors in the future.
+        log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample, sampling_params)
+
+        # This method only interacts with CPU tensors.
+        request_bookeeping = self._dynamic_step_context_bookkeeping(new_sample, termination_id)
+
+        ret = {
             "sample": new_sample,
             "log_probs": log_probs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+        ret.update(request_bookeeping)
+        return ret
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
-    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    ) -> Optional[Dict]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
         loop = get_asyncio_loop()
         return loop.run_until_complete(
