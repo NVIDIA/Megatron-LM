@@ -784,7 +784,7 @@ publish:approve_merge_gate:
         export COMMENT="Main is healthy. Submitting PR."
       elif [[ $EXIT_CODE -eq 1 ]]; then
         export STATUS="rejected"
-        export COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
+        export COMMENT="$TARGET_BRANCH is not healthy. An automation engineer is investigating. No need to take any action."
       elif [[ $EXIT_CODE -eq 2 ]]; then
         echo "Main is running. We won't cancel the deployment."
         exit 0
