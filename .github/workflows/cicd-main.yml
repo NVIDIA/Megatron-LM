@@ -250,11 +250,6 @@ jobs:
           apt-get update
           apt-get install -y gh
 
-      - name: Pull cache
-        run: |
-          docker pull ${{ env.container-registry }}/megatron-lm:main || true
-          docker pull ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
-
       - name: Get last merged PR
         id: cache_from
         env:
@@ -270,7 +265,7 @@ jobs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-              echo "${{ env.container-registry }}/megatron-lm:$number"
+              echo "type=registry,ref=${{ env.container-registry }}/megatron-lm:$number-buildcache,mode=max"
             done)
 
           echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
@@ -287,8 +282,8 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ env.container-registry }}/megatron-lm:main
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
             ${{ steps.cache_from.outputs.LAST_PRS }}
           no-cache: false
           tags: |
