@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 name: CICD Megatron-LM
 on:
   schedule:
@@ -149,6 +150,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
+    if: github.repository == 'NVIDIA/Megatron-LM'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
 
   linting:
@@ -250,11 +252,6 @@ jobs:
           apt-get update
           apt-get install -y gh
 
-      - name: Pull cache
-        run: |
-          docker pull ${{ env.container-registry }}/megatron-lm:main || true
-          docker pull ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
-
       - name: Get last merged PR
         id: cache_from
         env:
@@ -270,12 +267,15 @@ jobs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-              echo "${{ env.container-registry }}/megatron-lm:$number"
+              echo "type=registry,ref=${{ env.container-registry }}/megatron-lm:$number-buildcache,mode=max"
             done)
 
           echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
           echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
           echo "EOF" | tee -a $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -287,9 +287,11 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ env.container-registry }}/megatron-lm:main
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
             ${{ steps.cache_from.outputs.LAST_PRS }}
+          cache-to: |
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           no-cache: false
           tags: |
             ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
@@ -367,6 +369,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+    environment: nemo-ci
     if: |
       (
         success() 
@@ -398,20 +401,25 @@ jobs:
       - name: Parse functional tests
         id: main
         env:
-          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.HAS_RUN_TESTS_LABEL }}
+          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
         run: |
           export PYTHONPATH=$(pwd)
 
           if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
             ARGS=(
-              --scope mr
+              --scope mr-github
               --enable-lightweight-mode
             )
+            echo ":warning: The Run tests label is not yet supported."
           else
             ARGS=(
               --scope mr-slim
             )
           fi
+
+          ARGS=(
+            --scope mr-slim
+          )
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
