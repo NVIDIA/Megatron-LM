@@ -59,7 +59,7 @@ products:
   - test_case: [t5_11b_mcore_tp4_pp1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [t5_mcore_te_tp4_pp1]
     products:
