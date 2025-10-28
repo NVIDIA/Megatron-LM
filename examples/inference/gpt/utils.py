@@ -229,10 +229,12 @@ def get_time_offsets(
     return time_offsets
 
 
-def get_cli_requests(args: Namespace, tokenizer: Any) -> list[Request]:
+def get_cli_requests(
+        args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
 
     # Get time offsets.
-    time_offsets = get_time_offsets(
+    t_offsets = get_time_offsets(
         args.seed,
         args.incoming_requests_per_step,
         args.incoming_requests_per_sec,
@@ -240,7 +242,7 @@ def get_cli_requests(args: Namespace, tokenizer: Any) -> list[Request]:
     )
 
     # Init requests.
-    requests = [Request(p, t, tokenizer) for p,t in zip(args.prompts, time_offsets)]
+    requests = [Request(p, t, tokenizer, sampling_params) for p,t in zip(args.prompts, t_offsets)]
     return requests
 
 
@@ -306,7 +308,7 @@ def build_requests(
     if args.prompts:
         if args.prompt_file:
             raise ValueError("Cannot use both --prompts and --prompt-file")
-        return get_cli_requests(args, tokenizer)
+        return get_cli_requests(args, tokenizer, sampling_params)
     elif args.prompt_file:
         return get_requests_from_file(args, tokenizer, sampling_params)
     else:
