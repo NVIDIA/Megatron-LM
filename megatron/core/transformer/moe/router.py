@@ -1,10 +1,11 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
 
+from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -51,6 +52,12 @@ class Router(ABC, MegatronModule):
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
+        if self.config.add_bias_linear:
+            self.bias = torch.nn.Parameter(
+                torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+            )
+        else:
+            self.bias = None
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -60,8 +67,13 @@ class Router(ABC, MegatronModule):
         """Reset the router parameters."""
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
+            if self.bias is not None:
+                self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
+            setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -75,13 +87,16 @@ class Router(ABC, MegatronModule):
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+        if self.bias is not None and self.bias.device.type == 'cpu':
+            self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, router_dtype)
+        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
     @abstractmethod
@@ -447,12 +462,22 @@ class TopKRouter(Router):
             eps = self.config.moe_input_jitter_eps
             if self.input_jitter is None:
                 self.input_jitter = torch.distributions.uniform.Uniform(
-                    torch.tensor(1.0 - eps, device=input.device),
-                    torch.tensor(1.0 + eps, device=input.device),
+                    torch.tensor(1.0 - eps, dtype=input.dtype, device=input.device),
+                    torch.tensor(1.0 + eps, dtype=input.dtype, device=input.device),
                 ).rsample
             return input * self.input_jitter(input.shape)
         else:
             return input
+
+    @jit_fuser
+    def _apply_expert_bias(self, routing_map: torch.Tensor):
+        """
+        Update expert bias and tokens_per_expert
+        Prevent extra local tokens accumulation on evaluation or activation recomputation
+        """
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor):
         """Top-k routing function
@@ -512,11 +537,8 @@ class TopKRouter(Router):
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
 
-        # Update expert bias and tokens_per_expert
-        # Prevent extra local tokens accumulation on evaluation or activation recomputation
-        if self.enable_expert_bias and torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+        # Optionally apply expert bias
+        self._apply_expert_bias(routing_map)
 
         return probs, routing_map
 

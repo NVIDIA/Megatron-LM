@@ -1,8 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
+from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
     get_te_version,
@@ -27,6 +29,8 @@ try:
     HAVE_PACKAGING = True
 except ImportError:
     HAVE_PACKAGING = False
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,6 +111,11 @@ class TransformerConfig(ModelParallelConfig):
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
+    softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+       and learnable offset."""
+
     num_query_groups: Optional[int] = None
     """Number of query groups for group query attention. If None, normal attention is used."""
 
@@ -155,6 +164,14 @@ class TransformerConfig(ModelParallelConfig):
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
 
+    glu_linear_offset: float = 0.0
+    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
+    used when gated_linear_unit is True"""
+
+    activation_func_clamp_value: Optional[float] = None
+    """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
+    is quick_gelu."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -167,11 +184,19 @@ class TransformerConfig(ModelParallelConfig):
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
 
+    window_attn_skip_freq: Optional[Union[int, List[int]]] = None
+    """Frequency of full attention layers among sliding window attention layers. Accepts either:
+    - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
+    - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
+
     normalization: str = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
+
+    attention_output_gate: bool = False
+    """Whether to apply output gate to the attention layers."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -192,6 +217,38 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
+
+    moe_hybridep_num_sms: int = 16
+    """Number of SMs to use for HybridEP. In pure NVL scenarios, 
+    16 SMs can generally achieve good bandwidth."""
+
+    ####################
+    # linear attention
+    ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use. Currently support gated_delta_net."""
+
+    linear_attention_freq: Optional[Union[int, List[int]]] = None
+    """Frequency between LA (linear attention) layers 
+    and SDPA (scaled dot-product attention) layers.
+    Accepts either:
+    - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+
+    linear_conv_kernel_dim: Optional[int] = None
+    """Conv kernel dimension for the gated delta net."""
+
+    linear_key_head_dim: Optional[int] = None
+    """Query and key head dimension for the gated delta net."""
+
+    linear_value_head_dim: Optional[int] = None
+    """Value and gate head dimension for the gated delta net."""
+
+    linear_num_key_heads: Optional[int] = None
+    """Number of query and key heads for the gated delta net."""
+
+    linear_num_value_heads: Optional[int] = None
+    """Number of value and gate heads for the gated delta net."""
 
     ####################
     # initialization
@@ -269,6 +326,9 @@ class TransformerConfig(ModelParallelConfig):
 
     use_fused_weighted_squared_relu: bool = False
     """If True, uses fused weighted squared relu kernel when using MoE."""
+
+    fused_single_qkv_rope: bool = False
+    """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
     ####################
     # activation recomputation
@@ -405,11 +465,20 @@ class TransformerConfig(ModelParallelConfig):
     """Shared expert total ffn hidden size.
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
     there are multiple shared experts.
-    None means no shared expert."""
+    None means no shared expert.
+    By default, the shared experts execute before the router. However, when
+    moe_shared_expert_overlap or overlap_moe_expert_parallel_comm is set,
+    the shared experts execute after the router, before the routed experts.
+    This makes the gradients from the router and the shared experts added in
+    different orders to the hidden_states, causing minor numerical differences
+    in the hidden_states gradient."""
+
+    moe_shared_expert_gate: bool = False
+    """Enable gate for shared expert."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared epxerts execute after the routed experts."""
+    Without this, the shared experts execute before the router."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -441,10 +510,14 @@ class TransformerConfig(ModelParallelConfig):
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
+    moe_router_padding_for_quantization: Optional[bool] = False
+    """Whether to pad the routing_map to make sure the number of tokens each expert receives
+    is a multiple of 16/32 for quantized precision (e.g., FP8, FP4). This can remove the explicit
+    padding in the GroupedMLP layer."""
+
     moe_router_padding_for_fp8: Optional[bool] = False
-    """Whether to pad the routing_map to make sure the number of tokens each expert received
-    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
-    GroupedMLP layer."""
+    """[Compatibility alias for moe_router_padding_for_quantization]
+    Enabling this will also enable moe_router_padding_for_quantization."""
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
@@ -530,6 +603,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
+    moe_flex_dispatcher_backend: str = "deepep"
+    """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
+    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
+    the MNNVL case."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -583,7 +661,8 @@ class TransformerConfig(ModelParallelConfig):
     # Cuda Graphs
     ##################
     enable_cuda_graph: bool = False
-    """When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
+    """DEPRECATED and replaced by cuda_graph_impl.
+    When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
     CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
     determines the scope of graph capture."""
 
@@ -603,13 +682,23 @@ class TransformerConfig(ModelParallelConfig):
     """Number of warmup steps for CUDA graphs"""
 
     external_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+    """DEPRECATED and replaced by cuda_graph_impl.
+    When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
+    cuda_graph_impl: str = "none"
+    """Determines the CUDA graph capture implementation.
+    "none": no CUDA graph.
+    "local": capture the CUDA graph using MCore local implementation. Either partial CUDA graph
+    (1/many CUDA graph per layer) or full iteration CUDA graph (1 CUDA graph for whole iteration
+    excluding optimizer) is enabled.
+    "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
     cuda_graph_scope: str = "full"
-    """Determines the CUDA graphs capturing scope. When external_cuda_graph is set to true,
-    valid values are "full" and "attn". "Full" scope captures a whole Transformer
-    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention().
-    When enable_cuda_graph is set to true, "full_iteration" can be specified as cuda_graph_scope
+    """Determines the CUDA graphs capturing scope.
+    When cuda_graph_impl is set to "transformer_engine", valid values are "full" and "attn".
+    "Full" scope captures a whole Transformer layer. "Attn" scope only captures operations in
+    TransformerLayer._forward_attention().
+    When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
@@ -722,6 +811,54 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.linear_attention_type is not None:
+            supported_la_types = ["gated_delta_net", "mamba"]
+            assert self.linear_attention_type in supported_la_types, (
+                f"linear_attention_type ({self.linear_attention_type}) only support"
+                f" one of {supported_la_types}."
+            )
+            assert (
+                self.linear_attention_freq is not None
+            ), f"linear_attention_freq must be set for linear attention."
+
+            if self.linear_attention_type == "gated_delta_net":
+                # Check required parameters
+                assert (
+                    self.linear_conv_kernel_dim is not None
+                ), "linear_conv_kernel_dim must be set for gated delta net."
+                assert (
+                    self.linear_key_head_dim is not None
+                ), "linear_key_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_value_head_dim is not None
+                ), "linear_value_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_num_key_heads is not None
+                ), "linear_num_key_heads must be set for gated delta net."
+                assert (
+                    self.linear_num_value_heads is not None
+                ), "linear_num_value_heads must be set for gated delta net."
+                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                    f"linear_num_key_heads ({self.linear_num_key_heads})."
+                )
+
+                # Check tensor parallelism compatibility
+                assert (
+                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
+                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+                assert (
+                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
+                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+
+                # Do not support yet, but coming soon.
+                assert self.context_parallel_size == 1, (
+                    f"Gated delta net does not support context parallel for now,"
+                    f" but got {self.context_parallel_size=}."
+                )
+            elif self.linear_attention_type == "mamba":
+                raise NotImplementedError("Mamba is not supported yet.")
+
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
             if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
@@ -784,11 +921,18 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+            logger.warning(
+                "moe_enable_deepep is deprecated."
+                "Please use --moe-flex-dispatcher-backend=deepep instead."
+            )
 
         if self.moe_token_dispatcher_type == "flex":
-            if self.moe_pad_expert_input_to_capacity:
+            if self.moe_pad_expert_input_to_capacity and (
+                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
+            ):
                 raise ValueError(
-                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
+                    "Flex token dispatcher with deepep backend does not support "
+                    "moe_pad_expert_input_to_capacity"
                 )
 
         if self.moe_shared_expert_intermediate_size is not None:
@@ -1161,10 +1305,10 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.bias_activation_fusion:
-            if self.activation_func not in [F.gelu, F.silu]:
+            if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
-                    "gelu or swiglu"
+                    "gelu, swiglu, or quick_geglu"
                 )
             if (
                 self.activation_func == F.gelu
@@ -1172,8 +1316,18 @@ class TransformerConfig(ModelParallelConfig):
                 and not self.add_bias_linear
             ):
                 raise ValueError(
-                    "When bias_activation_fusion is True, gated_linear_unit is False, "
+                    "When bias_activation_fusion is True, gated_linear_unit is False "
                     "and activation function is gelu, add_bias_linear must also be True."
+                )
+            if self.activation_func == quick_gelu and not self.gated_linear_unit:
+                raise ValueError(
+                    "When bias_activation_fusion is True and activation function is quick_gelu, "
+                    "gated_linear_unit must be True."
+                )
+            if self.glu_linear_offset != 0.0 and self.activation_func != quick_gelu:
+                raise ValueError(
+                    "When bias_activation_fusion is True and glu_linear_offset is non-zero, "
+                    "activation function must be quick_gelu."
                 )
 
             if self.use_te_activation_func:
@@ -1219,6 +1373,10 @@ class TransformerConfig(ModelParallelConfig):
                         "apply_rope_fusion is not available. Please install TE >= 1.4."
                     )
 
+        if self.fused_single_qkv_rope:
+            if self.attention_output_gate:
+                raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
+
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
@@ -1249,8 +1407,10 @@ class TransformerConfig(ModelParallelConfig):
                 multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
-        if self.num_moe_experts is not None:
-            assert not self.add_bias_linear, "Bias is not supported for MoE"
+        if self.num_moe_experts is not None and self.add_bias_linear:
+            assert (
+                self.expert_tensor_parallel_size == 1
+            ), "Bias in Moe is only supported when ETP==1"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
@@ -1273,13 +1433,23 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_router_padding_for_fp8:
-            if self.fp8 is None:
-                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
+            # enable moe_router_padding_for_quantization
+            warnings.warn(
+                "--moe-router-padding-for-fp8 is going to be deprecated. "
+                "Use --moe-router-padding-for-quantization instead."
+            )
+            self.moe_router_padding_for_quantization = True
+
+        if self.moe_router_padding_for_quantization:
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
+                )
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
                 raise ValueError(
                     "allgather and alltoall_seq dispatcher does not support "
-                    "moe_router_padding_for_fp8."
+                    "moe_router_padding_for_quantization."
                 )
 
         if (
@@ -1319,11 +1489,48 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
 
-        if self.enable_cuda_graph:
+        if self.enable_cuda_graph or self.external_cuda_graph:
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Do not use enable_cuda_graph or external_cuda_graph with cuda_graph_impl."
+            assert (
+                not self.enable_cuda_graph or not self.external_cuda_graph
+            ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+
+            if self.enable_cuda_graph:
+                warnings.warn('enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.')
+                self.cuda_graph_impl = "local"
+            if self.external_cuda_graph:
+                warnings.warn(
+                    'external_cuda_graph is deprecated, '
+                    'use cuda_graph_impl=transformer_engine instead.'
+                )
+                self.cuda_graph_impl = "transformer_engine"
+        if self.cuda_graph_impl != "none":
+            assert self.cuda_graph_impl in [
+                "transformer_engine",
+                "local",
+            ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
             if self.recompute_granularity:
-                raise ValueError("CUDA graphs not supported with activation recomputation.")
+                if (
+                    self.recompute_granularity != "selective"
+                    or self.cuda_graph_impl != "transformer_engine"
+                    or self.cuda_graph_scope != "attn"
+                ):
+                    raise ValueError("CUDA graphs not supported with activation recomputation.")
+                else:
+                    for module in self.recompute_modules:
+                        if module in ['core_attn', 'mla_up_proj']:
+                            raise ValueError(
+                                f'attn cuda graph is not supported with {module} recompute.'
+                            )
+                    if "layernorm" in self.recompute_modules:
+                        warnings.warn(
+                            "input_layernorm recompute is not supported with attention "
+                            "cudagraph. Will only recompute the pre_mlp_layernorm."
+                        )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
@@ -1494,9 +1701,6 @@ class MLATransformerConfig(TransformerConfig):
     rotary_scaling_factor: float = 40
     """Rotary scaling factor for the rotary embeddings, used by yarn."""
 
-    max_position_embeddings: int = 4096
-    """This arg is not used, will be deprecated."""
-
     original_max_position_embeddings: int = 4096
     """Original maximum position embeddings for the original model, used by yarn."""
 
@@ -1522,19 +1726,8 @@ class MLATransformerConfig(TransformerConfig):
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
-        # TODO(boxiangw): Deprecate this check
-        if self.max_position_embeddings != 4096:
-            if self.original_max_position_embeddings == 4096:
-                # only override the original_max_position_embeddings if it is not set
-                self.original_max_position_embeddings = self.max_position_embeddings
-            self.max_position_embeddings = 4096
-            warnings.warn(
-                "MLA config max_position_embeddings is overridden by customer input, "
-                "please use the original_max_position_embeddings instead for YaRN!"
-                "max_position_embeddings will be deprecated in the future."
-                "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
-                "and assigned max_position_embeddings back to the original value."
-            )
+        if self.attention_output_gate:
+            raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (

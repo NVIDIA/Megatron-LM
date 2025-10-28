@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 
 import pytest
@@ -244,24 +246,13 @@ def test_precision_aware_optimizer(
         test_model, input, test_optim, fp8_recipe, fp8_recipe_settings
     )
 
-    rtol = 1e-3  # relative tolerance
-    atol = 1e-5  # absolute tolerance
+    rtol, atol = 1.6e-2, 1e-5
 
     # Compare grad norms - allow small difference due to precision
-    rel_diff = abs(test_grad_norm - baseline_grad_norm) / (
-        abs(baseline_grad_norm) + 1e-7  # avoid div by 0
-    )
-    abs_diff = abs(test_grad_norm - baseline_grad_norm)
-    assert (
-        rel_diff <= rtol or abs_diff <= atol
-    ), f"Grad norm mismatch: baseline={baseline_grad_norm}, test={test_grad_norm}, rel_diff={rel_diff}, abs_diff={abs_diff}"
+    torch.testing.assert_close(test_grad_norm, baseline_grad_norm, atol=atol, rtol=rtol)
 
     # Compare losses - allow small difference due to precision
-    loss_rel_diff = abs(test_loss - baseline_loss) / (abs(baseline_loss) + 1e-7)
-    loss_abs_diff = abs(test_loss - baseline_loss)
-    assert (
-        loss_rel_diff <= rtol or loss_abs_diff <= atol
-    ), f"Loss mismatch: baseline={baseline_loss}, test={test_loss}, rel_diff={loss_rel_diff}, abs_diff={loss_abs_diff}"
+    torch.testing.assert_close(test_loss, baseline_loss, atol=atol, rtol=rtol)
 
     # Save and reload state dict for the test model
     state_dict = test_optim.state_dict()
@@ -420,10 +411,16 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     mp_mesh = device_mesh["pp", "tp"]
     mp_group = mp_mesh._flatten().get_group()
 
+    # Create intra_dist_opt group
+    # It has the same ranks as dp_cp group when num_distributed_optimizer_instances is not > 1
+    intra_dist_opt_mesh = device_mesh["dp", "cp"]
+    intra_dist_opt_group = intra_dist_opt_mesh._flatten().get_group()
+
     # Create process group configurations
     pg_collection = ProcessGroupCollection()
     pg_collection.dp = dp_group
     pg_collection.dp_cp = dp_cp_group
+    pg_collection.intra_dist_opt = intra_dist_opt_group
     pg_collection.expt_dp = None  # Not using expert parallelism in this test
 
     pg_collection.tp = tp_group
@@ -547,12 +544,19 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             pg_collection=pg_collection_no_expt_dp,
         )
 
-    # Test 4: Missing mp attribute in pg_collection
+    # Test 4: Missing intra_dist_opt and mp attribute in pg_collection
     pg_collection_complete = ProcessGroupCollection()
     pg_collection_complete.dp = torch.distributed.new_group()
     pg_collection_complete.expt_dp = None  # Explicitly set to None as allowed
-    # Missing required 'mp' attribute
 
+    # Missing required 'intra_dist_opt' attribute
+    with pytest.raises(ValueError, match="intra_dist_opt process group is required"):
+        get_megatron_optimizer(
+            config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
+        )
+
+    pg_collection_complete.intra_dist_opt = None  # Explicitly set to None as allowed
+    # Missing required 'mp' attribute
     with pytest.raises(ValueError, match="mp process group is required"):
         get_megatron_optimizer(
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete

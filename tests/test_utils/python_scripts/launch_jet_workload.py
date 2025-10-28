@@ -17,7 +17,7 @@ import yaml
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -68,19 +68,22 @@ def launch_and_wait_for_completion(
             pipeline = jetclient.JETClient(
                 customer="mcore", gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
             ).workloads.submit(
-                workloads=common.load_workloads(
-                    test_case=test_case,
-                    n_repeat=n_repeat,
-                    time_limit=(1200 if enable_lightweight_mode else time_limit),
-                    tag=tag,
-                    scope=scope,
-                    container_image=container_image,
-                    container_tag=container_tag,
-                    platform=platform,
-                    environment=environment,
-                    record_checkpoints=record_checkpoints,
-                ),
-                config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
+                workloads=[
+                    jetclient.JETWorkloadManifest(**workload)
+                    for workload in recipe_parser.load_workloads(
+                        test_case=test_case,
+                        n_repeat=n_repeat,
+                        time_limit=(1200 if enable_lightweight_mode else time_limit),
+                        tag=tag,
+                        scope=scope,
+                        container_image=container_image,
+                        container_tag=container_tag,
+                        platform=platform,
+                        environment=environment,
+                        record_checkpoints=record_checkpoints,
+                    )
+                ],
+                config_id=f"mcore/{recipe_parser.resolve_cluster_config(cluster)}",
                 custom_config={
                     "launchers": {cluster: cluster_config},
                     "executors": {
@@ -103,6 +106,9 @@ def launch_and_wait_for_completion(
                                         "MCORE_BACKWARDS_COMMIT": (
                                             os.getenv("MCORE_BACKWARDS_COMMIT") or ""
                                         ),
+                                        "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
+                                        "TRANSFORMERS_OFFLINE": "1",
+                                        "CLUSTER": cluster,
                                     }
                                 }
                             }
@@ -110,7 +116,7 @@ def launch_and_wait_for_completion(
                     },
                     "outputs": {
                         "enabled": True,
-                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
+                        "artifacts_storages": [recipe_parser.resolve_artifact_config(cluster)],
                     },
                 },
                 wait_for_validation=True,
@@ -278,6 +284,11 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "invalid pointer" in concat_allranks_logs
         or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
         or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
+        or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
     )
 
 
@@ -479,15 +490,17 @@ def main(
                 )
 
             if is_flaky_failure(concat_allranks_logs):
-                logger.error("Detected flaky failure, attempt restart.")
+                if n_attempts < 9:
+                    logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
             if (
                 "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
-                logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
+                if n_nondeterminism_attemps < 3:
+                    logger.error("Non-determinism, let's try another node.")
                 continue
 
             telemetrics_and_exit(

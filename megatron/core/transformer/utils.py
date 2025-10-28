@@ -3,7 +3,7 @@
 """Utilities for transformer layers."""
 from functools import lru_cache
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
@@ -14,6 +14,9 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.transformer import TransformerConfig
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -30,6 +33,17 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
     return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+
+
+@lru_cache(maxsize=32)
+def get_sliding_window_causal_mask(sq, skv, window_size):
+    """Create the equivalent attention mask for SWA in [sq, skv] shape"""
+    m = torch.ones(sq, skv, dtype=torch.bool, device="cuda")
+    mu = torch.triu(m, diagonal=skv - sq - window_size[0])
+    ml = torch.tril(mu, diagonal=skv - sq + window_size[1])
+    ml = ~ml
+
+    return ml
 
 
 # pylint: disable=missing-function-docstring
@@ -281,7 +295,7 @@ def init_cuda_graph_cache(model):
     if cuda_graph_attr_cache is not None and model_id in cuda_graph_attr_cache:
         return  # Cache already initialized
 
-    cuda_graph_attrs = ["enable_cuda_graph", "flash_decode", "cudagraph_manager"]
+    cuda_graph_attrs = ["cuda_graph_impl", "flash_decode", "cudagraph_manager"]
 
     # Special case handling for activation recomputation
     if model.config.recompute_granularity is not None:
@@ -299,7 +313,7 @@ def init_cuda_graph_cache(model):
     # Recursive function to find all modules with our target attributes
     def find_modules_with_attrs(module):
         # Check if this module has any of our target attributes
-        for attr in ["enable_cuda_graph", "flash_decode"]:
+        for attr in ["cuda_graph_impl", "flash_decode"]:
             if hasattr(module, attr) and isinstance(getattr(module, attr), bool):
                 cuda_graph_attr_cache[model_id][attr].append(module)
 
@@ -329,12 +343,12 @@ def init_cuda_graph_cache(model):
     find_modules_with_attrs(model_modules)
 
 
-def toggle_cuda_graphs(model, set_to=False, reset_cuda_graphs=True):
+def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
     """
     Toggle CUDA graph-related attributes for the model and its modules.
 
     Args:
-        set_to (bool): Value to set for CUDA graph-related attributes.
+        set_to (str): Value to set for CUDA graph-related attributes.
         reset_cuda_graphs (bool): If True, remake the CUDA graph;
             if False, use cached CUDA graph managers.
     """
@@ -345,16 +359,17 @@ def toggle_cuda_graphs(model, set_to=False, reset_cuda_graphs=True):
     if cuda_graph_attr_cache is None or model_id not in cuda_graph_attr_cache:
         init_cuda_graph_cache(model)
 
-    model.config.enable_cuda_graph = set_to
+    assert set_to in ["none", "local"], f"Invalid CUDA graph implementation: {set_to}"
+    model.config.cuda_graph_impl = set_to
 
     # Collect all modules that have any of the CUDA graph attributes
     for attribute, modules in cuda_graph_attr_cache[model_id].items():
-        if attribute == "enable_cuda_graph":
+        if attribute == "cuda_graph_impl":
             for module in modules:
                 setattr(module, attribute, set_to)
         elif attribute == "recompute_granularity":
             for module in modules:
-                if set_to:
+                if set_to == "local":
                     # If we are turning on cuda graphs we need to turn of activation recomputation
                     setattr(module[0], attribute, None)
                 else:
@@ -363,7 +378,7 @@ def toggle_cuda_graphs(model, set_to=False, reset_cuda_graphs=True):
         # Cuda Graph manager case
         elif attribute == "cudagraph_manager":
             for module in modules:
-                if set_to:
+                if set_to == "local":
                     if reset_cuda_graphs:
                         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
@@ -381,5 +396,24 @@ def toggle_cuda_graphs(model, set_to=False, reset_cuda_graphs=True):
     from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 
     # if we are resetting cuda graphs we need to reset all the state
-    if reset_cuda_graphs and set_to == False:
+    if reset_cuda_graphs and set_to == "none":
         delete_cuda_graphs()
+
+
+def is_layer_window_attention(
+    window_size: Optional[Tuple[int, int]], window_attn_skip_freq: int | list, layer_number: int
+) -> bool:
+    # layer_number is 1-indexed
+    if not window_size:
+        return False
+    if window_attn_skip_freq is None:
+        return True
+    if isinstance(window_attn_skip_freq, int):
+        return layer_number % window_attn_skip_freq != 0
+    if isinstance(window_attn_skip_freq, list):
+        return bool(window_attn_skip_freq[layer_number - 1])
+
+    raise ValueError(
+        f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
+        f"{window_attn_skip_freq}"
+    )

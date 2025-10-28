@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -56,6 +56,8 @@ except ImportError:
     HAVE_TE = False
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
+    "expert_tp": False,
+    "is_qkv": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -247,6 +249,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                     rank=get_pg_rank(self.tp_group),
                     world_size=get_pg_size(self.tp_group),
                 )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=1
+                )
         else:
             self.weight = Parameter(
                 torch.empty(
@@ -258,6 +264,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=1
+                )
 
     def forward(self, input_):
         """Forward.
@@ -552,16 +562,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
-                if weight.main_grad.dtype == torch.float32:
-                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                        total_input, grad_output, weight.main_grad
-                    )
-                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                        total_input, grad_output, weight.main_grad
-                    )
+                # In case of Megatron-FSDP, need to create main grad buffers in-place
+                if hasattr(weight, "__fsdp_param__"):
+                    weight.main_grad = weight.get_main_grad()
+                    torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
                 else:
-                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+                    if weight.main_grad.dtype == torch.float32:
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Unsupported gradient type for gradient accumulation fusion"
+                        )
 
             if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
@@ -850,6 +867,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         rank=rank,
                         world_size=world_size,
                     )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
+                    )
             else:
                 self.weight = Parameter(
                     torch.empty(
@@ -866,6 +887,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         partition_dim=0,
                         stride=stride,
                         is_expert=self.is_expert,
+                    )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
             setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
@@ -1162,6 +1187,10 @@ class RowParallelLinear(torch.nn.Module):
                     rank=rank,
                     world_size=world_size,
                 )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=1, stride=stride
+                )
         else:
             self.weight = Parameter(
                 torch.empty(
@@ -1178,6 +1207,10 @@ class RowParallelLinear(torch.nn.Module):
                     partition_dim=1,
                     stride=stride,
                     is_expert=self.is_expert,
+                )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 

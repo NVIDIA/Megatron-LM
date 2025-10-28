@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 from typing import List, Optional, Union
@@ -7,6 +7,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -376,8 +377,20 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    # Scatter add the permuted_input back to the original positions
-    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    if torch.are_deterministic_algorithms_enabled():
+        # Use index_add which is deterministic when deterministic algorithms are enabled
+        # and is CUDA graph compatible
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+        # and is CUDA graph compatible unlike scatter_add
+        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+    else:
+        # Scatter add the permuted_input back to the original positions
+        output_tokens.scatter_add_(
+            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+        )
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -589,9 +602,21 @@ def topk_routing_with_score_function(
     if scaling_factor:
         probs = probs * scaling_factor
 
-    # TODO Try using element-wise operations instead of scatter?
-    routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    if torch.are_deterministic_algorithms_enabled():
+        # build [num_tokens, num_experts] from [num_tokens, topk]
+        routing_probs = torch.zeros_like(logits)
+        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+        routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map.index_put_(
+            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+        )
+        routing_map = routing_map.bool()
+    else:
+        # TODO Try using element-wise operations instead of scatter?
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     return routing_probs, routing_map
 
@@ -881,12 +906,16 @@ class RandomSTE(torch.autograd.Function):
     """
 
     generator = None
+    random_logits = None
 
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
+        if is_graph_capturing() and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         if RandomSTE.generator is None:
             global_rank = torch.distributed.get_rank()
             base_seed = 42
@@ -894,8 +923,8 @@ class RandomSTE(torch.autograd.Function):
             RandomSTE.generator = torch.Generator(device=logits.device)
             RandomSTE.generator.manual_seed(seed)
 
-        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return random_logits
+        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return RandomSTE.random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -918,11 +947,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+    def forward(
+        ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+    ):
         """
         Forward pass of the RouterGatingLinearFunction function.
         """
-        ctx.save_for_backward(inp, weight)
+        ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -930,10 +961,14 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
-        else:
+        elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+        else:
+            output = torch.addmm(
+                bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
+            )
 
         output = output.view(*inp_shape[:-1], -1)
         return output
@@ -943,7 +978,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         """
         Backward pass of the RouterGatingLinearFunction function.
         """
-        inp, weight = ctx.saved_tensors
+        inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
         grad_shape = grad_output.shape
         inp = inp.view(-1, inp_shape[-1])
@@ -962,17 +997,20 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
+        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, None
+        return grad_input, grad_weight, grad_bias, None
 
 
-def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+def router_gating_linear(
+    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+):
     """
     Customized linear layer for router gating.
     This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, router_dtype)
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.

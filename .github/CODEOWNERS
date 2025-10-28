@@ -1,0 +1,12 @@
+* @NVIDIA/core-nemo @NVIDIA/core-devtech
+
+.gitlab/ @NVIDIA/ci
+.github/ @NVIDIA/ci
+.gitlab-ci.yml @NVIDIA/ci
+docker/  @NVIDIA/ci
+tests/unit_tests/run_ci_test.sh @NVIDIA/ci
+tests/test_utils/python_scripts/
+tests/functional_tests/python_test_utils/ @NVIDIA/ci
+tests/functional_tests/shell_test_utils/ @NVIDIA/ci
+pyproject.toml @NVIDIA/ci
+uv.lock @NVIDIA/ci

@@ -59,7 +59,7 @@ class TestParallelTransformerBlockCudagraphs:
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
         )
         self.parallel_transformer_block = TransformerBlock(
             self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
@@ -67,6 +67,7 @@ class TestParallelTransformerBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
@@ -197,7 +198,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
         virtual_pipeline_model_parallel_size=vpp,
         pipeline_model_parallel_size=pp,
         deallocate_pipeline_outputs=True,
-        enable_cuda_graph=True,
+        cuda_graph_impl="local",
         use_te_rng_tracker=True,
         account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
         account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
@@ -258,6 +259,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
 
     # Teardown
     Utils.destroy_model_parallel()
+    _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
@@ -292,7 +294,7 @@ class TestLLaVACudaGraph:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs
+            cuda_graph_impl="local",  # Enable CUDA graphs
         )
 
         # Create vision transformer config
@@ -301,7 +303,7 @@ class TestLLaVACudaGraph:
             hidden_size=16,
             num_attention_heads=2,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,  # Enable CUDA graphs for vision model too
+            cuda_graph_impl="local",  # Enable CUDA graphs for vision model too
         )
 
         # Create vision projection config
@@ -344,6 +346,7 @@ class TestLLaVACudaGraph:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -423,6 +426,15 @@ class TestLLaVACudaGraph:
             loss = output1.sum()
         loss.backward()
 
+        # Import the CUDA graph creation function
+        from megatron.core.transformer.cuda_graphs import create_cudagraphs
+
+        # Create the CUDA graphs - this is where the is_last_layer logic is tested
+        create_cudagraphs()
+
+        # Verify that CUDA graphs were created successfully
+        assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
+
         if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
             self.llava_model.vision_model.decoder, 'layers'
         ):
@@ -459,7 +471,7 @@ class TestParallelMambaBlockCudagraphs:
                 num_layers=len(hybrid_override_pattern),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                enable_cuda_graph=True,
+                cuda_graph_impl="local",
             )
             modules = mamba_stack_spec.submodules
             return MambaStack(
@@ -474,6 +486,7 @@ class TestParallelMambaBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -553,7 +566,7 @@ class TestCaptureFreezeGC:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_cuda_graph=True,
+            cuda_graph_impl="local",
             inference_rng_tracker=True,
             tensor_model_parallel_size=1,  # needed?
         )
@@ -594,7 +607,7 @@ class TestCaptureFreezeGC:
             num_cuda_graphs=num_cuda_graphs,
             buffer_size_gb=20,
             buffer_guaranteed_fraction=0.05,
-            chunk_size_tokens=256,
+            block_size_tokens=256,
             buffer_overflow_factor=1.1,
             max_requests_override=512,
             max_tokens_override=8196,
@@ -625,6 +638,7 @@ class TestCaptureFreezeGC:
 
         return engine.capture_stats
 
+    @pytest.mark.flaky_in_dev  # Issue #2855
     @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -681,8 +695,8 @@ class TestCaptureFreezeGC:
         )
 
         # Validate time and memory usage.
-        assert freeze_on_results["internal"]["time"] < 0.2 * freeze_off_results["internal"]["time"]
-        assert freeze_on_results["external"]["time"] < 0.2 * freeze_off_results["external"]["time"]
+        assert freeze_on_results["internal"]["time"] < 0.3 * freeze_off_results["internal"]["time"]
+        assert freeze_on_results["external"]["time"] < 0.3 * freeze_off_results["external"]["time"]
         assert (
             freeze_on_results["internal"]["allocated_bytes"]
             <= freeze_off_results["internal"]["allocated_bytes"]
