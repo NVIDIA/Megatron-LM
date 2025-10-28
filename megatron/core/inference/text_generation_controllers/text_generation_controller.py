@@ -442,8 +442,7 @@ class TextGenerationController:
 
         # Initialize attention state.
         context.initialize_attention_state(
-            num_warmup_tokens=num_warmup_tokens,
-            warmup_engine_mode=warmup_engine_mode,
+            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
         )
 
         # If using symmetric kernels and we are using using nccl
@@ -545,16 +544,14 @@ class TextGenerationController:
         # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2.
         vocab_size = inference_wrapper_config.padded_vocab_size
-        return self.sample_from_logits(
-            last_token_logits, sampling_params, vocab_size=vocab_size
-        )
+        return self.sample_from_logits(last_token_logits, sampling_params, vocab_size=vocab_size)
 
     def _dynamic_step_log_probs_bookkeeping(self):
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
         pass
 
     def _dynamic_step_calculate_log_probs(
-        self, logits: Tensor, new_sample: Tensor, sampling_params: SamplingParams,
+        self, logits: Tensor, new_sample: Tensor, sampling_params: SamplingParams
     ) -> Optional[Tensor]:
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits

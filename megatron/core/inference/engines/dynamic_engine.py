@@ -194,8 +194,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Initialize context.
                 input_ids, position_ids = self.controller._dynamic_step_context_init(
-                    num_warmup_tokens=cuda_graph_token_count,
-                    warmup_engine_mode=warmup_engine_mode,
+                    num_warmup_tokens=cuda_graph_token_count, warmup_engine_mode=warmup_engine_mode
                 )
 
                 # Initialize attention state.
@@ -209,9 +208,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if HAVE_TQDM:
                     tbar.set_description(tbar_str)
                 else:
-                    logging.info(
-                        f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}"
-                    )
+                    logging.info(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
 
                 # Forward pass -> logits.
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
