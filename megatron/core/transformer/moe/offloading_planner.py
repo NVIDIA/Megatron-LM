@@ -4,8 +4,8 @@ import triton.language as tl
 from typing import Union
 
 def one_shot_greedy_assignment(
-    token_chunks: torch.Tensor,
-    buckets: torch.Tensor
+    count_tokens_per_chunk: torch.Tensor,
+    capacity_per_bucket: torch.Tensor
 ) -> torch.Tensor:
     """
     Perform one-shot greedy assignment between token chunks and buckets.
@@ -20,42 +20,42 @@ def one_shot_greedy_assignment(
     3. Calculating the overlap amount as the assignment
 
     Args:
-        token_chunks: Token chunks to be assigned
+        count_tokens_per_chunk: Token chunks to be assigned
             Shape: [num_token_chunks]
             Type: torch.Tensor (int)
             Description: Each element represents the number of tokens in a chunk
                        that needs to be assigned to buckets
 
-        buckets: Bucket capacities available for assignment
+        capacity_per_bucket: Bucket capacities available for assignment
             Shape: [num_buckets]
             Type: torch.Tensor (int)
             Description: Each element represents the capacity of a bucket that can
                        receive token chunks
 
     Returns:
-        overlap: Assignment matrix showing token chunk to bucket assignments
+        count_tokens_from_chunk_to_bucket: Assignment matrix showing token chunk to bucket assignments
             Shape: [num_token_chunks, num_buckets]
             Type: torch.Tensor (same dtype as inputs)
             Description: Element [i, j] represents how many tokens from chunk i
                        are assigned to bucket j. Zero if no assignment.
     """
-    token_chunks_cumsum = torch.cumsum(token_chunks, dim=0)
-    buckets_cumsum = torch.cumsum(buckets, dim=0)
-    token_chunks_start = token_chunks_cumsum - token_chunks
-    buckets_start = buckets_cumsum - buckets
-    token_chunks_start = token_chunks_start.unsqueeze(1)  # (num_token_chunks, 1)
-    token_chunks_end = token_chunks_cumsum.unsqueeze(1)   # (num_token_chunks, 1)
-    buckets_start = buckets_start.unsqueeze(0)  # (1, num_buckets)
-    buckets_end = buckets_cumsum.unsqueeze(0)   # (1, num_buckets)
-    overlap_start = torch.maximum(token_chunks_start, buckets_start)
-    overlap_end = torch.minimum(token_chunks_end, buckets_end)
-    overlap = (overlap_end - overlap_start).clamp(min=0)
-    return overlap
+    count_tokens_per_chunk_cumsum = torch.cumsum(count_tokens_per_chunk, dim=0)
+    capacity_per_bucket_cumsum = torch.cumsum(capacity_per_bucket, dim=0)
+    count_tokens_per_chunk_start = count_tokens_per_chunk_cumsum - count_tokens_per_chunk
+    capacity_per_bucket_start = capacity_per_bucket_cumsum - capacity_per_bucket
+    count_tokens_per_chunk_start = count_tokens_per_chunk_start.unsqueeze(1)  # (num_token_chunks, 1)
+    count_tokens_per_chunk_end = count_tokens_per_chunk_cumsum.unsqueeze(1)   # (num_token_chunks, 1)
+    capacity_per_bucket_start = capacity_per_bucket_start.unsqueeze(0)  # (1, num_buckets)
+    capacity_per_bucket_end = capacity_per_bucket_cumsum.unsqueeze(0)   # (1, num_buckets)
+    overlap_start = torch.maximum(count_tokens_per_chunk_start, capacity_per_bucket_start)
+    overlap_end = torch.minimum(count_tokens_per_chunk_end, capacity_per_bucket_end)
+    count_tokens_from_chunk_to_bucket = (overlap_end - overlap_start).clamp(min=0)
+    return count_tokens_from_chunk_to_bucket
 
 def reclaim_spare_experts(
-    num_token_to_ep_rank: torch.Tensor,
-    avg_token_to_ep_rank: float,
-    matched_assignment: torch.Tensor,
+    count_tokens_per_ep_rank: torch.Tensor,
+    avg_tokens_per_ep_rank: float,
+    count_tokens_from_home_expert_to_spare_expert: torch.Tensor,
     threshold_multiplier: float
 ) -> torch.Tensor:
     """
@@ -74,17 +74,17 @@ def reclaim_spare_experts(
     5. Creating a mask to disable assignments that exceed capacity thresholds
 
     Args:
-        num_token_to_ep_rank: Current token distribution per EP rank
+        count_tokens_per_ep_rank: Current token distribution per EP rank
             Shape: [num_ep_ranks]
             Type: torch.Tensor (int)
             Description: Number of tokens currently assigned to each EP rank
 
-        avg_token_to_ep_rank: Average tokens per EP rank
+        avg_tokens_per_ep_rank: Average tokens per EP rank
             Type: int
             Description: Average token load across all EP ranks, used as baseline
                        for threshold calculations
 
-        matched_assignment: Current offloading assignment matrix
+        count_tokens_from_home_expert_to_spare_expert: Current offloading assignment matrix
             Shape: [num_home_experts, num_spare_experts]
             Type: torch.Tensor (int)
             Description: Matrix where [i, j] indicates tokens offloaded from home
@@ -97,7 +97,7 @@ def reclaim_spare_experts(
                        no filtering is applied.
 
     Returns:
-        matched_assignment: Updated assignment matrix with some assignments disabled
+        count_tokens_from_home_expert_to_spare_expert: Updated assignment matrix with some assignments disabled
             Shape: [num_home_experts, num_spare_experts]
             Type: torch.Tensor (int)
             Description: Same shape as input but with some offloading assignments
@@ -105,272 +105,337 @@ def reclaim_spare_experts(
 
     """
     # Calculate current total tokens per home expert (without offloading)
-    ep = num_token_to_ep_rank.shape[0]
-    num_home_expert, num_spare_expert = matched_assignment.shape
-    current_tokens_home_rank = num_token_to_ep_rank.view(ep, -1).sum(dim=1)
-    threshold = threshold_multiplier * avg_token_to_ep_rank
-    max_allowed_load = avg_token_to_ep_rank + threshold
+    num_ep_ranks = count_tokens_per_ep_rank.shape[0]
+    num_home_experts, num_spare_experts = count_tokens_from_home_expert_to_spare_expert.shape
+    count_tokens_per_home_rank = count_tokens_per_ep_rank.view(num_ep_ranks, -1).sum(dim=1)
+    threshold = threshold_multiplier * avg_tokens_per_ep_rank
+    max_allowed_load = avg_tokens_per_ep_rank + threshold
     
     # Calculate current home expert loads after offloading
-    current_tokens_after_offloading = current_tokens_home_rank - matched_assignment.sum(dim=1).view(ep, -1).sum(dim=1)  
+    count_tokens_after_offloading = count_tokens_per_home_rank - count_tokens_from_home_expert_to_spare_expert.sum(dim=1).view(num_ep_ranks, -1).sum(dim=1)  
     
     # Sort each row in ascending order (zeros will naturally be at the beginning)
-    matched_assignment_ep_rank_view = matched_assignment.view(ep, num_home_expert//ep, -1).sum(dim=1)
-    sorted_tokens, sorted_indices = torch.sort(matched_assignment_ep_rank_view, dim=1)
-    cumulative_tokens = torch.cumsum(sorted_tokens, dim=1)
+    count_tokens_from_home_expert_to_spare_expert_ep_rank_view = count_tokens_from_home_expert_to_spare_expert.view(num_ep_ranks, num_home_experts//num_ep_ranks, -1).sum(dim=1)
+    count_tokens_sorted, indices_sorted = torch.sort(count_tokens_from_home_expert_to_spare_expert_ep_rank_view, dim=1)
+    count_tokens_cumsum = torch.cumsum(count_tokens_sorted, dim=1)
     
     # Use searchsorted to find where cumulative tokens exceed capacity for each home expert
-    # We need to find where cumulative_tokens > (max_allowed_load - current_tokens_after_offloading)
-    # safe_steps contains the last spare expert index needed for each EP rank (after sorting)
-    capacity_remaining = max_allowed_load - current_tokens_after_offloading 
-    safe_steps = torch.searchsorted(cumulative_tokens, capacity_remaining.unsqueeze(1), side='right').squeeze(1)
+    # We need to find where count_tokens_cumsum > (max_allowed_load - count_tokens_after_offloading)
+    # idx_safe_steps contains the last spare expert index needed for each EP rank (after sorting)
+    capacity_remaining = max_allowed_load - count_tokens_after_offloading 
+    idx_safe_steps = torch.searchsorted(count_tokens_cumsum, capacity_remaining.unsqueeze(1), side='right').squeeze(1)
     
-    # Create a boolean mask based on safe_steps with the same shape as sorted_tokens
+    # Create a boolean mask based on idx_safe_steps with the same shape as count_tokens_sorted
     # True indicates positions that need to be enabled (after the boundary)
-    step_indices = torch.arange(sorted_tokens.shape[1], device=matched_assignment.device).unsqueeze(0).expand(sorted_tokens.shape[0], -1)
-    safe_steps_expanded = safe_steps.unsqueeze(1).expand(-1, sorted_tokens.shape[1])
-    sorted_mask = step_indices >= safe_steps_expanded  
+    indices_steps = torch.arange(count_tokens_sorted.shape[1], device=count_tokens_from_home_expert_to_spare_expert.device).unsqueeze(0).expand(count_tokens_sorted.shape[0], -1)
+    idx_safe_steps_expanded = idx_safe_steps.unsqueeze(1).expand(-1, count_tokens_sorted.shape[1])
+    mask_sorted = indices_steps >= idx_safe_steps_expanded  
     
-    # Recover the mask to the original order using sorted_indices
-    # Use scatter to map sorted_mask back to original order
-    original_order_mask = torch.zeros_like(sorted_mask)
-    original_order_mask.scatter_(1, sorted_indices, sorted_mask)
+    # Recover the mask to the original order using indices_sorted
+    # Use scatter to map mask_sorted back to original order
+    mask_original_order = torch.zeros_like(mask_sorted)
+    mask_original_order.scatter_(1, indices_sorted, mask_sorted)
     
     # Do OR operation along dim=0 to get a 1D tensor indicating which columns to mask
-    column_mask = original_order_mask.any(dim=0) 
+    mask_column = mask_original_order.any(dim=0) 
     
-    # Apply the column mask directly to matched_assignment
-    matched_assignment = torch.where(column_mask.unsqueeze(0), matched_assignment, torch.zeros_like(matched_assignment))
-    return matched_assignment
+    # Apply the column mask directly to count_tokens_from_home_expert_to_spare_expert
+    count_tokens_from_home_expert_to_spare_expert = torch.where(mask_column.unsqueeze(0), count_tokens_from_home_expert_to_spare_expert, torch.zeros_like(count_tokens_from_home_expert_to_spare_expert))
+    return count_tokens_from_home_expert_to_spare_expert
 
-def breadth_first_allocation(transport, reroute_map, device='cuda'):
+def breadth_first_allocation(count_tokens_per_expert_from_ep_rank, count_tokens_from_home_expert_to_spare_expert, device='cuda'):
     """
     Ultra-compact loop-free version with over-allocation protection
+    
+    Args:
+        count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
+            Shape: [num_ep_ranks, num_experts]
+            Type: torch.Tensor (int)
+            
+        count_tokens_from_home_expert_to_spare_expert: Token assignment map from home to spare experts
+            Shape: [num_home_experts, num_spare_experts]
+            Type: torch.Tensor (int)
+            
+        device: Device to run computation on
+            Type: str
+            Default: 'cuda'
+    
+    Returns:
+        tuple containing:
+            - count_tokens_offloaded_from_home_to_spare: Tokens offloaded in first pass
+                Shape: [num_home_experts, num_spare_experts]
+            - count_tokens_per_expert_from_ep_rank_after_offload: Remaining tokens after offload
+                Shape: [num_ep_ranks, num_experts]
+            - capacity_spare_remaining: Remaining spare capacity
+                Shape: [num_home_experts, num_spare_experts]
     """
-    transport, reroute_map = transport.to(device).float(), reroute_map.to(device).float()
+    count_tokens_per_expert_from_ep_rank, count_tokens_from_home_expert_to_spare_expert = count_tokens_per_expert_from_ep_rank.to(device).float(), count_tokens_from_home_expert_to_spare_expert.to(device).float()
     # Initial allocation
-    supplier = reroute_map.argmax(0)
-    active = (reroute_map > 0).sum(0) > 0
-    capacity = reroute_map[supplier, torch.arange(reroute_map.shape[1], device=device)]
+    idx_supplier = count_tokens_from_home_expert_to_spare_expert.argmax(0)
+    mask_active = (count_tokens_from_home_expert_to_spare_expert > 0).sum(0) > 0
+    capacity = count_tokens_from_home_expert_to_spare_expert[idx_supplier, torch.arange(count_tokens_from_home_expert_to_spare_expert.shape[1], device=device)]
     
-    x_rel = transport[:, supplier]
+    count_tokens_rel = count_tokens_per_expert_from_ep_rank[:, idx_supplier]
     # Use safe division to avoid NaN and division by zero
-    denominator = x_rel.sum(0, keepdim=True)
-    props = torch.where(denominator > 0, x_rel / denominator, torch.zeros_like(x_rel))
-    ideal = props * capacity
-    floors = torch.floor(ideal).int()*active
+    denominator = count_tokens_rel.sum(0, keepdim=True)
+    probs_proportional = torch.where(denominator > 0, count_tokens_rel / denominator, torch.zeros_like(count_tokens_rel))
+    count_tokens_ideal = probs_proportional * capacity
+    count_tokens_floors = torch.floor(count_tokens_ideal).int() * mask_active
 
-    offloaded = torch.zeros_like(transport, dtype=torch.int32)
-    supplier_expanded = supplier.unsqueeze(0).expand(transport.shape[0], -1)  # (num_src, num_new_dst)
+    count_tokens_offloaded = torch.zeros_like(count_tokens_per_expert_from_ep_rank, dtype=torch.int32)
+    idx_supplier_expanded = idx_supplier.unsqueeze(0).expand(count_tokens_per_expert_from_ep_rank.shape[0], -1)  # (num_src, num_new_dst)
     
-    # For each new destination k, add t[:, k] to the reduction for old destination supplier[k]
-    offloaded.scatter_add_(1, supplier_expanded, floors)
-    transport_rerouted = transport - offloaded
-    leftover_spare_space = reroute_map.clone()
-    leftover_spare_space[supplier, torch.arange(reroute_map.shape[1], device=device)] -= floors.sum(dim=0)
-    return floors, transport_rerouted, leftover_spare_space
+    # For each new destination k, add t[:, k] to the reduction for old destination idx_supplier[k]
+    count_tokens_offloaded.scatter_add_(1, idx_supplier_expanded, count_tokens_floors)
+    count_tokens_per_expert_from_ep_rank_after_offload = count_tokens_per_expert_from_ep_rank - count_tokens_offloaded
+    capacity_spare_remaining = count_tokens_from_home_expert_to_spare_expert.clone()
+    capacity_spare_remaining[idx_supplier, torch.arange(count_tokens_from_home_expert_to_spare_expert.shape[1], device=device)] -= count_tokens_floors.sum(dim=0)
+    return count_tokens_floors, count_tokens_per_expert_from_ep_rank_after_offload, capacity_spare_remaining
 
-def depth_first_allocation(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def depth_first_allocation(count_tokens_per_expert_from_ep_rank: torch.Tensor, capacity_spare_remaining: torch.Tensor) -> torch.Tensor:
     """
     Vectorized batched version of one_shot_greedy_assignment for token routing composition.
-    """
-    S, J = x.shape
-    J2, K = y.shape
-    assert J == J2, "Dimension mismatch"
     
-    # For each old destination j, x[:,j] are the token chunks
+    Args:
+        count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
+            Shape: [num_ep_ranks, num_experts]
+            Type: torch.Tensor (int)
+            
+        capacity_spare_remaining: Remaining spare capacity
+            Shape: [num_experts, num_spare_experts]
+            Type: torch.Tensor (int)
+    
+    Returns:
+        tuple containing:
+            - count_tokens_offloaded_from_expert_to_spare: Tokens offloaded in second pass
+                Shape: [num_ep_ranks, num_spare_experts]
+            - count_tokens_per_expert_from_ep_rank_after_second_offload: Remaining tokens
+                Shape: [num_ep_ranks, num_experts]
+    """
+    num_ep_ranks, num_experts = count_tokens_per_expert_from_ep_rank.shape
+    num_experts_2, num_spare_experts = capacity_spare_remaining.shape
+    assert num_experts == num_experts_2, "Dimension mismatch"
+    
+    # For each old destination j, count_tokens_per_expert_from_ep_rank[:,j] are the token chunks
     # Compute cumulative intervals for token chunks along source dimension
-    x_cumsum = torch.cumsum(x, dim=0)  # (S, J)
-    x_start = x_cumsum - x             # (S, J) - start positions for each chunk
-    x_end = x_cumsum                   # (S, J) - end positions for each chunk
+    count_tokens_cumsum = torch.cumsum(count_tokens_per_expert_from_ep_rank, dim=0)  # (num_ep_ranks, num_experts)
+    count_tokens_start = count_tokens_cumsum - count_tokens_per_expert_from_ep_rank  # (num_ep_ranks, num_experts) - start positions for each chunk
+    count_tokens_end = count_tokens_cumsum                                            # (num_ep_ranks, num_experts) - end positions for each chunk
     
     # Compute bucket intervals for each old destination
-    y_cumsum = torch.cumsum(y, dim=1)  # (J, K)
-    y_start = y_cumsum - y             # (J, K) - bucket start positions
-    y_end = y_cumsum                   # (J, K) - bucket end positions
+    capacity_cumsum = torch.cumsum(capacity_spare_remaining, dim=1)  # (num_experts, num_spare_experts)
+    capacity_start = capacity_cumsum - capacity_spare_remaining      # (num_experts, num_spare_experts) - bucket start positions
+    capacity_end = capacity_cumsum                                   # (num_experts, num_spare_experts) - bucket end positions
     
     # Expand dimensions for broadcasting
-    x_start = x_start.unsqueeze(2)     # (S, J, 1)
-    x_end = x_end.unsqueeze(2)         # (S, J, 1)
-    y_start = y_start.unsqueeze(0)     # (1, J, K)
-    y_end = y_end.unsqueeze(0)         # (1, J, K)
+    count_tokens_start = count_tokens_start.unsqueeze(2)     # (num_ep_ranks, num_experts, 1)
+    count_tokens_end = count_tokens_end.unsqueeze(2)         # (num_ep_ranks, num_experts, 1)
+    capacity_start = capacity_start.unsqueeze(0)             # (1, num_experts, num_spare_experts)
+    capacity_end = capacity_end.unsqueeze(0)                 # (1, num_experts, num_spare_experts)
     
     # Compute overlaps for all (source, old_dst, new_dst) combinations
-    overlap_start = torch.maximum(x_start, y_start)  # (S, J, K)
-    overlap_end = torch.minimum(x_end, y_end)        # (S, J, K)
-    overlap = (overlap_end - overlap_start).clamp(min=0)  # (S, J, K)
+    overlap_start = torch.maximum(count_tokens_start, capacity_start)  # (num_ep_ranks, num_experts, num_spare_experts)
+    overlap_end = torch.minimum(count_tokens_end, capacity_end)        # (num_ep_ranks, num_experts, num_spare_experts)
+    count_tokens_overlap = (overlap_end - overlap_start).clamp(min=0)  # (num_ep_ranks, num_experts, num_spare_experts)
     
     # Sum over intermediate destinations to get final source->new_dst flows
-    z = overlap.sum(dim=1)  # (S, K)
-    supplier = y.argmax(0)
-    supplier_expanded = supplier.unsqueeze(0).expand(x.shape[0], -1)  # (num_src, num_new_dst)
-    x_rerouted = x.scatter_add(1, supplier_expanded, -z)
-    return z, x_rerouted
+    count_tokens_offloaded_from_expert_to_spare = count_tokens_overlap.sum(dim=1)  # (num_ep_ranks, num_spare_experts)
+    idx_supplier = capacity_spare_remaining.argmax(0)
+    idx_supplier_expanded = idx_supplier.unsqueeze(0).expand(count_tokens_per_expert_from_ep_rank.shape[0], -1)  # (num_src, num_new_dst)
+    count_tokens_per_expert_from_ep_rank_after_second_offload = count_tokens_per_expert_from_ep_rank.scatter_add(1, idx_supplier_expanded, -count_tokens_offloaded_from_expert_to_spare)
+    return count_tokens_offloaded_from_expert_to_spare, count_tokens_per_expert_from_ep_rank_after_second_offload
 
 @triton.jit
 def reroute_tokens_w_permute_map_kernel(
-    x_indices_sorted_ptr, 
-    expert_for_offload_ptr,
-    num_tokens_to_route_ptr,
-    cumulative_offsets_ptr,
-    y_ptr,
-    permute_map_ptr,
+    indices_token_sorted_ptr, 
+    idx_expert_for_offload_ptr,
+    count_tokens_to_route_ptr,
+    offset_cumulative_ptr,
+    map_rerouted_ptr,
+    map_permute_ptr,
     num_tokens: tl.constexpr,
     num_experts: tl.constexpr,
     num_offloading_experts: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offload_expert_id = tl.program_id(0)
+    idx_offload_expert = tl.program_id(0)
     
-    source_expert_id = tl.load(expert_for_offload_ptr + offload_expert_id).to(tl.int64)
-    if source_expert_id < 0:
+    idx_source_expert = tl.load(idx_expert_for_offload_ptr + idx_offload_expert).to(tl.int64)
+    if idx_source_expert < 0:
         return
-    num_tokens_to_route = tl.load(num_tokens_to_route_ptr + offload_expert_id).to(tl.int64)
-    offset = tl.load(cumulative_offsets_ptr + offload_expert_id).to(tl.int64)
+    count_tokens_to_route = tl.load(count_tokens_to_route_ptr + idx_offload_expert).to(tl.int64)
+    offset = tl.load(offset_cumulative_ptr + idx_offload_expert).to(tl.int64)
     
-    token_positions = tl.arange(0, BLOCK_SIZE)
-    valid_mask = (token_positions < num_tokens_to_route)
+    indices_token_position = tl.arange(0, BLOCK_SIZE)
+    mask_valid = (indices_token_position < count_tokens_to_route)
     
     # No conditional check needed - masked operations handle empty cases
-    base_offset = source_expert_id * num_tokens + offset
-    token_indices = tl.load(x_indices_sorted_ptr + base_offset + token_positions, 
-                           mask=valid_mask, other=0)
+    offset_base = idx_source_expert * num_tokens + offset
+    indices_token = tl.load(indices_token_sorted_ptr + offset_base + indices_token_position, 
+                           mask=mask_valid, other=0)
     
-    total_experts = num_experts + num_offloading_experts
+    num_total_experts = num_experts + num_offloading_experts
     
     # These stores are safe even with all-False masks
-    x_flat_idx = token_indices * total_experts + source_expert_id
-    tl.store(y_ptr + x_flat_idx, False, mask=valid_mask)
+    idx_flat = indices_token * num_total_experts + idx_source_expert
+    tl.store(map_rerouted_ptr + idx_flat, False, mask=mask_valid)
     
-    # Store source_expert_id to permute_map for valid tokens
-    permute_map_idx = token_indices * num_offloading_experts + offload_expert_id
-    tl.store(permute_map_ptr + permute_map_idx, source_expert_id, mask=valid_mask)
+    # Store idx_source_expert to map_permute for valid tokens
+    idx_permute = indices_token * num_offloading_experts + idx_offload_expert
+    tl.store(map_permute_ptr + idx_permute, idx_source_expert, mask=mask_valid)
     
-    offload_col = num_experts + offload_expert_id
-    y_flat_idx = token_indices * total_experts + offload_col
-    tl.store(y_ptr + y_flat_idx, True, mask=valid_mask)
+    idx_offload_col = num_experts + idx_offload_expert
+    idx_flat_rerouted = indices_token * num_total_experts + idx_offload_col
+    tl.store(map_rerouted_ptr + idx_flat_rerouted, True, mask=mask_valid)
 
 
 @triton.jit
 def reroute_tokens_kernel(
-    x_indices_sorted_ptr, 
-    expert_for_offload_ptr,
-    num_tokens_to_route_ptr,
-    cumulative_offsets_ptr,
-    y_ptr,
-    rerouted_probs_ptr,
+    indices_token_sorted_ptr, 
+    idx_expert_for_offload_ptr,
+    count_tokens_to_route_ptr,
+    offset_cumulative_ptr,
+    map_rerouted_ptr,
+    probs_rerouted_ptr,
     num_tokens: tl.constexpr,
     num_experts: tl.constexpr,
     num_offloading_experts: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offload_expert_id = tl.program_id(0)
+    idx_offload_expert = tl.program_id(0)
     
-    source_expert_id = tl.load(expert_for_offload_ptr + offload_expert_id).to(tl.int64)
-    if source_expert_id < 0:
+    idx_source_expert = tl.load(idx_expert_for_offload_ptr + idx_offload_expert).to(tl.int64)
+    if idx_source_expert < 0:
         return
-    num_tokens_to_route = tl.load(num_tokens_to_route_ptr + offload_expert_id).to(tl.int64)
-    offset = tl.load(cumulative_offsets_ptr + offload_expert_id).to(tl.int64)
+    count_tokens_to_route = tl.load(count_tokens_to_route_ptr + idx_offload_expert).to(tl.int64)
+    offset = tl.load(offset_cumulative_ptr + idx_offload_expert).to(tl.int64)
     
-    token_positions = tl.arange(0, BLOCK_SIZE)
-    valid_mask = (token_positions < num_tokens_to_route)
+    indices_token_position = tl.arange(0, BLOCK_SIZE)
+    mask_valid = (indices_token_position < count_tokens_to_route)
     
     # No conditional check needed - masked operations handle empty cases
-    base_offset = source_expert_id * num_tokens + offset
-    token_indices = tl.load(x_indices_sorted_ptr + base_offset + token_positions, 
-                           mask=valid_mask, other=0)
+    offset_base = idx_source_expert * num_tokens + offset
+    indices_token = tl.load(indices_token_sorted_ptr + offset_base + indices_token_position, 
+                           mask=mask_valid, other=0)
     
-    total_experts = num_experts + num_offloading_experts
+    num_total_experts = num_experts + num_offloading_experts
     
     # These stores are safe even with all-False masks
-    x_flat_idx = token_indices * total_experts + source_expert_id
-    tl.store(y_ptr + x_flat_idx, False, mask=valid_mask)
+    idx_flat = indices_token * num_total_experts + idx_source_expert
+    tl.store(map_rerouted_ptr + idx_flat, False, mask=mask_valid)
     
-    # Handle rerouted_probs: read from x_flat_idx and write to y_flat_idx, zero out x_flat_idx
-    prob_value = tl.load(rerouted_probs_ptr + x_flat_idx, mask=valid_mask, other=0.0)
-    tl.store(rerouted_probs_ptr + x_flat_idx, 0.0, mask=valid_mask)
+    # Handle probs_rerouted: read from idx_flat and write to idx_flat_rerouted, zero out idx_flat
+    prob_value = tl.load(probs_rerouted_ptr + idx_flat, mask=mask_valid, other=0.0)
+    tl.store(probs_rerouted_ptr + idx_flat, 0.0, mask=mask_valid)
     
-    offload_col = num_experts + offload_expert_id
-    y_flat_idx = token_indices * total_experts + offload_col
-    tl.store(y_ptr + y_flat_idx, True, mask=valid_mask)
-    tl.store(rerouted_probs_ptr + y_flat_idx, prob_value, mask=valid_mask)
+    idx_offload_col = num_experts + idx_offload_expert
+    idx_flat_rerouted = indices_token * num_total_experts + idx_offload_col
+    tl.store(map_rerouted_ptr + idx_flat_rerouted, True, mask=mask_valid)
+    tl.store(probs_rerouted_ptr + idx_flat_rerouted, prob_value, mask=mask_valid)
 
 
-def reroute_tokens_triton(x, probs, num_offloading_from, num_offloading_to, reroute_map):
+def reroute_tokens_triton(map_token_to_expert, probs_routing, count_tokens_offloading_from_expert, count_tokens_offloading_to_spare, map_home_expert_to_spare):
     """
     Triton-based token rerouting with static shapes for CUDA graph compatibility.
+    
+    Args:
+        map_token_to_expert: Binary routing map for current EP rank
+            Shape: [num_tokens, num_experts]
+            Type: torch.Tensor (bool)
+            
+        probs_routing: Routing probabilities for current EP rank
+            Shape: [num_tokens, num_experts]
+            Type: torch.Tensor (float)
+            
+        count_tokens_offloading_from_expert: Number of tokens offloading from each expert from the current EP rank
+            Shape: [num_experts]
+            Type: torch.Tensor (int)
+            
+        count_tokens_offloading_to_spare: Number of tokens offloading to each spare expert from the current EP rank
+            Shape: [num_spare_experts]
+            Type: torch.Tensor (int)
+            
+        map_home_expert_to_spare: Boolean map of expert offloading
+            Shape: [num_home_experts, num_spare_experts]
+            Type: torch.Tensor (bool)
+    
+    Returns:
+        tuple containing:
+            - map_token_to_all_experts: Updated routing map after offloading
+                Shape: [num_tokens, num_experts + num_spare_experts]
+            - probs_rerouted: Updated routing probabilities after offloading
+                Shape: [num_tokens, num_experts + num_spare_experts]
     """
-    device = x.device
-    num_tokens, num_experts = x.shape
-    num_offloading_experts = num_offloading_to.shape[0]
-    num_offloading_to = num_offloading_to.to(torch.int64)
-    # Step 1: Generate reroute_map2
-    reroute_map2 = reroute_map * num_offloading_to.unsqueeze(0)
+    device = map_token_to_expert.device
+    num_tokens, num_experts = map_token_to_expert.shape
+    num_spare_experts = count_tokens_offloading_to_spare.shape[0]
+    count_tokens_offloading_to_spare = count_tokens_offloading_to_spare.to(torch.int64)
+    # Step 1: Generate map with token counts
+    count_tokens_from_home_expert_to_spare_expert = map_home_expert_to_spare * count_tokens_offloading_to_spare.unsqueeze(0)
     
     # Step 2: Compute cumulative offsets
-    cumsum_routes = torch.cumsum(reroute_map2, dim=1)
-    cumulative_starts = cumsum_routes - reroute_map2
+    count_routes_cumsum = torch.cumsum(count_tokens_from_home_expert_to_spare_expert, dim=1)
+    offset_cumulative_starts = count_routes_cumsum - count_tokens_from_home_expert_to_spare_expert
     
     # Step 3: Extract expert mapping 
-    has_routing = reroute_map.any(dim=0)
-    expert_indices = torch.argmax(reroute_map.float(), dim=0)
-    expert_for_offload = torch.where(has_routing, expert_indices, -1)
-    oe_indices = torch.arange(num_offloading_experts, device=device)
+    has_routing_from_expert = map_home_expert_to_spare.any(dim=0)
+    indices_expert = torch.argmax(map_home_expert_to_spare.float(), dim=0)
+    idx_expert_for_offload = torch.where(has_routing_from_expert, indices_expert, -1)
+    indices_offload_expert = torch.arange(num_spare_experts, device=device)
     
     # Clamp expert indices to valid range for safe indexing (invalid entries will be ignored anyway)
-    safe_expert_indices = torch.clamp(expert_for_offload, 0, num_experts - 1)
+    indices_expert_safe = torch.clamp(idx_expert_for_offload, 0, num_experts - 1)
     # Extract offsets for ALL offloading experts using static indexing
-    all_offsets = cumulative_starts[safe_expert_indices, oe_indices]
+    offset_all = offset_cumulative_starts[indices_expert_safe, indices_offload_expert]
     
     # Use torch.where to zero out offsets for invalid offloading experts
-    cumulative_offsets = torch.where(expert_for_offload >= 0, all_offsets, 0)
-    
-    # Convert expert_for_offload to float for Triton compatibility
-    expert_for_offload = expert_for_offload
+    offset_cumulative = torch.where(idx_expert_for_offload >= 0, offset_all, 0)
     
     # Step 5: Create sorted indices
-    x_indices_sorted = x.argsort(dim=0, descending=True).transpose(0, 1).contiguous()
+    indices_token_sorted = map_token_to_expert.argsort(dim=0, descending=True).transpose(0, 1).contiguous()
     
     # Step 6: Initialize output tensor
-    y = torch.zeros(num_tokens, num_experts + num_offloading_experts, 
+    map_token_to_all_experts = torch.zeros(num_tokens, num_experts + num_spare_experts, 
                     dtype=torch.bool, device=device)
-    y[:, :num_experts] = x.clone()
+    map_token_to_all_experts[:, :num_experts] = map_token_to_expert.clone()
     
-    # Step 6b: Initialize permute_map tensor with 0
-    permute_map = torch.zeros((num_tokens, num_offloading_experts), 
-                             dtype=torch.int32, device=device)
+    # Step 6b: Initialize map_permute tensor with 0
+    map_permute = torch.zeros((num_tokens, num_spare_experts), 
+                             dtype=torch.int64, device=device)
     
     # Step 7: Launch Triton kernel with permute map
     max_tokens = num_tokens
     BLOCK_SIZE = triton.next_power_of_2(max_tokens)
-    grid = (num_offloading_experts,)
+    grid = (num_spare_experts,)
     
+    # Outpus of the kernel: map_token_to_all_experts, map_permute
+    # Akan: We can move all the indices calculation into this kernel.
     reroute_tokens_w_permute_map_kernel[grid](
-        x_indices_sorted, expert_for_offload, num_offloading_to,
-        cumulative_offsets, y, permute_map, num_tokens, num_experts, num_offloading_experts, BLOCK_SIZE
+        indices_token_sorted, idx_expert_for_offload, count_tokens_offloading_to_spare,
+        offset_cumulative, map_token_to_all_experts, map_permute, num_tokens, num_experts, num_spare_experts, BLOCK_SIZE
     )
     
     # Step 8: Apply permute map to probabilities using gather
     # Gather probabilities from source experts for offloading tokens
-    gathered_probs = torch.gather(probs, 1, permute_map)
+    probs_gathered = torch.gather(probs_routing, 1, map_permute)
     
     # Concatenate original probs with gathered probs
-    rerouted_probs = torch.cat([probs, gathered_probs], dim=1)
+    probs_rerouted = torch.cat([probs_routing, probs_gathered], dim=1)
     
-    # Mask with y to zero out probabilities for tokens that are not routed
-    rerouted_probs = rerouted_probs * y
+    # Mask with map_token_to_all_experts to zero out probabilities for tokens that are not routed
+    probs_rerouted = probs_rerouted * map_token_to_all_experts
     
-    return y, rerouted_probs
+    return map_token_to_all_experts, probs_rerouted
 
 def gen_offloading_plan(
-    routing_map: torch.Tensor,
-    probs: torch.Tensor,
-    tokens_per_expert_from_ep_rank: torch.Tensor,
+    map_token_to_expert: torch.Tensor,
+    probs_routing: torch.Tensor,
+    count_tokens_per_expert_from_ep_rank: torch.Tensor,
     ep_rank: Union[torch.Tensor, int],
-    ep: int,
-    spare_expert_per_ep_rank: int = 1,
+    num_ep_ranks: int,
+    num_spare_experts_per_ep_rank: int = 1,
     threshold_multiplier: float = 0.0,
-    index_dtype: torch.dtype = torch.int32,
+    dtype_index: torch.dtype = torch.int32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate an offloading plan to redistribute tokens from overloaded experts to spare experts.
@@ -385,32 +450,32 @@ def gen_offloading_plan(
     5. Generate the final rerouting map with token movements
 
     Args:
-        routing_map: Binary routing map for current EP rank
+        map_token_to_expert: Binary routing map for current EP rank
             Shape: [num_tokens_in_ep_rank, num_experts]
             Type: torch.Tensor (bool)
             Description: Binary tensor indicating which tokens are routed to which
                        experts within the current EP rank
 
-        probs: Routing probabilities for current EP rank
+        probs_routing: Routing probabilities for current EP rank
             Shape: [num_tokens_in_ep_rank, num_experts]
             Type: torch.Tensor (float)
             Description: Probability values for each token-expert assignment within
                        the current EP rank
 
-        tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
+        count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
             Shape: [num_ep_ranks, num_experts]
             Type: torch.Tensor (int)
             Description: Number of tokens assigned to each expert across all EP ranks
 
         ep_rank: Current EP rank index
             Type: Union[torch.Tensor, int]
-            Description: Index of the current expert parallel rank (0 to ep-1)
+            Description: Index of the current expert parallel rank (0 to num_ep_ranks-1)
 
-        ep: Number of expert parallel ranks
+        num_ep_ranks: Number of expert parallel ranks
             Type: int
             Description: Total number of expert parallel ranks
 
-        spare_expert_per_ep_rank: Number of spare experts per EP rank
+        num_spare_experts_per_ep_rank: Number of spare experts per EP rank
             Type: int
             Default: 1
             Description: How many spare experts are available for offloading per
@@ -423,163 +488,219 @@ def gen_offloading_plan(
                        some spare experts based on average token load. Lower
                        values = more aggressive filtering.
 
-        index_dtype: Data type for index tensors
+        dtype_index: Data type for index tensors
             Type: torch.dtype
             Default: torch.int32
             Description: Data type used for index tensors in the computation
 
     Returns:
         tuple containing:
-            - rerouting_map: Updated routing map after offloading
+            - map_token_to_all_experts: Updated routing map after offloading
                 Shape: [num_tokens_in_ep_rank, num_experts + num_spare_experts]
                 Type: torch.Tensor (bool)
                 Description: Binary tensor showing final token assignments including
                            offloaded tokens to spare experts
 
-            - rerouted_probs: Updated routing probabilities after offloading
+            - probs_rerouted: Updated routing probabilities after offloading
                 Shape: [num_tokens_in_ep_rank, num_experts + num_spare_experts]
                 Type: torch.Tensor (float)
                 Description: Probability values for final token assignments including
                            offloaded tokens to spare experts
 
-            - expert_offloading_map: Mapping of home experts to spare experts
+            - map_home_expert_to_spare: Mapping of home experts to spare experts
                 Shape: [num_home_experts, num_spare_experts]
                 Type: torch.Tensor (bool)
                 Description: Boolean matrix where [i,j] = True indicates home expert
                            i offloads tokens to spare expert j
     """
-    # Phase 1: calculate how many tokens need to be offloaded from home experts
-    device = routing_map.device
-    num_tokens_to_expert = tokens_per_expert_from_ep_rank.sum(dim=0).to(index_dtype)
-    num_token_to_ep_rank = num_tokens_to_expert.view(ep, -1).sum(dim=1)
-    avg_token_to_ep_rank = num_token_to_ep_rank.sum() // ep
-    deviation = num_token_to_ep_rank - avg_token_to_ep_rank
-    spare_space = torch.relu(-deviation)
 
-    # sort the local experts by token count and place smaller token chunk first
-    local_exp_sorted_token_count, local_exp_sorted_idx = num_tokens_to_expert.view(ep, -1).sort(dim=1)
-    spillover_tokens_per_exp_sorted_cumsum = (local_exp_sorted_token_count.cumsum(dim=1) - avg_token_to_ep_rank).clamp(min=0)
-    spillover_tokens_per_exp_sorted = torch.cat([spillover_tokens_per_exp_sorted_cumsum[:, :1], torch.diff(spillover_tokens_per_exp_sorted_cumsum, dim=1)], dim=1)
-    spillover_tokens_per_exp = torch.scatter(torch.empty_like(spillover_tokens_per_exp_sorted), 1, local_exp_sorted_idx, spillover_tokens_per_exp_sorted).view(-1)
-    
-    # [num_home_experts, num_spare_experts]
-    # assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
-    assignment = one_shot_greedy_assignment(spillover_tokens_per_exp, spare_space)
 
-    # Find top spare_expert_per_ep_rank token chunks for each EP rank
-    spare_bucket_max, spare_bucket_max_index = torch.topk(assignment, k=spare_expert_per_ep_rank, dim=0)
-    num_columns = assignment.shape[1]
-    matched_assignment = torch.zeros(assignment.shape[0], num_columns * spare_expert_per_ep_rank, device=device, dtype=assignment.dtype)
-    row_indices = spare_bucket_max_index.transpose(0, 1).flatten()
-    col_indices = torch.arange(num_columns, device=device).repeat_interleave(spare_expert_per_ep_rank) \
-                  * spare_expert_per_ep_rank \
-                  + torch.arange(spare_expert_per_ep_rank, device=device).repeat(num_columns)
-    values = spare_bucket_max.transpose(0, 1).flatten()
-    # [num_home_experts, num_spare_experts]
-    # matched_assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
-    matched_assignment[row_indices, col_indices] = values
-    # Apply threshold-based offloading expert selection
-    if threshold_multiplier > 0:
-        matched_assignment = reclaim_spare_experts(
-            num_token_to_ep_rank, avg_token_to_ep_rank, matched_assignment, threshold_multiplier
-        )
+    count_tokens_from_home_expert_to_spare_expert, _, map_home_expert_to_spare = gen_assignment(
+        count_tokens_per_expert_from_ep_rank,
+        ep_rank,
+        num_ep_ranks,
+        num_spare_experts_per_ep_rank,
+        threshold_multiplier,
+        dtype_index,
+    )
+
     
-    # Create expert_offloading_map with shape (num_home_experts, num_spare_experts)
-    # expert_offloading_map[i][j] indicates if home expert i is offloaded to spare expert j
-    export_offloading_map = matched_assignment > 0
-    offloaded_tokens, token_dist_after_offloading, leftover_spare_space = breadth_first_allocation(tokens_per_expert_from_ep_rank, matched_assignment)
-    offloaded_tokens2, token_dist_after_offloading = depth_first_allocation(token_dist_after_offloading, leftover_spare_space)
-    rerouting_map, rerouted_probs = reroute_tokens_triton(routing_map, 
-                                                         probs,
-                                                         (tokens_per_expert_from_ep_rank-token_dist_after_offloading)[ep_rank].int(), 
-                                                         (offloaded_tokens+offloaded_tokens2)[ep_rank].int().squeeze(), 
-                                                         export_offloading_map)
-    return rerouting_map, rerouted_probs, export_offloading_map
+    # Create map_home_expert_to_spare with shape (num_home_experts, num_spare_experts)
+    # map_home_expert_to_spare[i][j] indicates if home expert i is offloaded to spare expert j
+    map_home_expert_to_spare = count_tokens_from_home_expert_to_spare_expert > 0
+    count_tokens_offloaded_first_pass, count_tokens_per_expert_after_first_offload, capacity_spare_remaining = breadth_first_allocation(count_tokens_per_expert_from_ep_rank, count_tokens_from_home_expert_to_spare_expert)
+    count_tokens_offloaded_second_pass, count_tokens_per_expert_after_second_offload = depth_first_allocation(count_tokens_per_expert_after_first_offload, capacity_spare_remaining)
+    count_tokens_offloaded_from_ep_rank_to_spare_expert = count_tokens_offloaded_first_pass + count_tokens_offloaded_second_pass
+    count_tokens_offloaded_from_ep_rank_from_home_expert = count_tokens_per_expert_from_ep_rank - count_tokens_per_expert_after_second_offload
+    map_token_to_all_experts, probs_rerouted = reroute_tokens_triton(map_token_to_expert, 
+                                                         probs_routing,
+                                                         count_tokens_offloaded_from_ep_rank_from_home_expert[ep_rank].int(), 
+                                                         count_tokens_offloaded_from_ep_rank_to_spare_expert[ep_rank].int().squeeze(), 
+                                                         map_home_expert_to_spare)
+    return map_token_to_all_experts, probs_rerouted, map_home_expert_to_spare
 
 
 
 def gen_assignment(
-    tokens_per_expert_from_ep_rank: torch.Tensor,
+    count_tokens_per_expert_from_ep_rank: torch.Tensor,
     ep_rank: Union[torch.Tensor, int],
-    ep: int,
-    spare_expert_per_ep_rank: int = 1,
+    num_ep_ranks: int,
+    num_spare_experts_per_ep_rank: int = 1,
     threshold_multiplier: float = 0.0,
-    index_dtype: torch.dtype = torch.int32,
+    dtype_index: torch.dtype = torch.int32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate token assignment from home experts to spare experts.
+    
+    Args:
+        count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
+            Shape: [num_ep_ranks, num_experts]
+            Type: torch.Tensor (int)
+            
+        ep_rank: Current EP rank index
+            Type: Union[torch.Tensor, int]
+            
+        num_ep_ranks: Number of expert parallel ranks
+            Type: int
+            
+        num_spare_experts_per_ep_rank: Number of spare experts per EP rank
+            Type: int
+            Default: 1
+            
+        threshold_multiplier: Multiplier for threshold calculation
+            Type: float
+            Default: 0.0
+            
+        dtype_index: Data type for index tensors
+            Type: torch.dtype
+            Default: torch.int32
+    
+    Returns:
+        tuple containing:
+            - count_tokens_from_home_expert_to_spare_expert: Assignment matrix
+                Shape: [num_home_experts, num_spare_experts]
+            - count_spillover_per_home_expert: Spillover tokens per expert
+                Shape: [num_home_experts]
+            - capacity_spare_per_ep_rank: Spare capacity per EP rank
+                Shape: [num_ep_ranks]
+    """
     # Phase 1: calculate how many tokens need to be offloaded from home experts
-    device = tokens_per_expert_from_ep_rank.device
-    num_tokens_to_expert = tokens_per_expert_from_ep_rank.sum(dim=0).to(index_dtype)
-    num_token_to_ep_rank = num_tokens_to_expert.view(ep, -1).sum(dim=1)
-    avg_token_to_ep_rank = num_token_to_ep_rank.sum() // ep
-    deviation = num_token_to_ep_rank - avg_token_to_ep_rank
-    spare_space = torch.relu(-deviation)
+    count_spillover_per_home_expert, capacity_spare_per_ep_rank = gen_intermediate(
+        count_tokens_per_expert_from_ep_rank,
+        ep_rank,
+        num_ep_ranks,
+        num_spare_experts_per_ep_rank,
+        threshold_multiplier,
+        dtype_index,
+    )
+    
+    device = count_tokens_per_expert_from_ep_rank.device
+    count_tokens_per_expert = count_tokens_per_expert_from_ep_rank.sum(dim=0).to(dtype_index)
+    count_tokens_per_ep_rank = count_tokens_per_expert.view(num_ep_ranks, -1).sum(dim=1)
+    avg_tokens_per_ep_rank = count_tokens_per_ep_rank.sum() // num_ep_ranks
+    
+    # Sort count_spillover_per_home_expert in descending order and capacity_spare_per_ep_rank in descending order
+    count_spillover_sorted, indices_spillover_sort = torch.sort(count_spillover_per_home_expert, descending=True)
+    capacity_spare_sorted, indices_spare_sort = torch.sort(capacity_spare_per_ep_rank, descending=True)
+    # [num_chunks, num_buckets] == [num_experts, num_ep_ranks]
+    # Here tokens from an expert are regarded as a single chunk.
+    # Space in each ep rank is regarded as a single bucket.
+    count_tokens_from_chunk_to_bucket_sorted = one_shot_greedy_assignment(count_spillover_sorted, capacity_spare_sorted)
 
-    # sort the local experts by token count and place smaller token chunk first
-    local_exp_sorted_token_count, local_exp_sorted_idx = num_tokens_to_expert.view(ep, -1).sort(dim=1)
-    spillover_tokens_per_exp_sorted_cumsum = (local_exp_sorted_token_count.cumsum(dim=1) - avg_token_to_ep_rank).clamp(min=0)
-    spillover_tokens_per_exp_sorted = torch.cat([spillover_tokens_per_exp_sorted_cumsum[:, :1], torch.diff(spillover_tokens_per_exp_sorted_cumsum, dim=1)], dim=1)
-    spillover_tokens_per_exp = torch.scatter(torch.empty_like(spillover_tokens_per_exp_sorted), 1, local_exp_sorted_idx, spillover_tokens_per_exp_sorted).view(-1)
-    # import pdb; pdb.set_trace()
-    # Sort spillover_tokens_per_exp in descending order and spare_space in descending order
-    spillover_sorted, spillover_sort_indices = torch.sort(spillover_tokens_per_exp, descending=True)
-    spare_space_sorted, spare_space_sort_indices = torch.sort(spare_space, descending=True)
-    # [num_home_experts, num_spare_experts]
-    # assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
-    assignment_sorted = one_shot_greedy_assignment(spillover_sorted, spare_space_sorted)
-
-    # Find top spare_expert_per_ep_rank token chunks for each EP rank (on sorted assignment)
-    spare_bucket_max, spare_bucket_max_index = torch.topk(assignment_sorted, k=spare_expert_per_ep_rank, dim=0)
-    num_columns = assignment_sorted.shape[1]
+    # Find top num_spare_experts_per_ep_rank token chunks for each EP rank (on sorted assignment)
+    # Get the topk largest chunks (tokens from an expert) for each bucket (each ep rank is a bucket).
+    # idx_spare_bucket_max means the index of the topk largest chunks in the sorted space.
+    count_spare_bucket_max, idx_spare_bucket_max = torch.topk(count_tokens_from_chunk_to_bucket_sorted, k=num_spare_experts_per_ep_rank, dim=0)
+    num_buckets = count_tokens_from_chunk_to_bucket_sorted.shape[1]
     
-    # Map row_indices back to original spillover order
-    row_indices_sorted = spare_bucket_max_index.transpose(0, 1).flatten()
-    row_indices = spillover_sort_indices[row_indices_sorted]
+    # Map indices_row back to original spillover order
+    indices_row_sorted = idx_spare_bucket_max.transpose(0, 1).flatten()
+    indices_row = indices_spillover_sort[indices_row_sorted]
     
-    # Map col_indices back to original spare_space order
-    # Original col_indices in sorted space
-    ep_rank_indices = torch.arange(num_columns, device=device).repeat_interleave(spare_expert_per_ep_rank)
-    spare_slot_indices = torch.arange(spare_expert_per_ep_rank, device=device).repeat(num_columns)
-    # Map ep_rank back to original order
-    original_ep_rank_indices = spare_space_sort_indices[ep_rank_indices]
-    col_indices = original_ep_rank_indices * spare_expert_per_ep_rank + spare_slot_indices
+    # Map indices_col back to original capacity_spare_per_ep_rank order
+    # Original indices_col in sorted space
+    indices_ep_rank = torch.arange(num_buckets, device=device).repeat_interleave(num_spare_experts_per_ep_rank)
+    indices_spare_slot = torch.arange(num_spare_experts_per_ep_rank, device=device).repeat(num_buckets)
+    # Map num_ep_ranks back to original order
+    indices_ep_rank_original = indices_spare_sort[indices_ep_rank]
+    indices_col = indices_ep_rank_original * num_spare_experts_per_ep_rank + indices_spare_slot
     
-    values = spare_bucket_max.transpose(0, 1).flatten()
+    count_tokens_values = count_spare_bucket_max.transpose(0, 1).flatten()
     
     # [num_home_experts, num_spare_experts]
-    # matched_assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
-    matched_assignment = torch.zeros(spillover_tokens_per_exp.shape[0], num_columns * spare_expert_per_ep_rank, device=device, dtype=assignment_sorted.dtype)
-    matched_assignment[row_indices, col_indices] = values
-    # Create expert_offloading_map with shape (num_home_experts, num_spare_experts)
-    # expert_offloading_map[i][j] indicates if home expert i is offloaded to spare expert j
+    # count_tokens_from_home_expert_to_spare_expert[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
+    count_tokens_from_home_expert_to_spare_expert = torch.zeros(count_spillover_per_home_expert.shape[0], num_buckets * num_spare_experts_per_ep_rank, device=device, dtype=count_tokens_from_chunk_to_bucket_sorted.dtype)
+    count_tokens_from_home_expert_to_spare_expert[indices_row, indices_col] = count_tokens_values
+    # Create map_home_expert_to_spare with shape (num_home_experts, num_spare_experts)
+    # map_home_expert_to_spare[i][j] indicates if home expert i is offloaded to spare expert j
 
     # Apply threshold-based offloading expert selection
     if threshold_multiplier > 0:
-        matched_assignment = reclaim_spare_experts(
-            num_token_to_ep_rank, avg_token_to_ep_rank, matched_assignment, threshold_multiplier
+        count_tokens_from_home_expert_to_spare_expert = reclaim_spare_experts(
+            count_tokens_per_ep_rank, avg_tokens_per_ep_rank, count_tokens_from_home_expert_to_spare_expert, threshold_multiplier
         )
-    return matched_assignment, spillover_tokens_per_exp, spare_space
+    return count_tokens_from_home_expert_to_spare_expert, count_spillover_per_home_expert, capacity_spare_per_ep_rank
 
 
 def gen_intermediate(
-    tokens_per_expert_from_ep_rank: torch.Tensor,
+    count_tokens_per_expert_from_ep_rank: torch.Tensor,
     ep_rank: Union[torch.Tensor, int],
-    ep: int,
-    spare_expert_per_ep_rank: int = 1,
+    num_ep_ranks: int,
+    num_spare_experts_per_ep_rank: int = 1,
     threshold_multiplier: float = 0.0,
-    index_dtype: torch.dtype = torch.int32,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Phase 1: calculate how many tokens need to be offloaded from home experts
-    device = tokens_per_expert_from_ep_rank.device
-    num_tokens_to_expert = tokens_per_expert_from_ep_rank.sum(dim=0).to(index_dtype)
-    num_token_to_ep_rank = num_tokens_to_expert.view(ep, -1).sum(dim=1)
-    avg_token_to_ep_rank = num_token_to_ep_rank.sum() // ep
-    deviation = num_token_to_ep_rank - avg_token_to_ep_rank
-    spare_space = torch.relu(-deviation)
+    dtype_index: torch.dtype = torch.int32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculate spillover tokens and spare capacity.
+    
+    Args:
+        count_tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
+            Shape: [num_ep_ranks, num_experts]
+            Type: torch.Tensor (int)
+            
+        ep_rank: Current EP rank index
+            Type: Union[torch.Tensor, int]
+            
+        num_ep_ranks: Number of expert parallel ranks
+            Type: int
+            
+        num_spare_experts_per_ep_rank: Number of spare experts per EP rank
+            Type: int
+            Default: 1
+            
+        threshold_multiplier: Multiplier for threshold calculation
+            Type: float
+            Default: 0.0
+            
+        dtype_index: Data type for index tensors
+            Type: torch.dtype
+            Default: torch.int32
+    
+    Returns:
+        tuple containing:
+            - count_spillover_per_home_expert: Spillover tokens per expert
+                Shape: [num_home_experts]
+            - capacity_spare_per_ep_rank: Spare capacity per EP rank
+                Shape: [num_ep_ranks]
+    """
+    device = count_tokens_per_expert_from_ep_rank.device
+    count_tokens_per_expert = count_tokens_per_expert_from_ep_rank.sum(dim=0).to(dtype_index)
+    count_tokens_per_ep_rank = count_tokens_per_expert.view(num_ep_ranks, -1).sum(dim=1)
+    avg_tokens_per_ep_rank = count_tokens_per_ep_rank.sum() // num_ep_ranks
+    deviation = count_tokens_per_ep_rank - avg_tokens_per_ep_rank
+    capacity_spare_per_ep_rank = torch.relu(-deviation)
 
     # sort the local experts by token count and place smaller token chunk first
-    local_exp_sorted_token_count, local_exp_sorted_idx = num_tokens_to_expert.view(ep, -1).sort(dim=1)
-    spillover_tokens_per_exp_sorted_cumsum = (local_exp_sorted_token_count.cumsum(dim=1) - avg_token_to_ep_rank).clamp(min=0)
-    spillover_tokens_per_exp_sorted = torch.cat([spillover_tokens_per_exp_sorted_cumsum[:, :1], torch.diff(spillover_tokens_per_exp_sorted_cumsum, dim=1)], dim=1)
-    spillover_tokens_per_exp = torch.scatter(torch.empty_like(spillover_tokens_per_exp_sorted), 1, local_exp_sorted_idx, spillover_tokens_per_exp_sorted).view(-1)
+    # Here we: 
+    # 1. split the token counts into groups by ep rank;
+    # 2. sort the token counts within each group by number of tokens.
+    count_tokens_per_local_expert_sorted, indices_local_expert_sorted = count_tokens_per_expert.view(num_ep_ranks, -1).sort(dim=1)
+    # 3. calculate how many tokens are spilled over in each group.
+    # Here we treat average tokens per ep rank as the capacity of the ep rank.
+    count_spillover_per_expert_sorted_cumsum = (count_tokens_per_local_expert_sorted.cumsum(dim=1) - avg_tokens_per_ep_rank).clamp(min=0)
+    # From cumulative sum to spillover counts, the first element is equal to the first cumulative sum itself.
+    count_spillover_per_expert_sorted = torch.cat([count_spillover_per_expert_sorted_cumsum[:, :1], torch.diff(count_spillover_per_expert_sorted_cumsum, dim=1)], dim=1)
+    # 3. Recover the spillover counts in original order of the experts (unsorted). and concat results from all ep ranks.
+    count_spillover_per_home_expert = torch.scatter(torch.empty_like(count_spillover_per_expert_sorted), 1, indices_local_expert_sorted, count_spillover_per_expert_sorted).view(-1)
     
-    return spillover_tokens_per_exp, spare_space
+    return count_spillover_per_home_expert, capacity_spare_per_ep_rank
