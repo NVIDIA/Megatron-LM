@@ -20,6 +20,8 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 defaults:
   run:
@@ -31,13 +33,16 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.53.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
   build-test-publish-wheel:
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && github.repository == 'NVIDIA/Megatron-LM'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.63.1
     with:
       dry-run: true
@@ -60,9 +65,11 @@ jobs:
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
         || always()
       )
+      && github.repository == 'NVIDIA/Megatron-LM'
       && !cancelled()
     runs-on: ubuntu-latest
     steps:
