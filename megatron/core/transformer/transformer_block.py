@@ -555,7 +555,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
-        attention_mask: Optional[Tensor],
+        attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
