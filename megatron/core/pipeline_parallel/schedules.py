@@ -577,7 +577,6 @@ def forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     # here we need to do something to data_iterator
-    # 这里我们需要返回一个new_data_iterator和num_microbatches
 
     if config.sft_sequence_packing:
         if config.hybrid_context_parallel:
@@ -594,11 +593,8 @@ def forward_backward_no_pipelining(
         # then we need to pad sequence to multiple sizes otherwise
         # all the sequence same length and hybrid-cp is meaningless.
         # However, it's meaningless, why not use sequence packing directly?
-        if config.hybrid_context_parallel:
-            pass
-        else:
-            # 这就是最正常的bshd
-            pass
+        # 这就是最正常的bshd
+        pass
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(

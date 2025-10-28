@@ -70,7 +70,6 @@ def get_batch(data_iterator, vp_stage=None):
         max_seqlen = batch.pop('max_seqlen')
         local_cp_size = batch.pop('local_cp_size')
         local_cp_size = int(local_cp_size.item())
-        assert max_seqlen.dim() == 1
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
                 cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
         
