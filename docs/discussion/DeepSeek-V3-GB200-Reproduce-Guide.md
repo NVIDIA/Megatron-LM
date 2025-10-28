@@ -3,12 +3,13 @@
 ## 1. Dockerfile
 
 Requirements:
-- Transformer Engine: We recommend using commit [d2945c6](https://github.com/NVIDIA/TransformerEngine/commit/d2945c6a571e3978677614d1fe08779966a5a4ef) with PR [2146](https://github.com/NVIDIA/TransformerEngine/pull/2146) and [2150](https://github.com/NVIDIA/TransformerEngine/pull/2150). You could prepare the branch by yourself or use this [branch](https://github.com/hxbai/TransformerEngine/commits/dev_20251024/) based on TE v2.9 plus the above three commits/PRs.
+- Transformer Engine: We recommend using commit [d2945c6](https://github.com/NVIDIA/TransformerEngine/commit/d2945c6a571e3978677614d1fe08779966a5a4ef) with PR [2146](https://github.com/NVIDIA/TransformerEngine/pull/2146) and [2150](https://github.com/NVIDIA/TransformerEngine/pull/2150). You could prepare the branch by yourself, or use this [branch](https://github.com/hxbai/TransformerEngine/commits/dev_20251024/) based on TE v2.9 plus the above three commits/PRs.
 - cuDNN: v9.14 is required.
-- HybridEP: Install it from [here](https://github.com/deepseek-ai/DeepEP/3f601f7ac1c062c46502646ff04c535013bfca00).
+- HybridEP: Install it from [here](https://github.com/deepseek-ai/DeepEP/commits/3f601f7ac1c062c46502646ff04c535013bfca00).
 
 Dockerfile for reference.
-```docker
+
+```dockerfile
 FROM nvcr.io/nvidia/pytorch:25.09-py3 AS base
 
 ENV SHELL=/bin/bash
@@ -331,7 +332,7 @@ The following arguments indicate key optimizations.
 --moe-router-fusion \
 ```
 
-- Manual GC
+- Manual GC to make ranks better synchronized
 
 ```bash
 --manual-gc \
