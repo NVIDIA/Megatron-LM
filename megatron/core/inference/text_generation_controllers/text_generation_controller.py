@@ -25,7 +25,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask
+from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
@@ -425,7 +425,6 @@ class TextGenerationController:
             (Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]) Current request IDs,
                 paused request IDs, finished request IDs, new sample.
         """
-
         context = self.inference_wrapped_model.inference_context
 
         # Remove Float16Module wrapper if it exists
@@ -455,13 +454,22 @@ class TextGenerationController:
         input_ids, position_ids = context.current_input_and_position_ids()
 
         model_config = get_model_config(unwrapped_model)
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
         symmetric_ar_type = model_config.symmetric_ar_type
-        nccl_all_reduce_for_prefill = (
-            self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
+        nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
+        # Turning on/off MoE padding for prefill
+        moe_pad_experts_for_cuda_graph_inference = (
+            inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
+        if moe_pad_experts_for_cuda_graph_inference:
+            if context.is_decode_only():
+                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+            else:
+                set_decode_expert_padding(unwrapped_model, False)
 
         if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
             if context.is_decode_only():
@@ -482,7 +490,7 @@ class TextGenerationController:
             logits_seq_len = (
                 batch_size if materialize_only_last_token_logits else input_ids.shape[1]
             )
-            vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+            vocab_size = inference_wrapper_config.padded_vocab_size
             logits_shape = [1, logits_seq_len, vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
@@ -492,7 +500,7 @@ class TextGenerationController:
             # and then broadcast the sampled tokens rather than broadcasting the raw logits.
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
-                dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
+                dtype=inference_wrapper_config.params_dtype,
                 tensor=logits,
                 pp_group=self.pp_group,
             )
@@ -516,7 +524,7 @@ class TextGenerationController:
         # Sample.
         # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2.
-        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+        vocab_size = inference_wrapper_config.padded_vocab_size
         new_sample = self.sample_from_logits(
             last_token_logits, sampling_params, vocab_size=vocab_size
         )
@@ -657,12 +665,9 @@ class TextGenerationController:
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
         max_sequence_length = max_prompt_length_in_batch + sampling_params.num_tokens_to_generate
-        inference_max_batch_size = (
-            self.inference_wrapped_model.inference_wrapper_config.inference_max_requests
-        )
-        inference_max_sequence_length = (
-            self.inference_wrapped_model.inference_wrapper_config.inference_max_seq_length
-        )
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+        inference_max_batch_size = inference_wrapper_config.inference_max_requests
+        inference_max_sequence_length = inference_wrapper_config.inference_max_seq_length
         padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
         if padded_batch_size > inference_max_batch_size:
             raise ValueError(
@@ -704,7 +709,7 @@ class TextGenerationController:
 
         # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2
-        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+        vocab_size = inference_wrapper_config.padded_vocab_size
 
         # Check whether early termination is enabled
         no_early_termination = getattr(sampling_params, "no_early_termination", False)
@@ -767,11 +772,16 @@ class TextGenerationController:
             # If using symmetric kernels and we are using using nccl
             # for prefill turn off symmetric kernels
             symmetric_ar_type = model_config.symmetric_ar_type
-            nccl_all_reduce_for_prefill = (
-                self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
-            )
+            nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
             if symmetric_ar_type is not None and nccl_all_reduce_for_prefill:
                 unwrapped_model.set_symmetric_ar(None)
+
+            # Turning off MoE padding for prefill
+            moe_pad_experts_for_cuda_graph_inference = (
+                inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
+            )
+            if moe_pad_experts_for_cuda_graph_inference:
+                set_decode_expert_padding(unwrapped_model, False)
 
             context_start_position = 0
 
@@ -850,7 +860,7 @@ class TextGenerationController:
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, vocab_size],
-                        dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
+                        dtype=inference_wrapper_config.params_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
@@ -951,6 +961,14 @@ class TextGenerationController:
                 # Change to decode mode if all prefill is complete
                 if torch.all(generation_started):
                     self.inference_wrapped_model.inference_context.enable_decode_mode()
+                    # Turn on padding for decode if flag set
+                    if moe_pad_experts_for_cuda_graph_inference:
+                        capacity_factor = (
+                            model_config.num_moe_experts / model_config.moe_router_topk
+                        )
+                        set_decode_expert_padding(
+                            unwrapped_model, True, capacity_factor=capacity_factor
+                        )
 
                 context_end_position = context_start_position + 1
                 if context_end_position >= max_sequence_length:

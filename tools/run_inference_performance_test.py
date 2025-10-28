@@ -109,6 +109,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
 
     if args.engine_type == "static":
@@ -134,7 +135,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
             max_requests_override=args.inference_dynamic_batching_max_requests_override,
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-            chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+            block_size_tokens=args.inference_dynamic_batching_block_size,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             model, inference_wrapper_config, inference_context=context

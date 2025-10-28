@@ -14,6 +14,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -1063,6 +1064,21 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         return core_attn_out
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        """Sharded state dict for the learnable softmax offset parameter"""
+        if self.config.softmax_type == "learnable":
+            state_dict = self.state_dict(prefix="", keep_vars=True)
+        else:
+            state_dict = {}
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+        )
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
