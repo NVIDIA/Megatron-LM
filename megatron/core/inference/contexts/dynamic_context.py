@@ -216,17 +216,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         # Block size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.block_size_tokens = block_size_tokens
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
-            kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
-            self.kv_reduced_dim = kv_reduced_dim
+            self.kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.block_size_bytes = (
-                dtype_size_bytes * num_layers * self.block_size_tokens * kv_reduced_dim
+                dtype_size_bytes * num_layers * self.block_size_tokens * self.kv_reduced_dim
             )
         else:
             self.block_size_bytes = (
@@ -234,8 +233,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.block_size_tokens
-                * num_attention_heads_per_partition
-                * hidden_size_per_attention_head
+                * self.num_attention_heads_per_partition
+                * self.hidden_size_per_attention_head
             )
 
         # Adjust buffer to be a multiple of block size.
@@ -435,9 +434,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             else nullcontext()
         )
         with ctx_manager:
-            if cache_mla_latent:
+            if self.cache_mla_latent:
                 self.memory_buffer = torch.full(
-                    (self.num_layers, block_count_total, self.block_size_tokens, kv_reduced_dim),
+                    (
+                        self.num_layers,
+                        self.block_allocator.block_count_total,
+                        self.block_size_tokens,
+                        self.kv_reduced_dim,
+                    ),
                     -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -447,10 +451,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         2,  # key and value
                         self.num_layers,
-                        block_count_total,
+                        self.block_allocator.block_count_total,
                         self.block_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
                     ),
                     -1,
                     dtype=self.params_dtype,
