@@ -62,5 +62,5 @@ products:
   - test_case: [gpt3_mcore_reruns_resume_check_grads]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
