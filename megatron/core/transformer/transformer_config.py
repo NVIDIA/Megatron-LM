@@ -714,6 +714,10 @@ class TransformerConfig(ModelParallelConfig):
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
+    pre_dp_grad_clip_norm: float = 0.0
+    """If > 0.0, clip local gradients by L2 norm on each rank before any DP sync.
+    """
+
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
 

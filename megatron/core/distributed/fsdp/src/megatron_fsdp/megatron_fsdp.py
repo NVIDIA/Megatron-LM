@@ -1138,6 +1138,34 @@ class MegatronFSDP(torch.nn.Module):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         self.param_and_grad_buffer.scale_gradients(scaling_factor)
 
+    def clip_local_gradients(self, max_norm: float) -> float:
+        """Clip local (pre-DP-sync) gradients to `max_norm` L2 on this rank.
+
+        Computes the L2 norm across all grad buckets in the internal
+        ParamAndGradBuffer and scales them in-place when the norm exceeds
+        `max_norm`.
+
+        Returns:
+            float: the computed local L2 norm (before clipping).
+        """
+        if max_norm is None or max_norm <= 0:
+            return 0.0
+
+        # Sum of squares across all buckets (promote to fp32)
+        total_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
+        for bucket in self.param_and_grad_buffer.buckets:
+            grad_fp32 = bucket.grad_data.float()
+            total_sq += torch.sum(grad_fp32 * grad_fp32)
+
+        total_norm = torch.sqrt(total_sq).item()
+
+        denom = (total_norm + 1e-6)
+        clip_coeff = max_norm / denom if denom > 0 else 1.0
+        if clip_coeff < 1.0:
+            self.param_and_grad_buffer.scale_gradients(clip_coeff)
+
+        return total_norm
+
     def zero_grad_buffer(self):
         """
         Zeros out all grad buffers. Needs to be called at the beginning of each

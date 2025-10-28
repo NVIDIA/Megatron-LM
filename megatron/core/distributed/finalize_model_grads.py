@@ -427,6 +427,14 @@ def finalize_model_grads(
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    # Optional: clip local (pre-DP) gradients before any DP sync.
+    pre_dp_clip = getattr(config, 'pre_dp_grad_clip_norm', 0.0)
+    if pre_dp_clip and pre_dp_clip > 0.0:
+        for model_chunk in model:
+            if hasattr(model_chunk, 'clip_local_gradients'):
+                # Compute and clip by local L2 norm on this rank.
+                model_chunk.clip_local_gradients(pre_dp_clip)
+
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)

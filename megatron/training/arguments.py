@@ -1929,6 +1929,8 @@ def _add_regularization_args(parser):
                        'apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--pre-dp-grad-clip-norm', type=float, default=0.0,
+                       help='If > 0, clip local gradients by L2 norm on each rank before DP sync')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')
