@@ -151,6 +151,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 controller.inference_wrapped_model.model.config.enable_cuda_graph
             )
 
+        # Cuda graph impl.
+        if self.enable_cuda_graph is not None:
+            self.cuda_graph_impl = "local" if self.enable_cuda_graph else "none"
+        else:
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+
+        # Handle setting up expert padding for cuda graph inference if set.
+        if self.enable_cuda_graph:
+            model_config = get_model_config(controller.inference_wrapped_model.model)
+            inference_wrapper_config = controller.inference_wrapped_model.inference_wrapper_config
+            if inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference:
+                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+                set_decode_expert_padding(
+                    controller.inference_wrapped_model.model, True, capacity_factor=capacity_factor
+                )
+
         # Initialize engine.
         self.reset()
 
