@@ -139,6 +139,7 @@ class DynamicInferenceRequest(InferenceRequest):
     finished_chunk_token_count = 0
 
     def __post_init__(self):
+        self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
