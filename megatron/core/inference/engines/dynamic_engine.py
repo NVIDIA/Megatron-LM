@@ -97,6 +97,7 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
+        static_sampling: bool = False,
     ):
 
         if enable_cuda_graph is not None:
@@ -131,6 +132,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.paused = False
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.static_sampling = static_sampling
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -597,10 +599,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def get_active_sampling_map(self) -> List[Tuple[SamplingParams, List[int]]]:
         """Gets a map of sampling methods to active requests indices in the context."""
-        # Get a map from request_id to context array index.
+        # Get all active request IDs.
         active_request_ids = self.context.request_ids[
             self.context.paused_request_count : self.context.total_request_count
         ].tolist()
+        if self.static_sampling:
+            return [next(self.requests.values()).sampling_params, active_request_ids]
+
+        # Get a map from request_id to context array index.
         context_id_map = {r: i for i, r in enumerate(active_request_ids)}
 
         # Create map of sampling methods to context array indices.
