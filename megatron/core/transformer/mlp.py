@@ -137,7 +137,7 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-    def forward(self, hidden_states, per_token_scale=None):
+    def forward(self, hidden_states, per_token_scale=None, residual:Optional[torch.Tensor]=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
@@ -222,7 +222,11 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+        if self.config.use_inference_optimized_layers:
+            assert residual is not None
+            output, output_bias = self.linear_fc2(intermediate_parallel, residual)
+        else:
+            output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None and output_bias is not None:

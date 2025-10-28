@@ -383,6 +383,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+        if self.config.use_inference_optimized_layers:
+            for i in range(len(self.layers)):
+                if i > 0:
+                    self.layers[i].self_attention.linear_qkv.skip_norm_and_all_gather = True
+                    self.layers[i].mlp.linear_fc1.skip_norm_and_all_gather = True
+                if i < len(self.layers) - 1:
+                    self.layers[i].mlp.linear_fc2.next_layer_norm_weights = self.layers[i+1].self_attention.linear_qkv.layer_norm_weight.data
+                else:
+                    # dummy layer norm weights for last layer's fc2 module
+                    self.layers[i].mlp.linear_fc2.next_layer_norm_weights = torch.empty_like(self.layers[i].mlp.linear_fc1.layer_norm_weight.data)
+                self.layers[i].self_attention.linear_proj.next_layer_norm_weights = self.layers[i].mlp.linear_fc1.layer_norm_weight.data            
+
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 
