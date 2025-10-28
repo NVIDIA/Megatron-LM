@@ -155,6 +155,7 @@ class PipelineOffloadManager:
             min_offloaded_tensor_size: Minimum tensor size (in elements) to offload
         """
         if self._stages is None:
+            vp_size = 1 if vp_size is None else vp_size
             self._vpp = vp_size
             self._stages = [[] for _ in range(vp_size)]
 

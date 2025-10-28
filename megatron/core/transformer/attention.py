@@ -752,8 +752,8 @@ class Attention(MegatronModule, ABC):
                 hidden_states, key_value_states, split_qkv=split_qkv
             )
         if self.offload_qkv_linear:
-            qkv_output, _ = fine_grained_offloading_group_commit(
-                qkv_output, name="qkv_linear", forced_released_tensors=[hidden_states]
+            (qkv_output,) = fine_grained_offloading_group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
         attn_mask_type = self.attn_mask_type
         block_table = None

@@ -735,11 +735,12 @@ class TransformerConfig(ModelParallelConfig):
 
     offload_modules: Optional[list[str]] = None
     """The submodules to offload its input.
-    choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
+    choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
     "attn_norm": offload the input of the normalization in the attention part.
+    "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
-    "mlp_norm": offload the input of the normalization in the mlp part.
     "attn_proj": offload the input of the attn linear projection part.
+    "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     """
@@ -1048,6 +1049,7 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
+                "qkv_linear",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
