@@ -73,17 +73,10 @@ class PipelineOffloadManager:
 
     def __init__(self):
         """Initialize the manager with queues and dedicated CUDA streams."""
-        from megatron.core import parallel_state
-
         # Queue to store chunk handlers for backward pass
         self._queue = deque()
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is None:
-            self._vpp = 1
-        else:
-            self._vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-
         # Cache chunk handlers for each virtual pipeline stage
-        self._stages = [[] for _ in range(self._vpp)]
+        self._stages = None
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
@@ -150,14 +143,19 @@ class PipelineOffloadManager:
         """Return the number of chunk handlers in the queue."""
         return len(self._queue)
 
-    def init_model_chunk_offload_handler(self, vp_stage, min_offloaded_tensor_size=1024 * 1024):
+    def init_model_chunk_offload_handler(self, vp_size, vp_stage, min_offloaded_tensor_size=1024 * 1024):
         """
         Initialize a chunk offload handler for a model chunk (microbatch).
 
         Args:
+            vp_size: Virtual pipeline size
             vp_stage: Virtual pipeline stage index (None means stage 0)
             min_offloaded_tensor_size: Minimum tensor size (in elements) to offload
         """
+        if self._stages is None:
+            self._vpp = vp_size
+            self._stages = [[] for _ in range(vp_size)]
+
         if vp_stage is None:
             cur_vpp_rank = 0
         else:
@@ -596,10 +594,10 @@ def fine_grained_offloading_set_last_layer(is_last_layer):
     PipelineOffloadManager.get_instance().set_last_layer(is_last_layer)
 
 
-def fine_grained_offloading_init_chunk_handler(vp_stage, min_offloaded_tensor_size):
+def fine_grained_offloading_init_chunk_handler(vp_size, vp_stage, min_offloaded_tensor_size):
     """Initialize the chunk handler, called at the start of a microbatch forward pass."""
     PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
-        vp_stage, min_offloaded_tensor_size
+        vp_size, vp_stage, min_offloaded_tensor_size
     )
 
 
