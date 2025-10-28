@@ -454,10 +454,7 @@ products:
       - environment: [lts]
         scope: [mr, mr-github]
       - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-      - environment: [dev]
-        scope: [mr, mr-slim]
+        scope: [mr, mr-github, mr-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
