@@ -317,7 +317,7 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
         return torch.nn.functional.pad(x, pad_args)
 
     # unsqueeze and squeeze to get shapes supported by cudnn
-    print(f"Replicating last row for {expected_sharded_ten.key}")
+    logger.info(f"Replicating last row for {expected_sharded_ten.key}")
     if x.dtype == torch.bfloat16:
         return (
             torch.nn.functional.pad(x.float().unsqueeze(0), pad_args, mode="replicate")
