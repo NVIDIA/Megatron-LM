@@ -33,8 +33,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, set_decode_expert_padding
-from megatron.core.utils import get_asyncio_loop, get_model_config
+from megatron.core.inference.utils import Counter
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
