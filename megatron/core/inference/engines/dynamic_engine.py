@@ -144,6 +144,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
+        self.capture_stats = None
+
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
         else:
@@ -164,7 +166,6 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
-        self.capture_stats = None
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
