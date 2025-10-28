@@ -43,11 +43,10 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
     #   based on headers. 
     # 5. look at InferenceClient to see how we create requests with headers. 
-    # >>>
-    from lutil import pax
-    # <<<
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
     args = get_args()
+
+    # Test suspend/resume intervals.
     if args.suspend_resume_interval is not None:
         # Since the client doesn't directly call engine.async_step here, we test
         # the suspend-resume system ~4 times.
@@ -61,24 +60,11 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
             min(len(requests), i + suspend_resume_interval // 2)
             for i in suspend_idxs
         )
-        # >>>
-        # suspend_idxs = set([33]) # ... good.
-        # resume_idxs = set([67])
-        # +++
-        # suspend_idxs = set([33, 80]) # ... good.
-        # resume_idxs = set([67, 90])
-        # +++
-        # suspend_idxs = set([33, 100]) # ... good.
-        # resume_idxs = set([67, 100])
-        # +++
-        # pax("suspend_idxs, resume_idxs")
-        # suspend_idxs = set([25, 50, 75, 100])
-        # resume_idxs = set([37, 62, 87, 100])
-        # <<<
     else:
         suspend_idxs = set()
         resume_idxs = set()
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    # Create client and run example.
     if dist.get_rank() == 0: 
         client = InferenceClient(port) # submits requests to the inference coordinator
         await client.start()
