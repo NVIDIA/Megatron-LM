@@ -25,13 +25,15 @@ on:
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
   copyright-check:
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.65.11
+      && github.repository == 'NVIDIA/Megatron-LM'
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@v0.65.12
 
   copyright-check-summary:
     needs: [pre-flight, copyright-check]
@@ -42,6 +44,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     steps:
       - name: Result
