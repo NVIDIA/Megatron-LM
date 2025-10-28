@@ -221,7 +221,7 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
-                if self.config.fp8:
+                if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         self.shared_experts,
                         False,
