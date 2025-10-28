@@ -143,7 +143,9 @@ class PipelineOffloadManager:
         """Return the number of chunk handlers in the queue."""
         return len(self._queue)
 
-    def init_model_chunk_offload_handler(self, vp_size, vp_stage, min_offloaded_tensor_size=1024 * 1024):
+    def init_model_chunk_offload_handler(
+        self, vp_size, vp_stage, min_offloaded_tensor_size=1024 * 1024
+    ):
         """
         Initialize a chunk offload handler for a model chunk (microbatch).
 

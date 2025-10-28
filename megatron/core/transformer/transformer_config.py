@@ -782,7 +782,6 @@ class TransformerConfig(ModelParallelConfig):
     """If True, offload the input of the specified modules to the CPU.
     Fine-grained activation offloading is a module-level offloading method
     instead of a layer-level offloading method like cpu_offloading."""
-    
 
     offload_modules: Optional[list[str]] = None
     """The submodules to offload its input.
@@ -1143,8 +1142,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.recompute_modules.append("moe")
 
         if self.fine_grained_activation_offloading:
-            assert not self.cpu_offloading, \
-                "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
+            assert (
+                not self.cpu_offloading
+            ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
             assert self.offload_modules is not None and len(self.offload_modules) > 0
             allowed_modules = {
                 "core_attn",
