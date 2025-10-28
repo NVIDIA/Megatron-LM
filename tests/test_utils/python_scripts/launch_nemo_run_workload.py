@@ -117,8 +117,7 @@ def main(
             "CLUSTER": "dgxh100_dgxc",
         },
         packager=run.Packager(),
-        volumes=artifacts,
-        additional_kwargs={"tty": True},
+        volumes=artifacts
     )
 
     n_attempts = 0
