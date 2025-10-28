@@ -26,7 +26,7 @@ on:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   copyright-check:
@@ -51,6 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Result
+        env:
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 
