@@ -6,6 +6,11 @@ megatron/core/models/multimodal/ @NVIDIA/multi-modal
 
 megatron/core/models/mamba/ @NVIDIA/hybrid-mamba
 
+megatron/core/datasets/ @NVIDIA/datasets
+
+megatron/core/distributed/fsdp/ @NVIDIA/megatron-fsdp
+megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/megatron-fsdp
+
 megatron/core/dist_checkpointing/ @NVIDIA/dist-checkpointing
 
 megatron/core/optimizer/distrib_optimizer/ @NVIDIA/dist-optimizer
