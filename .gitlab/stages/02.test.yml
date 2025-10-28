@@ -2,6 +2,8 @@
   rules:
     - if: $PUBLISH == "yes"
       when: never
+    - if: $BUILD == "no"
+      when: never
     - when: on_success
   stage: test
 
@@ -11,8 +13,6 @@ include:
 wait_for_resources:
   extends: [.test_rules]
   needs:
-    - test:linting_formatting
-    - test:linting_copyright
     - job: test:linting_secret_detection
       optional: true
     - test:build_image
@@ -74,7 +74,7 @@ test:unit_tests_configure:
         "--n-repeat ${UNIT_TEST_REPEAT}"
         "--time-limit $(( UNIT_TEST_TIMEOUT * 60 ))"
         "--test-cases all"
-        "--cluster dgxh100_coreweave"
+        "--cluster $H100_CLUSTER"
         "--platform dgx_h100"
         "--partition batch"
         "--container-image ${UTILITY_IMAGE}"
@@ -127,8 +127,10 @@ test:unit_tests_configure:
 
 .unit_tests_run:
   needs:
-    - test:linting_formatting
-    - test:linting_copyright
+    - job: test:linting_formatting
+      optional: true
+    - job: test:linting_copyright
+      optional: true
     - job: test:linting_secret_detection
       optional: true
     - test:unit_tests_configure
@@ -151,46 +153,6 @@ test:unit_tests_configure:
   inherit:
     variables: true
   rules:
-    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
-      when: on_success
-
-test:unit_tests_pyt(DEV)_mcore(legacy):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: dev
-    TAG: legacy
-  rules:
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
-      when: never
-    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
-      when: never
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
-      when: never
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
-      when: never
-    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
-      when: on_success
-
-test:unit_tests_pyt(LTS)_mcore(legacy):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: lts
-    TAG: legacy
-  rules:
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
-      when: never
-    - if: $CI_COMMIT_BRANCH == 'ci-dev-unit-test-extended'
-      when: never
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^core_r/
-      when: never
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
-      when: never
     - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
@@ -266,57 +228,6 @@ test:linting_docs_build:
     - mv megatron-lm/ documentation/
     - cd documentation/
     - ./repo docs
-
-test:linting_formatting:
-  extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  needs: [test:build_image]
-  variables:
-    GIT_STRATEGY: "clone"
-  script:
-    - |
-      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
-        exit 0
-      fi
-    - set +e
-    - git fetch origin main:main
-    - |
-      if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
-        bash tools/autoformat.sh
-        set -e
-        git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-        git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-        git config --global user.email "mcore-bot@nvidia.com"
-        git config --global user.name "Mcore Bot"
-        git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
-        git add -A .
-        git commit -m "chore: Format files" || true
-        git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-      fi
-    - env
-    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
-
-test:linting_copyright:
-  extends: [.test_rules]
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  needs: [test:build_image]
-  script:
-    - git fetch origin main
-    - bash tools/copyright.sh
 
 # Override from template
 secret_detection:
