@@ -12,7 +12,7 @@ permissions:
 jobs:
   check-approval:
     runs-on: ubuntu-latest
-    if: github.event.review.state == 'approved'
+    if: github.event.review.state == 'approved' && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
