@@ -69,12 +69,12 @@ products:
   - test_case: [bert_mcore_tp2_pp2_resume_torch_dist]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp2_pp2_resume_torch_dist_local_spec]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [bert_mcore_tp1_pp2]
     products:

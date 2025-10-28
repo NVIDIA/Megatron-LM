@@ -62,5 +62,5 @@ products:
   - test_case: [hybrid_static_inference_tp1_pp1_2B_cudagraphs]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dg  x_h100]

@@ -18,4 +18,5 @@ on:
 
 jobs:
   close-issues:
+    if: github.repository == 'NVIDIA/Megatron-LM'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_close_inactive_issue_pr.yml@v0.44.0

@@ -30,6 +30,7 @@ on:
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
     needs: [pre-flight]
@@ -37,6 +38,7 @@ jobs:
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: linux-amd64-cpu16
     name: Pip - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
@@ -82,6 +84,7 @@ jobs:
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: linux-amd64-cpu16
     name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
@@ -135,6 +138,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Get workflow result
         id: result
