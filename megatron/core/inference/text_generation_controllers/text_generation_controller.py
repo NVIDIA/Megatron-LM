@@ -626,15 +626,16 @@ class TextGenerationController:
         Args:
             sampling_params (SamplingParams): Parameters for sampling logits.
             termination_id (int): The token ID that indicates termination.
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
 
         Return:
             (Optional[Dict]): A dictionary containing:
-                1. active_request_ids (Tensor): Current active request IDs.
-                2. newly_paused_request_ids (Tensor): Newly paused request IDs.
-                3. finished_request_ids (Tensor): Finished request IDs.
-                4. sample (Tensor): New sample.
-                5. log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
-                6. cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+                sample (Tensor): New sample.
+                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
