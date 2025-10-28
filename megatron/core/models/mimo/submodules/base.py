@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 
 # Initialize logger
@@ -72,6 +72,18 @@ class ModalitySubmodules(ABC, nn.Module):
         params = module_spec.params or {}
         submodules = module_spec.submodules or {}
 
+        # Check if at last PP stage for projections
+        # pg_collection is in encoder specs, not modality submodule spec
+        is_last_pp_stage = True  # Default to True if no PP
+        if 'encoders' in submodules:
+            # Check the first encoder's pg_collection
+            for encoder_spec in submodules['encoders'].values():
+                encoder_params = encoder_spec.params or {}
+                pg_collection = encoder_params.get('pg_collection')
+                if pg_collection and hasattr(pg_collection, 'pp'):
+                    is_last_pp_stage = is_pp_last_stage(pg_collection.pp)
+                break  # Only need to check one encoder
+
         # Build component lists from submodules dictionary
         encoders = {}
         if 'encoders' in submodules:
@@ -87,14 +99,16 @@ class ModalitySubmodules(ABC, nn.Module):
                 decoder = build_module(decoder_spec)
                 decoders[decoder_name] = decoder
 
+        # Only build projections on last PP stage
         input_projections = []
         if 'input_projections' in submodules:
             for proj_spec in submodules['input_projections']:
                 logger.debug(
-                    f"Building {cls.__name__} input projection: {proj_spec.module.__name__}"
+                    f"Building {cls.__name__} input projection: {proj_spec.module.__name__} is_last_pp_stage: {is_last_pp_stage}"
                 )
-                projection = build_module(proj_spec)
+                projection = build_module(proj_spec) if is_last_pp_stage else None
                 input_projections.append(projection)
+    
 
         output_projections = []
         if 'output_projections' in submodules:

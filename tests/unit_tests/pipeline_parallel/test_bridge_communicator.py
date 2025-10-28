@@ -11,11 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_expert_model_parallel_rank,
-    get_tensor_model_parallel_rank,
-)
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_rank
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -24,21 +20,19 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+
 
 def _create_transformer_block(
     dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
 ) -> TransformerBlock:
     torch.manual_seed(12345)
-    model_parallel_cuda_manual_seed(
-        123,
-        tp_rank=(
-            pg_collection.tp.rank()
-            if pg_collection is not None
-            else get_tensor_model_parallel_rank()
-        ),
-        ep_rank=torch.distributed.get_rank(),
-        etp_rank=torch.distributed.get_rank(),
-    )
+    model_parallel_cuda_manual_seed(123)
     if pg_collection is not None:
         cp_size = pg_collection.cp.size()
     else:
@@ -111,10 +105,6 @@ def _shard_and_copy_(
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
     # Set up environment for world size 8 if not already set
-    if not dist.is_initialized():
-        raise RuntimeError("Distributed process group is not initialized")
-
-    #  tests below assume a world size of 8
     if "WORLD_SIZE" not in os.environ:
         os.environ["WORLD_SIZE"] = "8"
 
@@ -181,6 +171,7 @@ def get_transformer_block_and_grid(
 
 
 class TestBridgeCommunicator:
+    """Test suite for BridgeCommunicator usage."""
 
     @classmethod
     def setup_class(cls):
@@ -205,8 +196,8 @@ class TestBridgeCommunicator:
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
         grid2 = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=1, dp=2)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
-        assert bridge_communicator.src_grid is grid1
-        assert bridge_communicator.dest_grid is grid2
+        assert bridge_communicator.src_grid == grid1
+        assert bridge_communicator.dest_grid == grid2
         assert bridge_communicator.current_rank == dist.get_rank()
         assert bridge_communicator.comm_map is not None
 
@@ -305,9 +296,6 @@ class TestBridgeCommunicator:
             (sequence_length, micro_batch_size, hidden_size), device="cuda"
         ).to(dtype)
         current_rank = dist.get_rank()
-
-        # we compare output with transformer block with global parallel state
-        # so need to initialize model parallel state
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=parallel_state_tp, create_gloo_process_groups=False
         )
@@ -402,6 +390,78 @@ class TestBridgeCommunicator:
                     global_block_2_output, output_grid_2_first_chunk, rtol=1e-3, atol=1e-3
                 )
 
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Feature requires PyTorch 2.3 or later",
+    )
+    def test_tranformer_block_with_different_parallelisms(self):
+        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+        os.environ["NVTE_FLASH_ATTN"] = "0"
+        os.environ["NVTE_FUSED_ATTN"] = "0"
+
+        torch.manual_seed(12345)
+
+        # Initialize model parallel state (required for model_parallel_cuda_manual_seed)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, create_gloo_process_groups=False
+        )
+
+        hidden_size = 2048
+        dtype = torch.float32
+
+        sequence_length = 8192
+        micro_batch_size = 2
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, hidden_size), device="cuda"
+        ).to(dtype)
+
+        ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
+        ref_pg_collection = _get_pg_collection_from_grid(ref_grid)
+        ref_block = _create_transformer_block(
+            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg_collection
+        )
+        _avg_params(ref_block, ref_grid.get_pg("dp"))
+
+        # tp8 dp 1 grid
+        block1, grid_1 = get_transformer_block_and_grid(
+            tp_size=8,
+            cp_size=1,
+            pp_size=1,
+            dp_size=1,
+            ref_block=ref_block,
+            dtype=dtype,
+            hidden_size=hidden_size,
+        )
+
+        # tp4 dp 2 grid
+        block2, grid_2 = get_transformer_block_and_grid(
+            tp_size=4,
+            cp_size=1,
+            pp_size=1,
+            dp_size=2,
+            ref_block=ref_block,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+
+        dist.barrier()
+
+        output_grid_1 = block1(hidden_states=hidden_states, attention_mask=None)
+
+        output_grid_2 = block2(hidden_states=hidden_states, attention_mask=None)
+
+        logging.debug(
+            f"Rank {dist.get_rank()}: shapes - grid 1 {output_grid_1.shape} grid 2 {output_grid_2.shape}"
+        )
+        logging.debug(
+            f"Rank {dist.get_rank()}: sum -  grid 1 {output_grid_1.sum()} grid 2 {output_grid_2.sum()}"
+        )
+
+        torch.testing.assert_close(output_grid_1, output_grid_2, rtol=1e-3, atol=1e-3)
+
+        # Clean up model parallel state
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
