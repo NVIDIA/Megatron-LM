@@ -196,7 +196,7 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 
 class ZarrLoadShardedStrategy(LoadShardedStrategy):
     """Load strategy for the Zarr backend."""
-    
+
     def __init__(self, backend: str, version: int):
         super().__init__(backend, version)
         raise CheckpointingException(
