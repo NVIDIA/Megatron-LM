@@ -1008,6 +1008,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for model_module in model:
                 model_module.broadcast_params()
 
+        if args.use_megatron_fsdp and args.no_mfsdp_comm:
+            for m in model:
+                m.module.fake_fsdp_hooks = disable_megatron_fsdp_communication(m.module)
+
     return model
 
 
