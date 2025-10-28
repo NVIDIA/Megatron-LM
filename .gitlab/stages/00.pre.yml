@@ -8,6 +8,7 @@ include:
       when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
       when: always
+
     - when: never
   stage: .pre
 
@@ -19,29 +20,6 @@ include:
     - docker system prune -a --filter "until=36h" -f || true
     - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
-
-pre:mirror_to_github:
-  rules:
-    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
-      allow_failure: true
-    - when: never
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  stage: .pre
-  image: python:3.10
-  variables:
-    GIT_STRATEGY: "clone"
-  script:
-    - git checkout $CI_COMMIT_BRANCH
-    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
-    - git push -u github $CI_COMMIT_BRANCH
-  retry:
-    max: 2
 
 pre:create_ci_branches:
   rules:
@@ -58,6 +36,9 @@ pre:create_ci_branches:
       - branch: ci-pre-release
       - branch: ci-review-reminder
       - branch: ci-upgrade-dependencies
+      - branch: ci-approve-main
+      - branch: ci-approve-dev
+      - branch: ci-sync-branches
   tags:
     - arch/amd64
     - env/prod
@@ -176,14 +157,16 @@ pre:maybe_cherry_pick_to_main:
       TITLE=$(echo -E $MR | jq '.title' | tr -d '"')
       MILESTONE_ID=$(echo -E $MR | jq '.milestone.id' | tr -d '"')
 
-      git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+      git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_PATH.git"
+      git remote add mr-origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH.git"
+
       git config --global user.email "mcore-bot@nvidia.com"
       git config --global user.name "Mcore Bot"
 
       git fetch origin dev
-      git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      git fetch mr-origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
       git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
-      START_COMMIT=$(git merge-base origin/dev origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME)
+      START_COMMIT=$(git merge-base origin/dev mr-origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME)
       END_COMMIT=$(git rev-parse HEAD)
 
       git fetch origin main

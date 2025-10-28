@@ -1058,11 +1058,11 @@ class CudaGraphManager(torch.nn.Module):
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
 
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-                "a crash due to illegal memory access or other undefined behaviour."
-            )
+        assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+            "a crash due to illegal memory access or other undefined behaviour."
+        )
 
         self.cudagraph_runners = []
         self.inference_cudagraphs_lookup_table = defaultdict(lambda: None)
@@ -1343,14 +1343,16 @@ class TECudaGraphHelper:
 
     def __init__(self, model, config, seq_length, micro_batch_size, optimizers=[]):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
+        assert (
+            config.cuda_graph_impl == "transformer_engine"
+        ), "Option cuda_graph_impl=transformer_engine not enabled."
         assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
             "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
             "a crash due to illegal memory access or other undefined behaviour."
         )
         assert config.cuda_graph_scope != "full_iteration", (
-            "full_iteration cuda graph is not supported for --external-cuda-graph. "
-            "Please use --enable-cuda-graph instead."
+            "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
+            "Please use cuda_graph_impl=local instead."
         )
         assert config.cuda_graph_scope in [
             'full',

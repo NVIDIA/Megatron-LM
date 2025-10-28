@@ -326,7 +326,7 @@ def build_dynamic_engine_setup_prefix(
         A configuration string for logging.
     """
     # CUDA graph config
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         cg_str = (
             f"graphs {context.cuda_graph_token_counts[0]}:"
             f"{context.cuda_graph_token_counts[-1]}"

@@ -509,7 +509,7 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            block_table (Tensor): KV cache chunk ids for all samples.
+            block_table (Tensor): KV cache block ids for all samples.
         Return:
             (Tensor) Attention output.
         """
@@ -773,7 +773,7 @@ class Attention(MegatronModule, ABC):
 
         if (
             in_decode_mode
-            and self.config.enable_cuda_graph
+            and self.config.cuda_graph_impl == "local"
             and self.config.cuda_graph_scope != "full_iteration"
             and inference_context.is_static_batching()
         ):

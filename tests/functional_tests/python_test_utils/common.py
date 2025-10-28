@@ -19,14 +19,6 @@ SIZE_GUIDANCE = {event_accumulator.TENSORS: 0, event_accumulator.SCALARS: 0}
 logger = logging.getLogger(__name__)
 
 
-def approximate_threshold(rtol: float) -> Callable:
-    def _func(y_pred: List[Union[float, int]], y_true: List[Union[float, int]]):
-
-        return np.mean([np.mean(y_pred), np.mean(y_true)]) * rtol
-
-    return _func
-
-
 class TypeOfTestResult(enum.Enum):
     APPROXIMATE = 1
     DETERMINISTIC = 2
@@ -46,7 +38,6 @@ class NotDeterminsticError(Exception):
 
 class ApproximateTest(Test):
     atol: Union[int, float] = 0
-    atol_func: Optional[Callable] = None
     rtol: float = 1e-5
 
     @property
@@ -59,14 +50,12 @@ class ApproximateTest(Test):
 
 class DeterministicTest(Test):
     @property
-    def atol(self) -> Union[int, float]:
-        return 0
-
-    atol_func: Optional[Callable] = None
-
-    @property
     def rtol(self) -> float:
         return 0.0
+
+    @property
+    def atol(self) -> Union[int, float]:
+        return 0
 
     @property
     def type_of_test_result(self) -> TypeOfTestResult:
@@ -218,38 +207,35 @@ def pipeline(
                 ]
 
                 if metric_name == "iteration-time":
-                    if len(actual_value_list) >= 10:
-                        actual_value_list = actual_value_list[3:-3]
-                        golden_value_list = golden_value_list[3:-3]
-                        total_steps_evaluated = (
-                            golden_value.end_step / golden_value.step_interval + 1 - 3 - 3
-                        )
-                    else:
-                        actual_value_list = actual_value_list[3:-1]
-                        golden_value_list = golden_value_list[3:-1]
-                        total_steps_evaluated = (
-                            golden_value.end_step / golden_value.step_interval + 1 - 3 - 1
-                        )
-                    logger.info(
-                        "For metric `%s`, the first and last 3 scalars are removed from the list to reduce noise.",
-                        metric_name,
-                    )
+                    actual_value_list = [
+                        np.median([np.inf if type(v) is str else v for v in actual_value_list])
+                    ]
+                    golden_value_list = [
+                        np.median([np.inf if type(v) is str else v for v in golden_value_list])
+                    ]
+                    total_steps_evaluated = 1
+                else:
+                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
 
-                actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
-                golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
+                    actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
+                    golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
 
                 actual = np.array(actual_value_list)
                 golden = np.array(golden_value_list)
 
                 # Tolerance check
-                is_close = np.isclose(actual, golden, rtol=0.10, atol=0)
+                is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
                 num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
                 passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
 
                 if not passing:
-                    logger.info("Actual values: %s", ", ".join([str(v) for v in actual_value_list]))
-                    logger.info("Golden values: %s", ", ".join([str(v) for v in golden_value_list]))
+                    logger.info(
+                        "Actual values: %s", ", ".join([str(v) for v in (*actual_value_list,)])
+                    )
+                    logger.info(
+                        "Golden values: %s", ", ".join([str(v) for v in (*golden_value_list,)])
+                    )
                     raise test.error_message(metric_name)
 
                 result = f"{test.type_of_test_result.name} test for metric {metric_name}: PASSED"
