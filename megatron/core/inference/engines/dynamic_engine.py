@@ -30,11 +30,11 @@ from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
-    SimpleTextGenerationController,
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
 )
-from megatron.core.inference.utils import Counter
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.inference.utils import Counter, set_decode_expert_padding
+from megatron.core.utils import get_asyncio_loop, get_model_config
 
 try:
     from tqdm import tqdm
@@ -67,6 +67,7 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
+# pylint: disable=line-too-long
 class DynamicInferenceEngine(AbstractEngine):
     """The dynamic inference engine.
 
@@ -78,11 +79,11 @@ class DynamicInferenceEngine(AbstractEngine):
     tokens across all requests.
 
     Args:
-        text_generation_controller (SimpleTextGenerationController): A text generation
+        text_generation_controller (TextGenerationController): A text generation
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
-            batching and a dynamic chunked KV cache (similar to paged attention).
+            batching and a dynamic block-level KV cache (similar to paged attention).
         termination_id (int): Token ID to mark end-of-sequence.
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
@@ -90,7 +91,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def __init__(
         self,
-        controller: SimpleTextGenerationController,
+        controller: TextGenerationController,
         context: DynamicInferenceContext,
         termination_id: int,
         enable_cuda_graph: Optional[bool] = None,
@@ -107,10 +108,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 "read directly from the transformer config object."
             )
 
-        assert isinstance(controller, SimpleTextGenerationController)
-        assert isinstance(context, DynamicInferenceContext)
-        assert isinstance(termination_id, int)
-        assert isinstance(random_seed, int)
+        assert isinstance(
+            controller, TextGenerationController
+        ), f"controller must be a TextGenerationController, got {type(controller)}"
+        assert isinstance(
+            context, DynamicInferenceContext
+        ), f"context must be a DynamicInferenceContext, got {type(context)}"
+        assert isinstance(
+            termination_id, int
+        ), f"termination_id must be an int, got {type(termination_id)}"
+        assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
         self.request_counter = Counter()
         self.controller = controller
@@ -138,13 +145,22 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Capture cuda graph.
         if enable_cuda_graph is not None:
-            self.enable_cuda_graph = enable_cuda_graph
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
         else:
-            self.enable_cuda_graph = (
-                controller.inference_wrapped_model.model.config.enable_cuda_graph
-            )
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+
+        # Handle setting up expert padding for cuda graph inference if set.
+        if enable_cuda_graph:
+            model_config = get_model_config(controller.inference_wrapped_model.model)
+            inference_wrapper_config = controller.inference_wrapped_model.inference_wrapper_config
+            if inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference:
+                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+                set_decode_expert_padding(
+                    controller.inference_wrapped_model.model, True, capacity_factor=capacity_factor
+                )
+
         self.capture_stats = None
-        if self.enable_cuda_graph:
+        if self.cuda_graph_impl == "local":
 
             time_start = time.time()
             mem_stats_start = torch.cuda.memory_stats()
@@ -438,9 +454,11 @@ class DynamicInferenceEngine(AbstractEngine):
         sampling_params = SamplingParams(
             num_tokens_to_generate=num_tokens_to_generate, num_tokens_total=num_tokens_total
         )
+        prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
             # Tokenize prompt if text. Support legacy single-arg mocks.
+            prompt_str = prompt
             try:
                 prompt_token_ids = self.controller.tokenize_prompt(prompt, sampling_params.add_BOS)
             except TypeError:
@@ -464,7 +482,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize request.
         request = DynamicInferenceRequest(
-            request_id=request_id, prompt_tokens=tokens, sampling_params=sampling_params
+            prompt=prompt_str,
+            request_id=request_id,
+            prompt_tokens=tokens,
+            sampling_params=sampling_params,
         )
 
         # Add request.
@@ -832,6 +853,9 @@ class DynamicInferenceEngine(AbstractEngine):
         while self.has_unfinished_requests():
             result = self.step_modern(sampling_params)
             finished_requests_list.extend(result["finished_requests"])
+
+        # Ensure requests are returned in the same order they were passed in.
+        finished_requests_list.sort(key=lambda x: x.request_id)
 
         return finished_requests_list
 
