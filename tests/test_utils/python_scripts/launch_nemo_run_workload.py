@@ -116,6 +116,7 @@ def main(
         },
         packager=run.Packager(),
         volumes=artifacts,
+        additional_kwargs={"tty": True},
     )
 
     n_attempts = 0
