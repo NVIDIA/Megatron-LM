@@ -262,8 +262,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         # Block size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.block_size_tokens = block_size_tokens
@@ -280,8 +280,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.block_size_tokens
-                * num_attention_heads_per_partition
-                * hidden_size_per_attention_head
+                * self.num_attention_heads_per_partition
+                * self.hidden_size_per_attention_head
             )
 
         # Adjust buffer to be a multiple of block size.
@@ -440,6 +440,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.unified_memory_level != 0 and not is_init:
             return
 
+        # Validate no tensors allocated prior to this method.
+        for key in vars(self).keys():
+            value = getattr(self, key)
+            assert not isinstance(value, torch.Tensor), (
+                "All tensors should be allocated within `allocate_all_tensors()."
+                f"Please move tensor '{key}'."
+            )
+
         # Per-request state.
         self.request_ids = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
@@ -481,9 +489,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             else nullcontext()
         )
         with ctx_manager:
-            if cache_mla_latent:
+            if self.cache_mla_latent:
                 self.memory_buffer = torch.full(
-                    (self.num_layers, block_count_total, self.block_size_tokens, kv_reduced_dim),
+                    (
+                        self.num_layers,
+                        self.block_allocator.block_count_total,
+                        self.block_size_tokens,
+                        kv_reduced_dim,
+                    ),
                     -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -493,10 +506,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         2,  # key and value
                         self.num_layers,
-                        block_count_total,
+                        self.block_allocator.block_count_total,
                         self.block_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
                     ),
                     -1,
                     dtype=self.params_dtype,
