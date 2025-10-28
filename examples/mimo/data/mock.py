@@ -125,9 +125,9 @@ class MockVLMDataset(Dataset):
             "loss_mask": loss_mask,
             "position_ids": position_ids,
             "modality_inputs": {
-                "clip_encoder": {
-                    "images": image,
-                }
+               "images": {
+                "clip_encoder": {'x': image},
+            }
             },
         }
 
@@ -200,7 +200,7 @@ def get_mock_vlm_dataloader(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         collate_fn=lambda batch: _collate_fn(batch),
     )
@@ -218,7 +218,7 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     Returns:
         Dictionary of batched tensors
     """
-    images = torch.stack([item["images"] for item in batch])
+    images = torch.stack([item["modality_inputs"]["images"]["clip_encoder"]['x'] for item in batch])
     input_ids = torch.stack([item["input_ids"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
     loss_mask = torch.stack([item["loss_mask"] for item in batch])
@@ -230,8 +230,8 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "loss_mask": loss_mask,
         "position_ids": position_ids,
         "modality_inputs": {
-            "clip_encoder": {
-                "images": images,
+            "images": {
+                "clip_encoder": {'x': images},
             }
         },
     }
@@ -291,6 +291,17 @@ if __name__ == "__main__":
 
     for batch in dataloader:
         print("\nBatch from dataloader:")
-        for key, tensor in batch.items():
-            print(f"  {key}: {tensor.shape}")
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                print(f"  {key}: {value.shape}")
+            elif isinstance(value, dict):
+                print(f"  {key}: (nested dict)")
+                for subkey, subvalue in value.items():
+                    if isinstance(subvalue, torch.Tensor):
+                        print(f"    {subkey}: {subvalue.shape}")
+                    elif isinstance(subvalue, dict):
+                        print(f"    {subkey}: (nested dict)")
+                        for subsubkey, subsubvalue in subvalue.items():
+                            if isinstance(subsubvalue, torch.Tensor):
+                                print(f"      {subsubkey}: {subsubvalue.shape}")
         break

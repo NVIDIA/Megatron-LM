@@ -99,7 +99,7 @@ else
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]}"
   else
-    torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    uv run python -m torch.distributed.run   ${DISTRIBUTED_ARGS[@]}   --log-dir logs/mimo     --redirects 3     --tee "0:3"   examples/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
