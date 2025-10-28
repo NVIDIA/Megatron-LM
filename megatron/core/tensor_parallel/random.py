@@ -510,6 +510,9 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
+        # Get the inputs from the context instead of the saved tensors
+        # because the saved tensors are already cached by the recomputation.
+        # This is to avoid double-reloading the inputs in CPU offloading scenario.
         inputs = ctx.inputs
         outputs = ctx.outputs
         torch.autograd.backward(outputs, args)
@@ -574,6 +577,7 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
+            # Store the inputs for backward pass
             inputs = self.ctx.saved_tensors
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*inputs)

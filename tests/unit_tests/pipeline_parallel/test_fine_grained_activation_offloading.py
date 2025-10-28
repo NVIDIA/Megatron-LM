@@ -45,7 +45,7 @@ class ToyModel(torch.nn.Module):
             # Initialize a new chunk (microbatch) and enable offload context.
             with off.get_fine_grained_offloading_context(True):
                 off.fine_grained_offloading_init_chunk_handler(
-                    vp_stage=None, min_offloaded_tensor_size=1
+                    vp_size=1, vp_stage=None, min_offloaded_tensor_size=1
                 )
                 for i, layer in enumerate(self.net):
                     # Group by module; with this linear-only model, each group corresponds to a layer.

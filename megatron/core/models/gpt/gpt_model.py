@@ -417,7 +417,9 @@ class GPTModel(LanguageModule):
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
         fine_grained_offloading_init_chunk_handler(
-            self.vp_stage, self.config.min_offloaded_tensor_size
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_stage=self.vp_stage,
+            min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
