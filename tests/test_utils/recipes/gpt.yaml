@@ -457,7 +457,7 @@ products:
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [dev]
-        scope: [mr, mr-github-slim]
+        scope: [mr, mr-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
@@ -474,7 +474,7 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
       - environment: [dev]
-        scope: [mr, mr-github-slim]
+        scope: [mr, mr-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone]
     products:
