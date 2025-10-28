@@ -43,7 +43,7 @@ SUPPORTED_ATTN_MASK = [
 
 try:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
+    from megatron.core.extensions.transformer_engine import qtype_debug_log
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
@@ -611,6 +611,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             transformer_layer_fp8_context = nullcontext()
 
         with rng_context, fp8_context:
+            if HAVE_TE:
+                qtype_debug_log(f"[mtp] layer {self.layer_number}")
             decoder_input = self.enorm(decoder_input)
             decoder_input = make_viewless_tensor(
                 inp=decoder_input, requires_grad=True, keep_graph=True
@@ -767,8 +769,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_hybrid_override_pattern: str = None,
         model_comm_pgs: ModelCommProcessGroups = None,
     ):
+        if config.keep_mtp_spec_in_bf16:
+            import copy
+            config = copy.deepcopy(config)
+            config.fp4 = None
+            config.fp8 = None
         super().__init__(config=config)
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
+
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.sequence_parallel = config.sequence_parallel
@@ -892,13 +900,13 @@ class MultiTokenPredictionBlock(MegatronModule):
             )
             mtp_loss = compute_language_model_loss(labels, mtp_logits)
             mtp_loss = loss_mask * mtp_loss
-            
+
             # Acceptance rate: compare predictions with labels
             # mtp_logits shape: [s, b, vocab_size] (tensor parallel: vocab is split)
             # labels shape: [b, s], loss_mask shape: [b, s]
             # Get the tensor parallel group for consistent processing
             tp_group = parallel_state.get_tensor_model_parallel_group()
-            
+
             # For tensor parallel, we need to gather the full vocabulary logits
             # This matches exactly how the loss computation works internally
             if tp_group is not None and tp_group.size() > 1:

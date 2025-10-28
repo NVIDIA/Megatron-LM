@@ -529,12 +529,17 @@ class MambaMixer(MegatronModule):
 
         if self.config.keep_mamba_out_proj_in_mxfp8 and self.config.fp4_recipe is not None:
             assert HAVE_TE
-            # Use MXFP8 for higher o_proj precision.
-            fp8_format = te.common.recipe.Format.E4M3
-            mxfp8_recipe = te.common.recipe.MXFP8BlockScaling(
-                    fp8_format=fp8_format
-            )
-            disable_low_precision = te.pytorch.fp8_autocast(fp8_recipe=mxfp8_recipe)
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+            if not FP8GlobalStateManager.is_fp8_enabled():
+                # Don't override keep_n_layers in BF16
+                disable_low_precision = nullcontext()
+            else:
+                # Use MXFP8 for higher o_proj precision.
+                fp8_format = te.common.recipe.Format.E4M3
+                mxfp8_recipe = te.common.recipe.MXFP8BlockScaling(
+                        fp8_format=fp8_format
+                )
+                disable_low_precision = te.pytorch.fp8_autocast(fp8_recipe=mxfp8_recipe)
         else:
             # Keep existing precision.
             disable_low_precision = nullcontext()

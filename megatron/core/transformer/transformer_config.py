@@ -395,6 +395,9 @@ class TransformerConfig(ModelParallelConfig):
     keep_moe_latent_projections_in_bf16: bool = False
     """Keep the moe latent output projections in high precision. """
 
+    keep_mtp_spec_in_bf16: bool = False
+    """Keep the MTP spec in high precision."""
+
 
     ####################
     # MoE related

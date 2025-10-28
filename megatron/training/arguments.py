@@ -1420,6 +1420,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--keep-moe-latent-projections-in-bf16', action='store_true',
                        help='Force moe latent projection layer to be bf16.')
 
+    group.add_argument('--keep-mtp-spec-in-bf16', action='store_true', default=False,
+                       help='Keep the MTP spec in high precision.')
+
     return parser
 
 def _add_inference_args(parser):

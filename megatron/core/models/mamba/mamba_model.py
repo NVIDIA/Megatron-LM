@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Literal, Optional
+from contextlib import nullcontext
 
 import torch
 from torch import Tensor
@@ -146,7 +147,7 @@ class MambaModel(LanguageModule):
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage, mtp_hybrid_override_pattern=self.mtp_hybrid_override_pattern
             )
-    
+
         # Output
         if post_process or self.mtp_process:
             self.output_layer = tensor_parallel.ColumnParallelLinear(
@@ -343,7 +344,11 @@ class MambaModel(LanguageModule):
             extra_block_kwargs = None
             packed_seq_params = None
             import transformer_engine as te
-            with te.pytorch.fp8_autocast(enabled=False):
+            if self.config.keep_mtp_spec_in_bf16:
+                disable_low_precision = te.pytorch.fp8_autocast(enabled=False)
+            else:
+                disable_low_precision = nullcontext()
+            with disable_low_precision:
                 decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = self._preprocess(
                     input_ids=input_ids,
                     position_ids=position_ids,

@@ -45,7 +45,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-
+from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
@@ -64,6 +64,24 @@ def condition_init_method(config, init_method):
     """Condition TE init_method on config.perform_initialization."""
     return init_method if config.perform_initialization else (lambda w: None)
 
+def qtype_debug_log(prefix: str) -> None:
+    if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
+        from megatron.training import print_rank_0
+        fp4_enabled = (
+            FP8GlobalStateManager.is_fp8_enabled()
+            and FP8GlobalStateManager.get_fp8_recipe().nvfp4()
+        )
+        mxfp8_enabled = (
+            FP8GlobalStateManager.is_fp8_enabled()
+            and FP8GlobalStateManager.get_fp8_recipe().mxfp8()
+        )
+        quantization_type = (
+            "none" if (not fp4_enabled and not mxfp8_enabled)
+            else "fp4" if fp4_enabled
+            else "mxfp8" if mxfp8_enabled
+            else "unknown"
+        )
+        print_rank_0(f"{prefix}, quantization_type: {quantization_type}")
 
 class TENorm:
     """
@@ -279,6 +297,8 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
+        if _is_first_microbatch:
+            qtype_debug_log(f"  {self.__class__.__name__}, weight shape {self.weight.shape}")
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
@@ -463,6 +483,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
+        if _is_first_microbatch:
+            qtype_debug_log(f"  {self.__class__.__name__}, weight shape: {self.weight.shape}")
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
@@ -1097,6 +1119,8 @@ if is_te_min_version("1.9.0.dev0"):
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
+            if _is_first_microbatch:
+                qtype_debug_log(f"  {self.__class__.__name__}")
             out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
