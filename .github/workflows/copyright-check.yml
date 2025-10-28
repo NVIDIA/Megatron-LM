@@ -21,6 +21,8 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   pre-flight:
