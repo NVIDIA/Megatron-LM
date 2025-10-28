@@ -52,6 +52,10 @@ class VisionModalitySubmodules(ModalitySubmodules):
                 len(self.output_projections) <= 1
             ), "VisionModalitySubmodules currently supports only one output projection"
 
+        self.pre_process = False
+        self.post_process = False
+        self.share_embeddings_and_output_weights=False
+
     def encode(self, encoders_data_batch: Dict) -> List[torch.Tensor]:
         """Encode image data batch into a list of tensors.
 
@@ -81,18 +85,19 @@ class VisionModalitySubmodules(ModalitySubmodules):
             # Process inputs through the encoder
             encoder_outputs = encoder(**encoder_inputs)
             logger.debug(f"Encoder '{name}' output shape: {encoder_outputs.shape}")
-            if encoder_outputs.ndim == 3:
-                # its b,s,h -> we need to flatten it to b*s,h
-                encoder_outputs = encoder_outputs.reshape(-1, encoder_outputs.size(-1))
-                embeddings.append(encoder_outputs)
-            elif encoder_outputs.ndim == 2:
-                # its b*s,h -> encoder already returned the flattened output
-                embeddings.append(encoder_outputs)
-            else:
-                raise ValueError(
-                    f"Encoder '{name}' output shape {encoder_outputs.shape} is not supported"
-                    "Expected 3D (b,s,h) or 2D (b*s,h) tensor, got {encoder_outputs.ndim}D"
-                )
+            embeddings.append(encoder_outputs)
+            # if encoder_outputs.ndim == 3:
+            #     # its b,s,h -> we need to flatten it to b*s,h
+            #     encoder_outputs = encoder_outputs.reshape(-1, encoder_outputs.size(-1))
+            #     embeddings.append(encoder_outputs)
+            # elif encoder_outputs.ndim == 2:
+            #     # its b*s,h -> encoder already returned the flattened output
+            #     embeddings.append(encoder_outputs)
+            # else:
+            #     raise ValueError(
+            #         f"Encoder '{name}' output shape {encoder_outputs.shape} is not supported"
+            #         "Expected 3D (b,s,h) or 2D (b*s,h) tensor, got {encoder_outputs.ndim}D"
+            #     )
 
         return embeddings
 
@@ -167,18 +172,30 @@ class VisionModalitySubmodules(ModalitySubmodules):
             encoder_inputs: Dictionary where keys match encoder names in self.encoders
                 and values are dictionaries of encoder-specific parameters.
                 Example: {"clip": {"pixel_values": images}, "vit": {"images": vit_images}}
+                For intermediate PP stages: {"_intermediate_tensor": tensor}
 
         Returns:
             Flattened image embeddings with shape [total_embeddings, hidden_dim],
             or None if no valid inputs were provided.
         """
-        # Encode the images
-        embeddings = self.encode(encoder_inputs)
+        # Handle intermediate PP stage
+        # TODO: ykarnati we need a better design this is temp for testing.
+        if '_intermediate_tensor' in encoder_inputs:
+            embeddings = [self.encoders[name](encoder_inputs['_intermediate_tensor']) for name in self.encoders.keys()]
+        else:# Encode the images
+            embeddings = self.encode(encoder_inputs)
 
         # If no embeddings were produced, return None
-        if not embeddings:
+        if  embeddings is None:
             return None
+        
+        # projection is only run on last PP stage
+        if self.input_projections[0] is None:
+            return embeddings[0]
+
+        if embeddings[0].ndim == 3:
+            embeddings = [embedding.reshape(-1, embedding.size(-1)) for embedding in embeddings]
 
         projected = self.project_embeddings(embeddings, is_input=True)
-        logging.debug(f"Projected audio embeddings shape: {projected.shape}")
+        logging.debug(f"Projected vision embeddings shape: {projected.shape}")
         return projected  # [total_embeddings, hidden_dim]

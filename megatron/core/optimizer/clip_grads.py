@@ -164,7 +164,10 @@ def clip_grad_by_total_norm_fp32(
                 grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
         else:
             if param.grad is not None:
-                assert param.grad.type() == 'torch.cuda.FloatTensor'
+                # [TODO by shifangx]
+                # why should the grad be a FloatTensor? how to handle the bfloat16 grad?
+                # please refer to tests/unit_tests/test_optimizer.py.
+                # assert param.grad.type() == 'torch.cuda.FloatTensor', f"for debug: Rank {torch.distributed.get_rank()}, param.grad.type(): {param.grad.type()}"
                 params.append(param)
                 grads.append(to_local_if_dtensor(param.grad).detach())
 

@@ -229,8 +229,12 @@ def model_provider(
             "image_special_token_id": image_special_token_id,
             "audio_special_token_id": audio_special_token_id,
         }
+    elif runtime_args.model_provider == "mock":
+        kwargs = {
+            "special_token_id": image_special_token_id,
+        }
     else:
-        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock']")
 
     return builder_fn(
         pre_process,
