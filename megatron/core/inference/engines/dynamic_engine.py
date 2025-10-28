@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import logging
@@ -306,7 +306,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
                     coordinator_ready_event,
-                    self.controller.tokenizer,
                     inference_coordinator_port,
                     parallel_state.get_data_parallel_world_size(),
                 ),
@@ -557,6 +556,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     finished_request = self.requests.pop(request_id)
+                    if finished_request.prompt is None:
+                        finished_request.prompt = self.controller.tokenizer.detokenize(
+                            finished_request.prompt_tokens.tolist()
+                        )
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_requests.append(finished_request)
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
@@ -675,11 +678,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Note that we do not need to continue check the queue, as the tokens are full
 
     async def async_step(
-        self,
-        sampling_params: SamplingParams,
-        *,
-        verbose: Optional[bool] = False,
-        post_process_requests_locally: bool = True,
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -738,16 +737,11 @@ class DynamicInferenceEngine(AbstractEngine):
             [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
 
             # Add finished events.
-            if post_process_requests_locally:
-                (active_requests, finished_requests) = self.post_process_requests(
-                    active_request_ids, finished_request_ids, step_time, sample, log_probs
-                )
-            else:
-                return active_request_ids, finished_request_ids, sample, log_probs
+            (active_requests, finished_requests) = self.post_process_requests(
+                active_request_ids, finished_request_ids, step_time, sample, log_probs
+            )
 
         else:
-            if not post_process_requests_locally:
-                return None
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
 
@@ -1009,33 +1003,22 @@ class DynamicInferenceEngine(AbstractEngine):
                     continue
 
                 engine_output = await self.async_step(
-                    sampling_params=sampling_params,
-                    verbose=verbose,
-                    post_process_requests_locally=False,
+                    sampling_params=sampling_params, verbose=verbose
                 )
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
                     and parallel_state.get_pipeline_model_parallel_rank() == 0
                 )
-                if is_tp0_and_pp0 and engine_output is not None:
-                    # return the engine output to the coordinator. The coordinator will take
-                    # care of the post-processing.
-                    request_ids, finished_request_ids, sample, logprobs = engine_output
-                    # Include chunked prefill request id, use -1 if None
-                    chunked_prefill_id = self.context.chunked_prefill_request_id
-                    materialize_only_last_token_logits = (
-                        self.context.materialize_only_last_token_logits
-                    )
+                if (
+                    is_tp0_and_pp0
+                    and engine_output is not None
+                    and engine_output["finished_requests"]
+                ):
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
-                            request_ids.tolist(),
-                            finished_request_ids.tolist(),
-                            sample.tolist(),
-                            logprobs,
-                            chunked_prefill_id,
-                            materialize_only_last_token_logits,
+                            [r.serializable() for r in engine_output["finished_requests"]],
                         ],
                         use_bin_type=True,
                     )
