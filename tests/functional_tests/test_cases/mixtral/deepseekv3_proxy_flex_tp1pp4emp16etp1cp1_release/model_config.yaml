@@ -83,10 +83,9 @@ MODEL_ARGS:
   # Add learning rate args
   --lr-decay-samples: 584765624
   --lr-warmup-samples: 1536000
-  # Learning rate scaled down from 7.3e-6 (DeepSeek-V3 technical report, GBS=15360) to 3.9e-6 (GBS=8192)
-  --lr-warmup-init: 3.9e-7
-  --lr: 3.9e-6
-  --min-lr: 3.9e-7
+  --lr-warmup-init: 5.8e-7
+  --lr: 5.8e-5
+  --min-lr: 5.8e-6
   --lr-decay-style: cosine
   --adam-beta1: 0.9
   --adam-beta2: 0.95
