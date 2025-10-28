@@ -6,6 +6,7 @@ import os
 import time
 import torch
 import torch.distributed as dist
+from collections import defaultdict
 from tqdm import tqdm
 from typing import List
 
@@ -121,11 +122,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 json.dump(json_results, fp, indent=4)
         else:
             print("Results:")
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # for req in results:
-            #     print(f"rid: {req.request_id}\nprompt: {req.prompt!r}\noutput: {req.generated_text!r}\n\n")
-            # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-            from collections import defaultdict
             unique_prompt_map = defaultdict(list)
             for req in results:
                 unique_prompt_map[req.prompt].append(req)
@@ -133,11 +129,10 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 print(f"%d/%d. prompt '%s' ... [%d] output '%s'." % (
                     idx,
                     len(unique_prompt_map),
-                    prompt_text,
+                    prompt_text.replace("\n", "\\n"),
                     len(reqs),
                     reqs[0].generated_text.replace("\n", "\\n"),
                 ))
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
  
         # kill the engines and suspend the client
         client.stop_engines()
