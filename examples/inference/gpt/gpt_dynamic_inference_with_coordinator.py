@@ -127,6 +127,7 @@ if __name__ == "__main__":
             top_p=args.top_p,
             return_log_probs=args.return_log_probs,
             num_tokens_to_generate=args.num_tokens_to_generate,
+            termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         )
 
         # Requests, context, conroller.
@@ -143,7 +144,6 @@ if __name__ == "__main__":
         engine = DynamicInferenceEngine(
             controller,
             context,
-            termination_id=tokenizer.eod,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill

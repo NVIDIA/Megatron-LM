@@ -86,6 +86,9 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
+        static_sampling (bool): If True, all requests are assumed to have the same
+            sampling parameters. This avoids needing to loop through all requests and
+            their sampling parameters every generation step, improving latency.
     """
 
     def __init__(
