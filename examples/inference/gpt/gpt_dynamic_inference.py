@@ -531,10 +531,10 @@ def main():
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
-    # Timing results.
-    print("~~~")
-    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
-    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+        # Timing results.
+        print("~~~")
+        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
 
         p_times = step_times["prefill"]
         d_times = step_times["decode"]
