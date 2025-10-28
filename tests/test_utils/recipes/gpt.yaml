@@ -471,7 +471,7 @@ products:
       - environment: [lts]
         scope: [mr, mr-github]
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       - environment: [dev]
         scope: [mr, mr-github-slim]
