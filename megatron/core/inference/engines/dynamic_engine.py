@@ -604,7 +604,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.paused_request_count : self.context.total_request_count
         ].tolist()
         if self.static_sampling:
-            return [next(self.requests.values()).sampling_params, active_request_ids]
+            return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
 
         # Get a map from request_id to context array index.
         context_id_map = {r: i for i, r in enumerate(active_request_ids)}
