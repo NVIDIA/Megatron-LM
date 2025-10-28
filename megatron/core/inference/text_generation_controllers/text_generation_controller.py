@@ -441,7 +441,10 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state()
+        context.initialize_attention_state(
+            num_warmup_tokens=num_warmup_tokens,
+            warmup_engine_mode=warmup_engine_mode,
+        )
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -467,7 +470,7 @@ class TextGenerationController:
                 unwrapped_model.set_symmetric_ar(None)
 
         # Get flat tokens, position ids.
-        return context.current_input_and_position_ids()
+        return context.current_input_and_position_ids(num_warmup_tokens=num_warmup_tokens)
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
         """Forward step the model to get logits for dynamic batching.
@@ -616,12 +619,16 @@ class TextGenerationController:
 
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
-        self, sampling_params: SamplingParams, termination_id: int
+        self,
+        sampling_params: SamplingParams,
+        termination_id: int,
+        skip_bookkeeping: Optional[bool] = False,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
             sampling_params (SamplingParams): Parameters for sampling logits.
+            termination_id (int): The token ID that indicates termination.
 
         Return:
             (Optional[Dict]): A dictionary containing:
@@ -656,7 +663,7 @@ class TextGenerationController:
         # Note: This can be moved further ahead if sampling can be made
         # asynchronous.
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This needs to happen after all GPU methods.
+        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
         # This method will only interact with CPU tensors in the future.
@@ -670,7 +677,10 @@ class TextGenerationController:
         log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample, sampling_params)
 
         # This method only interacts with CPU tensors.
-        request_bookeeping = self._dynamic_step_context_bookkeeping(new_sample, termination_id)
+        if skip_bookkeeping:
+            request_bookeeping = {}
+        else:
+            request_bookeeping = self._dynamic_step_context_bookkeeping(new_sample, termination_id)
 
         ret = {
             "sample": new_sample,

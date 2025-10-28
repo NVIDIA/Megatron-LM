@@ -164,15 +164,6 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
-        # Handle setting up expert padding for cuda graph inference if set.
-        model_config = get_model_config(controller.inference_wrapped_model.model)
-        inference_wrapper_config = controller.inference_wrapped_model.inference_wrapper_config
-        if inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference:
-            capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-            set_decode_expert_padding(
-                controller.inference_wrapped_model.model, True, capacity_factor=capacity_factor
-            )
-
         self.capture_stats = None
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -200,11 +191,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     # This case is not supported`` as we require atleast two
                     # tokens for a non-decode engine step.
                     continue
-                # Initialize attention state.
-                context.initialize_attention_state(
+
+                # Initialize context.
+                input_ids, position_ids = self.controller._dynamic_step_context_init(
                     num_warmup_tokens=cuda_graph_token_count,
                     warmup_engine_mode=warmup_engine_mode,
                 )
+
+                # Initialize attention state.
                 assert (
                     cuda_graph_token_count == context.padded_active_token_count
                 ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
@@ -219,21 +213,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}"
                     )
 
-                # Get flat tokens, position ids.
-                input_ids, position_ids = context.current_input_and_position_ids(
-                    num_warmup_tokens=cuda_graph_token_count
-                )
-
                 # Forward pass -> logits.
-                with torch.inference_mode():
-                    controller.inference_wrapped_model.run_one_forward_step(
-                        {
-                            "tokens": input_ids,
-                            "position_ids": position_ids,
-                            "attention_mask": None,
-                        }
-                    )
-                    if reset_context:
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                if reset_context:
+                    with torch.inference_mode():
                         context.reset()  # todo: @lmcafee, remove if unnecessary.
 
         # Memory usage.
