@@ -33,9 +33,12 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator(sampling_params, 
-                                                inference_coordinator_port=port,
-                                                launch_inference_coordinator=True)   
+    await engine.start_listening_to_data_parallel_coordinator(
+        sampling_params, 
+        inference_coordinator_port=port,
+        launch_inference_coordinator=True,
+        verbose=True,
+    )
     # if you want to use your own inference coordinator - 
     # 1. set launch_inference_coordinator to False
     # 2. setup a router socket at tcp://MASTER_ADDR:PORT
@@ -85,24 +88,13 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 futures.append(client.add_request(request.prompt_text, 
                                                         sampling_params))
                 num_requests_added += 1
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # >>>
-                def print_suspend_resume(key):
-                    print("++++++ %s ... r %d / %d, s %d." % (
-                        key,
-                        num_requests_added,
-                        num_requests_total,
-                        suspend_resume_interval,
-                    ))
-                # <<<
 
+                # Test suspend/resume.
                 if num_requests_added in suspend_idxs:
-                    print_suspend_resume("suspend")
                     client.pause_engines()
                 if num_requests_added in resume_idxs:
-                    print_suspend_resume("resume")
                     client.unpause_engines()
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
             if num_requests_added == num_requests_total:
                 break
             # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 

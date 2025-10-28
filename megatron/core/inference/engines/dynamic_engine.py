@@ -290,6 +290,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sampling_params: SamplingParams,
         inference_coordinator_port: int,
         launch_inference_coordinator: bool = True,
+        verbose: bool = False,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -321,6 +322,7 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            verbose (bool): Whether to run in verbose mode.
 
         Note:
             The current implementation uses `ipc` sockets for broadcasting requests
@@ -410,7 +412,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         self.engine_loop_task = asyncio.create_task(
-            self.run_engine_with_coordinator(sampling_params)
+            self.run_engine_with_coordinator(sampling_params, verbose=verbose)
         )
 
     @contextmanager

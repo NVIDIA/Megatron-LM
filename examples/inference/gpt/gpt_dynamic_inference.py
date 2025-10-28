@@ -479,6 +479,7 @@ def main():
                     o_len = 0
                     escaped_output_text = "--"
                     print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -545,6 +546,7 @@ def main():
             f"total time: {total_time:.3f}s … "
             f"steps: {engine.step_count:d} … "
             f"throughput: {throughput:.3f} tok/s"
+            f"text hash: {hashlib.sha256(str(text_hashes).encode()).hexdigest()[:6]}"
         )
         print("~~~")
 
