@@ -405,7 +405,7 @@ jobs:
 
           if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
             ARGS=(
-              --scope mr
+              --scope mr-github
               --enable-lightweight-mode
             )
           else
