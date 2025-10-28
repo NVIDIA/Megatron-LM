@@ -174,6 +174,11 @@ class SFTTokenizer(MegatronLegacyTokenizer):
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eos_token_id
+    
+    @property
+    def eos(self):
+        """End of sentence token ID."""
+        return self._tokenizer.eos_token_id
 
     @property
     def vocab(self):
