@@ -1190,6 +1190,9 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.cpu_offloading_num_layers > 0:
+        args.cpu_offloading = True
+
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
@@ -1417,6 +1420,9 @@ def _add_inference_args(parser):
                        'whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, '
                        'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -1471,6 +1477,9 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--decode-only-cuda-graphs',
+                       action='store_true', default=False,
+                       help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
@@ -2053,6 +2062,8 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
+    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
+                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2202,6 +2213,10 @@ def _add_training_args(parser):
                        help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
     group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
                        help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
+    group.add_argument('--dump-param-to-param-group-map', type=str, default=None,
+                        help="Path to a file containing parameter-to-parameter-group mapping. "
+                        "Provide a JSON file that specifies which parameters belong to which "
+                        "parameter group for global coordination.")
     group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
@@ -2506,9 +2521,6 @@ def _add_checkpointing_args(parser):
                             ' rank for saving. Turn on only if experiencing host or device memory'
                             ' issues. Has affect only with `--dist-ckpt-optim-fully-reshardable`'
                             ' flag.')
-    group.add_argument('--load-model-opt-format', action='store_true',
-                       help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
-                            'This function can also be used to load NeMo .nemo sharded checkpoints.')
     return parser
 
 
@@ -3156,6 +3168,10 @@ def _add_moe_args(parser):
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
+    group.add_argument('--moe-pad-experts-for-cuda-graph-inference', action='store_true',
+                       help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
+                       " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
+                       " max that an expert could see during inference so no tokens are actually dropped.")
     return parser
 
 def _add_mla_args(parser):

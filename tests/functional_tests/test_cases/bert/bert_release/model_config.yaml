@@ -27,7 +27,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 8
   # Data args
   --data-path: ${DATA_BLEND}
-  --vocab-file: ${DATA_PATH}/vocab.txt
+  --vocab-file: ${DATA_PATH}/text/the_pile/bert_shard00/vocab.txt
   --split: 949,50,1
   --data-cache-path: ${DATA_CACHE_PATH}
   # EVAL_AND_LOGGING_ARGS

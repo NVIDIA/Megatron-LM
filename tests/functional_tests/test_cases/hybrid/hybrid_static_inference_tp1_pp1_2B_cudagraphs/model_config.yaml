@@ -10,9 +10,9 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
-  --timing-log-level: 2
-  --load: ${CHECKPOINT_LOAD_PATH}/mamba_hybrid_2b/checkpoint
-  --tokenizer-model: ${DATA_PATH}/mamba_hybrid_2b/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --timing-log-level: 0
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/checkpoint
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
   --tiktoken-pattern: v2
   --distributed-backend: nccl

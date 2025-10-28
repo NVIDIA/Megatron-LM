@@ -13,6 +13,9 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -488,6 +491,40 @@ class DynamicInferenceContext(BaseInferenceContext):
         return token_rounder * int(math.ceil(int(value) / token_rounder))
 
     @classmethod
+    def from_config(
+        cls,
+        inference_config: InferenceWrapperConfig,
+        model,
+        max_batch_size: int,
+        buffer_size_gb: float = 40,
+        num_cuda_graphs: int = None,
+    ):
+        """
+        Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
+        """
+        # TODO: Add other necessary configs from inference_config
+
+        buffer_guaranteed_fraction = 0.1
+        model_config = model.config
+        max_sequence_length = (
+            inference_config.inference_max_seq_length or model_config.max_sequence_length
+        )
+        max_sequence_length = max(max_sequence_length, max_batch_size)
+        return cls(
+            params_dtype=inference_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=inference_config.inference_max_seq_length,
+            buffer_size_gb=buffer_size_gb,
+            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            materialize_only_last_token_logits=False,
+            max_requests_override=max_batch_size,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
+        )
+
+    @classmethod
     def round_up_requests(cls, value, tp_size=None):
         """Round up to nearest multiple of `REQUEST_ROUNDER` (above) that is also divisible by tensor model parallel size."""
         if not HAVE_PACKAGING:
@@ -716,7 +753,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_seq_idx = self.token_to_position_in_request[:n]
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
-            assert key.shape[0] == n
+            if key.shape[0] != n:
+                raise AssertionError(
+                    f"apply_rotary_emb_key: key.shape[0]={key.shape[0]} != n={n}; "
+                    f"padded_active_request_count={self.padded_active_request_count}, "
+                    f"active_token_count={self.active_token_count}, total_request_count={self.total_request_count}, "
+                    f"paused_request_count={self.paused_request_count}"
+                )
             key = apply_rotary_pos_emb(
                 t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
@@ -1002,7 +1045,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # todo: @lmcafee, remove these asserts?
-        assert logits.size(0) == 1
+        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
         assert logits.size(1) == self.padded_active_token_count, (
             f"logits.size(1) ({tuple(logits.shape)}) != "
             f"padded_active_token_count ({self.padded_active_token_count})."
