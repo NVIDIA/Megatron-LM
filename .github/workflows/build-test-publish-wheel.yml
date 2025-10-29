@@ -37,6 +37,7 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   build-and-test-wheels:
+    needs: [pre-flight]
     strategy:
       fail-fast: false
       matrix:
