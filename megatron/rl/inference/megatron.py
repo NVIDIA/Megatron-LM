@@ -80,7 +80,8 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
 
 
 ## This code is copied from tools/run_text_generation_server.py
-def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
+def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inference_logging_step_interval: int = 0,
+    metrics_writer = None) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
     This function will automatically choose the TRTLLMBackend when possible, and default to Mcore backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
@@ -88,6 +89,8 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     Args:
         args (Namespace): The user arguments parsed from command line
         model (MegatronModule): The megatron model.
+        inference_logging_step_interval (int): Step interval for logging inference metrics.
+        metrics_writer: Metrics writer (wandb module) for logging.
 
     Returns:
         AbstractBackend: The chosen backend
@@ -126,6 +129,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
         mamba_d_model=args.hidden_size,
         mamba_d_conv=4 if args.is_hybrid_model else None,
         mamba_d_state=args.mamba_state_dim,
+        metrics_writer=metrics_writer,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
@@ -143,6 +147,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
         context=inference_context,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
+        inference_logging_step_interval=inference_logging_step_interval,
     )
 
 
@@ -195,8 +200,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 logging.WARNING,
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
+        
+        # Get inference logging configuration from args
+        inference_logging_step_interval = args.inference_wandb_logging_step_interval
+        
+        # Get metrics writer if logging is enabled and on the logging rank
+        # Use the same rank convention as training (last rank logs)
+        metrics_writer = None
+        if inference_logging_step_interval > 0 and args.rank == (args.world_size - 1):
+            metrics_writer = get_wandb_writer()
+            if metrics_writer is None:
+                log_single_rank(logger, logging.WARNING, "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
+                           "wandb module is available. Inference logging will be disabled.")
 
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model)
+        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
         coordinator = DynamicEngineCoordinator(
             inference_engine,
             inference_max_requests=inference_engine.context.max_requests,
