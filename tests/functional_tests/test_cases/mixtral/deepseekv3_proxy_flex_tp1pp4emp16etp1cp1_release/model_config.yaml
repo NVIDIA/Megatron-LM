@@ -126,8 +126,6 @@ MODEL_ARGS:
   --eval-interval: 200
 
   # Add checkpointing args
-  --no-load-optim: true
-  --no-load-rng: true
   --auto-detect-ckpt-format:
     true
     # Add checkpointing args
