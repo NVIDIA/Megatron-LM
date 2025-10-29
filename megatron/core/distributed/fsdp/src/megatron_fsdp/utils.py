@@ -905,7 +905,7 @@ class FSDPDistributedIndex:
         return self._hybrid_fsdp_group_ranks.index(self.hybrid_fsdp_group.rank())
 
     def representative_rank(self) -> int:
-        return self.device_mesh.representative_rank()
+        return self.device_mesh.mesh.flatten()[0].item()
 
 
 class GlobalMemoryBuffer:
