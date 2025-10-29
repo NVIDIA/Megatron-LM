@@ -1646,8 +1646,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             'total_chunks': int,
             'allocated_chunks': int,
             'active_unique_chunks': int,
-            'allocated_utilization': float,  # 0..1
-            'active_utilization': float,     # 0..1
+            'allocated_utilization': float,
+            'active_utilization': float,
             'active_request_count': int,
             'paused_request_count': int,
             'gtd_chunk_count': int,
