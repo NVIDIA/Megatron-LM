@@ -85,7 +85,7 @@ jobs:
             docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp312-cp312/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp313-cp313/bin/python -m build
             USE_DIST_DIR=0
-            auditwheel repair dist/*.whl || USE_DIST_DIR=1
+            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} auditwheel repair dist/*.whl || USE_DIST_DIR=1
             if [ "$USE_DIST_DIR" != "1" ]; then
               rm -rf dist/*.whl
             fi
