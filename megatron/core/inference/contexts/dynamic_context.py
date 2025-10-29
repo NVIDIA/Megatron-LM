@@ -1637,64 +1637,62 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
 
-        Returns a dictionary with counts and percentages for both allocated chunk
-        usage (overall buffer occupancy) and active usage (chunks referenced by
+        Returns a dictionary with counts and percentages for both allocated block
+        usage (overall buffer occupancy) and active usage (blocks referenced by
         currently active requests this step).
 
         Return:
             {
-            'total_chunks': int,
-            'allocated_chunks': int,
-            'active_unique_chunks': int,
+            'total_blocks': int,
+            'allocated_blocks': int,
+            'active_unique_blocks': int,
             'allocated_utilization': float,
             'active_utilization': float,
             'active_request_count': int,
             'paused_request_count': int,
-            'gtd_chunk_count': int,
+            'gtd_block_count': int,
             }
         """
-        # Total usable chunks exclude the reserved dummy chunk.
-        total_chunks = max(self.chunk_allocator.chunk_count_total - 1, 1)
-        chunk_count_avail = int(self.chunk_allocator.chunk_count_avail)
+        # Total usable blocks exclude the reserved dummy block.
+        total_blocks = max(self.block_allocator.block_count_total - 1, 1)
+        block_count_avail = int(self.block_allocator.block_count_avail)
 
-        # Overall allocated chunks in the buffer right now.
-        allocated_chunks = (self.chunk_allocator.chunk_count_total - 1) - chunk_count_avail
-        allocated_chunks = int(max(0, allocated_chunks))
+        # Overall allocated blocks in the buffer right now.
+        allocated_blocks = (self.block_allocator.block_count_total - 1) - block_count_avail
+        allocated_blocks = int(max(0, allocated_blocks))
 
-        # Active unique chunks referenced by current active requests only.
-        # Restrict to active rows to avoid padded rows in cudagraph-only tensors.
+        # Active unique blocks referenced by current active requests only.
         active_start = self.paused_request_count
         active_end = self.total_request_count
         if active_end > active_start:
-            active_rows = self.request_to_kv_chunk_ids[active_start:active_end]
-            # Filter valid chunk ids (>= 0) and count unique ids.
+            active_rows = self.request_to_kv_block_ids[active_start:active_end]
+            # Filter valid block ids (>= 0) and count unique ids.
             valid_ids = active_rows[active_rows >= 0]
             if valid_ids.numel() > 0:
-                # torch.unique supports CUDA tensors; keep computation on device.
                 unique_ids = torch.unique(valid_ids)
-                active_unique_chunks = int(unique_ids.numel())
+                active_unique_blocks = int(unique_ids.numel())
             else:
-                active_unique_chunks = 0
+                active_unique_blocks = 0
         else:
-            active_unique_chunks = 0
+            active_unique_blocks = 0
 
-        allocated_utilization = float(allocated_chunks) / float(total_chunks)
-        active_utilization = float(active_unique_chunks) / float(total_chunks)
+        allocated_utilization = float(allocated_blocks) / float(total_blocks)
+        active_utilization = float(active_unique_blocks) / float(total_blocks)
 
         # Diagnostic helpers
-        num_non_gtd_chunks = max(0, chunk_count_avail - int(self.gtd_chunk_count))
+        num_non_gtd_blocks = max(0, block_count_avail - int(self.gtd_block_count))
         total_request_count = int(self.total_request_count)
         return {
-            'total_chunks': int(total_chunks),
-            'allocated_chunks': int(allocated_chunks),
-            'active_unique_chunks': int(active_unique_chunks),
+            'total_blocks': int(total_blocks),
+            'allocated_blocks': int(allocated_blocks),
+            'active_unique_blocks': int(active_unique_blocks),
             'allocated_utilization': allocated_utilization,
             'active_utilization': active_utilization,
             'active_request_count': int(self.get_active_request_count()),
             'paused_request_count': int(self.paused_request_count),
-            'gtd_chunk_count': int(self.gtd_chunk_count),
-            'chunk_count_avail': int(chunk_count_avail),
-            'num_non_gtd_chunks': int(num_non_gtd_chunks),
+            'gtd_block_count': int(self.gtd_block_count),
+            'block_count_avail': int(block_count_avail),
+            'num_non_gtd_blocks': int(num_non_gtd_blocks),
             'active_token_count': int(self.active_token_count),
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
