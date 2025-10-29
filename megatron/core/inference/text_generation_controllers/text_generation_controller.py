@@ -566,14 +566,13 @@ class TextGenerationController:
         return logits
 
     def _dynamic_step_sample_bookkeeping(
-        self,
-        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+        self, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
     ):
         """Perform bookkeeping necessary to sample logits for dynamic batching."""
         pass
 
     def _dynamic_step_sample_logits(
-        self, logits: Tensor, active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+        self, logits: Tensor, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
     ) -> Tensor:
         """Sample logits for dynamic batching.
 
