@@ -170,6 +170,8 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
     --node_rank $NODE_RANK
     --log-dir $LOG_DIR
+    --tee "0:3,7:3"
+    --redirects "3"
 )
 
 # Start training
