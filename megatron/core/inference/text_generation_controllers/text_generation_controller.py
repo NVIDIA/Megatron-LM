@@ -508,7 +508,7 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            if context.is_decode_only():
+            if context.is_decode_only() or warmup_engine_mode is not None:
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
@@ -565,18 +565,23 @@ class TextGenerationController:
             )
         return logits
 
-    def _dynamic_step_sample_bookkeeping(self, sampling_params: SamplingParams):
+    def _dynamic_step_sample_bookkeeping(
+        self,
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+    ):
         """Perform bookkeeping necessary to sample logits for dynamic batching."""
         pass
 
     def _dynamic_step_sample_logits(
-        self, logits: Tensor, sampling_params: SamplingParams
+        self, logits: Tensor, active_sampling_map: List[Tuple[SamplingParams, List[int]]],
     ) -> Tensor:
         """Sample logits for dynamic batching.
 
         Args:
             logits (Tensor): The logits from the forward step.
-            sampling_params (SamplingParams): Parameters for sampling logits.
+            active_sampling_map (List[Tuple[SamplingParams, List[int]]]): A list of tuples
+                matching each unique set of sampling params to the context array indices
+                of the corresponding active requests.
 
         Returns:
             new_sample (Tensor): The sampled tokens for each active request.
@@ -609,7 +614,10 @@ class TextGenerationController:
         pass
 
     def _dynamic_step_calculate_log_probs(
-        self, logits: Tensor, new_sample: Tensor, sampling_params: SamplingParams
+        self,
+        logits: Tensor,
+        new_sample: Tensor,
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
     ) -> Optional[Tensor]:
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
@@ -710,13 +718,13 @@ class TextGenerationController:
         if context.active_token_count == 0:
             return None
 
-        # This method only interacts with CPU tensors.
+        # This method only performs computations using CPU tensors.
         input_ids, position_ids = self._dynamic_step_context_init()
         cuda_graph_request_count = (
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
-        # This method only interacts with GPU tensors.
+        # This method only performs computations using GPU tensors.
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # This is the best place to yield control back to event loop.
@@ -728,17 +736,17 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
-        # This method will only interact with CPU tensors in the future.
-        self._dynamic_step_sample_bookkeeping(sampling_params)
-        # This method will only interact with GPU tensors in the future.
-        new_sample = self._dynamic_step_sample_logits(logits, sampling_params)
+        # This method will only perform computations using CPU tensors in the future.
+        self._dynamic_step_sample_bookkeeping(active_sampling_map)
+        # This method will only perform computations using GPU tensors in the future.
+        new_sample, termination_id = self._dynamic_step_sample_logits(logits, active_sampling_map)
 
-        # This method will only interact with CPU tensors in the future.
+        # This method will only perform computations using CPU tensors in the future.
         self._dynamic_step_log_probs_bookkeeping()
-        # This method will only interact with GPU tensors in the future.
-        log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample, sampling_params)
+        # This method will only perform computations using GPU tensors in the future.
+        log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample, active_sampling_map)
 
-        # This method only interacts with CPU tensors.
+        # This method only performs computations using CPU tensors.
         if skip_bookkeeping:
             request_bookeeping = {}
         else:
