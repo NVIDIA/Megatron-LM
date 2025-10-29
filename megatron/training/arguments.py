@@ -992,8 +992,6 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
-    if args.num_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
@@ -1261,7 +1259,8 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.is_hybrid_model:
         kw_args['is_hybrid_model'] = args.is_hybrid_model
-
+    kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
+    kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
     kw_args['inference_sampling_seed'] = args.seed
 
     # handle quantization config
@@ -1604,6 +1603,10 @@ def _add_network_size_args(parser):
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
                        'reasons.')
+    group.add_argument('--post-self-attn-layernorm', action='store_true',
+                       help='If set, use post self attention layernorm.')    
+    group.add_argument('--post-mlp-layernorm', action='store_true',
+                       help='If set, use post MLP layernorm.')
     group.add_argument('--squared-relu', action='store_true',
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',

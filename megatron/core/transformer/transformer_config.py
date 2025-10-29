@@ -191,7 +191,11 @@ class TransformerConfig(ModelParallelConfig):
 
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
+    
+    post_self_attn_layernorm: bool = False
 
+    post_mlp_layernorm: bool = False
+    
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -248,6 +252,8 @@ class TransformerConfig(ModelParallelConfig):
     training of very large models. This feature is only works when megatron fsdp is turned on.
     """
 
+    post_self_attn_layernorm: bool = False
+    post_mlp_layernorm: bool = False
     ####################
     # mixed-precision
     ####################

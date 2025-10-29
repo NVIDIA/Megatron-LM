@@ -79,7 +79,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     qk_l2_norm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
-    use_te_activation_func: bool = False,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -110,8 +111,6 @@ def get_gpt_layer_with_transformer_engine_spec(
         backend: BackendSpecProvider = KitchenSpecProvider(fallback=TESpecProvider())
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
-        if use_te_activation_func:
-            raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
         backend = TESpecProvider()
 
@@ -121,7 +120,6 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
-        use_te_activation_func=use_te_activation_func,
     )
 
     if multi_latent_attention:
@@ -156,9 +154,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             ),
         )
     else:
@@ -182,6 +182,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
@@ -193,6 +194,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
                     "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
                 },
+                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             ),
         )
 
@@ -207,6 +209,8 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -369,26 +373,22 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
-    use_te_activation_func: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
     linear_fc2 = backend.row_parallel_linear()
-    activation_func = backend.activation_func() if use_te_activation_func else None
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        module = TEFusedMLP if use_te_op_fuser else MLP
-        if backend.fuse_layernorm_and_linear():
+        if use_te_op_fuser:
+            return ModuleSpec(module=TEFusedMLP)
+        elif backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
             linear_fc1 = backend.column_parallel_linear()
         return ModuleSpec(
-            module=module,
-            submodules=MLPSubmodules(
-                linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
-            ),
+            module=MLP, submodules=MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
         )
     else:
         # Mixture of experts with modules in megatron core.
@@ -397,7 +397,6 @@ def get_mlp_module_spec_for_backend(
             num_experts=num_experts,
             moe_grouped_gemm=moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
-            use_te_activation_func=use_te_activation_func,
         )
 
 
@@ -407,7 +406,6 @@ def get_gpt_decoder_block_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -420,7 +418,6 @@ def get_gpt_decoder_block_spec(
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -430,7 +427,6 @@ def get_gpt_decoder_block_spec(
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
         )
     else:
         layer_norm_impl = LNImpl
@@ -487,17 +483,17 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
 
     if config.pipeline_model_parallel_layout is not None:
         local_layer_specs = [
             layer_specs[layer_id]
             for layer_id in config.pipeline_model_parallel_layout.get_layer_id_list(
-                layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+                layer_type=LayerType.decoder, vp_stage=vp_stage
             )
         ]
     else:
-        offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
@@ -513,7 +509,6 @@ def get_gpt_mtp_block_spec(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     use_transformer_engine: bool,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
@@ -529,7 +524,7 @@ def get_gpt_mtp_block_spec(
             else LocalSpecProvider()
         )
     return get_gpt_mtp_block_spec_for_backend(
-        config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
+        config=config, spec=spec, backend=backend, vp_stage=vp_stage
     )
 
 
@@ -538,10 +533,9 @@ def get_gpt_mtp_block_spec_for_backend(
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     backend: BackendSpecProvider,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage)
     if num_layers_to_build == 0:
         return None
 

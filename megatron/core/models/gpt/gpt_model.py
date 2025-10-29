@@ -6,11 +6,10 @@ from typing import Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -18,15 +17,11 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
-    MTPLossAutoScaler,
-    MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
-    roll_tensor,
     tie_output_layer_state_dict,
     tie_word_embeddings_state_dict,
 )
@@ -76,7 +71,7 @@ class GPTModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
-        pg_collection (ProcessGroupCollection): Model communication process groups
+        model_comm_pgs (ModelCommProcessGroups): Model communication process groups
     """
 
     def __init__(
@@ -91,7 +86,7 @@ class GPTModel(LanguageModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
-            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
+            'learned_absolute', 'rope', 'mrope', 'none'
         ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
@@ -100,10 +95,10 @@ class GPTModel(LanguageModule):
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -146,7 +141,7 @@ class GPTModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=self.pg_collection.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -159,29 +154,9 @@ class GPTModel(LanguageModule):
                 rope_scaling=rope_scaling,
                 rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
+                cp_group=self.model_comm_pgs.cp,
             )
 
-        elif self.position_embedding_type == 'yarn':
-            self.rotary_pos_emb = YarnRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
-                original_max_position_embeddings=getattr(
-                    self.config, "yarn_original_max_position_embeddings"
-                ),
-                beta_fast=getattr(self.config, "yarn_beta_fast"),
-                beta_slow=getattr(self.config, "yarn_beta_slow"),
-                mscale=getattr(self.config, "yarn_mscale"),
-                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
-                correction_range_round_to_int=getattr(
-                    self.config, "yarn_correction_range_round_to_int"
-                ),
-                use_cpu_initialization=self.config.use_cpu_initialization,
-            )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
@@ -204,7 +179,7 @@ class GPTModel(LanguageModule):
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
-            pg_collection=self.pg_collection,
+            model_comm_pgs=self.model_comm_pgs,
             vp_stage=vp_stage,
         )
 
@@ -214,7 +189,7 @@ class GPTModel(LanguageModule):
             )
 
         # Output
-        if self.post_process:
+        if self.post_process or self.mtp_process:
 
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
@@ -243,7 +218,7 @@ class GPTModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
-                tp_group=self.pg_collection.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:
@@ -307,35 +282,16 @@ class GPTModel(LanguageModule):
         rotary_pos_emb = None
         rotary_pos_cos = None
         rotary_pos_sin = None
-        # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
-        rotary_pos_cos_sin = None
-
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            use_flash_infer_fused_rope = (
-                hasattr(inference_context, 'use_flashinfer_fused_rope')
-                and inference_context.use_flashinfer_fused_rope
-            )
-            if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
+            if in_inference_mode and self.config.flash_decode:
                 assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
-                    "Flash decode is only applicable to static batching."
-                )
+                    inference_context.is_static_batching()
+                ), "GPTModel currently only supports static inference batching."
                 # Flash decoding uses precomputed cos and sin for RoPE
-                if self.config.flash_decode:
-                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                    )
-                elif use_flash_infer_fused_rope:
-                    assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
-                    rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        torch.cat(
-                            self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                            -1,
-                        ),
-                    )
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
+                    inference_context.max_sequence_length,
+                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                )
             else:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -345,24 +301,13 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
-        elif self.position_embedding_type == 'yarn':
-            if self.training or not self.config.flash_decode:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len)
-            else:
-                raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
-                    "YarnRotaryEmbedding yet."
-                )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
                 raise NotImplementedError(
-                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implmented in "
                     "MultimodalRotaryEmbedding yet."
                 )
 
@@ -390,22 +335,7 @@ class GPTModel(LanguageModule):
         if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
 
-        preproc_output = (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-        )
-        if rotary_pos_cos_sin is not None:
-            # only in the case of flashinfer fused rope will we
-            # return this extra tensor
-            # this is for backwards compatibility with
-            # legacy unit tests, which break if you
-            # return a 6 tuple instead of 5.
-            preproc_output += (rotary_pos_cos_sin,)
-
-        return preproc_output
+        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
 
     def forward(
         self,
@@ -423,7 +353,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoder and finally into the post
+        through the embedding layer, and then the decoeder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
@@ -435,19 +365,15 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        preproc_output = self._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+            self._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
         )
-
-        (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = (
-            preproc_output[:5]
-        )
-
-        rotary_pos_cos_sin = preproc_output[5] if len(preproc_output) == 6 else None
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -457,10 +383,9 @@ class GPTModel(LanguageModule):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            **(extra_block_kwargs or {}),
+            # **(extra_block_kwargs or {}),
         )
 
         return self._postprocess(
@@ -517,10 +442,12 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if mtp_in_postprocess:
+        if mtp_in_postprocess and labels is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
@@ -530,89 +457,29 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
-                **(extra_block_kwargs or {}),
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                compute_language_model_loss=self.compute_language_model_loss,
+                extra_block_kwargs=extra_block_kwargs,
             )
 
         if not self.post_process:
             return hidden_states
 
-        if self.mtp_process:
-            mtp_labels = labels.clone()
-            hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
-            hidden_states = hidden_states_list[0]
-            if loss_mask is None:
-                # if loss_mask is not provided, use all ones as loss_mask
-                loss_mask = torch.ones_like(mtp_labels)
-            for mtp_layer_number in range(self.config.mtp_num_layers):
-                # output
-                mtp_logits, _ = self.output_layer(
-                    hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
-                # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
-                loss_mask, num_tokens = roll_tensor(
-                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
-                )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
-                mtp_loss = loss_mask * mtp_loss
-                if self.training:
-                    # TODO(shifangx): remove the use of parallel_state here
-                    # after moving loss logging to loss_func in pretrain_gpt.py
-                    MTPLossLoggingHelper.save_loss_to_tracker(
-                        torch.sum(mtp_loss) / num_tokens,
-                        mtp_layer_number,
-                        self.config.mtp_num_layers,
-                        avg_group=parallel_state.get_data_parallel_group(
-                            with_context_parallel=True
-                        ),
-                    )
-                mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
-                if self.config.calculate_per_token_loss:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss
-                    )
-                else:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss / num_tokens
-                    )
-        sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    # TODO(ksanthanam): Make the equivalent change in the `MambaModel` code after
-                    # merging in !3722.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
                 # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
                 # state ([B, H]) → unsqueeze back to [1, B, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
-
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.materialize_only_last_token_logits
-            )
-            self.output_layer.sequence_parallel = True
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
@@ -628,6 +495,12 @@ class GPTModel(LanguageModule):
 
         if labels is None:
             # [s b h] => [b s h]
+            return logits.transpose(0, 1).contiguous()
+
+        # Optionally return logits even when labels are provided. This allows
+        # callers to trigger MTP loss computation while still obtaining logits
+        # for an external loss (e.g., RL policy loss).
+        if extra_block_kwargs and extra_block_kwargs.get('mtp_return_logits_when_labels', False):
             return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)

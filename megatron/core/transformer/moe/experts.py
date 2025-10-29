@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -22,9 +21,7 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_align_size
-from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
-from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -34,7 +31,7 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.moe.moe_utils import ModelCommProcessGroups
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -57,7 +54,7 @@ except ImportError:
 # TODO(Hepteract): delete the usage of the global parallel_state.
 # Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
 # in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass pg_collection to sub-module
+# After sub-module's refactoring is done, we can pass model_comm_pgs to sub-module
 # and delete the function expert_dist_ckpt_decorator.
 def expert_dist_ckpt_decorator(func):
     """Decorator of shared_state_dict in expert layer for distributed checkpoint.
@@ -107,7 +104,7 @@ class GroupedMLP(MegatronModule):
         self,
         num_local_experts: int,
         config: TransformerConfig,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         super().__init__(config=config)
         self.config: TransformerConfig = config
@@ -134,8 +131,6 @@ class GroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and self.config.fp8:
-            raise ValueError("moe_act recompute for fp8 cannot work with the legacy GroupedMLP.")
 
         @jit_fuser
         def activation_func_with_probs(x, probs):
@@ -145,11 +140,11 @@ class GroupedMLP(MegatronModule):
 
         self.activation_func_with_probs = activation_func_with_probs
 
-        self.ep_group = pg_collection.ep
-        # use pg_collection.expt_tp_group as tensor parallel group in this module.
-        self.tp_group = pg_collection.expt_tp
-        # use pg_collection.expt_dp_group as data parallel group in this module.
-        self.dp_group = pg_collection.expt_dp
+        self.ep_group = model_comm_pgs.ep
+        # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
+        self.tp_group = model_comm_pgs.expt_tp
+        # use model_comm_pgs.expt_dp_group as data parallel group in this module.
+        self.dp_group = model_comm_pgs.expt_dp
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
@@ -700,8 +695,27 @@ class GroupedMLP(MegatronModule):
                 with_glu = False
                 wkey = f'{prefix}experts.linear_fc2.weight'
 
+            """
+            When MCore Custom FSDP `optim_grads_params` is enabled, it is necessary to save the tensor local shard.
+            This local shard is accessible through the `fully_shard_param_local_shard` attribute of the tensor.
+
+            This attribute contains the local shard of the fully sharded parameter, which is essential for
+            correctly saving and loading the model state when using `optim_grads_params` with FSDP.
+
+            Example:
+                >>> # Assuming `tensor` is a fully sharded parameter
+                >>> local_shard = tensor.fully_shard_param_local_shard
+                >>> # Save the local shard as needed
+            """
             this_replica_id = list(copy.deepcopy(replica_id))
-            flattened_range = None
+            if hasattr(tensor, 'fully_shard_param_local_shard'):
+                if tensor.fully_shard_param_local_shard.numel() == 0:
+                    continue
+                flattened_range = slice(*tensor.fully_shard_param_local_index)
+                tensor = tensor.fully_shard_param_local_shard
+                this_replica_id[-1] = 0
+            else:
+                flattened_range = None
 
             sharded_state_dict[f'{prefix}{name}'] = ShardedTensorFactory(
                 wkey,
@@ -754,23 +768,23 @@ class TEGroupedMLP(MegatronModule):
         num_local_experts,
         config: TransformerConfig,
         submodules: MLPSubmodules,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
-        assert not (
-            self.config.add_bias_linear and config.bias_dropout_fusion
-        ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
+        assert (
+            config.add_bias_linear == False
+        ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
 
-        self.ep_group = pg_collection.ep
+        self.ep_group = model_comm_pgs.ep
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
+        # TODO(Hepteract): pass model_comm_pgs to submodule after refactoring Linear modules
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
@@ -779,18 +793,19 @@ class TEGroupedMLP(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=False,
+            skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc1',
-            tp_group=pg_collection.expt_tp,
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
-        else:
-            self.activation_func = self.config.activation_func
+        self.activation_func = self.config.activation_func
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "moe_act" in self.config.recompute_modules
+        )
 
-        # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
+        # TODO(Hepteract): pass model_comm_pgs to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
@@ -802,42 +817,13 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc2',
-            tp_group=pg_collection.expt_tp,
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
-
-        self.activation_recompute = (
-            self.config.recompute_granularity == 'selective'
-            and "moe_act" in self.config.recompute_modules
-        )
-        if self.activation_recompute and self.config.fp8:
-            from megatron.core.extensions.transformer_engine import set_save_original_input
-
-            set_save_original_input(self.linear_fc2)
 
         if self.config.fp8:
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
-
-    @staticmethod
-    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
-        if bias_parallel is None:
-            return intermediate_parallel
-        shape = intermediate_parallel.shape
-        return (
-            torch.cat(
-                [
-                    t + b * p
-                    for t, b, p in zip(
-                        torch.split(intermediate_parallel.view(-1, shape[-1]), tokens_per_expert),
-                        bias_parallel,
-                        torch.split(permuted_probs, tokens_per_expert),
-                    )
-                ]
-            )
-            .view(shape)
-            .to(intermediate_parallel.dtype)
-        )
 
     def forward(
         self,
@@ -883,15 +869,7 @@ class TEGroupedMLP(MegatronModule):
         )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
-            if self.config.use_te_activation_func:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-                if permuted_probs is not None:
-                    original_dtype = intermediate_parallel.dtype
-                    intermediate_parallel = intermediate_parallel * permuted_probs
-                    intermediate_parallel = intermediate_parallel.to(original_dtype)
-            elif self.config.bias_activation_fusion:
+            if self.config.bias_activation_fusion:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
                     intermediate_parallel = weighted_bias_swiglu_impl(
@@ -900,37 +878,27 @@ class TEGroupedMLP(MegatronModule):
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
                     )
-                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                    intermediate_parallel = weighted_bias_quick_geglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                        self.config.glu_linear_offset,
-                        self.config.activation_func_clamp_value,
-                    )
                 else:
-                    raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
-                    )
-            elif (
-                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
-            ):
-                assert bias_parallel is None
-                intermediate_parallel = weighted_squared_relu_impl(
-                    intermediate_parallel, permuted_probs
-                )
+                    raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
             else:
+                if bias_parallel is not None:
+                    shape = intermediate_parallel.shape
+                    intermediate_parallel = torch.cat(
+                        [
+                            t + b
+                            for t, b in zip(
+                                torch.split(
+                                    intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
+                                ),
+                                bias_parallel,
+                            )
+                        ]
+                    ).view(shape)
                 if self.config.gated_linear_unit:
 
                     def glu(x):
-                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (val := self.config.activation_func_clamp_value) is not None:
-                            x_glu = x_glu.clamp(min=None, max=val)
-                            x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
-                        )
+                        x = torch.chunk(x, 2, dim=-1)
+                        return self.config.activation_func(x[0]) * x[1]
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
@@ -956,9 +924,6 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if self.config.fp8:
             output = self.fp8_unpadding(output, actual_tokens_per_expert)
-
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
-        output_bias = None
 
         return output, output_bias
 
@@ -1022,7 +987,7 @@ class SequentialMLP(MegatronModule):
         num_local_experts,
         config: TransformerConfig,
         submodules: MLPSubmodules,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
@@ -1034,12 +999,13 @@ class SequentialMLP(MegatronModule):
             sequential_mlp_config.ffn_hidden_size = config.moe_ffn_hidden_size
             super().__init__(config=sequential_mlp_config)
 
+        self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
-        self.ep_group = pg_collection.ep
-        # use pg_collection.expt_dp_group as data parallel group in this module.
+        self.ep_group = model_comm_pgs.ep
+        # use model_comm_pgs.expt_dp_group as data parallel group in this module.
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
-        self.dp_group = pg_collection.expt_dp
+        self.dp_group = model_comm_pgs.expt_dp
 
         for _ in range(self.num_local_experts):
             expert = MLP(
@@ -1047,7 +1013,7 @@ class SequentialMLP(MegatronModule):
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
-                tp_group=pg_collection.expt_tp,
+                tp_group=parallel_state.get_expert_tensor_parallel_group(),
             )
             self.local_experts.append(expert)
 
@@ -1104,6 +1070,7 @@ class SequentialMLP(MegatronModule):
             probs_list = torch.split(permuted_probs, tokens_per_expert)
 
             output_local_list = []
+            output_bias_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
                 if self.config.fp8:
@@ -1113,10 +1080,15 @@ class SequentialMLP(MegatronModule):
                 else:
                     output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
+                if self.add_bias:
+                    output_bias_list.append(output_bias.expand_as(output))
 
             output_local = torch.cat(output_local_list, dim=0)
-            output_bias_local = None
-            # Note: if bias is enabled on experts, it is already added to the output at this point
+            if self.add_bias:
+                output_bias_local = torch.cat(output_bias_list, dim=0)
+            else:
+                output_bias_local = None
+
             return output_local, output_bias_local
 
     def backward_dw(self):
@@ -1159,6 +1131,11 @@ class SequentialMLP(MegatronModule):
                 assert (
                     len(replica_id) == 3
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+
+                is_custom_fsdp_shard_tensor = getattr(sh_ten, "is_data_parallel_fully_shard", False)
+                if is_custom_fsdp_shard_tensor:
+                    sh_ten.replica_id = (*replica_id[:2], 0)
+                    continue
 
                 sh_ten.replica_id = (*replica_id[:2], self.dp_group.rank())
 

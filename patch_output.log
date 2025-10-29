@@ -1,0 +1,46 @@
+Checking patch megatron/core/dist_checkpointing/strategies/torch.py...
+Hunk #1 succeeded at 587 (offset 5 lines).
+Hunk #2 succeeded at 622 (offset 5 lines).
+Hunk #3 succeeded at 951 (offset 4 lines).
+Checking patch megatron/core/distributed/__init__.py...
+error: while searching for:
+from .fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from .torch_fully_sharded_data_parallel import TorchFullyShardedDataParallel
+from .torch_fully_sharded_data_parallel_config import TorchFullyShardedDataParallelConfig
+
+error: patch failed: megatron/core/distributed/__init__.py:11
+error: megatron/core/distributed/__init__.py: patch does not apply
+Checking patch megatron/core/extensions/transformer_engine.py...
+error: while searching for:
+        )
+
+        for param in self.parameters():
+            if is_expert:
+                # Reduce the gradient on the expert_data_parallel group for expert linear layers
+                setattr(param, "allreduce", not self.expert_parallel)
+
+error: patch failed: megatron/core/extensions/transformer_engine.py:404
+error: megatron/core/extensions/transformer_engine.py: patch does not apply
+Checking patch megatron/core/models/gpt/gpt_layer_specs.py...
+error: while searching for:
+    use_te_op_fuser: Optional[bool] = False,
+    use_kitchen: bool = False,
+    use_te_activation_func: bool = False,
+) -> ModuleSpec:
+    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+
+
+error: patch failed: megatron/core/models/gpt/gpt_layer_specs.py:80
+error: megatron/core/models/gpt/gpt_layer_specs.py: patch does not apply
+Checking patch megatron/core/models/gpt/gpt_model.py...
+error: while searching for:
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        if mtp_in_postprocess:
+            hidden_states = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+
+error: patch failed: megatron/core/models/gpt/gpt_model.py:443
+error: megatron/core/models/gpt/gpt_model.py: patch does not apply
