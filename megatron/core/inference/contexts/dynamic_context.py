@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 import warnings
@@ -62,8 +62,10 @@ class ContextOverflowError(Exception):
         self, request_id: Optional[int], message: Optional[str] = None, *, is_transient: bool = True
     ):
         request_str = '--' if request_id is None else str(request_id)
-        message = "" if message is None else f" | {message}"
-        super().__init__(f"request {request_str}{message}")
+        _message = "" if message is None else f" | {message}"
+        super().__init__(f"request {request_str}{_message}")
+        self.request_id = request_id
+        self.message = message
         self.is_transient = is_transient
 
 
@@ -103,6 +105,50 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
             "active_request_count (%d) > max_request_count (%d)."
             % (active_request_count, max_request_count),
         )
+
+
+class ContextErrorFactory:
+    """Factory class for serializing/deserializing context errors."""
+
+    @classmethod
+    def serialize(cls, error: ContextOverflowError) -> dict:
+        """Serialize error.
+
+        Args:
+            error (ContextOverflowError): Error.
+
+        Returns:
+            (dict) Serialized error data.
+        """
+        assert isinstance(error, ContextOverflowError)
+        return {
+            "type": type(error).__name__,
+            "request_id": error.request_id,
+            "message": error.message,
+            "is_transient": error.is_transient,
+        }
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> ContextOverflowError:
+        """Deserialize error.
+
+        Args:
+            obj (dict): Serialized error data.
+
+        Returns:
+            (ContextOverflowError) Deserialized error.
+        """
+        error_cls = {
+            "ContextOverflowError": ContextOverflowError,
+            "RequestOverflowError": RequestOverflowError,
+            "TokenOverflowError": TokenOverflowError,
+            "MaxSequenceLengthOverflowError": MaxSequenceLengthOverflowError,
+            "BlockOverflowError": BlockOverflowError,
+            "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
+        }[obj["type"]]
+        error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
+        error.__class__ = error_cls  # todo (@lmcafe): better/safer alternative?
+        return error
 
 
 class WarmupEngineMode(Enum):
@@ -813,7 +859,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 warming up cuda graphs. Must be less than or equal to
                 `max_requests`.
             warmup_engine_mode (WarmupEngineMode): Denote whether to setup
-            for a decode or a non-decode cuda-graph warmup.
+                for a decode or a non-decode cuda-graph warmup.
             num_warmup_requests (Optional[int]): [DEPRECATED] Use num_warmup_tokens instead.
             This argument is kept for backward compatibility with the legacy API.
         Return:
