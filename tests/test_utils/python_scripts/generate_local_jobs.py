@@ -26,7 +26,9 @@ def load_script(config_path: str) -> str:
 
 @click.command()
 @click.option("--model", required=False, type=str, help="Filters all tests by matching model")
-@click.option("--scope", required=False, type=str, help="Filters all tests by matching scope")
+@click.option(
+    "--scope", required=False, type=str, default="mr", help="Filters all tests by matching scope"
+)
 @click.option(
     "--test-case", required=False, type=str, help="Returns a single test-case with matching name."
 )
@@ -78,8 +80,6 @@ def main(
         environment=environment,
         container_tag="none",
     )
-
-    print(workloads)
 
     for workload in workloads:
         if workload.type == "build":

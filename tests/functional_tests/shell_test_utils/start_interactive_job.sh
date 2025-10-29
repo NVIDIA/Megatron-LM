@@ -26,6 +26,7 @@ DATASET_DIR=""
 TIME="1:00:00"
 RECIPES_DIR="tests/test_utils/recipes"
 CONTAINER_MOUNTS=""
+NO_GPUS_PER_TASK="FALSE"
 
 # Declare associative array for tracking unique mounts
 declare -A seen_mounts
@@ -52,6 +53,10 @@ while [[ $# -gt 0 ]]; do
     --time)
         TIME="$2"
         shift 2
+        ;;
+    --no-gpus-per-task)
+        NO_GPUS_PER_TASK="TRUE"
+        shift 1
         ;;
     --help)
         print_usage
@@ -89,7 +94,7 @@ SRUN_CMD="srun \
     --container-workdir=/opt/megatron-lm \
     --container-mounts=$CONTAINER_MOUNTS \
     --nodes=1 \
-    --gpus-per-task=8 \
+    $(if [ "$NO_GPUS_PER_TASK" = "FALSE" ]; then echo "--gpus-per-task=8"; fi) \
     --time=$TIME \
     --pty bash"
 
