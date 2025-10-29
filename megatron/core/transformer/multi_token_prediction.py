@@ -570,10 +570,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             fp8_context = nullcontext()
             transformer_layer_fp8_context = nullcontext()
 
-        # TODO: currently no support for FP4 in MTP layers because we need more numerical validation
-        # raise Error here to avoid unexpected behavior
-        if self.config.fp4:
-            raise ValueError("FP4 is not supported for MTP layers yet.")
+        # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
 
         with rng_context:
             with fp8_context:
