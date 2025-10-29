@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 import os
 import random
@@ -49,6 +51,7 @@ class TestTextGenerationController:
         fp8: bool = False,
         tensor_model_parallel_size: int = 2,
         pipeline_model_parallel_size: int = 1,
+        batch_size: int = 4,
         static: bool = True,
         use_training_random_init: bool = False,
     ):
@@ -62,7 +65,7 @@ class TestTextGenerationController:
             _set_random_seed(123, inference_rng_tracker=True)
         else:
             model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
-        self.batch_size = 4
+        self.batch_size = batch_size
         self.hidden_size = 12
         self.vocab_size = 100
         self.sequence_length = 60 if fp8 else 64  # Test padding for fp8
@@ -224,6 +227,45 @@ class TestTextGenerationController:
         assert torch.all(
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
+
+    def test_sample_from_dynamic_logits(self):
+        batch_size = 12
+        self.setup_model(torch.float32, batch_size=batch_size, static=False)
+        self.mock_tokenizer.eod = self.vocab_size
+
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]] = [
+            (SamplingParams(top_k=3), [0, 3, 2]),
+            (SamplingParams(top_p=0.8), [4, 1, 7]),
+            (SamplingParams(top_k=5), [11, 5, 8]),
+            # (SamplingParams(top_k=5, top_p=0.7), [11, 5, 8]), # uncomment for FlashInfer sampling
+            (SamplingParams(temperature=2.0), [9, 6, 10]),
+        ]
+        rev_sampling_map: List[SamplingParams] = [None] * batch_size
+        for sampling_params, indices in active_sampling_map:
+            for idx in indices:
+                rev_sampling_map[idx] = sampling_params
+
+        last_token_logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).float().cuda()
+        sampled_logits, _ = self.text_generation_controller.sample_from_dynamic_logits(
+            last_token_logits, active_sampling_map, vocab_size=self.vocab_size
+        )
+        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_map]).cuda().unsqueeze(1)
+        top_k_values[top_k_values == 0] = self.vocab_size
+        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_map]).cuda().unsqueeze(1)
+        temp_values = torch.Tensor([s.temperature for s in rev_sampling_map]).cuda().unsqueeze(1)
+        vocab_indices = torch.arange(self.vocab_size).cuda()
+
+        assert torch.all(
+            sampled_logits >= self.vocab_size - top_k_values
+        ), f"The sampled logits should all be greater than {self.vocab_size - top_k_values} but its {sampled_logits}"
+        l = last_token_logits[0]
+        sampled_l = l.div(temp_values).softmax(dim=-1)
+        top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_values)
+        sampled_l.masked_fill_(top_k_mask, 0.0)
+        expected_min_values = sampled_l[sampled_l.cumsum(dim=-1) > top_p_values].amax(dim=-1)
+        assert torch.all(
+            sampled_logits >= expected_min_values
+        ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
@@ -731,10 +773,11 @@ class TestTextGenerationController:
                         ),
                     )
                 )
-            sampling_params = SamplingParams(top_k=10, return_log_probs=True)
+            sampling_params = SamplingParams(top_k=10, return_log_probs=True, termination_id=-1)
+            sampling_map = [(sampling_params, list(range(len(active_requests))))]
             while context.has_unfinished_requests():
                 result = self.text_generation_controller.generate_output_tokens_dynamic_batch(
-                    sampling_params=sampling_params, termination_id=-1
+                    active_sampling_map=sampling_map
                 )
                 new_tokens = result["sample"]
                 assert len(new_tokens) == len(active_requests)

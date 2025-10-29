@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import random
@@ -572,7 +572,9 @@ class TestCaptureFreezeGC:
         )
 
         # Sampling params.
-        sampling_params = SamplingParams(num_tokens_to_generate=num_tokens_to_generate)
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=num_tokens_to_generate, termination_id=vocab_size - 1
+        )
 
         # GPT model.
         model = GPTModel(
@@ -630,10 +632,7 @@ class TestCaptureFreezeGC:
 
         # Inference engine.
         engine = DynamicInferenceEngine(
-            text_generation_controller,
-            context,
-            termination_id=vocab_size - 1,
-            random_seed=random_seed,
+            text_generation_controller, context, random_seed=random_seed
         )
 
         return engine.capture_stats

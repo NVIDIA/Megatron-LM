@@ -84,21 +84,23 @@ class DynamicInferenceEngine(AbstractEngine):
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
-        termination_id (int): Token ID to mark end-of-sequence.
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
+        static_sampling (bool): If True, all requests are assumed to have the same
+            sampling parameters. This avoids needing to loop through all requests and
+            their sampling parameters every generation step, improving latency.
     """
 
     def __init__(
         self,
         controller: TextGenerationController,
         context: DynamicInferenceContext,
-        termination_id: int,
         enable_cuda_graph: Optional[bool] = None,
         random_seed: Optional[int] = None,
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
+        static_sampling: bool = False,
     ):
 
         if enable_cuda_graph is not None:
@@ -114,15 +116,11 @@ class DynamicInferenceEngine(AbstractEngine):
         assert isinstance(
             context, DynamicInferenceContext
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
-        assert isinstance(
-            termination_id, int
-        ), f"termination_id must be an int, got {type(termination_id)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
         self.request_counter = Counter()
         self.controller = controller
         self.context = context
-        self.termination_id = termination_id
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
         self.step_count = 0
@@ -137,6 +135,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.paused = False
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.static_sampling = static_sampling
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -248,10 +247,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
-        self,
-        sampling_params: SamplingParams,
-        inference_coordinator_port: int,
-        launch_inference_coordinator: bool = True,
+        self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -276,8 +272,6 @@ class DynamicInferenceEngine(AbstractEngine):
         (`self.run_engine`) as a background asyncio task.
 
         Args:
-            sampling_params (SamplingParams): The default sampling parameters to be
-                used for inference, passed to the engine's main loop.
             inference_coordinator_port (int): The network port where the central
                 `InferenceCoordinator` is or will be listening.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
@@ -371,9 +365,7 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        self.engine_loop_task = asyncio.create_task(
-            self.run_engine_with_coordinator(sampling_params)
-        )
+        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
@@ -435,24 +427,19 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
         request_id: int,
         prompt: Union[str, List[int], Tensor],
-        num_tokens_to_generate: Optional[int] = None,
-        num_tokens_total: Optional[int] = None,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
         Args:
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
-            num_tokens_to_generate (Optional[int]): Number of output tokens to generate.
-            num_tokens_total (Optional[int]): Limit on total number of tokens (prompt + generated).
+            sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
 
-        sampling_params = SamplingParams(
-            num_tokens_to_generate=num_tokens_to_generate, num_tokens_total=num_tokens_total
-        )
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -616,6 +603,37 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 break
 
+    def get_active_sampling_map(self) -> List[Tuple[SamplingParams, List[int]]]:
+        """Gets a map of sampling methods to active requests indices in the context."""
+        # Get all active request IDs.
+        active_request_ids = self.context.request_ids[
+            self.context.paused_request_count : self.context.total_request_count
+        ].tolist()
+        if self.static_sampling:
+            return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
+
+        # Get a map from request_id to context array index.
+        context_id_map = {r: i for i, r in enumerate(active_request_ids)}
+
+        # Create map of sampling methods to context array indices.
+        sampling_map: List[Tuple[SamplingParams, List[int]]] = []
+        for request_id, request in self.requests.items():
+            if request_id not in context_id_map:
+                continue
+            context_id = context_id_map[request_id]
+            sp = request.sampling_params
+
+            # Look for a pre-existing group with these sampling parameters.
+            for sampling, indices in sampling_map:
+                if sampling == sp:
+                    indices.append(context_id)
+                    break
+            # If no group exists, create a new one.
+            else:
+                sampling_map.append((sp, [context_id]))
+
+        return sampling_map
+
     def schedule_chunked_prefill(self):
         """
         This function schedules chunked prefill requests.
@@ -678,7 +696,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Note that we do not need to continue check the queue, as the tokens are full
 
     async def async_step(
-        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+        self, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -711,9 +729,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # save the is_decode_only AFTER scheduling, BEFORE update
         self.is_decode_only = is_decode_only
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(
-            sampling_params, self.termination_id
-        )
+        sampling_map = self.get_active_sampling_map()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -804,12 +821,10 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
     def step_modern(
-        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+        self, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(
-            self.async_step(sampling_params=sampling_params, verbose=verbose)
-        )
+        return self._loop.run_until_complete(self.async_step(verbose=verbose))
 
     def step_legacy(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
@@ -836,16 +851,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         for prompt in prompts:
             request_id = int(next(self.request_counter))
-            _ = self.add_request(
-                request_id,
-                prompt,
-                sampling_params.num_tokens_to_generate,
-                sampling_params.num_tokens_total,
-            )
+            _ = self.add_request(request_id, prompt, sampling_params)
 
         finished_requests_list = []
         while self.has_unfinished_requests():
-            result = self.step_modern(sampling_params)
+            result = self.step_modern()
             finished_requests_list.extend(result["finished_requests"])
 
         # Ensure requests are returned in the same order they were passed in.
@@ -922,12 +932,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                self.add_request(
-                    request_id,
-                    prompt,
-                    sampling_params.num_tokens_to_generate,
-                    sampling_params.num_tokens_total,
-                )
+                self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
                 self.paused = True
             elif header == Headers.STOP:
@@ -953,7 +958,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
         parallel_state.destroy_model_parallel()
 
-    async def run_engine(self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False):
+    async def run_engine(self, *, verbose: Optional[bool] = False):
         """Continually steps the engine asynchronously."""
         try:
             while True:
@@ -964,13 +969,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         or self.waiting_request_ids
                     )
 
-                await self.async_step(sampling_params=sampling_params, verbose=verbose)
+                await self.async_step(verbose=verbose)
         except asyncio.CancelledError:
             pass
 
-    async def run_engine_with_coordinator(
-        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
-    ):
+    async def run_engine_with_coordinator(self, *, verbose: Optional[bool] = False):
         """Continually steps the engine asynchronously."""
         try:
             while True:
@@ -1002,9 +1005,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
                     continue
 
-                engine_output = await self.async_step(
-                    sampling_params=sampling_params, verbose=verbose
-                )
+                engine_output = await self.async_step(verbose=verbose)
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
