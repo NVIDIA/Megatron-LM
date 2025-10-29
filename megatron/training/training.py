@@ -1894,7 +1894,6 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
-    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -1937,9 +1936,7 @@ def post_training_step_callbacks(
             assert prof is not None
             prof.stop()
         else:
-            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
-            if nsys_nvtx_context is not None:
-                nsys_nvtx_context.__exit__(None, None, None)
+            torch.cuda.cudart().cudaProfilerStop()
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2263,7 +2260,6 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
-    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
         and torch.distributed.get_rank() in args.profile_ranks
@@ -2318,9 +2314,8 @@ def train(
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
-                nsys_nvtx_context.__enter__()
+                torch.cuda.cudart().cudaProfilerStart()
+                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -2563,7 +2558,6 @@ def train(
             iteration,
             prof,
             num_floating_point_operations_since_last_log_event,
-            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.
