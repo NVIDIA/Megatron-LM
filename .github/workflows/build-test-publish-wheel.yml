@@ -49,7 +49,7 @@ jobs:
       python-package: megatron.core
       python-version: "3.10"
       packaging: uv
-      no-publish: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
+      no-publish: false # ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
       custom-container: nvcr.io/nvidia/pytorch:25.05-py3
       no-build-isolation: true
       runner: linux-amd64-cpu16
