@@ -1,5 +1,5 @@
 include megatron/core/requirements.txt
 include megatron/core/README.md
 include megatron/core/package_info.py
-include LICENSE
+global-exclude LICENSE
 recursive-include requirements *
