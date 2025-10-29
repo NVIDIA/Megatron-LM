@@ -575,9 +575,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _add_request(
         self, request: DynamicInferenceRequest
-        # >>>
-        , debug=False
-        # <<<
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
@@ -621,9 +618,6 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
-        # >>>
-        debug=False,
-        # <<<
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -671,10 +665,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Add request.
-        # >>>
-        # return self._add_request(request)
-        return self._add_request(request, debug=debug)
-        # <<<
+        return self._add_request(request)
 
     def post_process_requests(
         self,
