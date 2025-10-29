@@ -1005,9 +1005,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
                     continue
 
-                engine_output = await self.async_step(
-                    verbose=verbose
-                )
+                engine_output = await self.async_step(verbose=verbose)
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
