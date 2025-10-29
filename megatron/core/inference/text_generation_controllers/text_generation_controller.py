@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import concurrent
@@ -322,6 +322,60 @@ class TextGenerationController:
 
         return sampled_logits
 
+    def sample_from_dynamic_logits(
+        self,
+        last_token_logits: torch.Tensor,
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+        vocab_size: Optional[int] = None,
+        generation_started: Optional[torch.Tensor] = None,
+        top_n_logprobs_dict: Dict[int, List[Dict[str, float]]] = None,
+        logits: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Samples the logits to generate outputs
+
+        Given the logits of the last token, this function samples it
+        according to the parameters defined in active_sampling_map
+        and returns the samples. If sampling parameters top_n_logprobs > 0
+        at each step it also updates the top_n_logprobs dict.
+
+        Args:
+            last_token_logits (torch.Tensor): The last token logits. A tensor of
+                size [batch_size, vocab_size]
+            active_sampling_map (List[Tuple[SamplingParams, List[int]]]): A list of tuples
+                matching each unique set of sampling params to the context array indices
+                of the corresponding active requests.
+            vocab_size (int): Obtained from the tokenizer. Defaults to None
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
+                            indicates the prompt at that index has started generating tokens.
+            top_n_logprobs_dict (top_n_logprobs_dict): The dict to be updated
+
+        Returns:
+            sampled_logits (torch.Tensor): 1D tensor with [batch_size] elements
+            termination_id (torch.Tensor): Tensor of shape [batch_size] with termination ids
+            top_n_logprobs_this_step (torch.return_types.topk): a topk tensor with values as logits
+                and indices as the top k elements. None if sampling params top_n_logprobs is 0.
+        """
+        batch_size = last_token_logits.size(0)
+        new_sample = torch.zeros(batch_size, dtype=torch.int64, device=last_token_logits.device)
+        termination_id = torch.zeros_like(new_sample, dtype=torch.int64)
+
+        for sampling_params, mask in active_sampling_map:
+            # Filter out indices that are out of bounds for the current batch
+            valid_mask = [i for i in mask if i < batch_size]
+            if valid_mask:
+                new_sample[valid_mask] = self.sample_from_logits(
+                    last_token_logits[valid_mask],
+                    sampling_params=sampling_params,
+                    vocab_size=vocab_size,
+                )
+                if sampling_params.termination_id is not None:
+                    termination_id[valid_mask] = sampling_params.termination_id
+                else:
+                    termination_id[valid_mask] = self.tokenizer.eod
+
+        return new_sample, termination_id
+
     def update_generation_status(
         self,
         updated_prompts_tokens: torch.Tensor,
@@ -525,7 +579,8 @@ class TextGenerationController:
             sampling_params (SamplingParams): Parameters for sampling logits.
 
         Returns:
-            new_sample (Tensor): The sampled tokens.
+            new_sample (Tensor): The sampled tokens for each active request.
+            termination_id (int): The termination token IDs of each active request.
         """
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
@@ -544,7 +599,10 @@ class TextGenerationController:
         # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2.
         vocab_size = inference_wrapper_config.padded_vocab_size
-        return self.sample_from_logits(last_token_logits, sampling_params, vocab_size=vocab_size)
+        new_sample, termination_id = self.sample_from_dynamic_logits(
+            last_token_logits, active_sampling_map, vocab_size=vocab_size
+        )
+        return new_sample, termination_id
 
     def _dynamic_step_log_probs_bookkeeping(self):
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
@@ -557,18 +615,23 @@ class TextGenerationController:
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
         log_probs = None
-        if sampling_params.return_log_probs:
-            skip_prompt_log_probs_for_dynamic_inference = getattr(
-                sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
-            )
-            assert (
-                skip_prompt_log_probs_for_dynamic_inference
-                or materialize_only_last_token_logits is False
-            ), "Materialize only last token logits must be false for returning log probs"
+        return_log_probs = False
+        for sampling_params, mask in active_sampling_map:
+            if sampling_params.return_log_probs:
+                skip_prompt_log_probs_for_dynamic_inference = getattr(
+                    sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
+                )
+                assert (
+                    skip_prompt_log_probs_for_dynamic_inference
+                    or materialize_only_last_token_logits is False
+                ), "Materialize only last token logits must be false for returning log probs"
+                return_log_probs = True
 
+        if return_log_probs:
             log_probs = context.calculate_log_probs(
                 logits, new_sample, only_last_token_logits=materialize_only_last_token_logits
             )
+
         return log_probs
 
     def _dynamic_step_context_bookkeeping(
@@ -594,6 +657,7 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
+        # Note: termination_id tensor has per-request termination IDs from mixed sampling
         active_request_mask = (new_sample != termination_id).byte() & torch.less(
             active_sequence_lengths, max_sequence_lengths
         ).byte()
@@ -617,15 +681,15 @@ class TextGenerationController:
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
         self,
-        sampling_params: SamplingParams,
-        termination_id: int,
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
         skip_bookkeeping: Optional[bool] = False,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
-            sampling_params (SamplingParams): Parameters for sampling logits.
-            termination_id (int): The token ID that indicates termination.
+            active_sampling_map (List[Tuple[SamplingParams, List[int]]]): A list of tuples
+                matching each unique set of sampling params to the context array indices
+                of the corresponding active requests.
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
 
         Return:
@@ -690,12 +754,12 @@ class TextGenerationController:
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
-        self, sampling_params: SamplingParams, termination_id: int
+        self, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
     ) -> Optional[Dict]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
         loop = get_asyncio_loop()
         return loop.run_until_complete(
-            self.async_generate_output_tokens_dynamic_batch(sampling_params, termination_id)
+            self.async_generate_output_tokens_dynamic_batch(active_sampling_map)
         )
 
     def _update_top_n_logprobs_dict(
