@@ -904,6 +904,9 @@ class FSDPDistributedIndex:
         # Find the index for the current rank in the hybrid group
         return self._hybrid_fsdp_group_ranks.index(self.hybrid_fsdp_group.rank())
 
+    def representative_rank(self) -> int:
+        return self.device_mesh.representative_rank()
+
 
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.

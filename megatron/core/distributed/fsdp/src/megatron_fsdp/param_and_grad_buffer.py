@@ -1583,7 +1583,7 @@ class ParamAndGradBuffer:
             NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(
                     f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for \
                         UserBuffer Registration"
@@ -1600,26 +1600,26 @@ class ParamAndGradBuffer:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
 
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(
                     f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):"
                 )
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
-                if torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == self.dist_index.representative_rank():
                     logging.info(
                         f"Group [{i+1}/{len(self.ubr_groups)}] \
                             group.group_desc: {group.group_desc}, group.size(): {group.size()}"
                     )
                 torch.distributed.barrier(group=group, async_op=False)
-                if torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == self.dist_index.representative_rank():
                     logging.info(
                         f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] \
                             group.group_desc: {group.group_desc}"
                     )
             # Call barrier from the global communitcator group
             torch.distributed.barrier(async_op=False)
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(f"Call Success with the global communicator group")
 
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
@@ -1755,7 +1755,7 @@ class ParamAndGradBuffer:
             f"Total pad: {_bytes_to_mb(total_padded_bytes)}"
         )
 
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank() == self.dist_index.representative_rank():
             logger.info("\n".join(log_lines))
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
@@ -1998,7 +1998,7 @@ class ParamAndGradBuffer:
                 f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
                 f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
             )
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logger.info(log_str)
 
         # Initialize the model weight buffer data of each parameter group.
