@@ -36,71 +36,6 @@ jobs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
     if: github.repository == 'NVIDIA/Megatron-LM'
 
-  build-wheel:
-    strategy:
-      matrix:
-        include:
-          - PACKAGE: megatron-core
-            PLATFORM: arm64
-            IMAGE: quay.io/pypa/manylinux_2_28_aarch64
-          - PACKAGE: megatron-core
-            PLATFORM: amd64
-            IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-          - PACKAGE: megatron-fsdp
-            IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-            PLATFORM: amd64
-    runs-on: ubuntu-latest
-    container: ${{ matrix.IMAGE }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build wheel
-        run: |
-          PUBLISH_DRYRUN=yes
-
-          if [ "$PACKAGE" = "megatron-core" ]; then
-            ROOTDIR="megatron/core"
-            BUILD_DIR="."
-          elif [ "$PACKAGE" = "megatron-fsdp" ]; then
-            ROOTDIR="megatron/core/distributed/fsdp/src/megatron_fsdp"
-            BUILD_DIR="megatron/core/distributed/fsdp/src"
-          else
-            echo Unknown package: $PACKAGE
-            exit 1
-          fi
-
-          if [ "$PUBLISH_DRYRUN" = "yes" ]; then
-            PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" $ROOTDIR/package_info.py)
-            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" $ROOTDIR/package_info.py
-          fi
-
-          pushd $BUILD_DIR
-            /opt/python/cp310-cp310/bin/python -m build
-            /opt/python/cp311-cp311/bin/python -m build
-            /opt/python/cp312-cp312/bin/python -m build
-            /opt/python/cp313-cp313/bin/python -m build
-            USE_DIST_DIR=0
-            auditwheel repair dist/*.whl || USE_DIST_DIR=1
-            if [ "$USE_DIST_DIR" != "1" ]; then
-              rm -rf dist/*.whl
-            fi
-          popd
-
-          pushd $ROOTDIR
-            EXPECTED_RELEASE_NUMBER=$(/opt/python/cp312-cp312/bin/python -c "import package_info; print(package_info.__version__)")
-          popd
-
-          echo "EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}=$EXPECTED_RELEASE_NUMBER" | tee -a "${GITHUB_OUTPUT}"
-          mkdir -p wheelhouse/
-
-          if [ "$PACKAGE" = "megatron-fsdp" ]; then
-            cp -a megatron/core/distributed/fsdp/src/dist/* wheelhouse/
-          fi
-
-          ls -al wheelhouse/ || true
-          ls -al dist/ || true
-
   build-test-publish-wheel:
     needs: [pre-flight]
     if: |
@@ -109,6 +44,15 @@ jobs:
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       && github.repository == 'NVIDIA/Megatron-LM'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.63.1
+    with:
+      dry-run: true
+      python-package: megatron.core
+      python-version: "3.10"
+      packaging: uv
+      no-publish: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
+      custom-container: nvcr.io/nvidia/pytorch:25.05-py3
+      no-build-isolation: true
+      runner: linux-amd64-cpu16
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
