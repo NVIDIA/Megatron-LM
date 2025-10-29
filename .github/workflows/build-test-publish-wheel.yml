@@ -61,6 +61,8 @@ jobs:
           IMAGE: ${{ matrix.IMAGE }}
           PLATFORM: ${{ matrix.PLATFORM }}
         run: |
+          set -x -e -u -o pipefail
+
           PUBLISH_DRYRUN=yes
 
           if [ "$PACKAGE" = "megatron-core" ]; then
