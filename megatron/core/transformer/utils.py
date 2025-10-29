@@ -29,13 +29,11 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
     return layer
 
 
-@lru_cache(maxsize=32)
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
     return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
 
 
-@lru_cache(maxsize=32)
 def get_sliding_window_causal_mask(sq, skv, window_size):
     """Create the equivalent attention mask for SWA in [sq, skv] shape"""
     m = torch.ones(sq, skv, dtype=torch.bool, device="cuda")

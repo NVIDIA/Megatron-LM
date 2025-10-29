@@ -228,13 +228,15 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 @lru_cache(maxsize=8)
 def _yarn_get_concentration_factor(
-    scaling_factor: float, mscale: float, mscale_all_dim: float
+    scaling_factor: float, mscale: Optional[float], mscale_all_dim: Optional[float]
 ) -> float:
     """
     Get the concentration factor (factor multiplied to the sine and cosine components of the
     embedding). This factor is also known as attention factor, and sometimes homonymously known as
     "mscale"
     """
+    if mscale is None or mscale_all_dim is None:
+        return _yarn_get_mscale(scaling_factor)
     return float(
         _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim)
     )
