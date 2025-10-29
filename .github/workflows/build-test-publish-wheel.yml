@@ -85,7 +85,7 @@ jobs:
 
           pushd $BUILD_DIR
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp310-cp310/bin/python -m build
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp311-cp311/bin/python -m build
+            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/$IMAGEcp310-$IMAGEcp310/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp312-cp312/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp313-cp313/bin/python -m build
 
@@ -128,11 +128,11 @@ jobs:
 
           if [ "$PACKAGE" = "megatron-core" ]; then
             if [[ "$PLATFORM" == "arm64" ]]; then
-              for file in dist/$WHEEL_PREFIX*cp311*aarch64.whl; do
+              for file in dist/$WHEEL_PREFIX*$IMAGEcp310*aarch64.whl; do
                 pip install --no-cache-dir "$file"
               done
             else
-              for file in dist/$WHEEL_PREFIX*cp311*x86_64.whl; do
+              for file in dist/$WHEEL_PREFIX*$IMAGEcp310*x86_64.whl; do
                 pip install --no-cache-dir "$file"
               done
             fi
