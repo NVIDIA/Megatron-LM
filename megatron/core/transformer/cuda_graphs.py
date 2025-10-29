@@ -60,6 +60,7 @@ _IS_GRAPH_CAPTURING = False
 logger = logging.getLogger(__name__)
 
 # Freeze GC during capture.
+# TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
 FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
 try:
     from packaging.version import Version as PkgVersion
