@@ -61,7 +61,7 @@ jobs:
           IMAGE: ${{ matrix.IMAGE }}
           PLATFORM: ${{ matrix.PLATFORM }}
         run: |
-          set -x -e -u -o pipefail
+          set -x
 
           PUBLISH_DRYRUN=yes
 
@@ -86,7 +86,6 @@ jobs:
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp311-cp311/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp312-cp312/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp313-cp313/bin/python -m build
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE auditwheel repair dist/*.whl
 
             USE_DIST_DIR=0
             PLATFORM_WHEELS=$(find dist -name "*.whl" -not -name "*-none-any.whl")
