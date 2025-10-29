@@ -421,20 +421,14 @@ class TestDynamicInferenceEngine:
             # If it is not None, then the output length could be anything in the
             # range [1, num_tokens_to_generate].
             if test_config.suspend_resume_interval is None:
-                # >>>
-                try:
-                    assert (
-                        (num_tokens_to_generate is None and num_tokens_total is None)
-                        or len(request.generated_tokens) <= num_tokens_expected
-                        or request.status == Status.FAILED
-                    ), (
-                        f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
-                        f"tokens but generated {len(request.generated_tokens)}"
-                    )
-                except Exception as e:
-                    from lutil import pax
-                    pax("test_config, e")
-                # <<<
+                assert (
+                    (num_tokens_to_generate is None and num_tokens_total is None)
+                    or len(request.generated_tokens) <= num_tokens_expected
+                    or request.status == Status.FAILED
+                ), (
+                    f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
+                    f"tokens but generated {len(request.generated_tokens)}"
+                )
         env.mem_usage["end"] = torch.cuda.memory_stats()
 
         return env
