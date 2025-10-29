@@ -20,6 +20,8 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 defaults:
   run:
@@ -31,14 +33,17 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.53.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
   build-test-publish-wheel:
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.48.0
+      && github.repository == 'NVIDIA/Megatron-LM'
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.63.1
     with:
       dry-run: true
       python-package: megatron.core
@@ -47,6 +52,7 @@ jobs:
       no-publish: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
       custom-container: nvcr.io/nvidia/pytorch:25.05-py3
       no-build-isolation: true
+      runner: linux-amd64-cpu16
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
@@ -59,9 +65,11 @@ jobs:
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
         || always()
       )
+      && github.repository == 'NVIDIA/Megatron-LM'
       && !cancelled()
     runs-on: ubuntu-latest
     steps:

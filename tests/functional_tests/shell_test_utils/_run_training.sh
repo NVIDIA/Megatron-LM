@@ -8,7 +8,7 @@
 
 set -euxo pipefail
 
-echo "------ARGUMENTS LIST --------"
+set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -18,7 +18,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
@@ -39,9 +39,11 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set +x
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
+set -x
 
 # Pull env vars to export
 ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
@@ -172,23 +174,12 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
-sleep 5
-set -x
-fuser -k /dev/nvidia* || true
-nvidia-smi pmon -c 1
-
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
-        -m coverage run \
-        --data-file=.coverage.unit_tests \
-        --source=megatron/core \
-        -m $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+        --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
-        -m coverage run \
-        --data-file=.coverage.unit_tests \
-        --source=megatron/core \
         $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 

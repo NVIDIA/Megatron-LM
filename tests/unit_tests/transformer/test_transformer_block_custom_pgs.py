@@ -422,10 +422,19 @@ class TestTransformerBlockWithProcessGroups:
 
         attn_pg_collection = ProcessGroupCollection(tp=attn_tp_group, cp=attn_cp_group)
         mlp_pg_collection = ProcessGroupCollection(tp=mlp_tp_group)
+        default_pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'pp', 'cp']
+        )
 
         # Get the layer spec with different process groups for attention and mlp
         hetro_layer_spec = _gpt_te_layer_spec_with_hetro_pgs(attn_pg_collection, mlp_pg_collection)
-        custom_block = TransformerBlock(transformer_config, hetro_layer_spec).cuda().bfloat16()
+        custom_block = (
+            TransformerBlock(
+                transformer_config, hetro_layer_spec, pg_collection=default_pg_collection
+            )
+            .cuda()
+            .bfloat16()
+        )
 
         sequence_length = 4096
         micro_batch_size = 2

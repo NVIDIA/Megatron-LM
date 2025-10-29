@@ -1,5 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -21,8 +23,11 @@ class SamplingParams:
     return_log_probs: bool = False
     return_segments: bool = False  # Whether to return individually detokenized tokens
     num_tokens_to_generate: int = 30
+    num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
+    termination_id: Optional[int] = None
     top_n_logprobs: int = 0
     return_prompt_top_n_logprobs: bool = False
+    add_BOS: bool = False
 
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params

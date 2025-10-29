@@ -51,8 +51,6 @@ class DistributedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        self.module = module
-
         # If bucket_size is not provided as an input, use sane default.
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
@@ -121,9 +119,7 @@ class DistributedDataParallel(_BaseDataParallel):
             pp_rank = self.pp_group[0].rank()
         else:
             pp_rank = self.pp_group.rank()
-        if pp_rank > 0:
-            self.bucket_size = None
-        if disable_bucketing:
+        if disable_bucketing or pp_rank > 0:
             self.bucket_size = None
 
         self.param_to_bucket_group = {}
@@ -559,7 +555,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
-        if not getattr(self.config, 'external_cuda_graph', False):
+        if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back
             # to True, and there will be a double-GA.

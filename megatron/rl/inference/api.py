@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from pydantic import BaseModel
 
@@ -17,6 +17,7 @@ class InferenceRequest(Request):
 
 class ChatInferenceRequest(InferenceRequest):
     prompt: list[list[LLMChatMessage]]
+    tools: list[dict] | None = None
 
 
 class GroupedInferenceRequest(InferenceRequest):

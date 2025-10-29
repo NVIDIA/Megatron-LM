@@ -395,7 +395,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
-        expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
+        shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+        expert_output, mlp_bias = layer.mlp.routed_experts_compute(
             dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
         )
 

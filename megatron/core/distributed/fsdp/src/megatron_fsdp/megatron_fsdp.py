@@ -224,7 +224,7 @@ class MegatronFSDP(torch.nn.Module):
         # step of the model will reduce all gradients and gather all parameters
         # for synchronized operations such as distributed optimization and
         # distributed checkpointing particularly sharding with HSDP / DP-Outer.
-        self.model_auto_sync = self.set_model_auto_sync(sync_model_each_microbatch)
+        self.set_model_auto_sync(sync_model_each_microbatch)
 
         # Check if the module contains (Megatron-Core) expert parallel parameters or DTensors.
         has_expert_parameters = self._check_module_parameter_types()
@@ -235,7 +235,10 @@ class MegatronFSDP(torch.nn.Module):
         self.dist_index = dist_index
 
         # If Megatron Expert Parallelism is enabled, you need to provide an expt_dp_group.
-        if has_expert_parameters and self.dist_index.get_expert_dp_group() is None:
+        if (
+            has_expert_parameters
+            and self.dist_index.get_fsdp_group(is_expert_parallel=True) is None
+        ):
             raise ValueError(
                 "[Megatron-FSDP] Megatron Expert Parallelism is enabled, but no expt_dp_group is"
                 "provided."
@@ -353,9 +356,7 @@ class MegatronFSDP(torch.nn.Module):
         )
 
         # Set the suggested communication unit size for reduce-scatter and all-gather pipelines.
-        suggested_communication_unit_size = (
-            self.ddp_config.suggested_communication_unit_size or 1_000_000_000
-        )
+        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
         if suggested_communication_unit_size is None:
             if self.data_parallel_sharding_strategy == "optim_grads_params":
                 total_param_elements = 0
@@ -370,6 +371,8 @@ class MegatronFSDP(torch.nn.Module):
                 suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
             elif self.bucket_size is not None:
                 suggested_communication_unit_size = self.bucket_size
+            else:
+                suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
             suggested_communication_unit_size = max(
@@ -436,6 +439,11 @@ class MegatronFSDP(torch.nn.Module):
             # This setting is needed to have this attribute present after every
             # un-shard of the FSDP params.
             param.__fsdp_param__ = True
+            # Transformer Engine accumulates gradient on top of the `main_grad`
+            # buffer when gradient accumulation fusion in enabled. But with FSDP,
+            # we want to overwrite the `main_grad` which is enabled by this
+            # attribute.
+            param.overwrite_main_grad = True
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
