@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from __future__ import annotations
 
 import logging
@@ -43,22 +45,26 @@ def most_recent_pipeline(target_branch: str):
 
 def is_pending(target_branch: str):
     pipeline = most_recent_pipeline(target_branch)
-    is_pending = (
-        pipeline.attributes['status'] == 'pending' or pipeline.attributes['status'] == 'running'
-    )
-    is_canceled = pipeline.attributes['status'] == 'canceled'
+    PENDING_STATUSES = [
+        "created",
+        "waiting_for_resource",
+        "preparing",
+        "pending",
+        "running",
+        "canceled",
+        "skipped",
+        "manual",
+        "scheduled",
+    ]
+
+    is_pending = pipeline.attributes['status'] in PENDING_STATUSES
 
     if not is_pending:
         logger.info(
             f"Main pipeline {pipeline.id} finished with status {pipeline.attributes['status']}"
         )
 
-    return is_pending or is_canceled
-
-
-def is_sucess(target_branch: str):
-    pipeline = most_recent_pipeline(target_branch)
-    return pipeline.attributes['status'] == 'success'
+    return is_pending
 
 
 @click.command()
@@ -71,11 +77,17 @@ def main(target_branch: str, continuous: bool):
             break
         time.sleep(60)
 
-    if not is_sucess(target_branch=target_branch):
+    pipeline = most_recent_pipeline(target_branch)
+
+    if pipeline.attributes['status'] == 'failed':
         logger.error(
             "Main is broken, we're therefore blocking your merge. Please wait until main is fixed again by checking the repo's front page. If the status is green again, you can re-attempt the merge. Feel free to ping the team if you have any questions."
         )
         sys.exit(1)
+
+    if pipeline.attributes['status'] == 'running':
+        logger.info("Main is running, we won't cancel the deployment.")
+        sys.exit(2)
 
     sys.exit(0)
 

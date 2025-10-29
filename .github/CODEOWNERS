@@ -1,0 +1,52 @@
+megatron/core @NVIDIA/core-adlr @NVIDIA/core-nemo
+
+megatron/core/models/gpt/ @NVIDIA/gpt
+
+megatron/core/models/multimodal/ @NVIDIA/multi-modal
+
+megatron/core/models/mamba/ @NVIDIA/hybrid-mamba
+
+megatron/core/datasets/ @NVIDIA/datasets
+
+megatron/core/distributed/fsdp/ @NVIDIA/megatron-fsdp
+megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/megatron-fsdp
+
+megatron/core/dist_checkpointing/ @NVIDIA/dist-checkpointing
+
+megatron/core/optimizer/distrib_optimizer/ @NVIDIA/dist-optimizer
+
+megatron/core/inference/modelopt_support @NVIDIA/quantization-and-inference
+
+# megatron/core/datasets/ @NVIDIA/datasets
+
+megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
+
+megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
+
+megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-devtech
+
+# megatron/core/inference/ @NVIDIA/inference
+
+megatron/core/parallel_state.py @NVIDIA/core-nemo
+
+megatron/core/post_training/ @NVIDIA/post-training
+megatron/post_training @NVIDIA/post-training
+
+.gitlab/ @NVIDIA/ci
+.github/ @NVIDIA/ci
+.gitlab-ci.yml @NVIDIA/ci
+docker/  @NVIDIA/ci
+tests/unit_tests/run_ci_test.sh @NVIDIA/ci
+tests/test_utils/python_scripts/ 
+tests/functional_tests/python_test_utils/ @NVIDIA/ci
+tests/functional_tests/shell_test_utils/ @NVIDIA/ci
+megatron/core/transformer/transformer_block.py @NVIDIA/ci
+megatron/core/transformer/transformer_layer.py @NVIDIA/ci
+tests/functional_tests/test_cases/ @NVIDIA/ci
+tests/functional_tests/recipes/ @NVIDIA/ci
+tests/unit_tests/ @NVIDIA/ci
+
+megatron/rl/ @NVIDIA/reinforcement-learning
+examples/rl/ @NVIDIA/reinforcement-learning
+test/unit_tests/test_rl_utils.py @NVIDIA/reinforcement-learning
+train_rl.py @NVIDIA/reinforcement-learning
