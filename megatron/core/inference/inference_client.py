@@ -51,7 +51,7 @@ class InferenceClient:
             request IDs to the asyncio Future objects that will hold the results.
         next_request_id (int): A counter for generating unique request IDs.
         listener_task (asyncio.Task): The background task that listens for
-            completed requests.
+            completed requests
     """
 
     def __init__(self, inference_coordinator_port: int):
