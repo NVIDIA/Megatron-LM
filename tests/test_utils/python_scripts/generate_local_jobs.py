@@ -77,8 +77,6 @@ def main(
         container_tag="none",
     )
 
-    print(workloads)
-
     for workload in workloads:
         if workload.type == "build":
             continue
