@@ -31,5 +31,28 @@ jobs:
           }
 
           tmp=$(mktemp)
-          get_members "NVIDIA" "mcore-reviewers" "$tmp" | sort -u > final.txt && rm "$tmp"
-          cat final.txt
+          echo "" > final.txt
+          get_members "NVIDIA" "mcore-engineers" "$tmp" | sort -u >> final.txt && rm "$tmp"
+
+          tmp=$(mktemp)
+          get_members "NVIDIA" "mcore-reviewers" "$tmp" | sort -u >> final.txt && rm "$tmp"
+
+          cat final.txt | jq -sR 'split("\n") | map(select(. != "")) | flatten | unique'
+
+          export TRUSTEES=$(cat final.txt | jq -csR 'split("\n") | map(select(. != "")) | flatten | unique')
+          yq '.trustees_override = env(TRUSTEES)' .github/copy-pr-bot.yaml | yq -o yaml > .github/copy-pr-bot.yaml.new
+
+          mv .github/copy-pr-bot.yaml.new .github/copy-pr-bot.yaml
+
+      - name: Commit changes
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/NVIDIA/Megatron-LM.git
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/copy-pr-bot.yaml
+          if git diff --cached --exit-code --quiet; then
+            echo "No changes to commit. Exiting gracefully."
+            exit 0
+          fi
+          git commit -m "Update copy-pr-bot.yaml"
+          git push
