@@ -140,7 +140,7 @@ jobs:
             pip install --no-cache-dir dist/$WHEEL_PREFIX*.whl
           fi
 
-          rm -rf megatron/
+          sudo rm -rf megatron/
 
           RELEASE_NUMBER=$(python -c "import $ROOTPATH; print($ROOTPATH.__version__)")
           test "${{ steps.build-wheel.outputs.expected-release-number }}" == "$RELEASE_NUMBER"
