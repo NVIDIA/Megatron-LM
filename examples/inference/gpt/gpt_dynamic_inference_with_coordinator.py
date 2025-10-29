@@ -6,6 +6,7 @@ import os
 import time
 import torch
 import torch.distributed as dist
+from collections import defaultdict
 from tqdm import tqdm
 from typing import List
 
@@ -33,9 +34,12 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator(sampling_params, 
-                                                inference_coordinator_port=port,
-                                                launch_inference_coordinator=True)   
+    await engine.start_listening_to_data_parallel_coordinator(
+        sampling_params, 
+        inference_coordinator_port=port,
+        launch_inference_coordinator=True,
+        verbose=True,
+    )
     # if you want to use your own inference coordinator - 
     # 1. set launch_inference_coordinator to False
     # 2. setup a router socket at tcp://MASTER_ADDR:PORT
@@ -43,11 +47,10 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
     #   based on headers. 
     # 5. look at InferenceClient to see how we create requests with headers. 
-    # >>>
-    from lutil import pax
-    # <<<
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
     args = get_args()
+
+    # Test suspend/resume intervals.
     if args.suspend_resume_interval is not None:
         # Since the client doesn't directly call engine.async_step here, we test
         # the suspend-resume system ~4 times.
@@ -61,24 +64,11 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
             min(len(requests), i + suspend_resume_interval // 2)
             for i in suspend_idxs
         )
-        # >>>
-        # suspend_idxs = set([33]) # ... good.
-        # resume_idxs = set([67])
-        # +++
-        # suspend_idxs = set([33, 80]) # ... good.
-        # resume_idxs = set([67, 90])
-        # +++
-        # suspend_idxs = set([33, 100]) # ... good.
-        # resume_idxs = set([67, 100])
-        # +++
-        # pax("suspend_idxs, resume_idxs")
-        # suspend_idxs = set([25, 50, 75, 100])
-        # resume_idxs = set([37, 62, 87, 100])
-        # <<<
     else:
         suspend_idxs = set()
         resume_idxs = set()
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    # Create client and run example.
     if dist.get_rank() == 0: 
         client = InferenceClient(port) # submits requests to the inference coordinator
         await client.start()
@@ -99,24 +89,13 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 futures.append(client.add_request(request.prompt_text, 
                                                         sampling_params))
                 num_requests_added += 1
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # >>>
-                def print_suspend_resume(key):
-                    print("++++++ %s ... r %d / %d, s %d." % (
-                        key,
-                        num_requests_added,
-                        num_requests_total,
-                        suspend_resume_interval,
-                    ))
-                # <<<
 
+                # Test suspend/resume.
                 if num_requests_added in suspend_idxs:
-                    print_suspend_resume("suspend")
                     client.pause_engines()
                 if num_requests_added in resume_idxs:
-                    print_suspend_resume("resume")
                     client.unpause_engines()
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
             if num_requests_added == num_requests_total:
                 break
             # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 
@@ -143,11 +122,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 json.dump(json_results, fp, indent=4)
         else:
             print("Results:")
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # for req in results:
-            #     print(f"rid: {req.request_id}\nprompt: {req.prompt!r}\noutput: {req.generated_text!r}\n\n")
-            # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-            from collections import defaultdict
             unique_prompt_map = defaultdict(list)
             for req in results:
                 unique_prompt_map[req.prompt].append(req)
@@ -155,11 +129,10 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 print(f"%d/%d. prompt '%s' ... [%d] output '%s'." % (
                     idx,
                     len(unique_prompt_map),
-                    prompt_text,
+                    prompt_text.replace("\n", "\\n"),
                     len(reqs),
                     reqs[0].generated_text.replace("\n", "\\n"),
                 ))
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
  
         # kill the engines and suspend the client
         client.stop_engines()

@@ -290,6 +290,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sampling_params: SamplingParams,
         inference_coordinator_port: int,
         launch_inference_coordinator: bool = True,
+        verbose: bool = False,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -321,6 +322,7 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            verbose (bool): Whether to run in verbose mode.
 
         Note:
             The current implementation uses `ipc` sockets for broadcasting requests
@@ -344,7 +346,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
                     coordinator_ready_event,
-                    self.controller.tokenizer,
                     inference_coordinator_port,
                     parallel_state.get_data_parallel_world_size(),
                 ),
@@ -411,7 +412,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         self.engine_loop_task = asyncio.create_task(
-            self.run_engine_with_coordinator(sampling_params)
+            self.run_engine_with_coordinator(sampling_params, verbose=verbose)
         )
 
     @contextmanager
@@ -482,9 +483,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_all_tensors()
-        # >>>
-        print("         SUSPEND request_ids: %s.\n" % str(list(self.requests.keys())))
-        # <<<
 
         # Delete cuda graphs when not using unified memory at all (level 0). For
         # levels 1 and 2, the context's tensors maintain static memory addresses,
@@ -525,11 +523,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self.requests: Dict[int, DynamicInferenceRequest] = {}
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
 
-            # >>>
-            # if request_ids:
-            #     pax({"context": self.context})
-            # <<<
-
             # Create cuda graphs (before adding requests, to be in decode mode).
             # Only create cuda graphs when not using unified memory at all (level
             # 0). For levels 1 and 2, the context's tensors maintain static
@@ -565,9 +558,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     request_id,
                     tokens,
                     request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
-                    # >>>
-                    debug=bool(request_ids),
-                    # <<<
                 )
             torch.cuda.synchronize()
             add_time = time.time() - add_time
@@ -578,17 +568,6 @@ class DynamicInferenceEngine(AbstractEngine):
             f"add {add_time:.3f}",
             f"capture {capture_time:.3f}.",
         )))
-        # >>>
-        print("         RESUME request_ids: %s.\n" % str(list(self.requests.keys())))
-        # <<<
-
-        # >>>
-        # if request_ids:
-        #     pax({
-        #         "engine requests" : str(request_ids),
-        #         "context requests" : str(self.context.request_ids[:self.context.total_request_count].tolist()),
-        #     })
-        # <<<
 
         return futures
 
@@ -775,6 +754,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     finished_request = self.requests.pop(request_id)
+                    if finished_request.prompt is None:
+                        finished_request.prompt = self.controller.tokenizer.detokenize(
+                            finished_request.prompt_tokens.tolist()
+                        )
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_requests.append(finished_request)
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
@@ -893,11 +876,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Note that we do not need to continue check the queue, as the tokens are full
 
     async def async_step(
-        self,
-        sampling_params: SamplingParams,
-        *,
-        verbose: Optional[bool] = False,
-        post_process_requests_locally: bool = True,
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -956,16 +935,11 @@ class DynamicInferenceEngine(AbstractEngine):
             [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
 
             # Add finished events.
-            if post_process_requests_locally:
-                (active_requests, finished_requests) = self.post_process_requests(
-                    active_request_ids, finished_request_ids, step_time, sample, log_probs
-                )
-            else:
-                return active_request_ids, finished_request_ids, sample, log_probs
+            (active_requests, finished_requests) = self.post_process_requests(
+                active_request_ids, finished_request_ids, step_time, sample, log_probs
+            )
 
         else:
-            if not post_process_requests_locally:
-                return None
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
 
@@ -1231,33 +1205,22 @@ class DynamicInferenceEngine(AbstractEngine):
                     continue
 
                 engine_output = await self.async_step(
-                    sampling_params=sampling_params,
-                    verbose=verbose,
-                    post_process_requests_locally=False,
+                    sampling_params=sampling_params, verbose=verbose
                 )
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
                     and parallel_state.get_pipeline_model_parallel_rank() == 0
                 )
-                if is_tp0_and_pp0 and engine_output is not None:
-                    # return the engine output to the coordinator. The coordinator will take
-                    # care of the post-processing.
-                    request_ids, finished_request_ids, sample, logprobs = engine_output
-                    # Include chunked prefill request id, use -1 if None
-                    chunked_prefill_id = self.context.chunked_prefill_request_id
-                    materialize_only_last_token_logits = (
-                        self.context.materialize_only_last_token_logits
-                    )
+                if (
+                    is_tp0_and_pp0
+                    and engine_output is not None
+                    and engine_output["finished_requests"]
+                ):
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
-                            request_ids.tolist(),
-                            finished_request_ids.tolist(),
-                            sample.tolist(),
-                            logprobs,
-                            chunked_prefill_id,
-                            materialize_only_last_token_logits,
+                            [r.serializable() for r in engine_output["finished_requests"]],
                         ],
                         use_bin_type=True,
                     )

@@ -4,7 +4,7 @@ import asyncio
 import math
 import random
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import pytest
@@ -89,6 +89,7 @@ class DynamicEngineTestConfig:
     # to avoid the overhead of building the graphs, which is not
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
+    suspend_resume_interval: Optional[int] = None
 
     def __post_init__(self):
 
@@ -128,7 +129,10 @@ class DynamicEngineTestEnv:
 class TestDynamicInferenceEngine:
 
     @classmethod
-    def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
+    def _build_requests(
+        cls,
+        test_config: DynamicEngineTestConfig,
+    ) -> List[DynamicInferenceRequest]:
 
         requests = []
         for request_id in range(test_config.num_requests):
@@ -347,7 +351,30 @@ class TestDynamicInferenceEngine:
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
         result = env.engine.step_modern(env.requests[0].sampling_params, verbose=False)
+
+        # Suspend + resume.
+        if (
+            env.config.suspend_resume_interval is not None
+            and env.engine.step_count % env.config.suspend_resume_interval == 0
+        ):
+            suspend_resume_mems = {}
+            suspend_resume_mems["start"] = torch.cuda.memory_stats()
+            env.engine.suspend()  # suspend.
+            suspend_resume_mems["mid"] = torch.cuda.memory_stats()
+            env.engine.resume()  # resume.
+            suspend_resume_mems["end"] = torch.cuda.memory_stats()
+            env.mem_usage["suspend_resume"][env.engine.step_count] = suspend_resume_mems
+
+        # Nothing done?
         finished_requests = result["finished_requests"]
+        if len(finished_requests) == 0:
+            return
+
+        # Append output tokens.
+        for finished_request in finished_requests:
+            request = env.requests[finished_request.request_id]
+            request.output = finished_request.generated_tokens
+            request.state = "finished"
 
     @classmethod
     def _run_test(cls, **test_config_kwargs):
@@ -357,10 +384,12 @@ class TestDynamicInferenceEngine:
         env = cls._build_test_env(test_config)
 
         # Add requests to engine.
+        env.mem_usage["start"] = torch.cuda.memory_stats()
         for request in tqdm(env.requests, "add requests"):
 
             # Add request.
             env.engine._add_request(request)
+            request.state = "pending"
 
             # Insert gap steps between adding requests.
             for _ in range(test_config.num_gap_steps):
@@ -387,14 +416,19 @@ class TestDynamicInferenceEngine:
                 if num_tokens_total is None
                 else num_tokens_total - len(request.prompt_tokens)
             )
-            assert (
-                (num_tokens_to_generate is None and num_tokens_total is None)
-                or len(request.generated_tokens) == num_tokens_expected
-                or request.status == Status.FAILED
-            ), (
-                f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
-                f"tokens but generated {len(request.generated_tokens)}"
-            )
+
+            # Validate the output length only if suspend_resume_interval is None.
+            # If it is not None, then the output length could be anything in the
+            # range [1, num_tokens_to_generate].
+            if test_config.suspend_resume_interval is None:
+                assert (
+                    (num_tokens_to_generate is None and num_tokens_total is None)
+                    or len(request.generated_tokens) == num_tokens_expected
+                    or request.status == Status.FAILED
+                ), (
+                    f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
+                    f"tokens but generated {len(request.generated_tokens)}"
+                )
         env.mem_usage["end"] = torch.cuda.memory_stats()
 
         return env
@@ -414,6 +448,7 @@ class TestDynamicInferenceEngine:
 
         # Run test.
         env = self._run_test(
+            num_tokens_to_generate=16,
             num_cuda_graphs=num_cuda_graphs,
             context_max_requests_override=32,
             cuda_graph_scope=cuda_graph_scope,
@@ -475,7 +510,11 @@ class TestDynamicInferenceEngine:
     def test_token_overflow_transient(self) -> None:
         """Test token overflow."""
         test_config = DynamicEngineTestConfig(
-            num_requests=2, min_prompt_length=8, max_prompt_length=8, context_max_tokens_override=12
+            num_requests=2,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=2,
+            context_max_tokens_override=12,
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -858,10 +897,59 @@ class TestDynamicInferenceEngine:
 
         assert result_event_types == expected_event_types
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_suspend_resume_memory(self):
+
+        # Run tests.
+        mem_usages = {}
+        for suspend_resume_interval in None, 4, 2, 1:
+
+            # Run test.
+            env = self._run_test(suspend_resume_interval=suspend_resume_interval, num_gap_steps=1)
+
+            # Record memory usage.
+            mem_usages[suspend_resume_interval] = env.mem_usage
+
+            # Clear memory to make recorded memories consistent between tests.
+            # TODO(@lmcafee): why is memory not automatically cleared?
+            # env.engine.suspend() # TODO(@lmcafee): useful?
+            del env
+
+        # Utility methods.
+        get_alloc = lambda mem_stats: mem_stats["allocated_bytes.all.current"]
+
+        # Validate overall 'end' memory usage.
+        golden_end_bytes = get_alloc(mem_usages[None]["end"])
+        for interval, mem_usage in mem_usages.items():
+            current_end_bytes = get_alloc(mem_usage["end"])
+            assert math.isclose(
+                golden_end_bytes, current_end_bytes, rel_tol=0.01
+            ), f"{current_end_bytes} != {golden_end_bytes}."
+
+        # Validate 'suspend/resume' memory usage.
+        get_suspend_resume_bytes = lambda key: list(
+            get_alloc(list(d["suspend_resume"].values())[-1][key])
+            for i, d in mem_usages.items()
+            if i is not None
+        )
+        suspend_resume_mid_bytes = get_suspend_resume_bytes("mid")
+        suspend_resume_end_bytes = get_suspend_resume_bytes("end")
+        for mid_bytes in suspend_resume_mid_bytes:
+            assert math.isclose(
+                suspend_resume_mid_bytes[0], mid_bytes, rel_tol=0.01
+            ), f"{mid_bytes} != {suspend_resume_mid_bytes[0]}."
+        for end_bytes in suspend_resume_end_bytes:
+            assert math.isclose(
+                suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
+            ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
+
 
 if __name__ == "__main__":
     test = TestDynamicInferenceEngine()
-    test.test_simple(4)
+    test.test_simple(4, "full")
     test.test_overflow_factor()
     test.test_request_overflow()
     test.test_token_overflow_transient()
@@ -876,6 +964,7 @@ if __name__ == "__main__":
     test.test_return_log_probs()
     test.test_parallel_inference()
     # test.test_events() # uncomment in megatron-core 0.16
+    test.test_suspend_resume()
     test.teardown_method(None)
     print("~~~")
     print("success.")

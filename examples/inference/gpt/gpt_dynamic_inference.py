@@ -70,7 +70,6 @@ import builtins
 builtins.pax = _pax
 # <<<
 
-
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
 
@@ -321,6 +320,22 @@ def run_inference(
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
         is_decode_only = engine.is_decode_only 
 
+        # Test suspending and resuming engine.
+        if (
+            args.suspend_resume_interval is not None
+            and
+            engine.step_count % args.suspend_resume_interval == 0
+        ):
+            active_token_count_0 = engine.context.active_token_count
+            engine.suspend()
+            engine.resume()
+            active_token_count_1 = engine.context.active_token_count
+            print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
+                engine.step_count,
+                active_token_count_0,
+                active_token_count_1,
+            ))
+
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
         if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
@@ -506,6 +521,7 @@ def main():
                     o_len = 0
                     escaped_output_text = "--"
                 print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -574,6 +590,7 @@ def main():
             f"total time: {total_time:.3f}s … "
             f"steps: {engine.step_count:d} … "
             f"throughput: {throughput:.3f} tok/s"
+            f"text hash: {hashlib.sha256(str(text_hashes).encode()).hexdigest()[:6]}"
         )
         print("~~~")
 
