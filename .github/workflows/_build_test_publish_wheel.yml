@@ -1,5 +1,10 @@
 on:
   workflow_call:
+    secrets:
+      TWINE_USERNAME:
+        required: true
+      TWINE_PASSWORD:
+        required: true
 
 jobs:
   build-and-test-wheels:
