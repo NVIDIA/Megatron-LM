@@ -959,7 +959,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
-        self._loop = get_event_loop(loop)
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -978,7 +978,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
-        self._loop = get_event_loop(loop)
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 self.schedule_requests()

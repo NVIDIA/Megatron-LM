@@ -8,7 +8,7 @@ from typing import List, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
 
