@@ -34,7 +34,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, set_decode_expert_padding
-from megatron.core.utils import get_asyncio_loop, get_model_config
+from megatron.core.utils import get_asyncio_loop, get_model_config, trace_async_exceptions
 
 try:
     from tqdm import tqdm
@@ -367,6 +367,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Finally run the engine infinite loop
         self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
 
+    @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
         async with self._cond:
@@ -958,6 +959,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
         parallel_state.destroy_model_parallel()
 
+    @trace_async_exceptions
     async def run_engine(self, *, verbose: Optional[bool] = False):
         """Continually steps the engine asynchronously."""
         try:
@@ -973,6 +975,7 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    @trace_async_exceptions
     async def run_engine_with_coordinator(self, *, verbose: Optional[bool] = False):
         """Continually steps the engine asynchronously."""
         try:

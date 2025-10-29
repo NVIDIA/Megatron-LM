@@ -107,6 +107,7 @@ class InferenceClient:
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
+    @trace_async_exceptions
     async def _listen_for_completed_requests(self):
         """
         Listens for completed inference requests from the coordinator.
