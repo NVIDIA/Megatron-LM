@@ -152,7 +152,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
-        active_buffer_size_bytes (float): Buffer size reserved for active requests
+        active_buffer_size_gb (float): Buffer size reserved for active requests
             that live on the GPU. The total buffer size (stored in unified memory)
             is 2x this value, with the the other half of the buffer reserved for
             paused requests that live on the CPU.
@@ -184,8 +184,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_channels: int,
         num_attention_heads: int,
         max_sequence_length: int,
-        active_buffer_size_bytes: float,
-        max_tokens: int,
+        active_buffer_size_gb: float,
+        max_tokens: int = 16384,
         chunk_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
         cache_mla_latent: bool = False,
@@ -234,6 +234,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Initialize chunk allocator.
+        active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
         active_chunk_count_total = active_buffer_size_bytes // self.chunk_size_bytes
         self.chunk_allocator = ChunkAllocator(context=self, active_count=active_chunk_count_total)
         del active_chunk_count_total  # use self.chunk_allocator.active_count

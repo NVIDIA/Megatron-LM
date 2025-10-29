@@ -60,9 +60,6 @@ except:
     HAVE_MSGPACK = False
 
 
-process = psutil.Process(os.getpid())
-
-
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
     for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:

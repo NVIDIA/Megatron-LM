@@ -115,30 +115,6 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context_active_buffer_size_bytes(model: torch.nn.Module) -> int:
-    """Estimate memory remaining for context's `memory_buffer`.
-
-    The following implementation is a placeholder, using only
-    `args.inference_dynamic_batching_active_buffer_size_gb`. Eventually, this will
-    be computed by first computing memory used by the model, activations, and the
-    KV cache.
-    """
-    args = get_args()
-    active_buffer_size_gb = args.inference_dynamic_batching_active_buffer_size_gb
-    active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
-    return active_buffer_size_bytes
-
-
-def get_inference_context_max_tokens(model: torch.nn.Module) -> int:
-    """Estimate `max_tokens` for the context.
-
-    The following implementation is a placeholder, simply returning a hard-coded
-    value for `max_tokens`. Eventually, this will be computed by analyzing the
-    correlation between `max_tokens` and request throughput.
-    """
-    return 16384
-
-
 def get_inference_context(
     requests: List[Request],
     sampling_params: SamplingParams,
@@ -157,10 +133,6 @@ def get_inference_context(
     else:
         max_sequence_length = args.inference_max_seq_length
 
-    # Active buffer size & max tokens.
-    active_buffer_size_bytes = get_inference_context_active_buffer_size_bytes(model)
-    max_tokens = get_inference_context_max_tokens(model)
-
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -176,8 +148,7 @@ def get_inference_context(
             else None
         ),
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
-        active_buffer_size_bytes=active_buffer_size_bytes,
-        max_tokens=max_tokens,
+        active_buffer_size_gb=args.inference_dynamic_batching_active_buffer_size_gb,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
