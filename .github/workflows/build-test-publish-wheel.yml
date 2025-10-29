@@ -103,6 +103,7 @@ jobs:
           echo "EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}=$EXPECTED_RELEASE_NUMBER" | tee -a "${GITHUB_OUTPUT}"
 
           if [ "$PACKAGE" = "megatron-fsdp" ]; then
+            mkdir -p dist/
             cp -a megatron/core/distributed/fsdp/src/dist/* dist/
           fi
 
