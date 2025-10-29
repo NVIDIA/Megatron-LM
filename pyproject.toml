@@ -19,7 +19,6 @@ name = "megatron-core"
 dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
-license = { text = "Apache 2.0" }
 license-files = ["LICENSE"]
 dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
