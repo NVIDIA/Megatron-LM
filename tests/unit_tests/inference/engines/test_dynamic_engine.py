@@ -350,7 +350,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(env.requests[0].sampling_params, verbose=False)
+        result = env.engine.step_modern(verbose=False)
 
         # Suspend + resume.
         if (

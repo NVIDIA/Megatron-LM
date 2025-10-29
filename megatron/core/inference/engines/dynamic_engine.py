@@ -127,6 +127,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.static_sampling = static_sampling
         self.unified_memory_level = unified_memory_level
         self.capture_stats = None
         self.is_suspended = False
@@ -183,8 +184,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.static_sampling = static_sampling
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
