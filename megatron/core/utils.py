@@ -2045,7 +2045,7 @@ def trace_async_exceptions(
             try:
                 return await fn(*args, **kwargs)
             except Exception as e:
-                print(f"Exception in async function {fn.__name__}: {e}")
+                print(f"Exception in async function {fn.__name__}: {e}")  # pylint: disable=W0141
                 traceback.print_exc()
                 sys.exit(1)
             finally:
@@ -2058,7 +2058,7 @@ def trace_async_exceptions(
 
                     log10 = numpy.log10(max(cnt, 1))
                     if numpy.isclose(log10, round(log10)):
-                        print(
+                        print(  # pylint: disable=W0141
                             f"{name} completed in {elapsed:.3f} ms, "
                             f"lifetime avg: {avg:.3f} ms, "
                             f"lifetime cnt: {cnt + 1}"
