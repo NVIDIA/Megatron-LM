@@ -151,8 +151,23 @@ jobs:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}
           path: dist/
 
+  publish-wheels:
+    needs: [build-and-test-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge: true
+
+      - name: Publish wheels
+        run: |
+          ls -al dist/
+          # twine upload dist/*
+
   build-test-publish-wheel-summary:
-    needs: [pre-flight, build-and-test-wheels]
+    needs: [pre-flight, build-and-test-wheels, publish-wheels]
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
