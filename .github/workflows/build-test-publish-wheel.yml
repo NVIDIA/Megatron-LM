@@ -84,15 +84,11 @@ jobs:
             docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp311-cp311/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp312-cp312/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp313-cp313/bin/python -m build
-            USE_DIST_DIR=0
-            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} auditwheel repair dist/*.whl || USE_DIST_DIR=1
-            if [ "$USE_DIST_DIR" != "1" ]; then
-              rm -rf dist/*.whl
-            fi
+            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} auditwheel repair dist/*.whl
           popd
 
           pushd $ROOTDIR
-            EXPECTED_RELEASE_NUMBER=$(/opt/python/cp312-cp312/bin/python -c "import package_info; print(package_info.__version__)")
+            EXPECTED_RELEASE_NUMBER=$(python -c "import package_info; print(package_info.__version__)")
           popd
 
           echo "EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}=$EXPECTED_RELEASE_NUMBER" | tee -a "${GITHUB_OUTPUT}"
