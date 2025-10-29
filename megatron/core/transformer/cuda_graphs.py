@@ -66,12 +66,6 @@ try:
     FREEZE_GC_MAX_TORCH_VERSION = PkgVersion("2.9.0a0")
     if get_torch_version() >= FREEZE_GC_MAX_TORCH_VERSION:
         FREEZE_GC = False
-    # >>>
-    from lutil import pax
-    pax({
-        "torch version" : get_torch_version(),
-    }, "FREEZE_GC_MAX_TORCH_VERSION, FREEZE_GC")
-    # <<<
 except ImportError:
     pass
 
@@ -633,12 +627,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        # >>>
-        from lutil import pax
-        pax({"torch version": get_torch_version()})
-        # <<<
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         # save grads and other variables that may be affected by graph warmup
@@ -727,7 +716,7 @@ class _CudaGraphRunner(torch.nn.Module):
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             # gc.collect() drops references to unreachable tensors created during capture,
@@ -742,8 +731,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         self.bwd_graph = torch.cuda.CUDAGraph()
@@ -803,7 +791,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = static_grad_inputs
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             if self.is_first_layer:
