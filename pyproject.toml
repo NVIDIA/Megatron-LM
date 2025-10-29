@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 include = ["megatron.core", "megatron.core.*"]
@@ -17,9 +18,9 @@ readme = { file = "README.md", content-type = "text/markdown" }
 [project]
 name = "megatron-core"
 dynamic = ["version", "readme"]
+license = { text = "Apache 2.0" }
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
-license-files = ["LICENSE"]
 dependencies = ["torch", "numpy<2.0.0", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
