@@ -155,6 +155,12 @@ jobs:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
     environment: public
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - PACKAGE: megatron_core
+          - PACKAGE: megatron_fsdp
     steps:
       - name: Download wheels
         uses: actions/download-artifact@v4
@@ -167,9 +173,9 @@ jobs:
           TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
         run: |
-          ls -al dist/
+          ls -al dist/$PACKAGE*.whl
           pip install twine
-          twine upload -r testpypi -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/*
+          twine upload -r testpypi -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/$PACKAGE*.whl
 
   build-test-publish-wheel-summary:
     needs: [pre-flight, build-and-test-wheels, publish-wheels]
