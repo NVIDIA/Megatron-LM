@@ -64,6 +64,7 @@ jobs:
         id: check-membership
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
+          IS_DEV_BRANCH: ${{ github.ref == 'refs/heads/dev' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
