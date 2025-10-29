@@ -46,6 +46,7 @@ MODEL_ARGS:
   --log-interval: 100
   --save-interval: 2000
   --eval-interval: 1000
+  --save-retain-interval: 10000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --eval-iters: 10
