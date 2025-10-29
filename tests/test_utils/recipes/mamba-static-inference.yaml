@@ -63,4 +63,4 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dg  x_h100]
+        platforms: [dgx_h100]
