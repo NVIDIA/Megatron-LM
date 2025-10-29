@@ -84,10 +84,12 @@ jobs:
           fi
 
           pushd $BUILD_DIR
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp310-cp310/bin/python -m build
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp311-cp311/bin/python -m build
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp312-cp312/bin/python -m build
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp313-cp313/bin/python -m build
+            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c '
+              pip install --upgrade "setuptools>=80.0.0"
+              for python_version in cp310 cp311 cp312 cp313; do
+                /opt/$python_version-cp$python_version/bin/python -m build
+              done
+            ' 
 
             PLATFORM_WHEELS=$(find dist -name "*.whl" -not -name "*-none-any.whl")
             if [ -n "$PLATFORM_WHEELS" ]; then
