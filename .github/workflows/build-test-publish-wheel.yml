@@ -159,7 +159,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist/
-          merge: true
+          merge-multiple: true
 
       - name: Publish wheels
         run: |
