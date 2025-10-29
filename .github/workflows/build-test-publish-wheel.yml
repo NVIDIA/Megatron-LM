@@ -38,6 +38,7 @@ jobs:
 
   build-wheels:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - PACKAGE: megatron-core
@@ -49,7 +50,7 @@ jobs:
           - PACKAGE: megatron-fsdp
             IMAGE: quay.io/pypa/manylinux_2_28_x86_64
             PLATFORM: amd64
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.PLATFORM == 'arm64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
