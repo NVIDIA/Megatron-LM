@@ -50,7 +50,6 @@ jobs:
             IMAGE: quay.io/pypa/manylinux_2_28_x86_64
             PLATFORM: amd64
     runs-on: ubuntu-latest
-    container: ${{ matrix.IMAGE }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -76,10 +75,10 @@ jobs:
           fi
 
           pushd $BUILD_DIR
-            /opt/python/cp310-cp310/bin/python -m build
-            /opt/python/cp311-cp311/bin/python -m build
-            /opt/python/cp312-cp312/bin/python -m build
-            /opt/python/cp313-cp313/bin/python -m build
+            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp310-cp310/bin/python -m build
+            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp311-cp311/bin/python -m build
+            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp312-cp312/bin/python -m build
+            docker run --rm -v $(pwd):/workspace -w /workspace ${{ matrix.IMAGE }} /opt/python/cp313-cp313/bin/python -m build
             USE_DIST_DIR=0
             auditwheel repair dist/*.whl || USE_DIST_DIR=1
             if [ "$USE_DIST_DIR" != "1" ]; then
