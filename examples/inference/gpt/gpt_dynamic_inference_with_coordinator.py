@@ -86,7 +86,7 @@ async def main(
                     "generated_tokens": req.generated_tokens,
                     "latency": req.latency, #InferenceClient populates this field in the returned future.
                 }
-                if req.sampling_params.return_log_probs:
+                if req.sampling_params["return_log_probs"]:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 json_results[req.request_id] = result_dict
             with open(args.output_path, "w") as fp:
