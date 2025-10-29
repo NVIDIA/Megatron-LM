@@ -36,7 +36,7 @@ jobs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
     if: github.repository == 'NVIDIA/Megatron-LM'
 
-  build-wheels:
+  build-and-test-wheels:
     strategy:
       fail-fast: false
       matrix:
@@ -51,15 +51,16 @@ jobs:
             IMAGE: quay.io/pypa/manylinux_2_28_x86_64
             PLATFORM: amd64
     runs-on: ${{ matrix.PLATFORM == 'amd64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
+    env:
+      PACKAGE: ${{ matrix.PACKAGE }}
+      IMAGE: ${{ matrix.IMAGE }}
+      PLATFORM: ${{ matrix.PLATFORM }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build wheel
-        env:
-          PACKAGE: ${{ matrix.PACKAGE }}
-          IMAGE: ${{ matrix.IMAGE }}
-          PLATFORM: ${{ matrix.PLATFORM }}
+        id: build-wheel
         run: |
           set -x
 
@@ -100,7 +101,7 @@ jobs:
             EXPECTED_RELEASE_NUMBER=$(python -c "import package_info; print(package_info.__version__)")
           popd
 
-          echo "EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}=$EXPECTED_RELEASE_NUMBER" | tee -a "${GITHUB_OUTPUT}"
+          echo "expected-release-number=$EXPECTED_RELEASE_NUMBER" | tee -a "${GITHUB_OUTPUT}"
 
           if [ "$PACKAGE" = "megatron-fsdp" ]; then
             mkdir -p dist/
@@ -109,6 +110,40 @@ jobs:
 
           ls -al dist/
 
+      - name: Test wheels
+        run: |
+          ls -al dist/
+
+          if [ "$PACKAGE" = "megatron-core" ]; then
+            ROOTPATH="megatron.core"
+            WHEEL_PREFIX="megatron_core"
+          elif [ "$PACKAGE" = "megatron-fsdp" ]; then
+            ROOTPATH="megatron_fsdp"
+            WHEEL_PREFIX="megatron_fsdp"
+          else
+            echo Unknown package: $PACKAGE
+            exit 1
+          fi
+
+          if [ "$PACKAGE" = "megatron-core" ]; then
+            if [[ "$PLATFORM" == "arm64" ]]; then
+              for file in dist/$WHEEL_PREFIX*cp311*aarch64.whl; do
+                pip install --no-cache-dir "$file"
+              done
+            else
+              for file in dist/$WHEEL_PREFIX*cp311*x86_64.whl; do
+                pip install --no-cache-dir "$file"
+              done
+            fi
+          else
+            pip install --no-cache-dir dist/$WHEEL_PREFIX*.whl
+          fi
+
+          rm -rf megatron/
+
+          RELEASE_NUMBER=$(python -c "import $ROOTPATH; print($ROOTPATH.__version__)")
+          test "${{ steps.build-wheel.outputs.expected-release-number }}" == "$RELEASE_NUMBER"
+
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -116,7 +151,7 @@ jobs:
           path: dist/
 
   build-test-publish-wheel-summary:
-    needs: [pre-flight, build-wheels]
+    needs: [pre-flight, build-and-test-wheels]
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
