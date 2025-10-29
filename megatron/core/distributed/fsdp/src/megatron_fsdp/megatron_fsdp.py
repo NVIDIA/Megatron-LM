@@ -235,7 +235,10 @@ class MegatronFSDP(torch.nn.Module):
         self.dist_index = dist_index
 
         # If Megatron Expert Parallelism is enabled, you need to provide an expt_dp_group.
-        if has_expert_parameters and self.dist_index.get_expert_dp_group() is None:
+        if (
+            has_expert_parameters
+            and self.dist_index.get_fsdp_group(is_expert_parallel=True) is None
+        ):
             raise ValueError(
                 "[Megatron-FSDP] Megatron Expert Parallelism is enabled, but no expt_dp_group is"
                 "provided."
@@ -353,9 +356,7 @@ class MegatronFSDP(torch.nn.Module):
         )
 
         # Set the suggested communication unit size for reduce-scatter and all-gather pipelines.
-        suggested_communication_unit_size = (
-            self.ddp_config.suggested_communication_unit_size or 1_000_000_000
-        )
+        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
         if suggested_communication_unit_size is None:
             if self.data_parallel_sharding_strategy == "optim_grads_params":
                 total_param_elements = 0
@@ -370,6 +371,8 @@ class MegatronFSDP(torch.nn.Module):
                 suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
             elif self.bucket_size is not None:
                 suggested_communication_unit_size = self.bucket_size
+            else:
+                suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
             suggested_communication_unit_size = max(

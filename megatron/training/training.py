@@ -1080,6 +1080,17 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import has_modelopt_state
+        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
+        # set a flag to use our model provider if so.
+        if args.load is not None and has_modelopt_state(args.load):
+            print_rank_0(f'ModelOpt checkpoint detected')
+            args.modelopt_enabled = True
+        elif getattr(args, "export_kd_teacher_load", None):
+            # For distillation ckpts without ModelOpt state
+            args.modelopt_enabled = True
+
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
 
@@ -1100,6 +1111,7 @@ def setup_model_and_optimizer(
         # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
         #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
         default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+        dump_param_to_param_group_map=args.dump_param_to_param_group_map,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1470,6 +1482,13 @@ def training_log(
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
+        # Log bins for packed mode
+        if has_rl_utils and args.rl_use_sequence_packing:
+            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
+            for metric_name, metric_value in packing_metrics.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+            if wandb_writer and packing_metrics:
+                wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
@@ -1573,6 +1592,8 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        if has_rl_utils and args.rl_use_sequence_packing:
+            log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -1761,6 +1782,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -1803,7 +1825,9 @@ def post_training_step_callbacks(
             assert prof is not None
             prof.stop()
         else:
-            torch.cuda.cudart().cudaProfilerStop()
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            if nsys_nvtx_context is not None:
+                nsys_nvtx_context.__exit__(None, None, None)
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2127,6 +2151,7 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
         and torch.distributed.get_rank() in args.profile_ranks
@@ -2181,8 +2206,9 @@ def train(
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -2201,22 +2227,31 @@ def train(
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
+        # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
+        # Skip automatic checkpoint on microbatch changes when sequence packing is active
+        # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            assert get_num_microbatches() > num_microbatches, (
-                f"Number of microbatches should be increasing due to batch size rampup; "
-                f"instead going from {num_microbatches} to {get_num_microbatches()}"
-            )
-            if args.save is not None:
-                save_checkpoint_and_time(
-                    iteration,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    num_floating_point_operations_so_far,
-                    checkpointing_context,
-                    train_data_iterator=train_data_iterator,
+            if args.rl_use_sequence_packing:
+                print_rank_0(
+                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
+                    f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
+            else:
+                assert get_num_microbatches() > num_microbatches, (
+                    f"Number of microbatches should be increasing due to batch size rampup; "
+                    f"instead going from {num_microbatches} to {get_num_microbatches()}"
+                )
+                if args.save is not None:
+                    save_checkpoint_and_time(
+                        iteration,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        num_floating_point_operations_so_far,
+                        checkpointing_context,
+                        train_data_iterator=train_data_iterator,
+                    )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
@@ -2252,12 +2287,10 @@ def train(
 
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
-                # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
-                if iteration % (args.grpo_iterations * ((args.grpo_samples_per_iteration) // args.global_batch_size)) == 0:
-                    buffered_rollouts = rl_utils.get_rollout_data_iterator(
-                        model, optimizer, iteration, ref_state_dict,
-                    )
-                train_data_iterator = buffered_rollouts
+                train_data_iterator = rl_utils.setup_grpo_data_iterator(
+                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                )
+                buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
         (
@@ -2310,10 +2343,23 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
-        batch_size = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
-        )
-        args.consumed_train_samples += batch_size
+
+        if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
+            iteration_sequences = rl_utils.get_iteration_sequence_count(args)
+            # Track bins separately for packed mode
+            rl_utils.update_sequence_packing_metrics(args)
+        else:
+            batch_size = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            iteration_sequences = batch_size
+
+        # Update consumed samples (always means sequences now)
+        args.consumed_train_samples += iteration_sequences
+
+        # Use iteration_sequences as batch_size for floating point operations
+        batch_size = iteration_sequences
+
         num_skipped_samples_in_batch = (
             get_current_global_batch_size() - get_current_running_global_batch_size()
         )
@@ -2405,6 +2451,7 @@ def train(
             iteration,
             prof,
             num_floating_point_operations_since_last_log_event,
+            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.
