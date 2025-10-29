@@ -33,8 +33,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, set_decode_expert_padding
-from megatron.core.utils import get_asyncio_loop, get_model_config
+from megatron.core.inference.utils import Counter
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -143,108 +143,103 @@ class DynamicInferenceEngine(AbstractEngine):
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
+        self.capture_stats = None
+
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
         else:
             self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
 
-        # Handle setting up expert padding for cuda graph inference if set.
-        if enable_cuda_graph:
-            model_config = get_model_config(controller.inference_wrapped_model.model)
-            inference_wrapper_config = controller.inference_wrapped_model.inference_wrapper_config
-            if inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference:
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(
-                    controller.inference_wrapped_model.model, True, capacity_factor=capacity_factor
+        if self.cuda_graph_impl == "local":
+            self.create_cuda_graphs()
+
+    def create_cuda_graphs(self, reset_context: bool = True):
+        """Create cuda graphs.
+
+        This method iterates the dynamic context's `cuda_graph_request_counts`
+        to record and capture cuda graphs.
+
+        Args:
+            reset_context (bool): Whether to reset the context after building cuda graphs.
+        """
+        context = self.context
+        controller = self.controller
+
+        time_start = time.time()
+        mem_stats_start = torch.cuda.memory_stats()
+
+        logging.info(
+            "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
+            len(context.cuda_graph_token_counts),
+            context.cuda_graph_token_counts,
+        )
+        for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
+            # Iterate cuda graph dims.
+            if (
+                warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                and not context.non_decode_cuda_graphs
+            ):
+                continue
+            tbar = enumerate(context.cuda_graph_token_counts)
+            if HAVE_TQDM:
+                tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+            for tbar_idx, cuda_graph_token_count in tbar:
+                if (
+                    cuda_graph_token_count == 1
+                    and warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                ):
+                    # This case is not supported`` as we require atleast two
+                    # tokens for a non-decode engine step.
+                    continue
+
+                # Initialize context.
+                input_ids, position_ids = self.controller._dynamic_step_context_init(
+                    num_warmup_tokens=cuda_graph_token_count, warmup_engine_mode=warmup_engine_mode
                 )
 
-        self.capture_stats = None
-        if self.cuda_graph_impl == "local":
+                # Initialize attention state.
+                assert (
+                    cuda_graph_token_count == context.padded_active_token_count
+                ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
 
-            time_start = time.time()
-            mem_stats_start = torch.cuda.memory_stats()
-
-            logging.info(
-                "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
-                len(context.cuda_graph_token_counts),
-                context.cuda_graph_token_counts,
-            )
-            for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
-                # Iterate cuda graph dims.
-                if (
-                    warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    and not context.non_decode_cuda_graphs
-                ):
-                    continue
-                tbar = enumerate(context.cuda_graph_token_counts)
+                # Progress.
+                mode_str = warmup_engine_mode.name.lower()
+                tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
                 if HAVE_TQDM:
-                    tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
-                for tbar_idx, cuda_graph_token_count in tbar:
-                    if (
-                        cuda_graph_token_count == 1
-                        and warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    ):
-                        # This case is not supported`` as we require atleast two
-                        # tokens for a non-decode engine step.
-                        continue
-                    # Initialize attention state.
-                    context.initialize_attention_state(
-                        num_warmup_tokens=cuda_graph_token_count,
-                        warmup_engine_mode=warmup_engine_mode,
-                    )
-                    assert (
-                        cuda_graph_token_count == context.padded_active_token_count
-                    ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+                    tbar.set_description(tbar_str)
+                else:
+                    logging.info(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
 
-                    # Progress.
-                    mode_str = warmup_engine_mode.name.lower()
-                    tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
-                    if HAVE_TQDM:
-                        tbar.set_description(tbar_str)
-                    else:
-                        logging.info(
-                            f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}"
-                        )
+                # Forward pass -> logits.
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                    # Get flat tokens, position ids.
-                    input_ids, position_ids = context.current_input_and_position_ids(
-                        num_warmup_tokens=cuda_graph_token_count
-                    )
-
-                    # Forward pass -> logits.
+                if reset_context:
                     with torch.inference_mode():
-                        controller.inference_wrapped_model.run_one_forward_step(
-                            {
-                                "tokens": input_ids,
-                                "position_ids": position_ids,
-                                "attention_mask": None,
-                            }
-                        )
                         context.reset()  # todo: @lmcafee, remove if unnecessary.
 
-            # Memory usage.
-            time_end = time.time()
-            mem_stats_end = torch.cuda.memory_stats()
-            capture_stats = {
-                "time": time_end - time_start,
-                "allocated_bytes": (
-                    mem_stats_end["allocated_bytes.all.current"]
-                    - mem_stats_start["allocated_bytes.all.current"]
-                ),
-                "reserved_bytes": (
-                    mem_stats_end["reserved_bytes.all.current"]
-                    - mem_stats_start["reserved_bytes.all.current"]
-                ),
-            }
-            logging.info(
-                "> built cuda graph(s) in %.2f sec, with total memory usage: "
-                "allocated %s, reserved %s.",
-                capture_stats["time"],
-                format_mem_bytes(capture_stats["allocated_bytes"]),
-                format_mem_bytes(capture_stats["reserved_bytes"]),
-            )
+        # Memory usage.
+        time_end = time.time()
+        mem_stats_end = torch.cuda.memory_stats()
+        capture_stats = {
+            "time": time_end - time_start,
+            "allocated_bytes": (
+                mem_stats_end["allocated_bytes.all.current"]
+                - mem_stats_start["allocated_bytes.all.current"]
+            ),
+            "reserved_bytes": (
+                mem_stats_end["reserved_bytes.all.current"]
+                - mem_stats_start["reserved_bytes.all.current"]
+            ),
+        }
+        logging.info(
+            "> built cuda graph(s) in %.2f sec, with total memory usage: "
+            "allocated %s, reserved %s.",
+            capture_stats["time"],
+            format_mem_bytes(capture_stats["allocated_bytes"]),
+            format_mem_bytes(capture_stats["reserved_bytes"]),
+        )
 
-            self.capture_stats = capture_stats
+        self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
         self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
