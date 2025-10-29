@@ -9,6 +9,7 @@ import time
 import warnings
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -546,10 +547,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
                 # Add request.
+                new_sampling_params = SamplingParams(**{
+                    **asdict(request.sampling_params),
+                    "num_tokens_to_generate" : request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+                })
                 futures[request_id] = self.add_request(
                     request_id,
                     tokens,
-                    request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+                    new_sampling_params,
                 )
             torch.cuda.synchronize()
             add_time = time.time() - add_time
