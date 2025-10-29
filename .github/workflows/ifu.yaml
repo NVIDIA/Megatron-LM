@@ -1,0 +1,453 @@
+name: Megatron-LM IFU
+
+on:
+  # Manual trigger with inputs
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to merge into (e.g., rocm_dev, main)"
+        required: false
+        default: "rocm_dev"
+      target_version:
+        description: "Target version (e.g., core_v0.13.0, 'latest', 'next-untested')"
+        required: false
+        default: "latest"
+      container_image:
+        description: "Container image to use (e.g., rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1)"
+        required: false
+        default: "rocm/pytorch:rocm7.0_ubuntu24.04_py3.12_pytorch_release_2.7.1"
+
+  # Every 3 months on the 1st at 9 AM UTC - more or less NVIDIA's schedule
+  schedule:
+    - cron: "0 9 1 */3 *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  analyze-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine target version
+        id: version
+        run: |
+          # Add nvidia upstream to fetch tags
+          git remote remove nvidia-upstream 2>/dev/null || true
+          git remote add nvidia-upstream https://github.com/NVIDIA/Megatron-LM.git
+          git fetch nvidia-upstream --tags
+
+          # For scheduled runs, find the next untested version
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Running scheduled IFU check - finding next untested version"
+
+            # Read the state file to see what we've already processed
+            LAST_PROCESSED=""
+            if [ -f ".github/ifu-state.json" ]; then
+              LAST_PROCESSED=$(jq -r '.last_processed_versions[]? // empty' .github/ifu-state.json 2>/dev/null)
+            fi
+
+            # Get all core versions, sorted by version
+            ALL_VERSIONS=$(git tag --list --sort=-version:refname "core_v*")
+
+            # Find the first version not in our processed list
+            TARGET_VERSION=""
+            for version in $ALL_VERSIONS; do
+              if ! echo "$LAST_PROCESSED" | grep -q "^${version}$"; then
+                TARGET_VERSION="$version"
+                break
+              fi
+            done
+
+            if [ -z "$TARGET_VERSION" ]; then
+              # All versions processed, use the latest
+              TARGET_VERSION=$(echo "$ALL_VERSIONS" | head -1)
+              echo "All versions processed, using latest: $TARGET_VERSION"
+            else
+              echo "Next untested version: $TARGET_VERSION"
+            fi
+
+          else
+            # Manual run - handle the input parameter
+            INPUT_VERSION="${{ inputs.target_version }}"
+
+            if [ "$INPUT_VERSION" = "latest" ]; then
+              # Get latest stable version (non-RC), fallback to any latest
+              TARGET_VERSION=$(git tag --list --sort=-version:refname "core_v*" | grep -v "rc" | head -1)
+              if [ -z "$TARGET_VERSION" ]; then
+                TARGET_VERSION=$(git tag --list --sort=-version:refname "core_v*" | head -1)
+              fi
+              echo "Using latest stable version: $TARGET_VERSION"
+
+            elif [ "$INPUT_VERSION" = "next-untested" ]; then
+              # Same logic as scheduled runs
+              LAST_PROCESSED=""
+              if [ -f ".github/ifu-state.json" ]; then
+                LAST_PROCESSED=$(jq -r '.last_processed_versions[]? // empty' .github/ifu-state.json 2>/dev/null)
+              fi
+
+              ALL_VERSIONS=$(git tag --list --sort=-version:refname "core_v*")
+              TARGET_VERSION=""
+              for version in $ALL_VERSIONS; do
+                if ! echo "$LAST_PROCESSED" | grep -q "^${version}$"; then
+                  TARGET_VERSION="$version"
+                  break
+                fi
+              done
+
+              if [ -z "$TARGET_VERSION" ]; then
+                TARGET_VERSION=$(echo "$ALL_VERSIONS" | head -1)
+                echo "All processed, using latest: $TARGET_VERSION"
+              else
+                echo "Next untested: $TARGET_VERSION"
+              fi
+            else
+              TARGET_VERSION="$INPUT_VERSION"
+              echo "Using specified version: $TARGET_VERSION"
+            fi
+          fi
+
+          echo "Final target version: $TARGET_VERSION"
+          echo "TARGET_VERSION=$TARGET_VERSION" >> $GITHUB_OUTPUT
+
+          # Verify the version exists
+          VERSION_EXISTS=false
+
+          if git tag --list | grep -q "^${TARGET_VERSION}$"; then
+            VERSION_EXISTS=true
+          elif git rev-parse --verify "refs/tags/${TARGET_VERSION}" >/dev/null 2>&1; then
+            VERSION_EXISTS=true
+          elif git show-ref --tags | grep -q "/${TARGET_VERSION}$"; then
+            VERSION_EXISTS=true
+          fi
+
+          if [ "$VERSION_EXISTS" = "true" ]; then
+            echo "Target version ${TARGET_VERSION} verified"
+            echo "VERSION_EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Target version ${TARGET_VERSION} does not exist"
+            echo "Available core_v versions:"
+            git tag --list "core_v*" --sort=-version:refname | head -10
+            echo "VERSION_EXISTS=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Determine parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "BASE_BRANCH=rocm_dev" >> $GITHUB_OUTPUT
+            echo "CONTAINER_IMAGE=rocm/pytorch-training:v25.3" >> $GITHUB_OUTPUT
+            echo "RUN_MODE=scheduled" >> $GITHUB_OUTPUT
+          else
+            echo "BASE_BRANCH=${{ inputs.base_branch }}" >> $GITHUB_OUTPUT
+            echo "CONTAINER_IMAGE=${{ inputs.container_image }}" >> $GITHUB_OUTPUT
+            echo "RUN_MODE=manual" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pull and Run Container
+        if: steps.version.outputs.VERSION_EXISTS == 'true'
+        id: container
+        run: |
+          IMAGE="${{ steps.params.outputs.CONTAINER_IMAGE }}"
+          echo "Pulling container image: $IMAGE"
+          docker pull "$IMAGE"
+
+          CONTAINER_ID=$(docker run -d \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            --name ifu-container \
+            "$IMAGE" \
+            tail -f /dev/null)
+
+          echo "CONTAINER_ID=$CONTAINER_ID" >> $GITHUB_OUTPUT
+          echo "Container started: $CONTAINER_ID"
+
+      - name: Setup Git in Container
+        if: steps.container.outputs.CONTAINER_ID != ''
+        run: |
+          docker exec ifu-container bash -c "
+            git config --global user.name 'IFU Bot'
+            git config --global user.email 'ifu-bot@amd.com'
+            git config --global --add safe.directory /workspace
+
+            git checkout ${{ steps.params.outputs.BASE_BRANCH }} 2>/dev/null || git checkout -b ${{ steps.params.outputs.BASE_BRANCH }}
+            git branch -D test-merge 2>/dev/null || true
+            git branch -D ifu/* 2>/dev/null || true
+          "
+
+      - name: Add upstream in Container
+        if: steps.container.outputs.CONTAINER_ID != ''
+        run: |
+          docker exec ifu-container bash -c "
+            git remote remove nvidia-upstream 2>/dev/null || true
+            git remote add nvidia-upstream https://github.com/NVIDIA/Megatron-LM.git
+
+            VERSION='${{ steps.version.outputs.TARGET_VERSION }}'
+            echo 'Fetching: \$VERSION'
+            git fetch nvidia-upstream --no-tags refs/tags/\${VERSION}:refs/tags/nvidia/\${VERSION}
+          "
+
+      - name: Analyze merge conflicts in Container
+        if: steps.container.outputs.CONTAINER_ID != ''
+        env:
+          GIT_PAGER: cat
+        run: |
+          cat > /tmp/analyze_conflicts.sh << 'SCRIPT_EOF'
+          #!/bin/bash
+
+          VERSION="${{ steps.version.outputs.TARGET_VERSION }}"
+          BASE_BRANCH="${{ steps.params.outputs.BASE_BRANCH }}"
+
+          if ! git rev-parse --verify $BASE_BRANCH >/dev/null 2>&1; then
+            echo "Error: Branch '$BASE_BRANCH' does not exist!"
+            exit 1
+          fi
+
+          git checkout $BASE_BRANCH
+          git branch -D test-merge 2>/dev/null || true
+          git checkout -b test-merge
+
+          git merge --no-commit --no-ff --allow-unrelated-histories nvidia/${VERSION} 2>&1 || true
+
+          TOTAL_CONFLICTS=$(git diff --name-only --diff-filter=U | wc -l || echo "0")
+
+          echo "## Conflict Analysis"
+          echo "- Base branch: $BASE_BRANCH"
+          echo "- Target version: $VERSION"
+          echo "- Total conflicts: $TOTAL_CONFLICTS"
+          echo ""
+
+          echo "### Conflicts by directory:"
+          git diff --name-only --diff-filter=U | cut -d/ -f1-2 | sort | uniq -c | sort -rn || echo "No conflicts"
+          echo ""
+
+          echo "### Key areas breakdown:"
+          echo -n "Core directory: "
+          git diff --name-only --diff-filter=U | grep -c "^megatron/core/" || echo "0"
+          echo -n "Training directory: "
+          git diff --name-only --diff-filter=U | grep -c "^megatron/training/" || echo "0"
+          echo -n "Tests: "
+          git diff --name-only --diff-filter=U | grep -c "^tests/" || echo "0"
+          echo -n "Tools: "
+          git diff --name-only --diff-filter=U | grep -c "^tools/" || echo "0"
+          echo ""
+
+          echo "### All conflicted files:"
+          git diff --name-only --diff-filter=U || echo "No conflicts"
+
+          echo "TOTAL_CONFLICTS=$TOTAL_CONFLICTS" > /workspace/env_vars
+          echo "BASE_BRANCH=$BASE_BRANCH" >> /workspace/env_vars
+          echo "VERSION=$VERSION" >> /workspace/env_vars
+
+          git diff --name-only --diff-filter=U > /workspace/all_conflicts.txt 2>/dev/null || echo "" > /workspace/all_conflicts.txt
+
+          mkdir -p /workspace/conflict_previews
+          for file in $(git diff --name-only --diff-filter=U); do
+            safe_name=$(echo "$file" | tr "/" "_")
+            grep -A 3 -B 3 "^<<<<<<< \|^======= \|^>>>>>>> " "$file" 2>/dev/null | head -50 > "/workspace/conflict_previews/${safe_name}.preview" || true
+            conflict_count=$(grep -c "^<<<<<<< " "$file" 2>/dev/null || echo "0")
+            echo "$conflict_count" > "/workspace/conflict_previews/${safe_name}.count"
+          done
+
+          git merge --abort 2>/dev/null || git reset --hard HEAD
+          git checkout $BASE_BRANCH
+          git branch -D test-merge 2>/dev/null || true
+
+          echo "Analysis complete. Total conflicts found: $TOTAL_CONFLICTS"
+          SCRIPT_EOF
+
+          docker cp /tmp/analyze_conflicts.sh ifu-container:/tmp/analyze_conflicts.sh
+          docker exec ifu-container chmod +x /tmp/analyze_conflicts.sh
+          docker exec ifu-container /tmp/analyze_conflicts.sh
+
+          if [ -f env_vars ]; then
+            cat env_vars >> $GITHUB_ENV
+          fi
+
+      - name: Update processed versions state
+        if: github.event_name == 'schedule' && env.VERSION != ''
+        run: |
+          mkdir -p .github
+
+          CURRENT_STATE="{}"
+          if [ -f ".github/ifu-state.json" ]; then
+            CURRENT_STATE=$(cat .github/ifu-state.json)
+          fi
+
+          NEW_STATE=$(echo "$CURRENT_STATE" | jq --arg version "${{ steps.version.outputs.TARGET_VERSION }}" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+            .last_processed_versions = (.last_processed_versions // []) + [$version] | unique |
+            .last_run = $date |
+            .["version_" + ($version | gsub("[^a-zA-Z0-9]"; "_"))] = {
+              "processed_date": $date,
+              "conflicts": ($ENV.TOTAL_CONFLICTS // "0" | tonumber),
+              "run_mode": "scheduled"
+            }
+          ')
+
+          echo "$NEW_STATE" > .github/ifu-state.json
+
+          git config --local user.email "ifu-bot@amd.com"
+          git config --local user.name "IFU Bot"
+          git add .github/ifu-state.json
+          git commit -m "Track IFU processing: ${{ steps.version.outputs.TARGET_VERSION }}" || true
+          git push origin HEAD:${{ steps.params.outputs.BASE_BRANCH }} || true
+
+      - name: Create IFU branch and draft PR
+        if: env.TOTAL_CONFLICTS != '0' && github.actor != 'nektos/act' && steps.container.outputs.CONTAINER_ID != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "${{ env.TOTAL_CONFLICTS }}" ] || [ "${{ env.TOTAL_CONFLICTS }}" = "0" ]; then
+            echo "No conflicts found, skipping PR creation"
+            exit 0
+          fi
+
+          VERSION="${{ steps.version.outputs.TARGET_VERSION }}"
+          BASE_BRANCH="${{ steps.params.outputs.BASE_BRANCH }}"
+          IFU_BRANCH="ifu/${VERSION}-to-${BASE_BRANCH}"
+
+          echo "Creating IFU branch: $IFU_BRANCH"
+
+          docker exec ifu-container bash -c "
+            git checkout -b $IFU_BRANCH $BASE_BRANCH
+            git merge --no-commit --no-ff --allow-unrelated-histories nvidia/${VERSION} || true
+            git add -A
+            git reset -- \$(git diff --name-only --diff-filter=U)
+            git commit -m 'WIP: IFU merge of ${VERSION} into ${BASE_BRANCH} - conflicts need resolution' || true
+          "
+
+          git push origin $IFU_BRANCH -f
+
+          CONFLICT_PREVIEWS=""
+          preview_count=0
+          for file in $(head -10 all_conflicts.txt); do
+            safe_name=$(echo "$file" | tr '/' '_')
+            preview_file="conflict_previews/${safe_name}.preview"
+            count_file="conflict_previews/${safe_name}.count"
+
+            if [ -f "$preview_file" ] && [ -s "$preview_file" ]; then
+              conflict_count=$(cat "$count_file" 2>/dev/null || echo "?")
+
+              CONFLICT_PREVIEWS="${CONFLICT_PREVIEWS}
+
+          ### \`${file}\` (${conflict_count} conflict regions)
+          <details>
+          <summary>Click to see conflict preview</summary>
+
+          \`\`\`diff
+          $(cat "$preview_file")
+          \`\`\`
+
+          </details>"
+              preview_count=$((preview_count + 1))
+            fi
+          done
+
+          remaining=$((TOTAL_CONFLICTS - preview_count))
+          if [ $remaining -gt 0 ]; then
+            CONFLICT_PREVIEWS="${CONFLICT_PREVIEWS}
+
+          _...and ${remaining} more files with conflicts. Check out the branch locally to see all conflicts._"
+          fi
+
+          RUN_MODE_NOTE=""
+          if [ "${{ steps.params.outputs.RUN_MODE }}" = "scheduled" ]; then
+            RUN_MODE_NOTE="_Scheduled monthly IFU check (auto-detected version: ${VERSION})_"
+          else
+            RUN_MODE_NOTE="_Manual IFU check_"
+          fi
+
+          PR_BODY=$(cat <<EOF
+          # IFU: Merge NVIDIA ${VERSION} into ${BASE_BRANCH}
+
+          ${RUN_MODE_NOTE}
+
+          ## Summary
+          - **NVIDIA Version**: ${VERSION}
+          - **Target Branch**: ${BASE_BRANCH}
+          - **Total Conflicts**: ${{ env.TOTAL_CONFLICTS }} files
+
+          ## Conflict Breakdown
+
+          ### By Directory
+          \`\`\`
+          $(cat all_conflicts.txt | cut -d/ -f1-2 | sort | uniq -c | sort -rn)
+          \`\`\`
+
+          ## Conflict Previews
+
+          Below are previews of the actual conflicts in the first 10 files. This shows the conflict markers and surrounding context to help understand what needs to be resolved.
+
+          ${CONFLICT_PREVIEWS}
+
+          ## All Conflicted Files
+          <details>
+          <summary>Click to expand full conflict list</summary>
+
+          \`\`\`
+          $(cat all_conflicts.txt)
+          \`\`\`
+          </details>
+
+          ## Resolution Steps
+
+          ### Quick Start Commands
+          \`\`\`bash
+          git fetch origin
+          git checkout $IFU_BRANCH
+          git status  # See all conflicted files
+          \`\`\`
+
+          ### For each conflicted file:
+          1. Open the file and look for conflict markers:
+             - \`<<<<<<< HEAD\` - Your changes (AMD/ROCm version)
+             - \`=======\` - Separator
+             - \`>>>>>>> nvidia/${VERSION}\` - NVIDIA's changes
+
+          2. Consider:
+             - **Preserve**: AMD-specific optimizations, ROCm/HIP compatibility
+             - **Integrate**: New NVIDIA features, bug fixes, performance improvements
+             - **Test**: Ensure functionality after resolution
+
+          3. After resolving:
+             \`\`\`bash
+             git add <resolved-file>
+             \`\`\`
+
+          4. When all conflicts are resolved:
+             \`\`\`bash
+             git commit
+             git push
+             \`\`\`
+
+          ## Checklist
+          - [ ] All conflicts resolved
+          - [ ] AMD optimizations preserved
+          - [ ] ROCm compatibility maintained
+          - [ ] Tests passing
+          - [ ] Code review completed
+
+          ---
+          _This PR was automatically created by the IFU workflow_
+          EOF
+          )
+
+          gh pr create \
+            --draft \
+            --title "IFU: Merge NVIDIA ${VERSION} into ${BASE_BRANCH}" \
+            --body "$PR_BODY" \
+            --base "$BASE_BRANCH" \
+            --head "$IFU_BRANCH"
+
+      - name: Cleanup Container
+        if: always()
+        run: |
+          docker stop ifu-container 2>/dev/null || true
+          docker rm ifu-container 2>/dev/null || true
+          echo "Container cleaned up"
