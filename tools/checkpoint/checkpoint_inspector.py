@@ -444,6 +444,19 @@ def convert_checkpoint(
                         # Store both w and v in the state_dict
                         fsdp_dtensor_state_dict[w_key] = w
                         fsdp_dtensor_state_dict[v_key] = v
+                    elif swiglu and "mlp.linear_fc1.bias" in layer_key:
+                        # Special case for SwiGLU bias: split into w/v halves
+                        b_w, b_v = torch.chunk(per_layer_values[i], 2, dim=0)
+                        b_w = b_w.redistribute(placements=[Shard(0)])
+                        b_v = b_v.redistribute(placements=[Shard(0)])
+                        b_w_key = layer_key.replace(
+                            "mlp.linear_fc1.bias", "mlp.linear_fc1.bias_w"
+                        )
+                        b_v_key = layer_key.replace(
+                            "mlp.linear_fc1.bias", "mlp.linear_fc1.bias_v"
+                        )
+                        fsdp_dtensor_state_dict[b_w_key] = b_w
+                        fsdp_dtensor_state_dict[b_v_key] = b_v
                     elif (
                         "experts.experts.linear_fc1.weight" in layer_key
                         or "experts.experts.linear_fc2.weight" in layer_key
