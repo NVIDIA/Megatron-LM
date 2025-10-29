@@ -368,7 +368,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
-      - cicd-unit-tests-latest
+      # - cicd-unit-tests-latest
     environment: nemo-ci
     if: |
       (
@@ -410,16 +410,11 @@ jobs:
               --scope mr-github
               --enable-lightweight-mode
             )
-            echo ":warning: The Run tests label is not yet supported."
           else
             ARGS=(
               --scope mr-slim
             )
           fi
-
-          ARGS=(
-            --scope mr-slim
-          )
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -451,7 +446,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
-      - cicd-unit-tests-latest
+      # - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
