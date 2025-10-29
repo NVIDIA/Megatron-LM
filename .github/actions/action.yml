@@ -82,7 +82,7 @@ runs:
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
-          --test-case '${{ inputs.test_case }}' \
+          --test-case "${{ inputs.test_case }}" \
           --environment dev \
           --platform dgx_h100 \
           --tag ${{ inputs.tag }} \
@@ -92,6 +92,27 @@ runs:
         )
         echo "$cmd" | tee "job.sh"        
         echo "::endgroup::"
+
+    - name: Get PR info
+      id: get-pr-info
+      if: startsWith(github.ref, 'refs/heads/pull-request/')
+      uses: nv-gha-runners/get-pr-info@main
+
+    - name: Install GH CLI
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        apt-get update
+        apt-get install -y gh
+
+    - name: Has Run tests label
+      shell: bash -x -e -u -o pipefail {0}
+      id: has-run-tests-label
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
+        echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
     - name: Create run-script (e2e test)
       shell: bash -x -e -u -o pipefail {0}
@@ -115,7 +136,8 @@ runs:
           --environment dev \
           --platform dgx_h100 \
           --container-image ${{ inputs.container-image }} \
-          --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts
+          --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
+          --enable-lightweight-mode
 
         RUN_TEST_EOF
         )
@@ -202,5 +224,5 @@ runs:
       if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
-        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir/logs' }}
+        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir' }}
         include-hidden-files: true
