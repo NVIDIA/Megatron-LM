@@ -128,11 +128,11 @@ jobs:
 
           if [ "$PACKAGE" = "megatron-core" ]; then
             if [[ "$PLATFORM" == "arm64" ]]; then
-              for file in dist/$WHEEL_PREFIX*${IMAGE}cp310*aarch64.whl; do
+              for file in dist/$WHEEL_PREFIX*cp310*aarch64.whl; do
                 pip install --no-cache-dir "$file"
               done
             else
-              for file in dist/$WHEEL_PREFIX*${IMAGE}cp310*x86_64.whl; do
+              for file in dist/$WHEEL_PREFIX*cp310*x86_64.whl; do
                 pip install --no-cache-dir "$file"
               done
             fi
