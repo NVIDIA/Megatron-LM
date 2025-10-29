@@ -87,15 +87,12 @@ jobs:
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp312-cp312/bin/python -m build
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE /opt/python/cp313-cp313/bin/python -m build
 
-            USE_DIST_DIR=0
             PLATFORM_WHEELS=$(find dist -name "*.whl" -not -name "*-none-any.whl")
             if [ -n "$PLATFORM_WHEELS" ]; then
                 echo "Found platform wheels to repair: $PLATFORM_WHEELS"
-                docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE auditwheel repair $PLATFORM_WHEELS || USE_DIST_DIR=1
-            fi
-
-            if [ "$USE_DIST_DIR" != "1" ]; then
-              docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE rm -rf dist/*.whl
+                docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE auditwheel repair $PLATFORM_WHEELS
+                docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE rm -rf dist/*.whl
+                docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE cp -a wheelhouse/* dist/
             fi
           popd
 
@@ -104,14 +101,18 @@ jobs:
           popd
 
           echo "EXPECTED_RELEASE_NUMBER_${PLATFORM}_${PACKAGE//-/_}=$EXPECTED_RELEASE_NUMBER" | tee -a "${GITHUB_OUTPUT}"
-          mkdir -p wheelhouse/
 
           if [ "$PACKAGE" = "megatron-fsdp" ]; then
-            cp -a megatron/core/distributed/fsdp/src/dist/* wheelhouse/
+            cp -a megatron/core/distributed/fsdp/src/dist/* dist/
           fi
 
-          ls -al wheelhouse/ || true
-          ls -al dist/ || true
+          ls -al dist/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/
 
   build-test-publish-wheel-summary:
     needs: [pre-flight, build-wheels]
