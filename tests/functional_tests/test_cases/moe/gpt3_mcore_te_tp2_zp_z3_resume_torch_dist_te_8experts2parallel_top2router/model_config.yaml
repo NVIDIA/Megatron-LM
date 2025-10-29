@@ -56,7 +56,7 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
-  --ckpt-format: fsdp_dtensor
+  --ckpt-format: torch_dist
   --dist-ckpt-optim-fully-reshardable: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}

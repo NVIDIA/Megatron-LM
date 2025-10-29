@@ -34,14 +34,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import _mesh_resources
 
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
-from .utils import (
-    _MODEL_PARALLEL_RNG_TRACKER_NAME,
-    FSDPDistributedIndex,
-    get_global_memory_buffer,
-    get_mcore_tensor_parallel_partition_dim,
-    is_mcore_tensor_model_parallel,
-    is_mcore_tensor_parallel_duplicated,
-)
+from .utils import _MODEL_PARALLEL_RNG_TRACKER_NAME, FSDPDistributedIndex, get_global_memory_buffer
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +100,8 @@ def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     message ``s`` since otherwise, it is swallowed.
     """
     if not cond:
-        logger.error(s)
-        logger.error(''.join(traceback.format_stack()))
+        print(s)
+        traceback.print_stack()
         if raise_assertion_error:
             raise AssertionError(s)
 
@@ -218,7 +211,7 @@ class MultiGroupUBRAllocator:
         for group in self.groups[1:]:
             backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
             if torch.distributed.get_rank() == 0:
-                logger.info(
+                print(
                     f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
                     f"group.group_desc:{group.group_desc}"
                 )
@@ -1306,7 +1299,7 @@ def _get_parameter_groups(
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
 
-    is_expert_parameter = lambda n, p: ".experts." in n
+    is_expert_parameter = lambda p: not getattr(p, "allreduce", True)
 
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
@@ -1320,7 +1313,7 @@ def _get_parameter_groups(
                 if is_float8tensor(param) or meta_device_init_fp8_params.get(name, False)
                 else param.dtype
             ),
-            is_expert_param=is_expert_parameter(name, param),
+            is_expert_param=is_expert_parameter(param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
         )
@@ -2264,10 +2257,6 @@ class ParamAndGradBuffer:
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
 
-            for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
-                if getattr(old_param, tp_attr, None) is not None:
-                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
-
         for item_id, p in enumerate(self.params):
             if p in param_map:
                 new_p = param_map[p]
@@ -2351,7 +2340,6 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
-                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
                 elif wbuf:
@@ -2363,7 +2351,6 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
-                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
                 else:
@@ -2378,7 +2365,6 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=False,
-                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
 
@@ -2413,9 +2399,6 @@ class ParamAndGradBuffer:
                             "partition_dim",
                             "partition_stride",
                             "is_embedding_or_output_parameter",
-                            "_mcore_tp",
-                            "_tp_duplicated",
-                            "_tp_partition_dim",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -3563,9 +3546,7 @@ def to_local_if_dtensor(tensor):
     return tensor
 
 
-def _get_fsdp_tensor_spec(
-    param, dist_index: FSDPDistributedIndex, is_sharded_param, is_expert_param
-):
+def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_param):
     """
     Get the DeviceMesh for the parameter and modify the placement for Megatron-FSDP.
     """
@@ -3576,7 +3557,7 @@ def _get_fsdp_tensor_spec(
         dtensor_mesh = getattr(dtensor_spec, "mesh", None)
 
         # Validate that the DTensor root mesh is identical to the Megatron-FSDP device mesh.
-        megatron_fsdp_global_mesh = dist_index.get_root_mesh(is_expert_parallel=is_expert_param)
+        megatron_fsdp_global_mesh = dist_index.get_root_mesh()
         dtensor_global_mesh = _mesh_resources.get_root_mesh(dtensor_mesh)
         # FIXME(boxiangw): add or megatron_fsdp_global_mesh != dtensor_global_mesh:
         # _mesh_resources.get_root_mesh(dtensor_mesh) is not getting the correct root mesh
@@ -3621,7 +3602,7 @@ def _get_fsdp_tensor_spec(
             placements = [Shard(0), dtensor_placement]
             shard_order = [1, 0]
 
-        device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
+        device_mesh = dist_index.get_submesh(mesh_dim_names)
         if shard_order is not None:
             setattr(device_mesh, "_shard_order", shard_order)
 
@@ -3646,7 +3627,7 @@ def _get_fsdp_tensor_spec(
     else:
         placements = [Shard(0)]
 
-    device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
+    device_mesh = dist_index.get_submesh(mesh_dim_names)
     if shard_order is not None:
         setattr(device_mesh, "_shard_order", shard_order)
 
@@ -3661,7 +3642,6 @@ def make_fsdp_dtensor(
     is_expert_param: bool = False,
     run_check: bool = False,
     update_uneven_dtensor_chunk_meta: bool = False,
-    force_sync_tp_duplicated_param: bool = False,
 ):
     """
     Creates a distributed tensor (DTensor) from a local tensor with support for
@@ -3740,39 +3720,38 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if is_mcore_tensor_model_parallel(param):
+    if getattr(param, "tensor_model_parallel", False):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
-            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
+            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel "
+            "is True. Check usage."
         )
 
-        tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
-        global_shape = list(param.shape)
+        # Validate M-Core TP attributes
+        assert hasattr(
+            param, "partition_dim"
+        ), "[Megatron-FSDP] tensor_model_parallel param missing 'partition_dim'."
+        assert hasattr(
+            param, "partition_stride"
+        ), "[Megatron-FSDP] tensor_model_parallel param missing 'partition_stride'."
+        assert (
+            param.partition_stride == 1
+        ), "[Megatron-FSDP] Only partition_stride=1 is currently supported for "
+        "tensor_model_parallel."
+
+        tp_dim = param.partition_dim
+        tp_mesh = dist_index.get_submesh(dist_index.tp_dim)
+
+        # Adjust shape for global dimension
         if tp_mesh.mesh.numel() > 1:
-            if is_mcore_tensor_parallel_duplicated(param):
-                placements = [Replicate()]
-                if force_sync_tp_duplicated_param:
-                    if local_tensor.numel() > 0:
-                        torch.distributed.broadcast(
-                            local_tensor, group=tp_mesh.get_group(), group_src=0
-                        )
-                elif run_check:
-                    # TODO: Implement consistency check for duplicated TP parameters
-                    pass
-            else:
-                tp_dim = get_mcore_tensor_parallel_partition_dim(param)
-                assert tp_dim is not None, (
-                    "[Megatron-FSDP] Parameter is not tensor model parallel, "
-                    "yet tensor_model_parallel is True."
-                )
-                placements = [Shard(tp_dim)]
-                global_shape[tp_dim] *= tp_mesh.mesh.numel()
+            global_shape = list(param.shape)
+            global_shape[tp_dim] *= tp_mesh.mesh.numel()
 
             # Construct TP-sharded DTensor using Megatron-style placement
             param = DTensor.from_local(
-                local_tensor=local_tensor,
+                local_tensor=param,
                 device_mesh=tp_mesh,
-                placements=placements,
+                placements=[Shard(tp_dim)],
                 run_check=run_check,
                 shape=global_shape,
                 stride=torch.empty(global_shape).stride(),
@@ -3780,7 +3759,7 @@ def make_fsdp_dtensor(
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
-        param, dist_index, is_sharded_param=is_sharded_param, is_expert_param=is_expert_param
+        param, dist_index, is_sharded_param=is_sharded_param
     )
 
     # Reshape local tensor for sharded layouts beyond 1D
