@@ -21,9 +21,10 @@ except ImportError:
 
 
 class CompilationState(Enum):
-    UNATTEMPTED = auto()
-    FAILURE = auto()
-    SUCCESS = auto()
+    """Enum to distinguish between unified memory (UVM) compilation states."""
+    UNATTEMPTED = auto()  # Compilation has not been attempted.
+    FAILURE = auto()  # Compilation attempted, but failed.
+    SUCCESS = auto()  # Compilation attempted, and succeeded.
 
 
 # Compilation vars.
@@ -33,6 +34,7 @@ _mod = None  # must remain global until process exit.
 
 
 class UnifiedMemoryUnsupportedError(Exception):
+    """Unified memory is not supported on this system."""
     pass
 
 
