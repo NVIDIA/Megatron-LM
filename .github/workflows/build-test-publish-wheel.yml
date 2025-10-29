@@ -87,8 +87,12 @@ jobs:
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE auditwheel repair dist/*.whl
 
             USE_DIST_DIR=0
-            auditwheel repair dist/*.whl || USE_DIST_DIR=1
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE auditwheel repair dist/*.whl || USE_DIST_DIR=1
+            PLATFORM_WHEELS=$(find dist -name "*.whl" -not -name "*-none-any.whl")
+            if [ -n "$PLATFORM_WHEELS" ]; then
+                echo "Found platform wheels to repair: $PLATFORM_WHEELS"
+                docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE auditwheel repair $PLATFORM_WHEELS || USE_DIST_DIR=1
+            fi
+
             if [ "$USE_DIST_DIR" != "1" ]; then
               docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE rm -rf dist/*.whl
             fi
