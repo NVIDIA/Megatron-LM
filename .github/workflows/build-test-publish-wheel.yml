@@ -175,9 +175,9 @@ jobs:
           TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
         run: |
-          ls -al dist/$PACKAGE*.whl
+          ls -al dist/$PACKAGE*
           pip install twine
-          twine upload -r testpypi -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/$PACKAGE*.whl
+          twine upload -r testpypi -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/$PACKAGE*
 
   build-test-publish-wheel-summary:
     needs: [pre-flight, build-and-test-wheels, publish-wheels]
