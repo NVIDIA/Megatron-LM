@@ -1,9 +1,11 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from unittest.mock import MagicMock
 
 import torch
 from packaging import version
 
+from megatron.core.jit import jit_fuser
 from megatron.core.utils import experimental_fn, null_decorator
 
 try:
@@ -69,6 +71,7 @@ def _pad_routing_map_kernel(
 
 
 @experimental_fn(introduced_with_version="0.13.0")
+@jit_fuser
 def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
     """Fused version of pad_routing_map.
     Args:
