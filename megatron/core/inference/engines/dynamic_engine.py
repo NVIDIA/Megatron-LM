@@ -130,6 +130,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.unified_memory_level = unified_memory_level
         self.capture_stats = None
         self.is_suspended = False
+        self._loop = None
 
         # Deprecate `enable_cuda_graph`.
         if enable_cuda_graph is not None:
@@ -187,7 +188,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        self._loop = get_asyncio_loop()
+        self._loop = get_asyncio_loop(self._loop)
         self._cond = asyncio.Condition()
 
     def create_cuda_graphs(self):
