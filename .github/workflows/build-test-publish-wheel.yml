@@ -168,6 +168,7 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
         run: |
           ls -al dist/
+          pip install twine
           twine upload -r testpypi -u $TWINE_USERNAME -p $TWINE_PASSWORD dist/*
 
   build-test-publish-wheel-summary:
