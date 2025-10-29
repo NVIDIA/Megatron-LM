@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
 try:
     from packaging.version import Version as PkgVersion
+
     FREEZE_GC_MAX_TORCH_VERSION = PkgVersion("2.9.0a0")
     if get_torch_version() >= FREEZE_GC_MAX_TORCH_VERSION:
         FREEZE_GC = False
