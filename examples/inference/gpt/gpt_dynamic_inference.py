@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import json
@@ -11,7 +11,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from tqdm import tqdm
@@ -127,8 +127,11 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(requests: List[Request], sampling_params: SamplingParams, 
-                          calculate_max_sequence_length_from_requests: bool =True):
+def get_inference_context(
+    requests: List[Request],
+    sampling_params: Optional[SamplingParams] = None,
+    calculate_max_sequence_length_from_requests: bool = True
+):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
@@ -209,18 +212,27 @@ def get_inference_controller(
 
 
 def run_inference(
-    requests: List[Request], sampling_params: SamplingParams, engine: DynamicInferenceEngine
+    requests: List[Request],
+    engine: DynamicInferenceEngine,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
 
     Args:
         requests (List[Request]): Requests that are to be added and processed.
-        sampling_params (SamplingParams): Sampling params for the logits.
         engine (DynamicInferenceEngine): Inference engine that manages generating tokens.
+        sampling_params (SamplingParams): Deprecated as of megatron-core 0.16.
 
     Return:
         A dictionary of step times with `prefill` and `decode` keys.
     """
+
+    if sampling_params is not None and torch.distributed.get_rank() == 0:
+        warnings.warn(
+            "The `sampling_params` argument is deprecated. "
+            "Sampling parameters are specified per request.",
+            DeprecationWarning,
+        )
 
     args = get_args()
 
@@ -253,7 +265,7 @@ def run_inference(
         engine.add_request(
             num_requests_added,
             _request.prompt_text,
-            sampling_params.num_tokens_to_generate,
+            _request.sampling_params,
         )
         _request.time_start = get_curr_time()
         _request.state = "started"
@@ -280,7 +292,7 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
-        result = engine.step_modern(sampling_params, verbose=True)
+        result = engine.step_modern(verbose=True)
 
         # Test suspending and resuming engine.
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -373,7 +385,7 @@ def run_inference(
                 total_output_tokens += len(request.output_tokens)
 
                 # Log probs.
-                if sampling_params.return_log_probs:
+                if finished_request.sampling_params.return_log_probs:
                     request.log_probs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
@@ -421,11 +433,12 @@ def main():
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
+        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
     )
 
     # Requests, context, conroller.
     model = get_model()
-    requests = build_requests(args, tokenizer)
+    requests = build_requests(args, tokenizer, sampling_params)
     context = get_inference_context(requests, sampling_params)
     controller = get_inference_controller(model, context)
 
@@ -443,7 +456,6 @@ def main():
     engine = DynamicInferenceEngine(
         controller,
         context,
-        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         enable_cuda_graph=args.cuda_graph_impl == "local",
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
@@ -460,7 +472,7 @@ def main():
     throughputs = []
     for _ in range(args.inference_repeat_n):
         t = get_curr_time()
-        result = run_inference(requests, sampling_params, engine)
+        result = run_inference(requests, engine)
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
@@ -538,7 +550,7 @@ def main():
                         "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
                         "step_count" : engine.step_count,
                     }
-                    if sampling_params.return_log_probs:
+                    if req.sampling_params.return_log_probs:
                         response_logprobs = req.log_probs
                         result_dict["logprobs"] = response_logprobs
                     json_results[req.request_id] = result_dict
