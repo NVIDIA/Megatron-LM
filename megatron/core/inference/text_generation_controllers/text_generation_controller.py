@@ -629,10 +629,12 @@ class TextGenerationController:
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
-        self, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
+        self,
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
-        loop = get_asyncio_loop()
+        loop = get_asyncio_loop(loop)
         return loop.run_until_complete(
             self.async_generate_output_tokens_dynamic_batch(active_sampling_map)
         )

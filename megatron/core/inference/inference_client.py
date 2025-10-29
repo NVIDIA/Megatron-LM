@@ -8,6 +8,7 @@ from typing import List, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import get_asyncio_loop
 
 from .headers import Headers
 
@@ -103,7 +104,7 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_event_loop().create_future()
+        self.completion_futures[request_id] = get_asyncio_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 

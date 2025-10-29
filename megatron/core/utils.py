@@ -9,7 +9,6 @@ import hashlib
 import inspect
 import logging
 import math
-import numpy
 import operator
 import queue
 import socket
@@ -27,6 +26,7 @@ from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+import numpy
 import torch
 
 from megatron.core import config
@@ -2018,9 +2018,7 @@ _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
 
 
 def trace_async_exceptions(
-    func: Optional[Callable[..., Coroutine]],
-    *,
-    verbose: bool = False,
+    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
 ) -> Callable[..., Coroutine]:
     """Decorator to be applied to every coroutine that runs in a separate task.
 
@@ -2035,6 +2033,7 @@ def trace_async_exceptions(
             ...
     ```
     """
+
     def _decorate(fn):
         if not asyncio.iscoroutinefunction(fn):
             raise TypeError("trace_async_exceptions can only be used with async functions")

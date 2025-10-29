@@ -960,8 +960,11 @@ class DynamicInferenceEngine(AbstractEngine):
         parallel_state.destroy_model_parallel()
 
     @trace_async_exceptions
-    async def run_engine(self, *, verbose: Optional[bool] = False):
+    async def run_engine(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_event_loop(loop)
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -976,8 +979,11 @@ class DynamicInferenceEngine(AbstractEngine):
             pass
 
     @trace_async_exceptions
-    async def run_engine_with_coordinator(self, *, verbose: Optional[bool] = False):
+    async def run_engine_with_coordinator(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_event_loop(loop)
         try:
             while True:
                 self.schedule_requests()
