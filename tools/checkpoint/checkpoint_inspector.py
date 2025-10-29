@@ -447,8 +447,10 @@ def convert_checkpoint(
                     elif (
                         "experts.experts.linear_fc1.weight" in layer_key
                         or "experts.experts.linear_fc2.weight" in layer_key
+                        or "experts.experts.linear_fc1.bias" in layer_key
+                        or "experts.experts.linear_fc2.bias" in layer_key
                     ):
-                        # Special case for MoE
+                        # Special case for MoE (handle experts weights and biases)
                         layer_key = layer_key.replace(".experts.experts.", ".experts.")
                         expert_weights = torch.split(per_layer_values[i], 1, dim=0)
                         for expert_idx, expert_weight in enumerate(expert_weights):
