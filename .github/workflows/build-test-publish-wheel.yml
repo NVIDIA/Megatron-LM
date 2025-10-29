@@ -85,11 +85,13 @@ jobs:
 
           pushd $BUILD_DIR
             docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
-              pip install --upgrade "setuptools>=80.0.0" && \
               for python_version in cp310 cp311 cp312 cp313; do \
-                /opt/$python_version-cp$python_version/bin/python -m build \
+                /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools>=80.0.0" build; \
+              done && \
+              for python_version in cp310 cp311 cp312 cp313; do \
+                /opt/python/${python_version}-${python_version}/bin/python -m build; \
               done \
-            ' 
+            '
 
             PLATFORM_WHEELS=$(find dist -name "*.whl" -not -name "*-none-any.whl")
             if [ -n "$PLATFORM_WHEELS" ]; then
