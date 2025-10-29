@@ -63,4 +63,4 @@ products:
     products:
       - environment: [dev]
         scope: [mr, mr-github]
-        platforms: [dg  x_h100]
+        platforms: [dgx_h100]

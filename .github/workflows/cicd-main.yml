@@ -192,7 +192,7 @@ jobs:
           export PATH=".venv/bin:$PATH"
           export GITLAB_ENDPOINT=github.com
           export CI_PROJECT_NAMESPACE=NVIDIA
-          export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}" 
+          export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
           export CHECK_ONLY=true 
           export SKIP_DOCS=false 
           bash tools/autoformat.sh
