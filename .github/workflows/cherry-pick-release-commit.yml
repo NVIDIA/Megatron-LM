@@ -22,6 +22,7 @@ on:
 jobs:
   cherry-pick:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@v0.65.9
+    if: github.repository == 'NVIDIA/Megatron-LM'
     with:
       target-branches-pattern: 'core_(*dev_)?r[0-9]+\.[0-9]+\.[0-9]+'
     secrets:
