@@ -8,9 +8,7 @@ ulimit -Sn $(ulimit -Hn)
 # Increase soft limit for number of processes to match hard limit
 ulimit -Su $(ulimit -Hu)
 
-echo "------ARGUMENTS LIST --------"
-# Use eval to properly handle quoted arguments
-eval "set -- $@"
+set +x
 for ARGUMENT in "$@"; do
     # Split on first = only, preserving any subsequent = signs in the value
     KEY="${ARGUMENT%%=*}"
@@ -26,7 +24,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$(eval echo $VALUE)"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
@@ -48,6 +46,8 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set -exo pipefail
+
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
@@ -64,7 +64,7 @@ else
 fi
 
 mkdir -p $CHECKPOINT_SAVE_PATH
-mkdir -p $CHECKPOINT_LOAD_PATH
+mkdir -p $CHECKPOINT_LOAD_PATH || true
 _CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH
 _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
 
@@ -102,6 +102,10 @@ if [[ "$MODE" == "pretraining" && "$TEST_TYPE" != "release" ]]; then
         /usr/local/bin/yq -i '.MODEL_ARGS."--exit-interval" = .MODEL_ARGS."--train-iters"' $TRAINING_PARAMS_PATH
         TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
             /usr/local/bin/yq '.MODEL_ARGS."--exit-interval" // "100"')
+    fi
+elif [[ "$MODE" == "inference" && "$TEST_TYPE" != "release" ]]; then
+    if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+        /usr/local/bin/yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
     fi
 fi
 
@@ -300,7 +304,7 @@ for i in $(seq 1 $N_REPEAT); do
         fi
 
         # For inference jobs
-        if [[ "$MODE" == "inference" ]]; then
+        if [[ "$MODE" == "inference" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \

@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -109,6 +111,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
 
     if args.engine_type == "static":
@@ -232,7 +235,6 @@ def generate_dynamic(
     args: argparse.Namespace,
     inference_requests: List[InferenceRequest],
     inference_engine: DynamicInferenceEngine,
-    sampling_params: SamplingParams,
 ):
     global REQUEST_ID
     for request in inference_requests:
@@ -240,13 +242,13 @@ def generate_dynamic(
         REQUEST_ID += 1
         prompt_tokens = request.prompt_tokens
         inference_engine.add_request(
-            request_id, prompt_tokens, num_tokens_to_generate=args.num_tokens_to_generate
+            request_id, prompt_tokens, request.inference_parameters,
         )
 
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step(sampling_params, verbose=False)
+        result = inference_engine.step(verbose=False)
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -339,7 +341,7 @@ def main():
         if args.engine_type == "static":
             inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
         elif args.engine_type == "dynamic":
-            generate_dynamic(args, requests, inference_engine, sampling_params)
+            generate_dynamic(args, requests, inference_engine)
 
     if args.benchmark_profile:
         torch.cuda.cudart().cudaProfilerStart()
@@ -360,7 +362,7 @@ def main():
             )
         elif args.engine_type == "dynamic":
             results: List[InferenceRequest] = generate_dynamic(
-                args, requests, inference_engine, sampling_params
+                args, requests, inference_engine,
             )
     end_time = time.perf_counter()
     latency = end_time - start_time
