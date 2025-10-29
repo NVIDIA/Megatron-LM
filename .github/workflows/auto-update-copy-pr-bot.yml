@@ -56,5 +56,5 @@ jobs:
             echo "No changes to commit. Exiting gracefully."
             exit 0
           fi
-          git commit -m "Update copy-pr-bot.yaml"
+          git commit -m "Update copy-pr-bot.yaml [skip ci]"
           git push
