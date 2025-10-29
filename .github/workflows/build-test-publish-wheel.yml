@@ -55,6 +55,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build wheel
+        env:
+          PACKAGE: ${{ matrix.PACKAGE }}
+          IMAGE: ${{ matrix.IMAGE }}
+          PLATFORM: ${{ matrix.PLATFORM }}
         run: |
           PUBLISH_DRYRUN=yes
 
