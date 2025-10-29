@@ -41,7 +41,7 @@ jobs:
     uses: ./.github/workflows/_build_test_publish_wheel.yml
 
   build-test-publish-wheel-summary:
-    needs: [pre-flight, build-and-test-wheels, publish-wheels]
+    needs: [pre-flight, build-test-publish-wheels]
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
