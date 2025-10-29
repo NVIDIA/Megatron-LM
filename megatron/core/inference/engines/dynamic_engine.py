@@ -808,7 +808,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures[failed_request_id].set_result(failed_request)
         self.failed_request_ids.clear()
 
-        # Log KV cache utilization stats to TensorBoard or W&B (only on logging rank)
+        # Log KV cache utilization stats to W&B
         if (
             self.inference_logging_step_interval > 0
             and self.step_count > 0
