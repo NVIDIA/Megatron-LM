@@ -161,6 +161,8 @@ jobs:
         include:
           - PACKAGE: megatron_core
           - PACKAGE: megatron_fsdp
+    env:
+      PACKAGE: ${{ matrix.PACKAGE }}
     steps:
       - name: Download wheels
         uses: actions/download-artifact@v4
