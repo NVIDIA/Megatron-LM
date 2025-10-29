@@ -2,6 +2,7 @@
 import logging
 import os
 from contextlib import nullcontext
+from functools import lru_cache
 
 import torch
 
@@ -94,6 +95,7 @@ def _build_nccl_allocator():
     _allocator = nccl_allocator.get_nccl_allocator()
 
 
+@lru_cache(maxsize=None)
 def get_func_args(func):
     """
     Get the argument names of a function.
@@ -122,15 +124,17 @@ def create_nccl_mem_pool(symmetric=None):  # symmetric: bool | None = None -> to
         _pool = torch.cuda.MemPool(_allocator)
     else:
         if 'symmetric' in get_func_args(torch.cuda.MemPool):
+            # The PyTorch version >= 2.9.0a0 and before PyTorch PR #161238,
+            # The symmetric knob should passed to the MemPool constructor.
+            # Since PyTorch PR #161238 symmetric knob is now in registration function.
             _pool = torch.cuda.MemPool(_allocator, symmetric=symmetric)
         elif 'symm_mem' in get_func_args(torch.cuda.MemPool):
             # This path handles argument name divergence between
             # nvidia pytorch and the official pytorch.
             _pool = torch.cuda.MemPool(_allocator, symm_mem=symmetric)
         else:
-            raise ValueError(
-                "symmetric setting with torch.cuda.MemPool requires " "higher PyTorch version"
-            )
+            # This path handles the case where the symmetric knob is in the registration function.
+            _pool = torch.cuda.MemPool(_allocator)
     return _pool
 
 
@@ -149,7 +153,7 @@ def init() -> None:
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
     _build_nccl_allocator()
-    print(f"[MCORE][NCCL_ALLOCATOR] Initialized NCCL Allocator")
+    logging.info(f"[MCORE][NCCL_ALLOCATOR] Initialized NCCL Allocator")
 
 
 # Preserve the original APEX NCCL allocator interface for backward compatibility
@@ -158,11 +162,12 @@ class nccl_mem:
     An NCCL memory allocator, which inherits APEX nccl_allocator implementation.
     """
 
-    def __init__(self, pool, enabled=True, device=None, group=None):
+    def __init__(self, pool, enabled=True, device=None, group=None, symmetric=True):
         self.device = None
         self.group = None
         self.mem_context = None
         self.pool = pool
+        self.symmetric = symmetric
 
         if enabled:
             if device is None:
@@ -185,26 +190,41 @@ class nccl_mem:
     def __enter__(self):
         self.mem_context.__enter__()
         if self.group is not None:
-            backend = self.group._get_backend(self.device)
-            try:
-                # Deregister first to avoid duplicate registration of previously
-                # registered memory.
-                backend.deregister_mem_pool(self.pool)
-            except RuntimeError:
-                desc = getattr(self.group, "group_desc", None)
-                print(
-                    f"[MCORE][NCCL_ALLOCATOR] Failed to deregister mem pool from"
-                    f"{repr(self.group)}({desc}) group!!"
-                )
+            # If the pool is not empty, deregister the pool from the group.
+            if self.pool.snapshot():
+                backend = self.group._get_backend(self.device)
+                try:
+                    # Deregister first to avoid duplicate registration of previously
+                    # registered memory.
+                    backend.deregister_mem_pool(self.pool)
+                except RuntimeError:
+                    desc = getattr(self.group, "group_desc", None)
+                    logging.warning(
+                        f"[MCORE][NCCL_ALLOCATOR] Failed to deregister mem pool from"
+                        f"{repr(self.group)}({desc}) group!!"
+                    )
 
     def __exit__(self, *args):
         if self.group is not None:
             backend = self.group._get_backend(self.device)
             try:
-                backend.register_mem_pool(self.pool)
+                # Prefer attempting symmetric registration first; fall back if unsupported.
+                if self.symmetric:
+                    try:
+                        # Since PyTorch PR #161238 symmetric knob is now in registration function.
+                        backend.register_mem_pool(self.pool, symm=self.symmetric)
+                    except TypeError:
+                        # Older PyTorch/APIs without 'symm' keyword.
+                        logging.warning(
+                            f"[MCORE][NCCL_ALLOCATOR] Failed in symmetric registration."
+                            f"Falling back to non-symmetric registration!!"
+                        )
+                        backend.register_mem_pool(self.pool)
+                else:
+                    backend.register_mem_pool(self.pool)
             except RuntimeError:
                 desc = getattr(self.group, "group_desc", None)
-                print(
+                logging.warning(
                     f"[MCORE][NCCL_ALLOCATOR] Failed to register mem pool to"
                     f"{repr(self.group)}({desc}) group!!"
                 )
@@ -238,11 +258,12 @@ class MultiGroupMemPoolAllocator:
     """
 
     def __init__(
-        self, pool, groups
+        self, pool, groups, symmetric=True
     ):  # pool: torch.cuda.MemPool, groups: List[torch.distributed.ProcessGroup]
         self.pool = pool
         self.groups = groups
         self.mem_context = torch.cuda.use_mem_pool(self.pool)
+        self.symmetric = symmetric
 
         assert isinstance(self.pool, torch.cuda.MemPool), "pool must be a torch.cuda.MemPool"
         assert isinstance(self.groups, list), "groups must be a list"
@@ -252,28 +273,43 @@ class MultiGroupMemPoolAllocator:
 
     def __enter__(self):
         self.mem_context.__enter__()
-        for group in self.groups:
-            backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
-            try:
-                # Since the registration is done in mempool granularity, we need to deregister
-                # the tensors in the mempool and re-register the mempool including the newly created
-                # tensors after the context is exited.
-                backend.deregister_mem_pool(self.pool)
-            except RuntimeError:
-                desc = getattr(group, "group_desc", None)
-                print(
-                    f"[MCORE][MultiGroupMemPoolAllocator] Failed to deregister mem pool from"
-                    f"{repr(group)}({desc}) group!!"
-                )
+        # If the pool is not empty, deregister the pool from all the groups.
+        if self.pool.snapshot():
+            for group in self.groups:
+                backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+                try:
+                    # Since the registration is done in mempool granularity, we need to deregister
+                    # the tensors in the mempool and re-register the mempool including
+                    # the newly created tensors after the context is exited.
+                    backend.deregister_mem_pool(self.pool)
+                except RuntimeError:
+                    desc = getattr(group, "group_desc", None)
+                    logging.warning(
+                        f"[MCORE][MultiGroupMemPoolAllocator] Failed to deregister mem pool from"
+                        f"{repr(group)}({desc}) group!!"
+                    )
 
     def __exit__(self, *args):
         for group in self.groups:
             backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
             try:
-                backend.register_mem_pool(self.pool)
+                # Prefer attempting symmetric registration first; fall back if unsupported.
+                if self.symmetric:
+                    try:
+                        # Since PyTorch PR #161238 symmetric knob is now in registration function.
+                        backend.register_mem_pool(self.pool, symm=self.symmetric)
+                    except TypeError:
+                        # Older PyTorch/APIs without 'symm' keyword.
+                        logging.warning(
+                            f"[MCORE][MultiGroupMemPoolAllocator] Failed in symmetric registration."
+                            f"Falling back to non-symmetric registration!!"
+                        )
+                        backend.register_mem_pool(self.pool)
+                else:
+                    backend.register_mem_pool(self.pool)
             except RuntimeError:
                 desc = getattr(group, "group_desc", None)
-                print(
+                logging.warning(
                     f"[MCORE][MultiGroupMemPoolAllocator] Failed to register mem pool to"
                     f"{repr(group)}({desc}) group!!"
                 )
