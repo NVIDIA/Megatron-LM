@@ -404,6 +404,7 @@ class TELinear(te.pytorch.Linear):
         )
 
         for param in self.parameters():
+            setattr(param, "parallel_mode", parallel_mode)
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
                 setattr(param, "allreduce", not self.expert_parallel)

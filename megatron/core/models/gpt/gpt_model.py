@@ -443,7 +443,7 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if mtp_in_postprocess:
+        if mtp_in_postprocess and labels is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,

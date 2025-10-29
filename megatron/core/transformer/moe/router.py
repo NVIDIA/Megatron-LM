@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -155,6 +156,15 @@ class TopKRouter(Router):
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+            from .moe_utils import RoutingReplay, set_routing_replay
+            self.routing_replay = RoutingReplay()
+
+            def pre_forward_hook(*args, **kwargs):
+                set_routing_replay(self.routing_replay)
+
+            self.register_forward_pre_hook(pre_forward_hook)
 
     def _maintain_float32_expert_bias(self):
         """
