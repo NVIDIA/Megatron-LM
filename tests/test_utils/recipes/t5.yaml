@@ -64,22 +64,22 @@ products:
   - test_case: [t5_mcore_te_tp4_pp1]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [t5_mcore_te_tp4_pp1_resume_torch_dist]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [t5_mcore_tp4_pp1]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [t5_mcore_tp4_pp1_resume_torch_dist]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [t5_mcore_te_tp1_pp1_vp1_resume_torch]
     products:
