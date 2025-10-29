@@ -420,7 +420,6 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
-        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)

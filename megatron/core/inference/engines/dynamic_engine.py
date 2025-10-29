@@ -90,12 +90,6 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
-        unified_memory_level (Optional[int]): Set unified memory usage within the
-            dynamic inference context. The levels are: 0) no unified memory, 1)
-            allocate `memory_buffer` only in unified memory, and 2) allocate all
-            tensors in unified memory. Note that levels 1 and 2 not not perform
-            any deallocations and allocations when suspending and resuming the
-            context.
         static_sampling (bool): If True, all requests are assumed to have the same
             sampling parameters. This avoids needing to loop through all requests and
             their sampling parameters every generation step, improving latency.
@@ -110,7 +104,6 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
-        unified_memory_level: int = 0,
         static_sampling: bool = False,
     ):
 
@@ -129,7 +122,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.track_paused_request_events = track_paused_request_events
         self.enable_chunked_prefill = enable_chunked_prefill
         self.static_sampling = static_sampling
-        self.unified_memory_level = unified_memory_level
+        self.unified_memory_level = context.unified_memory_level
         self.capture_stats = None
         self.is_suspended = False
         self._loop = None
