@@ -20,9 +20,10 @@ jobs:
         with:
           repository: noamelf/codeowner-multi-approval-action
           ref: v0.1
+          path: codeowner-multi-approval-action
 
       - name: Check Codeowners Approval
-        uses: ./.github/actions/codeowner-multi-approval-action
+        uses: ./codeowner-multi-approval-action
         with:
           pr-number: ${{ steps.get-pr-info.outputs.pr_number }}
           repo-name: ${{ github.repository }}
