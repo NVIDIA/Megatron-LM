@@ -236,8 +236,8 @@ class MambaStack(MegatronModule):
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
-        Returns the Mamba conv and ssm states shapes per request if this block
-        contains Mamba layers (this may not be the case with PP > 1).
+        Returns the Mamba conv and ssm states shapes per input sequence
+        if this block contains Mamba layers (this may not be the case with PP > 1).
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:

@@ -367,7 +367,6 @@ class MambaMixer(MegatronModule):
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
         # trainable variables for the current tensor parallel rank, with each tensor parallel rank
-
         # having indepdendent trainable variables. All context parallel ranks in a tensor parallel
         # rank store the same trainable variables, but only use and update their unique/independent
         # slice of them.
