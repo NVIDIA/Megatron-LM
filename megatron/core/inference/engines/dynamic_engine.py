@@ -12,7 +12,6 @@ from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
@@ -23,7 +22,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
     WarmupEngineMode,
-    get_mem_size_str,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,

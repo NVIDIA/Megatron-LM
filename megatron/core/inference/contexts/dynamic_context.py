@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import math
 import warnings
 from contextlib import nullcontext
@@ -420,7 +421,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
 
         # Print info.
-        print(
+        logging.info(
             "DynamicInferenceContext: allocated context with active buffer size %s (%d chunks)."
             % (get_mem_size_str(active_buffer_size_bytes), self.chunk_allocator.active_count)
         )
@@ -993,8 +994,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         request_can_be_added = (
-            self.total_request_count - self.paused_request_count
-            < self.max_active_requests
+            self.total_request_count - self.paused_request_count < self.max_active_requests
         )
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
