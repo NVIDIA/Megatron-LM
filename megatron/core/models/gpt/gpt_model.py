@@ -547,18 +547,24 @@ class GPTModel(LanguageModule):
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_num_layers):
-                # output
-                mtp_logits, _ = self.output_layer(
-                    hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
                 loss_mask, num_tokens = roll_tensor(
                     loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
                 )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
+
+                # Compute mtp loss without storing logits to save memory.
+                mtp_loss = self.compute_language_model_loss_without_logits(
+                    hidden_states_list[mtp_layer_number + 1],
+                    labels=mtp_labels,
+                    weight=output_weight,
+                    column_parallel_linear=self.output_layer,
+                    col_linear_kwargs={
+                        'weight': output_weight,
+                        'runtime_gather_output': runtime_gather_output,
+                    },
+                )
+
                 mtp_loss = loss_mask * mtp_loss
                 if self.training:
                     # TODO(shifangx): remove the use of parallel_state here
@@ -604,9 +610,12 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if has_config_logger_enabled(self.config) or labels is not None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        else:
+            logits = None
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -633,7 +642,16 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_language_model_loss_without_logits(
+            hidden_states,
+            labels=labels,
+            weight=output_weight,
+            column_parallel_linear=self.output_layer,
+            col_linear_kwargs={
+                'weight': output_weight,
+                'runtime_gather_output': runtime_gather_output,
+            },
+        )
 
         return loss
 
