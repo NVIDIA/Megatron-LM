@@ -189,6 +189,9 @@ class TestExpertLayerReconfiguration:
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
+            
+            if "dp_cp_group" in list(metadata.keys()):
+                del metadata["dp_cp_group"]
 
             # Load checkpoint A with different TP/PP/EP and save as checkpoint B
             # No FPS this time, only FPL

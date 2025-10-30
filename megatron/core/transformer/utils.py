@@ -115,7 +115,7 @@ def make_sharded_tensors_for_checkpoint(
         tp_group = get_tensor_model_parallel_group_if_none(tp_group)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     # DEBUG ASSERT REMOVE LATER
-    assert tp_group == parallel_state.get_tensor_model_parallel_group()
+    assert (tp_group == parallel_state.get_tensor_model_parallel_group() or tp_group == parallel_state.get_expert_tensor_parallel_group())
     assert dp_cp_group == parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     sharded_state_dict = {}
