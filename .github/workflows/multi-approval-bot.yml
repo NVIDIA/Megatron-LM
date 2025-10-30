@@ -20,7 +20,6 @@ jobs:
         with:
           repository: noamelf/codeowner-multi-approval-action
           ref: v0.1
-          path: codeowner-multi-approval-action
 
       - name: Check Codeowners Approval
         uses: ./.github/actions/codeowner-multi-approval-action
