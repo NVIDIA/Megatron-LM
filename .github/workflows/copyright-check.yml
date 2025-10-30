@@ -17,8 +17,6 @@ name: Copyright check
 on:
   push:
     branches:
-      - dev
-      - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
   merge_group:
