@@ -18,7 +18,7 @@ jobs:
           path: codeowner-multi-approval-action
 
       - name: Check Codeowners Approval
-        uses: github/actions/codeowner-multi-approval-action
+        uses: .github/actions/codeowner-multi-approval-action
         with:
           pr-number: ${{ github.event.pull_request.number }}
           repo-name: ${{ github.repository }}
