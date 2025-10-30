@@ -247,14 +247,22 @@ class MambaModel(LanguageModule):
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-
         if labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_language_model_loss_without_logits(
+            hidden_states,
+            labels,
+            weight=output_weight,
+            column_parallel_linear=self.output_layer,
+            col_linear_kwargs={
+                "weight": output_weight,
+                "runtime_gather_output": runtime_gather_output,
+            },
+        )
 
         return loss

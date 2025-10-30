@@ -237,7 +237,14 @@ def get_valid_fp8_flags():
     recipes = []
     valid_flags = []
     if is_te_min_version("2.3.0.dev0"):
-        recipes.append(Fp8Recipe.blockwise)
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        compute_capability = (props.major, props.minor)
+        if (
+            compute_capability >= (9, 0)
+            and compute_capability < (10, 0)
+            and float(torch.version.cuda) >= 12.9
+        ):
+            recipes.append(Fp8Recipe.blockwise)
         recipes.append(Fp8Recipe.tensorwise)
 
     for fp8_type in fp8_types:
