@@ -53,3 +53,5 @@ class GeLUFunction(torch.autograd.Function):
 
 
 bias_gelu_impl = GeLUFunction.apply
+
+print("Hello, world!")
