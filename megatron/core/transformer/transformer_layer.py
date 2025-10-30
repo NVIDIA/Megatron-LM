@@ -599,7 +599,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
             fine_grained_offloading_group_start,
             get_fine_grained_offloading_context,
         )
@@ -684,6 +683,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def _forward_post_mlp(self, mlp_output_with_bias, residual):
+        """
+        Perform operations after the MLP computation.
+
+        Args:
+            mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
+            residual (Tensor): Residual tensor.
+
+        Returns:
+            output (Tensor): Transformed hidden states of shape [s, b, h].
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_group_commit,
+        )
+
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")

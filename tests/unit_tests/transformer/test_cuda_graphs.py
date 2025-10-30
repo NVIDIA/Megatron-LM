@@ -744,10 +744,21 @@ class TestPartialCudaGraph:
     def setup_method(self, method):
         self.seq_length = 512
         self.micro_batch_size = 2
+        # Store original environment variable values
+        self.original_env = {
+            'CUDA_DEVICE_MAX_CONNECTIONS': os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS'),
+            'NVTE_ALLOW_NONDETERMINISTIC_ALGO': os.environ.get('NVTE_ALLOW_NONDETERMINISTIC_ALGO'),
+        }
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
 
     def teardown_method(self, method):
+        # Restore original environment variable values
+        for key, value in self.original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -787,7 +798,7 @@ class TestPartialCudaGraph:
         args = parse_args()
         args.num_layers = 4
         args.mtp_num_layers = 1
-        args.vocab_size = 128800
+        args.vocab_size = 1024
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
