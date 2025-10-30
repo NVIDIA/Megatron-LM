@@ -78,6 +78,80 @@ def get_batch(data_iterator, vp_stage=None):
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
            
+           
+    if not hasattr(get_batch, 'microbatch_counter'):
+        get_batch.microbatch_counter = 0
+    
+    # Debugmtl: 保存batch数据到文本文件 - 保存所有元素
+    print_data = True
+    if print_data:
+        import os
+        import numpy as np
+        
+        debug_dir = '/lustre/fsw/portfolios/coreai/users/tailaim/debug_data'
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        microbatch_id = get_batch.microbatch_counter
+        debug_file = os.path.join(debug_dir, f'batch_microbatch{microbatch_id:06d}_rank{rank}.txt')
+        
+        with open(debug_file, 'w') as f:
+            f.write("="*80 + "\n")
+            f.write(f"Batch Debug Info - Microbatch {microbatch_id} - Rank {rank}\n")
+            f.write("="*80 + "\n\n")
+            
+            # Batch shapes
+            f.write("BATCH SHAPES:\n")
+            f.write("-"*80 + "\n")
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    f.write(f"{key}: {value.shape}, dtype: {value.dtype}, device: {value.device}\n")
+            f.write("\n")
+            
+            # Batch values (ALL elements)
+            f.write("BATCH VALUES (ALL ELEMENTS):\n")
+            f.write("-"*80 + "\n")
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    f.write(f"\n{key}:\n")
+                    f.write(f"Shape: {value.shape}\n")
+                    # 转换为numpy并设置打印选项
+                    data = value.cpu().numpy()
+                    # 设置numpy打印选项：打印所有元素，不省略
+                    np.set_printoptions(threshold=np.inf, linewidth=200, suppress=False)
+                    f.write(f"{data}\n")
+            f.write("\n")
+            
+            # Packed seq params
+            if packed_seq_params is not None:
+                f.write("PACKED_SEQ_PARAMS:\n")
+                f.write("-"*80 + "\n")
+                if hasattr(packed_seq_params, 'cu_seqlens_q') and packed_seq_params.cu_seqlens_q is not None:
+                    f.write(f"cu_seqlens_q: {packed_seq_params.cu_seqlens_q.cpu().numpy()}\n")
+                if hasattr(packed_seq_params, 'cu_seqlens_kv') and packed_seq_params.cu_seqlens_kv is not None:
+                    f.write(f"cu_seqlens_kv: {packed_seq_params.cu_seqlens_kv.cpu().numpy()}\n")
+                if hasattr(packed_seq_params, 'max_seqlen_q'):
+                    f.write(f"max_seqlen_q: {packed_seq_params.max_seqlen_q}\n")
+                if hasattr(packed_seq_params, 'max_seqlen_kv'):
+                    f.write(f"max_seqlen_kv: {packed_seq_params.max_seqlen_kv}\n")
+                f.write("\n")
+            
+            # Additional info
+            f.write("ADDITIONAL INFO:\n")
+            f.write("-"*80 + "\n")
+            f.write(f"local_cp_size: {local_cp_size}\n")
+            f.write(f"max_seqlen: {max_seqlen}\n")
+            f.write(f"cu_seqlens (original): {cu_seqlens.cpu().numpy()}\n")
+            f.write(f"cu_seqlens_padded (original): {cu_seqlens_padded.cpu().numpy()}\n")
+            
+            f.write("\n" + "="*80 + "\n")
+        
+        print(f"[DEBUG] Batch data saved to: {debug_file}")
+        
+        # 递增计数器
+        get_batch.microbatch_counter += 1
+        
+           
     return (*batch.values(), packed_seq_params)
 
 

@@ -39,7 +39,7 @@ USE_MOCK_DATA=1
 if [[ $BATCH -eq 0 ]]; then
     DATETIME=`date +'%y-%m-%d-%H-%M-%S'`
     MODEL_NAME="interactive_hybrid_cp"
-    DEBUG=1
+    # DEBUG=1
 else
     MODEL_NAME="interactive_hybrid_cp"
 fi
