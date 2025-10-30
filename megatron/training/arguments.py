@@ -2644,6 +2644,10 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
+                       'values over the wire (using an all-to-all to keep total communication overhead in line '
+                       'with the standard ring implementation) but performs accumulation locally in FP32.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -2902,6 +2906,20 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 or msc dataloader')
     group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
                        help='The sample surplus to build for the mid-level datasets(s)')
+    group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
+                       help='Whether to prevent pad tokens already present in the dataset '
+                       'from being masked out when the pad token incorrectly shares the same id '
+                       'with other special tokens in the tokenizer. Note that this argument has '
+                       'no effect when the tokenizer correctly provides a unique id for the pad. '
+                       'Masking out such ambiguous pad tokens results in training instability. '
+                       'Such a scenario is best resolved by fixing the tokenizer; leaving this '
+                       'option as False provides a workaround. '
+                       'When left to the default of False, any token ids that collide with the '
+                       'pad token id - as provided by the tokenizer - will not be masked out of '
+                       'the loss calculation: it cannot be determined whether they are truly pad. '
+                       'If instead this argument is set, the training flow will treat all tokens '
+                       'that share the same id as the pad token as true pad tokens, potentially '
+                       'causing severe training instability.')
     return parser
 
 
