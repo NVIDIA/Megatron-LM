@@ -67,7 +67,7 @@ Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.37.0a0,<0.38.0; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "tqdm",
@@ -81,7 +81,7 @@ dev = [
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
-    "av<16.0.0",                                                          # At the time, av 16.0.0 is not compatible with Python 3.12
+    "av<16.0.0",                                        # At the time, av 16.0.0 is not compatible with Python 3.12
     "flashinfer-python",
     "wget",
     "onnxscript",
