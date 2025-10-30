@@ -1,14 +1,12 @@
 name: "Codeowners Approval Workflow"
 
 on:
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  pull_request_review:
+    types: [submitted]
 
 jobs:
   codeowners-approval:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     steps:
       - name: Get PR info
         id: get-pr-info
