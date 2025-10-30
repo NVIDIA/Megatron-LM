@@ -1,144 +1,136 @@
-# Llama Models
+# Llama2/Llama3 Model Pretraining Instructions
 
-## Table of contents
-- [1. Overview](#1-overview)
-- [2. Prerequisites](#2-prerequisites)
-- [3. Training Setup](#3-training-setup)
-- [4. Configuration](#4-configuration)
-- [5. Test Datasets](#5-test-datasets)
-- [6. FP8 Debugging](#6-fp8-debugging)
+This guide provides the steps for setting up the environment and configuring the script to train Llama2 or Llama3 models.
 
-## 1. Overview
-<a id="overview" name="overview"></a>
+---
 
-Train Llama models using FP8 precision with Megatron-Core.
+## 1. Environment Setup
 
-## 2. Prerequisites
-<a id="prerequisites" name="prerequisites"></a>
+1. **Download Docker Image**  
+   Download the Docker image required for training (e.g. docker images from rocm/megatron-lm):  
+   `docker pull <image_name>`
 
+2. **Launch Docker Container**  
+   Start the Docker container:  
+   `docker run -it <additional flags> <image_name>`
+	 For example
+   `docker run -it --network=host --device=/dev/kfd --device=/dev/dri --group-add=video --ipc=host --cap-add=SYS_PTRACE --security-opt seccomp=unconfined <image_name>`
+
+---
+
+## 2. How to Run
+
+### 2.1 Single Node Training
+To run the training on a single node, go to Megatron-LM folder, use the following command:
 ```bash
-# Clone repository
-export HOST_MEGATRON_LM_DIR="/path/to/your/host/megatron-lm"
-git clone https://github.com/NVIDIA/Megatron-LM.git "$HOST_MEGATRON_LM_DIR"
-cd "$HOST_MEGATRON_LM_DIR"
-git checkout "core_r0.12.0"
-
-# Set paths
-export HOST_CHECKPOINT_PATH="./checkpoints/llama3_8b_fp8"
-export HOST_TENSORBOARD_LOGS_PATH="./tensorboard_logs/llama3_8b_fp8"
-
-# Optional: For real data
-# export HOST_TOKENIZER_MODEL_PATH="/path/to/host/tokenizer.model"
-# export HOST_DATA_PREFIX="/path/to/host/mydata_prefix"
+TEE_OUTPUT=1 MBS=2 BS=64 TP=8 TE_FP8=0 SEQ_LENGTH=4096 bash examples/llama/train_llama2.sh
 ```
 
-## 3. Training Setup
-<a id="training-setup" name="training-setup"></a>
 
-### Using Mock Data
+### 2.2 Multi-node Training
+To run training on multiple nodes, launch the Docker container on each node. Follow these steps:
+
+- **On the Master Node:**
+  ```bash
+  TEE_OUTPUT=1 MBS=2 BS=64 TP=8 TE_FP8=0 SEQ_LENGTH=4096 bash examples/llama/train_llama2.sh
+  ```
+
+- **On the Worker Node(s):**
+  ```bash
+  TEE_OUTPUT=1 MBS=2 BS=64 TP=8 TE_FP8=0 SEQ_LENGTH=4096 bash examples/llama/train_llama2.sh
+  ```
+
+## 3. Configurations in Script (`Megatron/examples/llama`)
+
+### 3.1 Network Interface
+Update the network interface in the script to match your system’s network interface.  
+To find your network interface, run (out of container):  
 ```bash
-PYTORCH_IMAGE="nvcr.io/nvidia/pytorch:25.03-py3"
-
-docker run --rm --gpus all --ipc=host --ulimit memlock=-1 \
-  -v "${HOST_MEGATRON_LM_DIR}:/workspace/megatron-lm" \
-  -v "${HOST_CHECKPOINT_PATH}:/workspace/checkpoints" \
-  -v "${HOST_TENSORBOARD_LOGS_PATH}:/workspace/tensorboard_logs" \
-  --workdir /workspace/megatron-lm \
-  $PYTORCH_IMAGE \
-  bash examples/llama/train_llama3_8b_h100_fp8.sh \
-    /workspace/checkpoints \
-    /workspace/tensorboard_logs \
-  2>&1 | tee "${HOST_TENSORBOARD_LOGS_PATH}/training_mock_$(date +'%y-%m-%d_%H-%M-%S').log"
+ip a
+```
+Then, update the following variables in the script:  
+```bash
+export NCCL_SOCKET_IFNAME=ens50f0np0
+export GLOO_SOCKET_IFNAME=ens50f0np0
 ```
 
-### Using Custom Data and Tokenizer
-```bash
-PYTORCH_IMAGE="nvcr.io/nvidia/pytorch:25.03-py3"
+### 3.2 Dataset
+You can use either mock data or real data for training.
 
-docker run --rm --gpus all --ipc=host --ulimit memlock=-1 \
-  -v "${HOST_MEGATRON_LM_DIR}:/workspace/megatron-lm" \
-  -v "${HOST_CHECKPOINT_PATH}:/workspace/checkpoints" \
-  -v "${HOST_TENSORBOARD_LOGS_PATH}:/workspace/tensorboard_logs" \
-  -v "${HOST_TOKENIZER_MODEL_PATH}:/workspace/tokenizer_model" \
-  -v "$(dirname "${HOST_DATA_PREFIX}"):/workspace/data_dir" \
-  --workdir /workspace/megatron-lm \
-  $PYTORCH_IMAGE \
-  bash examples/llama/train_llama3_8b_h100_fp8.sh \
-    /workspace/checkpoints \
-    /workspace/tensorboard_logs \
-    /workspace/tokenizer_model \
-    "/workspace/data_dir/$(basename "${HOST_DATA_PREFIX}")" \
-  2>&1 | tee "${HOST_TENSORBOARD_LOGS_PATH}/training_custom_$(date +'%y-%m-%d_%H-%M-%S').log"
-```
+- **Mock Data:**  
+  Replace the data path:
+  ```bash
+  --data-path $DATA_PATH \ with 
+  --mock-data
+  ```
 
-## 4. Configuration
-<a id="configuration" name="configuration"></a>
+- **Real Data:**  
+  Update the `DATA_PATH` to the location where your dataset is stored:
+  ```bash
+  DATA_DIR="/root/.cache/data"  # Change to where your dataset is stored
+  DATA_PATH=${DATA_DIR}/bookcorpus_text_sentence
+  ```
 
-Default parallelism strategy:
-- Tensor Parallel: 1
-- Pipeline Parallel: 1
-- Context Parallel: 2
+### 3.3 Tokenizer
 
-Llama-3-8B architecture:
-- 32 layers
-- Hidden size: 4096
-- FFN hidden size: 14336
-- Attention heads: 32
-- Query groups: 8
-- Sequence length: 8192
-- RMSNorm normalization with SwiGLU and RoPE
+- **For Llama2 Training:**  
+  Use the `Llama2Tokenizer`.
 
-Key training parameters:
-- Micro-batch size: 1
-- Global batch size: 128
-- Learning rate: 1.5e-4
-- Min learning rate: 1.0e-5
-- Weight decay: 0.1
-- FP8 format: hybrid
+- **For Llama3 Training:**  
+  Use the `HuggingFaceTokenizer`. Set the HuggingFace model link in the `TOKENIZER_MODEL` variable:
+  ```bash
+  TOKENIZER_MODEL=meta-llama/Llama-3.1-8B  # For Llama3
+  ```
 
-You can modify these parameters directly in the `train_llama3_8b_h100_fp8.sh` script.
+### 3.4 Multi-node Training
+If you're running multi-node training, update the following environment variables:
 
-This configuration follows those defined in NeMo Framework's performance scripts, which can be found at [https://github.com/NVIDIA/NeMo/tree/main/scripts/performance](https://github.com/NVIDIA/NeMo/tree/main/scripts/performance). 
+- **Master Address:**  
+  Change `localhost` to the master node's hostname:
+  ```bash
+  MASTER_ADDR="${MASTER_ADDR:-localhost}"
+  ```
 
-### FP8 Performance
+- **Number of Nodes:**  
+  Set the number of nodes you want to train on (e.g., 2, 4, 8):
+  ```bash
+  NNODES="${NNODES:-1}"
+  ```
 
-| Model | #-GPUs | GBS | MBS | Seq Length | TP | PP | CP | VP | EP | GA | Tokens/sec/GPU | TFLOP/sec/GPU |
-|-------|--------|-----|-----|------------|----|----|----|----|----|----|----------------|---------------|
-| LLAMA3-8B | 8 | 128 | 1 | 8192 | 1 | 1 | 2 | 1 | 1 | 32 | 13812 | 800 |
-| LLAMA3-70B | 64 | 128 | 1 | 8192 | 4 | 8 | 1 | 5 | 1 | 64 | 1621 | 780 |
-| LLAMA3-405B | 1024 | 512 | 1 | 8192 | 8 | 8 | 2 | 8 | 1 | 64 | 315 | 834 |
+- **Node Rank:**  
+  Set the rank of each node (0 for master, 1 for the first worker node, etc.):
+  ```bash
+  NODE_RANK="${NODE_RANK:-0}"
+  ```
 
-Legend:
-- GBS: Global Batch Size
-- MBS: Micro Batch Size
-- TP: Tensor Parallel size
-- PP: Pipeline Parallel size
-- CP: Context Parallel size
-- VP: Virtual Pipeline stages
-- EP: Expert Parallel size
-- GA: Gradient Accumulation steps
+---
 
-As NeMo uses Megatron-Core, for the latest performance benchmarks, please refer to the official [NeMo documentation](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance_summary.html).
+## 4. Key Variables to Pay Attention To
 
-## 5. Test Datasets
-<a id="test-datasets" name="test-datasets"></a>
+- **TE_FP8:**  
+  `0` for BF16 (default), `1` for FP8.
 
-Recommended datasets:
-1. **WikiText-103**: https://huggingface.co/datasets/Salesforce/wikitext
+- **TE_FP8_RECIPE:**  
+  `delayed` (default), `tensorwise`, `mxfp8` (supported on MI350) 
 
-Preprocess datasets:
-```bash
-python "${HOST_MEGATRON_LM_DIR}/tools/preprocess_data.py" \
-       --input your_dataset.json \
-       --output-prefix test_dataset \
-       --tokenizer-type HuggingFaceTokenizer \
-       --tokenizer-model /path/to/tokenizer.model \
-       --append-eod
-```
+- **GEMM_TUNING:**  
+  `1` to enable GEMM tuning, which boosts performance by using the best GEMM kernels. Currently not supported for `mxfp8`.
 
-## 6. FP8 Training Considerations
-<a id="fp8-training-considerations" name="fp8-training-considerations"></a>
+- **USE_FLASH_ATTN:**  
+  `1` to enable Flash Attention.
 
-- **Hardware**: Requires NVIDIA Hopper, Ada, or Blackwell GPUs for FP8 support
-   
-- **Troubleshooting**: If you encounter NaN values or instability with FP8 training, please refer to [Transformer Engine](https://github.com/NVIDIA/TransformerEngine).
+- **ENABLE_PROFILING:**  
+  `1` to enable PyTorch profiling for performance analysis.
+
+- **transformer-impl:**  
+  `transformer_engine` to use the Transformer Engine (TE). Set to `local` if you want to disable TE. Required for fp8 support.
+
+- **MODEL_SIZE:**  
+  Set to `7B` or `70B` for Llama2, or `8B` or `70B` for Llama3/3.1.
+
+- **TOTAL_ITERS:**  
+  Set the total number of iterations (default: 10).
+
+--- 
+
+That's it! You've now set up the environment and configured the necessary settings for training Llama2 or Llama3 models.
