@@ -21,3 +21,6 @@ def quick_gelu(x: torch.Tensor) -> torch.Tensor:
 def fast_gelu(x: torch.Tensor) -> torch.Tensor:
     """Fast GELU activation"""
     return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
+
+def hello_world():
+    print("Hello, world!")
