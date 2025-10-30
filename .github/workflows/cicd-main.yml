@@ -411,16 +411,11 @@ jobs:
               --scope mr-github
               --enable-lightweight-mode
             )
-            echo ":warning: The Run tests label is not yet supported."
           else
             ARGS=(
               --scope mr-slim
             )
           fi
-
-          ARGS=(
-            --scope mr-slim
-          )
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
