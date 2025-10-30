@@ -249,10 +249,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = params_dtype
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
-        assert (
-            has_unified_memory
-        ), "CUDA unified memory must be available to use `DynamicInferenceContext`."
-        self.unified_memory_mempool = create_unified_mempool()
+        # >>>
+        # assert (
+        #     has_unified_memory
+        # ), "CUDA unified memory must be available to use `DynamicInferenceContext`."
+        # self.unified_memory_mempool = create_unified_mempool()
+        # +++
+        self.unified_memory_level = unified_memory_level
+        if unified_memory_level > 0:
+            if not has_unified_memory and torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    "Unified memory requested but not available; defaulting to GPU memory."
+                )
+                self.unified_memory_level = 0
+            else:
+                self.unified_memory_mempool = create_unified_mempool()
+        # <<<
 
         self.total_request_count = 0
         self.active_token_count = 0
@@ -290,7 +302,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
 
         # Memory buffer.
-        with torch.cuda.use_mem_pool(self.unified_memory_mempool):
+        # >>>
+        # with torch.cuda.use_mem_pool(self.unified_memory_mempool):
+        # +++
+        ctx_manager = (
+            torch.cuda.use_mem_pool(self.unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
+        with ctx_manager:
+        # <<<
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
                     (
@@ -317,6 +338,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
+        # >>>
+        pax("ctx_manager", {
+            "unified_memory_level" : self.unified_memory_level,
+            # "unified_memory_mempool" : self.unified_memory_mempool,
+            "memory buffer gb" : self.memory_buffer.numel() * self.memory_buffer.element_size() / 1024**3,
+        })
+        # <<<
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
