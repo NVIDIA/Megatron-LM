@@ -227,7 +227,7 @@ class MockSFTLowLevelDataset:
         length = self.sequence_lengths[idx % self.size]
         # the length of sample is 'length', but only length-1 elements are generated here, 
         # because an eod token will be appended at the end later in SFTDataset
-        sample = np.arange(1, length, dtype=np.int64)
+        sample = np.arange(2, length + 1 , dtype=np.int64)
         return sample
 class MockSFTDataset(SFTDataset):
     """The mock dataset used during SFT"""
@@ -259,11 +259,15 @@ class MockSFTDataset(SFTDataset):
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
         target = np.array(tokens, dtype=np.int64)
         
-        force_eod_length = int(tokenizer.force_eod)
+        #debugmtl
+        force_eod_length = 1      
+        # force_eod_length = int(tokenizer.force_eod)
 
         if len(tokens) > max_seq_len - force_eod_length:
-            tokens = tokens[: max_seq_len - force_eod_length]
-            target = target[: max_seq_len - force_eod_length]
+            # tokens = tokens[: max_seq_len - force_eod_length]
+            # target = target[: max_seq_len - force_eod_length]
+            tokens = tokens[(-max_seq_len + force_eod_length):]
+            target = target[(-max_seq_len + force_eod_length):]
 
         # padding
         num_tokens = len(tokens) + force_eod_length
@@ -307,5 +311,8 @@ class MockSFTDataset(SFTDataset):
         if sft_sequence_packing:
             # sequence packing need both original sequence length and padded length
             ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
+
+        #debugmtl
+        # print("get item successfully idx:", idx)
 
         return ret

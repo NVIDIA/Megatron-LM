@@ -67,6 +67,10 @@ def get_batch(data_iterator, vp_stage=None):
     if args.sft_sequence_packing:
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
+        #debugmtl for debug nan
+        cu_seqlens = torch.cat([cu_seqlens, torch.tensor([1024], device=cu_seqlens.device, dtype=torch.int32)], dim=0)
+        cu_seqlens_padded = torch.cat([cu_seqlens_padded, torch.tensor([1024], device=cu_seqlens_padded.device, dtype=torch.int32)], dim=0)
+        
         max_seqlen = int(batch.pop('max_seqlen').item())
         # local_cp_size is None if we disable hybrid-cp
         local_cp_size = int(batch.pop('local_cp_size').item()) if 'local_cp_size' in batch else None

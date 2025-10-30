@@ -391,7 +391,9 @@ def wrap_dataloader(
             cu_seqlens_padded[0] = 0
             np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
             cu_seqlens_padded = (
-                torch.from_numpy(cu_seqlens_padded).to(device=dev, non_blocking=True).reshape(-1)
+                torch.from_numpy(cu_seqlens_padded)
+                .to(device=dev, non_blocking=True, dtype=torch.int32)
+                .reshape(-1)
             )
             new_sample["cu_seqlens_padded"] = cu_seqlens_padded
 
