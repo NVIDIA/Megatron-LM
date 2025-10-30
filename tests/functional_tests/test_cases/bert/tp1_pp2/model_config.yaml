@@ -1,0 +1,10 @@
+.model_config: !include ../bert_mcore.yaml
+
+ENV_VARS: !reference [.model_config, ENV_VARS]
+
+MODEL_ARGS:
+  <<: !reference [.model_config, MODEL_ARGS]
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 2
+
+TEST_TYPE: !reference [.model_config, TEST_TYPE]
