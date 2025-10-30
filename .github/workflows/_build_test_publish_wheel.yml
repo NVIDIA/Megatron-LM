@@ -149,7 +149,7 @@ jobs:
         env:
           TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-          TWINE_REPOSITORY: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r') && 'pypi' || 'testpypi' }}
+          TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
         run: |
           ls -al dist/$PACKAGE*
           pip install twine
