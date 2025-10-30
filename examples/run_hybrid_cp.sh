@@ -24,7 +24,8 @@ USER=$SLURM_JOB_USER
 
 # Auto-detect batch or interactive mode.
 which srun
-BATCH=$((1-$?))
+# BATCH=$((1-$?))
+BATCH=0
 
 DEBUG=0
 USE_TILING=1

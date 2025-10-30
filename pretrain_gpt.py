@@ -87,7 +87,7 @@ def get_batch(data_iterator, vp_stage=None):
         get_batch.microbatch_counter = 0
     
     # Debugmtl: 保存batch数据到文本文件 - 保存所有元素
-    print_data = True
+    print_data = False
     if print_data:
         import os
         import numpy as np
@@ -221,6 +221,9 @@ def loss_func(
 
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+    
+    #debugmtl: 
+    print(f"loss: {loss.item()}, num_tokens: {num_tokens.item()}")
 
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
