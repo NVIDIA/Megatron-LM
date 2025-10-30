@@ -64,12 +64,6 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-# >>>
-from lutil import pax as _pax
-import builtins
-builtins.pax = _pax
-# <<<
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -260,9 +254,6 @@ def run_inference(
             _request.prompt_text,
             _request.sampling_params,
         )
-        # >>>
-        print("+++++++++++ added request %d / %d." % (num_requests_added, num_requests_total))
-        # <<<
         _request.time_start = get_curr_time()
         _request.state = "started"
         num_requests_added += 1
@@ -301,11 +292,6 @@ def run_inference(
         # Update requests.
         active_requests = result["active_requests"]
         finished_requests = result["finished_requests"]
-        # >>>
-        if finished_requests:
-            from lutil import pax
-            pax("finished_requests")
-        # <<<
         step_time = result["step_time"]
         if len(active_requests) > 0 or len(finished_requests) > 0:
             if is_decode_only:

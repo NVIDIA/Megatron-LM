@@ -404,28 +404,13 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ):
-            # >>>
-            from lutil import pax
-            pax("request", {
-                "prompt" : len(request.prompt_tokens),
-                "gen" : request.sampling_params.num_tokens_to_generate,
-                "max_sequence_length" : self.context.max_sequence_length,
-            })
-            # <<<
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
-            # >>>
-            raise Exception("hi.")
-            # <<<
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
-        # >>>
-        # from lutil import pax
-        # pax("request")
-        # <<<
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
 
@@ -661,9 +646,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
-            # >>>
-            # raise Exception("hi.")
-            # <<<
             can_schedule = False
             req = self.requests[self.waiting_request_ids[0]]
 
@@ -680,9 +662,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
-            # >>>
-            raise Exception("hi.")
-            # <<<
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1

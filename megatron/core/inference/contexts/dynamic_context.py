@@ -1086,8 +1086,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
         )
         blocks = math.ceil(
-            (req.remaining_prompt_length + req.finished_block_token_count) / self.block_size_tokens
-        ) - math.ceil(req.finished_block_token_count / self.block_size_tokens)
+            (req.remaining_prompt_length + req.finished_chunk_token_count) / self.block_size_tokens
+        ) - math.ceil(req.finished_chunk_token_count / self.block_size_tokens)
         kv_cache_available = self.block_allocator.is_memory_available(blocks)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
@@ -1101,9 +1101,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None
         """
-        # >>>
-        raise Exception("hi.")
-        # <<<
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
 
@@ -1379,9 +1376,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (active_requests_requiring_new_block == 1).sum().item()
             )
 
-            if active_requests_requiring_new_chunk_count > 0:
+            if active_requests_requiring_new_block_count > 0:
                 newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_chunk) + self.paused_request_count
+                    torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
                 ]
 
             # Swap unfinished active requests on the left side with paused requests on the right side
