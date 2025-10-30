@@ -283,14 +283,6 @@ def get_synthetic_requests(
         for t, o in zip(prompt_texts, time_offsets)
     ]
 
-    # >>>
-    # pax("max_prompt_length", {
-    #     "old num_tokens_to_generate" : sampling_params.num_tokens_to_generate,
-    #     "new num_tokens_to_generate" : requests[0].sampling_params.num_tokens_to_generate,
-    #     "new num_tokens_to_generate'" : requests[-1].sampling_params.num_tokens_to_generate,
-    #     "set(num_tokens_to_generate)" : "%d | %s" % (len(requests), set(r.sampling_params.num_tokens_to_generate for r in requests)),
-    # })
-    # <<<
     return requests
 
 
