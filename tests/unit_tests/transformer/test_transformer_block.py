@@ -627,8 +627,6 @@ class TestPipelineParallelLayoutTransformerBlock:
         layout = PipelineParallelLayerLayout(input_layout, pp_size)
         repr_result = repr(layout)
 
-
-
         # Assert that repr returns a string
         assert isinstance(
             repr_result, str
