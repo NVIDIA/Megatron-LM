@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import random
@@ -13,7 +13,7 @@ from tqdm import tqdm
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
-    ChunkOverflowError,
+    BlockOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
@@ -65,7 +65,7 @@ class DynamicEngineTestConfig:
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
-    context_chunk_size_tokens: int = 256
+    context_block_size_tokens: int = 256
     context_buffer_guaranteed_fraction: float = 0.01
     context_buffer_overflow_factor: Optional[float] = None
     context_max_requests_override: Optional[int] = None
@@ -154,6 +154,9 @@ class TestDynamicInferenceEngine:
             # Sampling params.
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
+                termination_id=(
+                    -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
+                ),
                 return_log_probs=test_config.return_log_probs,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
@@ -161,10 +164,10 @@ class TestDynamicInferenceEngine:
                 sampling_params.add_attributes({"num_tokens_total": num_tokens_total})
             else:
                 sampling_params.num_tokens_total = num_tokens_total
+
+            config_entry = test_config.skip_prompt_log_probs_for_dynamic_inference
             sampling_params.add_attributes(
-                {
-                    "skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs_for_dynamic_inference
-                }
+                {"skip_prompt_log_probs_for_dynamic_inference": config_entry}
             )
 
             # Request.
@@ -201,7 +204,7 @@ class TestDynamicInferenceEngine:
             num_cuda_graphs=test_config.num_cuda_graphs,
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
-            chunk_size_tokens=test_config.context_chunk_size_tokens,
+            block_size_tokens=test_config.context_block_size_tokens,
             buffer_overflow_factor=test_config.context_buffer_overflow_factor,
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
@@ -316,9 +319,6 @@ class TestDynamicInferenceEngine:
         engine = DynamicInferenceEngine(
             text_generation_controller,
             inference_context,
-            termination_id=(
-                -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
-            ),
             random_seed=test_config.random_seed,
             enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
         )
@@ -342,7 +342,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(env.requests[0].sampling_params, verbose=False)
+        result = env.engine.step_modern(verbose=False)
         finished_requests = result["finished_requests"]
 
     @classmethod
@@ -502,12 +502,12 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_chunk_overflow(self) -> None:
-        """Test token overflow."""
+    def test_block_overflow(self) -> None:
+        """Test block overflow."""
         env = self._build_test_env(DynamicEngineTestConfig())
         context = env.engine.context
-        chunk_size_bytes = context.chunk_size_bytes
-        buffer_size_gb = (chunk_size_bytes + 1) / 1024**3
+        block_size_bytes = context.block_size_bytes
+        buffer_size_gb = (block_size_bytes + 1) / 1024**3
         test_config = DynamicEngineTestConfig(context_buffer_size_gb=buffer_size_gb)
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -724,11 +724,7 @@ class TestDynamicInferenceEngine:
         test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
         env = self._build_test_env(test_config)
 
-        # It's safe to use request 0's sampling params here because all sampling
-        # params are identical as long as use_fixed_output_lengths == False.
-        engine_task = asyncio.create_task(
-            env.engine.run_engine(sampling_params=env.requests[0].sampling_params, verbose=False)
-        )
+        engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
 
         request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
@@ -825,7 +821,7 @@ class TestDynamicInferenceEngine:
             num_requests=16,
             max_prompt_length=10,
             num_tokens_to_generate=32,
-            context_buffer_size_gb=0.001,  # 0.001, # 8 chunks
+            context_buffer_size_gb=0.001,  # 0.001, # 8 blocks
             context_max_requests_override=8,
             context_max_tokens_override=8,
             num_gap_steps=1,
@@ -861,7 +857,7 @@ if __name__ == "__main__":
     test.test_request_overflow()
     test.test_token_overflow_transient()
     # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
-    test.test_chunk_overflow()
+    test.test_block_overflow()
     test.test_multi_add()
     test.test_fixed_output_lengths()
     test.test_cuda_graph_request_counts()

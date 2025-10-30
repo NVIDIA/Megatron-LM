@@ -2001,11 +2001,12 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def get_asyncio_loop():
+def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError as e:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
     return loop

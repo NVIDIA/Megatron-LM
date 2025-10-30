@@ -1,6 +1,8 @@
 .publish_common_freeze:
   stage: publish
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: ($CI_COMMIT_BRANCH == "main") && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
@@ -538,10 +540,6 @@ publish:upload_statistics:
   stage: publish
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs:
-    - job: test:unit_tests_pyt(DEV)_mcore(legacy)
-      optional: true
-    - job: test:unit_tests_pyt(LTS)_mcore(legacy)
-      optional: true
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
     - job: functional:run_lts_dgx_a100
@@ -748,4 +746,113 @@ publish:merge_into_dev:
   rules:
     - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
       allow_failure: true
+    - when: never
+
+publish:approve_merge_gate:
+  stage: publish
+  image: maniator/gh
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - |
+      set -eoux pipefail
+      EXIT_CODE=0
+      apk add python3
+      python -m venv .venv
+      source .venv/bin/activate
+      pip install --no-cache-dir python-gitlab click pygithub
+      export GITLAB_ENDPOINT
+      export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+      if [[ "$CI_COMMIT_BRANCH" == *main* ]]; then
+        export TARGET_BRANCH="main"
+      elif [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
+        export TARGET_BRANCH="dev"
+      fi
+
+      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$TARGET_BRANCH" --once || EXIT_CODE=$?
+
+      export GH_TOKEN=$GH_TOKEN
+      export REPO=NVIDIA/Megatron-LM
+
+      if [[ $EXIT_CODE -eq 0 ]]; then
+        export STATUS="approved"
+        export COMMENT="Main is healthy. Submitting PR."
+      elif [[ $EXIT_CODE -eq 1 ]]; then
+        export STATUS="rejected"
+        export COMMENT="$TARGET_BRANCH is not healthy. An automation engineer is investigating. No need to take any action."
+      elif [[ $EXIT_CODE -eq 2 ]]; then
+        echo "Main is running. We won't cancel the deployment."
+        exit 0
+      fi
+
+      if [[ $EXIT_CODE -lt 2 ]]; then
+        python tests/test_utils/python_scripts/approve_merge_gate.py
+      fi
+
+  retry:
+    max: 2
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
+      when: always
+    - when: never
+
+publish:sync_branches:
+  stage: publish
+  image: python:3.10
+  script:
+    - set -x
+    - git remote add github https://github.com/NVIDIA/Megatron-LM.git || true
+    - git remote add gitlab https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/${CI_PROJECT_NAMESPACE}/Megatron-LM.git || true
+    - BRANCHES=("main" "dev")
+    - |
+      while IFS= read -r line; do
+        BRANCHES+=("$line") # Add each line to the array
+      done < <( \
+        git ls-remote --heads "https://token:${PAT}@github.com/NVIDIA/Megatron-LM.git" 'refs/heads/core_*' | \
+        cut -d'/' -f3- \
+      )
+    - |
+      for BRANCH in "${BRANCHES[@]}"; do
+        # Define the full refspec for the branch
+        BRANCH_REF="refs/heads/$BRANCH"
+        
+        echo "--- Processing branch: $BRANCH ---"
+        
+        # 1. Explicitly fetch the branch ref from 'github'
+        # This avoids fetching a tag with the same name.
+        # It updates/creates the remote-tracking branch (e.g., 'refs/remotes/github/core_r0.10.0')
+        if ! git fetch github "$BRANCH_REF:refs/remotes/github/$BRANCH"; then
+            echo "Failed to fetch branch $BRANCH. Skipping."
+            continue
+        fi
+
+        # 2. Create or update the local branch from the remote-tracking branch we just fetched.
+        # The -B flag creates the branch if it doesn't exist or resets it if it does.
+        if ! git checkout -B "$BRANCH" "github/$BRANCH"; then
+            echo "Failed to checkout local branch $BRANCH. Skipping."
+            continue
+        fi
+        
+        # 3. Now you are on the correct local branch, ready to push.
+        echo "Successfully on branch $BRANCH. Echoing push command:"
+        git push -u gitlab HEAD:refs/heads/$BRANCH --force
+        echo "-----------------------------------"
+      done
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  retry:
+    max: 2
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-sync-branches')
+      when: always
     - when: never

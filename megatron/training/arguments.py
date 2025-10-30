@@ -1137,7 +1137,7 @@ def validate_args(args, defaults={}):
 
     if args.inference_dynamic_batching:
         assert args.inference_dynamic_batching_active_buffer_size_gb is not None
-        assert args.inference_dynamic_batching_chunk_size % 256 == 0, "chunk size should be a multiple of 256"
+        assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
     # MoE upcycling check
     if args.moe_use_upcycling:
@@ -1188,6 +1188,9 @@ def validate_args(args, defaults={}):
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
             + f"The supported position embedding types are rope and none."
         )
+
+    if args.cpu_offloading_num_layers > 0:
+        args.cpu_offloading = True
 
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
@@ -1416,6 +1419,9 @@ def _add_inference_args(parser):
                        'whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, '
                        'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -1434,9 +1440,9 @@ def _add_inference_args(parser):
                        'portion of the chunked KV memory. The total buffer size '
                        'is 2x this value, which includes the same-size on-CPU '
                        'paused buffer.')
-    group.add_argument('--inference-dynamic-batching-chunk-size',
+    group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
-                       help='KV cache chunk size. '
+                       help='KV cache block size. '
                        'It should be a multiple of 256')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
@@ -1450,6 +1456,9 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--decode-only-cuda-graphs',
+                       action='store_true', default=False,
+                       help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
@@ -2032,6 +2041,8 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
+    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
+                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2181,6 +2192,10 @@ def _add_training_args(parser):
                        help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
     group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
                        help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
+    group.add_argument('--dump-param-to-param-group-map', type=str, default=None,
+                        help="Path to a file containing parameter-to-parameter-group mapping. "
+                        "Provide a JSON file that specifies which parameters belong to which "
+                        "parameter group for global coordination.")
     group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
@@ -2485,9 +2500,6 @@ def _add_checkpointing_args(parser):
                             ' rank for saving. Turn on only if experiencing host or device memory'
                             ' issues. Has affect only with `--dist-ckpt-optim-fully-reshardable`'
                             ' flag.')
-    group.add_argument('--load-model-opt-format', action='store_true',
-                       help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
-                            'This function can also be used to load NeMo .nemo sharded checkpoints.')
     return parser
 
 
@@ -2603,6 +2615,10 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
+                       'values over the wire (using an all-to-all to keep total communication overhead in line '
+                       'with the standard ring implementation) but performs accumulation locally in FP32.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -2861,6 +2877,20 @@ def _add_data_args(parser):
                        help='Path to cache index files when using s3 or msc dataloader')
     group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
                        help='The sample surplus to build for the mid-level datasets(s)')
+    group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
+                       help='Whether to prevent pad tokens already present in the dataset '
+                       'from being masked out when the pad token incorrectly shares the same id '
+                       'with other special tokens in the tokenizer. Note that this argument has '
+                       'no effect when the tokenizer correctly provides a unique id for the pad. '
+                       'Masking out such ambiguous pad tokens results in training instability. '
+                       'Such a scenario is best resolved by fixing the tokenizer; leaving this '
+                       'option as False provides a workaround. '
+                       'When left to the default of False, any token ids that collide with the '
+                       'pad token id - as provided by the tokenizer - will not be masked out of '
+                       'the loss calculation: it cannot be determined whether they are truly pad. '
+                       'If instead this argument is set, the training flow will treat all tokens '
+                       'that share the same id as the pad token as true pad tokens, potentially '
+                       'causing severe training instability.')
     return parser
 
 
