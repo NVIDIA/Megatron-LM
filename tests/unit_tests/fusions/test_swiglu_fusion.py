@@ -39,3 +39,5 @@ def test_weighted_bias_swiglu(input_dtype):
     assert weights_2.grad.dtype == weights.grad.dtype
     if input_dtype == torch.float32:
         assert torch.allclose(weights.grad, weights_2.grad, **tols)
+
+print("Hello, world!")
