@@ -22,7 +22,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
@@ -1314,6 +1314,14 @@ def _layer_is_graphable(layer, config):
     Check if a layer is graphable.
     """
 
+    # Only GraphableMegatronModule can be graphed.
+    if not isinstance(layer, GraphableMegatronModule):
+        return False
+
+    # If cuda_graph_scope is not set, every layer is graphed.
+    if not config.cuda_graph_scope:
+        return True
+
     # import modules here to avoid a circular import
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
@@ -1504,7 +1512,10 @@ class TECudaGraphHelper:
                     contains_self_attn = (
                         isinstance(layer, TransformerLayer)
                         and not isinstance(layer.self_attention, IdentityOp)
-                        and 'attn' in self.config.cuda_graph_scope
+                        and (
+                            not self.config.cuda_graph_scope
+                            or 'attn' in self.config.cuda_graph_scope
+                        )
                     )
                     if is_te_min_version("1.10.0"):
                         # te.make_graphed_callables() accepts keyword arguments since 1.10.0.

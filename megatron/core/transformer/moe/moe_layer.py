@@ -10,7 +10,8 @@ from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
-    MoELayerEarlyReturnException,
+    MoECudaGraphPartialCaptureSignal,
+    MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
@@ -174,7 +175,7 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
-        self.cudagraph_tensor_store = {}
+        self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor):
@@ -192,8 +193,8 @@ class MoELayer(BaseMoELayer):
     ):
         """Preprocess token routing for dispatch.
 
-        This method preprocesses the hidden states and probabilities for the token dispatcher.
-        The original hidden states are returned as a residual connection.
+        This method preprocesses the hidden states and routing probabilities for the token
+        dispatcher. The original hidden states are returned as a residual connection.
         """
         residual = hidden_states
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
@@ -296,7 +297,12 @@ class MoELayer(BaseMoELayer):
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
-            except MoELayerEarlyReturnException as e:
+            except MoECudaGraphPartialCaptureSignal as e:
+                # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
+                # It means we should early-return from the MoE layer forward pass.
+                # This happens when we are partially capturing the CUDA graph of the MoE layer,
+                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             dispatched_input, probs = self.dispatch(hidden_states, probs)
@@ -334,22 +340,3 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
-
-    def set_cudagraph_tensor_store(
-        self,
-        hidden_states: Optional[torch.Tensor] = None,
-        probs: Optional[torch.Tensor] = None,
-        routing_map: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
-        shared_expert_output: Optional[torch.Tensor] = None,
-    ):
-        """Set the cudagraph tensor store for the MoE layer."""
-        self.cudagraph_tensor_store['hidden_states'] = hidden_states
-        self.cudagraph_tensor_store['probs'] = probs
-        self.cudagraph_tensor_store['routing_map'] = routing_map
-        self.cudagraph_tensor_store['residual'] = residual
-        self.cudagraph_tensor_store['shared_expert_output'] = shared_expert_output
-
-    def clear_cudagraph_tensor_store(self):
-        """Clear the cudagraph tensor store for the MoE layer."""
-        self.cudagraph_tensor_store.clear()

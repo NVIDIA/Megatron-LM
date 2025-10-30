@@ -742,9 +742,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
-        if (
-            not isinstance(self.self_attention, IdentityOp)
-            and 'attn' in self.config.cuda_graph_scope
+        if not isinstance(self.self_attention, IdentityOp) and (
+            not self.config.cuda_graph_scope or 'attn' in self.config.cuda_graph_scope
         ):
             slen_per_cp = seq_length // self.config.context_parallel_size
             static_inputs["attention_mask"] = (
@@ -759,6 +758,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         Get the submodules that are covered by cudagraphs.
         """
+        if not self.config.cuda_graph_scope:
+            return super()._get_submodules_under_cudagraphs()
+
         submodules = []
         if 'attn' in self.config.cuda_graph_scope:
             submodules += [
@@ -789,7 +791,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         2. If context is None, it cannot be returned as output.
         """
         context = None
-        if 'attn' in self.config.cuda_graph_scope:
+        if not self.config.cuda_graph_scope or 'attn' in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
             if len(args) > 0:
@@ -797,11 +799,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else:
                 hidden_states = kwargs.pop("hidden_states")
 
-        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
-            self.is_moe_layer
-            and (
-                'moe' in self.config.cuda_graph_scope
-                or 'moe_router' in self.config.cuda_graph_scope
+        if (
+            not self.config.cuda_graph_scope
+            or (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope)
+            or (
+                self.is_moe_layer
+                and (
+                    'moe' in self.config.cuda_graph_scope
+                    or 'moe_router' in self.config.cuda_graph_scope
+                )
             )
         ):
             hidden_states = self._forward_mlp(hidden_states)
@@ -821,7 +827,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
         context = None
-        if 'attn' not in self.config.cuda_graph_scope:
+        if self.config.cuda_graph_scope and 'attn' not in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
@@ -839,8 +845,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
 
-        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
-            self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
+        if (
+            not self.config.cuda_graph_scope
+            or (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope)
+            or (self.is_moe_layer and 'moe' in self.config.cuda_graph_scope)
         ):
             # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
@@ -880,7 +888,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The MoE layer will skip redundant computations when we pass in the calculated values
             # through the keyword arguments. See MoELayer.forward docstring for more details.
             nvtx_range_push(suffix="mlp")
-            self.mlp.set_cudagraph_tensor_store(
+            self.mlp.cudagraph_tensor_store.set(
                 hidden_states=hidden_states,
                 probs=probs,
                 routing_map=routing_map,
@@ -888,7 +896,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 shared_expert_output=shared_expert_output,
             )
             mlp_output_with_bias = self.mlp(hidden_states)
-            self.mlp.clear_cudagraph_tensor_store()
+            self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
             output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
