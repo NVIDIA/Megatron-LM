@@ -673,6 +673,9 @@ def forward_backward_no_pipelining(
 
         total_num_tokens += num_tokens
 
+        # debugmtl
+        # print(f"num_microbatches: {num_microbatches}, total_num_tokens: {total_num_tokens}")
+
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 

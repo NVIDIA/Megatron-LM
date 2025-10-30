@@ -85,7 +85,7 @@ def get_batch(data_iterator, vp_stage=None):
            
     if not hasattr(get_batch, 'microbatch_counter'):
         get_batch.microbatch_counter = 0
-    
+    print(batch['tokens'])
     # Debugmtl: 保存batch数据到文本文件 - 保存所有元素
     print_data = False
     if print_data:
@@ -259,6 +259,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
+                for i in [tokens, position_ids, attention_mask, labels, loss_mask, packed_seq_params]:
+                    print(i)
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
