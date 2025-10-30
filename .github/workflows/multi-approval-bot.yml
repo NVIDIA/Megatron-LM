@@ -1,0 +1,30 @@
+name: "Codeowners Approval Workflow"
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+jobs:
+  codeowners-approval:
+    runs-on: ubuntu-latest
+    environment: nemo-ci
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Checkout action
+        uses: actions/checkout@v3
+        with:
+          repository: noamelf/codeowner-multi-approval-action
+          ref: v0.1
+          path: codeowner-multi-approval-action
+
+      - name: Check Codeowners Approval
+        uses: ./codeowner-multi-approval-action
+        with:
+          pr-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          repo-name: ${{ github.repository }}
+          github-token: ${{ secrets.PAT }}
