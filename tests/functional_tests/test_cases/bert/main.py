@@ -1,24 +1,30 @@
-import yaml
 import os
 import sys
-from typing import Any, List, Dict
-from yaml.nodes import MappingNode, ScalarNode
+from typing import Any, Dict, List
+
+import yaml
 from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode, ScalarNode
 
 # --- Pass 1: Placeholders and Custom Loader ---
 
+
 class Reference:
     """A placeholder object for a !reference tag."""
+
     def __init__(self, keys: List[str]):
         self.keys = keys
+
     def __repr__(self):
         return f"Reference(keys={self.keys})"
+
 
 class ConfigLoader(yaml.SafeLoader):
     """
     Custom YAML Loader that handles !include, creates
     placeholders for !reference, and defers merge (<<) resolution.
     """
+
     def __init__(self, stream):
         try:
             self._root = os.path.dirname(stream.name)
@@ -32,23 +38,31 @@ class ConfigLoader(yaml.SafeLoader):
         This prevents PyYAML from trying to resolve '<<' in Pass 1.
         """
         if not isinstance(node, MappingNode):
-            raise ConstructorError(None, None,
-                "expected a mapping node, but found %s" % node.id,
-                node.start_mark)
-        
+            raise ConstructorError(
+                None, None, "expected a mapping node, but found %s" % node.id, node.start_mark
+            )
+
         mapping = {}
         for key_node, value_node in node.value:
             key = self.construct_object(key_node, deep=deep)
             try:
                 hash(key)
             except TypeError as exc:
-                raise ConstructorError("while constructing a mapping", node.start_mark,
-                    "found unhashable key (%s)" % exc, key_node.start_mark)
-            
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key (%s)" % exc,
+                    key_node.start_mark,
+                )
+
             if key in mapping:
-                 raise ConstructorError("while constructing a mapping", node.start_mark,
-                    "found duplicate key (%s)" % key, key_node.start_mark)
-            
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found duplicate key (%s)" % key,
+                    key_node.start_mark,
+                )
+
             value = self.construct_object(value_node, deep=deep)
             mapping[key] = value
         return mapping
@@ -60,19 +74,22 @@ class ConfigLoader(yaml.SafeLoader):
         """
         return self.construct_scalar(node)
 
+
 def include_constructor(loader: ConfigLoader, node: yaml.Node) -> Any:
     """Handles !include by recursively loading with the same loader."""
     filename = os.path.join(loader._root, loader.construct_scalar(node))
     if not os.path.isfile(filename):
         raise FileNotFoundError(f"Included file not found: {filename}")
-        
+
     with open(filename, 'r') as f:
         return yaml.load(f, Loader=type(loader))
+
 
 def reference_constructor(loader: ConfigLoader, node: yaml.Node) -> Reference:
     """Handles !reference by creating a Reference placeholder."""
     keys = loader.construct_sequence(node)
     return Reference(keys)
+
 
 # Register all custom constructors with our loader
 yaml.add_constructor('!include', include_constructor, Loader=ConfigLoader)
@@ -82,12 +99,14 @@ yaml.add_constructor('tag:yaml.org,2002:merge', ConfigLoader.construct_merge, Lo
 
 # --- Pass 2: Resolver Functions ---
 
+
 def _lookup(keys: List[str], data: Dict[str, Any]) -> Any:
     """Helper to look up a value from a nested dict via a key path."""
     current = data
     for k in keys:
         current = current[k]
     return current
+
 
 def resolve_refs(node: Any, root: Dict[str, Any]) -> Any:
     """
@@ -108,12 +127,12 @@ def resolve_refs(node: Any, root: Dict[str, Any]) -> Any:
     # 3. Recurse into a dict (and handle merges)
     if isinstance(node, dict):
         new_dict = {}
-        
+
         # Handle the YAML merge key '<<' first.
         if '<<' in node:
             # Resolve the merge source (which could be a Reference)
             merge_source = resolve_refs(node['<<'], root)
-            
+
             if isinstance(merge_source, dict):
                 # Must resolve the *contents* of the merged dict too
                 new_dict.update(resolve_refs(merge_source, root))
@@ -132,13 +151,15 @@ def resolve_refs(node: Any, root: Dict[str, Any]) -> Any:
             if key == '<<':
                 continue
             new_dict[key] = resolve_refs(value, root)
-        
+
         return new_dict
 
     # 4. It's a primitive, return as-is
     return node
 
+
 # --- Main Execution ---
+
 
 def load_config(main_config_path: str) -> Dict[str, Any]:
     """
@@ -150,15 +171,15 @@ def load_config(main_config_path: str) -> Dict[str, Any]:
         pass1_data = None
         with open(main_config_path, 'r') as f:
             pass1_data = yaml.load(f, Loader=ConfigLoader)
-        
+
         print("Result after Pass 1 (with placeholders):")
         print(pass1_data)
-        
+
         # --- Pass 2: Resolve references ---
         print("\n--- Running Pass 2 (Resolving) ---")
         # The 'root' for resolution is the entire data structure itself.
         final_data = resolve_refs(pass1_data, pass1_data)
-        
+
         print("\n--- Final, fully resolved data ---")
         return final_data
 
@@ -167,11 +188,16 @@ def load_config(main_config_path: str) -> Dict[str, Any]:
         # Depending on your app, you might want to re-raise or sys.exit
         raise
 
+
 if __name__ == "__main__":
     # --- Create dummy files for a self-contained test ---
     # (You would remove this and just call load_config in your real app)
-    
+
     # This is the main function call
-    
+
     # Pretty-print the final result
-    print(yaml.dump(load_config('tp1_pp2/model_config.yaml'), default_flow_style=False, sort_keys=False))
+    print(
+        yaml.dump(
+            load_config('tp1_pp2/model_config.yaml'), default_flow_style=False, sort_keys=False
+        )
+    )
