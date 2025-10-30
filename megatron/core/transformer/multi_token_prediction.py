@@ -474,7 +474,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         # For the linear projection at the (k - 1)-th MTP layer, the input is the concatenation
-        # of the i-th tocken's hidden states and the (i + K)-th tocken's decoder input,
+        # of the i-th token's hidden states and the (i + K)-th token's decoder input,
         # so the input's shape is [s, b, 2*h].
         # The output will be send to the following transformer layer,
         # so the output's shape should be [s, b, h].
@@ -540,8 +540,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
         hidden_states = self.hnorm(hidden_states)
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-        # At the (k - 1)-th MTP module, concatenates the i-th tocken's hidden_states
-        # and the (i + K)-th tocken's embedding, and combine them with linear projection.
+        # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
+        # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
         hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
@@ -865,13 +865,16 @@ class MultiTokenPredictionBlock(MegatronModule):
 
     def _build_layers(self, pg_collection):
         def build_layer(layer_spec, layer_number):
-            return build_module(
-                layer_spec,
-                config=self.config,
-                layer_number=layer_number,
-                vp_stage=self.vp_stage,
-                pg_collection=pg_collection,
-            )
+            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            with fp8_init_context:
+                module = build_module(
+                    layer_spec,
+                    config=self.config,
+                    layer_number=layer_number,
+                    vp_stage=self.vp_stage,
+                    pg_collection=pg_collection,
+                )
+            return module
 
         self.layers = torch.nn.ModuleList(
             [

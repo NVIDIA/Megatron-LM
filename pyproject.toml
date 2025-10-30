@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools<80.0.0", "pybind11"]
+requires = ["setuptools>=80.0.0", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -47,8 +47,9 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Image Recognition",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -66,6 +67,9 @@ Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
+    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -76,10 +80,8 @@ dev = [
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
-    "transformer-engine[pytorch]>=2.6.0a0,<2.8.0",
-    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
-    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
+    "av<16.0.0",                                        # At the time, av 16.0.0 is not compatible with Python 3.12
     "flashinfer-python",
     "wget",
     "onnxscript",
@@ -127,6 +129,7 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
+    "nvidia-mathdx",     # for TE
 ]
 linting = [
     "ruff~=0.9.0",
@@ -141,12 +144,12 @@ flash_mla = ["flash_mla"]
 [tool.uv]
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
-    "transformer-engine",
-    "transformer-engine-torch",
-    "mamba-ssm",
     "causal-conv1d",
     "nv-grouped-gemm",
     "flash_mla",
+    "mamba-ssm",
+    "transformer-engine",
+    "transformer-engine-torch",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
@@ -163,7 +166,9 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "0289e76380088358a584d809faf69effab1a7cda" } # on `release_v2.7
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.9" } # on `release_v2.9`
+nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "fb1add873e7851ec34b48581ea1b15761b73d189" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

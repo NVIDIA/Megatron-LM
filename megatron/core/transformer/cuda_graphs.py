@@ -26,6 +26,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
+    get_torch_version,
     is_te_min_version,
     log_on_each_pipeline_stage,
     log_single_rank,
@@ -57,6 +58,18 @@ except:
 _IS_GRAPH_CAPTURING = False
 
 logger = logging.getLogger(__name__)
+
+# Freeze GC during capture.
+# TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
+FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
+try:
+    from packaging.version import Version as PkgVersion
+
+    FREEZE_GC_MAX_TORCH_VERSION = PkgVersion("2.9.0a0")
+    if get_torch_version() >= FREEZE_GC_MAX_TORCH_VERSION:
+        FREEZE_GC = False
+except ImportError:
+    pass
 
 
 def is_graph_capturing():
@@ -616,8 +629,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         # save grads and other variables that may be affected by graph warmup
@@ -706,7 +718,7 @@ class _CudaGraphRunner(torch.nn.Module):
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             # gc.collect() drops references to unreachable tensors created during capture,
@@ -721,8 +733,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         self.bwd_graph = torch.cuda.CUDAGraph()
@@ -782,7 +793,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = static_grad_inputs
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             if self.is_first_layer:
@@ -833,7 +844,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if not self.fwd_graph_recorded:
             logger.debug(f"Recording forward graph creation...")
-            if not self.is_first_layer:
+            if self.is_transformer_decoder_layer and not self.is_first_layer:
                 # transformer layers hidden_states are already saved as the output of the previous
                 # layer's cudagraph so avoid saving again
                 kwargs_copy = dict(kwargs)
@@ -1058,13 +1069,14 @@ class CudaGraphManager(torch.nn.Module):
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
 
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-                "a crash due to illegal memory access or other undefined behaviour."
-            )
+        assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+            "a crash due to illegal memory access or other undefined behaviour."
+        )
 
         self.cudagraph_runners = []
+        self.inference_cudagraphs_lookup_table = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
         # Without pipeline parallelism, microbatches execute one at a time.
@@ -1147,15 +1159,27 @@ class CudaGraphManager(torch.nn.Module):
             bwd_mempool = CudaGraphManager.bwd_mempool
 
         if self.reuse_cudagraphs:
-            runner = next(
-                (
-                    r
-                    for r in self.cudagraph_runners
-                    if r.status == _GraphStatus.FWD_READY
-                    and not r.get_mismatch_errors(args, kwargs)
-                ),
-                None,
-            )
+            is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            if is_inference_mode:
+                batch_size = kwargs['hidden_states'].shape[0]
+                is_decode_only = kwargs["inference_context"].is_decode_only()
+                # Attempt to retrieve the corresponding runner from the lookup table.
+                # The table is keyed on (batch_size, is_decode_only).
+                # It returns None if no match is found, in which case a new runner is created
+                # and cached in the lookup table.
+                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+            else:
+                # Todo: For training, we could also cache runners based on input shape.
+                runner = next(
+                    (
+                        r
+                        for r in self.cudagraph_runners
+                        if r.status == _GraphStatus.FWD_READY
+                        and not r.get_mismatch_errors(args, kwargs)
+                    ),
+                    None,
+                )
+
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
                     assert False
@@ -1169,6 +1193,11 @@ class CudaGraphManager(torch.nn.Module):
                         self.share_cudagraph_io_buffers,
                     )
                     self.cudagraph_runners.append(runner)
+                    if is_inference_mode:
+                        # Cache the newly created runner in the inference lookup table.
+                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                            runner
+                        )
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1325,14 +1354,16 @@ class TECudaGraphHelper:
 
     def __init__(self, model, config, seq_length, micro_batch_size, optimizers=[]):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
+        assert (
+            config.cuda_graph_impl == "transformer_engine"
+        ), "Option cuda_graph_impl=transformer_engine not enabled."
         assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
             "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
             "a crash due to illegal memory access or other undefined behaviour."
         )
         assert config.cuda_graph_scope != "full_iteration", (
-            "full_iteration cuda graph is not supported for --external-cuda-graph. "
-            "Please use --enable-cuda-graph instead."
+            "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
+            "Please use cuda_graph_impl=local instead."
         )
         assert config.cuda_graph_scope in [
             'full',

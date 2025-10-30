@@ -102,6 +102,7 @@ def experimental_fn(introduced_with_version: str):
         ExperimentalNotEnabledError: Error raised when experimental function
             was called without enabling the experimental flag.
     """
+    logged_functions = set()
 
     def validator(func: Callable, max_lifetime: int = 3) -> Callable:
         """Validates the request to the experimental function.
@@ -135,8 +136,12 @@ def experimental_fn(introduced_with_version: str):
         def wrapped_func(*args, **kwargs):
             if config.is_experimental_enabled() is not True:
                 raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
-
-            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+            # log once on one rank
+            if func.__name__ not in logged_functions:
+                logged_functions.add(func.__name__)
+                log_single_rank(
+                    logger, logging.INFO, "ENABLE_EXPERIMENTAL is True, running experimental code."
+                )
 
             return func(*args, **kwargs)
 
@@ -161,6 +166,7 @@ def experimental_cls(introduced_with_version: str):
         ExperimentalNotEnabledError: Error raised when experimental class
             was called without enabling the experimental flag.
     """
+    logged_classes = set()
 
     def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
         """Validates the request to the experimental function.
@@ -212,8 +218,14 @@ def experimental_cls(introduced_with_version: str):
                     raise ExperimentalNotEnabledError(
                         f"Flag config.ENABLE_EXPERIMENTAL not enabled."
                     )
-
-                logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+                # log once on one rank
+                if cls.__name__ not in logged_classes:
+                    logged_classes.add(cls.__name__)
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "ENABLE_EXPERIMENTAL is True, running experimental code.",
+                    )
                 return super.__getattribute__(attr)
 
             class ClassInterceptor(type):
@@ -2037,11 +2049,12 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
-def get_asyncio_loop():
+def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError as e:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
     return loop

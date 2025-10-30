@@ -1,6 +1,7 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 from argparse import Namespace
 
 from pydantic import PrivateAttr
@@ -23,6 +24,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -33,6 +35,8 @@ from ..inference.inference_interface import (
     ReturnsTokens,
 )
 from ..server.api import InferenceServer
+
+logger = logging.getLogger(__name__)
 
 
 ## This code is copied from tools/run_text_generation_server.py
@@ -94,6 +98,8 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
     if args.enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
+    module = model.module.module if hasattr(model.module, "module") else model.module
+
     # Inference context.
     inference_context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -112,6 +118,14 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
+        unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
+        is_hybrid_model=args.is_hybrid_model,
+        layer_type_list=module.decoder.layer_type_list if args.is_hybrid_model else None,
+        mamba_head_dim=args.mamba_head_dim,
+        mamba_num_groups=args.mamba_num_groups,
+        mamba_d_model=args.hidden_size,
+        mamba_d_conv=4 if args.is_hybrid_model else None,
+        mamba_d_state=args.mamba_state_dim,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
@@ -140,6 +154,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _kill_engine: bool = PrivateAttr(False)
 
     async def base_generate(self, request: InferenceRequest):
+        tokenizer = get_tokenizer()
+
         sampling_params = SamplingParams(
             num_tokens_to_generate=request.generation_args.max_tokens or 1024,
             temperature=request.generation_args.temperature or 1.0,
@@ -148,6 +164,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._coordinator.engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs_for_dynamic_inference=True,
+            add_BOS=tokenizer.bos is not None,
         )
         request_ids = [
             self._coordinator.schedule_request(prompt=prompt, sampling_params=sampling_params)
@@ -170,6 +187,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
         args = get_args()
+        tokenizer = get_tokenizer()
+
+        if tokenizer.bos is None:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
+            )
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model)
         coordinator = DynamicEngineCoordinator(
@@ -191,6 +216,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         await self._coordinator.suspend_engine()
+
+    def resume(self):
+        self._coordinator.resume_engine()
 
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
