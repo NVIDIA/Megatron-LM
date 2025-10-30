@@ -1,0 +1,88 @@
+name: Mirror Dev to Main
+
+on:
+  pull_request:
+    types: [labeled]
+    branches:
+      - dev
+
+jobs:
+  cherry-pick-to-main:
+    if: github.event.label.name == 'mirror-to-main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+
+      - name: Cherry-pick to main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          TARGET_BRANCH="cp/$PR_NUMBER-into-main"
+
+          # Check if target branch already exists
+          if git ls-remote --heads origin "refs/heads/$TARGET_BRANCH" | grep -q .; then
+            echo "Target branch already exists, will not cherry-pick again."
+            exit 0
+          fi
+
+          # Get PR details
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}"
+          SOURCE_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+
+          # Fetch all branches
+          git fetch origin dev
+
+          # Handle forks vs same repo
+          if [ "$SOURCE_REPO" = "${{ github.repository }}" ]; then
+            git fetch origin "$SOURCE_BRANCH"
+            git checkout "$SOURCE_BRANCH"
+          else
+            git fetch "https://github.com/$SOURCE_REPO.git" "$SOURCE_BRANCH"
+            git checkout FETCH_HEAD
+          fi
+
+          # Find commit range to cherry-pick
+          START_COMMIT=$(git merge-base origin/dev HEAD)
+          END_COMMIT=$(git rev-parse HEAD)
+
+          # Create cherry-pick branch from main
+          git fetch origin main
+          git checkout main
+          git checkout -b "$TARGET_BRANCH"
+
+          # Cherry-pick commits
+          if ! git cherry-pick "$START_COMMIT..$END_COMMIT"; then
+            echo "Cherry-pick failed. Please resolve conflicts manually."
+            exit 1
+          fi
+
+          # Push branch
+          git push -u origin "$TARGET_BRANCH"
+
+          # Create PR to main
+          gh pr create \
+            --base main \
+            --head "$TARGET_BRANCH" \
+            --title "cp PR #$PR_NUMBER from dev: \`$PR_TITLE\`" \
+            --body "[🤖]: Hi @$PR_AUTHOR 👋<br><br>We've cherry-picked \`$PR_TITLE (#$PR_NUMBER)\` into \`main\` for you! 🚀<br><br>Please review and approve this cherry-pick at your convenience!" \
+            --label "cherry-picked-from-dev" \
+            --reviewer "$PR_AUTHOR"
+
