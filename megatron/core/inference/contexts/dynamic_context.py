@@ -4,7 +4,7 @@ import math
 import warnings
 from contextlib import nullcontext
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,7 @@ from megatron.core.utils import divide as core_divide
 from megatron.core.inference.sampling_params import SamplingParams
 
 from .attention_context.mha_metadata import GraphMHAMetadata, NonGraphMHAMetadata
+from .attention_context.mha_splitpd_metadata import MHASplitPDMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
 from ..kv_cache import KVCacheBase, KVCacheLayout, MLACache, create_mhagqa_cache
@@ -343,9 +344,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif attention_backend in [AttnBackend.flashinfer_fa2,
                                    AttnBackend.flashinfer_fa3,
                                    AttnBackend.flashinfer_trt]:
-            layout = KVCacheLayout.M_N2HCD  # NOT Triton-compatible
+            layout = KVCacheLayout.M_N2HCD  
         else:  # Flash backend
-            layout = KVCacheLayout.M_2NCHD  # Triton-compatible
+            layout = KVCacheLayout.M_2NCHD 
 
         ctx_manager = (
             torch.cuda.use_mem_pool(self.unified_memory_mempool)
@@ -392,21 +393,37 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.non_graph_attn_metadata = {}
         self.active_attn_metadata = None
 
-        self.graph_attn_metadata["mha_metadata"] = GraphMHAMetadata(
-            block_count_total=block_count_total,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
+        if attention_backend in [AttnBackend.flash, AttnBackend.auto]:
+            self.graph_attn_metadata["mha_metadata"] = GraphMHAMetadata(
+                block_count_total=block_count_total,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+            )
 
-        self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAMetadata(
-            block_count_total=block_count_total,
-            max_kv_block_count=self.max_kv_block_count,
-            max_requests=self.max_requests,
-            block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
-        )
+            self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAMetadata(
+                block_count_total=block_count_total,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+            )
+        elif attention_backend == AttnBackend.flash_split:
+            self.graph_attn_metadata["mha_metadata"] = MHASplitPDMetadata(
+                block_count_total=block_count_total,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+            )
+            self.non_graph_attn_metadata["mha_metadata"] = MHASplitPDMetadata(
+                block_count_total=block_count_total,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+            )
 
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
@@ -720,30 +737,45 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_to_local_position_within_kv_block=self.token_to_local_position_within_kv_block,
         )
 
-    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Optional[Tensor], Tensor]:
         """Read from KV cache.
 
         Args:
             layer_number (int): Layer number.
 
         Return:
-            (Tuple[Tensor, Optional[Tensor], Tensor]) The key cache, value cache (or None for MLA),
-            and block table tensor.
+            Tuple[Tensor, Optional[Tensor], Tensor]: The key cache, value cache (or None for MLA),
+                and block table tensor.
+                - For MLA: (kv_latent_cache, None, block_table)
+                - For separate K/V caches (S_NCHD, S_NHCD): (k_cache, v_cache, block_table)
+                - For merged caches (M_2NCHD, M_N2CHD, M_N2HCD): (k_view, v_view, block_table)
         """
         cache = self.memory_buffer[layer_number - 1]
         cache_content = cache.get_content()
         block_table = self.active_attn_metadata["mha_metadata"].state_data["block_table"]
 
-        if self.cache_mla_latent:
-            # MLA: cache_content is single tensor
-            return (cache_content, None, block_table)
-        elif isinstance(cache_content, tuple):
-            # Separate K/V caches
+        if isinstance(cache_content, tuple):
+            # Separate K/V caches (S_NCHD, S_NHCD)
             k_cache, v_cache = cache_content
             return (k_cache, v_cache, block_table)
+        elif self.cache_mla_latent:
+            # MLA latent cache - return as single tensor with None for value
+            return (cache_content, None, block_table)
         else:
-            # Merged cache: slice [0] for K, [1] for V
-            return (cache_content[0], cache_content[1], block_table)
+            # Merged K/V cache - return views on K and V components
+            # All merged layouts have the K/V dimension, we need to slice it
+            from megatron.core.inference.kv_cache import KVCacheM2NCHD, KVCacheMN2CHD, KVCacheMN2HCD
+
+            if isinstance(cache, KVCacheM2NCHD):
+                # M_2NCHD layout: [2, N, C, H, D] - K/V is first dimension
+                return (cache_content[0], cache_content[1], block_table)
+            elif isinstance(cache, (KVCacheMN2CHD, KVCacheMN2HCD)):
+                # M_N2CHD layout: [N, 2, C, H, D] - K/V is second dimension
+                # M_N2HCD layout: [N, 2, H, C, D] - K/V is second dimension
+                return (cache_content[:, 0], cache_content[:, 1], block_table)
+            else:
+                # Should not reach here, but fallback for unknown merged layout
+                raise ValueError(f"Unknown cache type: {type(cache)}")
 
     def apply_fused_qk_rotary_emb(
         self, query: Tensor, key: Tensor, cos_sin_emb: Tensor, config: TransformerConfig

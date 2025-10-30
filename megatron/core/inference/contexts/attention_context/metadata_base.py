@@ -64,3 +64,9 @@ class MetadataBase:
         Return a string representation of the metadata.
         """
         return "\n".join([f"{key}: {value}" for key, value in self.state_data.items()])
+
+    def attention(self, *args, **kwargs):
+        """
+        Attention operation.
+        """
+        pass

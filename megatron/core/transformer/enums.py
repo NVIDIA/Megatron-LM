@@ -68,3 +68,4 @@ class AttnBackend(enum.Enum):
     flashinfer_fa2 = 6
     flashinfer_fa3 = 7
     flashinfer_trt = 8
+    flash_split = 9
