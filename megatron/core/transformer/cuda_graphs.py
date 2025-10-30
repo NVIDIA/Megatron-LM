@@ -1058,13 +1058,14 @@ class CudaGraphManager(torch.nn.Module):
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
 
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-                "a crash due to illegal memory access or other undefined behaviour."
-            )
+        assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+            "a crash due to illegal memory access or other undefined behaviour."
+        )
 
         self.cudagraph_runners = []
+        self.inference_cudagraphs_lookup_table = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
         # Without pipeline parallelism, microbatches execute one at a time.
@@ -1147,15 +1148,27 @@ class CudaGraphManager(torch.nn.Module):
             bwd_mempool = CudaGraphManager.bwd_mempool
 
         if self.reuse_cudagraphs:
-            runner = next(
-                (
-                    r
-                    for r in self.cudagraph_runners
-                    if r.status == _GraphStatus.FWD_READY
-                    and not r.get_mismatch_errors(args, kwargs)
-                ),
-                None,
-            )
+            is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            if is_inference_mode:
+                batch_size = kwargs['hidden_states'].shape[0]
+                is_decode_only = kwargs["inference_context"].is_decode_only()
+                # Attempt to retrieve the corresponding runner from the lookup table.
+                # The table is keyed on (batch_size, is_decode_only).
+                # It returns None if no match is found, in which case a new runner is created
+                # and cached in the lookup table.
+                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+            else:
+                # Todo: For training, we could also cache runners based on input shape.
+                runner = next(
+                    (
+                        r
+                        for r in self.cudagraph_runners
+                        if r.status == _GraphStatus.FWD_READY
+                        and not r.get_mismatch_errors(args, kwargs)
+                    ),
+                    None,
+                )
+
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
                     assert False
@@ -1169,6 +1182,11 @@ class CudaGraphManager(torch.nn.Module):
                         self.share_cudagraph_io_buffers,
                     )
                     self.cudagraph_runners.append(runner)
+                    if is_inference_mode:
+                        # Cache the newly created runner in the inference lookup table.
+                        self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
+                            runner
+                        )
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1325,14 +1343,16 @@ class TECudaGraphHelper:
 
     def __init__(self, model, config, seq_length, micro_batch_size, optimizers=[]):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
+        assert (
+            config.cuda_graph_impl == "transformer_engine"
+        ), "Option cuda_graph_impl=transformer_engine not enabled."
         assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
             "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
             "a crash due to illegal memory access or other undefined behaviour."
         )
         assert config.cuda_graph_scope != "full_iteration", (
-            "full_iteration cuda graph is not supported for --external-cuda-graph. "
-            "Please use --enable-cuda-graph instead."
+            "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
+            "Please use cuda_graph_impl=local instead."
         )
         assert config.cuda_graph_scope in [
             'full',

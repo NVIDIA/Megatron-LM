@@ -139,18 +139,14 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
         assert length_pads >= 0
 
         tokens = numpy.array(tokens, dtype=numpy.int64)
-        tokens = numpy.pad(tokens, (0, length_pads), constant_values=self.config.tokenizer.pad)
+        tokens = numpy.pad(tokens, (0, length_pads), constant_values=self._pad_token_id)
 
         assignments = numpy.array(assignments, dtype=numpy.int64)
-        assignments = numpy.pad(
-            assignments, (0, length_pads), constant_values=self.config.tokenizer.pad
-        )
+        assignments = numpy.pad(assignments, (0, length_pads), constant_values=self._pad_token_id)
 
         # Get the padding mask
         mask_pads = numpy.ones(length_toks, dtype=numpy.int64)
-        mask_pads = numpy.pad(
-            mask_pads, (0, length_pads), constant_values=self.config.tokenizer.pad
-        )
+        mask_pads = numpy.pad(mask_pads, (0, length_pads), constant_values=self._pad_token_id)
 
         # Mask the labels
         labels = numpy.zeros(self.config.sequence_length, dtype=numpy.int64) - 1

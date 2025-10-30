@@ -29,7 +29,7 @@ def add_generate_args(parser):
     group.add_argument("--draft-length", type=int, default=0, help="Only used in EAGLE.")
     group.add_argument("--draft-topk", type=int, default=1, help="Only used in EAGLE.")
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
 
     add_modelopt_args(parser)
     return parser
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     unwrapped_model.eval()
 
     for idx, example in enumerate(dataset):
-        if idx > args.percentage * len(dataset):
+        if idx > args.fraction * len(dataset):
             break
         ref_conversations = get_conversations(example)
         new_conversations = []

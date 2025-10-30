@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import warnings
@@ -112,14 +112,14 @@ def get_transformer_layer_offset(
                     else config.num_layers_in_last_pipeline_stage // vp_size
                 )
 
-                num_layers_per_vritual_model_chunk_in_middle_pipeline_stage = (
+                num_layers_per_virtual_model_chunk_in_middle_pipeline_stage = (
                     middle_num_layers // vp_size
                 )
 
                 # First stage + middle stage + last stage
                 total_virtual_chunks = (
                     num_layers_per_virtual_model_chunk_in_first_pipeline_stage
-                    + num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
+                    + num_layers_per_virtual_model_chunk_in_middle_pipeline_stage
                     + num_layers_per_virtual_model_chunk_in_last_pipeline_stage
                 )
 
@@ -132,7 +132,7 @@ def get_transformer_layer_offset(
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
                         + middle_pipeline_rank
                         * (
-                            num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
+                            num_layers_per_virtual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
                         )
                     )
@@ -378,7 +378,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "layernorm" in self.config.recompute_modules:
                 if (
                     not isinstance(self.input_layernorm, IdentityOp)
-                    and not self.config.external_cuda_graph
+                    and self.config.cuda_graph_impl == "none"
                 ):
                     self.recompute_input_layernorm = True
                     if self.config.fp8:
@@ -397,6 +397,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
+        self.offload_attn_norm = (
+            self.config.fine_grained_activation_offloading
+            and "attn_norm" in self.config.offload_modules
+            and not isinstance(self.input_layernorm, IdentityOp)
+        )
+        self.offload_mlp_norm = (
+            self.config.fine_grained_activation_offloading
+            and "mlp_norm" in self.config.offload_modules
+            and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+        )
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -479,20 +489,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_group_commit,
+            fine_grained_offloading_group_start,
+            get_fine_grained_offloading_context,
+        )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.
         residual = hidden_states
 
+        if self.offload_attn_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="attn_norm")
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                self.input_layernorm, hidden_states
-            )
+            with get_fine_grained_offloading_context(self.offload_attn_norm):
+                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                    self.input_layernorm, hidden_states
+                )
         else:
-            input_layernorm_output = self.input_layernorm(hidden_states)
+            with get_fine_grained_offloading_context(self.offload_attn_norm):
+                input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -525,6 +544,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="self_attn_bda")
+
+        if self.offload_attn_norm:
+            (hidden_states,) = fine_grained_offloading_group_commit(
+                hidden_states, name="attn_norm", forced_released_tensors=[residual]
+            )
 
         # Residual connection.
         residual = hidden_states
@@ -563,17 +587,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_group_commit,
+            fine_grained_offloading_group_start,
+            get_fine_grained_offloading_context,
+        )
+
         # Residual connection.
         residual = hidden_states
 
+        if self.offload_mlp_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
+            with get_fine_grained_offloading_context(self.offload_mlp_norm):
+                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                    self.pre_mlp_layernorm, hidden_states
+                )
         else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+            with get_fine_grained_offloading_context(self.offload_mlp_norm):
+                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -633,6 +667,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
+        if self.offload_mlp_norm:
+            (hidden_states,) = fine_grained_offloading_group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            )
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
@@ -738,7 +776,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ), (
             "CUDA graph accepts only Tensor inputs. "
             "inference_context and packed_seq_params are excluded from input list. "
-            "For inference cuda graph, please use enable_cuda_graph instead."
+            "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
         cuda_graph_output = super()._te_cuda_graph_replay(*args, **kwargs)

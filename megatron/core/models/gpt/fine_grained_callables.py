@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import weakref
 from contextlib import nullcontext
@@ -8,6 +8,11 @@ from typing import Optional
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
+)
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -325,7 +330,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
-    enable_deepep = layer.config.moe_enable_deepep
+    enable_deepep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "deepep"
+    )
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -347,13 +355,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Run forward pass for computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
+        if layer.offload_mlp_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         if layer.recompute_pre_mlp_layernorm:
             layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                layer.pre_mlp_layernorm, hidden_states
-            )
+            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                    layer.pre_mlp_layernorm, hidden_states
+                )
         else:
-            pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
+                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
         local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
 
@@ -395,7 +407,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
-        expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
+        shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+        expert_output, mlp_bias = layer.mlp.routed_experts_compute(
             dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
         )
 
@@ -432,6 +445,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
+            )
+        if layer.offload_mlp_norm:
+            (hidden_states,) = fine_grained_offloading_group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True

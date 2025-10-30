@@ -41,7 +41,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            if args.num_experts:
+            if args.num_experts or (args.linear_attention_type is not None):
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -112,6 +112,7 @@ def _get_transformer_layer_spec(use_te, config):
             args.moe_grouped_gemm,
             args.qk_layernorm,
             args.multi_latent_attention,
+            args.linear_attention_type,
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
@@ -122,6 +123,7 @@ def _get_transformer_layer_spec(use_te, config):
             args.moe_grouped_gemm,
             args.qk_layernorm,
             args.multi_latent_attention,
+            args.linear_attention_type,
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             normalization=args.normalization,
             use_kitchen=config.use_kitchen,
