@@ -734,7 +734,7 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and self.config.fp8 or self.config.fp4:
+        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
