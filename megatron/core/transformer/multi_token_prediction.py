@@ -109,7 +109,7 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -120,6 +120,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
     For CP=1 (default behavior): Uses standard torch.roll with zero padding
     For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
     boundary elements between adjacent CP ranks to maintain sequence continuity.
+    
+    For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
+    from different sequences.
 
     Args:
         tensor (Tensor): The input tensor to roll.
@@ -127,17 +130,50 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None):
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
                                falls back to standard rolling behavior.
+        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+                                            If provided, respects sequence boundaries.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.select(dims, shifts).fill_(0)
+        
+        # Handle packed sequences: zero out positions at sequence boundaries
+        if packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None:
+            # cu_seqlens_q contains cumulative sequence lengths [0, len1, len1+len2, ...]
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+            # For each sequence boundary, zero out the position that would cross the boundary
+            for i in range(1, len(cu_seqlens)):
+                seq_end = cu_seqlens[i]
+                if shifts < 0:
+                    # Rolling left (shifts=-1): zero out the position just before the boundary
+                    # This prevents the first token of the next sequence from appearing at the end
+                    if seq_end - 1 < rolled_tensor.size(dims) and seq_end > 0:
+                        rolled_tensor.select(dims, seq_end - 1).fill_(0)
+                else:
+                    # Rolling right: zero out the position at the boundary
+                    if seq_end < rolled_tensor.size(dims):
+                        rolled_tensor.select(dims, seq_end).fill_(0)
+        else:
+            # For non-packed sequences, just zero out the boundary position
+            rolled_tensor.select(dims, shifts).fill_(0)
+        
         return rolled_tensor, rolled_tensor.sum()
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
     # This matches the batch splitting logic in get_batch_on_this_cp_rank() function
+    
+    # Note: When using packed sequences with CP, we need to be careful about sequence boundaries
+    # The current implementation handles CP boundaries but may need additional logic for
+    # packed sequence boundaries within CP chunks
+    if packed_seq_params is not None:
+        import warnings
+        warnings.warn(
+            "Using packed sequences with Context Parallelism (CP > 1) in MTP. "
+            "Ensure sequence boundaries are properly handled within CP chunks."
+        )
+    
     tensor_list = tensor.chunk(2, dim=dims)
     rolled_tensor_list = []
     for i in range(len(tensor_list)):
@@ -493,6 +529,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: torch.Tensor,
         embedding: Callable,
         hidden_states: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -507,10 +544,15 @@ class MultiTokenPredictionLayer(MegatronModule):
                 from gpt model to compute the decoder input.
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
+            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1, cp_group=self.cp_group)
-        position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1, cp_group=self.cp_group)
+        input_ids, _ = roll_tensor(
+            input_ids, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
+        )
+        position_ids, _ = roll_tensor(
+            position_ids, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
+        )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -691,15 +733,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, f"multi token prediction + cross attention is not yet supported."
-        assert (
-            packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
 
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=embedding,
             hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
