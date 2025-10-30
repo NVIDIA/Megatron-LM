@@ -279,10 +279,18 @@ def get_synthetic_requests(
     # Init requests.
     assert len(prompt_texts) == len(time_offsets)
     requests = [
-        Request(t, o, tokenizer)
+        Request(t, o, tokenizer, sampling_params=sampling_params)
         for t, o in zip(prompt_texts, time_offsets)
     ]
 
+    # >>>
+    # pax("max_prompt_length", {
+    #     "old num_tokens_to_generate" : sampling_params.num_tokens_to_generate,
+    #     "new num_tokens_to_generate" : requests[0].sampling_params.num_tokens_to_generate,
+    #     "new num_tokens_to_generate'" : requests[-1].sampling_params.num_tokens_to_generate,
+    #     "set(num_tokens_to_generate)" : "%d | %s" % (len(requests), set(r.sampling_params.num_tokens_to_generate for r in requests)),
+    # })
+    # <<<
     return requests
 
 
@@ -396,7 +404,7 @@ def build_dynamic_engine_setup_prefix(
     # Buffer limits config
     buffer_limits_str = (
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_active_buffer_size_gb*1024**3)}, "
-        f"{context.chunk_allocator.active_count} chunks "
+        f"{context.block_allocator.active_count} chunks "
         f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )
 

@@ -471,8 +471,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Print info.
         logging.info(
-            "DynamicInferenceContext: allocated context with active buffer size %s (%d chunks)."
-            % (get_mem_size_str(active_buffer_size_bytes), self.chunk_allocator.active_count)
+            "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
+            % (get_mem_size_str(active_buffer_size_bytes), self.block_allocator.active_count)
         )
 
     TOKEN_ROUNDER = 64
@@ -1101,6 +1101,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None
         """
+        # >>>
+        raise Exception("hi.")
+        # <<<
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
 
@@ -1430,7 +1433,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
             resume_request_count = min(
                 torch.nonzero(paused_chunk_counts_cumsum <= active_chunk_count_avail).numel(),
-                self.chunk_allocator.total_avail,
+                self.block_allocator.total_avail,
             )
 
         self.paused_request_count -= resume_request_count

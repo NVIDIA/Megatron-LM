@@ -404,13 +404,28 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ):
+            # >>>
+            from lutil import pax
+            pax("request", {
+                "prompt" : len(request.prompt_tokens),
+                "gen" : request.sampling_params.num_tokens_to_generate,
+                "max_sequence_length" : self.context.max_sequence_length,
+            })
+            # <<<
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            # >>>
+            raise Exception("hi.")
+            # <<<
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
+        # >>>
+        # from lutil import pax
+        # pax("request")
+        # <<<
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
 
@@ -646,6 +661,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
+            # >>>
+            # raise Exception("hi.")
+            # <<<
             can_schedule = False
             req = self.requests[self.waiting_request_ids[0]]
 
@@ -662,6 +680,9 @@ class DynamicInferenceEngine(AbstractEngine):
             request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
+            # >>>
+            raise Exception("hi.")
+            # <<<
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
@@ -772,7 +793,7 @@ class DynamicInferenceEngine(AbstractEngine):
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
                 "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
-                "chunks: a %d/%d, p %d/%d ... "
+                "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.step_count,
@@ -791,15 +812,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     prev_total_request_count - prev_paused_request_count,
-                    context.chunk_allocator.active_count,
+                    context.block_allocator.active_count,
                     prev_paused_request_count,
-                    context.chunk_allocator.paused_count,
+                    context.block_allocator.paused_count,
                     len(self.waiting_request_ids),
                     self.finished_request_count,
-                    context.chunk_allocator.get_active_used(),
-                    context.chunk_allocator.active_count,
-                    context.chunk_allocator.get_paused_used(),
-                    context.chunk_allocator.paused_count,
+                    context.block_allocator.get_active_used(),
+                    context.block_allocator.active_count,
+                    context.block_allocator.get_paused_used(),
+                    context.block_allocator.paused_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
