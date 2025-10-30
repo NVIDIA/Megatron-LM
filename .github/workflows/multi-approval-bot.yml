@@ -8,11 +8,6 @@ jobs:
   codeowners-approval:
     runs-on: ubuntu-latest
     steps:
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
-
       - name: Checkout action
         uses: actions/checkout@v3
         with:
@@ -23,6 +18,6 @@ jobs:
       - name: Check Codeowners Approval
         uses: ./codeowner-multi-approval-action
         with:
-          pr-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          pr-number: ${{ github.event.pull_request.number }}
           repo-name: ${{ github.repository }}
           github-token: ${{ secrets.PAT }}
