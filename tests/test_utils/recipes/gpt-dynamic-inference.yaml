@@ -57,7 +57,7 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github-broken] # this test takes too long for github CI
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp8_pp1_583m_logitsmatch]
     products:
