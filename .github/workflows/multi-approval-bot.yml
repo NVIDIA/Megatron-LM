@@ -25,6 +25,6 @@ jobs:
       - name: Check Codeowners Approval
         uses: ./codeowner-multi-approval-action
         with:
-          pr-number: ${{ steps.get-pr-info.outputs.pr_number }}
+          pr-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           repo-name: ${{ github.repository }}
           github-token: ${{ secrets.PAT }}
