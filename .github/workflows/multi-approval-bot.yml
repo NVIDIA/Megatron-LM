@@ -3,10 +3,12 @@ name: "Codeowners Approval Workflow"
 on:
   pull_request_review:
     types: [submitted]
+  pull_request:
 
 jobs:
   codeowners-approval:
     runs-on: ubuntu-latest
+    environment: nemo-ci
     steps:
       - name: Checkout action
         uses: actions/checkout@v3
@@ -16,8 +18,8 @@ jobs:
           path: codeowner-multi-approval-action
 
       - name: Check Codeowners Approval
-        uses: ./codeowner-multi-approval-action/.github/actions/codeowner-multi-approval-action
+        uses: github/actions/codeowner-multi-approval-action
         with:
           pr-number: ${{ github.event.pull_request.number }}
           repo-name: ${{ github.repository }}
-          github-token: ${{ secrets.MY_GITHUB_TOKEN }}
+          github-token: ${{ secrets.PAT }}
