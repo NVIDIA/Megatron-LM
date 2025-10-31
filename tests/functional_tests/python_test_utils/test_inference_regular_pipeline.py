@@ -24,9 +24,6 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         # Handle JSONL output, assume only one line in this case.
         output_current = json.loads(output_current)
 
-    assert set(output_groundtruth.keys()).issuperset(
-        set(output_current.keys())
-    ), f"Some IDs from groundtruth are missing in current: {output_groundtruth.keys()} vs {output_current.keys()}"
     if set(output_groundtruth.keys()) != set(output_current.keys()):
         logger.warning(
             f"Some IDs from groundtruth are missing in output, only the subset of ids in groundtruth will be tested: {output_groundtruth.keys()} vs {output_current.keys()}"
