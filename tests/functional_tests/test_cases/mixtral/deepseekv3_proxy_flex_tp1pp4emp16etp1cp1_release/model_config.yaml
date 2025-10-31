@@ -81,11 +81,11 @@ MODEL_ARGS:
   --qk-layernorm: true
 
   # Add learning rate args
-  --lr-decay-samples: 584765624
+  --lr-decay-samples: 24413696
   --lr-warmup-samples: 1536000
-  --lr-warmup-init: 5.8e-7
-  --lr: 5.8e-5
-  --min-lr: 5.8e-6
+  --lr-warmup-init: 1e-7
+  --lr: 1e-5
+  --min-lr: 1e-6
   --lr-decay-style: cosine
   --adam-beta1: 0.9
   --adam-beta2: 0.95
