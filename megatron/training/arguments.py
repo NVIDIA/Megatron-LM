@@ -1227,6 +1227,9 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.cpu_offloading_num_layers > 0:
+        args.cpu_offloading = True
+
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
@@ -1454,6 +1457,9 @@ def _add_inference_args(parser):
                        'whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, '
                        'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -2122,6 +2128,8 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
+    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
+                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2699,6 +2707,10 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
+                       'values over the wire (using an all-to-all to keep total communication overhead in line '
+                       'with the standard ring implementation) but performs accumulation locally in FP32.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',

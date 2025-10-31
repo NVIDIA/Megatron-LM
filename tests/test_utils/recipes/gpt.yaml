@@ -117,7 +117,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
@@ -438,7 +438,7 @@ products:
   - test_case: [gpt3_mcore_reruns_persistent_1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly]
