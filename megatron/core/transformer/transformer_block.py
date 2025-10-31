@@ -522,7 +522,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and self.config.cuda_graph_scope == 'full_iteration'
+            and 'full_iteration' in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()

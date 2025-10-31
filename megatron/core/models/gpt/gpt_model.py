@@ -371,7 +371,7 @@ class GPTModel(LanguageModule):
             and (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and self.config.cuda_graph_scope != "full_iteration"
+                    and "full_iteration" not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
