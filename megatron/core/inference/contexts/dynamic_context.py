@@ -28,12 +28,12 @@ from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
 
 # >>>
-# try:
-#     from .fused_kv_append_kernel import triton_append_key_value_cache
-# except ImportError:
-#     triton_append_key_value_cache = None
+try:
+    from .fused_kv_append_kernel import triton_append_key_value_cache
+except ImportError:
+    triton_append_key_value_cache = None
 # +++
-triton_append_key_value_cache = None
+# triton_append_key_value_cache = None
 # <<<
 
 try:
@@ -633,12 +633,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
             # currently does not support MLA latent cache
             # >>>
-            pax("layer_number, key, value", {
-                "memory_buffer" : self.memory_buffer,
-                "padded_active_token_count" : self.padded_active_token_count,
-                "token_to_block_idx" : self.token_to_block_idx,
-                "token_to_local_position_within_kv_block" : self.token_to_local_position_within_kv_block,
-            })
+            # pax("layer_number, key, value", {
+            #     "memory_buffer" : self.memory_buffer,
+            #     "padded_active_token_count" : self.padded_active_token_count,
+            #     "token_to_block_idx" : self.token_to_block_idx,
+            #     "token_to_local_position_within_kv_block" : self.token_to_local_position_within_kv_block,
+            # })
             # <<<
             return triton_append_key_value_cache(
                 layer_number=layer_number,
@@ -1064,11 +1064,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         num_tokens = num_warmup_tokens or self.padded_active_token_count
         # >>>
-        pax("num_warmup_tokens", {
-            "padded_active_token_count" : self.padded_active_token_count,
-            "inp" : self.token_to_input_ids[:num_tokens].unsqueeze(0),
-            "pos" : self.token_to_pos_ids[:num_tokens].unsqueeze(0),
-        })
+        # pax("num_warmup_tokens", {
+        #     "padded_active_token_count" : self.padded_active_token_count,
+        #     "inp" : self.token_to_input_ids[:num_tokens].unsqueeze(0),
+        #     "pos" : self.token_to_pos_ids[:num_tokens].unsqueeze(0),
+        # })
         # <<<
         return (
             self.token_to_input_ids[:num_tokens].unsqueeze(0),

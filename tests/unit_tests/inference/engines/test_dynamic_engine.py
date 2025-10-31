@@ -404,7 +404,7 @@ class TestDynamicInferenceEngine:
         )
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_tokens == 160
+        assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
 
         # Validate generated tokens.
         expected_generated_tokens_list = [
@@ -856,7 +856,7 @@ if __name__ == "__main__":
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     # test.test_simple(None, "full")
     test.test_simple(1, "full")
-    exit()
+    print("~~~\nsuccess."); exit()
     test.test_simple(4, "full")
     test.test_simple(None, "full_iteration")
     test.test_simple(1, "full_iteration")
