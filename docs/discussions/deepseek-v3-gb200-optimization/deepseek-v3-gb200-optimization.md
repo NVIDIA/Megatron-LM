@@ -4,7 +4,7 @@
 
 ---
 
-This guide describes how we used Megatron Core (MCore) and Transformer Engine (TE) to pre-train the DeepSeek-V3 model with MXFP8 precision on 256 GB200 GPUs. We will detail the step-by-step process of optimizing performance to 944 TFLOPS/GPU, which is a 2.48x speedup compared to the estimated 380 TFLOPS on H100/H800 (refer to the estimation in this article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] in Chinese). The related features have been or will be open-sourced to the [Megatron Core](https://github.com/NVIDIA/Megatron-LM) and [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) repositories.
+This guide describes how we used Megatron Core (MCore) and Transformer Engine (TE) to pre-train the DeepSeek-V3 model with MXFP8 precision on 256 GB200 GPUs. We will detail the step-by-step process of optimizing performance to **970 TFLOPS/GPU**, which is a **2.55x** speedup compared to the estimated 380 TFLOPS on H100/H800 (refer to the estimation in this article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] in Chinese). The related features have been or will be open-sourced to the [Megatron Core](https://github.com/NVIDIA/Megatron-LM) and [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) repositories.
 
 ## **0. Methodology**
 
@@ -25,7 +25,7 @@ Here, we will briefly introduce the difference in implementation between MXFP8 G
 When we started optimizing DeepSeek-V3 on the GB200 NVL72 platform with MCore, our baseline already included the following features:
 
 1. **MXFP8 recipe**, where the fprop/wgrad/dgrad inputs of all linear layers in the model are quantized at a 1x32 granularity, while Scaled Dot Product Attention (SDPA)/Embedding/LM Head/Router/Loss/Optimizer, etc., remain at their original high precision. For details on the FP8 recipe, please refer to our presentation at the NVIDIA AI Open Day in June 2025 (Video \[[2](https://www.bilibili.com/video/BV1mpMwz9Ey5/)\] in Chinese) and GTC 2025 (Video \[[3](https://www.nvidia.com/en-us/on-demand/session/gtc25-s72778/)\] in English). The option to enable this in MCore is `--fp8-recipe mxfp8 --fp8-format e4m3`.  
-2. **Multi-headed Latent Attention (MLA) kernels** on the Blackwell platform, provided by cuDNN 9.11.  
+2. **Multi-head Latent Attention (MLA) kernels** on the Blackwell platform, provided by cuDNN 9.11.  
 3. **MXFP8 Grouped GEMM**, implemented using multi-stream \+ cuBLAS. The advantage of this implementation is that we can support various quantization schemes at the fastest speed: as long as the single GEMM is ready, we can have a Grouped GEMM implementation with good performance. Our multi-stream \+ cuBLAS solution can achieve 2,672 TFLOP/s (flush L2) on the shape K=7,168, N=2,048, which is basically equivalent to a highly optimized Grouped GEMM \[[4](https://cursor.com/cn/blog/kernels)\]. We will continue to optimize the performance of Grouped GEMM. The option to enable this in MCore is `--moe-grouped-gemm`.  
 4. **Kernel fusions**, such as:  
    1. Yarn RoPE fusion, enabled by default.  
@@ -43,7 +43,7 @@ On the above software stack, using the parallel configuration of TP1/PP8/VPP4/EP
 
 ## **2. Performance Optimization**
 
-By capturing and analyzing the Nsys timeline corresponding to the baseline, taking a forward step as an example, we can see that the biggest performance issue is that there are large gaps between kernels, and the CPU kernel launch speed cannot keep up with the kernel execution speed on GPU. We call this phenomenon *CPU overhead* or *host boundedness*. This overhead mainly comes from Python code (such as loops, `getattr`, etc.), PyTorch's Python and C++ logic code (for example, a simple `torch.empty` will not call any CUDA kernel, but it will generate a few microseconds of overhead on the host side), CUDA kernel launch, etc. The reason for this phenomenon is that, on the one hand, the speed of GPU executing kennels is getting faster and faster, resulting in not enough time to overlap the CPU execution time. On the other hand, FP8 training and fine-grained MoE models introduce more quantization, router, and other kernels. The main idea to solve CPU overhead is to reduce the number of kernels through kernel fusion and use CUDA Graphs for graph launch to bypass repeated work on the CPU side.
+By capturing and analyzing the Nsys timeline corresponding to the baseline, taking a forward iteration as an example, we can see that the biggest performance issue is that there are large gaps between kernels, and the CPU kernel launch speed cannot keep up with the kernel execution speed on GPU. We call this phenomenon *CPU overhead* or *host boundedness*. This overhead mainly comes from Python code (such as loops, `getattr`, etc.), PyTorch's Python and C++ logic code (for example, a simple `torch.empty` will not call any CUDA kernel, but it will generate a few microseconds of overhead on the host side), CUDA kernel launch, etc. The reason for this phenomenon is that, on the one hand, the speed of GPU executing kernels is getting faster and faster, resulting in not enough time to overlap the CPU execution time. On the other hand, FP8 training and fine-grained MoE models introduce more quantization, router, and other kernels. The main idea to solve CPU overhead is to reduce the number of kernels through kernel fusion and use CUDA Graphs for graph launch to bypass repeated work on the CPU side.
 
 ![images/image1.png](images/image1.png)
 
@@ -51,6 +51,8 @@ In addition to CPU overhead, we can also see several other obvious problems:
 
 * The length of the Permute kernel is clearly abnormal, suggesting that this kernel needs to be optimized.  
 * Before the GEMM in the Expert part, there are a large number of small, fragmented kernels. This is obviously abnormal, and we need to locate what these kernels are doing and whether they can be eliminated or fused.
+* The NCCL-based token dispatcher, which requires explicit global token permutation, is not optimal.
+* The overhead of recomputing MLA up projection is not as small as expected due to the CPU overhead.
 
 Therefore, our optimization plan is roughly as follows:
 
@@ -84,7 +86,16 @@ The Router part contains a large number of element-wise operators, mainly for ca
 
 The reason why it cannot be completely fused is that the remaining kernels are separated by communication kernels of global auxiliary losses calculation, which are not easy to fuse. There are also many kernels scattered in different Python logic codes. If they are forcibly fused, it will mess up the code structure of Python. Moreover, we will apply CUDA Graphs for the router part later, which can already solve the CPU overhead problem well, so there is little performance gain from fusing the remaining kernels.
 
-Under the same parallel configuration, we measured that optimizations 2.1.1 and 2.1.2 improved the end-to-end (E2E) performance by 35 TFLOPS, optimization 2.1.3 improved it by 35.5 TFLOPS, and optimization 2.1.4 improved it by 10.5 TFLOPS. The Nsys timeline with optimizations 2.1.1, 2.1.2, and 2.1.4 enabled is as follows (the reason for not including 2.1.3 is that 2.1.3 was done later, and at that time the timeline had already been superimposed with other optimizations, so it could not be directly compared):
+#### **2.1.5 Quantization Fused to Normalization**
+
+cuDNN supports fusing MXFP8 quantization into normalization, including layer norm and RMS norm. To enable this feature, we suggest using cuDNN 9.14 or later and set the following environment variables.
+
+```shell
+NVTE_NORM_FWD_USE_CUDNN=1
+NVTE_NORM_BWD_USE_CUDNN=1
+```
+
+Under the same parallel configuration, we measured that optimizations 2.1.1 and 2.1.2 improved the end-to-end (E2E) performance by 35 TFLOPS, optimization 2.1.3 improved it by 35.5 TFLOPS, optimization 2.1.4 improved it by 10.5 TFLOPS, and optimization 2.1.5 improved it by 13.8 TFLOPS. The Nsys timeline with optimizations 2.1.1, 2.1.2, and 2.1.4 enabled is as follows (the reason for not including 2.1.3 nor 2.1.5 is that they were done later, and at that time the timeline had already been superimposed with other optimizations, so it could not be directly compared):
 
 ![images/image2.png](images/image2.png)
 
@@ -94,13 +105,13 @@ Although it still doesn't look very satisfactory, it has improved.
 
 #### **2.2.1 DeepEP**
 
-Theoretically, with EP64 parallelism enabled on the GB200 NVL72 system, all EP communication is within the NVLink domain. Thanks to the bidirectional 1.8 TB/s bandwidth of MNNVL on the GB200, EP communication will be greatly accelerated. However, DeepEP still does not officially support scenarios where the NVLink domain is larger than 8. We have supported the EP32 scenario based on [this community PR](https://github.com/deepseek-ai/DeepEP/pull/218). But this support is not well-optimized. In the EP32 scenario, the dispatch can only reach about 400 GB/s and the combine can only reach about 190 GB/s algorithm bandwidth with 24 SMs, which is a large gap from the unidirectional bandwidth of 900 GB/s for MNNVL on the GB200 NVL72. Therefore, after switching to DeepEP, we did not get the communication benefits, but got some memory-saving benefits (DeepEP does not need explicit global permute, so it reduces the peak memory consumption), and reduced CPU overhead (DeepEP uses a fused kernel for the EP communication preprocess, further reducing the number of kernels in the router and preprocess parts to 17), so we put DeepEP in the memory optimization part.
+Theoretically, on the GB200 NVL72 system, all EP communication is within the NVLink domain. Thanks to the bidirectional 1.8 TB/s bandwidth of MNNVL on the GB200, EP communication will be greatly accelerated. However, DeepEP still does not officially support scenarios where the NVLink domain is larger than 8. We have supported the EP32 scenario based on [this community PR](https://github.com/deepseek-ai/DeepEP/pull/218). But this support is not well-optimized. In the EP32 scenario, the dispatch can only reach about 400 GB/s and the combine can only reach about 190 GB/s algorithm bandwidth with 24 SMs, which is a large gap from the unidirectional bandwidth of 900 GB/s for MNNVL on the GB200 NVL72. Therefore, after switching to DeepEP, we did not get the communication benefits, but got some memory-saving benefits (DeepEP does not need explicit global permute, so it reduces the peak memory consumption), and reduced CPU overhead (DeepEP uses a fused kernel for the EP communication preprocess, further reducing the number of kernels in the router and preprocess parts to 17), so we put DeepEP in the memory optimization part.
 
 The options to enable DeepEP in MCore are:
 
 ```shell
 --moe-token-dispatcher-type flex
---moe-enable-deepep true
+--moe-flex-dispatcher-backend deepep
 ```
 
 #### **2.2.2 Fine-grained Recompute for FP8**
@@ -113,7 +124,7 @@ This technique is also applicable to SDPA and the subsequent Linear module (call
 
 ![images/image3.png](images/image3.png)
 
-E2E testing shows that enabling DeepEP reduces the CPU overhead of the router and preprocess, improving performance by 54.3 TFLOPS. By using fine-grained recompute, the redundant activation saved between SDPA and Projection is eliminated, allowing us to turn off the recomputation of MLA up projection, which improves performance by 44.7 TFLOPS. The reason is that although the MLA up projection has a low computational density and the cost of recomputation is theoretically small, it also has serious CPU overhead, so turning off recomputation can achieve a certain performance improvement. Correspondingly, the recomputation parameters were changed to `--recompute-modules mlp moe_act`.
+E2E testing shows that enabling DeepEP reduces the CPU overhead of the router and preprocess, improving performance by 54.3 TFLOPS. By using fine-grained recompute, the redundant activation saved between SDPA and Projection is eliminated, allowing us to turn off the recomputation of MLA up projection, which improves performance by 44.7 TFLOPS. The reason is that although the MLA up projection has a low computational density and the cost of recomputation is theoretically small, it also has serious CPU overhead, so turning off recomputation can achieve a certain performance improvement. Correspondingly, the recomputation parameters were changed to `--recompute-modules mlp moe_act`. The following figure shows the Nsys timeline with DeepEP enabled and using new recompute parameters:
 
 ![images/image4.png](images/image4.png)
 
@@ -126,13 +137,19 @@ We have developed the Partial CUDA Graphs feature in MCore and TE, which allows 
 * `attn`: capture the attention part.  
 * `mlp`: capture the MLP part of the dense layer, for example, the first three layers of DeepSeek-V3 are dense layers.  
 * `moe`: capture the moe part, only supports token-drop MoE.  
-* `moe_router`: capture the moe router part. When `moe_shared_expert_compute_before_router` is enabled, it will also capture shared experts.  
+* `moe_router`: capture the moe router part. Also capture shared experts unless the shared experts overlap is enabled.
 * `moe_preprocess`: capture the EP preprocess part, must be used with `moe_router`.  
 * `mamba`: captures the mamba layer.
 
-In DeepSeek-v3, we finally used `--cuda-graph-scope attn moe_router moe_preprocess` in conjunction with `--moe-shared_expert_compute_before_router` to capture attention, router, EP preprocess, and shared experts.
+In DeepSeek-v3, we finally used `--cuda-graph-impl transformer_engine --cuda-graph-scope attn moe_router moe_preprocess` to capture attention, router, EP preprocess, and shared experts of each layer. The partial CUDA Graphs feature is temporarily only available in `--cuda-graph-impl transformer_engine` implementation. Another implementation is called `local`, which introduces full-layer and full-iteration CUDA Graphs support, but not feasible for MoE models due to the dynamic shape issue.
 
-One limitation of CUDA Graphs is that it occupies additional memory. This additional memory comes from two aspects. First, the structure of CUDA Graphs itself occupies some memory, but this amount is small. Second, CUDA Graphs needs to use an independent and static memory pool, and the memory in this pool can no longer be reused by PyTorch's caching allocator. We have made a series of optimizations to optimize the memory consumption of CUDA Graphs, such as reusing memory buffers between different PP stages. For details, please refer to TE PR 1234. In addition, we have also made a series of adaptations and optimizations for CUDA Graphs for MoE models, different FP8 recipes, and flexible PP layouts, and refactored the different CUDA Graphs implementations in MCore, including partial, full layer, and full iteration, to make it more intuitive and reduce confusion.
+One limitation of CUDA Graphs is that it occupies additional memory. The number of CUDA Graphs we need to capture is `L*M*2`, where `L` is the number of layers per GPU and `M` is the number of micro-batches in one iteration. `*2` because we need to capture both forward and backward graphs. This additional memory of these graphs comes from three aspects.
+
+1. The structure of CUDA Graphs itself occupies some memory. This memory usage increases with the number of nodes in the graph, but the amount is typically negligible.
+2. CUDA Graphs need to use an independent memory pool. PyTorch’s caching allocator cannot reuse the memory in this pool for operators outside of CUDA Graphs.
+3. CUDA Graphs need static memory buffers for input and output data of the graphs.
+
+We have made a series of optimizations to optimize the memory consumption of CUDA Graphs, especially targeting 2 and 3. For 2, though graphed and non-graphed parts must use separate pools, we managed to make all graphs share one pool by capturing them in the same order they will be replayed. For 3, we reuse the static memory buffers between graphs as much as possible following its PP pattern. For details, please refer to the `_order` and `_reuse_graph_input_output_buffers` arguments in TE [make_graphed_callables()](https://github.com/NVIDIA/TransformerEngine/blob/release_v2.8/transformer_engine/pytorch/graph.py#L847-L863) API. In addition, we have also made a series of adaptations and optimizations for CUDA Graphs for MoE models, different FP8 recipes, MTP support, flexible PP layouts, and precision alignment to ensure it works correctly and efficiently.
 
 The following figure shows our timeline after enabling CUDA Graphs (this figure also includes 2.1.3 fuse swizzle scaling factor). It can be seen that the CPU overhead problem has been greatly alleviated, and currently only the routed experts part still has some CPU overhead. Enabling CUDA Graphs has improved the E2E performance by a total of 84.8 TFLOPS.
 
@@ -163,35 +180,48 @@ HybridEP is fully adapted to the NVL72 architecture and can achieve high transmi
 
 It is worth mentioning that although we only report the performance of EP36 here, HybridEP actually supports the full NVL72. Therefore, if future models are designed with the number of experts being a multiple of 72, HybridEP can fully utilize the bandwidth of NVL72. This also reflects the philosophy of model and hardware architecture co-design.
 
-When integrating HybridEP into MCore, we need to solve a problem: in the implementation, we need to register some special buffers so that they can be accessed by other ranks in the same NVLink domain. And since the output of dispatch and the input of combine both exist in the buffer managed by HybridEP itself. This buffer is globally unique on the current rank and is reused between layers. We need an extra D2D (Device to Device) copy to copy the output of the dispatch kernel from the buffer to the downstream required PyTorch tensor, or to copy the input of the combine kernel from the upstream PyTorch tensor to the combine input buffer. And the duration of this D2D copy is about 10%-20% of the communication time, as shown in the figure: ![images/image7.png](images/image7.png)
+When integrating HybridEP into MCore, we need to solve a problem: in the implementation, we need to register some special buffers so that they can be accessed by other ranks in the same NVLink domain. And since the output of dispatch and the input of combine both exist in the buffer managed by HybridEP itself. This buffer is globally unique on the current rank and is reused between layers. We need an extra D2D (Device to Device) copy to copy the output of the dispatch kernel from the buffer to the downstream required PyTorch tensor, or to copy the input of the combine kernel from the upstream PyTorch tensor to the combine input buffer. And the duration of this D2D copy is about 10%-20% of the communication time.
 
-Considering that the permute operation immediately follows the D2D copy, and permute itself is also a "D2D copy", we chose to fuse this D2D copy with the subsequent permute, that is, while permuting, we also completed the data transfer between the HybridEP managed buffer and the ordinary PyTorch tensor. Furthermore, since cuBLAS FP8 GEMM requires the input M dimension to be aligned to 16 (per-tensor recipe or blockwise recipe) or 32 (MXFP8 recipe), and the output generated by permute is very likely not to meet this requirement, it needs to be padded in the M dimension. This padding task is also essentially a D2D copy, and we also fused it into the permute process.
+Considering that the MoE permute operation following dispatch, we’re doing
+
+1. EP communication over NVLink: dispatch -> HybridEP managed buffer
+2. D2D copy: HybridEP managed buffer -> output buffer in PyTorch tensors
+3. Permute: output buffer -> permuted tensors to be fed into experts
+
+Therefore, we choose to fuse this D2D copy with the subsequent permute, that is, while permuting, we also complete the data transfer between the HybridEP managed buffer and the ordinary PyTorch tensor. Furthermore, since cuBLAS FP8 GEMM requires the input M dimension to be aligned to 16 (per-tensor recipe or blockwise recipe) or 32 (MXFP8 recipe), and the output generated by permute is very likely not to meet this requirement, it needs to be padded in the M dimension. This padding task is also essentially a D2D copy, and we also fuse it into the permute process.
+
+The options to enable HybridEP in MCore are:
+
+```shell
+--moe-token-dispatcher-type flex
+--moe-flex-dispatcher-backend hybridep
+```
 
 The figure below shows the timeline after we used HybridEP to optimize EP communication and permute/pad, which improved the E2E performance by 113.6 TFLOPS.
 
-![images/image8.png](images/image8.png)
+![images/image7.png](images/image7.png)
 
 HybridEP has been open-sourced as an [independent branch](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) in the DeepEP repository, have a try now!
 
 ## **3. Summary and Outlook**
 
-We started from a baseline of 494 TFLOPS, and through multiple rounds of performance analysis and optimization, we finally reached 944 TFLOPS, achieving a 1.91x performance improvement. The following is our optimization history sorted by time:
+We started from a baseline of 494 TFLOPS, and through multiple rounds of performance analysis and optimization, we finally reached 970 TFLOPS, achieving a 1.96x performance improvement. The following is our optimization history sorted by time:
 
 | Model | System | Precision | Dispatcher | Feature Roadmap | TFLOPS/GPU |
 | ----- | ----- | ----- | ----- | ----- | ----- |
 | DeepSeek-V3 | GB200 | MXFP8 | AlltoAll | Baseline | 494.46 |
-| DeepSeek-V3 | GB200 | MXFP8 | AlltoAll | Fuse torch.zeros for scaling factor allocation | 529.55 |
-| DeepSeek-V3 | GB200 | MXFP8 | AlltoAll | Permute kernel Optimization |  |
+| DeepSeek-V3 | GB200 | MXFP8 | AlltoAll | Fuse torch.zeros for scaling factor allocation & Permute kernel Optimization | 529.55 |
 | DeepSeek-V3 | GB200 | MXFP8 | AlltoAll | Router fusion | 540.00 |
 | DeepSeek-V3 | GB200 | MXFP8 | DeepEP | Enable DeepEP (Will switch to HybridEP) | 566.07 |
 | DeepSeek-V3 | GB200 | MXFP8 | DeepEP | Remove up\_proj recompute | 610.71 |
 | DeepSeek-V3 | GB200 | MXFP8 | DeepEP | CUDA Graphs | 663.27 |
 | DeepSeek-V3 | GB200 | MXFP8 | DeepEP | Tune DeepEP (Will switch to HybridEP) | 691.49 |
 | DeepSeek-V3 | GB200 | MXFP8 | DeepEP | CPU-side optimization | 762.12 |
-| DeepSeek-V3 | GB200 | MXFP8 | DeepEP | PDL for quantization kernels | 797.67 |
-| DeepSeek-V3 | GB200 | MXFP8 | DeepEP | Fuse MXFP8 swizzle scaling factor |  |
+| DeepSeek-V3 | GB200 | MXFP8 | DeepEP | PDL for quantization kernels & Fuse MXFP8 swizzle scaling factor | 797.67 |
 | DeepSeek-V3 | GB200 | MXFP8 | DeepEP | CUDA Graphs capture shared expert | 829.93 |
 | DeepSeek-V3 | GB200 | MXFP8 | HybridEP | HybridEP | 943.56 |
+| DeepSeek-V3 | GB200 | MXFP8 | HybridEP | CPU-side optimization | 956.21 |
+| DeepSeek-V3 | GB200 | MXFP8 | HybridEP | Fuse quantization to normalization (cuDNN 9.14) | 970.01 |
 
 ### **3.1 Future Work**
 
@@ -206,7 +236,7 @@ We started from a baseline of 494 TFLOPS, and through multiple rounds of perform
 2. Why didn't we use 1F1B AlltoAll overlap on the GB200 (a kind of inter-batch overlap scheme similar to DualPipe, for details see MCore commits [8333bd5](https://github.com/NVIDIA/Megatron-LM/commit/8333bd5bb6de2bdbdb3ebebf224b4a339a04ec90), [ae1c882](https://github.com/NVIDIA/Megatron-LM/commit/ae1c88296f465ab4ac9c503d75a57ba4044c47d1), [d7bf5aa](https://github.com/NVIDIA/Megatron-LM/commit/d7bf5aaaa8e331f901366621db009b0c2880c8fd))?  
    * First, thanks to NVL72, EP communication is very fast, and the necessity of overlap is not great. Second, 1F1B AlltoAll overlap is not a free lunch either. It divides the forward and backward into multiple stages for scheduling, and there is some synchronization between different stages, which aggravates the CPU overhead, so the overall benefit is negative on the GB200. If we can further solve the CPU overhead problem, we can re-evaluate the benefits of 1F1B AlltoAll overlap.  
 3. How much performance improvement is there compared to the H100?  
-   * DeepSeek's technical report did not announce the TFLOPS during its pre-training phase, but some article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] (in Chinese, we recommend reading it by translation) has estimated it to be around 380 TFLOPS, so the 944 TFLOPS on the GB200 is a 2.48x performance improvement. This number is almost the 2.5x improvement of the GB200 over the H100 in terms of FP8 computing power. However, only a part of operations can benefit from the 2.5x computing power, so the total speedup should be less than that. To achieve more performance gain, we leverage the MNNVL on GB200 to further optimize EP communication, and the much larger device memory on the GB200 to explore better parallel configurations. 
+   * DeepSeek's technical report did not announce the TFLOPS during its pre-training phase, but some article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] (in Chinese, we recommend reading it by translation) has estimated it to be around 380 TFLOPS, so the 970 TFLOPS on the GB200 is a 2.55x performance improvement. This surpasses the 2.5x improvement of the GB200 over the H100 in FP8 computing power. This significant performance gain is attributed to leveraging MNNVL on the GB200 for optimized EP communication and utilizing the substantially larger device memory on the GB200 to explore enhanced parallel configurations. 
 
 ## **4. Resources**
 
