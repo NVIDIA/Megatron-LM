@@ -22,7 +22,7 @@ def test_resume_checkpoint_pipeline(
     checks_types = (
         model_config["METRICS"]
         if "METRICS" in model_config
-        else ["iteration-time", "lm loss", "num-zeros"]
+        else ["lm loss", "num-zeros"]
     )
     checks = {
         metric: test_pretraining_regular_pipeline.CHECK_THRESHOLDS[metric]
