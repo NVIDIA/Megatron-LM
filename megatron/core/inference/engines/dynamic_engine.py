@@ -211,13 +211,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     logging.info(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
 
                 # Forward pass -> logits.
-                # >>>
-                # pax({
-                #     "context" : self.context,
-                #     "block_allocator" : self.context.block_allocator,
-                # }, "cuda_graph_token_count, input_ids, position_ids")
-                # print("~~~~~~~~~~~~~~~~~~~~~~ cuda_graph_token_count : %d." % cuda_graph_token_count)
-                # <<<
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
                 if reset_context:

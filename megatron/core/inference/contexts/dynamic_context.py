@@ -27,14 +27,10 @@ from megatron.core.utils import divide as core_divide
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
 
-# >>>
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
 except ImportError:
     triton_append_key_value_cache = None
-# +++
-# triton_append_key_value_cache = None
-# <<<
 
 try:
     from packaging.version import Version as PkgVersion
@@ -303,9 +299,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
         self.max_active_requests = self.block_allocator.active_count
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
-        # >>>
-        # pax({"DEFAULT_MAX_TOKENS": self.DEFAULT_MAX_TOKENS}, "max_tokens", {"max_tokens'": self.max_tokens})
-        # <<<
 
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
@@ -632,14 +625,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
             # currently does not support MLA latent cache
-            # >>>
-            # pax("layer_number, key, value", {
-            #     "memory_buffer" : self.memory_buffer,
-            #     "padded_active_token_count" : self.padded_active_token_count,
-            #     "token_to_block_idx" : self.token_to_block_idx,
-            #     "token_to_local_position_within_kv_block" : self.token_to_local_position_within_kv_block,
-            # })
-            # <<<
             return triton_append_key_value_cache(
                 layer_number=layer_number,
                 key=key,
@@ -1063,13 +1048,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) Flattened active input and position IDs.
         """
         num_tokens = num_warmup_tokens or self.padded_active_token_count
-        # >>>
-        # pax("num_warmup_tokens", {
-        #     "padded_active_token_count" : self.padded_active_token_count,
-        #     "inp" : self.token_to_input_ids[:num_tokens].unsqueeze(0),
-        #     "pos" : self.token_to_pos_ids[:num_tokens].unsqueeze(0),
-        # })
-        # <<<
         return (
             self.token_to_input_ids[:num_tokens].unsqueeze(0),
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
