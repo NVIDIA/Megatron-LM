@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT }}
 
       - name: Get PR info
         id: get-pr-info
@@ -37,7 +37,7 @@ jobs:
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
           HAS_MIRROR_MAIN_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "mirror-to-main")' || echo "false")
-          TARGET_BRANCH="cp/$PR_NUMBER-into-main"
+          TARGET_BRANCH="cherry-pick-$PR_NUMBER-into-main"
 
           # Skip if not labeled with mirror-to-main
           if [ "$HAS_MIRROR_MAIN_LABEL" != "true" ]; then
