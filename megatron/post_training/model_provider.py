@@ -2,6 +2,7 @@
 
 """ModelOpt GPT model provider."""
 
+import json
 import os
 from argparse import Namespace
 from typing import Any, Dict
@@ -25,6 +26,14 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
 
+def count_parameters_in_layer(model, layer_name):
+    num_params = 0
+    for name, param in model.named_parameters():
+        if layer_name in name:
+            num_params += param.numel()
+            print_rank_0(f" - {name}: {param.numel()}")
+    return num_params
+
 def _add_load_convert_hooks(model: MCoreGPTModel):
     """Register some load_state_dict prehooks to handle some known state_dict key mismatch.
     """
@@ -36,7 +45,7 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
 def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
-    The file named ``model_config.yaml`` within the checkpoint directory should specify
+    The config provided via --teacher-model-config should specify
     (in NEMO format) any model architecture settings which differ from the main student model's.
     This function will translate NEMO field names to MCore as needed.
     """
@@ -47,7 +56,8 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
         "num_attention_heads",
     )
 
-    config_path = os.path.join(checkpoint_path, "model_config.yaml")
+    args = get_args()
+    config_path = os.path.join(checkpoint_path, "model_config.yaml") if args.teacher_model_config is None else args.teacher_model_config
     if not os.path.exists(config_path):
         raise FileNotFoundError(
             "Teacher checkpoint dir must contain a NEMO-format yaml config named 'model_config.yaml'"
@@ -99,10 +109,13 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
     # Convert to `TransformerConfig` here to avoid ModelOpt pickling issues (contains local functions)
     config = core_transformer_config_from_args(config)
 
-    teacher = MCoreGPTModel(config=config, **model_kwargs)
+    if config.is_hybrid_model:
+        teacher = MCoreMambaModel(config=config, **model_kwargs)
+    else:
+        teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
 
-    print_rank_0("Loading teacher checkpoint...")
+    print_rank_0("Loading teacher {} checkpoint...".format("MCoreMambaModel" if config.is_hybrid_model else "MCoreGPTModel"))
     # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
     # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
     # True while loading the teacher checkpoint.
@@ -112,6 +125,7 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
         args.ckpt_format = args.export_kd_teacher_ckpt_format
     load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
     args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
+    print_rank_0("successfully loaded teacher...")
 
     return teacher
 
@@ -137,6 +151,21 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
 
+    # Handle GPT-OSS mode with YaRN RoPE configuration
+    if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
+        print_rank_0("GPT-OSS mode enabled: Configuring YaRN RoPE parameters")
+
+        # Set GPT-OSS YaRN values directly on the config
+        # These defaults are based on Huggingface GPT-OSS configurations
+        config.position_embedding_type = "yarn"
+        config.yarn_rotary_scaling_factor = 32.0
+        config.yarn_original_max_position_embeddings = 131072
+        config.yarn_beta_fast = 32.0
+        config.yarn_beta_slow = 1.0
+        config.yarn_mscale = 1.0
+        config.yarn_mscale_all_dim = 0.0
+        config.yarn_correction_range_round_to_int = False
+
     if args.use_legacy_models:
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
@@ -149,18 +178,35 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input 
 
     if args.export_model_type == "GPTModel":
+        if args.export_offline_model:
+            # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
+            config.original_num_layers = config.num_layers
+            # Set num_layers to 0 for base model in offline mode
+            config.num_layers = 0
+            # SP is not used for offline
+            # TODO: DSR1 MTP may require SP
+            config.sequence_parallel = False
         if config.heterogeneous_block_specs:
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
                 config=config,
                 use_te=args.transformer_impl == "transformer_engine",
             )
         else:
+            local_core_attention=args.export_force_local_attention
+            if config.context_parallel_size > 1:
+                print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
+                local_core_attention=False
+                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
+                use_arbitrary_attention_mask = False
+            else:
+                use_arbitrary_attention_mask = True
+
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
-                local_core_attention=args.export_force_local_attention,
+                local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=True,
+                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
             )
 
         model_kwargs = {
@@ -178,29 +224,35 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
             "rope_scaling": args.use_rope_scaling,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type == "MambaModel":
+    elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model
         )
-        model = MCoreMambaModel(
-            config=config,
-            mamba_stack_spec=mamba_stack_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            hybrid_attention_ratio=args.hybrid_attention_ratio,
-            hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-            hybrid_override_pattern=args.hybrid_override_pattern,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base,
-        )
+        model_kwargs = {
+            "mamba_stack_spec": mamba_stack_spec,
+            "vocab_size": args.padded_vocab_size,
+            "max_sequence_length": args.max_position_embeddings,
+            "pre_process": pre_process,
+            "hybrid_attention_ratio": args.hybrid_attention_ratio,
+            "hybrid_mlp_ratio": args.hybrid_mlp_ratio,
+            "hybrid_override_pattern": args.hybrid_override_pattern,
+            "post_process": post_process,
+            "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "parallel_output": True,
+            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_percent": args.rotary_percent,
+            "rotary_base": args.rotary_base,
+        }
+
+        model = MCoreMambaModel(config=config, **model_kwargs)
+
+        for l in range(model.decoder.num_layers_per_pipeline_rank):
+            layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
+            print_rank_0(f" == params layer {l}: {layer_params}")
+
     else:
         raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
 
@@ -238,6 +290,13 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         distill_cfg = distillation.load_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=core_transformer_config_from_args(teacher_config)
         )
+        if "hybrid_override_pattern" in teacher_config and args.is_hybrid_model:
+            model_kwargs["hybrid_override_pattern"] = teacher_config.hybrid_override_pattern
+        if "hybrid_attention_ratio" in teacher_config and args.is_hybrid_model:
+            model_kwargs["hybrid_attention_ratio"] = teacher_config.hybrid_attention_ratio
+        if "hybrid_mlp_ratio" in teacher_config and args.is_hybrid_model:
+            model_kwargs["hybrid_mlp_ratio"] = teacher_config.hybrid_mlp_ratio
+
         kd_config = {
             "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
             "criterion": distill_cfg["criterion"],

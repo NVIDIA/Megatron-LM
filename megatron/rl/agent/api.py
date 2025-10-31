@@ -1,11 +1,22 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterable
+from typing import TypeVar
 
+import numpy as np
 from pydantic import BaseModel
 
-from ..__init__ import Request
-from ..inference import InferenceInterface
+from ..__init__ import Request, TypeLookupable, trace_async_exceptions
+from ..inference import (
+    ChatInferenceInterface,
+    ChatInferenceRequest,
+    InferenceInterface,
+    InferenceRequest,
+    LLMChatMessage,
+    ReturnsRaw,
+)
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -75,43 +86,50 @@ class EvaluationRequest(Request):
     validation: bool = True
 
 
-class EvaluationResponse(AgentBaseModel):
+class EvaluationResult(AgentBaseModel):
+    prompt: str | list[LLMChatMessage]
+    response: str | LLMChatMessage
+
+
+class RewardEvaluationResult(EvaluationResult):
+    reward: float
+    problem_id: str | None = None
+
+
+T = TypeVar('T', bound=EvaluationResult)
+
+
+class EvaluationResponse[T](AgentBaseModel, TypeLookupable):
     env_id: str | None = None
-    results: list[AgentBaseModel]
+    results: list[T]
 
     def metrics(self):
         raise NotImplementedError(f"{type(self)} did not provide metric aggregation.")
-
-
-class NextStateRequest(Request):
-    """Request to enumerate all possible next states, useful for tree search."""
-
-    current_state: list[str] | str
-    inference_interface: list[InferenceInterface]
-
-
-class NextStateResponse(AgentBaseModel):
-    """Response containing next states for the provided states."""
-
-    possible_next_states: list[list[str]] | list[str]
 
 
 class Agent(ABC, AgentBaseModel):
     pass
 
 
-class NextStateGenerator(Agent, ABC):
-    """An agent that allows querying next state from a given state."""
-
-    @abstractmethod
-    async def get_next_state(self, request: NextStateRequest) -> NextStateResponse: ...
-
-
 class RolloutGenerator(Agent, ABC):
     """An agent that produces Rollout objects containing rollout string and associated reward."""
 
     @abstractmethod
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]: ...
+    async def rollout(self, request: RolloutRequest) -> Rollout: ...
+
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
+        assert isinstance(
+            request.inference_interface, ReturnsRaw
+        ), "InferenceInterface must support raw_text return to provide rollouts."
+
+        if isinstance(request.inference_interface, ChatInferenceInterface):
+            self.chat_mode = True
+        else:
+            self.chat_mode = False
+
+        return await asyncio.gather(
+            *[self.rollout(request=request) for _ in range(request.num_rollouts)]
+        )
 
 
 class ContrastiveRolloutGenerator(Agent, ABC):
@@ -131,14 +149,71 @@ class TokenizedRolloutGenerator(Agent, ABC):
     """
 
     @abstractmethod
-    async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]: ...
+    async def rollout(self, request: RolloutRequest) -> TokenRollout: ...
+
+    async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
+        assert isinstance(
+            request.inference_interface, ReturnsRaw
+        ), "InferenceInterface must support raw_text return to provide rollouts."
+
+        if isinstance(request.inference_interface, ChatInferenceInterface):
+            self.chat_mode = True
+        else:
+            self.chat_mode = False
+
+        return await asyncio.gather(
+            *[self.rollout(request=request) for _ in range(request.num_rollouts)]
+        )
 
 
 class GroupedRolloutGenerator(Agent, ABC):
     """An interface to return grouped Rollout objects to support algorithms like GRPO."""
 
+    parallel_generation_tasks: int = 512
+    buffer_size: int = 10
+
     @abstractmethod
-    async def get_grouped_rollouts(self, request: GroupedRolloutRequest) -> list[list[Rollout]]: ...
+    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
+
+    async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
+        assert isinstance(
+            request.inference_interface, ReturnsRaw
+        ), "InferenceInterface must support raw_text return to provide rollouts."
+
+        if isinstance(request.inference_interface, ChatInferenceInterface):
+            self.chat_mode = True
+        else:
+            self.chat_mode = False
+
+        # If num_groups is -1, we generate a stream of groups.
+        # The buffer size is used to create backpressure for each agent in order to balance group generation in a multi-task setting.
+        grouped_rollouts: asyncio.Queue[list[Rollout]] = asyncio.Queue(
+            maxsize=self.buffer_size if request.num_groups < 0 else 0
+        )
+        submitted_groups = 0
+
+        @trace_async_exceptions
+        async def group_task():
+            nonlocal submitted_groups
+            while request.num_groups == -1 or submitted_groups < request.num_groups:
+                submitted_groups += 1
+                group = await self.group_rollout(request=request)
+                if (
+                    not request.filter_groups_with_same_reward
+                    or np.std([r.reward for r in group]) > 1e-6
+                ):
+                    await grouped_rollouts.put(group)
+                else:
+                    submitted_groups -= 1
+
+        tasks = [asyncio.create_task(group_task()) for _ in range(self.parallel_generation_tasks)]
+
+        try:
+            while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
+                yield await grouped_rollouts.get()
+        finally:
+            for task in tasks:
+                task.cancel()
 
 
 class EvaluationAgent(Agent, ABC):

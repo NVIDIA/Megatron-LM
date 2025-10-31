@@ -31,7 +31,7 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_adlr_autoresume
+from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -128,14 +128,16 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-        # Sum over all DP groups, including CP since distributed optimizer state is
-        # sharded jointly over DP+CP.
-        torch.distributed.all_reduce(
-            sharded_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_data_parallel_group(with_context_parallel=True)
-        )
-        norm_2 += sharded_norm_2
+    else:
+        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    # Sum over all DP groups, including CP since distributed optimizer state is
+    # sharded jointly over DP+CP.
+    torch.distributed.all_reduce(
+        sharded_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=True)
+    )
+    norm_2 += sharded_norm_2
 
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
@@ -659,12 +661,17 @@ def get_nvtx_range():
         from torch.cuda import nvtx
 
         @contextmanager
-        def nvtx_range(msg):
+        def nvtx_range(msg, time=False):
+            if time:
+                timers = get_timers()
+                timers(msg, log_level=0).start()
             try:
                 nvtx.range_push(msg)
                 yield
             finally:
                 nvtx.range_pop()
+                if time:
+                    timers(msg, log_level=0).stop()
 
         return nvtx_range
     except:

@@ -34,7 +34,14 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import _mesh_resources
 
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
-from .utils import _MODEL_PARALLEL_RNG_TRACKER_NAME, FSDPDistributedIndex, get_global_memory_buffer
+from .utils import (
+    _MODEL_PARALLEL_RNG_TRACKER_NAME,
+    FSDPDistributedIndex,
+    get_global_memory_buffer,
+    get_mcore_tensor_parallel_partition_dim,
+    is_mcore_tensor_model_parallel,
+    is_mcore_tensor_parallel_duplicated,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +83,19 @@ try:
 except Exception:
     HAVE_TE = False
 
+NCCL_ALLOCATOR = None
+
 try:
     # Try to import the MCore NCCL nccl_allocator first.
     # If it fails, try to import the APEX NCCL nccl_allocator.
     import megatron.core.nccl_allocator as nccl_allocator
+
+    NCCL_ALLOCATOR = "MCORE"
 except ImportError:
     try:
         import apex.contrib.nccl_allocator as nccl_allocator
+
+        NCCL_ALLOCATOR = "APEX"
     except ImportError:
         nccl_allocator = None
 
@@ -94,8 +107,8 @@ def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     message ``s`` since otherwise, it is swallowed.
     """
     if not cond:
-        print(s)
-        traceback.print_stack()
+        logger.error(s)
+        logger.error(''.join(traceback.format_stack()))
         if raise_assertion_error:
             raise AssertionError(s)
 
@@ -205,7 +218,7 @@ class MultiGroupUBRAllocator:
         for group in self.groups[1:]:
             backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
             if torch.distributed.get_rank() == 0:
-                print(
+                logger.info(
                     f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
                     f"group.group_desc:{group.group_desc}"
                 )
@@ -1293,7 +1306,7 @@ def _get_parameter_groups(
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
 
-    is_expert_parameter = lambda p: not getattr(p, "allreduce", True)
+    is_expert_parameter = lambda n, p: ".experts." in n
 
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
@@ -1307,7 +1320,7 @@ def _get_parameter_groups(
                 if is_float8tensor(param) or meta_device_init_fp8_params.get(name, False)
                 else param.dtype
             ),
-            is_expert_param=is_expert_parameter(param),
+            is_expert_param=is_expert_parameter(name, param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
         )
@@ -1583,9 +1596,9 @@ class ParamAndGradBuffer:
             if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
                 # Expert-DP group when using EP
                 self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
-            if self.dist_index.get_inter_fsdp_group() is not None:
-                # Inner-FSDP group when using hybrid FSDP
-                self.ubr_groups.append(self.dist_index.get_inter_fsdp_group())
+            if self.dist_index.get_outer_fsdp_group() is not None:
+                # Outer/Inter-FSDP group when using hybrid FSDP
+                self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
 
             if torch.distributed.get_rank() == 0:
                 logging.info(
@@ -1612,7 +1625,9 @@ class ParamAndGradBuffer:
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
         # In the case of not using nccl_ub, it returns a nullcontext
-        self.mem_alloc_context = self.get_mem_alloc_context(groups=self.ubr_groups)
+        self.mem_alloc_context = self.get_mem_alloc_context(
+            groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
+        )
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
@@ -1640,7 +1655,7 @@ class ParamAndGradBuffer:
 
         self._log_parameter_groups()
 
-    def get_mem_alloc_context(self, groups=None):
+    def get_mem_alloc_context(self, groups=None, symmetric=True):
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
@@ -1653,22 +1668,43 @@ class ParamAndGradBuffer:
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-            if len(groups) == 1:
-                # register buffers to the default group directly using apex memory allocator
-                mem_alloc_context = functools.partial(
-                    nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
-                )
-            else:
-                if hasattr(nccl_allocator, "MultiGroupMemPoolAllocator"):
-                    # Case of MCore NCCL allocator
+
+            if NCCL_ALLOCATOR == "MCORE":
+                if len(groups) == 1:
+                    # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.MultiGroupMemPoolAllocator, NCCL_MEMORY_POOL, groups=groups
+                        nccl_allocator.nccl_mem,
+                        NCCL_MEMORY_POOL,
+                        group=groups[0],
+                        symmetric=symmetric,
                     )
                 else:
-                    # Case of APEX NCCL allocator.
+                    mem_alloc_context = functools.partial(
+                        nccl_allocator.MultiGroupMemPoolAllocator,
+                        NCCL_MEMORY_POOL,
+                        groups=groups,
+                        symmetric=symmetric,
+                    )
+            elif NCCL_ALLOCATOR == "APEX":
+                if symmetric:
+                    logging.warning(
+                        "Symmetric registration is not supported for APEX NCCL allocator."
+                        "falling back to non-symmetric registration. "
+                        "Please use Megatron Core NCCL allocator for symmetric registration."
+                    )
+
+                if len(groups) == 1:
+                    # register buffers to the default group directly using nccl memory allocator
+                    mem_alloc_context = functools.partial(
+                        nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
+                    )
+                else:
+                    # Supports multiple groups registration for APEX NCCL allocator.
                     mem_alloc_context = functools.partial(
                         MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
                     )
+            else:
+                raise ValueError(f"Invalid NCCL allocator: {NCCL_ALLOCATOR}")
             return mem_alloc_context
         else:
             return nullcontext
@@ -1773,6 +1809,8 @@ class ParamAndGradBuffer:
         grad_reduce_in_fp32 = self.grad_reduce_in_fp32
         buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
 
+        # Only create HSDP buffers if sharding on DP-Outer. Otherwise, no need to all-gather
+        # parameters on DP-Outer, but still need to all-reduce gradients on DP-Outer.
         should_create_hfsdp_wbuf_and_gbuf = (
             self.dist_index.use_hybrid_fsdp
             and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
@@ -1972,20 +2010,29 @@ class ParamAndGradBuffer:
             if wbuf:
                 with self.mem_alloc_context():
                     if group.hsdp_wbuf:
+                        # When using HSDP, the hybrid-sharded buffer shards across the FSDP group,
+                        # while the main buffer shards across the larger / more granular DP group.
+                        # The main weight buffer data is a shard of the hybrid-sharded buffer data.
+                        # Because the hybrid buffer data is persistently allocated, the weight and
+                        # gradient memory footprint is similar to not sharding on DP-Outer, i.e.
+                        # replicating on DP-Outer. However, optimizer states based on main buffer
+                        # weights (self.dist_main_weight) and gradients (self.dist_main_grad) will
+                        # be sharded persistently upon initialization.
                         hsdp_wbuf = group.hsdp_wbuf
                         hsdp_wbuf.init_data(
                             torch.empty(
                                 hsdp_wbuf.data_size, dtype=hsdp_wbuf.dtype, device=self.device
                             )
                         )
-                        inter_fsdp_group = self.dist_index.inter_fsdp_group
+                        outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
                         wbuf_data = hsdp_wbuf.data[
                             wbuf.data_size
-                            * inter_fsdp_group.rank() : wbuf.data_size
-                            * (inter_fsdp_group.rank() + 1)
+                            * outer_fsdp_group.rank() : wbuf.data_size
+                            * (outer_fsdp_group.rank() + 1)
                         ]
                         wbuf.init_data(wbuf_data)
                     else:
+                        # When not using HSDP, the main buffer shards across the FSDP group.
                         wbuf.init_data(
                             torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
                         )
@@ -2155,17 +2202,26 @@ class ParamAndGradBuffer:
             # Allocate the main grad buffer data, and attach it to the main grad buffer.
             with self.mem_alloc_context():
                 if group.hsdp_gbuf:
+                    # When using HSDP, the hybrid-sharded buffer shards across the FSDP group,
+                    # while the main buffer shards across the larger / more granular DP group.
+                    # The main weight buffer data is a shard of the hybrid-sharded buffer data.
+                    # Because the hybrid buffer data is persistently allocated, the weight and
+                    # gradient memory footprint is similar to not sharding on DP-Outer, i.e.
+                    # replicating on DP-Outer. However, optimizer states based on main buffer
+                    # weights (self.dist_main_weight) and gradients (self.dist_main_grad) will
+                    # be sharded persistently upon initialization.
                     hsdp_gbuf = group.hsdp_gbuf
                     hsdp_gbuf.init_data(_alloc(hsdp_gbuf.dtype, hsdp_gbuf.data_size))
-                    inter_fsdp_group = self.dist_index.inter_fsdp_group
+                    outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
                     gbuf_data = hsdp_gbuf.data[
                         gbuf.data_size
-                        * inter_fsdp_group.rank() : gbuf.data_size
-                        * (inter_fsdp_group.rank() + 1)
+                        * outer_fsdp_group.rank() : gbuf.data_size
+                        * (outer_fsdp_group.rank() + 1)
                     ]
                     gbuf.init_data(gbuf_data)
                     hsdp_gbuf.data.zero_()
                 else:
+                    # When not using HSDP, the main buffer shards across the FSDP group.
                     gbuf.init_data(_alloc(gbuf.dtype, gbuf.data_size))
                     gbuf.data.zero_()
             gbuf.data.zero_()
@@ -2207,6 +2263,10 @@ class ParamAndGradBuffer:
 
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
+
+            for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
+                if getattr(old_param, tp_attr, None) is not None:
+                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
 
         for item_id, p in enumerate(self.params):
             if p in param_map:
@@ -2272,11 +2332,11 @@ class ParamAndGradBuffer:
             for item_id, orig_param in enumerate(pg.params):
                 param_name = self.param_to_name[orig_param]
 
-                # If the optimizer state is sharded, we need to shard the model
-                # optimizer parameters, even if the model training and high-precision
-                # weight buffers are not sharded.
-                # This is the case for "optim", where the gradient and optimizer param buffer are
-                # unsharded, but the optimizer state needs to be sharded.
+                # If the optimizer state is sharded, we need to track references to shards
+                # of the main weight or training weight buffer data for distributed
+                # optimization, regardless whether the buffers are sharded or not.
+                # mbuf and wbuf won't exist in the case of "no_shard", in which case
+                # we simply take the original unsharded parameter weight from the model.
                 sharded_optimizer_state = (
                     self.bucketing_policy.data_parallel_sharding_strategy != "no_shard"
                 )
@@ -2291,6 +2351,7 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
+                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
                 elif wbuf:
@@ -2302,6 +2363,7 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
+                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
                 else:
@@ -2316,6 +2378,7 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=False,
+                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
 
@@ -2350,6 +2413,9 @@ class ParamAndGradBuffer:
                             "partition_dim",
                             "partition_stride",
                             "is_embedding_or_output_parameter",
+                            "_mcore_tp",
+                            "_tp_duplicated",
+                            "_tp_partition_dim",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -2543,7 +2609,7 @@ class ParamAndGradBuffer:
         ), "all_gather_parameters() should only be called when parameters are not sharded."
         assert (
             self.ddp_config.outer_dp_sharding_strategy == "no_shard"
-        ), "all_gather_parameters() should not be called when outer DP sharding is enabled."
+        ), "all_gather_parameters() should not be called when outer-DP sharding is enabled."
 
         all_gather_ops = []
         for g in self.parameter_groups:
@@ -2571,7 +2637,7 @@ class ParamAndGradBuffer:
         ), "reduce_scatter_gradients() should only be called when gradients are not sharded."
         assert (
             self.ddp_config.outer_dp_sharding_strategy == "no_shard"
-        ), "reduce_scatter_gradients() should not be called when outer DP sharding is enabled."
+        ), "reduce_scatter_gradients() should not be called when outer-DP sharding is enabled."
 
         reduce_scatter_ops = []
         for g in self.parameter_groups:
@@ -2609,7 +2675,7 @@ class ParamAndGradBuffer:
         ), "all_reduce_gradients() should only be called when gradients are not sharded."
         assert (
             self.ddp_config.outer_dp_sharding_strategy == "no_shard"
-        ), "all_reduce_gradients() should not be called when outer DP sharding is enabled."
+        ), "all_reduce_gradients() should not be called when outer-DP sharding is enabled."
 
         all_reduce_ops = []
         for g in self.parameter_groups:
@@ -2669,14 +2735,14 @@ class GradReducePipeline:
         self.rs_stream = rs_stream
         self.check_nans = check_nans
 
-        # Init inter-FSDP group gradient reduction related attributes.
+        # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
         if dist_index.use_hybrid_fsdp:
             # If there are multiple FSDP groups, we need to reduce gradients across groups.
-            self.inter_fsdp_group_grad_reduce = True
-            self.inter_fsdp_group_grad_reduce_stream = torch.cuda.Stream()
+            self.outer_fsdp_group_grad_reduce = True
+            self.outer_fsdp_group_grad_reduce_stream = torch.cuda.Stream()
         else:
-            self.inter_fsdp_group_grad_reduce = False
+            self.outer_fsdp_group_grad_reduce = False
 
     @property
     def num_buckets(self):
@@ -2706,15 +2772,15 @@ class GradReducePipeline:
         self,
         params: List[torch.Tensor],
         suggested_queue_capacity: Optional[int] = None,
-        inter_fsdp_group_grad_reduce: bool = False,
+        outer_fsdp_group_grad_reduce: bool = False,
     ):
         """Reduce the gradients for the given parameters.
         Args:
             params (List[torch.Tensor]): The parameters.
             suggested_queue_capacity (int, optional): The suggested queue capacity.
                 Defaults to None.
-            inter_fsdp_group_grad_reduce (bool, optional): Whether to reduce gradients
-                across inter-FSDP groups. Defaults to False.
+            outer_fsdp_group_grad_reduce (bool, optional): Whether to reduce gradients
+                across outer-DP groups. Defaults to False.
         """
         for param in params:
             bucket_id = self.buffer.param_to_param_group[param]
@@ -2740,7 +2806,7 @@ class GradReducePipeline:
                 self._bucket_group_gradient_reduce(
                     bucket_group,
                     async_op=True,
-                    inter_fsdp_group_grad_reduce=inter_fsdp_group_grad_reduce,
+                    outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
                 )
 
     def wait_for_previous_grad_reduce(
@@ -2775,8 +2841,8 @@ class GradReducePipeline:
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
 
-        if suggested_queue_size == 0 and self.inter_fsdp_group_grad_reduce:
-            torch.cuda.current_stream().wait_stream(self.inter_fsdp_group_grad_reduce_stream)
+        if suggested_queue_size == 0 and self.outer_fsdp_group_grad_reduce:
+            torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_grad_reduce_stream)
 
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:
@@ -2837,7 +2903,7 @@ class GradReducePipeline:
         self,
         bucket_group: List[int],
         async_op: bool = False,
-        inter_fsdp_group_grad_reduce: bool = False,
+        outer_fsdp_group_grad_reduce: bool = False,
     ) -> bool:
         """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
         the bucket group are ready, then do the reduce-scatter/all-reduce.
@@ -2871,6 +2937,7 @@ class GradReducePipeline:
                     # Fetch pre-allocated main gradient bucket.
                     gbuf = self.get_fsdp_buffer(bucket_id)
                     bucket = gbuf.fetch_bucket()
+                    # Scale gradients.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
                         gbuf.data, scaling_factor, gbuf.ddp_config
@@ -2893,6 +2960,7 @@ class GradReducePipeline:
                         # For reference: https://dev-discuss.pytorch.org/t/fsdp-cudacachingallocator-an-outsider-newb-perspective/1486
                         if not self.buffer.ddp_config.fsdp_double_buffer:
                             grad_shard = torch.empty_like(grad_shard)
+                        # Reduce-scatter gradients on the FSDP group.
                         torch.distributed.reduce_scatter_tensor(
                             output=grad_shard,
                             input=bucket.data,
@@ -2903,17 +2971,19 @@ class GradReducePipeline:
                         grad_buffer.append(gbuf.get_shard_from_local_buffer())
                     self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
             for local_grad, reduced_grad in zip(grad_buffer, reduced_grad):
+                # Accumulate the reduced gradient shard into the local gradient buffer,
+                # when ZeRO-2 (gradient sharding) is enabled. Otherwise, bucket.data
+                # is equivalent to the buffer data and will have been all-reduced.
                 local_grad += reduced_grad
             # Record a checkpoint for the event to synchronize against the reduce-scatter stream.
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
 
-        # Inter-FSDP group gradient reduction.
-        if inter_fsdp_group_grad_reduce:
-            assert ddp_config.data_parallel_sharding_strategy != "no_shard"
-            self.inter_fsdp_group_grad_reduce_stream.wait_stream(reduce_scatter_stream)
-            inter_fsdp_group = self.buffer.dist_index.inter_fsdp_group
-            with torch.cuda.stream(self.inter_fsdp_group_grad_reduce_stream):
-                with _coalescing_manager(inter_fsdp_group):
+        # Outer-DP group gradient reduction.
+        if outer_fsdp_group_grad_reduce:
+            self.outer_fsdp_group_grad_reduce_stream.wait_stream(reduce_scatter_stream)
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
+            with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
+                with _coalescing_manager(outer_fsdp_group):
                     reduced_grad = []
                     for bucket_id in bucket_group:
                         if ddp_config.average_in_collective:
@@ -2922,9 +2992,14 @@ class GradReducePipeline:
                             reduce_op = torch.distributed.ReduceOp.SUM
 
                         # All-reduce/reduce-scatter the gradients on every rank
-                        # in the inter-FSDP group.
+                        # in the outer-DP group.
                         gbuf = self.get_fsdp_buffer(bucket_id)
                         if ddp_config.outer_dp_sharding_strategy != "no_shard":
+                            # Outer-DP sharding is only supported for fully-sharded inner-DP.
+                            assert ddp_config.data_parallel_sharding_strategy != "no_shard"
+                            # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
+                            # main gradient buffer which shards across the entire DP group,
+                            # i.e. across all DP-Shard and DP-Outer ranks.
                             grad_full_shard = self.buffer.parameter_groups[
                                 bucket_id
                             ].main_grad_buffer.get_shard_from_local_buffer()
@@ -2933,21 +3008,26 @@ class GradReducePipeline:
                             # to work correctly
                             grad_full_shard = torch.empty_like(grad_full_shard)
                             reduced_grad.append(grad_full_shard)
+                            # Reduce-scatter the FSDP gradient buffer shard further
+                            # into the (DP-Outer, DP-Shard) gradient shard.
                             torch.distributed.reduce_scatter_tensor(
                                 output=grad_full_shard,
                                 input=gbuf.data,
                                 op=reduce_op,
-                                group=inter_fsdp_group,
+                                group=outer_fsdp_group,
                             )
                         else:
+                            # No outer-DP sharding, so just all-reduce the FSDP gradient
+                            # buffer shard into itself.
                             torch.distributed.all_reduce(
-                                gbuf.data, group=inter_fsdp_group, op=reduce_op
+                                gbuf.data, group=outer_fsdp_group, op=reduce_op
                             )
                 for bucket_id, grad_full_shard in zip(bucket_group, reduced_grad):
+                    # Update the (DP-Outer, DP-Shard) gradient shard in the main gradient buffer.
                     self.buffer.parameter_groups[
                         bucket_id
                     ].main_grad_buffer.get_shard_from_local_buffer().copy_(grad_full_shard)
-            reduce_scatter_view_out_event = self.inter_fsdp_group_grad_reduce_stream.record_event()
+            reduce_scatter_view_out_event = self.outer_fsdp_group_grad_reduce_stream.record_event()
 
         free_up_grad_bucket_func = {}
         for bucket_id in bucket_group:
@@ -3034,7 +3114,7 @@ class AllGatherPipeline:
         ):
             # If there are multiple FSDP groups and full sharding, we need to
             # all-gather parameters across groups.
-            self.inter_fsdp_group_param_gather_stream = torch.cuda.Stream()
+            self.outer_fsdp_group_param_gather_stream = torch.cuda.Stream()
 
     @property
     def num_buckets(self):
@@ -3076,7 +3156,7 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
         suggested_AG_prefetch_size: Optional[int] = None,
         async_param_gather: bool = True,
-        inter_fsdp_group_param_gather: bool = False,
+        outer_fsdp_group_param_gather: bool = False,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -3088,8 +3168,8 @@ class AllGatherPipeline:
                 Defaults to PrefetchOrder.FORWARD_PASS_ORDER.
             suggested_AG_prefetch_size (Optional[int], optional):
                 The suggested prefetch size for all-gathering. Defaults to None.
-            inter_fsdp_group_param_gather (bool, optional):
-                Whether to all-gather parameters across inter-FSDP groups. Defaults to False.
+            outer_fsdp_group_param_gather (bool, optional):
+                Whether to all-gather parameters across outer-DP groups. Defaults to False.
         """
         if len(params) == 0:
             return
@@ -3201,21 +3281,23 @@ class AllGatherPipeline:
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
-            if inter_fsdp_group_param_gather:
-                self.inter_fsdp_group_param_gather_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.inter_fsdp_group_param_gather_stream):
-                    inter_fsdp_group = self.buffer.dist_index.inter_fsdp_group
-                    with _coalescing_manager(inter_fsdp_group, async_ops=False):
+            if outer_fsdp_group_param_gather:
+                self.outer_fsdp_group_param_gather_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
+                    outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
+                    with _coalescing_manager(outer_fsdp_group, async_ops=False):
                         for bucket_id in buckets:
+                            # All-gather the (DP-Outer, DP-Shard) weight shards from the DP-backed
+                            # main weight buffer into the (DP-Shard)-backed hybrid weight buffer.
                             wbuf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
                             hsdp_wbuf = self.buffer.parameter_groups[bucket_id].hsdp_wbuf
                             torch.distributed.all_gather_into_tensor(
                                 output_tensor=hsdp_wbuf.data,
                                 input_tensor=wbuf.data,
-                                group=inter_fsdp_group,
+                                group=outer_fsdp_group,
                             )
-                # Wait for the inter-FSDP group all-gather to finish.
-                all_gather_stream.wait_stream(self.inter_fsdp_group_param_gather_stream)
+                # Wait for the outer-DP group all-gather to finish.
+                all_gather_stream.wait_stream(self.outer_fsdp_group_param_gather_stream)
 
             # Coalesce the asynchronous NCCL operations in this context.
             all_gather_stream.wait_stream(torch.cuda.current_stream())
@@ -3225,8 +3307,8 @@ class AllGatherPipeline:
                     dp_group, async_ops=async_param_gather
                 ) as coalescing_event:
                     for bucket_id in buckets:
-                        # All-gather the module weights from each buffer shard
-                        # into an allocated bucket.
+                        # All-gather the module weights from each FSDP buffer shard
+                        # into an allocated bucket containing unsharded weights.
                         self.async_bucket_gather(bucket_id)
 
             # Replace the parameter all-gather event with coalescing event.
@@ -3481,18 +3563,20 @@ def to_local_if_dtensor(tensor):
     return tensor
 
 
-def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_param):
+def _get_fsdp_tensor_spec(
+    param, dist_index: FSDPDistributedIndex, is_sharded_param, is_expert_param
+):
     """
     Get the DeviceMesh for the parameter and modify the placement for Megatron-FSDP.
     """
-    # Check if the parameter is a DTensor and has more than one shard(TP enabled).
+    # Check if the parameter is a DTensor and has more than one shard (TP enabled).
     if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
         # Retrieve original DTensorSpec (for TP).
         dtensor_spec = cast(DTensor, param)._spec
         dtensor_mesh = getattr(dtensor_spec, "mesh", None)
 
         # Validate that the DTensor root mesh is identical to the Megatron-FSDP device mesh.
-        megatron_fsdp_global_mesh = dist_index.get_root_mesh()
+        megatron_fsdp_global_mesh = dist_index.get_root_mesh(is_expert_parallel=is_expert_param)
         dtensor_global_mesh = _mesh_resources.get_root_mesh(dtensor_mesh)
         # FIXME(boxiangw): add or megatron_fsdp_global_mesh != dtensor_global_mesh:
         # _mesh_resources.get_root_mesh(dtensor_mesh) is not getting the correct root mesh
@@ -3512,7 +3596,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
         dtensor_placement = dtensor_spec.placements[0]
 
         if dist_index.use_hybrid_fsdp:
-            mesh_dim_names = (dist_index.dp_inter_dim, dist_index.dp_shard_dim, dist_index.tp_dim)
+            mesh_dim_names = (dist_index.dp_outer_dim, dist_index.dp_shard_dim, dist_index.tp_dim)
         else:
             mesh_dim_names = (dist_index.dp_shard_dim, dist_index.tp_dim)
 
@@ -3537,7 +3621,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
             placements = [Shard(0), dtensor_placement]
             shard_order = [1, 0]
 
-        device_mesh = dist_index.get_submesh(mesh_dim_names)
+        device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
         if shard_order is not None:
             setattr(device_mesh, "_shard_order", shard_order)
 
@@ -3546,7 +3630,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
     shard_order = None
 
     if dist_index.use_hybrid_fsdp:
-        mesh_dim_names = (dist_index.dp_inter_dim, dist_index.dp_shard_dim)
+        mesh_dim_names = (dist_index.dp_outer_dim, dist_index.dp_shard_dim)
     else:
         mesh_dim_names = (dist_index.dp_shard_dim,)
 
@@ -3562,7 +3646,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
     else:
         placements = [Shard(0)]
 
-    device_mesh = dist_index.get_submesh(mesh_dim_names)
+    device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
     if shard_order is not None:
         setattr(device_mesh, "_shard_order", shard_order)
 
@@ -3577,6 +3661,7 @@ def make_fsdp_dtensor(
     is_expert_param: bool = False,
     run_check: bool = False,
     update_uneven_dtensor_chunk_meta: bool = False,
+    force_sync_tp_duplicated_param: bool = False,
 ):
     """
     Creates a distributed tensor (DTensor) from a local tensor with support for
@@ -3655,38 +3740,39 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if getattr(param, "tensor_model_parallel", False):
+    if is_mcore_tensor_model_parallel(param):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
-            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel "
-            "is True. Check usage."
+            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
         )
 
-        # Validate M-Core TP attributes
-        assert hasattr(
-            param, "partition_dim"
-        ), "[Megatron-FSDP] tensor_model_parallel param missing 'partition_dim'."
-        assert hasattr(
-            param, "partition_stride"
-        ), "[Megatron-FSDP] tensor_model_parallel param missing 'partition_stride'."
-        assert (
-            param.partition_stride == 1
-        ), "[Megatron-FSDP] Only partition_stride=1 is currently supported for "
-        "tensor_model_parallel."
-
-        tp_dim = param.partition_dim
-        tp_mesh = dist_index.get_submesh(dist_index.tp_dim)
-
-        # Adjust shape for global dimension
+        tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
+        global_shape = list(param.shape)
         if tp_mesh.mesh.numel() > 1:
-            global_shape = list(param.shape)
-            global_shape[tp_dim] *= tp_mesh.mesh.numel()
+            if is_mcore_tensor_parallel_duplicated(param):
+                placements = [Replicate()]
+                if force_sync_tp_duplicated_param:
+                    if local_tensor.numel() > 0:
+                        torch.distributed.broadcast(
+                            local_tensor, group=tp_mesh.get_group(), group_src=0
+                        )
+                elif run_check:
+                    # TODO: Implement consistency check for duplicated TP parameters
+                    pass
+            else:
+                tp_dim = get_mcore_tensor_parallel_partition_dim(param)
+                assert tp_dim is not None, (
+                    "[Megatron-FSDP] Parameter is not tensor model parallel, "
+                    "yet tensor_model_parallel is True."
+                )
+                placements = [Shard(tp_dim)]
+                global_shape[tp_dim] *= tp_mesh.mesh.numel()
 
             # Construct TP-sharded DTensor using Megatron-style placement
             param = DTensor.from_local(
-                local_tensor=param,
+                local_tensor=local_tensor,
                 device_mesh=tp_mesh,
-                placements=[Shard(tp_dim)],
+                placements=placements,
                 run_check=run_check,
                 shape=global_shape,
                 stride=torch.empty(global_shape).stride(),
@@ -3694,7 +3780,7 @@ def make_fsdp_dtensor(
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
-        param, dist_index, is_sharded_param=is_sharded_param
+        param, dist_index, is_sharded_param=is_sharded_param, is_expert_param=is_expert_param
     )
 
     # Reshape local tensor for sharded layouts beyond 1D

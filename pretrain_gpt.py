@@ -27,7 +27,7 @@ from model_provider import model_provider
 from gpt_builders import gpt_builder
 
 try:
-    from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
+    from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
 
     has_nvidia_modelopt = True
@@ -74,7 +74,7 @@ def loss_func(
     """
     args = get_args()
 
-    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
     losses = output_tensor.view(-1).float()
@@ -190,6 +190,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
 

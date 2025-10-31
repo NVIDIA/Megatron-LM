@@ -4,7 +4,7 @@
 import os
 import torch
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 from model_provider import model_provider
 from mamba_builders import mamba_builder
@@ -24,19 +24,21 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
 from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tokenizers import MegatronTokenizer
-
 from megatron.training.datasets.sft_dataset import SFTDataset
+
+# modelopt distillation
+try:
+    from megatron.post_training.arguments import add_modelopt_args
+    from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    has_nvidia_modelopt = True
+except ImportError:
+    has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
 
@@ -60,7 +62,7 @@ def get_batch(data_iterator, vp_stage=None):
 SPIKY_LOSS_FACTOR = 10
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None):
     """Loss function.
 
     Args:
@@ -74,6 +76,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             the data parallel ranks
     """
     args = get_args()
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
@@ -86,14 +90,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
@@ -106,10 +110,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=False,
         )
-
 
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
@@ -139,7 +142,8 @@ def forward_step(data_iterator, model: MambaModel):
         output_tensor = model(tokens, position_ids, attention_mask,
                               labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask)
+    # [ModelOpt]: model is needed to access ModelOpt distillation losses
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 def is_dataset_built_on_rank(vp_stage=None):
@@ -173,6 +177,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
 
@@ -221,4 +226,6 @@ if __name__ == "__main__":
              ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-             store=store)
+             store=store,
+             extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+             )

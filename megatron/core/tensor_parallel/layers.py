@@ -552,16 +552,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
-                if weight.main_grad.dtype == torch.float32:
-                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                        total_input, grad_output, weight.main_grad
-                    )
-                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                        total_input, grad_output, weight.main_grad
-                    )
+                # In case of Megatron-FSDP, need to create main grad buffers in-place
+                if hasattr(weight, "__fsdp_param__"):
+                    weight.main_grad = weight.get_main_grad()
+                    torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
                 else:
-                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+                    if weight.main_grad.dtype == torch.float32:
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Unsupported gradient type for gradient accumulation fusion"
+                        )
 
             if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
