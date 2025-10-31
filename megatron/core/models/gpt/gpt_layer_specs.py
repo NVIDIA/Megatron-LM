@@ -4,7 +4,7 @@ import warnings
 from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider, InferenceSpecProvider
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
@@ -38,7 +38,6 @@ try:
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import (
-        InferenceSpecProvider,
         TESpecProvider,
     )
 
@@ -77,6 +76,7 @@ def get_gpt_layer_with_inference_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
+    assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
     backend = InferenceSpecProvider()
     
     mlp = get_mlp_module_spec_for_backend(
