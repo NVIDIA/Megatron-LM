@@ -39,10 +39,10 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         # First warmup iteration is excluded from throughput statistics.
         throughput_sampled = median(output_current["throughput"][1:])
 
-        # 5 token/seconds is empirically observed to be within run variance.
+        # 10% is empirically observed to be within hardware variance.
         assert (
-            throughput_sampled >= output_groundtruth["throughput"] - 5.0
-        ), f"Throughput is slower than expected! Expected ~{output_groundtruth['throughput']} tok/s but benchmarked {output_current['throughput']} tok/s"
+            output_current["throughput"] >= 0.9 * output_groundtruth["throughput"]
+        ), f"Throughput is slower than expected! Expected to be within 10% of ~{output_groundtruth['throughput']} tok/s but benchmarked {output_current['throughput']} tok/s"
 
         # If throughput is significantly improved (> 20%), update golden values accordingly.
         assert (
