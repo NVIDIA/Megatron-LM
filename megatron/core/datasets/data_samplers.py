@@ -81,6 +81,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
 
 class MegatronPretrainingSampler:
+    """
+    Sampler for Megatron pretraining dataloaders that divides data samples across
+    data parallel workers. Each worker receives a contiguous chunk of data determined by
+    its rank and the micro batch size. Supports dropping the last incomplete batch if
+    specified, and keeps track of total and consumed samples. Designed to work with
+    distributed training using Megatron's data parallelism.
+    """
 
     def __init__(
         self,
@@ -116,6 +123,13 @@ class MegatronPretrainingSampler:
         return self.total_samples
 
     def get_start_end_idx(self):
+        """
+        Calculate the start and end indices for the current data parallel worker's
+        chunk within a batch.
+
+        Returns:
+            tuple: (start_idx, end_idx) indicating the slice of the batch for this worker.
+        """
         start_idx = self.data_parallel_rank * self.micro_batch_size
         end_idx = start_idx + self.micro_batch_size
         return start_idx, end_idx
@@ -137,6 +151,21 @@ class MegatronPretrainingSampler:
 
 
 class RandomSeedDataset(Dataset):
+    """
+    A dataset wrapper that resets the random seed before each sample.
+
+    This ensures deterministic behavior per sample by setting the RNG state
+    for torch, numpy, and random before accessing each underlying data sample.
+    The base seed is retrieved from training arguments, and can be varied per epoch
+    using the set_epoch method to ensure different shuffling or augmentation each epoch.
+
+    Args:
+        dataset: The underlying dataset to wrap.
+
+    Methods:
+        set_epoch(epoch): Change the seed offset so each epoch produces different randomization.
+        __getitem__(idx): Sets the seed based on the sample index and current epoch.
+    """
 
     def __init__(self, dataset):
         args = get_args()
@@ -148,6 +177,12 @@ class RandomSeedDataset(Dataset):
         return len(self.dataset)
 
     def set_epoch(self, epoch):
+        """
+        Change the seed offset so each epoch produces different randomization.
+
+        Args:
+            epoch: The epoch number to use as the seed offset.
+        """
         self.curr_seed = self.base_seed + epoch
 
     def __getitem__(self, idx):
@@ -159,6 +194,12 @@ class RandomSeedDataset(Dataset):
 
 
 class MegatronPretrainingRandomSampler:
+    """
+    Sampler for Megatron pretraining dataloaders that performs random sampling
+    across data parallel workers. Supports data sharding to divide the dataset
+    into buckets and shuffle within each bucket. Designed to work with distributed
+    training using Megatron's data parallelism.
+    """
 
     def __init__(
         self,
