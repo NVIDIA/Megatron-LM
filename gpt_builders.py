@@ -121,7 +121,6 @@ def _get_transformer_layer_spec(use_te, config) :
             use_kitchen=config.use_kitchen
         )
     elif config.transformer_impl == "inference_optimized":
-        assert not config.use_kitchen, "KITCHEN not supported with inference optimized layers."
         return get_gpt_layer_with_inference_spec(
             args.qk_layernorm,
             args.multi_latent_attention,

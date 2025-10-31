@@ -1206,11 +1206,6 @@ def validate_args(args, defaults={}):
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
-    if args.use_inference_optimized_layers:
-        assert args.transformer_impl == 'transformer_engine', (
-            "--use-inference-optimized-layers is only supported with transformer_engine implementation"
-        )
-
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1345,7 +1340,7 @@ def _add_transformer_engine_args(parser):
                        help='Execute wgrad in higher precision even for FP8 runs',
                        dest='fp8_wgrad')
     group.add_argument('--transformer-impl', default='transformer_engine',
-                       choices=['local', 'transformer_engine'],
+                       choices=['local', 'transformer_engine', 'inference_optimized'],
                        help='Which Transformer implementation to use.')
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
@@ -1503,8 +1498,6 @@ def _add_inference_args(parser):
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')  
-    group.add_argument('--use-inference-optimized-layers', default=False, action="store_true",
-                       help='Use inference optimized transformer layers.')
     return parser
 
 
