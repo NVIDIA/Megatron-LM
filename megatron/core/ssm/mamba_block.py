@@ -105,6 +105,8 @@ class MambaStack(MegatronModule):
             total layers. Defaults to 0.0.
         hybrid_mlp_ratio (float, optional): the target ratio of mlp layers to total
             layers. Defaults to 0.0.
+        parallel_hybrid_ratio (float, optional): the target ratio of parallel hybrid layers
+            (combined transformer+SSM) to total layers. Defaults to 0.0.
         hybrid_override_pattern (str, optional): the hybrid layer pattern to override
              with. Defaults to None.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -198,7 +200,7 @@ class MambaStack(MegatronModule):
                         submodules.parallel_hybrid_layer,
                         config=self.config,
                         layer_number=i + 1 + pp_layer_offset,
-                        model_comm_pgs=model_comm_pgs,
+                        pg_collection=pg_collection,
                     )
                 else:
                     assert False, "unexpected layer_type"

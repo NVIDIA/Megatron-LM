@@ -1280,11 +1280,13 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    _set_arg('gradient_accumulation_fusion', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
     _set_arg('hybrid_attention_ratio', force=True)
     _set_arg('hybrid_mlp_ratio', force=True)
+    _set_arg('parallel_hybrid_ratio', force=True)
 
     _set_arg('num_experts', force=True)
     _set_arg('moe_layer_freq', force=True)
@@ -1360,7 +1362,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             strict=strict,
             load_arg=load_arg
         )
-        
+
         # Since load_modelopt_checkpoint doesn't return iteration count, we need to get it
         if torch.distributed.is_initialized():
             tracker_filename = get_checkpoint_tracker_filename(load_dir)
@@ -1372,7 +1374,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 iteration = 0
         else:
             iteration = 0
-        
+
         # We don't have a reliable way to get num_floating_point_operations_so_far from ModelOpt format
         return iteration, 0
 

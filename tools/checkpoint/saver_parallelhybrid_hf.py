@@ -89,7 +89,7 @@ def is_hybrid_layer(layer_idx: int) -> bool:
 def process_hybrid_layer_weights(message: dict, layer_idx: int, falcon_h1_config: FalconH1Config) -> dict[str, torch.Tensor]:
     """Process weights for hybrid layers (Mamba + Attention)"""
     state_dict = {}
-    
+
     # Mamba mixer components
     state_dict[f"model.layers.{layer_idx}.mamba.A_log"] = message["mamba A_log"]
     state_dict[f"model.layers.{layer_idx}.mamba.D"] = message["mamba D"]
@@ -98,21 +98,21 @@ def process_hybrid_layer_weights(message: dict, layer_idx: int, falcon_h1_config
     state_dict[f"model.layers.{layer_idx}.mamba.conv1d.bias"] = message["mamba conv1d bias"]
     state_dict[f"model.layers.{layer_idx}.mamba.in_proj.weight"] = message["mamba in_proj weight"]
     state_dict[f"model.layers.{layer_idx}.mamba.out_proj.weight"] = message["mamba out_proj weight"]
-    
+
     state_dict[f"model.layers.{layer_idx}.input_layernorm.weight"] = message["mamba pre norm weight"]
     state_dict[f"model.layers.{layer_idx}.mamba.norm.weight"] = message["mamba internal norm weight"]
-    
+
     # Self-attention components - PROPER QKV SPLITTING
     qkv_weight = message["attention qkv weight"]
-    
+
     # using standard Llama QKV layout
     head_size = falcon_h1_config.hidden_size // falcon_h1_config.num_attention_heads  # 128
     heads_per_group = falcon_h1_config.num_attention_heads // falcon_h1_config.num_key_value_heads  # 4
     qkv_total_heads = falcon_h1_config.num_attention_heads + 2 * falcon_h1_config.num_key_value_heads  # 12
-    
+
     # Reshape QKV to [12, 128, 1024] like Llama does
     qkv_weights = qkv_weight.reshape([qkv_total_heads, head_size, falcon_h1_config.hidden_size])
-    
+
     # Create slices for Q, K, V exactly like Llama saver
     q_slice = torch.cat([
         torch.arange(
@@ -123,41 +123,41 @@ def process_hybrid_layer_weights(message: dict, layer_idx: int, falcon_h1_config
     ])
     k_slice = torch.arange(heads_per_group, qkv_total_heads, (heads_per_group + 2))
     v_slice = torch.arange(heads_per_group + 1, qkv_total_heads, (heads_per_group + 2))
-    
+
     # Extract Q, K, V using Llama's slicing approach
     state_dict[f"model.layers.{layer_idx}.self_attn.q_proj.weight"] = qkv_weights[q_slice].reshape(-1, falcon_h1_config.hidden_size)
     state_dict[f"model.layers.{layer_idx}.self_attn.k_proj.weight"] = qkv_weights[k_slice].reshape(-1, falcon_h1_config.hidden_size)
     state_dict[f"model.layers.{layer_idx}.self_attn.v_proj.weight"] = qkv_weights[v_slice].reshape(-1, falcon_h1_config.hidden_size)
-    
+
     # Attention output projection
     state_dict[f"model.layers.{layer_idx}.self_attn.o_proj.weight"] = message["attention dense weight"]
-    
-    # Attention layer norm 
+
+    # Attention layer norm
     state_dict[f"model.layers.{layer_idx}.input_layernorm.weight"] = message["attention input norm weight"]
-    
+
     return state_dict
 
 def process_mlp_layer_weights(message: dict, layer_idx: int, falcon_h1_config: FalconH1Config) -> dict[str, torch.Tensor]:
     """Process weights for MLP-only layers"""
     state_dict = {}
-    
+
     # MLP components - FIXED NAMES TO FEED_FORWARD
     mlp_fc1_weight = message["mlp fc1 weight"]
-    
+
     # Split gate and up projections (assuming SwiGLU like Llama)
     intermediate_size = falcon_h1_config.intermediate_size
-    
+
     # Split the fc1 weight into gate_proj and up_proj
     gate_proj_weight = mlp_fc1_weight[:intermediate_size, :]
     up_proj_weight = mlp_fc1_weight[intermediate_size:, :]
-    
+
     state_dict[f"model.layers.{layer_idx}.feed_forward.gate_proj.weight"] = gate_proj_weight
     state_dict[f"model.layers.{layer_idx}.feed_forward.up_proj.weight"] = up_proj_weight
     state_dict[f"model.layers.{layer_idx}.feed_forward.down_proj.weight"] = message["mlp fc2 weight"]
-    
+
     # MLP layer norm - FIXED NAME
     state_dict[f"model.layers.{layer_idx}.pre_ff_layernorm.weight"] = message["mlp input norm weight"]
-    
+
     return state_dict
 
 def save_checkpoint(queue: mp.Queue, args):
@@ -181,11 +181,11 @@ def save_checkpoint(queue: mp.Queue, args):
     ### Verify compatibility of args
     if not hasattr(md, "checkpoint_args"):
         raise ValueError("missing checkpoint_args in metadata")
-    
+
     # Falcon-H1 specific validations
     if not hasattr(md.checkpoint_args, 'hybrid_architecture'):
         print("Warning: hybrid_architecture not specified in checkpoint_args, assuming Falcon-H1")
-    
+
     torch_dtype = torch.float32
     if md.checkpoint_args.bf16:
         torch_dtype = torch.bfloat16
@@ -222,64 +222,66 @@ def save_checkpoint(queue: mp.Queue, args):
         tokenizer.save_pretrained(args.save_dir)
 
     ### save config.json
+    mamba_expand = 2
+    mamba_intermediate_size = mamba_expand * md.checkpoint_args.hidden_size
+    mamba_n_heads = mamba_intermediate_size // md.checkpoint_args.mamba_head_dim
     falcon_h1_config = FalconH1Config(
         # Basic model parameters from checkpoint
         vocab_size=md.true_vocab_size if md.true_vocab_size else md.checkpoint_args.padded_vocab_size,
-        hidden_size=md.checkpoint_args.hidden_size,                    
-        intermediate_size=md.checkpoint_args.ffn_hidden_size,           
-        num_hidden_layers=md.checkpoint_args.num_layers,               
-        num_attention_heads=md.checkpoint_args.num_attention_heads,  
-        num_key_value_heads=md.checkpoint_args.num_query_groups,   
-        max_position_embeddings=md.checkpoint_args.max_position_embeddings, 
-        rms_norm_eps=md.checkpoint_args.norm_epsilon,                  
+        hidden_size=md.checkpoint_args.hidden_size,
+        intermediate_size=md.checkpoint_args.ffn_hidden_size,
+        num_hidden_layers=md.checkpoint_args.num_layers,
+        num_attention_heads=md.checkpoint_args.num_attention_heads,
+        num_key_value_heads=md.checkpoint_args.num_query_groups,
+        max_position_embeddings=md.checkpoint_args.max_position_embeddings,
+        rms_norm_eps=md.checkpoint_args.norm_epsilon,
         tie_word_embeddings=not md.checkpoint_args.untie_embeddings_and_output_weights,
-        attention_dropout=md.checkpoint_args.attention_dropout,        
-        
+        attention_dropout=md.checkpoint_args.attention_dropout,
         # Mamba parameters from checkpoint
-        mamba_d_state=md.checkpoint_args.mamba_state_dim,              
-        mamba_d_conv=md.checkpoint_args.d_conv,                        
-        mamba_expand=md.checkpoint_args.expand,                        
-        mamba_d_ssm=md.checkpoint_args.d_inner,                        
-        mamba_n_heads=md.checkpoint_args.d_inner // md.checkpoint_args.mamba_head_dim, 
-        mamba_d_head=md.checkpoint_args.mamba_head_dim,          
-        mamba_n_groups=md.checkpoint_args.mamba_num_groups,            
-        mamba_chunk_size=md.checkpoint_args.chunk_size,                
-        mamba_conv_bias=md.checkpoint_args.conv_bias,                  
-        mamba_proj_bias=md.checkpoint_args.add_bias_linear,            
-        mamba_norm_before_gate=md.checkpoint_args.norm_before_gate,   
-        mamba_rms_norm=md.checkpoint_args.rmsnorm,                     
-        
+        mamba_d_state=md.checkpoint_args.mamba_state_dim,
+        mamba_d_head=md.checkpoint_args.mamba_head_dim,
+        mamba_n_groups=md.checkpoint_args.mamba_num_groups,
+        mamba_d_ssm=mamba_intermediate_size,
+        mamba_n_heads=mamba_n_heads,
+        mamba_expand=mamba_expand,
+        mamba_d_conv=4,
+        mamba_chunk_size=256,
+        mamba_conv_bias=True,
+        mamba_proj_bias=md.checkpoint_args.add_bias_linear,
+        mamba_norm_before_gate=True,
+        mamba_rms_norm=md.checkpoint_args.normalization == "RMSNorm",
+
         # RoPE parameters from checkpoint
-        rope_theta=md.checkpoint_args.rotary_base,                  
-        
+        rope_theta=md.checkpoint_args.rotary_base,
+
         # Bias parameters from checkpoint
-        attention_bias=md.checkpoint_args.add_bias_linear,            
-        mlp_bias=md.checkpoint_args.add_bias_linear,                 
-        projectors_bias=md.checkpoint_args.add_bias_linear,           
-        
+        attention_bias=md.checkpoint_args.add_bias_linear,
+        mlp_bias=md.checkpoint_args.add_bias_linear,
+        projectors_bias=md.checkpoint_args.add_bias_linear,
+
         # Token IDs - from tokenizer if available, otherwise defaults
         pad_token_id=getattr(tokenizer, 'pad_token_id', 0) if tokenizer else 0,
         bos_token_id=getattr(tokenizer, 'bos_token_id', 1) if tokenizer else 1,
         eos_token_id=getattr(tokenizer, 'eos_token_id', 2) if tokenizer else 2,
-        
+
         # Parameters using FalconH1Config defaults (not in checkpoint)
-        hidden_act="silu",                                             
-        initializer_range=0.02,                                     
-        use_cache=True,                                                 
-        num_logits_to_keep=1,                                           
-        rope_scaling=None,                                            
-        
+        hidden_act="silu",
+        initializer_range=0.02,
+        use_cache=True,
+        num_logits_to_keep=1,
+        rope_scaling=None,
+
         # Model metadata
         torch_dtype=torch_dtype,
         architectures=["FalconH1ForCausalLM"],
         model_type="falcon_h1",
         transformers_version="4.52.0",
     )
-    
+
     if args.hf_tokenizer:
         falcon_h1_config.eos_token_id = tokenizer.eos_token_id
         falcon_h1_config.bos_token_id = tokenizer.bos_token_id
-    
+
     print(f"saving config.json to {tmp_save_dir}")
     falcon_h1_config.save_pretrained(tmp_save_dir)
 
@@ -325,53 +327,53 @@ def save_checkpoint(queue: mp.Queue, args):
 
     for i_layer in range(falcon_h1_config.num_hidden_layers):
         state_dict = {}
-        
+
         if is_hybrid_layer(i_layer):
             # Process hybrid layer (Mamba + Attention) - EVEN layers
             message = queue_get(f"hybrid layer {i_layer}")
-            
+
             # Add Mamba + Attention components from Megatron
             hybrid_weights = process_hybrid_layer_weights(message, i_layer, falcon_h1_config)
             state_dict.update(hybrid_weights)
-            
+
             # Add MISSING MLP components (configured to output zeros = identity for addition)
-            mlp_intermediate_size = falcon_h1_config.intermediate_size 
+            mlp_intermediate_size = falcon_h1_config.intermediate_size
             state_dict.update({
                 # Gate and up can be anything since down_proj will zero everything out
                 f"model.layers.{i_layer}.feed_forward.gate_proj.weight": torch.randn(
-                    mlp_intermediate_size, falcon_h1_config.hidden_size, 
+                    mlp_intermediate_size, falcon_h1_config.hidden_size,
                     dtype=torch_dtype
                 ) * 0.01,
                 f"model.layers.{i_layer}.feed_forward.up_proj.weight": torch.randn(
-                    mlp_intermediate_size, falcon_h1_config.hidden_size, 
+                    mlp_intermediate_size, falcon_h1_config.hidden_size,
                     dtype=torch_dtype
                 ) * 0.01,
                 # KEY: down_proj = 0 makes entire MLP output zero
                 f"model.layers.{i_layer}.feed_forward.down_proj.weight": torch.zeros(
-                    falcon_h1_config.hidden_size, mlp_intermediate_size, 
+                    falcon_h1_config.hidden_size, mlp_intermediate_size,
                     dtype=torch_dtype
                 ),
                 f"model.layers.{i_layer}.pre_ff_layernorm.weight": torch.ones(
                     falcon_h1_config.hidden_size, dtype=torch_dtype
                 ),
             })
-            
+
         else:
             # Process MLP-only layer - ODD layers
             message = queue_get(f"mlp layer {i_layer}")
-            
+
             # Add MLP components from Megatron
             mlp_weights = process_mlp_layer_weights(message, i_layer, falcon_h1_config)
             state_dict.update(mlp_weights)
-            
+
             # Add MISSING Mamba components (configured to output zeros = identity for addition)
             mamba_intermediate_size = (
-                falcon_h1_config.mamba_d_ssm if falcon_h1_config.mamba_d_ssm 
+                falcon_h1_config.mamba_d_ssm if falcon_h1_config.mamba_d_ssm
                 else int(falcon_h1_config.mamba_expand * falcon_h1_config.hidden_size)
             )
             conv_dim = mamba_intermediate_size + 2 * falcon_h1_config.mamba_n_groups * falcon_h1_config.mamba_d_state
             projection_size = mamba_intermediate_size + conv_dim + falcon_h1_config.mamba_n_heads
-            
+
             state_dict.update({
                 f"model.layers.{i_layer}.mamba.A_log": torch.log(torch.arange(1, falcon_h1_config.mamba_n_heads + 1, dtype=torch_dtype)),
                 f"model.layers.{i_layer}.mamba.D": torch.ones(falcon_h1_config.mamba_n_heads, dtype=torch_dtype),
@@ -389,7 +391,7 @@ def save_checkpoint(queue: mp.Queue, args):
                 ),
                 f"model.layers.{i_layer}.mamba.norm.weight": torch.ones(mamba_intermediate_size, dtype=torch_dtype),
             })
-            
+
             # Add MISSING Attention components (configured to output zeros = identity for addition)
             head_dim = falcon_h1_config.hidden_size // falcon_h1_config.num_attention_heads
             state_dict.update({
@@ -414,7 +416,7 @@ def save_checkpoint(queue: mp.Queue, args):
                 f"model.layers.{i_layer}.input_layernorm.weight": torch.ones(
                     falcon_h1_config.hidden_size, dtype=torch_dtype
                 ),
-            })        
+            })
         index_dict, ref_state_dict = save_layer(
             state_dict,
             index_dict,
@@ -431,7 +433,7 @@ def save_checkpoint(queue: mp.Queue, args):
 }
     if md.checkpoint_args.untie_embeddings_and_output_weights:
         state_dict["lm_head.weight"] = pad_weight(queue_get("output layer")["weight"], md.true_vocab_size)
-    
+
     index_dict, ref_state_dict = save_layer(
         state_dict,
         index_dict,
@@ -440,7 +442,7 @@ def save_checkpoint(queue: mp.Queue, args):
         check_reference=args.check_eq_hf,
         ref_state_dict=ref_state_dict,
     )
-    
+
     # final check
     if ref_state_dict:
         remaining_keys = list(ref_state_dict.keys())
@@ -468,7 +470,7 @@ def save_checkpoint(queue: mp.Queue, args):
     model = FalconH1ForCausalLM.from_pretrained(
         str(tmp_save_dir), torch_dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True
     )
-    
+
     # Avoid saving this as part of the config.
     if hasattr(model.config, '_name_or_path'):
         del model.config._name_or_path
@@ -494,7 +496,7 @@ def save_checkpoint(queue: mp.Queue, args):
     )
     print(f"Saving generation config to {args.save_dir}")
     generation_config.save_pretrained(args.save_dir)
-    
+
     ### cleanup tmp
     print(f"Deleting {tmp_save_dir}")
     rmtree(tmp_save_dir)

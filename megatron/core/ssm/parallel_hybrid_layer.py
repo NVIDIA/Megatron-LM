@@ -11,14 +11,14 @@ from typing import Optional, Union, Tuple
 import torch
 
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules  
+from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 
 
@@ -40,10 +40,12 @@ class ParallelHybridLayer(MegatronModule):
         submodules: ParallelHybridLayerSubmodules,
         layer_number: int = 1,
         residual_in_fp32=False,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config)
-        assert model_comm_pgs is not None, "model_comm_pgs must be provided for ParallelHybridLayer"
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
 
         self.config = config
         self.layer_number = layer_number
@@ -51,8 +53,8 @@ class ParallelHybridLayer(MegatronModule):
         self.hidden_dropout = config.hidden_dropout
 
         self.input_layernorm = build_module(
-            submodules.input_layernorm, 
-            config=self.config, 
+            submodules.input_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
@@ -68,7 +70,7 @@ class ParallelHybridLayer(MegatronModule):
             config=self.config,
             layer_number=layer_number,
             d_model=self.config.hidden_size,
-            model_comm_pgs=model_comm_pgs
+            pg_collection=pg_collection
         )
 
         attention_optional_kwargs = {}
@@ -77,8 +79,7 @@ class ParallelHybridLayer(MegatronModule):
                 attention_optional_kwargs["cp_comm_type"] = self.config.cp_comm_type[self.layer_number]
             else:
                 attention_optional_kwargs["cp_comm_type"] = self.config.cp_comm_type
-        model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        attention_optional_kwargs["model_comm_pgs"] = model_comm_pgs
+        attention_optional_kwargs["pg_collection"] = pg_collection
 
         attention_submodules = SelfAttentionSubmodules(
             linear_qkv=submodules.self_attention.module.submodules.linear_qkv,
@@ -154,7 +155,7 @@ class ParallelHybridLayer(MegatronModule):
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.parallel_hybrid_bda(
-                training=self.training, 
+                training=self.training,
                 fused=self.config.bias_dropout_fusion
             )(out_with_bias, residual, self.hidden_dropout)
 
@@ -197,4 +198,3 @@ class ParallelHybridLayer(MegatronModule):
 
         return sharded_state_dict
 
-    
