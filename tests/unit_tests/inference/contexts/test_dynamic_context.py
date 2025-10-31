@@ -901,20 +901,3 @@ class TestDynamicContext:
 
         # Unified memory test should succeed.
         init_contexts(unified_memory_level=1)
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-if __name__ == "__main__":
-    test = TestDynamicContext()
-    # test.test_initialize_dynamic_context()
-    # test.test_is_static_batching()
-    # test.test_is_memory_available()
-    # test.test_request_overflow()
-    # test.test_token_overflow_error()
-    # test.test_reset()
-    # test.test_allocate_and_release_memory_blocks()
-    # test.test_add_request()
-    # test.test_update_request()
-    # test.test_release_memory_blocks_for_finished_requests()
-    test.test_finished_requests_with_multiple_blocks()
-    test.test_calculate_and_store_log_probs()
-    test.test_unified_memory()
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

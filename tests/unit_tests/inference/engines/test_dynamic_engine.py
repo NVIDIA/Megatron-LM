@@ -39,6 +39,12 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
+
 
 def set_rounder(value):
     """Utility function to set the DynamicInferenceContext rounder."""
@@ -64,12 +70,11 @@ class DynamicEngineTestConfig:
 
     num_gap_steps: int = 2
 
-    context_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_active_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
     context_buffer_guaranteed_fraction: float = 0.01
     context_buffer_overflow_factor: Optional[float] = None
-    context_max_requests_override: Optional[int] = None
-    context_max_tokens_override: Optional[int] = None
+    context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
@@ -103,13 +108,9 @@ class DynamicEngineTestConfig:
         # Update overrides if not using overflow factor.
         if self.context_buffer_overflow_factor is None:
 
-            # Enough room for all requests.
-            if self.context_max_requests_override is None:
-                self.context_max_requests_override = self.num_requests
-
             # Enough room for all tokens.
-            if self.context_max_tokens_override is None:
-                self.context_max_tokens_override = self.num_requests * self.max_sequence_length
+            if self.context_max_tokens is None:
+                self.context_max_tokens = self.num_requests * self.max_sequence_length
 
 
 @dataclass
@@ -202,12 +203,9 @@ class TestDynamicInferenceEngine:
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
-            buffer_size_gb=test_config.context_buffer_size_gb,
-            buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
+            active_buffer_size_gb=test_config.context_active_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
-            buffer_overflow_factor=test_config.context_buffer_overflow_factor,
-            max_requests_override=test_config.context_max_requests_override,
-            max_tokens_override=test_config.context_max_tokens_override,
+            max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
@@ -410,13 +408,11 @@ class TestDynamicInferenceEngine:
         # Run test.
         env = self._run_test(
             num_cuda_graphs=num_cuda_graphs,
-            context_max_requests_override=32,
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
         )
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 32
         assert env.engine.context.max_tokens == 160
 
         # Validate generated tokens.
@@ -448,8 +444,7 @@ class TestDynamicInferenceEngine:
         # Run test.
         env = self._run_test(
             context_buffer_overflow_factor=0.1,
-            context_max_requests_override=None,
-            context_max_tokens_override=None,
+            context_max_tokens=None,
         )
 
         # Validate max_requests, max_tokens.
@@ -470,7 +465,7 @@ class TestDynamicInferenceEngine:
     def test_token_overflow_transient(self) -> None:
         """Test token overflow."""
         test_config = DynamicEngineTestConfig(
-            num_requests=2, min_prompt_length=8, max_prompt_length=8, context_max_tokens_override=12
+            num_requests=2, min_prompt_length=8, max_prompt_length=8, context_max_tokens=12
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -489,7 +484,7 @@ class TestDynamicInferenceEngine:
     )
     def test_token_overflow_nontransient(self) -> None:
         """Test token overflow (non-transient)."""
-        test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
+        test_config = DynamicEngineTestConfig(context_max_tokens=8)
         env = self._build_test_env(test_config)
         try:
             env.engine._add_request(env.requests[0])
@@ -507,8 +502,8 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(DynamicEngineTestConfig())
         context = env.engine.context
         block_size_bytes = context.block_size_bytes
-        buffer_size_gb = (block_size_bytes + 1) / 1024**3
-        test_config = DynamicEngineTestConfig(context_buffer_size_gb=buffer_size_gb)
+        active_buffer_size_gb = (block_size_bytes + 1) / 1024**3
+        test_config = DynamicEngineTestConfig(context_active_buffer_size_gb=active_buffer_size_gb)
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
         assert list(env.engine.waiting_request_ids) == [0]
@@ -821,9 +816,8 @@ class TestDynamicInferenceEngine:
             num_requests=16,
             max_prompt_length=10,
             num_tokens_to_generate=32,
-            context_buffer_size_gb=0.001,  # 0.001, # 8 blocks
-            context_max_requests_override=8,
-            context_max_tokens_override=8,
+            context_active_buffer_size_gb=0.001,  # 0.001, # 8 blocks
+            context_max_tokens=8,
             num_gap_steps=1,
         )
 
@@ -852,21 +846,98 @@ class TestDynamicInferenceEngine:
 
 if __name__ == "__main__":
     test = TestDynamicInferenceEngine()
-    test.test_simple(4)
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # test.test_simple(4)
+    # test.test_overflow_factor()
+    # test.test_request_overflow()
+    # test.test_token_overflow_transient()
+    # # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
+    # test.test_block_overflow()
+    # test.test_multi_add()
+    # test.test_fixed_output_lengths()
+    # test.test_cuda_graph_request_counts()
+    # test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
+    # test.test_generate_function()
+    # asyncio.run(test.test_run_engine())
+    # test.test_return_log_probs()
+    # test.test_parallel_inference()
+    # # test.test_events() # uncomment in megatron-core 0.16
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # test.test_simple(None, "full")
+    test.test_simple(1, "full")
+    exit()
+    test.test_simple(4, "full")
+    test.test_simple(None, "full_iteration")
+    test.test_simple(1, "full_iteration")
+    test.test_simple(4, "full_iteration")
     test.test_overflow_factor()
     test.test_request_overflow()
     test.test_token_overflow_transient()
-    # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
+    test.test_token_overflow_nontransient()
     test.test_block_overflow()
     test.test_multi_add()
     test.test_fixed_output_lengths()
-    test.test_cuda_graph_request_counts()
-    test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
+    test.test_cuda_graph_token_counts()
+    test.test_cuda_graph_warmup(1, 8, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(1, 8, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(2, 8, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(2, 8, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(4, 8, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(4, 8, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(8, 8, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(8, 8, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(10, 16, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(10, 16, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(12, 16, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(12, 16, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(16, 16, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(16, 16, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(20, 24, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(20, 24, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(24, 24, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(24, 24, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(28, 32, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(28, 32, WarmupEngineMode.NON_DECODE)
+    test.test_cuda_graph_warmup(32, 32, WarmupEngineMode.DECODE)
+    test.test_cuda_graph_warmup(32, 32, WarmupEngineMode.NON_DECODE)
     test.test_generate_function()
-    asyncio.run(test.test_run_engine())
+    test.test_run_engine()
     test.test_return_log_probs()
-    test.test_parallel_inference()
-    # test.test_events() # uncomment in megatron-core 0.16
+    test.test_parallel_inference(1, 1, 1, False, False)
+    test.test_parallel_inference(1, 1, 1, False, True)
+    test.test_parallel_inference(1, 1, 1, True, False)
+    test.test_parallel_inference(1, 1, 1, True, True)
+    test.test_parallel_inference(1, 1, 2, False, False)
+    test.test_parallel_inference(1, 1, 2, False, True)
+    test.test_parallel_inference(1, 1, 2, True, False)
+    test.test_parallel_inference(1, 1, 2, True, True)
+    test.test_parallel_inference(1, 2, 1, False, False)
+    test.test_parallel_inference(1, 2, 1, False, True)
+    test.test_parallel_inference(1, 2, 1, True, False)
+    test.test_parallel_inference(1, 2, 1, True, True)
+    test.test_parallel_inference(1, 2, 2, False, False)
+    test.test_parallel_inference(1, 2, 2, False, True)
+    test.test_parallel_inference(1, 2, 2, True, False)
+    test.test_parallel_inference(1, 2, 2, True, True)
+    test.test_parallel_inference(2, 1, 1, False, False)
+    test.test_parallel_inference(2, 1, 1, False, True)
+    test.test_parallel_inference(2, 1, 1, True, False)
+    test.test_parallel_inference(2, 1, 1, True, True)
+    test.test_parallel_inference(2, 1, 2, False, False)
+    test.test_parallel_inference(2, 1, 2, False, True)
+    test.test_parallel_inference(2, 1, 2, True, False)
+    test.test_parallel_inference(2, 1, 2, True, True)
+    test.test_parallel_inference(2, 2, 1, False, False)
+    test.test_parallel_inference(2, 2, 1, False, True)
+    test.test_parallel_inference(2, 2, 1, True, False)
+    test.test_parallel_inference(2, 2, 1, True, True)
+    test.test_parallel_inference(2, 2, 2, False, False)
+    test.test_parallel_inference(2, 2, 2, False, True)
+    test.test_parallel_inference(2, 2, 2, True, False)
+    test.test_parallel_inference(2, 2, 2, True, True)
+    test.test_num_tokens_total()
+    test.test_events()
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     test.teardown_method(None)
     print("~~~")
     print("success.")
