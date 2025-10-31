@@ -4,13 +4,11 @@
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 
-from megatron.core.extensions.transformer_engine import (
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 try:
     import transformer_engine.pytorch.cpp_extensions as tex
@@ -19,7 +17,6 @@ try:
         gather_along_first_dim,
         reduce_scatter_along_first_dim,
     )
-
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
@@ -42,7 +39,7 @@ def _te_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float):
     return out.to(x.dtype)
 
 
-class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
+class InferenceLayerNormColumnParallelLinear(torch.nn.Module):
     """
     Inference optimized version of TELayerNormColumnParallelLinear.
     """
@@ -63,19 +60,26 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         assert HAVE_TE, "--use-inference-optimized-layers requires transformer engine"
-        super().__init__(
-            input_size,
-            output_size,
-            config=config,
-            init_method=init_method,
-            gather_output=gather_output,
-            bias=bias,
-            skip_bias_add=skip_bias_add,
-            is_expert=is_expert,
-            skip_weight_param_allocation=skip_weight_param_allocation,
-            tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group,
+        super().__init__()
+        self.tp_group = get_tensor_model_parallel_group_if_none(
+            tp_group, is_expert=is_expert
         )
+        self.tp_size = dist.get_world_size(self.tp_group)
+        assert output_size % self.tp_size == 0, (
+            f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
+        )
+        
+        self.weight = torch.nn.Parameter(
+            torch.empty(output_size // self.tp_size, input_size,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype)
+        )
+        self.layer_norm_weight = torch.nn.Parameter(
+            torch.empty(input_size, 
+                        device=torch.cuda.current_device(), 
+                        dtype=config.params_dtype)
+        )
+        self.eps = config.layernorm_epsilon
 
         if self.tp_size > 1:
             assert (
@@ -104,7 +108,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return self._inference_forward(x), None
 
 
-class InferenceRowParallelLinear(TERowParallelLinear):
+class InferenceRowParallelLinear(torch.nn.Module):
     """
     Inference optimized version of TERowParallelLinear.
     """
@@ -123,19 +127,22 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        super().__init__(
-            input_size,
-            output_size,
-            config=config,
-            init_method=init_method,
-            bias=bias,
-            input_is_parallel=input_is_parallel,
-            skip_bias_add=skip_bias_add,
-            is_expert=is_expert,
-            tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group,
+        assert HAVE_TE, "--use-inference-optimized-layers requires transformer engine"
+        super().__init__()
+        self.tp_group = get_tensor_model_parallel_group_if_none(
+            tp_group, is_expert=is_expert
         )
-
+        self.tp_size = dist.get_world_size(self.tp_group)
+        assert input_size % self.tp_size == 0, (
+            f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
+        )
+        
+        self.weight = torch.nn.Parameter(
+            torch.empty(output_size, input_size // self.tp_size,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype)
+        )
+ 
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
