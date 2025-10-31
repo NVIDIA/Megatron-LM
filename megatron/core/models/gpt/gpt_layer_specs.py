@@ -4,7 +4,11 @@ import warnings
 from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider, InferenceSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    InferenceSpecProvider,
+    LocalSpecProvider,
+)
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
@@ -37,9 +41,7 @@ try:
     import transformer_engine as te  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
-    from megatron.core.extensions.transformer_engine_spec_provider import (
-        TESpecProvider,
-    )
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
     HAVE_TE = True
 except ImportError:
@@ -70,15 +72,21 @@ except ImportError:
     LNImpl = WrappedTorchNorm
     HAVE_APEX = False
 
+
 def get_gpt_layer_with_inference_spec(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
-    normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
+    """Use this spec to use inference optimized linear layers.
+    Args:
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+    """
     assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
     backend = InferenceSpecProvider()
-    
+
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
         num_experts=None,
@@ -159,8 +167,6 @@ def get_gpt_layer_with_inference_spec(
                 },
             ),
         )
-
-    
 
 
 def get_gpt_layer_with_transformer_engine_spec(

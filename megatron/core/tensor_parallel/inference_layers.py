@@ -17,6 +17,7 @@ try:
         gather_along_first_dim,
         reduce_scatter_along_first_dim,
     )
+
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
@@ -59,29 +60,28 @@ class InferenceLayerNormColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        assert HAVE_TE, "--use-inference-optimized-layers requires transformer engine"
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__()
-        self.tp_group = get_tensor_model_parallel_group_if_none(
-            tp_group, is_expert=is_expert
-        )
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
-        assert output_size % self.tp_size == 0, (
-            f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
-        )
-        
-        # Parameter names "weight"  and "layer_norm_weight" are kept the 
+        assert (
+            output_size % self.tp_size == 0
+        ), f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
+
+        # Parameter names "weight"  and "layer_norm_weight" are kept the
         # same as in TELayerNormColumnParallelLinear for compatibility with
         # loading pretrained checkpoints.
-        
+
         self.weight = torch.nn.Parameter(
-            torch.empty(output_size // self.tp_size, input_size,
-                        device=torch.cuda.current_device(),
-                        dtype=config.params_dtype)
+            torch.empty(
+                output_size // self.tp_size,
+                input_size,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
         )
         self.layer_norm_weight = torch.nn.Parameter(
-            torch.empty(input_size, 
-                        device=torch.cuda.current_device(), 
-                        dtype=config.params_dtype)
+            torch.empty(input_size, device=torch.cuda.current_device(), dtype=config.params_dtype)
         )
         self.eps = config.layernorm_epsilon
 
@@ -92,6 +92,9 @@ class InferenceLayerNormColumnParallelLinear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        """
         x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
         if self.tp_size > 1:
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
@@ -118,26 +121,27 @@ class InferenceRowParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        assert HAVE_TE, "--use-inference-optimized-layers requires transformer engine"
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__()
-        self.tp_group = get_tensor_model_parallel_group_if_none(
-            tp_group, is_expert=is_expert
-        )
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
-        assert input_size % self.tp_size == 0, (
-            f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
-        )
-        
-        # Parameter name "weight" is kept the 
+        assert (
+            input_size % self.tp_size == 0
+        ), f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
+
+        # Parameter name "weight" is kept the
         # same as in TERowParallelLinear for compatibility with
         # loading pretrained checkpoints.
 
         self.weight = torch.nn.Parameter(
-            torch.empty(output_size, input_size // self.tp_size,
-                        device=torch.cuda.current_device(),
-                        dtype=config.params_dtype)
+            torch.empty(
+                output_size,
+                input_size // self.tp_size,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
         )
- 
+
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
@@ -145,6 +149,9 @@ class InferenceRowParallelLinear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        """
         x = torch.matmul(x, self.weight.t())
         if self.tp_size > 1:
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)

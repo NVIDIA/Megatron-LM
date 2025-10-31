@@ -23,19 +23,18 @@ except ImportError:
     HAVE_APEX = False
 
 from megatron.core.extensions.transformer_engine import (
-    TELinear,
+    TEActivationOp,
     TEColumnParallelLinear,
     TEDotProductAttention,
-    TEActivationOp,
-    TENorm
+    TELinear,
+    TENorm,
 )
-
 from megatron.core.tensor_parallel.inference_layers import (
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
-
 from megatron.core.utils import is_te_min_version
+
 
 class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""

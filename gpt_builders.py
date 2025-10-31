@@ -98,7 +98,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
     return model
 
 
-def _get_transformer_layer_spec(use_te, config) :
+def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
 
     Args:
@@ -118,7 +118,7 @@ def _get_transformer_layer_spec(use_te, config) :
             args.multi_latent_attention,
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
-            use_kitchen=config.use_kitchen
+            use_kitchen=config.use_kitchen,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
