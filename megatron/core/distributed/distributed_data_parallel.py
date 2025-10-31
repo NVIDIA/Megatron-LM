@@ -582,3 +582,46 @@ class DistributedDataParallel(_BaseDataParallel):
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
                 group=data_parallel_group,
             )
+
+    def clip_local_gradients(self, max_norm: float) -> float:
+        """Clip local (pre-DP-sync) gradients to `max_norm` L2 on this rank.
+
+        - Computes the L2 norm across all grad buffers owned by this rank
+          (including expert-parallel buffers if present).
+        - Scales in-place when the norm exceeds `max_norm`.
+
+        Returns:
+            float: the computed local L2 norm (before clipping).
+        """
+        if max_norm is None or max_norm <= 0:
+            return 0.0
+
+        # Accumulate squared L2 over all buffers (handle dtype promotion).
+        total_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
+
+        def _accumulate_sq(buf_list):
+            nonlocal total_sq
+            for buf in buf_list:
+                # buf.grad_data is a flat 1-D tensor representing gradients for this buffer
+                # Accumulate in fp32 for numerical stability
+                grad_fp32 = buf.grad_data.float()
+                total_sq += torch.sum(grad_fp32 * grad_fp32)
+
+        _accumulate_sq(self.buffers)
+        _accumulate_sq(self.expert_parallel_buffers)
+
+        total_norm = torch.sqrt(total_sq).item()
+
+        # Compute clip coeff and scale if needed
+        denom = (total_norm + 1e-6)
+        clip_coeff = max_norm / denom if denom > 0 else 1.0
+        if clip_coeff < 1.0:
+            def _scale(buf_list):
+                for buf in buf_list:
+                    buf.grad_data.mul_(clip_coeff)
+
+            _scale(self.buffers)
+            _scale(self.expert_parallel_buffers)
+
+        return total_norm
+
