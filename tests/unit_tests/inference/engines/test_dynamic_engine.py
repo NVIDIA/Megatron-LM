@@ -72,8 +72,6 @@ class DynamicEngineTestConfig:
 
     context_active_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
-    context_buffer_guaranteed_fraction: float = 0.01
-    context_buffer_overflow_factor: Optional[float] = None
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -104,13 +102,6 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
-
-        # Update overrides if not using overflow factor.
-        if self.context_buffer_overflow_factor is None:
-
-            # Enough room for all tokens.
-            if self.context_max_tokens is None:
-                self.context_max_tokens = self.num_requests * self.max_sequence_length
 
 
 @dataclass

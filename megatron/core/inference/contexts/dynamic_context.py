@@ -211,7 +211,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             is 2x this value, with the the other half of the buffer reserved for
             paused requests that live on the CPU.
         max_tokens (int): Max number of tokens to use for forward passes. This is
-            primarily limited by prefill activation memory usage.
+            primarily limited by prefill activation memory usage. (Defaults to
+            16384).
         block_size_tokens (int): Size of KV cache block size.
         tensor_model_parallel_size (Optional[int]): Tensor model parallel size.
         num_cuda_graphs (Optional[int]): Maximum number of cuda graphs to capture,
@@ -230,6 +231,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         If None, defaults to using flash-infer if available.
     """
 
+    DEFAULT_MAX_TOKENS = 16384
+    TOKEN_ROUNDER = 64
+    REQUEST_ROUNDER = 4
+
     def __init__(
         self,
         *,
@@ -239,7 +244,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads: int,
         max_sequence_length: int,
         active_buffer_size_gb: float,
-        max_tokens: int = 16384,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
         cache_mla_latent: bool = False,
@@ -297,7 +302,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_total_requests, max_active_requests, max_tokens.
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
         self.max_active_requests = self.block_allocator.active_count
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+        # >>>
+        # pax({"DEFAULT_MAX_TOKENS": self.DEFAULT_MAX_TOKENS}, "max_tokens", {"max_tokens'": self.max_tokens})
+        # <<<
 
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
@@ -484,9 +492,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
             % (get_mem_size_str(active_buffer_size_bytes), self.block_allocator.active_count)
         )
-
-    TOKEN_ROUNDER = 64
-    REQUEST_ROUNDER = 4
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):

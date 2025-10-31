@@ -420,9 +420,7 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
-            # >>> [ problematic ]
             inference_context.append_key_value_cache(self.layer_number, key, value)
-            # <<<
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
             if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
@@ -619,9 +617,6 @@ class Attention(MegatronModule, ABC):
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
-                    # >>>
-                    # pax("flash_attn_args")
-                    # <<<
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
