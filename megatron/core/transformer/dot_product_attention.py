@@ -117,7 +117,7 @@ class DotProductAttention(MegatronModule):
             self.softmax_offset = None
         elif self.config.softmax_type == "off-by-one":
             self.softmax_offset = torch.zeros(
-                self.num_attention_heads_per_partition, 
+                self.num_attention_heads_per_partition,
                 device=torch.cuda.current_device(),
                 dtype=self.config.params_dtype,
             )
@@ -126,7 +126,7 @@ class DotProductAttention(MegatronModule):
                 "softmax_offset",
                 torch.nn.Parameter(
                     torch.empty(
-                        self.num_attention_heads_per_partition, 
+                        self.num_attention_heads_per_partition,
                         device=torch.cuda.current_device(),
                         dtype=self.config.params_dtype,
                     )
