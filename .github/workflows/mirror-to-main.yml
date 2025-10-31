@@ -109,7 +109,7 @@ jobs:
           gh pr create \
             --base main \
             --head "$TARGET_BRANCH" \
-            --title "cp: \`$PR_TITLE ($PR_ID)\` into \`main\`" \
+            --title "cp: \`$PR_TITLE ($PR_NUMBER)\` into \`main\`" \
             --body "[🤖]: Hi @$PR_AUTHOR 👋<br><br>We've cherry-picked \`$PR_TITLE (#$PR_NUMBER)\` into \`main\` for you! 🚀<br><br>Please review and approve this cherry-pick at your convenience!" \
             --label "cherry-pick" \
             --reviewer "$PR_AUTHOR"
