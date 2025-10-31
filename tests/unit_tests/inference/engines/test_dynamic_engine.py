@@ -427,10 +427,7 @@ class TestDynamicInferenceEngine:
     def test_overflow_factor(self) -> None:
         """Test overflow factor arg."""
         # Run test.
-        env = self._run_test(
-            context_buffer_overflow_factor=0.1,
-            context_max_tokens=None,
-        )
+        env = self._run_test(context_buffer_overflow_factor=0.1, context_max_tokens=None)
 
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_requests == 420

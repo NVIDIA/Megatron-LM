@@ -433,9 +433,7 @@ class TestDynamicContext:
         )
         dynamic_context.request_to_kv_block_ids[3][
             1
-        ] = (
-            dynamic_context.block_allocator.total_avail
-        )  # Assign one extra block  to request 3.
+        ] = dynamic_context.block_allocator.total_avail  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
         # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
         dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
@@ -522,7 +520,7 @@ class TestDynamicContext:
                     [-1, -1, -1, -1],
                     [-1, -1, -1, -1],
                     [-1, -1, -1, -1],
-               ]
+                ]
             )
         )
 
