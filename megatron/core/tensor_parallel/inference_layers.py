@@ -22,7 +22,7 @@ except ImportError:
     HAVE_TE = False
 
 
-def _te_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float):
+def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
@@ -69,6 +69,10 @@ class InferenceLayerNormColumnParallelLinear(torch.nn.Module):
             f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
         )
         
+        # Parameter names "weight"  and "layer_norm_weight" are kept the 
+        # same as in TELayerNormColumnParallelLinear for compatibility with
+        # loading pretrained checkpoints.
+        
         self.weight = torch.nn.Parameter(
             torch.empty(output_size // self.tp_size, input_size,
                         device=torch.cuda.current_device(),
@@ -87,25 +91,12 @@ class InferenceLayerNormColumnParallelLinear(torch.nn.Module):
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
     @torch.no_grad()
-    def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
-        # make x 2D but restore original shape at the end
-
-        x = _te_rms_norm(x=x, weight=self.layer_norm_weight, eps=self.eps)
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
         if self.tp_size > 1:
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
         x = torch.matmul(x, self.weight.t())
-        return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward
-        """
-        if self.training:
-            # Training mode -> fallback to TE
-            return super().forward(x)
-        else:
-            return self._inference_forward(x), None
+        return x, None
 
 
 class InferenceRowParallelLinear(torch.nn.Module):
@@ -137,6 +128,10 @@ class InferenceRowParallelLinear(torch.nn.Module):
             f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
         )
         
+        # Parameter name "weight" is kept the 
+        # same as in TERowParallelLinear for compatibility with
+        # loading pretrained checkpoints.
+
         self.weight = torch.nn.Parameter(
             torch.empty(output_size, input_size // self.tp_size,
                         device=torch.cuda.current_device(),
@@ -149,19 +144,8 @@ class InferenceRowParallelLinear(torch.nn.Module):
             ), "--use-inference-optimized-layers requires sequence parallelism"
 
     @torch.no_grad()
-    def _inference_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.matmul(x, self.weight.t())
         if self.tp_size > 1:
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
-        return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward
-        """
-        if self.training:
-            # Training mode -> fallback to TE
-            return super().forward(x)
-        else:
-            # Inference mode -> custom fw pass can be implemented here
-            return self._inference_forward(x), None
+        return x, None
