@@ -706,6 +706,8 @@ class BalancedHybridCPscheduler(BaseScheduler):
                 else:
                     chosen_members = group_members[best_gid]
             else:
+                if best_gid is None:
+                    break
                 chosen_members = group_members[best_gid]
 
             # ---- Step 2 – if we decided to create a fresh group ----------------

@@ -264,10 +264,11 @@ class MockSFTDataset(SFTDataset):
         # force_eod_length = int(tokenizer.force_eod)
 
         if len(tokens) > max_seq_len - force_eod_length:
-            # tokens = tokens[: max_seq_len - force_eod_length]
-            # target = target[: max_seq_len - force_eod_length]
-            tokens = tokens[(-max_seq_len + force_eod_length):]
-            target = target[(-max_seq_len + force_eod_length):]
+            # cut the right side
+            tokens = tokens[: max_seq_len - force_eod_length]
+            target = target[: max_seq_len - force_eod_length]
+            # tokens = tokens[(-max_seq_len + force_eod_length):]
+            # target = target[(-max_seq_len + force_eod_length):]
 
         # padding
         num_tokens = len(tokens) + force_eod_length

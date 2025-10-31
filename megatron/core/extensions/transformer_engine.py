@@ -935,6 +935,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
+        # debugmtl
+        if self.config.hybrid_context_parallel:
+            TEDotProductAttention.cp_stream = {}
+            for i in [2, 4, 8]:
+                TEDotProductAttention.cp_stream[i] = torch.cuda.Stream()
+
         if self.config.deterministic_mode:
             if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:
                 raise RuntimeError(
@@ -1024,9 +1030,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 super().set_context_parallel_group(
                     self.cp_group,
                     torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
+                    TEDotProductAttention.cp_stream[self.cp_group.size()],
                     self.cp_comm_type,
                 )
+                # debugmtl
+                # print("cp_stream is:",TEDotProductAttention.cp_stream)
             # If cp_group is None but local_cp_size is provided,
             # Indicates to turn off CP dynamically
             elif packed_seq_params.local_cp_size is not None:

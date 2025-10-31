@@ -67,9 +67,6 @@ def get_batch(data_iterator, vp_stage=None):
     if args.sft_sequence_packing:
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
-        #debugmtl for debug nan
-        cu_seqlens = torch.cat([cu_seqlens, torch.tensor([1024], device=cu_seqlens.device, dtype=torch.int32)], dim=0)
-        cu_seqlens_padded = torch.cat([cu_seqlens_padded, torch.tensor([1024], device=cu_seqlens_padded.device, dtype=torch.int32)], dim=0)
         
         max_seqlen = int(batch.pop('max_seqlen').item())
         # local_cp_size is None if we disable hybrid-cp
@@ -83,10 +80,9 @@ def get_batch(data_iterator, vp_stage=None):
         packed_seq_params = None
            
            
+    # Debugmtl: 保存batch数据到文本文件 - 保存所有元素
     if not hasattr(get_batch, 'microbatch_counter'):
         get_batch.microbatch_counter = 0
-    print(batch['tokens'])
-    # Debugmtl: 保存batch数据到文本文件 - 保存所有元素
     print_data = False
     if print_data:
         import os
@@ -221,9 +217,6 @@ def loss_func(
 
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
-    
-    #debugmtl: 
-    print(f"loss: {loss.item()}, num_tokens: {num_tokens.item()}")
 
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
@@ -259,8 +252,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
-                for i in [tokens, position_ids, attention_mask, labels, loss_mask, packed_seq_params]:
-                    print(i)
+                #debugmtl
+                # for i in [tokens, position_ids, labels, loss_mask, packed_seq_params]:
+                #     print(f"{i=}")
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )

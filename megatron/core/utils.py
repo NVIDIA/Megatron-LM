@@ -1887,6 +1887,7 @@ def get_thd_batch_on_this_cp_rank(
                     group_size=cp_size
                 )
                 cp_rank = torch.distributed.get_rank(group=cp_group)
+                assert cp_group.size() == cp_size
         else:
             # TODO: debugmtl modify this comments
             # If cp group is provided, it must match the local cp size
@@ -1905,6 +1906,7 @@ def get_thd_batch_on_this_cp_rank(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        local_cp_size=cp_size,
         cp_group=cp_group,
     )
 
@@ -1920,6 +1922,9 @@ def get_thd_batch_on_this_cp_rank(
             if key in {'attention_mask'}:
                 continue
             batch[key] = data.index_select(1, index)
+
+    # debugmtl
+    # print(packed_seq_params)
 
     return batch, packed_seq_params
 
