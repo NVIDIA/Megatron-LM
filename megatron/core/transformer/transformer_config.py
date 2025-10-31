@@ -1543,11 +1543,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"the number of layers ({self.num_layers})"
                 )
 
-        if self.use_inference_optimized_layers:
+        if self.transformer_impl == "inference_optimized":
             assert self.normalization == "RMSNorm"
             assert not self.layernorm_zero_centered_gamma
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
+            assert not self.use_kitchen
 
 
 @dataclass
