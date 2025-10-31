@@ -35,9 +35,15 @@ jobs:
           set -x
 
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}
-          HAS_MIRROR_MAIN_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "mirror-to-main")') || echo "false"
+          BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
+          HAS_MIRROR_MAIN_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "mirror-to-main")' || echo "false")
           TARGET_BRANCH="cp/$PR_NUMBER-into-main"
+
+          # Skip if not labeled with mirror-to-main
+          if [ "$HAS_MIRROR_MAIN_LABEL" != "true" ]; then
+            echo "PR is not labeled with mirror-to-main, will not mirror to main."
+            exit 0
+          fi
 
           # Skip if not targeting dev
           if [ "$BASE_REF" != "dev" ]; then
@@ -80,16 +86,19 @@ jobs:
 
           # Cherry-pick commits
           if ! git cherry-pick "$START_COMMIT..$END_COMMIT"; then
-
             # Comment on the original PR about the failure
-            gh pr comment $PR_NUMBER --body "❌ **Cherry-pick to main failed**
+            COMMENT_BODY=$(cat <<'EOF'
+          ❌ **Cherry-pick to main failed**
 
-            The automated cherry-pick encountered conflicts and could not be completed automatically.
+          The automated cherry-pick encountered conflicts and could not be completed automatically.
 
-            **Next steps:**
-            1. Manually create a PR with these changes to main
-            2. Resolve any conflicts"
+          **Next steps:**
+          1. Manually create a PR with these changes to main
+          2. Resolve any conflicts
+          EOF
+            )
 
+            gh pr comment $PR_NUMBER --body "$COMMENT_BODY"
             exit 1
           fi
 
