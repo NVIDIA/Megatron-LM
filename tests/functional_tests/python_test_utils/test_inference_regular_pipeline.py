@@ -41,7 +41,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
 
         # 10% is empirically observed to be within hardware variance.
         assert (
-            output_current["throughput"] >= 0.9 * output_groundtruth["throughput"]
+            throughput_sampled >= 0.9 * output_groundtruth["throughput"]
         ), f"Throughput is slower than expected! Expected to be within 10% of ~{output_groundtruth['throughput']} tok/s but benchmarked {output_current['throughput']} tok/s"
 
         # If throughput is significantly improved (> 20%), update golden values accordingly.
