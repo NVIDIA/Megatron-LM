@@ -11,12 +11,12 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-from megatron.training import get_args
-from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
+    from megatron.training import get_args
+    from megatron.training.dist_signal_handler import DistributedSignalHandler
 
     if dataset is None:
         return None
