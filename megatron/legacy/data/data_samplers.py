@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from megatron.training import get_args
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-
+from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
@@ -58,12 +58,16 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         raise Exception('{} dataloader type is not supported.'.format(
                 args.dataloader_type))
 
+    def worker_init_fn(_):
+        DistributedSignalHandler(args.exit_signal).__enter__()
+    maybe_worker_init_fn = worker_init_fn if args.exit_signal_handler and args.num_workers > 0 else None
     # Torch dataloader.
     return torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=args.num_workers,
                                        pin_memory=True,
                                        persistent_workers=True if args.num_workers > 0 else False,
+                                       worker_init_fn=maybe_worker_init_fn,
                                        )
 
 class MegatronPretrainingSampler:
