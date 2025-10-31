@@ -21,8 +21,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -1074,18 +1073,10 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
 
-    def _get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
-
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
-        divisor = self._get_align_size_for_quantization()
+        divisor = get_align_size_for_quantization(self.config)
         padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(

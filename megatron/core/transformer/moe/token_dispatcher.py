@@ -8,8 +8,6 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
@@ -33,6 +31,7 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
+    get_align_size_for_quantization,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -203,14 +202,6 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
-
-    def get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -624,7 +615,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if self.config.moe_router_padding_for_quantization:
-            pad_multiple = self.get_align_size_for_quantization()
+            pad_multiple = get_align_size_for_quantization(self.config)
             if is_experimental_enabled() and self.config.moe_permute_fusion:
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
@@ -1047,8 +1038,8 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        if self.config.fp8:
-            self.pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        if self.config.fp8 or self.config.fp4:
+            self.pad_multiple = get_align_size_for_quantization(self.config)
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
@@ -1269,7 +1260,7 @@ class _DeepepManager(_DispatchManager):
         """
         Pad the routing map to the nearest multiple of the pad_multiple.
         """
-        pad_multiple = self.get_align_size_for_quantization()
+        pad_multiple = get_align_size_for_quantization(self.config)
 
         num_input_tokens = routing_map.shape[0]
         target_tokens_per_expert = (
@@ -1331,14 +1322,6 @@ class _DeepepManager(_DispatchManager):
             fused=self.permute_fusion,
         )
         return hidden_states
-
-    def get_align_size_for_quantization(self):
-        """Get the alignment size for quantization."""
-        if self.config.fp8:
-            return get_fp8_align_size(self.config.fp8_recipe)
-        elif self.config.fp4:
-            return get_fp4_align_size(self.config.fp4_recipe)
-        return 16
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
