@@ -250,50 +250,53 @@ class TestMultiTokenPrediction:
     def get_packed_batch(self, seq_lengths, micro_batch_size):
         """
         Create a packed sequence batch with multiple sequences of varying lengths.
-        
+
         Args:
             seq_lengths: List of sequence lengths (e.g., [10, 15, 8] for 3 sequences)
             micro_batch_size: Batch size (typically 1 for packed sequences)
-        
+
         Returns:
             batch: Dictionary containing packed sequences and PackedSeqParams
         """
         total_seq_length = sum(seq_lengths)
-        
+
         # Create packed input_ids, labels, and position_ids
         input_ids_list = []
         labels_list = []
         position_ids_list = []
-        
+
         for seq_len in seq_lengths:
             data = list(range(seq_len))
             input_ids_list.extend(data)
             labels_list.extend([x + 1 for x in data])
             position_ids_list.extend(data)
-        
+
         # Convert to tensors with shape [batch, total_seq_length]
         input_ids = torch.tensor(input_ids_list, dtype=torch.int64).unsqueeze(0).cuda()
         labels = torch.tensor(labels_list, dtype=torch.int64).unsqueeze(0).cuda()
         position_ids = torch.tensor(position_ids_list, dtype=torch.int64).unsqueeze(0).cuda()
-        
+
         # Create attention mask for packed sequences (all ones for simplicity)
-        attention_mask = torch.ones((micro_batch_size, 1, total_seq_length, total_seq_length), dtype=bool).cuda()
-        
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, total_seq_length, total_seq_length), dtype=bool
+        ).cuda()
+
         # Create loss mask with shape [batch, total_seq_length]
         loss_mask = torch.ones(micro_batch_size, total_seq_length).cuda()
-        
+
         # Create cumulative sequence lengths for PackedSeqParams
-        cu_seqlens = torch.tensor([0] + [sum(seq_lengths[:i+1]) for i in range(len(seq_lengths))], 
-                                  dtype=torch.int32).cuda()
-        
+        cu_seqlens = torch.tensor(
+            [0] + [sum(seq_lengths[: i + 1]) for i in range(len(seq_lengths))], dtype=torch.int32
+        ).cuda()
+
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max(seq_lengths),
             max_seqlen_kv=max(seq_lengths),
-            qkv_format='thd'
+            qkv_format='thd',
         )
-        
+
         batch = {
             'tokens': input_ids,
             'labels': labels,
@@ -473,13 +476,13 @@ class TestMultiTokenPrediction:
         # Create args with packed sequences support
         seq_lengths = [8, 12, 6]  # Three sequences of different lengths
         total_seq_length = sum(seq_lengths)
-        
+
         args = self.create_test_args(tp, cp, total_seq_length, micro_batch_size=1)
         set_args(args)
-        
+
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        
+
         # Get packed batch
         batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
         tokens = batch['tokens']
@@ -488,12 +491,12 @@ class TestMultiTokenPrediction:
         attention_mask = batch['attention_mask']
         position_ids = batch['position_ids']
         packed_seq_params = batch['packed_seq_params']
-        
+
         # Create model
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             self.model_provider, ModelType.encoder_or_decoder
         )
-        
+
         # Forward pass with packed sequences
         output = gpt_model[0].forward(
             input_ids=tokens,
@@ -503,22 +506,22 @@ class TestMultiTokenPrediction:
             loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
         )
-        
+
         # Verify output shape
         assert output.shape[0] == 1  # batch size
         assert output.shape[1] == total_seq_length
-        
+
         # Verify MTP loss was computed
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker
         mtp_loss = tracker['values'].clone()
         assert mtp_loss.shape[0] == args.mtp_num_layers
         MTPLossLoggingHelper.clean_loss_in_tracker()
-        
+
         # Backward pass
         loss = output.mean()
         loss.backward()
-        
+
         # Verify gradients exist
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
@@ -528,40 +531,40 @@ class TestMultiTokenPrediction:
         # Test case 1: Simple packed sequences
         tensor = torch.tensor([1, 2, 3, 4, 5], dtype=torch.float32).cuda()
         cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32).cuda()
-        
+
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=3,
             max_seqlen_kv=3,
-            qkv_format='thd'
+            qkv_format='thd',
         )
-        
+
         # Roll by -1 (shift left)
         rolled, sum_val = roll_tensor(
             tensor, shifts=-1, dims=0, cp_group=None, packed_seq_params=packed_seq_params
         )
-        
+
         # Expected: [2, 3, 0, 5, 0] - boundaries at indices 2 and 4 are zeroed
         expected = torch.tensor([2, 3, 0, 5, 0], dtype=torch.float32).cuda()
         assert torch.allclose(rolled, expected), f"Expected {expected}, got {rolled}"
-        
+
         # Test case 2: Multiple sequences
         tensor = torch.tensor([10, 20, 30, 40, 50, 60], dtype=torch.float32).cuda()
         cu_seqlens = torch.tensor([0, 2, 5, 6], dtype=torch.int32).cuda()
-        
+
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=3,
             max_seqlen_kv=3,
-            qkv_format='thd'
+            qkv_format='thd',
         )
-        
+
         rolled, sum_val = roll_tensor(
             tensor, shifts=-1, dims=0, cp_group=None, packed_seq_params=packed_seq_params
         )
-        
+
         # Expected: [20, 0, 40, 50, 0, 0] - boundaries at 1, 4, 5 are zeroed
         expected = torch.tensor([20, 0, 40, 50, 0, 0], dtype=torch.float32).cuda()
         assert torch.allclose(rolled, expected), f"Expected {expected}, got {rolled}"

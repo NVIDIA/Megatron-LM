@@ -120,7 +120,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     For CP=1 (default behavior): Uses standard torch.roll with zero padding
     For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
     boundary elements between adjacent CP ranks to maintain sequence continuity.
-    
+
     For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
     from different sequences.
 
@@ -138,7 +138,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        
+
         # Handle packed sequences: zero out positions at sequence boundaries
         if packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None:
             # cu_seqlens_q contains cumulative sequence lengths [0, len1, len1+len2, ...]
@@ -158,22 +158,23 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         else:
             # For non-packed sequences, just zero out the boundary position
             rolled_tensor.select(dims, shifts).fill_(0)
-        
+
         return rolled_tensor, rolled_tensor.sum()
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
     # This matches the batch splitting logic in get_batch_on_this_cp_rank() function
-    
+
     # Note: When using packed sequences with CP, we need to be careful about sequence boundaries
     # The current implementation handles CP boundaries but may need additional logic for
     # packed sequence boundaries within CP chunks
     if packed_seq_params is not None:
         import warnings
+
         warnings.warn(
             "Using packed sequences with Context Parallelism (CP > 1) in MTP. "
             "Ensure sequence boundaries are properly handled within CP chunks."
         )
-    
+
     tensor_list = tensor.chunk(2, dim=dims)
     rolled_tensor_list = []
     for i in range(len(tensor_list)):
@@ -548,10 +549,18 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
         input_ids, _ = roll_tensor(
-            input_ids, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
+            input_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=self.cp_group,
+            packed_seq_params=packed_seq_params,
         )
         position_ids, _ = roll_tensor(
-            position_ids, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params
+            position_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=self.cp_group,
+            packed_seq_params=packed_seq_params,
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
