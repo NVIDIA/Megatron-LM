@@ -37,7 +37,6 @@ RUN unset PIP_CONSTRAINT && pip install --no-cache-dir debugpy dm-tree torch_tb_
     tiktoken flask-restful \
     nltk wrapt pytest pytest_asyncio pytest-cov pytest_mock pytest-random-order \
     black==24.4.2 isort==5.13.2 flake8==7.1.0 pylint==3.2.6 coverage mypy \
-    one-logger --index-url https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple \
     setuptools==69.5.1
 
 # =========================
