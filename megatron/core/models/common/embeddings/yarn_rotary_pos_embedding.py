@@ -243,9 +243,10 @@ def _yarn_get_concentration_factor(
 
 
 def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> float:
-    fields = ["yarn_rotary_scaling_factor", "yarn_mscale", "yarn_mscale_all_dim"]
-    if all(hasattr(config, f) for f in fields):
+    if hasattr(config, "yarn_rotary_scaling_factor"):
         return _yarn_get_concentration_factor(
-            config.yarn_rotary_scaling_factor, config.yarn_mscale, config.yarn_mscale_all_dim
+            config.yarn_rotary_scaling_factor,
+            getattr(config, "yarn_mscale", None),
+            getattr(config, "yarn_mscale_all_dim", None),
         )
     return 1.0
