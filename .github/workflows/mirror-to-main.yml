@@ -111,6 +111,6 @@ jobs:
             --head "$TARGET_BRANCH" \
             --title "cp PR #$PR_NUMBER from dev: \`$PR_TITLE\`" \
             --body "[🤖]: Hi @$PR_AUTHOR 👋<br><br>We've cherry-picked \`$PR_TITLE (#$PR_NUMBER)\` into \`main\` for you! 🚀<br><br>Please review and approve this cherry-pick at your convenience!" \
-            --label "cherry-picked-from-dev" \
+            --label "cherry-pick" \
             --reviewer "$PR_AUTHOR"
 
