@@ -277,7 +277,10 @@ def apply_rotary_pos_emb(
                 )
                 use_unfused = True
             if mscale != 1.0:
-                warnings.warn(f"mscale={mscale} is not supported by TE's fused RoPE. Using unfused implementation.")
+                warnings.warn(
+                    f"mscale={mscale} is not supported by TE's fused RoPE. "
+                    "Using unfused implementation."
+                )
                 use_unfused = True
             if not use_unfused:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
