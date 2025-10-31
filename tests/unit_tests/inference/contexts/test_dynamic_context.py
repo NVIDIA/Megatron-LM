@@ -40,7 +40,7 @@ class TestDynamicContext:
         kv_channels,
         num_attention_heads,
         max_sequence_length,
-        buffer_size_gb,
+        active_buffer_size_gb,
         block_size_tokens,
         buffer_guarenteed_fraction,
         buffer_overflow_factor,
@@ -55,12 +55,8 @@ class TestDynamicContext:
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
-            buffer_size_gb=buffer_size_gb,
-            buffer_guaranteed_fraction=buffer_guarenteed_fraction,
+            active_buffer_size_gb=active_buffer_size_gb,
             block_size_tokens=block_size_tokens,
-            buffer_overflow_factor=buffer_overflow_factor,
-            max_requests_override=max_requests_override,
-            max_tokens_override=max_tokens_override,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
         )
@@ -80,7 +76,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -88,11 +84,12 @@ class TestDynamicContext:
             buffer_overflow_factor=None,
         )
 
-        assert dynamic_context.gtd_block_count == 48
-        assert dynamic_context.gtd_request_count == 12
-        assert dynamic_context.block_allocator.block_count_total == 491
-        assert dynamic_context.max_requests == 128
-        assert dynamic_context.max_tokens == 62848
+        assert dynamic_context.block_allocator.total_count == 981
+        assert dynamic_context.block_allocator.active_count == 490
+        assert dynamic_context.block_allocator.paused_count == 490
+        assert dynamic_context.max_total_requests == 980
+        assert dynamic_context.max_active_requests == 490
+        assert dynamic_context.max_tokens == 16384
 
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
@@ -107,8 +104,7 @@ class TestDynamicContext:
             num_attention_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
-            buffer_size_gb=1.0,
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=1.0,
             block_size_tokens=128,
         )
         assert not dynamic_context.is_static_batching()
@@ -123,22 +119,16 @@ class TestDynamicContext:
             num_attention_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
-            buffer_size_gb=1.0,
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=1.0,
             block_size_tokens=128,
         )
-        dynamic_context.block_allocator.block_count_avail = 10
+        dynamic_context.block_allocator.active_count = 10
         assert dynamic_context.block_allocator.is_memory_available(10)
         assert not dynamic_context.block_allocator.is_memory_available(11)
 
         assert dynamic_context.block_allocator.is_memory_available(1)
-        dynamic_context.block_allocator.block_count_avail = 0
+        dynamic_context.block_allocator.active_count = 0
         assert not dynamic_context.block_allocator.is_memory_available(1)
-
-        dynamic_context.block_allocator.block_count_avail = 10
-        dynamic_context.gtd_block_count = 5
-        assert dynamic_context.block_allocator.is_memory_available(6)
-        assert not dynamic_context.block_allocator.is_memory_available(6, safe=True)
 
     @pytest.mark.internal
     def test_request_overflow(self):
@@ -151,12 +141,12 @@ class TestDynamicContext:
             num_attention_heads=8,
             max_sequence_length=128,
             num_cuda_graphs=None,
-            buffer_size_gb=0.01,
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=0.01,
             block_size_tokens=32,
         )
+        dynamic_context.max_active_requests //= 2
         with pytest.raises(RequestOverflowError):
-            for i in range(dynamic_context.max_requests + 1):
+            for i in range(dynamic_context.max_active_requests + 1):
                 dynamic_context.add_request(
                     DynamicInferenceRequest(
                         request_id=i,
@@ -178,12 +168,9 @@ class TestDynamicContext:
             num_attention_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
-            buffer_size_gb=0.1,
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=0.1,
             block_size_tokens=128,
-            buffer_overflow_factor=1.0,
-            max_requests_override=2,
-            max_tokens_override=20,  # Setting a very low token limit
+            max_tokens=20,  # Setting a very low token limit
         )
 
         with pytest.raises(TokenOverflowError):
@@ -207,8 +194,7 @@ class TestDynamicContext:
             num_attention_heads=8,
             max_sequence_length=128,
             num_cuda_graphs=None,
-            buffer_size_gb=1.0,
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=1.0,
             block_size_tokens=128,
         )
 
@@ -231,7 +217,7 @@ class TestDynamicContext:
         dynamic_context.token_to_position_in_request.fill_(1)
         dynamic_context.token_to_block_idx.fill_(1)
         dynamic_context.token_to_local_position_within_kv_block.fill_(1)
-        dynamic_context.block_allocator.block_count_avail = 5
+        dynamic_context.block_allocator.active_count = 1023
         dynamic_context.memory_buffer.fill_(1)
         dynamic_context.request_to_kv_block_ids.fill_(1)
 
@@ -258,8 +244,8 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.token_to_block_idx == -1)
         assert torch.all(dynamic_context.token_to_local_position_within_kv_block == 0)
         assert (
-            dynamic_context.block_allocator.block_count_avail
-            == dynamic_context.block_allocator.block_count_total - 1
+            dynamic_context.block_allocator.active_count
+            == dynamic_context.block_allocator.total_count // 2
         )
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
 
@@ -272,7 +258,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -282,18 +268,18 @@ class TestDynamicContext:
 
         assert dynamic_context.block_allocator.allocate_memory_blocks(
             4
-        ).cpu().detach().numpy().tolist() == [486, 487, 488, 489]
-        assert dynamic_context.block_allocator.block_count_avail == 486
+        ).cpu().detach().numpy().tolist() == [976, 977, 978, 979]
+        assert dynamic_context.block_allocator.total_avail == 976
         dynamic_context.block_allocator.release_memory_blocks(
             torch.tensor([488, 489], device='cuda')
         )
-        assert dynamic_context.block_allocator.block_count_avail == 488
+        assert dynamic_context.block_allocator.total_avail == 978
         assert dynamic_context.block_allocator.allocate_memory_blocks(1).item() == 489
-        assert dynamic_context.block_allocator.block_count_avail == 487
+        assert dynamic_context.block_allocator.total_avail == 977
         # Should return None since we allocate more blocks than what we have.
         assert (
             dynamic_context.block_allocator.allocate_memory_blocks(
-                dynamic_context.block_allocator.block_count_avail + 100
+                dynamic_context.block_allocator.total_avail + 100
             )
             == None
         )
@@ -307,7 +293,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -332,13 +318,13 @@ class TestDynamicContext:
         assert dynamic_context.request_query_lengths[0] == context_length
         assert dynamic_context.request_kv_length_offsets[0] == 0
         assert dynamic_context.request_to_kv_block_ids[0].cpu().detach().numpy().tolist() == [
-            488,
-            489,
+            978,
+            979,
             -1,
             -1,
         ]
         assert dynamic_context.request_kv_block_counts[0] == 2
-        assert dynamic_context.request_last_kv_block_id[0] == 489
+        assert dynamic_context.request_last_kv_block_id[0] == 979
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
             dynamic_context.token_to_pos_ids[0:context_length]
@@ -356,13 +342,13 @@ class TestDynamicContext:
             dynamic_context.token_to_block_idx[0:context_length][
                 0 : dynamic_context.block_size_tokens
             ]
-            == 488
+            == 978
         )
         assert torch.all(
             dynamic_context.token_to_block_idx[0:context_length][
                 dynamic_context.block_size_tokens : context_length
             ]
-            == 489
+            == 979
         )
         assert torch.all(
             dynamic_context.token_to_local_position_within_kv_block[0:context_length]
@@ -379,7 +365,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -392,7 +378,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 0
         dynamic_context.total_request_count = 3
         dynamic_context.request_kv_block_counts[0:3] = 1
-        new_block_ids = dynamic_context.block_allocator.allocate_memory_blocks(3, safe=True)
+        new_block_ids = dynamic_context.block_allocator.allocate_memory_blocks(3)
         dynamic_context.request_to_kv_block_ids[0:3, 0] = new_block_ids
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
@@ -416,7 +402,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -438,17 +424,17 @@ class TestDynamicContext:
             )
 
         total_request_count = 10
-        dynamic_context.block_allocator.block_count_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
+        dynamic_context.block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
         dynamic_context.total_request_count = total_request_count
 
         dynamic_context.request_to_kv_block_ids[0:total_request_count, 0] = torch.arange(
-            dynamic_context.block_allocator.block_count_avail,
-            dynamic_context.block_allocator.block_count_avail + 10,
+            dynamic_context.block_allocator.total_avail,
+            dynamic_context.block_allocator.total_avail + 10,
         )
         dynamic_context.request_to_kv_block_ids[3][
             1
         ] = (
-            dynamic_context.block_allocator.block_count_avail
+            dynamic_context.block_allocator.total_avail
         )  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
         # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
@@ -526,17 +512,17 @@ class TestDynamicContext:
             dynamic_context.request_to_kv_block_ids[0:10].cpu()
             == torch.tensor(
                 [
-                    [479, 482, -1, -1],
-                    [480, 479, -1, -1],
-                    [484, 486, -1, -1],
-                    [485, 487, -1, -1],
-                    [483, -1, -1, -1],
-                    [481, -1, -1, -1],
-                    [488, -1, -1, -1],
+                    [969, 972, -1, -1],
+                    [970, 969, -1, -1],
+                    [974, 976, -1, -1],
+                    [975, 977, -1, -1],
+                    [973, -1, -1, -1],
+                    [971, -1, -1, -1],
+                    [978, -1, -1, -1],
                     [-1, -1, -1, -1],
                     [-1, -1, -1, -1],
                     [-1, -1, -1, -1],
-                ]
+               ]
             )
         )
 
@@ -550,7 +536,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -560,12 +546,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 5 requests
         # Allocate 5 blocks for 5 requests
-        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(5, safe=True)
+        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(5)
         dynamic_context.total_request_count = 5
         dynamic_context.paused_request_count = 0
 
         # Record the available blocks before releasing memory
-        initial_available_blocks = dynamic_context.block_allocator.block_count_avail
+        initial_available_blocks = dynamic_context.block_allocator.total_avail
 
         # Assign blocks to the requests (one block per request)
         for i in range(5):
@@ -589,7 +575,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 2
 
         # Verify that 3 blocks were released by checking the available blocks
-        assert dynamic_context.block_allocator.block_count_avail == initial_available_blocks + 3
+        assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 3
 
     @pytest.mark.internal
     def test_finished_requests_with_multiple_blocks(self):
@@ -601,7 +587,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -611,12 +597,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 3 requests, where some use multiple blocks
         # Allocate 6 blocks in total for the requests
-        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(6, safe=True)
+        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(6)
         dynamic_context.total_request_count = 3
         dynamic_context.paused_request_count = 0
 
         # Record the available blocks before releasing memory
-        initial_available_blocks = dynamic_context.block_allocator.block_count_avail
+        initial_available_blocks = dynamic_context.block_allocator.total_avail
 
         # Assign blocks to the requests:
         # - Request 0: 1 block
@@ -653,7 +639,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 0
 
         # Verify that all 6 blocks were released by checking the available blocks
-        assert dynamic_context.block_allocator.block_count_avail == initial_available_blocks + 6
+        assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
 
     @pytest.mark.internal
     def test_calculate_and_store_log_probs(self):
@@ -664,7 +650,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
+            active_buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
             block_size_tokens=128,
             max_requests_override=None,
@@ -886,8 +872,8 @@ class TestDynamicContext:
         gpu_size_gb = (
             torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
         )
-        buffer_size_gb = 20
-        num_contexts = math.ceil(gpu_size_gb / buffer_size_gb) + 1
+        active_buffer_size_gb = 20
+        num_contexts = math.ceil(gpu_size_gb / active_buffer_size_gb) + 1
 
         # Allocate enough contexts to fill GPU memory.
         def init_contexts(*, unified_memory_level):
@@ -900,9 +886,7 @@ class TestDynamicContext:
                         kv_channels=8,
                         num_attention_heads=2,
                         max_sequence_length=512,
-                        buffer_size_gb=buffer_size_gb,
-                        buffer_overflow_factor=1,
-                        buffer_guaranteed_fraction=0,
+                        active_buffer_size_gb=active_buffer_size_gb,
                         unified_memory_level=unified_memory_level,
                     )
                 )
@@ -917,3 +901,20 @@ class TestDynamicContext:
 
         # Unified memory test should succeed.
         init_contexts(unified_memory_level=1)
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+if __name__ == "__main__":
+    test = TestDynamicContext()
+    # test.test_initialize_dynamic_context()
+    # test.test_is_static_batching()
+    # test.test_is_memory_available()
+    # test.test_request_overflow()
+    # test.test_token_overflow_error()
+    # test.test_reset()
+    # test.test_allocate_and_release_memory_blocks()
+    # test.test_add_request()
+    # test.test_update_request()
+    # test.test_release_memory_blocks_for_finished_requests()
+    test.test_finished_requests_with_multiple_blocks()
+    test.test_calculate_and_store_log_probs()
+    test.test_unified_memory()
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

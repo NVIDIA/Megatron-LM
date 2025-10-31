@@ -1429,7 +1429,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_block_counts += 1  # +1 for newly added block
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
             resume_request_count = min(
-                torch.nonzero(paused_chunk_counts_cumsum <= active_chunk_count_avail).numel(),
+                torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
                 self.block_allocator.total_avail,
             )
 
