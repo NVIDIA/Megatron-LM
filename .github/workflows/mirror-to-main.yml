@@ -1,14 +1,12 @@
 name: Mirror Dev to Main
 
 on:
-  pull_request_target:
-    types: [labeled]
+  push:
     branches:
-      - dev
+      - "pull-request/[0-9]+"
 
 jobs:
   cherry-pick-to-main:
-    if: github.event.label.name == 'mirror-to-main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -21,6 +19,10 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Get PR info
+        id: get-pr-info
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Configure Git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -32,8 +34,16 @@ jobs:
         run: |
           set -x
 
-          PR_NUMBER=${{ github.event.pull_request.number }}
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}
+          HAS_MIRROR_MAIN_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "mirror-to-main")') || echo "false"
           TARGET_BRANCH="cp/$PR_NUMBER-into-main"
+
+          # Skip if not targeting dev
+          if [ "$BASE_REF" != "dev" ]; then
+            echo "PR is not targeting dev, will not mirror to main."
+            exit 0
+          fi
 
           # Check if target branch already exists
           if git ls-remote --heads origin "refs/heads/$TARGET_BRANCH" | grep -q .; then
@@ -42,10 +52,10 @@ jobs:
           fi
 
           # Get PR details
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}"
-          SOURCE_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          PR_AUTHOR="${{ fromJSON(steps.get-pr-info.outputs.pr-info).user.login }}"
+          PR_TITLE="${{ fromJSON(steps.get-pr-info.outputs.pr-info).title }}"
+          SOURCE_BRANCH="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.ref }}"
+          SOURCE_REPO="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.repo.full_name }}"
 
           # Fetch all branches
           git fetch origin dev
