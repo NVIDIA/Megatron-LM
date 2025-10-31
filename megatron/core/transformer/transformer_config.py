@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass
@@ -643,11 +643,10 @@ class TransformerConfig(ModelParallelConfig):
     excluding optimizer) is enabled.
     "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
-    cuda_graph_scope: str = "full"
+    cuda_graph_scope: Optional[List[str]] = None
     """Determines the CUDA graphs capturing scope.
-    When cuda_graph_impl is set to "transformer_engine", valid values are "full" and "attn".
-    "Full" scope captures a whole Transformer layer. "Attn" scope only captures operations in
-    TransformerLayer._forward_attention().
+    When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
+    "moe_router", "moe_preprocess", "mamba". None means ["attn", "mlp"].
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
@@ -1394,24 +1393,133 @@ class TransformerConfig(ModelParallelConfig):
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
-            if self.recompute_granularity:
-                if (
-                    self.recompute_granularity != "selective"
-                    or self.cuda_graph_impl != "transformer_engine"
-                    or self.cuda_graph_scope != "attn"
-                ):
-                    raise ValueError("CUDA graphs not supported with activation recomputation.")
+
+            if self.cuda_graph_scope is None:
+                self.cuda_graph_scope = []
+            elif not isinstance(self.cuda_graph_scope, list):
+                assert isinstance(self.cuda_graph_scope, str), (
+                    "cuda_graph_scope must be a string or a list of strings, "
+                    f"got {self.cuda_graph_scope}."
+                )
+                self.cuda_graph_scope = [self.cuda_graph_scope]
+
+            if self.cuda_graph_impl == "local":
+                assert not self.cuda_graph_scope or self.cuda_graph_scope == ["full_iteration"], (
+                    "For local cuda graph implementation, the only valid value "
+                    "for cuda_graph_scope is full_iteration. "
+                    "To use other scopes, use cuda_graph_impl=transformer_engine."
+                )
+
+            if self.cuda_graph_impl == "transformer_engine":
+                assert "full_iteration" not in self.cuda_graph_scope, (
+                    "To use full iteration cuda graph, please use "
+                    "cuda_graph_impl=transformer_engine instead of cuda_graph_impl=local."
+                )
+                for scope in self.cuda_graph_scope:
+                    assert scope in [
+                        'attn',
+                        'mlp',
+                        'moe',
+                        'moe_router',
+                        'moe_preprocess',
+                        'mamba',
+                    ], (
+                        "--cuda-graph-scope should be attn, mlp, moe, moe_router, moe_preprocess, "
+                        f"or mamba, got {self.cuda_graph_scope}."
+                    )
+
+                assert (
+                    'moe' not in self.cuda_graph_scope or 'moe_router' not in self.cuda_graph_scope
+                ), 'cuda_graph_scope must not contain both moe and moe_router.'
+                if 'moe_preprocess' in self.cuda_graph_scope:
+                    assert (
+                        'moe_router' in self.cuda_graph_scope
+                    ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+                if self.num_moe_experts is None or self.num_moe_experts <= 1:
+                    assert (
+                        'moe' not in self.cuda_graph_scope
+                        and 'moe_router' not in self.cuda_graph_scope
+                    ), 'moe cuda graph is only supported for MoE.'
                 else:
-                    for module in self.recompute_modules:
-                        if module in ['core_attn', 'mla_up_proj']:
-                            raise ValueError(
-                                f'attn cuda graph is not supported with {module} recompute.'
-                            )
-                    if "layernorm" in self.recompute_modules:
-                        warnings.warn(
-                            "input_layernorm recompute is not supported with attention "
-                            "cudagraph. Will only recompute the pre_mlp_layernorm."
+                    if self.moe_layer_freq == 1 or (
+                        isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
+                    ):
+                        assert 'mlp' not in self.cuda_graph_scope, (
+                            'mlp cuda graph is only supported for dense layers, '
+                            'but not found in the model.'
                         )
+                    if (
+                        self.moe_expert_capacity_factor is None
+                        or not self.moe_pad_expert_input_to_capacity
+                    ):
+                        assert (
+                            'moe' not in self.cuda_graph_scope
+                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                        if self.moe_token_dispatcher_type == 'alltoall' and (
+                            self.moe_expert_capacity_factor is not None
+                            or self.moe_router_padding_for_fp8
+                        ):
+                            assert 'moe_preprocess' not in self.cuda_graph_scope, (
+                                'moe_preprocess cuda graph is not supported when there are '
+                                'DtoH copies and synchronizations in the preprocess step.'
+                            )
+
+            if self.recompute_granularity:
+                if self.recompute_granularity != "selective" or not self.cuda_graph_scope:
+                    raise ValueError(
+                        "Full-layer CUDA graphs not supported with activation recomputation."
+                    )
+                elif self.cuda_graph_scope != ['full_iteration']:
+                    # For scoped CUDA graphs, only the non-graphed parts of the layer can be
+                    # recomputed. So check if there are overlaps between the recomputed parts
+                    # and the graphed parts.
+                    if "attn" in self.cuda_graph_scope:
+                        for module in self.recompute_modules:
+                            if module in ['core_attn', 'mla_up_proj']:
+                                raise ValueError(
+                                    f'attn cuda graph is not supported with {module} recompute.'
+                                )
+                    if "mlp" in self.cuda_graph_scope and "mlp" in self.recompute_modules:
+                        raise ValueError(f'mlp cuda graph is not supported with mlp recompute.')
+                    if "moe" in self.cuda_graph_scope:
+                        for module in self.recompute_modules:
+                            if module in ['moe_act', 'moe', 'shared_experts']:
+                                raise ValueError(
+                                    f'moe cuda graph is not supported with {module} recompute.'
+                                )
+                    if "moe_router" in self.cuda_graph_scope:
+                        for module in self.recompute_modules:
+                            if module in ['moe', 'shared_experts']:
+                                raise ValueError(
+                                    f'moe_router cuda graph is not supported with {module} '
+                                    'recompute.'
+                                )
+                    if "layernorm" in self.recompute_modules:
+                        if (
+                            "attn" in self.cuda_graph_scope
+                            and "mlp" in self.cuda_graph_scope
+                            and (
+                                "moe" in self.cuda_graph_scope
+                                or "moe_router" in self.cuda_graph_scope
+                            )
+                        ):
+                            raise ValueError(
+                                'cuda graph is not supported with layernorm recompute.'
+                            )
+                        if "attn" in self.cuda_graph_scope:
+                            warnings.warn(
+                                "input_layernorm recompute is not supported with attention "
+                                "cudagraph. Will only recompute the pre_mlp_layernorm."
+                            )
+                        if (
+                            "mlp" in self.cuda_graph_scope
+                            or "moe" in self.cuda_graph_scope
+                            or "moe_router" in self.cuda_graph_scope
+                        ):
+                            warnings.warn(
+                                "pre_mlp_layernorm recompute is not supported with mlp/moe "
+                                "cudagraph. Will only recompute the input_layernorm."
+                            )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
