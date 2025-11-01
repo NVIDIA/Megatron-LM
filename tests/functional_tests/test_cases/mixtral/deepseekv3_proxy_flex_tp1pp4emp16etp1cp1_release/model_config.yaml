@@ -47,8 +47,8 @@ MODEL_ARGS:
   # Data args
   --seq-length: 4096
   --data-cache-path: ${DATA_CACHE_PATH}
-  --tokenizer-type: HuggingFaceTokenizer
-  --tokenizer-model: ${TOKENIZER_PATH}
+  --tokenizer-type: GPTSentencePieceTokenizer
+  --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
   --data-path: $DATA_BLEND
   --split: 99,1,0
   --no-mmap-bin-files: true
