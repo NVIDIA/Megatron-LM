@@ -203,13 +203,14 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=self.config.num_layers,
-                initializer_range=self.config.init_method_std,
+        if self.config.perform_initialization:
+            self.apply(
+                partial(
+                    _init_weights,
+                    n_layer=self.config.num_layers,
+                    initializer_range=self.config.init_method_std,
+                )
             )
-        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
