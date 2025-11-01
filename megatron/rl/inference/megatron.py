@@ -31,6 +31,7 @@ from ..inference.inference_interface import (
     ChatInferenceInterface,
     InferenceRequest,
     InferenceResponse,
+    LLMChatMessage,
     ReturnsRaw,
     ReturnsTokens,
 )
@@ -154,6 +155,15 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _kill_engine: bool = PrivateAttr(False)
 
     async def base_generate(self, request: InferenceRequest):
+
+        if any(isinstance(p, LLMChatMessage) for p in request.prompt):
+            raise ValueError(
+                "MegatronLocal does not support chat requests. Use MegatronChatLocal to apply chat templating."
+            )
+        assert all(
+            isinstance(p, str) for p in request.prompt
+        ), "MegatronLocal only supports string prompts."
+
         tokenizer = get_tokenizer()
 
         sampling_params = SamplingParams(
