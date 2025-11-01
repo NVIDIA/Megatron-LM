@@ -347,10 +347,10 @@ class TransformerConfig(ModelParallelConfig):
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
 
     fp8_recipe: Optional[str] = "delayed"
-    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
+    """If set, enables the use of FP8 precision through Transformer Engine. There are 5 predefined
     choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
-    4) 'blockwise' for blockwise scaling recipe."""
+    4) 'blockwise' for blockwise scaling recipe, 5) 'custom' for custom quantization recipe."""
 
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
@@ -358,6 +358,10 @@ class TransformerConfig(ModelParallelConfig):
     will be converted to fp8; for example, biases will remain unchanged. The parameters affected are
     primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
     determined by TE."""
+
+    fp8_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp8_recipe is custom."""
 
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
@@ -419,6 +423,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, keep the parameters in fp4 precision to save memory. This option must be used
     together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
     will be converted to fp4; for example, biases will remain unchanged."""
+
+    fp4_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp4_recipe is custom."""
 
     ####################
     # MoE related

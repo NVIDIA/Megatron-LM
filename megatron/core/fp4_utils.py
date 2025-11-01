@@ -9,6 +9,7 @@ import torch
 from megatron.core.enums import Fp4Recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+from megatron.core.fp8_utils import _get_custom_recipe
 
 # Check if Transformer Engine is installed
 HAVE_TE = False
@@ -70,9 +71,16 @@ if HAVE_TE:
                         Transformer Engine. Please make sure you are using TE version 
                         >= 2.7.0.dev0."""
                     )
+            elif config.fp4_recipe == Fp4Recipe.custom:
+                if not config.fp4_quantizer_factory:
+                    raise ValueError(
+                        "Python import path, e.g. package.module.quantizer_factory, must be provided "
+                        "via --fp4-quantizer-factory when --fp4-recipe custom is selected."
+                    )
+                fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
             else:
                 raise ValueError(
-                    "NVFP4BlockScaling is the only supported FP4 recipe. "
+                    "NVFP4BlockScaling and custom are the only supported FP4 recipes. "
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:
