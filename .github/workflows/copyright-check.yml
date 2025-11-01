@@ -48,6 +48,9 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Result
         env:
           GH_TOKEN: ${{ github.token }}
