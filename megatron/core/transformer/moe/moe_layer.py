@@ -199,7 +199,7 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
-                if self.config.fp8:
+                if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         self.shared_experts,
                         False,
@@ -278,7 +278,7 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         if self.moe_layer_recompute:
-            if self.config.fp8:
+            if self.config.fp8 or self.config.fp4:
                 output, mlp_bias = te_checkpoint(
                     custom_forward,
                     False,
@@ -300,7 +300,7 @@ class MoELayer(BaseMoELayer):
             self.shared_experts.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
-        """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8."""
+        """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
         # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
         # function will save the original input tensors.
         if self.shared_experts is not None and not self.shared_experts_recompute:
