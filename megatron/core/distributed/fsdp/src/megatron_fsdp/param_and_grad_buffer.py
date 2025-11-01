@@ -101,8 +101,8 @@ def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     message ``s`` since otherwise, it is swallowed.
     """
     if not cond:
-        print(s)
-        traceback.print_stack()
+        logger.error(s)
+        logger.error(''.join(traceback.format_stack()))
         if raise_assertion_error:
             raise AssertionError(s)
 
@@ -212,7 +212,7 @@ class MultiGroupUBRAllocator:
         for group in self.groups[1:]:
             backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
             if torch.distributed.get_rank() == 0:
-                print(
+                logger.info(
                     f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
                     f"group.group_desc:{group.group_desc}"
                 )
