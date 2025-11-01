@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 from argparse import Namespace
+from io import BytesIO
 from pathlib import PosixPath
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ SAFE_GLOBALS = [
     RerunDiagnostic,
     RerunMode,
     RerunState,
+    BytesIO,
 ]
 
 

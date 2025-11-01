@@ -60,11 +60,6 @@ import torch
 import io
 import megatron
 
-torch.serialization.add_safe_globals([io.BytesIO])
-torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
-torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
