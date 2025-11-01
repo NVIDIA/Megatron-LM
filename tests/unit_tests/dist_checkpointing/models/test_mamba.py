@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+# FAILED: torchrun --nproc_per_node=8 -m pytest -s -vv -x tests/unit_tests/dist_checkpointing/models/test_mamba.py::TestMambaReconfiguration::test_parallel_reconfiguration_e2e[True-False-src_tp_pp_exp_cp5-dest_tp_pp_exp_cp5-False]
+
 import pytest
 import torch
 
@@ -130,6 +132,8 @@ class TestMambaReconfiguration:
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
+            if metadata is not None:
+                metadata.pop("dp_cp_group")
 
             # Load checkpoint A with different TP/PP/expert/CP and save as checkpoint B
             # No FPS this time, only FPL
