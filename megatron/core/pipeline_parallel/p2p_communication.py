@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import List, Optional, Tuple, Union
@@ -214,22 +214,22 @@ class P2PCommunicator:
             ops = []
             if send_prev_shape_tensor is not None:
                 send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank
+                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(send_prev_op)
             if recv_prev_shape_tensor is not None:
                 recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank
+                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(recv_prev_op)
             if send_next_shape_tensor is not None:
                 send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank
+                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(send_next_op)
             if recv_next_shape_tensor is not None:
                 recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank
+                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(recv_next_op)
             if len(ops) > 0:
@@ -298,13 +298,13 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        if not config.variable_seq_lengths:
-            recv_prev_shape = tensor_shape
-            recv_next_shape = tensor_shape
-        else:
+        if config.variable_seq_lengths or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
+        else:
+            recv_prev_shape = tensor_shape
+            recv_next_shape = tensor_shape
 
         def create_tensor_recv_prev():
             return torch.empty(
