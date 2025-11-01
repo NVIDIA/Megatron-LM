@@ -18,6 +18,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -384,7 +385,7 @@ class GatedDeltaNet(MegatronModule):
 
         # RMSNorm
         nvtx_range_push(suffix="gated_norm")
-        norm_out = self._torch_compiled_gated_norm(core_attn_out, gate)
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
 
         # Transpose: b s x --> s b x
@@ -399,8 +400,8 @@ class GatedDeltaNet(MegatronModule):
 
         return out, out_bias
 
-    @torch.compile
-    def _torch_compiled_gated_norm(self, x, gate):
+    @jit_fuser
+    def _apply_gated_norm(self, x, gate):
         # Output Norm
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
