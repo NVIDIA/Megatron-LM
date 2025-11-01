@@ -123,6 +123,12 @@ device_mesh[("dp_shard", "cp")]._flatten("dp_shard_cp")
 # Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group.
 device_mesh[("dp_outer", "dp_shard", "cp")]._flatten("hsdp")
 hsdp_group = device_mesh["hsdp"].get_group()
+# Initialize DeviceMesh for expert parallel (EP) modules when using FSDP + EP.
+expert_device_mesh = torch.distributed.device_mesh.init_device_mesh(
+    "cuda",
+    mesh_shape=(expt_dp_shard_size, expt_tp_size),
+    mesh_dim_names=("dp_shard", "tp"),
+)
 
 # Fully-shards your model and distributes your optimizer.
 model, optimizer = fully_shard(
@@ -141,6 +147,8 @@ model, optimizer = fully_shard(
     tp_dim="tp",
     # Only required when using HSDP. Otherwise, set this to None.
     hybrid_fsdp_group=hsdp_group,
+    # Only required for FSDP + EP. Otherwise, set this to None.
+    expt_device_mesh=expt_device_mesh,
     # FSDP Sharding Strategy: no_shard (0) / optim (1) / optim_grads (2) / optim_grads_params (3)
     zero_dp_strategy=3,
     outer_dp_sharding_strategy=1,
@@ -188,6 +196,9 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
   - `tp_dim` is the name of the sub-mesh used for tensor parallelism (TP), which is required for `(FSDP, TP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` TP.
     - For more information about tensor parallelism, refer to: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053).
   - `hybrid_fsdp_group` is the `ProcessGroup` which contains all ranks in the flattened `dp_shard_dim` and `dp_outer_dim` sub-meshes utilized to specify the `(DP-Outer, DP-Shard)` sharded coordinate system for the weight and gradient buffers. Required for HSDP.
+- `expt_device_mesh` is another [`torch.distributed.DeviceMesh`](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh) tailored for the expert parallel (EP) modules in `MegatronFSDP`.
+  - `dp_shard_dim` is the name of the sub-mesh required for FSDP sharding of the EP modules, enabling expert data parallelism (EDP).
+  - `tp_dim` is the name of the sub-mesh used for expert tensor parallelism (ETP), which is required for `(FSDP, ETP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` ETP.
 - `init_model_with_meta_device` has `MegatronFSDP` initialize your `meta`-device model in shards on every CUDA device to avoid OOM when initializing extremely large models that cannot fit on a single device. Users can initialize their model on a [`meta`-device](https://docs.pytorch.org/docs/stable/meta.html) (`with torch.device('meta'): ...`), and ``MegatronFSDP`` will further shard and initialize the model parameters layer-by-layer adhering to the customizable `module.reset_parameters` method, which prevents the entire model from being allocated in memory at any point during runtime.
     - Defaults to `False`.
     - Note that the `device` argument which installs your model on a specific device or rank will be deactivated when `init_model_with_meta_device=True`.
