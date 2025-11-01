@@ -44,7 +44,9 @@ logger = logging.getLogger(__name__)
 def get_static_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible,
+    and default to Mcore backend if the user does not specify any backends.
+    TRTLLMBackend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -84,7 +86,9 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
 def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Get the relevant backend for running inference.
 
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible,
+    and default to Mcore backend if the user does not specify any backends.
+    TRTLLMBackend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -158,7 +162,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         if any(isinstance(p, LLMChatMessage) for p in request.prompt):
             raise ValueError(
-                "MegatronLocal does not support chat requests. Use MegatronChatLocal to apply chat templating."
+                "MegatronLocal does not support chat requests."
+                "Use MegatronChatLocal to apply chat templating."
             )
         assert all(
             isinstance(p, str) for p in request.prompt
