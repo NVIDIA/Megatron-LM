@@ -3,7 +3,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -99,7 +99,7 @@ class RewardEvaluationResult(EvaluationResult):
 T = TypeVar('T', bound=EvaluationResult)
 
 
-class EvaluationResponse[T](AgentBaseModel, TypeLookupable):
+class EvaluationResponse(AgentBaseModel, TypeLookupable, Generic[T]):
     env_id: str | None = None
     results: list[T]
 
