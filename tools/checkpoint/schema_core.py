@@ -11,6 +11,7 @@ def get_core_transformer_block_key(model_key):
     return {
         "GPT" : "decoder",
         "BERT" : "encoder",
+        "Mamba": "decoder"
     }[model_key]
 
 
@@ -70,6 +71,17 @@ class CoreLocalSchema(CoreSchema):
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
 
+            # MambaMixer.
+            "mamba_mixer_norm_weight" : "mamba_mixer.in_proj.layer_norm_weight",
+            "mamba_mixer_in_proj_weight" : "mamba_mixer.in_proj.weight",
+            "mamba_mixer_conv1d_weight" : "mamba_mixer.conv1d.weight",
+            "mamba_mixer_conv1d_bias" : "mamba_mixer.conv1d.bias",
+            "mamba_mixer_out_proj_weight" : "mamba_mixer.out_proj.weight",
+            "mamba_mixer_dt_bias" : "mamba_mixer.dt_bias",
+            "mamba_mixer_A_log" : "mamba_mixer.A_log",
+            "mamba_mixer_D" : "mamba_mixer.D",
+            "mamba_mixer_internal_norm_weight" : "mamba_mixer.norm.weight",  # RMSNorm inside mixer
+
         } | extra_layer_schema, prefix=prefix)
 
 
@@ -94,6 +106,17 @@ class CoreTESchema(CoreSchema):
             "mlp_fc1_bias" : "mlp.linear_fc1.bias",
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
+
+            # MambaMixer.
+            "mamba_mixer_norm_weight" : "mamba_mixer.in_proj.layer_norm_weight",
+            "mamba_mixer_in_proj_weight" : "mamba_mixer.in_proj.weight",
+            "mamba_mixer_conv1d_weight" : "mamba_mixer.conv1d.weight",
+            "mamba_mixer_conv1d_bias" : "mamba_mixer.conv1d.bias",
+            "mamba_mixer_out_proj_weight" : "mamba_mixer.out_proj.weight",
+            "mamba_mixer_dt_bias" : "mamba_mixer.dt_bias",
+            "mamba_mixer_A_log" : "mamba_mixer.A_log",
+            "mamba_mixer_D" : "mamba_mixer.D",
+            "mamba_mixer_internal_norm_weight" : "mamba_mixer.norm.weight",
 
         } | extra_layer_schema, prefix=prefix)
 
