@@ -303,7 +303,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Todo [Siddharth]: can we move this code to another file?
         self.zmq_context = zmq.Context()
-        self.zmq_sockets = []  # keep track of all sockets created by this engine
+        self.zmq_sockets = []  # keep track of all sockets created by this engine.
         ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
         identity = f'tp-coord-{parallel_state.get_data_parallel_rank()}'
         if (
