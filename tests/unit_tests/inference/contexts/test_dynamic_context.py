@@ -875,11 +875,19 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     def test_unified_memory(self):
-        from megatron.core.inference.unified_memory import has_unified_memory
 
-        if not has_unified_memory:
+        from megatron.core.inference.unified_memory import (
+            UnifiedMemoryUnsupportedError,
+            create_unified_mempool,
+        )
+
+        # Check UVM support.
+        try:
+            create_unified_mempool()
+        except UnifiedMemoryUnsupportedError:
             pytest.skip("Unified memory not available due to bad environment.")
 
+        # Setup.
         self._setup_model_parallel_group(1, 1)
 
         # Compute number of contexts needed to fill GPU memory.
