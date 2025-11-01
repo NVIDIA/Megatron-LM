@@ -16,6 +16,7 @@ megatron/core/models/multimodal/
 
 [Hybrid-mamba] @mcore-reviewers/hybrid-mamba
 megatron/core/models/mamba/
+megatron/core/ssm
 
 # Distributed Checkpointing
 [Distributed Checkpointing] @mcore-reviewers/dist-checkpointing
