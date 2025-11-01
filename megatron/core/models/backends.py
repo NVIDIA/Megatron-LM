@@ -22,6 +22,19 @@ except ImportError:
     LNImpl = WrappedTorchNorm
     HAVE_APEX = False
 
+from megatron.core.extensions.transformer_engine import (
+    TEActivationOp,
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TELinear,
+    TENorm,
+)
+from megatron.core.tensor_parallel.inference_layers import (
+    InferenceLayerNormColumnParallelLinear,
+    InferenceRowParallelLinear,
+)
+from megatron.core.utils import is_te_min_version
+
 
 class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
@@ -119,3 +132,51 @@ class LocalSpecProvider(BackendSpecProvider):
     def activation_func(self) -> type:
         """Which module to use for activation function"""
         return None
+
+
+class InferenceSpecProvider(BackendSpecProvider):
+    """A protocol for providing the submodules used in Spec building."""
+
+    def linear(self) -> type:
+        """Which linear module TE backend uses"""
+        return TELinear
+
+    def column_parallel_linear(self) -> type:
+        """Which column parallel linear module TE backend uses"""
+        return TEColumnParallelLinear
+
+    def row_parallel_linear(self) -> type:
+        """Which row parallel linear module TE backend uses"""
+        return InferenceRowParallelLinear
+
+    def fuse_layernorm_and_linear(self) -> bool:
+        """TE backend chooses a single module for layernorm and linear"""
+        return True
+
+    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+        """Which module for sequential layernorm and linear"""
+        return InferenceLayerNormColumnParallelLinear
+
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+        """Which module to use for layer norm"""
+        if for_qk and not is_te_min_version("1.9.0"):
+            # TENorm significantly harms convergence when used
+            # for QKLayerNorm if TE Version < 1.9;
+            # we instead use the Apex implementation.
+            return FusedLayerNorm
+        return TENorm
+
+    def core_attention(self) -> type:
+        """Which module to use for attention"""
+        return TEDotProductAttention
+
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        return TEActivationOp
+
+    def grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
+    ) -> Tuple[type, Optional[MLPSubmodules]]:
+        raise NotImplementedError(
+            "MOE is not supported with inference optimized transformer implementation."
+        )
