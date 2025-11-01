@@ -26,6 +26,11 @@ from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+    HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    HAVE_TORCH_SYMM_MEM = False
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
@@ -537,6 +542,29 @@ class GlobalMemoryBuffer:
                 )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+class GlobalSymmetricMemoryBuffer:
+    """
+    Global symmetric memory buffer used in inference.
+    """
+
+    def __init__(self, size_in_mb, process_group):
+        assert HAVE_TORCH_SYMM_MEM, "PyTorch symmetric memory module not found."
+        numel = int(size_in_mb * 1024 * 1024)  # size in bytes
+        self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
+        self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
+
+    def get_tensor(self, tensor_shape, dtype):
+        """
+        Returns (potentially) a sub-tensor from the self.symm_buffer for the given shape.
+        If the buffer is not large enough, returns None.
+        """
+        size_of_dtype = torch.tensor([], dtype=dtype).element_size()
+        required_len = reduce(operator.mul, tensor_shape, 1) * size_of_dtype
+        if required_len <= self.symm_buffer.numel():
+            return self.symm_buffer[0:required_len].view(dtype).view(*tensor_shape), self.symm_mem_hdl
+        return None, None
+
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
