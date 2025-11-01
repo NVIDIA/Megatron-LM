@@ -65,7 +65,6 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunSta
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
 
-
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
 
@@ -79,7 +78,13 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     )
     group.add_argument(
         "--termination-id", type=int, default=None,
-        help="Termination ID that overrides `tokenizer.eod`."
+        help="Termination ID that overrides `tokenizer.eod`.",
+    )
+    group.add_argument(
+        "--suspend-resume-interval", type=int, default=None,
+        help="Suspend and resume the dynamic engine every "
+        "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
+        "system.",
     )
     group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
 
@@ -235,7 +240,6 @@ def run_inference(
     num_requests_total = len(requests)
     num_requests_added = 0
     num_requests_finished = 0
-    step_id = 0
     step_times = {"prefill": [], "decode": []}
     add_times = []
     output_times = []
@@ -284,9 +288,25 @@ def run_inference(
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         result = engine.step_modern(verbose=True)
+
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
         is_decode_only = engine.is_decode_only 
-        step_id += 1
+
+        # Test suspending and resuming engine.
+        if (
+            args.suspend_resume_interval is not None
+            and
+            engine.step_count % args.suspend_resume_interval == 0
+        ):
+            active_token_count_0 = engine.context.active_token_count
+            engine.suspend()
+            engine.resume()
+            active_token_count_1 = engine.context.active_token_count
+            print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
+                engine.step_count,
+                active_token_count_0,
+                active_token_count_1,
+            ))
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
@@ -306,13 +326,25 @@ def run_inference(
             # Append output tokens.
             output_start = get_curr_time()
             for finished_request in finished_requests:
+
+                # Update local request object.
                 request = requests[finished_request.request_id]
-                request.output_tokens = finished_request.generated_tokens
-                total_output_tokens += len(request.output_tokens)
                 request.time_end = get_curr_time()
-                request.output_text = finished_request.generated_text
                 request.state = "finished"
                 request.request_id = finished_request.request_id
+
+                # Update prompt, in case engine has been suspended and resumed.
+                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_text = engine.controller.tokenizer.detokenize(
+                    finished_request.prompt_tokens.tolist()
+                )
+
+                # Get output tokens and text.
+                request.output_tokens = finished_request.generated_tokens
+                request.output_text = finished_request.generated_text
+                total_output_tokens += len(request.output_tokens)
+
+                # Log probs.
                 if finished_request.sampling_params.return_log_probs:
                     request.log_probs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
@@ -388,6 +420,7 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
+        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -430,7 +463,9 @@ def main():
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
+        text_hashes = []
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
+
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
@@ -445,15 +480,20 @@ def main():
             # ---- Print each unique output ----
             for output_text, output_request_idxs in output_map.items():
                 if output_text is not None:
-                    o_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                    # Use hash of prompt + generated text in case engine was
+                    # suspended and resumed, which misaligns boundary between
+                    # prompt and generated tokens.
+                    o_hash = hashlib.sha256(
+                        (prompt_text + output_text).encode()
+                    ).hexdigest()[:6]
                     o_len = len(requests[output_request_idxs[0]].output_tokens)
                     escaped_output_text = escape_str(output_text)
-                    print(f"  >>>> [n {len(output_request_idxs)}, l {o_len}, hash {o_hash}] {escaped_output_text}")
                 else:
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                    print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -481,47 +521,50 @@ def main():
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
-    # Timing results.
-    print("~~~")
-    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
-    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+        # Timing results.
+        stats = torch.cuda.memory_stats()
+        throughput = total_output_tokens / total_time
+        print("~~~")
+        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
 
-    p_times = step_times["prefill"]
-    d_times = step_times["decode"]
+        p_times = step_times["prefill"]
+        d_times = step_times["decode"]
 
-    p_total = sum(p_times)
-    d_total = sum(d_times)
+        p_total = sum(p_times)
+        d_total = sum(d_times)
 
-    p_count = len(p_times)
-    d_count = len(d_times)
+        p_count = len(p_times)
+        d_count = len(d_times)
 
-    p_mean = p_total / p_count
-    d_mean = d_total / d_count
+        p_mean = p_total / p_count
+        d_mean = d_total / d_count if d_count != 0 else 0.
 
-    # Commented out for now as the step/add/output times are not calculated correctly.
-    # print(
-    #     f"{setup_prefix} … "
-    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-    #     f"total time: {step_total:.3f}s … "
-    #     f"step time: total {step_total:.3f}s "
-    #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
-    #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
-    #     f"count [ p {p_count}, d {d_count} ]."
-    # )
-    capture_str = (
-        f"{engine.capture_stats["time"]:.2f} sec"
-        if engine.capture_stats else
-        "--"
-    )
-    print(
-        f"{setup_prefix} … "
-        f"capture {capture_str} … "
-        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        f"total time: {total_time:.3f}s … "
-        f"steps: {engine.step_count:d} … "
-        f"throughput: {throughput:.3f} tok/s"
-    )
-    print("~~~")
+        # Commented out for now as the step/add/output times are not calculated correctly.
+        # print(
+        #     f"{setup_prefix} … "
+        #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        #     f"total time: {step_total:.3f}s … "
+        #     f"step time: total {step_total:.3f}s "
+        #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+        #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+        #     f"count [ p {p_count}, d {d_count} ]."
+        # )
+        capture_str = (
+            f"{engine.capture_stats["time"]:.2f} sec"
+            if engine.capture_stats else
+            "--"
+        )
+        print(
+            f"{setup_prefix} … "
+            f"capture {capture_str} … "
+            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+            f"total time: {total_time:.3f}s … "
+            f"steps: {engine.step_count:d} … "
+            f"throughput: {throughput:.3f} tok/s"
+            f"text hash: {hashlib.sha256(str(text_hashes).encode()).hexdigest()[:6]}"
+        )
+        print("~~~")
 
     # Stop Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):

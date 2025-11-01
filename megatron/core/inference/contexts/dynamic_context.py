@@ -262,17 +262,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         # Block size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.block_size_tokens = block_size_tokens
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
-            kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
-            self.kv_reduced_dim = kv_reduced_dim
+            self.kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.block_size_bytes = (
-                dtype_size_bytes * num_layers * self.block_size_tokens * kv_reduced_dim
+                dtype_size_bytes * num_layers * self.block_size_tokens * self.kv_reduced_dim
             )
         else:
             self.block_size_bytes = (
@@ -280,8 +279,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * num_layers
                 * self.block_size_tokens
-                * num_attention_heads_per_partition
-                * hidden_size_per_attention_head
+                * self.num_attention_heads_per_partition
+                * self.hidden_size_per_attention_head
             )
 
         # Adjust buffer to be a multiple of block size.
@@ -339,74 +338,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = None
         self.paused_tokens = None
 
-        # Per-request state.
-        self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_query_lengths = torch.empty_like(self.request_ids)
-        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
-        self.request_output_lengths = torch.empty_like(self.request_ids)
-        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
-        self.request_kv_block_counts = torch.empty_like(self.request_ids)
-        self.request_last_kv_block_id = torch.empty_like(self.request_ids)
-        # request_last_kv_block_offset represents number of tokens in the last kv block
-        self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
-
-        # Per-token state.
-        self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
-        )
-        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
-        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
-        self.token_to_block_idx = torch.empty_like(self.token_to_input_ids)
-        # i.e For a set of tokens A B C D E F ..  and block_size 4:
-        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
-        # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
-        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
-        self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
-
         # Calculate the total number of blocks available in the buffer
         block_count_total = buffer_size_bytes // self.block_size_bytes
 
-        # Memory buffer.
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
-        with ctx_manager:
-            if cache_mla_latent:
-                self.memory_buffer = torch.full(
-                    (self.num_layers, block_count_total, self.block_size_tokens, kv_reduced_dim),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                self.memory_buffer = torch.full(
-                    (
-                        2,  # key and value
-                        self.num_layers,
-                        block_count_total,
-                        self.block_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
-                    ),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
-        self.request_to_kv_block_ids = torch.full(
-            (self.max_requests, self.max_kv_block_count),
-            -1,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
 
         # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
         self.cuda_graph_token_counts = None
@@ -447,32 +383,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_cuda_graphs is not None
         )
 
-        # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
-        # consistent input shapes, which is required to use cuda graphs.
-        # During these steps, the `*_cudagraph_only`
-        # tensors are used, otherwise their same-name but un-suffixed
-        # corresponding tensors are used.
-
-        self.query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.cu_query_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self.cu_kv_seq_lengths_cudagraph_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-
-        self.request_to_kv_block_ids_cudagraph_only = torch.full(
-            (self.max_requests, self.max_kv_block_count),
-            0,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
-
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
         #   the fraction of blocks in the memory buffer that are reserved for
@@ -503,14 +413,156 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
-        # Reset attention state.
-        self.reset_attention_state()
-
         if use_flashinfer_fused_rope is True:
             assert HAVE_FLASHINFER, "flashinfer is not installed"
         elif use_flashinfer_fused_rope is None:
             use_flashinfer_fused_rope = HAVE_FLASHINFER
         self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+
+        # Allocate GPU state.
+        self.allocate_all_tensors(is_init=True)
+
+    def allocate_all_tensors(self, *, is_init: bool) -> None:
+        """Allocate GPU state.
+
+        This method is used for both 1) initial allocation, and 2) resuming the
+        GPU state after a suspend.
+
+        Args:
+            is_init (bool): True if this is being called from `__init__()`.
+        """
+
+        # Only allocate tensors when not using unified memory at all (level 0),
+        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
+        # not perform any explicit allocations or deallocations after the initial
+        # call to `__init__()`.
+        if self.unified_memory_level != 0 and not is_init:
+            return
+
+        # Validate no tensors allocated prior to this method.
+        for key in vars(self).keys():
+            value = getattr(self, key)
+            assert not isinstance(value, torch.Tensor), (
+                "All tensors should be allocated within `allocate_all_tensors()."
+                f"Please move tensor '{key}'."
+            )
+
+        # Per-request state.
+        self.request_ids = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_query_lengths = torch.empty_like(self.request_ids)
+        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
+        self.request_output_lengths = torch.empty_like(self.request_ids)
+        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
+        self.request_kv_block_counts = torch.empty_like(self.request_ids)
+        self.request_last_kv_block_id = torch.empty_like(self.request_ids)
+        # request_last_kv_block_offset represents number of tokens in the last kv block
+        self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
+        self.request_to_kv_block_ids = torch.full(
+            (self.max_requests, self.max_kv_block_count),
+            -1,
+            dtype=torch.int,
+            device=torch.cuda.current_device(),
+        )
+
+        # Per-token state.
+        self.token_to_input_ids = torch.full(
+            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
+        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
+        self.token_to_block_idx = torch.empty_like(self.token_to_input_ids)
+        # i.e For a set of tokens A B C D E F ..  and block_size 4:
+        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
+        # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
+        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
+        self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
+
+        # Memory buffer.
+        ctx_manager = (
+            torch.cuda.use_mem_pool(self.unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
+        with ctx_manager:
+            if self.cache_mla_latent:
+                self.memory_buffer = torch.full(
+                    (
+                        self.num_layers,
+                        self.block_allocator.block_count_total,
+                        self.block_size_tokens,
+                        self.kv_reduced_dim,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.full(
+                    (
+                        2,  # key and value
+                        self.num_layers,
+                        self.block_allocator.block_count_total,
+                        self.block_size_tokens,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
+        # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
+        # consistent input shapes, which is required to use cuda graphs.
+        # During these steps, the `*_cudagraph_only`
+        # tensors are used, otherwise their same-name but un-suffixed
+        # corresponding tensors are used.
+
+        self.query_seq_lengths_cudagraph_only = torch.full(
+            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.cu_query_seq_lengths_cudagraph_only = torch.full(
+            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.kv_seq_lengths_cudagraph_only = torch.full(
+            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.cu_kv_seq_lengths_cudagraph_only = torch.full(
+            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
+        self.request_to_kv_block_ids_cudagraph_only = torch.full(
+            (self.max_requests, self.max_kv_block_count),
+            0,
+            dtype=torch.int,
+            device=torch.cuda.current_device(),
+        )
+
+        # Reset attention state.
+        self.reset_attention_state()
+
+    def deallocate_all_tensors(self):
+        """Deallocate GPU state.
+
+        This method is used for suspending the dynamic engine.
+        """
+
+        # Only deallocate tensors when not using unified memory at all (level 0).
+        # For levels 1 and 2, we do not perform any explicit allocations or
+        # deallocations after the initial call to `__init__()`.
+        if self.unified_memory_level != 0:
+            return
+
+        # Delete all tensor attributes.
+        # TODO(@lmcafee): check that device == 'cuda'?
+        keys = list(vars(self).keys())
+        for key in keys:
+            value = getattr(self, key)
+            if isinstance(value, torch.Tensor):
+                delattr(self, key)
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4

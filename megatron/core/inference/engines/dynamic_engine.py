@@ -8,10 +8,13 @@ import struct
 import time
 import warnings
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
@@ -34,6 +37,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import get_asyncio_loop
 
 try:
@@ -86,6 +90,12 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
+        unified_memory_level (Optional[int]): Set unified memory usage within the
+            dynamic inference context. The levels are: 0) no unified memory, 1)
+            allocate `memory_buffer` only in unified memory, and 2) allocate all
+            tensors in unified memory. Note that levels 1 and 2 not not perform
+            any deallocations and allocations when suspending and resuming the
+            context.
         static_sampling (bool): If True, all requests are assumed to have the same
             sampling parameters. This avoids needing to loop through all requests and
             their sampling parameters every generation step, improving latency.
@@ -100,15 +110,9 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
+        unified_memory_level: int = 0,
         static_sampling: bool = False,
     ):
-
-        if enable_cuda_graph is not None:
-            warnings.warn(
-                "The `enable_cuda_graph` argument is deprecated and will be "
-                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
-                "read directly from the transformer config object."
-            )
 
         assert isinstance(
             controller, TextGenerationController
@@ -118,11 +122,48 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        self.request_counter = Counter()
+        # Setup.
         self.controller = controller
         self.context = context
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.static_sampling = static_sampling
+        self.unified_memory_level = unified_memory_level
+        self.capture_stats = None
+        self.is_suspended = False
+        self._loop = None
+
+        # Deprecate `enable_cuda_graph`.
+        if enable_cuda_graph is not None:
+            warnings.warn(
+                "The `enable_cuda_graph` argument is deprecated and will be "
+                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
+                "read directly from the transformer config object."
+            )
+            self.enable_cuda_graph = enable_cuda_graph
+        else:
+            self.enable_cuda_graph = (
+                controller.inference_wrapped_model.model.config.enable_cuda_graph
+            )
+
+        if enable_cuda_graph is not None:
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
+        else:
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+
+        # Initialize engine.
+        self.reset()
+
+        # Create cuda graphs.
+        if self.cuda_graph_impl == "local":
+            self.create_cuda_graphs()
+
+    def reset(self) -> None:
+        """Reset by removing all requests and reset all state."""
+
+        self.context.reset()
+
         self.step_count = 0
         self.finished_request_count = 0
         self.waiting_request_ids = deque()
@@ -134,24 +175,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.static_sampling = static_sampling
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        self._loop = get_asyncio_loop()
+        self._loop = get_asyncio_loop(self._loop)
         self._cond = asyncio.Condition()
 
-        # Capture cuda graph.
-        self.capture_stats = None
-
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
-
-        if self.cuda_graph_impl == "local":
-            self.create_cuda_graphs()
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -272,6 +301,7 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            verbose (bool): Whether to run in verbose mode.
 
         Note:
             The current implementation uses `ipc` sockets for broadcasting requests
@@ -362,6 +392,166 @@ class DynamicInferenceEngine(AbstractEngine):
         # Finally run the engine infinite loop
         self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
 
+    @contextmanager
+    @staticmethod
+    def suspend_resume_ctx(key: str, *, unified_memory_level: int) -> None:
+        """Context manager for of suspending and resuming the engine.
+
+        This context manager records the time and memory usage when suspending
+        and resuming the context. TODO(@lmcafee): add argument to optionally
+        return nullcontext, to avoid overhead.
+
+        Args:
+            key (str): Key that identifies caller (e.g., 'suspend' or 'resume').
+
+        Return:
+            None.
+        """
+
+        try:
+
+            start_mem = torch.cuda.memory_stats()
+            start_time = time.time()
+            torch.cuda.synchronize()
+
+            yield
+
+        finally:
+
+            end_time = time.time()
+
+            end_mem = torch.cuda.memory_stats()
+            start_mem_alloc = start_mem["allocated_bytes.all.current"]
+            end_mem_alloc = end_mem["allocated_bytes.all.current"]
+            start_mem_res = start_mem["reserved_bytes.all.current"]
+            end_mem_res = end_mem["reserved_bytes.all.current"]
+
+            rank_str = torch.distributed.get_rank()
+            dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
+            relative_time_str = f"{end_time - start_time:.3f} sec"
+            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            total_mem_str = ", ".join((
+                f"cpu: {mem_info.rss / 1024**3:.1f} gb",
+                f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
+                f"res {end_mem_res / 1024**3:.1f} gb",
+            ))
+            logging.info(
+                f"[rank {rank_str}] dynamic engine {key}, "
+                f"unified {unified_memory_level}, "
+                f"{dir_str} "
+                f"{relative_mem_str} in {relative_time_str} ... "
+                f"abs mem usage: {total_mem_str}"
+            )
+
+    def suspend(self):
+        """Suspend engine by deallocating context's GPU state."""
+
+        # Skip if already suspended, which can happen when using the inference
+        # coordinator.
+        if self.is_suspended:
+            return
+        self.is_suspended = True
+
+        # Deallocate context tensors.
+        with self.__class__.suspend_resume_ctx(
+            "suspended", unified_memory_level=self.unified_memory_level
+        ):
+            self.context.deallocate_all_tensors()
+
+        # Delete cuda graphs when not using unified memory at all (level 0). For
+        # levels 1 and 2, the context's tensors maintain static memory addresses,
+        # so the cuda graphs are re-used.
+        if self.unified_memory_level == 0:
+            delete_cuda_graphs()
+
+    def resume(self):
+        """Resume engine by reallocating context's GPU state."""
+
+        # Skip if not suspended, which can happen when using the inference
+        # coordinator.
+        if not self.is_suspended:
+            return
+        self.is_suspended = False
+
+        # Resume.
+        with self.__class__.suspend_resume_ctx(
+            "resumed", unified_memory_level=self.unified_memory_level
+        ):
+
+            # Maintain references to requests before reset.
+            waiting_request_ids = list(self.waiting_request_ids)
+            active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
+            request_ids = [*active_request_ids, *waiting_request_ids]
+            requests = dict(self.requests)
+
+            # Allocate context tensors.
+            alloc_time = time.time()
+            torch.cuda.synchronize()
+            self.context.allocate_all_tensors(is_init=False)
+            torch.cuda.synchronize()
+            alloc_time = time.time() - alloc_time
+
+            # Reset context and request data.
+            self.context.reset()
+            self.waiting_request_ids = deque()
+            self.requests: Dict[int, DynamicInferenceRequest] = {}
+            self.request_completion_futures: Dict[int, asyncio.Future] = {}
+
+            # Create cuda graphs (before adding requests, to be in decode mode).
+            # Only create cuda graphs when not using unified memory at all (level
+            # 0). For levels 1 and 2, the context's tensors maintain static
+            # memory addresses, so the cuda graphs are re-used.
+            capture_time = time.time()
+            if self.unified_memory_level == 0:
+                self.create_cuda_graphs()
+            capture_time = time.time() - capture_time
+
+            # Add requests.
+            futures = {}
+            add_time = time.time()
+            torch.cuda.synchronize()
+            for request_id in request_ids:
+
+                request = requests[request_id]
+
+                # Concatenate prompt + generated tokens.
+                tokens = torch.cat(
+                    (
+                        request.prompt_tokens,
+                        torch.tensor(
+                            request.generated_tokens,
+                            dtype=request.prompt_tokens.dtype,
+                            device=request.prompt_tokens.device,
+                        ),
+                    ),
+                    dim=0,
+                )
+
+                # Add request.
+                new_sampling_params = SamplingParams(**{
+                    **asdict(request.sampling_params),
+                    "num_tokens_to_generate" : request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+                })
+                futures[request_id] = self.add_request(
+                    request_id,
+                    tokens,
+                    new_sampling_params,
+                )
+            torch.cuda.synchronize()
+            add_time = time.time() - add_time
+
+        # Print inner timing (must be outside context manager above for correct formatting).
+        logging.info(", ".join((
+            f"    > inner timing: alloc {alloc_time:.3f}",
+            f"add {add_time:.3f}",
+            f"capture {capture_time:.3f}.",
+        )))
+
+        return futures
+
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
         async with self._cond:
@@ -370,13 +560,6 @@ class DynamicInferenceEngine(AbstractEngine):
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
-
-    def reset(self) -> None:
-        """Reset by removing all requests and reset all state."""
-        self.context.reset()
-        self.waiting_request_ids.clear()
-        self.step_count = 0
-        self.finished_request_count = 0
 
     def _add_request(
         self, request: DynamicInferenceRequest
@@ -990,8 +1173,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
                 if self.paused:
+                    self.suspend()
                     await asyncio.sleep(0.02)
                     continue
+
+                else:
+                    self.resume()
 
                 if (
                     self.context.get_active_request_count() == 0
