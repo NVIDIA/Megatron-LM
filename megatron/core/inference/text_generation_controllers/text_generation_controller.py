@@ -508,7 +508,8 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            if context.is_decode_only() or warmup_engine_mode is not None:
+            assert warmup_engine_mode is not WarmupEngineMode.NON_DECODE
+            if context.is_decode_only():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
