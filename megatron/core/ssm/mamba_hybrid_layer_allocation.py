@@ -1,20 +1,30 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from typing import Dict, List, Tuple
 
 if __name__ != "__main__":
     from megatron.core.utils import log_single_rank
 else:
     from typing import Any
 
+    import torch
+
     def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-        print(*args[1:], **kwargs)
+        """Logs a message to the given rank."""
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == rank:
+                logger.log(*args, **kwargs)
+        else:
+            logger.log(*args, **kwargs)
 
 
 logger = logging.getLogger(__name__)
 
 
 class Symbols:
+    """Symbols for different layer types."""
+
     MAMBA = "M"
     ATTENTION = "*"
     MLP = "-"
@@ -87,6 +97,7 @@ def allocate_layers(
     target_mlp_ratio: float,
     override_pattern: str = None,
 ) -> list:
+    """Allocates layers according to the requested distribution of layer types."""
     assert total_layers_count > 0
     assert target_attention_ratio >= 0.0 and target_attention_ratio <= 1.0
     assert target_mlp_ratio >= 0.0 and target_mlp_ratio <= 1.0
@@ -156,6 +167,22 @@ def allocate_layers(
     return layer_type_list
 
 
+def get_layer_maps_from_layer_type_list(
+    layer_type_list: List[str],
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
+    """
+    Returns maps from global layer index to the corresponding layer index
+    for each layer type in [Attention, Mamba, MLP] given a layer type list.
+    """
+    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]
+    layer_maps = {layer_type: {} for layer_type in layer_types}
+    for global_layer_idx, layer_type in enumerate(layer_type_list):
+        layer_map = layer_maps[layer_type]
+        local_layer_idx = len(layer_map)
+        layer_map[global_layer_idx] = local_layer_idx
+    return [layer_maps[layer_type] for layer_type in layer_types]
+
+
 if __name__ == "__main__":
     test_cases = [
         # (10, 0.2, 0.0),
@@ -187,5 +214,5 @@ if __name__ == "__main__":
         (9, 0.0, 0.0, "MMMMMMMMM"),
     ]
     for t in test_cases:
-        print("")
+        logging.info("")
         allocate_layers(*t)
