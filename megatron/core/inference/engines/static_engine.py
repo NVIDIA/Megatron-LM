@@ -17,6 +17,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -217,11 +218,6 @@ class StaticInferenceEngine(AbstractEngine):
             generated tokens, texts and log probs if required
         """
         assert hasattr(self, 'dynamic_engine'), "Dynamic engine not initialized"
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:  # 'RuntimeError: There is no current event loop...'
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
 
         if common_inference_params:
             sampling_params = common_inference_params
@@ -385,8 +381,8 @@ class StaticInferenceEngine(AbstractEngine):
         torch.cuda.set_device(cuda_device)
         self.run_engine()
 
-    async def run_engine_async(self):
+    async def run_engine_async(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Runs the engine asynchronously using asyncio"""
-        loop = asyncio.get_running_loop()
+        loop = get_asyncio_loop(loop)
 
         await loop.run_in_executor(None, self._wrapped_run_engine, torch.cuda.current_device())

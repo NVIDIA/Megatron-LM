@@ -8,6 +8,7 @@ from typing import List, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
 
@@ -50,7 +51,7 @@ class InferenceClient:
             request IDs to the asyncio Future objects that will hold the results.
         next_request_id (int): A counter for generating unique request IDs.
         listener_task (asyncio.Task): The background task that listens for
-            completed requests.
+            completed requests
     """
 
     def __init__(self, inference_coordinator_port: int):
@@ -103,10 +104,11 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_event_loop().create_future()
+        self.completion_futures[request_id] = get_asyncio_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
+    @trace_async_exceptions
     async def _listen_for_completed_requests(self):
         """
         Listens for completed inference requests from the coordinator.
