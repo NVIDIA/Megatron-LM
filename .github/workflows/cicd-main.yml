@@ -491,6 +491,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -529,6 +530,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -554,6 +556,7 @@ jobs:
         || success()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
         flag: [unit-test]
