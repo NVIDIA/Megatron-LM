@@ -1033,11 +1033,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         query_lengths_view = self.request_query_lengths[active_slice]
         request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
         request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
+
+        attn_config = real_config
+        if real_config.decode_req_count > self.padded_config.decode_req_count:
+            attn_config.prefill_req_count = attn_config.req_count - self.padded_config.decode_req_count
+            attn_config.decode_req_count = self.padded_config.decode_req_count
+            
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
             request_kv_length_offsets=request_kv_length_offsets_view,
             request_to_kv_block_ids=request_to_kv_block_ids_view,
-            real_config = real_config,
+            real_config = attn_config,
             padded_config = self.padded_config,
         )
         # All attention metadata calculations are now handled by MHAMetadata.update()
