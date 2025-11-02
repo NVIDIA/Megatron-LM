@@ -7,23 +7,19 @@ import torch
 import torch.distributed as dist
 from packaging import version
 
-from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_expert_model_parallel_rank,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 
 def _create_transformer_block(
     dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
@@ -108,19 +104,15 @@ def _shard_and_copy_(
         )
 
 
-def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
+def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, ep=1, etp=1):
     """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
     # Set up environment for world size 8 if not already set
-    if not dist.is_initialized():
-        raise RuntimeError("Distributed process group is not initialized")
-
-    #  tests below assume a world size of 8
     if "WORLD_SIZE" not in os.environ:
         os.environ["WORLD_SIZE"] = "8"
 
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp],
-        dim_names=["tp", "cp", "pp", "dp"],
+        shape=[tp, cp, pp, dp, ep, etp],
+        dim_names=["tp", "cp", "pp", "dp", "ep", "etp"],
         rank_offset=offset,
         backend="nccl",
     )
@@ -128,6 +120,12 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     _ = grid.create_pg(["cp"])
     _ = grid.create_pg(["pp"])
     _ = grid.create_pg(["dp"])
+    _ = grid.create_pg(["ep"])
+    _ = grid.create_pg(["tp", "pp"])
+    _ = grid.create_pg(["dp", "cp"])
+    _ = grid.create_pg(["tp", "cp"])
+    _ = grid.create_pg(["tp", "dp", "cp"])
+    _ = grid.create_pg(["tp", "ep", "pp"])
     return grid
 
 
@@ -136,6 +134,16 @@ def _get_pg_collection_from_grid(grid):
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
     pg_collection.pp = grid.get_pg("pp")
+    pg_collection.ep = grid.get_pg("ep")
+    dp_group = grid.get_pg("dp")
+    dp_cp_group = grid.get_pg(["dp", "cp"])
+    pg_collection.dp = dp_group
+    pg_collection.dp_cp = dp_cp_group
+    pg_collection.mp = grid.get_pg(["tp", "pp"])
+    pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
+    pg_collection.tp_cp = grid.get_pg(["tp", "cp"])
+    pg_collection.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
     return pg_collection
 
 
@@ -147,7 +155,7 @@ def _avg_params(module: torch.nn.Module, group: dist.ProcessGroup = None) -> Non
 
 
 def get_transformer_block_and_grid(
-    ref_block,
+    ref_block = None,
     tp_size=1,
     cp_size=1,
     pp_size=1,
@@ -156,13 +164,15 @@ def get_transformer_block_and_grid(
     use_global_parallel_state: bool = False,
     hidden_size: int = 4096,
     dtype: torch.dtype = torch.bfloat16,
+    wrap_with_ddp: bool = False,
 ):
     """Utility to build a ``TransformerBlock`` for tests."""
 
     current_rank = dist.get_rank()
     if use_global_parallel_state:
         block = _create_transformer_block(dtype=dtype, hidden_size=hidden_size)
-        _shard_and_copy_(ref_block, block, tp_size, get_tensor_model_parallel_rank())
+        if ref_block is not None:
+            _shard_and_copy_(ref_block, block, tp_size, get_tensor_model_parallel_rank())
         grid = None
     else:
         grid = create_hypercomm_grid(
@@ -173,9 +183,19 @@ def get_transformer_block_and_grid(
             block = _create_transformer_block(
                 dtype=dtype, hidden_size=hidden_size, pg_collection=pg_collection
             )
-            _shard_and_copy_(ref_block, block, tp_size, pg_collection.tp.rank())
+            if ref_block is not None:
+                _shard_and_copy_(ref_block, block, tp_size, pg_collection.tp.rank())
         else:
             block = None
+    
+    if wrap_with_ddp and block is not None:
+        ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
+        block = DistributedDataParallel(
+            config=block.config, ddp_config=ddp_config, module=block, pg_collection=pg_collection
+        )
+        block.pre_process = False
+        block.post_process = False
+        block.share_embeddings_and_output_weights = False
 
     return block, grid
 
