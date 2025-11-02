@@ -6,9 +6,18 @@ on:
       - "pull-request/[0-9]+"
 
 jobs:
+  pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    if: github.repository == 'NVIDIA/Megatron-LM'
+
   codeowners-approval:
+    needs: [pre-flight]
     runs-on: ubuntu-latest
     environment: nemo-ci
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -28,3 +37,37 @@ jobs:
           pr-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           repo-name: ${{ github.repository }}
           github-token: ${{ secrets.PAT }}
+
+  multi-approval-bot-summary:
+    needs: [pre-flight, codeowners-approval]
+    if: |
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || always()
+      )
+      && github.repository == 'NVIDIA/Megatron-LM'
+      && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              # Show which jobs failed
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              exit 1
+          fi
