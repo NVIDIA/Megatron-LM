@@ -16,7 +16,7 @@ TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
-  --tensor-model-parallel-size: 1
+  --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 4
   --pipeline-model-parallel-layout: Et*2\\|\\(tt\\|\\)*5t\\|tmL # Et*2|(tt|)*5t|tmL
   --expert-model-parallel-size: 16
