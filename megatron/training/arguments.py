@@ -163,7 +163,7 @@ def validate_model_config_args_from_heterogeneous_config(args):
     )
 
     n_kv_heads_in_group = [
-        config["attention"]["n_heads_in_group"] for config in hf_config_dict.block_configs 
+        config["attention"]["n_heads_in_group"] for config in hf_config_dict.block_configs
         if config["attention"]["n_heads_in_group"] is not None
     ]
     assert all(num == n_kv_heads_in_group[0] for num in n_kv_heads_in_group), "num query head must be consistent across all layers"
@@ -624,7 +624,7 @@ def validate_args(args, defaults={}):
 
                 assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                     'Number of layers should be divisible by the pipeline-model-parallel size'
-    
+
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
@@ -684,7 +684,7 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
         if args.fp4_param and not is_te_min_version("2.7.0.dev0"):
-            raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")   
+            raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -717,7 +717,7 @@ def validate_args(args, defaults={}):
     # FP4 param requires FP4 mode
     if args.fp4_param and not args.fp4:
         raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
-    
+
     # FP4 requires TE >= 2.7.0.dev0
     if args.fp4 and not is_te_min_version("2.7.0.dev0"):
         raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
@@ -1227,6 +1227,9 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.cpu_offloading_num_layers > 0:
+        args.cpu_offloading = True
+
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
@@ -1275,7 +1278,7 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if args.multi_latent_attention:
         config_class = MLATransformerConfig
-    
+
     if args.heterogeneous_layers_config_path is not None:
         assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
         config_class = HeterogeneousTransformerConfig
@@ -1388,7 +1391,7 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
-    
+
     # FP4 related arguments
     group.add_argument('--fp4-format', default=None,
                        choices=['e2m1'],
@@ -1462,6 +1465,9 @@ def _add_inference_args(parser):
                        '"full_iteration": captures a whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -1536,7 +1542,7 @@ def _add_inference_args(parser):
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')
     return parser
 
 
@@ -1907,7 +1913,7 @@ def _add_logging_args(parser):
                        help='The wandb entity name. It is useful when '
                        'there are multiple sub-projects in a project. '
                        'https://community.wandb.ai/t/how-do-i-decide-which-account-private-or-team-to-upload-the-run-to/5704 '
-                       'Ignore wandb by default.')    
+                       'Ignore wandb by default.')
     group.add_argument('--wandb-exp-name', type=str, default='',
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
@@ -1982,7 +1988,7 @@ def _add_rl_args(parser):
                        help="Use the RL training step.")
     group.add_argument('--rl-prompts-per-eval', type=int, default=32,
                        help='Number of prompts to evaluate for for each RL task.'
-                        'This evaluation can be very expensive when using environments' 
+                        'This evaluation can be very expensive when using environments'
                         'that evaluate pass@k so we default to a lower number.')
     # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
     group.add_argument('--grpo-prompts-per-step', type=int, default=32,
@@ -2130,6 +2136,8 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
+    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
+                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2707,6 +2715,10 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
+                       'values over the wire (using an all-to-all to keep total communication overhead in line '
+                       'with the standard ring implementation) but performs accumulation locally in FP32.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -2740,14 +2752,14 @@ def _add_distributed_args(parser):
                        'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-    group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub', 
+    group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
                        'which is improving the performance of the overlapped computation.')
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
-    group.add_argument('--use-sharp', action='store_true', 
+    group.add_argument('--use-sharp', action='store_true',
                        help='Required to enable SHARP communication.')
     group.add_argument('--sharp-enabled-group', type=str, default=None,
                        choices=['dp', 'dp_replica'],
@@ -3314,9 +3326,9 @@ def _add_linear_attention_args(parser):
 
 def _add_heterogeneous_args(parser):
     """
-    Heterogeneous models refer to transformer architectures where individual layers can differ 
+    Heterogeneous models refer to transformer architectures where individual layers can differ
     in configuration. Specifically:
-        - Attention or MLP layers can be replaced with either a linear layer or a no-op 
+        - Attention or MLP layers can be replaced with either a linear layer or a no-op
         - MLP intermediate dimensions can vary between layers
     We use the format of the HuggingFace config files in llama nemotron models to define the architecture.
     For example, https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json
@@ -3466,6 +3478,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned", 
+    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
     return parser

@@ -34,7 +34,11 @@
             1278,
             2362
         ],
+<<<<<<< HEAD
         "latency": 0.2756917476654053,
+=======
+        "latency": 0.29413437843322754,
+>>>>>>> upstream/main
         "cuda_graph_request_count_map": {
             "372": 0,
             "360": 0,

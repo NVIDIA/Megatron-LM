@@ -22,7 +22,13 @@ def test_resume_checkpoint_pipeline(
         model_config = yaml.safe_load(f)
 
     checks_types = (
+<<<<<<< HEAD
         model_config["METRICS"] if "METRICS" in model_config else ["lm loss", "num-zeros"]
+=======
+        model_config["METRICS"]
+        if "METRICS" in model_config
+        else ["lm loss", "num-zeros"]
+>>>>>>> upstream/main
     )
     checks = {
         metric: test_pretraining_regular_pipeline.CHECK_THRESHOLDS[metric]
