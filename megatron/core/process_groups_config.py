@@ -147,7 +147,11 @@ class ProcessGroupCollection:
             pg = getattr(self, field_info.name, None)
             if pg is not None:
                 active_pgs.append(f"{field_info.name}({pg.size()})")
-        return f"ProcessGroupCollection({', '.join(active_pgs)})" if active_pgs else "ProcessGroupCollection(empty)"
+        return (
+            f"ProcessGroupCollection({', '.join(active_pgs)})"
+            if active_pgs
+            else "ProcessGroupCollection(empty)"
+        )
 
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):

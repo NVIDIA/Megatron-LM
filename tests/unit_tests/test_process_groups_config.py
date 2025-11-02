@@ -83,7 +83,7 @@ class TestProcessGroupsConfig:
         model_pgs = ProcessGroupCollection()
         model_pgs.tp = mock_tp
         model_pgs.pp = mock_pp
-        
+
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
         assert "tp(4)" in repr_str
