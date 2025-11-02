@@ -67,6 +67,28 @@ class TestProcessGroupsConfig:
         assert model_pgs.hcp[0] == mock_pg1
         assert model_pgs.hcp[1] == mock_pg2
 
+    def test_repr(self, mocker):
+        """Test __repr__ shows active process groups and their sizes."""
+        # Create mock process groups with known sizes
+        mock_tp = mocker.Mock(spec=dist.ProcessGroup)
+        mock_tp.size.return_value = 4
+        mock_pp = mocker.Mock(spec=dist.ProcessGroup)
+        mock_pp.size.return_value = 2
+
+        # Test empty collection
+        empty_pgs = ProcessGroupCollection()
+        assert repr(empty_pgs) == "ProcessGroupCollection(empty)"
+
+        # Test collection with process groups
+        model_pgs = ProcessGroupCollection()
+        model_pgs.tp = mock_tp
+        model_pgs.pp = mock_pp
+        
+        repr_str = repr(model_pgs)
+        assert "ProcessGroupCollection(" in repr_str
+        assert "tp(4)" in repr_str
+        assert "pp(2)" in repr_str
+
 
 class TestPGConfigDefaultInitialization:
 
