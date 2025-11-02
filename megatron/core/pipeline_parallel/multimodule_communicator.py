@@ -329,11 +329,6 @@ class MultiModulePipelineCommunicator:
         Returns:
             A dictionary mapping module names to tensors.
         """
-        logging.debug(
-            f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
-            f"[send_forward_recv_backward] output_dict keys: {output_dict.keys()}, "
-            f"tensor_shape: {tensor_shape}, is_last_stage: {is_last_stage}"
-        )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
