@@ -24,7 +24,8 @@ USER=$SLURM_JOB_USER
 
 # Auto-detect batch or interactive mode.
 which srun
-BATCH=$((1-$?))
+# BATCH=$((1-$?))
+BATCH=0
 
 DEBUG=0
 USE_TILING=1
@@ -39,7 +40,7 @@ USE_MOCK_DATA=1
 if [[ $BATCH -eq 0 ]]; then
     DATETIME=`date +'%y-%m-%d-%H-%M-%S'`
     MODEL_NAME="interactive_hybrid_cp"
-    DEBUG=1
+    # DEBUG=1
 else
     MODEL_NAME="interactive_hybrid_cp"
 fi
@@ -58,7 +59,7 @@ export HF_DATASETS_CACHE="${OUTPUT}/hf_datasets_cache"
 
 DATA_TRAIN="/lustre/fs1/portfolios/llmservice/users/adithyare/sft/nano_v2_fake_packed_131072_10000_rndm//stage1_stage2_multiling_128k_seq_packed.empty_assist_filtered.shuf.jsonl"
 
-SEQ_LEN=131072 #131072 #81920 #65536
+SEQ_LEN=1024 #131072 #81920 #65536
 
 if [[ $DEBUG -eq 1 ]]; then
     MBZ=1

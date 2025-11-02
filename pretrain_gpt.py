@@ -75,10 +75,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sft_sequence_packing:
         cu_seqlens = batch.pop('cu_seqlens')
         cu_seqlens_padded = batch.pop('cu_seqlens_padded')
-        max_seqlen = batch.pop('max_seqlen')
-        local_cp_size = batch.pop('local_cp_size')
-        local_cp_size = int(local_cp_size.item())
-        assert max_seqlen.dim() == 1
+
+        max_seqlen = int(batch.pop('max_seqlen').item())
+        # local_cp_size is None if we disable hybrid-cp
+        local_cp_size = int(batch.pop('local_cp_size').item()) if 'local_cp_size' in batch else None
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
                 cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
         
@@ -86,7 +86,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
-           
     return (*batch.values(), packed_seq_params)
 
 

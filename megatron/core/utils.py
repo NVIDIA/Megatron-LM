@@ -56,6 +56,12 @@ try:
 except ImportError:
     HAVE_NVTX = False
 
+# Register the TE CUDA kernels
+import transformer_engine  # pylint: disable=unused-import
+
+# Alias the PyTorch wrapper so we can call tex.* APIs
+import transformer_engine_torch as tex
+
 logger = logging.getLogger(__name__)
 
 
@@ -1860,7 +1866,7 @@ def get_thd_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
-    max_seqlen: torch.Tensor,
+    max_seqlen: Optional[int] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
     local_cp_size: Optional[int] = None,
@@ -1872,19 +1878,24 @@ def get_thd_batch_on_this_cp_rank(
     """
     if local_cp_size:
         # enable hybrid context parallel
+        cp_size = local_cp_size
         if cp_group is None:
             # TODO: debugmtl modify this comments
             # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
-            if local_cp_size > 1:
+            if cp_size > 1:
                 cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
-                    group_size=local_cp_size
+                    group_size=cp_size
                 )
+                cp_rank = torch.distributed.get_rank(group=cp_group)
+                assert cp_group.size() == cp_size
         else:
             # TODO: debugmtl modify this comments
             # If cp group is provided, it must match the local cp size
             # as defined by the HybridCPDataLoaderWrapper
             assert cp_group.size() == local_cp_size
     else:
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
         cp_group = None
 
     packed_seq_params = PackedSeqParams(
@@ -1893,13 +1904,12 @@ def get_thd_batch_on_this_cp_rank(
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=int(max_seqlen[0].item()),
-        max_seqlen_kv=int(max_seqlen[0].item()),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        local_cp_size=cp_size,
         cp_group=cp_group,
     )
 
-    cp_size = get_context_parallel_world_size() if cp_size is None else cp_size
-    cp_rank = get_context_parallel_rank() if cp_rank is None else cp_rank
     if cp_size > 1:  # slice batch along sequence dimension for context parallelism
         assert tex is not None and is_te_min_version("1.10.0"), (
             "Please update Transformer Engine to >= 1.10 to use "
@@ -1909,7 +1919,7 @@ def get_thd_batch_on_this_cp_rank(
             cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
         )
         for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+            if key in {'attention_mask'}:
                 continue
             batch[key] = data.index_select(1, index)
 

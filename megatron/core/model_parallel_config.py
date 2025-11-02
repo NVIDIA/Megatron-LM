@@ -78,6 +78,14 @@ class ModelParallelConfig:
     Else, it would be controlled by the maximum sequence length / context parallel size.
     """
 
+    balanced_sequence_packing: bool = False
+    """
+    If true, enables balanced sequence packing.
+    This is used to pack samples with variable sequence lengths into a single sample
+    such that each packed sample has similar total sequence lengths.
+    This is useful to improve the efficiency of sequence packing.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 

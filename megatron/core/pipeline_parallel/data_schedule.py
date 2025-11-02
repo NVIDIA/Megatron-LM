@@ -1,9 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import enum
 from collections import deque
 from functools import lru_cache
 from math import ceil, log2
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -13,8 +14,18 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
-def wrap_hybrid_cp_dataloader(
-    data_iterator, config, pg_collection: Optional[ProcessGroupCollection] = None
+class PackingScheduler(enum.Enum):
+    """Enum for supported sequence packing algorithms."""
+
+    HYBRID_CP = "hybrid_cp"
+    NAIVE_SEQUENCE_PACKING = "naive_sequence_packing"
+
+
+def wrap_dataloader(
+    data_iterator,
+    config,
+    scheduler_type: Union[PackingScheduler, str],
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -25,6 +36,13 @@ def wrap_hybrid_cp_dataloader(
         config: The config object containing the max_seqlen_per_dp_cp_rank
         dp_cp_group: Data parallel context parallel group.
     """
+
+    scheduler_map = {"hybrid_cp": BalancedHybridCPscheduler, "naive": NaiveSequencePackingScheduler}
+
+    scheduler_map: Dict[PackingScheduler, Type[BaseScheduler]] = {
+        PackingScheduler.HYBRID_CP: BalancedHybridCPscheduler,
+        PackingScheduler.NAIVE_SEQUENCE_PACKING: NaiveSequencePackingScheduler,
+    }
 
     def _get_global_seqlens(subsample_seqlens: torch.Tensor, dp_group) -> List[int]:
         """
@@ -151,16 +169,17 @@ def wrap_hybrid_cp_dataloader(
         ]
         # send_counts = [len(combined_sample_id_groups[d]) for d in range(total_hdp_gpus)]
 
+        send_num_split = [0] * total_hdp_gpus
         send_lens_split = [0] * total_hdp_gpus
         for dest_rank in range(total_hdp_gpus):
             if dest_rank in dp_ranks:
-                send_lens_split[dest_rank] = sum(
-                    [
-                        global_id_seqlens[gid][1]
-                        for gid in combined_sample_id_groups[dest_rank]
-                        if gid in global_ids_this_rank
-                    ]
-                )
+                send_seq_lens = [
+                    global_id_seqlens[gid][1]
+                    for gid in combined_sample_id_groups[dest_rank]
+                    if gid in global_ids_this_rank
+                ]
+                send_num_split[dest_rank] = len(send_seq_lens)
+                send_lens_split[dest_rank] = sum(send_seq_lens)
             else:
                 # We only need to share local data with DP ranks that have different data.
                 send_lens_split[dest_rank] = 0
@@ -197,20 +216,30 @@ def wrap_hybrid_cp_dataloader(
         def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
             cursor = 0
             for i, gid in enumerate(recv_ids_sorted):
-                sample_len = global_id_seqlens[gid][1]
+                sample_len = 1 if key in ["original_seq_len"] else global_id_seqlens[gid][1]
                 recv_samples[i][key] = recv_tensor[cursor : cursor + sample_len]
                 cursor += sample_len
 
         for key in data_keys:
-            send_tensor = _pack_sample_by_key(key)
-            recv_tensor = torch.empty(
-                sum(recv_lens_split), device=torch.cuda.current_device(), dtype=send_tensor.dtype
+            output_split_sizes, input_split_sizes = (
+                (recv_counts, send_num_split)
+                if key in ["original_seq_len"]
+                else (recv_lens_split, send_lens_split)
             )
+            send_tensor = _pack_sample_by_key(key)
+            recv_tensor_size = sum(output_split_sizes)
+            recv_tensor = torch.empty(
+                recv_tensor_size, device=torch.cuda.current_device(), dtype=send_tensor.dtype
+            )
+            # debugmtl
+            # print(f"ready to all to all for key:{key}, output_split_sizes:{output_split_sizes},
+            # input_split_sizes:{input_split_sizes}, recv_tensor_size:
+            # {tensor_size},send_tensor_size:{send_tensor.size(0)}")
             torch.distributed.all_to_all_single(
                 output=recv_tensor,
                 input=send_tensor,
-                output_split_sizes=recv_lens_split,
-                input_split_sizes=send_lens_split,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
                 group=dp_cp_group,
             )
             _unpack_sample_by_key(key, recv_tensor)
@@ -245,29 +274,24 @@ def wrap_hybrid_cp_dataloader(
                 group=parallel_state.get_tensor_model_parallel_group(),
             )
 
-    def _broadcast_num_samples_this_group(num_samples_this_group):
-        dev = torch.cuda.current_device()
-        # TODO(tailaim) do we need this barrier?
-        torch.distributed.barrier()
+    # Convert string to enum if needed
+    if isinstance(scheduler_type, str):
+        try:
+            scheduler_type = PackingScheduler[scheduler_type.upper()]
+        except KeyError:
+            available_scheduler = ", ".join([scheduler.name for scheduler in PackingScheduler])
+            raise ValueError(
+                f"Unknown packing scheduler: {scheduler_type}. "
+                f"Available schedulers: {available_scheduler}"
+            )
 
-        n = 0 if num_samples_this_group is None else int(num_samples_this_group.numel())
-        n = torch.tensor([n], dtype=torch.int64, device=dev)
-
-        _broadcast(n)
-        n = int(n.item())
-
-        assert n > 0, "there should be at least 1 sub samples in the group"
-        num_samples_this_group_broadcast = (
-            torch.empty(n, dtype=torch.int32, device=dev)
-            if num_samples_this_group is None
-            else num_samples_this_group
+    if scheduler_type not in scheduler_map:
+        available_scheduler = ", ".join([scheduler.name for scheduler in PackingScheduler])
+        raise ValueError(
+            f"Unknown scheduler: {scheduler}. " f"Available schedulers: {available_scheduler}"
         )
-        _broadcast(num_samples_this_group_broadcast)
-        return num_samples_this_group_broadcast
 
-    cp_balancing_scheduler = BalancedHybridCPScheduler(
-        max_seq_len_per_rank=config.max_seqlen_per_dp_cp_rank
-    )
+    scheduler = scheduler_map[scheduler_type](config)
     if pg_collection is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         dp_group = parallel_state.get_data_parallel_group()
@@ -305,9 +329,7 @@ def wrap_hybrid_cp_dataloader(
             subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group
         )
 
-        groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(
-            global_id_seqlens, config
-        )
+        groups, sample_id_groups = scheduler.get_groups_and_subsamples(global_id_seqlens, config)
 
         batch = _unpack_batch(batch)
         samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
@@ -353,10 +375,10 @@ def wrap_hybrid_cp_dataloader(
 
             # TODO(tailaim): do we need attention_mask for sequence packing?
             new_sample = {}
-            new_sample["tokens"] = tokens
-            new_sample["labels"] = labels
-            new_sample["loss_mask"] = loss_mask
-            new_sample["position_ids"] = position_ids
+            new_sample["tokens"] = tokens.unsqueeze(0)
+            new_sample["labels"] = labels.unsqueeze(0)
+            new_sample["loss_mask"] = loss_mask.unsqueeze(0)
+            new_sample["position_ids"] = position_ids.unsqueeze(0)
             new_sample["local_cp_size"] = torch.tensor(
                 partner_cp_size, dtype=torch.int32, device=dev
             )
@@ -367,9 +389,11 @@ def wrap_hybrid_cp_dataloader(
             )
             cu_seqlens_padded = np.empty(len(samples) + 1, dtype=np.int32)
             cu_seqlens_padded[0] = 0
-            np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
-            cu_seqlens_padded = torch.from_numpy(cu_seqlens_padded).to(
-                device=dev, non_blocking=True
+            cu_seqlens_padded[1:] = np.cumsum(lengths_padding, out=cu_seqlens_padded[1:])
+            cu_seqlens_padded = (
+                torch.from_numpy(cu_seqlens_padded)
+                .to(device=dev, non_blocking=True, dtype=torch.int32)
+                .reshape(-1)
             )
             new_sample["cu_seqlens_padded"] = cu_seqlens_padded
 
@@ -379,27 +403,95 @@ def wrap_hybrid_cp_dataloader(
             new_sample["max_seqlen"] = max_seqlen
 
             # create cu_seqlens without padding
-            lengths = torch.stack([s["original_seq_len"] for s in samples], dim=0)
+            lengths = torch.stack([s["original_seq_len"] for s in samples], dim=0).reshape(-1)
             cu_seqlens = torch.empty(lengths.numel() + 1, device=dev, dtype=torch.int32)
             cu_seqlens[0] = 0
-            cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+            cu_seqlens[1:] = torch.cumsum(lengths, dim=0).reshape(-1)
             new_sample["cu_seqlens"] = cu_seqlens
 
             new_samples.append(new_sample)
-
+        # debugmtl
+        # print(f"new_samples type: {type(new_samples)}, new_sample type: {type(new_samples[0])}")
         new_data_iterator = RerunDataIterator(iter(new_samples))
+
+        # debugmtl
+        # data = next(new_data_iterator)
+        # print(f"data type: {type(data)}")
+        # print(data)
 
         return new_data_iterator, num_micro_batches
 
 
-class BalancedHybridCPScheduler:
+class BaseScheduler:
+    """
+    Base class for sequence packing schedulers.
+    """
+
+    def __init__(self, config):
+        pass
+
+
+class NaiveSequencePackingScheduler(BaseScheduler):
+    """
+    This scheduler simply packs sequences in their original order
+    until reaching the max sequence length.
+    It does not reorder sequences nor perform any load balancing.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_len_all_ranks = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+        self.dp_size = parallel_state.get_data_parallel_world_size()
+
+    def get_groups_and_subsamples(self, sample_id_seqlens, config):
+        """
+        This scheduler simply packs sequences in their original order
+        until reaching the max sequence length.
+        It does not reorder sequences nor perform any load balancing.
+        """
+        groups = []
+        sample_id_groups = []
+        sum_seqlen = 0
+        single_microbatch = []
+
+        for i in range(len(sample_id_seqlens)):
+            if sum_seqlen + sample_id_seqlens[i] <= self.max_seq_len_all_ranks:
+                single_microbatch.append(i)
+                sum_seqlen += sample_id_seqlens[i][1]
+            else:
+                groups.append(single_microbatch)
+                sample_id_groups.append(single_microbatch)
+                single_microbatch = [i]
+                sum_seqlen = sample_id_seqlens[i][1]
+
+        # we want the number of microbatches to be multiple of dp_size
+        # so we move few samples from previous microbatch
+        # to the end of the microbatches if needed
+        num_microbatches_before = len(sample_id_groups)
+        if num_microbatches_before % self.dp_size != 0:
+            remainder = num_microbatches_before % self.dp_size
+            num_to_move = self.dp_size - remainder
+            i = num_microbatches_before - 1
+            while num_to_move > 0:
+                assert i > 0, "Not enough samples to move"
+                if len(sample_id_groups[i]) > 1:
+                    seq_id = sample_id_groups[i].pop()
+                    sample_id_groups[i].append(seq_id)
+                    num_to_move -= 1
+                else:
+                    i -= 1
+        return groups, sample_id_groups
+
+
+class BalancedHybridCPscheduler(BaseScheduler):
     """
     This class provides the functionality to form groups of sub-samples
     such that all DPxCP ranks have a roughly balanced workload in the group.
     """
 
-    def __init__(self, max_seq_len_per_rank: int):
-        self.max_seq_len_per_rank = max_seq_len_per_rank
+    def __init__(self, config):
+        super().__init__(config)
+        self.max_seq_len_per_rank = config.max_seqlen_per_dp_cp_rank
         self.num_subsamples = 0
         self.num_subsamples_processed = 0
         self.free_resources = []
@@ -614,6 +706,8 @@ class BalancedHybridCPScheduler:
                 else:
                     chosen_members = group_members[best_gid]
             else:
+                if best_gid is None:
+                    break
                 chosen_members = group_members[best_gid]
 
             # ---- Step 2 – if we decided to create a fresh group ----------------
@@ -731,7 +825,6 @@ class BalancedHybridCPScheduler:
                 else:
                     break
 
-        # debugmtl make sure total_seq_len after packing smaller than max_seq_len
         # trim_overload()
 
         # Track samples in this group before redistribution to empty GPUs

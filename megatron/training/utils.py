@@ -537,8 +537,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             ),
             'cu_seqlens_padded': (
                 None
-                if "cu_seqlens" not in data
-                else data["cu_seqlens"].cuda(non_blocking=True)
+                if "cu_seqlens_padded" not in data
+                else data["cu_seqlens_padded"].cuda(non_blocking=True)
             ),
             'max_seqlen': (
                 None

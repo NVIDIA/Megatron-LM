@@ -12,7 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
 )
-from megatron.core.pipeline_parallel.data_schedule import wrap_hybrid_cp_dataloader
+from megatron.core.pipeline_parallel.data_schedule import PackingScheduler, wrap_dataloader
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -215,6 +215,17 @@ def forward_step_calc_loss(
     """Calculate the loss and number of tokens for forward_step()"""
 
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    # TODO(tailaim): this is wrong, must fix it
+    num_tokens_this_microbatch = output_tensor.numel()
+    if len(forward_data_store) == 0:
+        # the first element is the total number of tokens within a single GA
+        forward_data_store.append(num_tokens_this_microbatch)
+        # the second element is the squared sum of the sequences within a single GA
+        forward_data_store.append(num_tokens_this_microbatch * num_tokens_this_microbatch)
+    else:
+        forward_data_store[0] += num_tokens_this_microbatch
+        forward_data_store[1] += num_tokens_this_microbatch * num_tokens_this_microbatch
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -498,6 +509,33 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def wrap_iterator_helper(
+    config,
+    data_iterator: Union[Iterator, List[Iterator]],
+    num_microbatches: int,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Warp data iterator for sequence packing if needed."""
+    if config.sft_sequence_packing:
+        if config.hybrid_context_parallel:
+            data_iterator, num_microbatches = wrap_dataloader(
+                data_iterator, config, PackingScheduler.HYBRID_CP, pg_collection=None
+            )
+        else:
+            if config.balanced_sequence_packing:
+                # enable balanced sequence packing scheduler
+                pass
+            else:
+                # naive sequence packing scheduler
+                data_iterator, num_microbatches = wrap_dataloader(
+                    data_iterator,
+                    config,
+                    PackingScheduler.NAIVE_SEQUENCE_PACKING,
+                    pg_collection=None,
+                )
+    return data_iterator, num_microbatches
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -579,29 +617,9 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
-    # here we need to do something to data_iterator
-    # 这里我们需要返回一个new_data_iterator和num_microbatches
-
-    if config.sft_sequence_packing:
-        if config.hybrid_context_parallel:
-            data_iterator, num_microbatches = wrap_hybrid_cp_dataloader(
-                data_iterator, config, pg_collection=None
-            )
-        else:
-            if config.balanced_sequence_packing:
-                pass
-            else:
-                pass
-    else:
-        # if we want to enable hybrid-cp without sequence packing,
-        # then we need to pad sequence to multiple sizes otherwise
-        # all the sequence same length and hybrid-cp is meaningless.
-        # However, it's meaningless, why not use sequence packing directly?
-        if config.hybrid_context_parallel:
-            pass
-        else:
-            # 这就是最正常的bshd
-            pass
+    data_iterator, num_microbatches = wrap_iterator_helper(
+        config, data_iterator, num_microbatches, pg_collection
+    )
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
@@ -620,24 +638,6 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
-    # elif config.hybrid_context_parallel:
-    #     forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
-    #         forward_step_func,
-    #         data_iterator,
-    #         model,
-    #         num_microbatches,
-    #         input_tensor,
-    #         output_tensor_grad,
-    #         forward_data_store,
-    #         config,
-    #         collect_non_loss_data,
-    #         first_val_step,
-    #         forward_only,
-    #         no_sync_func,
-    #         total_num_tokens,
-    #         check_first_val_step,
-    #         model_type,
-    #     )
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
@@ -678,6 +678,9 @@ def forward_backward_no_pipelining(
         )
 
         total_num_tokens += num_tokens
+
+        # debugmtl
+        # print(f"num_microbatches: {num_microbatches}, total_num_tokens: {total_num_tokens}")
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -952,6 +955,10 @@ def forward_backward_pipelining_with_interleaving(
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+
+    data_iterator, num_microbatches = wrap_iterator_helper(
+        config, data_iterator, num_microbatches, pg_collection
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2085,6 +2092,10 @@ def forward_backward_pipelining_without_interleaving(
             "Invalid combination of p2p_communicator, pg_collection "
             "provide none or provide all the process groups"
         )
+
+    data_iterator, num_microbatches = wrap_iterator_helper(
+        config, data_iterator, num_microbatches, pg_collection
+    )
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:

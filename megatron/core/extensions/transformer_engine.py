@@ -937,6 +937,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
+        # we need to create a single stream for cp=1 and enable hybrid cp case
+        if (
+            self.config.hybrid_context_parallel
+            and getattr(TEDotProductAttention, "cp_stream") is None
+        ):
+            TEDotProductAttention.cp_stream = torch.cuda.Stream()
+
         if self.config.deterministic_mode:
             if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:
                 raise RuntimeError(
