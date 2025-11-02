@@ -1,14 +1,10 @@
-import logging
-import os
-import sys
 
+import os
 import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
 
-from megatron.core import parallel_state
-from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
