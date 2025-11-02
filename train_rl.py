@@ -101,8 +101,9 @@ def loss_func(
 
     total_tokens = loss_mask_flat.sum()
     # Avoid division by zero for empty bins
-    if total_tokens == 0:
-        total_tokens = torch.tensor(1.0, device=loss_mask_flat.device)
+    # total_tokens is a 0-d tensor; use .item() to compare its scalar value safely in Python
+    if total_tokens.item() == 0:
+        total_tokens = torch.tensor(1.0, device=loss_mask_flat.device, dtype=loss_mask_flat.dtype)
     loss = torch.cat([torch.sum(losses_flat * loss_mask_flat).view(1), total_tokens.view(1)])
 
     # Ensure all tensors are on the same device as losses
