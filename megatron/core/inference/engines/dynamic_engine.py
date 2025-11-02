@@ -161,9 +161,6 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("> dynamic_engine.py: building cuda graphs for ")
             for graph in context.cudagraph_config_list:
                 logging.info(graph)
-            
-            for graph in context.cudagraph_config_list:
-                logging.info(graph)
 
             tbar = enumerate(context.cudagraph_config_list)
             if HAVE_TQDM:
@@ -760,6 +757,12 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info(output_str)
 
         self.step_count += 1
+
+        # Print debug buffers for FlashInfer metadata at end of iteration
+        if hasattr(self.context, 'active_attn_metadata') and self.context.active_attn_metadata:
+            mha_metadata = self.context.active_attn_metadata.get("mha_metadata")
+            if mha_metadata and hasattr(mha_metadata, 'print_debug_buffers'):
+                mha_metadata.print_debug_buffers()
 
         range_pop()
         return {

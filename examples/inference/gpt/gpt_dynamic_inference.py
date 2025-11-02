@@ -43,6 +43,7 @@ from model_provider import model_provider
 from gpt_builders import gpt_builder
 
 import json
+import logging
 
 from examples.inference.gpt.utils import (
     Request,
@@ -335,7 +336,8 @@ def run_inference(
 
 @torch.inference_mode()
 def main():
-
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
     # Initialize Megatron.
     initialize_megatron(
         extra_args_provider=add_dynamic_inference_args,

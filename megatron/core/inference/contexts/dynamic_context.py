@@ -25,6 +25,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 from .attention_context.mha_metadata import GraphMHAMetadata, NonGraphMHAMetadata
 from .attention_context.mha_splitpd_metadata import MHASplitPDMetadata
+from .attention_context.mha_flashinfer_metadata import (
+    GraphMHAFlashInferMetadata,
+    NonGraphMHAFlashInferMetadata
+)
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
 from ..kv_cache import KVCacheBase, KVCacheLayout, MLACache, create_mhagqa_cache
@@ -282,7 +286,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         if max_tokens_override is not None:
-            self.max_tokens = self.round_up_tokens(max_tokens_override, tp_size=tp_size)
+            self.max_tokens = max_tokens_override # self.round_up_tokens(max_tokens_override, tp_size=tp_size)
 
         self.max_requests = min(self.max_requests, self.max_tokens)  # e.g., decode only.
 
@@ -290,6 +294,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = params_dtype
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
+
+        # Store model parameters for FlashInfer metadata (needed for set_model_params)
+        self.num_attention_qo_heads_per_partition = core_divide(num_attention_qo_heads, tp_size)
+        self.num_attention_kv_heads_per_partition = num_attention_kv_heads_per_partition
+        self.hidden_size_per_attention_head = hidden_size_per_attention_head
         self.unified_memory_level = unified_memory_level
         if unified_memory_level > 0:
             if not has_unified_memory and torch.distributed.get_rank() == 0:
@@ -424,6 +433,41 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_size_tokens=self.block_size_tokens,
                 max_seqlen=self.max_sequence_length,
             )
+        elif attention_backend in [AttnBackend.flashinfer_fa2,
+                                   AttnBackend.flashinfer_fa3,
+                                   AttnBackend.flashinfer_trt]:
+            # Create FlashInfer metadata for both graph and non-graph modes
+            self.graph_attn_metadata["mha_metadata"] = GraphMHAFlashInferMetadata(
+                block_count_total=block_count_total,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+                backend=attention_backend,
+                prefill_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
+                decode_workspace_size=1 * 1024 * 1024 * 1024,   # 1GB
+            )
+
+            self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAFlashInferMetadata(
+                block_count_total=block_count_total,
+                max_kv_block_count=self.max_kv_block_count,
+                max_requests=self.max_requests,
+                block_size_tokens=self.block_size_tokens,
+                max_seqlen=self.max_sequence_length,
+                backend=attention_backend,
+                prefill_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
+                decode_workspace_size=1 * 1024 * 1024 * 1024,   # 1GB
+            )
+
+            # Set model parameters for FlashInfer planning
+            for metadata in [self.graph_attn_metadata["mha_metadata"],
+                             self.non_graph_attn_metadata["mha_metadata"]]:
+                metadata.set_model_params(
+                    num_qo_heads=self.num_attention_qo_heads_per_partition,
+                    num_kv_heads=self.num_attention_kv_heads_per_partition,
+                    head_dim=self.hidden_size_per_attention_head,
+                    params_dtype=self.params_dtype,
+                )
 
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
@@ -1000,7 +1044,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.padded_active_request_count = self.padded_config.req_count
         else:
             self.padded_config = CUDAGraphConfig()
-            self.padded_config.token_count = self.round_up_tokens(self.active_token_count)
+            self.padded_config.token_count = self.active_token_count
             if self.is_decode_only():
                 self.padded_config.decode_req_count = self.padded_config.token_count
                 self.padded_config.prefill_req_count = 0

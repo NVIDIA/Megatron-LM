@@ -226,9 +226,40 @@ class MHASplitPDMetadata(MetadataBase):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         q = q.squeeze(1)
+        
+
+        # prefill only:
+        if self.padded_config.prefill_req_count > 0 and self.padded_config.decode_req_count == 0:
+            o_pf = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                self.state_data["prefill_qo_indptr"],
+                self.state_data["prefill_cum_kv_seq_len"],
+                self.state_data["max_seqlen_q"],
+                self.state_data["max_seqlen_k"],
+                softmax_scale=softmax_scale,
+                causal=True,
+                block_table=self.state_data["prefill_block_table"],
+            )
+            return o_pf.unsqueeze(1)
+        
+        # decode only:
+        if self.padded_config.decode_req_count > 0 and self.padded_config.prefill_req_count == 0:
+            flash_attn_args = {
+                "q": q[:self.padded_config.decode_req_count].unsqueeze(1),
+                "k_cache": k,
+                "v_cache": v,
+                "cache_seqlens": self.state_data["kv_seq_lengths"][:self.padded_config.decode_req_count],
+                "causal": True,
+                "block_table": self.state_data["decode_block_table"],
+            }
+            o_dc = flash_attn_with_kvcache(**flash_attn_args).squeeze(1)
+            return o_dc.unsqueeze(1)
+        
+        # prefill and decode:
         q_pf = torch.empty_like(q)
         attn_partial_copy_triton(q, q_pf, self.state_data["device_decode_prefill"], check_bounds=False)
-
         if self.padded_config.prefill_req_count > 0:
             o_pf = flash_attn_varlen_func(
                 q_pf[:self.padded_config.token_count - self.padded_config.decode_req_count],
