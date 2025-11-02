@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   pre-flight:
