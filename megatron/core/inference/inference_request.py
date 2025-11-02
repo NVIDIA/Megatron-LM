@@ -1,6 +1,7 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import io
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -10,6 +11,22 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
+
+
+def serialize_tensor(tensor):
+    """Serialize tensor to bytes."""
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer)
+    buffer.seek(0)
+    tensor_bytes = buffer.read()
+    return tensor_bytes
+
+
+def deserialize_tensor(tensor_bytes):
+    """Deserialize tensor from bytes."""
+    buffer = io.BytesIO(tensor_bytes)
+    tensor = torch.load(buffer)
+    return tensor
 
 
 # class syntax
@@ -66,7 +83,39 @@ class InferenceRequest:
             dict: A dictionary representation of the instance suitable for serialization.
         """
 
-        return asdict(self)
+        # Dataclass to dict.
+        obj = asdict(self)
+        obj["status"] = self.status.name if self.status else None
+
+        # Serialize tensors.
+        obj = {
+            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            for k, v in obj.items()
+        }
+
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "InferenceRequest":
+        """Deserialize request.
+
+        Args:
+            obj (dict): Serialized request data.
+
+        Returns:
+            (InferenceRequest) Deserialized request.
+        """
+
+        # Initialize request.
+        request = cls(**obj)
+        request.status = None if obj["status"] is None else Status[obj["status"]]
+
+        # Deserialize tensors.
+        for k, v in obj.items():
+            if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
+                setattr(request, k, deserialize_tensor(v[1]))
+
+        return request
 
 
 class DynamicInferenceEventType(Enum):
@@ -101,8 +150,8 @@ class DynamicInferenceEvent:
     def __post_init__(self):
 
         # Timestamp.
-        assert self.timestamp is None, "timestamp automatically set."
-        self.timestamp = time.time()
+        if self.timestamp is None:
+            self.timestamp = time.time()
 
         # Validate type.
         assert isinstance(self.type, DynamicInferenceEventType)
@@ -119,6 +168,47 @@ class DynamicInferenceEvent:
     def __str__(self):
         payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
+
+    def serialize(self):
+        """
+        Converts the instance into a serializable dictionary.
+        Returns:
+            dict: A dictionary representation of the instance suitable for serialization.
+        """
+
+        # Dataclass to dict.
+        obj = asdict(self)
+        obj["type"] = self.type.name
+
+        # Serialize payload.
+        if self.payload:
+            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+
+            obj["payload"] = ContextErrorFactory.serialize(self.payload)
+
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceEvent":
+        """Deserialize event.
+
+        Args:
+            obj (dict): Serialized event data.
+
+        Returns:
+            (DynamicInferenceEvent) Deserialized event.
+        """
+
+        # Initialize event.
+        event = cls(**{**obj, "type": DynamicInferenceEventType[obj["type"]]})
+
+        # Deserialize payload.
+        if obj["payload"]:
+            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+
+            event.payload = ContextErrorFactory.deserialize(obj["payload"])
+
+        return event
 
 
 @dataclass(kw_only=True)
@@ -139,6 +229,7 @@ class DynamicInferenceRequest(InferenceRequest):
     finished_chunk_token_count = 0
 
     def __post_init__(self):
+        self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
@@ -161,6 +252,30 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"num events {len(self.events)}",
             )
         )
+
+    def serializable(self):
+        """
+        Converts the instance into a serializable dictionary.
+        Returns:
+            dict: A dictionary representation of the instance suitable for serialization.
+        """
+        obj = super().serializable()
+        obj["events"] = [e.serialize() for e in self.events]
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceRequest":
+        """Deserialize request.
+
+        Args:
+            obj (dict): Serialized request data.
+
+        Returns:
+            (DynamicInferenceRequest) Deserialized request.
+        """
+        request = super().deserialize(obj)
+        request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        return request
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""
