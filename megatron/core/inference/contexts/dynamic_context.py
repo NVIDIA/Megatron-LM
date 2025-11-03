@@ -104,6 +104,13 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
         )
 
 
+class TensorStateDeallocatedError(ContextOverflowError):
+    """Context's tensor state is currently deallocated, such as when the engine
+    has been suspended."""
+
+    pass
+
+
 class ContextErrorFactory:
     """Factory class for serializing/deserializing context errors."""
 
@@ -420,6 +427,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
 
         # Allocate GPU state.
+        self.is_tensor_state_allocated = False
         self.allocate_all_tensors(is_init=True)
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
@@ -438,6 +446,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # call to `__init__()`.
         if self.unified_memory_level != 0 and not is_init:
             return
+
+        # Mark allocated.
+        if self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = True
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
@@ -555,6 +568,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # deallocations after the initial call to `__init__()`.
         if self.unified_memory_level != 0:
             return
+
+        # Mark deallocated.
+        if not self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = False
 
         # Delete all tensor attributes.
         # TODO(@lmcafee): check that device == 'cuda'?
@@ -1188,6 +1206,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None
         """
+
+        # If tensor state is deallocated, do not add request.
+        if not self.is_tensor_state_allocated:
+            raise TensorStateDeallocatedError(req.request_id)
+
+        # Chunk length.
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
 
@@ -1357,6 +1381,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
+
+        # If tensor state is deallocated, do not add request.
+        if not self.is_tensor_state_allocated:
+            raise TensorStateDeallocatedError(req.request_id)
+
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion

@@ -20,7 +20,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -245,6 +245,7 @@ def run_inference(
     output_times = []
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
+    attempted_step_count = 0
     if args.cuda_graph_impl == "local":
         cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
     else:
@@ -287,26 +288,54 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
-        result = engine.step_modern(verbose=True)
+        try:
+            result = engine.step_modern(verbose=True)
+        except EngineSuspendedError as e:
+            result = e
+            pass # ignore error in order to call 'engine.resume()' below.
+        attempted_step_count += 1
 
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
         is_decode_only = engine.is_decode_only 
 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # # Test suspending and resuming engine.
+        # if (
+        #     args.suspend_resume_interval is not None
+        #     and
+        #     engine.step_count % args.suspend_resume_interval == 0
+        # ):
+        #     active_token_count_0 = engine.context.active_token_count
+        #     engine.suspend()
+        #     engine.resume()
+        #     active_token_count_1 = engine.context.active_token_count
+        #     print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
+        #         engine.step_count,
+        #         active_token_count_0,
+        #         active_token_count_1,
+        #     ))
+        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # Test suspending and resuming engine.
-        if (
-            args.suspend_resume_interval is not None
-            and
-            engine.step_count % args.suspend_resume_interval == 0
-        ):
-            active_token_count_0 = engine.context.active_token_count
-            engine.suspend()
-            engine.resume()
-            active_token_count_1 = engine.context.active_token_count
-            print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
-                engine.step_count,
-                active_token_count_0,
-                active_token_count_1,
-            ))
+        if args.suspend_resume_interval is not None:
+
+            # Suspend.
+            if attempted_step_count % args.suspend_resume_interval == 0:
+                print("**** step %d/%d ... suspend." % (engine.step_count, attempted_step_count))
+                engine.suspend()
+
+            # Resume, 4 (attempted) steps later.
+            if (
+                attempted_step_count > 0
+                and
+                (attempted_step_count - 4) % args.suspend_resume_interval == 0
+            ):
+                print("**** step %d/%d ... resume." % (engine.step_count, attempted_step_count))
+                engine.resume()
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+        # If engine suspended, continue to next iter.
+        if isinstance(result, EngineSuspendedError):
+            continue
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]

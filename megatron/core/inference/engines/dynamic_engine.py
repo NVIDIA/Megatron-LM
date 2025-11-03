@@ -62,6 +62,12 @@ except:
     HAVE_MSGPACK = False
 
 
+class EngineSuspendedError(Exception):
+    """Engine is currently suspended and not performing steps."""
+
+    pass
+
+
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
     for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
@@ -900,6 +906,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+
+        # If suspended, no stepping.
+        if self.is_suspended:
+            raise EngineSuspendedError(self.step_count)
+
         # schedule requests
         self.schedule_waiting_requests()
 
