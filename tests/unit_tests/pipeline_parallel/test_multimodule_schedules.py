@@ -247,9 +247,10 @@ def _get_pg_collection_with_embedding_groups(grid):
 @pytest.mark.parametrize(
     "encoder_tp,encoder_pp,encoder_dp,llm_tp,llm_pp,llm_dp,llm_grid_offset",
     [
-        # (2, 2, 1, 2, 2, 1, 4),
-        # (4, 1, 1, 2, 2, 1, 4),
+        (2, 2, 1, 2, 2, 1, 4),
+        (4, 1, 1, 2, 2, 1, 4),
         (2, 1, 1, 1, 6, 1, 2),
+        (2, 2, 1, 1, 4, 1, 4)
     ],
 )
 def test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
@@ -277,7 +278,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
         return model_output, loss_func
 
     sequence_length = 512
-    micro_batch_size = 1
+    micro_batch_size = 4
     hidden_size = 1024
 
     # Create model
@@ -305,6 +306,7 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
     config.moe_router_enable_expert_bias = False
     config.moe_router_load_balancing_type = "aux_loss"
     config.variable_seq_lengths = True
+    config.batch_p2p_comm = False
     config.no_sync_func = model.no_sync
     config.finalize_model_grads_func = model.finalize_model_grads
     config.fine_grained_activation_offloading = False
@@ -364,10 +366,10 @@ if __name__ == "__main__":
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
     test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
         encoder_tp=2, 
-        encoder_pp=1, 
+        encoder_pp=2,
         encoder_dp=1, 
-        llm_tp=1, 
-        llm_pp=6, 
+        llm_tp=2, 
+        llm_pp=2, 
         llm_dp=1, 
-        llm_grid_offset=2
+        llm_grid_offset=4
     )
