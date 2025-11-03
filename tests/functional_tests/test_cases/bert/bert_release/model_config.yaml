@@ -27,12 +27,13 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 8
   # Data args
   --data-path: ${DATA_BLEND}
-  --vocab-file: ${DATA_PATH}/text/the_pile/bert_shard00/vocab.txt
+  --vocab-file: ${DATA_PATH}/vocab.txt
   --split: 949,50,1
   --data-cache-path: ${DATA_CACHE_PATH}
   # EVAL_AND_LOGGING_ARGS
   --log-interval: 100
   --save-interval: 2000
+  --save-retain-interval: 10000
   --eval-interval: 1000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
@@ -47,6 +48,7 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
   --exit-interval: 20000
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"

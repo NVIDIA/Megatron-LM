@@ -130,9 +130,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             self.original_max_position_embeddings,
             self.correction_range_round_to_int,
         )
-        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, self.dim // 2).to(
-            device=self.inv_freq_extra.device, dtype=torch.float32
-        )
+        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(
+            low, high, self.dim // 2, device=self.inv_freq_extra.device
+        ).to(dtype=torch.float32)
         inv_freq = self.inv_freq_inter * (1 - inv_freq_mask) + self.inv_freq_extra * inv_freq_mask
 
         seq = (
@@ -211,11 +211,11 @@ def _yarn_find_correction_range(
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
-def _yarn_linear_ramp_mask(min: float, max: float, dim: int) -> Tensor:
+def _yarn_linear_ramp_mask(min: float, max: float, dim: int, device: torch.device) -> Tensor:
     if min == max:
         max += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    linear_func = (torch.arange(dim, dtype=torch.float32, device=device) - min) / (max - min)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
