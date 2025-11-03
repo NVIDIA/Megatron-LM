@@ -120,7 +120,7 @@ class TestFP8Param:
             args.reuse_grad_buf_for_mxfp8_param_ag = True
 
         if use_cuda_graph:
-            args.external_cuda_graph = True
+            args.cuda_graph_impl = "transformer_engine"
             args.cuda_graph_warmup_steps = 0
 
         for key, value in kwargs.items():
