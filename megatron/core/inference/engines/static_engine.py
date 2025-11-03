@@ -103,6 +103,7 @@ class StaticInferenceEngine(AbstractEngine):
                 )
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
                 self.controller.inference_wrapped_model.prep_model_for_inference()
+                self.controller._init_dynamic_sampling_tensors()
 
                 self.dynamic_engine = DynamicInferenceEngine(
                     controller=self.controller,
