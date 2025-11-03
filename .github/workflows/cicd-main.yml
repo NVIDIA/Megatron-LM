@@ -491,6 +491,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -502,7 +503,7 @@ jobs:
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
@@ -529,6 +530,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -554,6 +556,7 @@ jobs:
         || success()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
         flag: [unit-test]
