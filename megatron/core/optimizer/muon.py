@@ -314,9 +314,9 @@ def get_megatron_muon_optimizer(
             reset_config_bf16 = True
         else:
             # if not using layer_wise wrapper, just create master weight here is fine
-            optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, init_state_fn)
+            optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, muon_init_state_fn)
     else:
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+        optimizer = FP32Optimizer(optimizer, config, muon_init_state_fn)
 
     optimizers.append(optimizer)
 
