@@ -55,6 +55,9 @@ try:
 
     HAVE_FA3 = True
 except ImportError as e:
+    HAVE_FA3 = False
+
+if not HAVE_FA3:
     try:
         from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
@@ -63,7 +66,7 @@ except ImportError as e:
 
         HAVE_FA3 = True
     except ImportError as e:
-        HAVE_FA3 = False
+        pass
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
