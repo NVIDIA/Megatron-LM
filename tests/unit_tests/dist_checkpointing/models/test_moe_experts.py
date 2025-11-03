@@ -278,6 +278,9 @@ class TestExpertLayerReconfiguration:
             save_strategy = get_default_save_sharded_strategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
+            
+            if "dp_cp_group" in list(metadata.keys()):
+                del metadata["dp_cp_group"]
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
             model_B = initialize_expert_layer(1, use_glu, expert_type=dest_module)
@@ -353,6 +356,9 @@ class TestExpertLayerReconfiguration:
             save_strategy = get_default_save_sharded_strategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
+            
+            if "dp_cp_group" in list(metadata.keys()):
+                del metadata["dp_cp_group"]
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
             load_strategy = None
