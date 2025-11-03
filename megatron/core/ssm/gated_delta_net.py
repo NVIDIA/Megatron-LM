@@ -21,6 +21,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.ssm_context_parallel import SSMContextParallel
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -114,6 +115,7 @@ class GatedDeltaNet(MegatronModule):
         self.use_qk_l2norm = use_qk_l2norm
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
+        self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -129,6 +131,8 @@ class GatedDeltaNet(MegatronModule):
         self.num_value_heads = config.linear_num_value_heads
         self.qk_dim = self.key_head_dim * self.num_key_heads
         self.v_dim = self.value_head_dim * self.num_value_heads
+        self.qk_dim_local_tp = self.qk_dim // self.tp_size
+        self.v_dim_local_tp = self.v_dim // self.tp_size
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
@@ -217,7 +221,7 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
-        # TODO: support CP
+        self.cp = SSMContextParallel(self.pg_collection.cp)
 
         self.reset_parameters()
 
@@ -287,7 +291,7 @@ class GatedDeltaNet(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size
+        seq_len = seq_len * self.sp_size * self.cp_size
 
         if inference_context is not None:
             assert (
@@ -306,6 +310,21 @@ class GatedDeltaNet(MegatronModule):
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
+        # CP All to All: CP to HP
+        qkvzba = self.cp.tensor_a2a_cp2hp(
+            qkvzba,
+            seq_dim=0,
+            head_dim=-1,
+            split_size_or_sections=[
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+        )
+
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
         qkvzba = qkvzba.transpose(0, 1)
@@ -314,10 +333,10 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim * 2 + self.v_dim) // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+                self.v_dim_local_tp // self.cp_size,
+                self.num_value_heads // self.tp_size // self.cp_size,
+                self.num_value_heads // self.tp_size // self.cp_size,
             ],
             dim=-1,
         )
@@ -328,14 +347,38 @@ class GatedDeltaNet(MegatronModule):
         # Convolution on qkv
         qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
         nvtx_range_push(suffix="conv1d")
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = self.cp.get_parameter_local_cp(
+            self.conv1d.weight, dim=0, split_size_or_sections=qkv_channels_split_sections
+        )
+        conv1d_bias = (
+            self.cp.get_parameter_local_cp(
+                self.conv1d.bias, dim=0, split_size_or_sections=qkv_channels_split_sections
+            )
+            if self.conv_bias
+            else None
+        )
         if (causal_conv1d_fn is None) or self.config.deterministic_mode:
-            qkv = self.act_fn(self.conv1d(qkv)[..., :seq_len])
+            conv_out = F.conv1d(
+                input=qkv,
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // self.cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
         else:
             assert self.activation in ["silu", "swish"]
             qkv = causal_conv1d_fn(
                 x=qkv,
-                weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
-                bias=self.conv1d.bias,
+                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                bias=conv1d_bias,
                 activation=self.activation,
             )
         nvtx_range_pop(suffix="conv1d")
@@ -343,7 +386,11 @@ class GatedDeltaNet(MegatronModule):
         qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         query, key, value = torch.split(
             qkv,
-            [self.qk_dim // self.tp_size, self.qk_dim // self.tp_size, self.v_dim // self.tp_size],
+            [
+                self.qk_dim_local_tp // self.cp_size,
+                self.qk_dim_local_tp // self.cp_size,
+                self.v_dim_local_tp // self.cp_size,
+            ],
             dim=-1,
         )
         query = query.reshape(batch, seq_len, -1, self.key_head_dim)
@@ -367,7 +414,9 @@ class GatedDeltaNet(MegatronModule):
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        g = -self.A_log.exp() * F.softplus(alpha.float() + self.dt_bias)  # In fp32
+        A_log_local_cp = self.cp.get_parameter_local_cp(self.A_log, dim=0)
+        dt_bias_local_cp = self.cp.get_parameter_local_cp(self.dt_bias, dim=0)
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
         beta = beta.sigmoid()
         nvtx_range_pop(suffix="g_and_beta")
 
@@ -405,6 +454,9 @@ class GatedDeltaNet(MegatronModule):
         # From bshd back to sbhd format
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
+
+        # CP all to all: HP to CP
+        norm_out = self.cp.tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -479,10 +531,10 @@ class GatedDeltaNet(MegatronModule):
         sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             [
-                self.qk_dim // self.tp_size,
-                self.qk_dim // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.v_dim // self.tp_size,
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
                 self.num_value_heads // self.tp_size,
                 self.num_value_heads // self.tp_size,
             ],
@@ -502,11 +554,7 @@ class GatedDeltaNet(MegatronModule):
         for conv_layer_name in conv_layer_name_list:
             sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
                 sharded_state_dict[f"{prefix}{conv_layer_name}"],
-                [
-                    self.qk_dim // self.tp_size,
-                    self.qk_dim // self.tp_size,
-                    self.v_dim // self.tp_size,
-                ],
+                [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp],
                 ["query", "key", "value"],
                 0,
             )

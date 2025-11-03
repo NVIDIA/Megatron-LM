@@ -922,17 +922,14 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
                 # Check tensor parallelism compatibility
-                assert (
-                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-                assert (
-                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
-
-                # Do not support yet, but coming soon.
-                assert self.context_parallel_size == 1, (
-                    f"Gated delta net does not support context parallel for now,"
-                    f" but got {self.context_parallel_size=}."
+                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+                assert self.linear_num_key_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_key_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                )
+                assert self.linear_num_value_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_value_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
                 )
         elif self.experimental_attention_variant == "dsa":
             assert (

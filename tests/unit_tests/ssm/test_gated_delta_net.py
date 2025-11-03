@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
 from unittest import mock
@@ -40,12 +40,7 @@ except ImportError:
 
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
-    [
-        (1, False, 1),
-        (2, False, 1),
-        (2, True, 1),
-        # GDN does not support CP for now. Leave it for future work.
-    ],
+    [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
@@ -143,13 +138,15 @@ class TestGatedDeltaNet:
     [
         (4, False, 1),  # TP w/o SP
         (4, True, 1),  # TP w/ SP
-        # CP does not support GDN for now. Add it once it is supported.
+        (1, False, 2),  # CP
+        (2, False, 2),  # TP w/o SP + CP
+        (2, True, 2),  # TP w/ SP + CP
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     transformer_config = TransformerConfig(
-        hidden_size=128,
+        hidden_size=hidden_size,
         linear_conv_kernel_dim=2,
         linear_key_head_dim=32,
         linear_value_head_dim=32,
