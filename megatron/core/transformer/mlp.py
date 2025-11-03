@@ -235,13 +235,13 @@ class MLP(MegatronModule):
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(
-        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None, tp_group = None
     ) -> ShardedStateDict:
         """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata, tp_group)
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):

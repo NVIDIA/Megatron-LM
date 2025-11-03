@@ -999,6 +999,7 @@ class SequentialMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
         # use pg_collection.expt_dp_group as data parallel group in this module.
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
@@ -1086,7 +1087,7 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             expert.backward_dw()
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
         """Maps local expert to global experts."""
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
@@ -1111,7 +1112,7 @@ class SequentialMLP(MegatronModule):
                 )
 
             expert_state_dict = expert.sharded_state_dict(
-                expert_state_dict_prefix, expert_sharded_offsets, metadata
+                expert_state_dict_prefix, expert_sharded_offsets, metadata, tp_group
             )
             # Remove expert layers indexing from sharded keys
             replace_prefix_for_sharding(
