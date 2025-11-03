@@ -951,6 +951,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             padded_active_token_count=self.padded_active_token_count,
             real_batch_size=real_req_batch_size,
             padded_active_request_count=self.padded_active_request_count,
+            decode_only=self.is_decode_only(),
         )
         # All attention metadata calculations are now handled by MHAMetadata.update()
 

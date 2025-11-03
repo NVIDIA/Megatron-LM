@@ -43,6 +43,7 @@ class MHAMetadata(MetadataBase):
         padded_active_token_count: int,
         real_batch_size: int,
         padded_active_request_count: Optional[int] = None,
+        decode_only: bool = False,
     ):
         """
         Args:
@@ -52,6 +53,7 @@ class MHAMetadata(MetadataBase):
             padded_active_token_count: int
             real_batch_size: int
             padded_active_request_count: Optional[int]
+            decode_only: bool
         """
         if padded_active_request_count is None:
             padded_active_request_count = real_batch_size
@@ -98,9 +100,11 @@ class MHAMetadata(MetadataBase):
             padded_active_request_count,
             is_cumulative_tensor=True,
         )
-        self._max_seqlen_q = padded_active_token_count
-        if torch.all(self._query_lengths_buf[:padded_active_request_count] <= 1):
+
+        if decode_only:
             self._max_seqlen_q = 1
+        else:
+            self._max_seqlen_q = max(2, padded_active_token_count)
         self._max_seqlen_k = self.max_seqlen
 
         self.state_data = {
@@ -148,6 +152,7 @@ class GraphedMHAMetadata(MHAMetadata):
         padded_active_token_count: int,
         real_batch_size: int,
         padded_active_request_count: Optional[int] = None,
+        decode_only: bool = False,
     ):
         """
         Args:
@@ -157,6 +162,7 @@ class GraphedMHAMetadata(MHAMetadata):
             padded_active_token_count: int
             real_batch_size: int
             padded_active_request_count: Optional[int]
+            decode_only: bool
         """
         super().update(
             request_query_lengths,
@@ -165,6 +171,7 @@ class GraphedMHAMetadata(MHAMetadata):
             padded_active_token_count,
             real_batch_size,
             padded_active_request_count,
+            decode_only,
         )
 
     def reset(self):
@@ -184,6 +191,7 @@ class NonGraphedMHAMetadata(MHAMetadata):
         padded_active_token_count: int,
         real_batch_size: int,
         padded_active_request_count: Optional[int] = None,
+        decode_only: bool = False,
     ):
         """
         Args:
@@ -193,6 +201,7 @@ class NonGraphedMHAMetadata(MHAMetadata):
             padded_active_token_count: int
             real_batch_size: int
             padded_active_request_count: Optional[int]
+            decode_only: bool
         """
         super().update(
             request_query_lengths,
@@ -201,6 +210,7 @@ class NonGraphedMHAMetadata(MHAMetadata):
             padded_active_token_count,
             real_batch_size,
             padded_active_request_count,
+            decode_only,
         )
         if len(self.state_data["query_lengths"]) > 0:
             self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
