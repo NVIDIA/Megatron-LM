@@ -2457,7 +2457,7 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "numpy", specifier = "<2.0.0" },
     { name = "nv-grouped-gemm", marker = "extra == 'dev'", specifier = "~=1.1" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.33.0a0,<0.34.0" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = ">=0.4.0a0,<0.5.0" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
     { name = "nvtx", marker = "extra == 'lts'" },
@@ -3335,13 +3335,12 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.33.1"
+version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ninja" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt-core" },
     { name = "packaging" },
     { name = "pulp" },
     { name = "pydantic" },
@@ -3352,25 +3351,10 @@ dependencies = [
     { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "torchprofile" },
-    { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ca/cb/4af39357792a96f334c7877ea0380c9337aec210ff4794a7dd95beb7c349/nvidia_modelopt-0.33.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:6c51091683a117cd40fdb96a0ec28579f2276f6b627db7ccddc370df544e1dd7", size = 751683, upload-time = "2025-08-12T18:37:48.832Z" },
-    { url = "https://files.pythonhosted.org/packages/0a/b1/fc2f468d140ef58e90fac584759d0cc449db9bc4f64668cdff750ef38fef/nvidia_modelopt-0.33.1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:ef78a98901890f265596ec413dffac177d4a1865201d89a14f29f4fa0cf8e710", size = 751683, upload-time = "2025-08-12T18:36:59.964Z" },
-]
-
-[[package]]
-name = "nvidia-modelopt-core"
-version = "0.33.1"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6a/21/d12ca11f5554340684d11958aae6c6e7755cf0aaae10a2d2c9db217228cf/nvidia_modelopt_core-0.33.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:f25f6a817609c693ee39d1bcf2d3aeef462b9769f971590133de8b1b0310885b", size = 1307716, upload-time = "2025-08-12T18:41:12.086Z" },
-    { url = "https://files.pythonhosted.org/packages/eb/df/7bead24d4854274d9f2818f1ae780fc24260aab60b7b6f73e1af4f056ce5/nvidia_modelopt_core-0.33.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:195f32f06d19bc9f9d858811f1864bddcc1db6278974d98ea6309cb3553427f1", size = 1326896, upload-time = "2025-08-12T18:39:48.243Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/36/3318980c670292d827ace5ac6110ab6054d0f2d87e507382842ea9e7c78f/nvidia_modelopt_core-0.33.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:ffd008a90d8867660ae41c98002156b526e368a4cdf39e225fe20f478adce8b2", size = 1376104, upload-time = "2025-08-12T18:41:47.358Z" },
-    { url = "https://files.pythonhosted.org/packages/27/97/99d1ddabe01ab262c18621619c996e1c2c119bc058607d2bc9ce7eb85fe7/nvidia_modelopt_core-0.33.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:be49121b2f74db4cb73955396a7bb83935d92232c5a20bcfd7b8e7cae68e482f", size = 1393729, upload-time = "2025-08-12T18:40:07.86Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/b5/ba79b1c52b634b24e45dca409f133f947217a5c7ec5c256266e4ec5fa3eb/nvidia_modelopt_core-0.33.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:1ddd9279d8312f8e972b302692a26e6180f1c9fd277232f5925a5589f42b1b76", size = 1338081, upload-time = "2025-08-12T18:40:36.156Z" },
-    { url = "https://files.pythonhosted.org/packages/13/40/4427583475dfd8eb1b8c7522d75d4d059f0512ff03dcc62d6986a22ab918/nvidia_modelopt_core-0.33.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:69d5ace564f2b056c916117be2023f2b7fc01cd1501073915e6b2ced2b8a5394", size = 1363366, upload-time = "2025-08-12T18:39:28.854Z" },
+    { url = "https://files.pythonhosted.org/packages/27/a8/85034a33753a56ef120b931dda1183d98efef1010e379c54d3c3214a5048/nvidia_modelopt-0.37.0-py3-none-any.whl", hash = "sha256:3490b6d6aea3541aa5d475d81230fee627e2c16ff47bbab1cba4b80a1eb119a2", size = 831271, upload-time = "2025-10-08T18:37:03.951Z" },
 ]
 
 [[package]]
@@ -5919,8 +5903,8 @@ name = "torchvision"
 version = "0.24.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
+    { name = "numpy", marker = "sys_platform != 'linux'" },
+    { name = "pillow", marker = "sys_platform != 'linux'" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
 wheels = [
