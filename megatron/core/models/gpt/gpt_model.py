@@ -30,6 +30,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     roll_tensor,
+    tie_output_layer_state_dict,
     tie_word_embeddings_state_dict,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -249,7 +250,7 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process or self.mtp_process:
+        if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
         if has_config_logger_enabled(self.config):
@@ -542,6 +543,7 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
+
         if mtp_in_postprocess:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -561,7 +563,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None:
+        if self.mtp_process:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
@@ -603,7 +605,6 @@ class GPTModel(LanguageModule):
                         hidden_states, mtp_loss_scale * mtp_loss / num_tokens
                     )
         sequence_parallel_override = False
-
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
@@ -768,14 +769,27 @@ class GPTModel(LanguageModule):
             output_extra_state and output_extra_state.data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
-        # Multi-Token Prediction (MTP) need embedding layer in mtp process stage.
+        # Multi-Token Prediction (MTP) need both embedding layer and output layer in
+        # mtp process stage.
         # If MTP is not placed in the pre processing stage, we need to maintain a copy of
         # embedding layer in the mtp process stage and tie it to the embedding in the pre
         # processing stage.
-        # Now MTP loss is computed in post processing stage, so the output_layer is not needed.
+        # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
+        # of output layer in the mtp process stage and tie it to the output layer in the post
+        # processing stage.
         if self.mtp_process and not self.pre_process:
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
             tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
+        if self.mtp_process and not self.post_process:
+            # We only need to tie the output layer weight if share_embeddings_and_output_weights
+            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
+            # will be stored in embedding layer, and output layer will not have any weight.
+            if not self.share_embeddings_and_output_weights:
+                output_layer_weight_key = f'{prefix}output_layer.weight'
+                output_layer_weight = self.output_layer.weight
+                tie_output_layer_state_dict(
+                    sharded_state_dict, output_layer_weight, output_layer_weight_key
+                )
 
         return sharded_state_dict
