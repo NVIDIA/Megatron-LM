@@ -3204,6 +3204,8 @@ def _add_moe_args(parser):
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    group.add_argument('--moe-use-device-initiated-grouped-gemm', action='store_true',
+                       help='Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU. This can prevent the GPU-CPU synchronization during the grouped gemm.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-layer-recompute', action='store_true',
