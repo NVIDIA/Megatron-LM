@@ -112,7 +112,18 @@ runs:
       run: |
         PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
         HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
-        echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+
+        if [[ "$HAS_RUN_TESTS_LABEL" == "true" && "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]]; then
+          echo "main=has-tests-label" | tee -a $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        if
+          echo "main=has-functional-tests-label" | tee -a $GITHUB_OUTPUT
+          exit 0
+        fi
 
     - name: Create run-script (e2e test)
       shell: bash -x -e -u -o pipefail {0}
@@ -125,16 +136,21 @@ runs:
         #!/bin/bash
         set -euxo pipefail
 
-        if [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-              --enable-lightweight-mode
-            )
-          else
-            ARGS=(
-              --scope mr-slim
-            )
-          fi
+        if [ "${{ steps.has-run-tests-label.outputs.main }}" == "has-tests-label" ]; then
+          ARGS=(
+            --scope mr-github
+            --enable-lightweight-mode
+          )
+        elif [ "${{ steps.has-run-tests-label.outputs.main }}" == "has-functional-tests-label" ]; then
+          ARGS=(
+            --scope mr-github
+          )
+        else
+          ARGS=(
+            --scope mr-slim
+            --enable-lightweight-mode
+          )
+        fi
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
