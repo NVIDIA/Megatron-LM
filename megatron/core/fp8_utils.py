@@ -168,7 +168,7 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
 def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
     """Get the alignment size required for fp8 GEMM."""
     if fp8_recipe == Fp8Recipe.mxfp8:
-        return 32
+        return 128
     else:
         return 16
 

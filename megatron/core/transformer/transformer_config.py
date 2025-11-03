@@ -664,6 +664,10 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_use_device_initiated_grouped_gemm: bool = False
+    """Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU. This can prevent the GPU-CPU synchronization during the grouped gemm."""
+
+
     moe_use_legacy_grouped_gemm: bool = False
     """Use legacy GroupedMLP rather than TEGroupedMLP.
     Note: The legacy one will be deprecated soon."""
