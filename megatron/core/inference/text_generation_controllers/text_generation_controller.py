@@ -620,12 +620,10 @@ class TextGenerationController:
         batch_size = last_token_logits.size(0)
 
         if backend == "torch":
-            new_sample = torch.zeros(batch_size, dtype=torch.int64, device=last_token_logits.device)
             self.cu_termination_id.copy_(self.cpu_termination_id, non_blocking=True)
-            termination_id = self.cu_termination_id[:batch_size]
             # Loop.
             for sampling_params, mask in torch_sampling_groups.items():
-                new_sample[mask] = self._torch_sampling_func(
+                self.cu_sampled_tokens[mask] = self._torch_sampling_func(
                     last_token_logits[mask],
                     sampling_params.temperature,
                     sampling_params.top_k,
@@ -638,10 +636,9 @@ class TextGenerationController:
             self.cu_temperatures.copy_(self.cpu_temperature, non_blocking=False)
             self.cu_topk.copy_(self.cpu_topk, non_blocking=False)
             self.cu_topp.copy_(self.cpu_topp, non_blocking=False)
+            raise NotImplementedError
 
-            termination_id = self.cu_termination_id[:batch_size]
-
-        return new_sample, termination_id
+        return self.cu_sampled_tokens[:batch_size], self.cu_termination_id[:batch_size]
 
     def _dynamic_step_log_probs_bookkeeping(self):
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
@@ -762,7 +759,7 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         self._dynamic_step_sample_bookkeeping()  # CPU ops
-        new_sample = self._dynamic_step_sample_logits(logits)  # GPU ops
+        new_sample, termination_id = self._dynamic_step_sample_logits(logits)  # GPU ops
 
         self._dynamic_step_log_probs_bookkeeping()  # CPU ops
         log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample)  # GPU ops
