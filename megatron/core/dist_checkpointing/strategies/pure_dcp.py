@@ -19,6 +19,7 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint.metadata import Metadata
 
+from .checkpointable import CheckpointableShardedTensor
 from ...utils import is_torch_min_version
 from ..dict_utils import dict_list_map_inplace
 from ..mapping import (
@@ -27,7 +28,6 @@ from ..mapping import (
     ShardedStateDict,
     ShardedTensor,
     StateDict,
-    CheckpointableShardedTensor,
 )
 from .async_utils import AsyncRequest
 from .base import (
@@ -64,14 +64,14 @@ def translate_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict,
                 x = x.to_dtensor()
                 num_dtensor += 1
             elif sh_ten_mode == 'ckptable':
-                x = x.to_checkpointable()
+                x = CheckpointableShardedTensor.from_sh_ten(x)
                 num_ckptable += 1
             elif sh_ten_mode == 'hybrid':
                 if x.dtensor_ckpt_device_mesh is not None:
                     x = x.to_dtensor()
                     num_dtensor += 1
                 else:
-                    x = x.to_checkpointable()
+                    x = CheckpointableShardedTensor.from_sh_ten(x)
                     num_ckptable += 1
             else:
                 raise NotImplementedError(f'sh_ten_mode: {sh_ten_mode}')
