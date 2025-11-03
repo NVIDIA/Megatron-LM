@@ -48,9 +48,7 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import (
-        _flash_attn_forward,
-    )
+    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
     from flashattn_hopper.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -1224,9 +1222,7 @@ class SelfAttention(Attention):
             weight_q = weight_q * torch.pow(
                 qk_clip_balancing_eta_extended, self.config.qk_clip_alpha
             )
-            weight_k = weight_k * torch.pow(
-                qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha
-            )
+            weight_k = weight_k * torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha)
 
             # Concatenate back and reshape to original shape
             weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
