@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class SamplingParams:
     """Inference parameters sent along with the prompts.
     This class contains request-level attributes that control the sampling techniques used when

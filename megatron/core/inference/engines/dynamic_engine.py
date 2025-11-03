@@ -598,37 +598,6 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 break
 
-    def get_active_sampling_map(self) -> List[Tuple[SamplingParams, List[int]]]:
-        """Gets a map of sampling methods to active requests indices in the context."""
-        # Get all active request IDs.
-        active_request_ids = self.context.request_ids[
-            self.context.paused_request_count : self.context.total_request_count
-        ].tolist()
-        if self.static_sampling:
-            return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
-
-        # Get a map from request_id to context array index.
-        context_id_map = {r: i for i, r in enumerate(active_request_ids)}
-
-        # Create map of sampling methods to context array indices.
-        sampling_map: List[Tuple[SamplingParams, List[int]]] = []
-        for request_id, request in self.requests.items():
-            if request_id not in context_id_map:
-                continue
-            context_id = context_id_map[request_id]
-            sp = request.sampling_params
-
-            # Look for a pre-existing group with these sampling parameters.
-            for sampling, indices in sampling_map:
-                if sampling == sp:
-                    indices.append(context_id)
-                    break
-            # If no group exists, create a new one.
-            else:
-                sampling_map.append((sp, [context_id]))
-
-        return sampling_map
-
     def schedule_chunked_prefill(self):
         """
         This function schedules chunked prefill requests.
@@ -724,8 +693,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # save the is_decode_only AFTER scheduling, BEFORE update
         self.is_decode_only = is_decode_only
         self.step_start_event.record()
-        sampling_map = self.get_active_sampling_map()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3

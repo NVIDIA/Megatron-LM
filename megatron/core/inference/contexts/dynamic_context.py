@@ -16,6 +16,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -339,10 +340,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = None
         self.paused_tokens = None
 
+        # Keep a reverse hash map for SamplingParams that correspond to active & paused requests.
+        self.sampling_hash_map: Dict[int, SamplingParams] = {}
+
         # Per-request state.
         self.request_ids = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        # Hashes of SamplingParams for each request.
+        self.request_sampling_hashes = torch.empty_like(self.request_ids)
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
@@ -1190,6 +1196,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
+        # Handle the sampling parameters hash.
+        old_sampling_hash = self.request_sampling_hashes[current_id].item()
+        new_sampling_hash = hash(req.sampling_params)
+        self.request_sampling_hashes[current_id] = new_sampling_hash
+        self.sampling_hash_map[new_sampling_hash] = req.sampling_params
+        # Update the reverse hash map if there are no more requests with this sampling hash.
+        # We do this to prevent unbounded growth of the hash map.
+        if (self.request_sampling_hashes != old_sampling_hash).all().item():
+            del self.sampling_hash_map[old_sampling_hash]
+        # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
@@ -1242,6 +1258,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
+        self.request_sampling_hashes[dst_idxs] = self.request_sampling_hashes[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
         next_tokens[dst_idxs] = next_tokens[src_idxs]
 

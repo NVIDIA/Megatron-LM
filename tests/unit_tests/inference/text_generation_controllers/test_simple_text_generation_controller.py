@@ -228,31 +228,47 @@ class TestTextGenerationController:
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    def test_sample_from_dynamic_logits(self):
+    @pytest.mark.parametrize("backend", ["torch"])
+    def test_sample_from_dynamic_logits(self, backend):
         batch_size = 12
         self.setup_model(torch.float32, batch_size=batch_size, static=False)
         self.mock_tokenizer.eod = self.vocab_size
 
-        active_sampling_map: List[Tuple[SamplingParams, List[int]]] = [
+        # Prepare sampling params.
+        sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
+            (SamplingParams(temperature=2.0), [9, 6, 10]),
             (SamplingParams(top_k=3), [0, 3, 2]),
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(top_k=5), [11, 5, 8]),
-            # (SamplingParams(top_k=5, top_p=0.7), [11, 5, 8]), # uncomment for FlashInfer sampling
-            (SamplingParams(temperature=2.0), [9, 6, 10]),
         ]
-        rev_sampling_map: List[SamplingParams] = [None] * batch_size
-        for sampling_params, indices in active_sampling_map:
-            for idx in indices:
-                rev_sampling_map[idx] = sampling_params
+        # For non-torch backends, test simultaneous top_k and top_p sampling.
+        if backend != "torch":
+            sampling_test_cases[3][0] = SamplingParams(top_k=5, top_p=0.7)
 
-        last_token_logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).float().cuda()
-        sampled_logits, _ = self.text_generation_controller.sample_from_dynamic_logits(
-            last_token_logits, active_sampling_map, vocab_size=self.vocab_size
+        rev_sampling_dict: List[SamplingParams] = [None] * batch_size
+        for sampling_params, indices in sampling_test_cases:
+            for idx in indices:
+                rev_sampling_dict[idx] = sampling_params
+
+        # Prepare override data for sampling params.
+        active_sampling_hashes = [hash(rev_sampling_dict[i]) for i in range(batch_size)]
+        active_sampling_hashes = torch.Tensor(active_sampling_hashes).cuda()
+        sampling_hash_map = {hash(s): s for s, _ in sampling_test_cases}
+
+        # Bookkeeping.
+        self.text_generation_controller._dynamic_step_sample_bookkeeping(
+            active_sampling_hashes=active_sampling_hashes, sampling_hash_map=sampling_hash_map
         )
-        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_map]).cuda().unsqueeze(1)
+
+        # Sampling.
+        logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
+        sampled_logits, _ = self.text_generation_controller._dynamic_step_sample_logits(
+            logits, backend=backend
+        )
+        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).cuda().unsqueeze(1)
         top_k_values[top_k_values == 0] = self.vocab_size
-        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_map]).cuda().unsqueeze(1)
-        temp_values = torch.Tensor([s.temperature for s in rev_sampling_map]).cuda().unsqueeze(1)
+        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda().unsqueeze(1)
+        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda().unsqueeze(1)
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
         assert torch.all(
@@ -773,12 +789,8 @@ class TestTextGenerationController:
                         ),
                     )
                 )
-            sampling_params = SamplingParams(top_k=10, return_log_probs=True, termination_id=-1)
-            sampling_map = [(sampling_params, list(range(len(active_requests))))]
             while context.has_unfinished_requests():
-                result = self.text_generation_controller.generate_output_tokens_dynamic_batch(
-                    active_sampling_map=sampling_map
-                )
+                result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
                 new_tokens = result["sample"]
                 assert len(new_tokens) == len(active_requests)
                 for i, token in enumerate(new_tokens.tolist()):
