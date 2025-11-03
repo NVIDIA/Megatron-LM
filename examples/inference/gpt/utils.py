@@ -373,8 +373,8 @@ def build_dynamic_engine_setup_prefix(
     else:
         cg_str = "--"
 
-    # Unified memory.
-    uvm_str = f"uvm {int(args.inference_dynamic_batching_unified_memory_level)}"
+    # Unified memory (UVM).
+    uvm_str = f"uvm {int(context.unified_memory_level)}"
 
     # Prompt description
     prompt_src_str = (
