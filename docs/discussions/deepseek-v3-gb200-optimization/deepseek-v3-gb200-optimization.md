@@ -4,7 +4,7 @@
 
 ---
 
-This guide describes how we used Megatron Core (MCore) and Transformer Engine (TE) to pre-train the DeepSeek-V3 model with MXFP8 precision on 256 GB200 GPUs. We will detail the step-by-step process of optimizing performance to **970 TFLOPS/GPU**, which is a **2.55x** speedup compared to the estimated 380 TFLOPS on H100/H800 (refer to the estimation in this article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] in Chinese). The related features have been or will be open-sourced to the [Megatron Core](https://github.com/NVIDIA/Megatron-LM) and [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) repositories.
+This guide describes how we used Megatron Core (MCore) and Transformer Engine (TE) to pre-train the DeepSeek-V3 model with MXFP8 precision on 256 GB200 GPUs. We will detail the step-by-step process of optimizing performance to **970 TFLOPS/GPU**, which is a **2.55x** speedup compared to the estimated 380 TFLOPS on H100/H800 (refer to the estimation in this article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] in Chinese). The related features have been or will be open-sourced to the [Megatron Core](https://github.com/NVIDIA/Megatron-LM) and [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) repositories. Refer to [the guide](./deepseek-v3-gb200-reproduce-guide.md) to reproduce the performance.
 
 ## **0. Methodology**
 
@@ -242,6 +242,7 @@ We started from a baseline of 494 TFLOPS, and through multiple rounds of perform
 
 **Complete Training Examples**
 
+* [Reproduce Guide](./deepseek-v3-gb200-reproduce-guide.md)
 * [DeepSeek-V3 Training Scripts](https://github.com/yanring/Megatron-MoE-ModelZoo) \- End-to-end training configurations and launch scripts
 
 **Papers and Technical Reports**
