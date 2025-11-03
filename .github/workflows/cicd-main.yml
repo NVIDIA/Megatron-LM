@@ -396,16 +396,15 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+
           HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
-
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
-
-          if [[ "$HAS_RUN_TESTS_LABEL" == "true" && "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]]; then
+          if [[ "$HAS_RUN_TESTS_LABEL" == "true" ]]; then
             echo "main=has-tests-label" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
 
-          if
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+          if [[ "$HAS_RUN_FUNCTIONAL_TESTS_LABEL" == "true" ]]; then
             echo "main=has-functional-tests-label" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
