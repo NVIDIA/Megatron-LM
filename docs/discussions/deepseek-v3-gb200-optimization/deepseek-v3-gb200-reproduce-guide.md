@@ -75,22 +75,12 @@ RUN rm -rf /root/.cache /tmp/*
 
 ## 2. Megatron-Core
 
-We recommend using the [dev branch](https://github.com/NVIDIA/Megatron-LM/tree/dev) plus PR [1917](https://github.com/NVIDIA/Megatron-LM/pull/1917).
-
-If PR 1917 is not merged yet, you can pull it by
+We recommend using the [dev branch](https://github.com/NVIDIA/Megatron-LM/tree/dev) after PR [1917](https://github.com/NVIDIA/Megatron-LM/pull/1917).
 
 ```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git && \
 cd Megatron-LM &&
-git fetch origin pull/1917/head &&
-git checkout FETCH_HEAD
-```
-
-After PR 1917 being merged, simply
-```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git && \
-cd Megatron-LM &&
-git checkout dev
+git checkout effebd81f410bc6566fffee6c320b6f8f762e06d
 ```
 
 ## 3. Cluster Configuration
@@ -202,6 +192,8 @@ chmod 755 bindpcie
 --moe-aux-loss-coeff 1e-4 \
 --moe-router-group-topk 4 \
 --moe-router-num-groups 8 \
+--moe-router-pre-softmax \
+--moe-router-padding-for-quantization \
 --moe-router-topk-scaling-factor 2.5 \
 --moe-router-score-function sigmoid \
 --moe-router-enable-expert-bias \
@@ -243,7 +235,6 @@ chmod 755 bindpcie
 --cuda-graph-impl transformer_engine \
 --cuda-graph-scope attn moe_router moe_preprocess \
 --te-rng-tracker \
---cuda-graph-warmup-steps 0 \
 --pipeline-model-parallel-layout "Et|(tt|)*30L" \
 --moe-router-force-load-balancing \
 --moe-token-dispatcher-type flex \
@@ -258,7 +249,6 @@ chmod 755 bindpcie
 --main-params-dtype fp32 \
 --exp-avg-dtype bf16 \
 --exp-avg-sq-dtype bf16 \
---moe-router-padding-for-quantization
 ```
 
 ### Explanation of arguments
@@ -286,7 +276,6 @@ The following arguments indicate key optimizations.
 --cuda-graph-impl transformer_engine \
 --cuda-graph-scope attn moe_router moe_preprocess \
 --te-rng-tracker \
---cuda-graph-warmup-steps 0 \
 ```
 
 - Force load balancing for performance benchmark
