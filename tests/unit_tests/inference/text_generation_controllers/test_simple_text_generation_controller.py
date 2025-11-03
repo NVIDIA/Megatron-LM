@@ -280,7 +280,7 @@ class TestTextGenerationController:
         sampled_l = l.div(temp_values).softmax(dim=-1)
         top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_values)
         sampled_l.masked_fill_(top_k_mask, 0.0)
-        top_p_mask = (sampled_l.cumsum(dim=-1) > top_p_values)
+        top_p_mask = sampled_l.cumsum(dim=-1) > top_p_values
 
         first_excluded = torch.where(
             top_p_mask.any(dim=-1),
