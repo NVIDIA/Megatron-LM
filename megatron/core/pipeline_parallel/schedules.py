@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -9,6 +9,9 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_reset,
+)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -562,6 +565,9 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
+    if not forward_only and config.fine_grained_activation_offloading:
+        fine_grained_offloading_reset()
+
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
@@ -648,7 +654,7 @@ def forward_backward_no_pipelining(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and "full_iteration" not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
@@ -897,6 +903,9 @@ def forward_backward_pipelining_with_interleaving(
     assert (
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        fine_grained_offloading_reset()
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1912,7 +1921,7 @@ def forward_backward_pipelining_with_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and "full_iteration" not in config.cuda_graph_scope
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
@@ -2042,6 +2051,9 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        fine_grained_offloading_reset()
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -2296,7 +2308,7 @@ def forward_backward_pipelining_without_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and "full_iteration" not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 

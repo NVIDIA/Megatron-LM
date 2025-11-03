@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 from typing import Optional, Tuple
@@ -62,6 +62,8 @@ class LanguageModule(MegatronModule):
         if torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(
             self.embd_group
         ):
+            if getattr(self, 'mtp_process', False):
+                return True
             if (
                 torch.distributed.get_rank()
                 == torch.distributed.get_process_group_ranks(self.embd_group)[0]
@@ -136,7 +138,7 @@ class LanguageModule(MegatronModule):
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
-                        and self.config.cuda_graph_scope == 'full_iteration'
+                        and 'full_iteration' in self.config.cuda_graph_scope
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -201,7 +203,10 @@ class LanguageModule(MegatronModule):
         ):
             self.shared_embedding_or_output_weight().shared_embedding = True
 
-        if (self.post_process or getattr(self, 'mtp_process', False)) and not self.pre_process:
+        if (
+            (self.post_process and self.share_embeddings_and_output_weights)
+            or getattr(self, 'mtp_process', False)
+        ) and not self.pre_process:
             assert not (
                 is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(self.pp_group)
             )
