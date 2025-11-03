@@ -1341,7 +1341,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             return extra_states
 
         def _sharded_state_dict_grouped(
-            self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None
+            self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None, tp_group=None,
         ):
             """
             prefix should be module_name to make keys identical to sequetial ones.
@@ -1371,7 +1371,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict, '', tp_axis_map, new_sharded_offsets
+                    state_dict, '', tp_axis_map, new_sharded_offsets, tp_group=tp_group, dp_cp_group=metadata["dp_cp_group"]
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
@@ -1440,7 +1440,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group=tp_group,
             )
 
-        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
             """
             For each gemm, sharding along axis 0, bias sharded.
             Assume sharded_offsets[-1] is the expert parallel offset.
@@ -1449,7 +1449,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for gemm_idx in range(self.num_gemms):
                 tp_axis_map.update({f"{gemm_idx}.weight": 0, f"{gemm_idx}.bias": 0})
             return super()._sharded_state_dict_grouped(
-                tp_axis_map, prefix, sharded_offsets, metadata
+                tp_axis_map, prefix, sharded_offsets, metadata, tp_group=tp_group
             )
 
     class TERowParallelGroupedLinear(TEGroupedLinear):
@@ -1486,14 +1486,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group=tp_group,
             )
 
-        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
             """
             For each gemm, sharding along axis 1, bias not sharded.
             Assume sharded_offsets[-1] is the expert parallel offset.
             """
             tp_axis_map = {f"{gemm_idx}.weight": 1 for gemm_idx in range(self.num_gemms)}
             return super()._sharded_state_dict_grouped(
-                tp_axis_map, prefix, sharded_offsets, metadata
+                tp_axis_map, prefix, sharded_offsets, metadata, tp_group=tp_group
             )
 
 else:

@@ -243,14 +243,14 @@ def sharded_state_dict_default(
     # Guard for cases metadata is not provided
     metadata = ensure_metadata_has_dp_cp_group(metadata)
     # DEBUG ASSERT REMOVE LATER
-    assert tp_group == parallel_state.get_tensor_model_parallel_group()
+    assert (tp_group == parallel_state.get_tensor_model_parallel_group() or tp_group == parallel_state.get_expert_tensor_parallel_group())
     assert metadata['dp_cp_group'] == parallel_state.get_data_parallel_group(
         with_context_parallel=True
     )
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
-            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata, tp_group=tp_group
         )
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)

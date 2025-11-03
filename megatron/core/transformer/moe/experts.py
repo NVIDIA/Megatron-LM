@@ -722,7 +722,7 @@ class TEGroupedMLP(MegatronModule):
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = pg_collection.ep
-        self.tp_group = pg_collection.tp
+        self.tp_group = pg_collection.expt_tp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
