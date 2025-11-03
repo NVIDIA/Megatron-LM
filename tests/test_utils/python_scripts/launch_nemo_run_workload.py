@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import os
 import pathlib
@@ -50,6 +52,15 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="To enable lightweight mode",
+)
 def main(
     scope,
     model,
@@ -59,6 +70,7 @@ def main(
     container_image,
     data_dir: Optional[str] = None,
     tag: Optional[str] = None,
+    enable_lightweight_mode: Optional[bool] = False,
 ):
     workloads = recipe_parser.load_workloads(
         container_image="none",
@@ -100,8 +112,9 @@ def main(
         env_vars={
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
-            "ENABLE_LIGHTWEIGHT_MODE": "true",
+            "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": "1",
+            "CLUSTER": "dgxh100_dgxc",
         },
         packager=run.Packager(),
         volumes=artifacts,

@@ -35,10 +35,14 @@ Megatron-FSDP can provide up to 25% speed up and 23% memory savings compared to 
 - **Advanced Bucketing**: Data-type aware bucketing system to minimize the overhead of collective operations
 - **Buffer Management**: Zero copy communication is achieved by reorganizing the storage of parameters and main grad with `ParamAndGradBuffer` class
 - **Communication Overlapping**: Improved communication overlap of paramter all-gather and gradient reduce-scatter
-- **User-Buffer-Registration NCCL communication**: Offload NCCL collective communication to NVL/IB Sharp to reduce GPU SM usage for communication
 - **FP8 Mixed Precision with Transformer Engine**: Compatibility with Transformer Engine enables efficient FP8 mixed precision training
 - **Gradient accumulate fusion support with Transformer Engine**: Remove the explicit gradient copy to the communication buffer in backwards pass
 
+### Advanced Collective Communication
+- **SM Usage Reduction with SHARP**: FSDP's `All-Gather` (AG) and `Reduce-Scatter` (RS) collectives are designed to overlap with compute kernels. However, standard NCCL communication kernels can consume a significant number of GPU SMs (e.g., 16-32 SMs), "stealing" resources from compute (GEMM) kernels and reducing overall TFLOPS.
+- **In-Switch Processing**: We leverage **SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol) to offload these collective operations. SHARP performs aggregation and reduction computations directly on the network switches (InfiniBand or NVLink Switch) instead of on the GPU SMs. This dramatically reduces the SM consumption for communication to **1-6 SM** freeing up GPU resources for compute. It also provides lower communication latency, especially in large, scaled-out workloads.
+- **Symmetric Optimizations for MNNVL**: We support **symmetric-based optimizations**, introduced in NCCL v2.27, which enable switch offloading for **Multi-Node NVLink (MNNVL)** systems such as GB200/GB300. This allows the same SM-saving benefits over the high-bandwidth NVLink fabric itself.
+- **Hierarchical Collectives**: When an FSDP sharding domain spans both NVLink and InfiniBand, the library utilizes **hierarchical SHARP collectives** (e.g., NVL-SHARP + IB-SHARP) to optimize the communication path across the entire system topology.
 <!-- ## 📊 Performance  -->
 
 ## 📦 Installation
@@ -123,6 +127,12 @@ device_mesh[("dp_shard", "cp")]._flatten("dp_shard_cp")
 # Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group.
 device_mesh[("dp_outer", "dp_shard", "cp")]._flatten("hsdp")
 hsdp_group = device_mesh["hsdp"].get_group()
+# Initialize DeviceMesh for expert parallel (EP) modules when using FSDP + EP.
+expert_device_mesh = torch.distributed.device_mesh.init_device_mesh(
+    "cuda",
+    mesh_shape=(expt_dp_shard_size, expt_tp_size),
+    mesh_dim_names=("dp_shard", "tp"),
+)
 
 # Fully-shards your model and distributes your optimizer.
 model, optimizer = fully_shard(
@@ -141,6 +151,8 @@ model, optimizer = fully_shard(
     tp_dim="tp",
     # Only required when using HSDP. Otherwise, set this to None.
     hybrid_fsdp_group=hsdp_group,
+    # Only required for FSDP + EP. Otherwise, set this to None.
+    expt_device_mesh=expt_device_mesh,
     # FSDP Sharding Strategy: no_shard (0) / optim (1) / optim_grads (2) / optim_grads_params (3)
     zero_dp_strategy=3,
     outer_dp_sharding_strategy=1,
@@ -188,6 +200,9 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
   - `tp_dim` is the name of the sub-mesh used for tensor parallelism (TP), which is required for `(FSDP, TP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` TP.
     - For more information about tensor parallelism, refer to: [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053).
   - `hybrid_fsdp_group` is the `ProcessGroup` which contains all ranks in the flattened `dp_shard_dim` and `dp_outer_dim` sub-meshes utilized to specify the `(DP-Outer, DP-Shard)` sharded coordinate system for the weight and gradient buffers. Required for HSDP.
+- `expt_device_mesh` is another [`torch.distributed.DeviceMesh`](https://docs.pytorch.org/docs/stable/distributed.html#devicemesh) tailored for the expert parallel (EP) modules in `MegatronFSDP`.
+  - `dp_shard_dim` is the name of the sub-mesh required for FSDP sharding of the EP modules, enabling expert data parallelism (EDP).
+  - `tp_dim` is the name of the sub-mesh used for expert tensor parallelism (ETP), which is required for `(FSDP, ETP)`-strided sharding when using Megatron-LM or Torch-native `DTensor` ETP.
 - `init_model_with_meta_device` has `MegatronFSDP` initialize your `meta`-device model in shards on every CUDA device to avoid OOM when initializing extremely large models that cannot fit on a single device. Users can initialize their model on a [`meta`-device](https://docs.pytorch.org/docs/stable/meta.html) (`with torch.device('meta'): ...`), and ``MegatronFSDP`` will further shard and initialize the model parameters layer-by-layer adhering to the customizable `module.reset_parameters` method, which prevents the entire model from being allocated in memory at any point during runtime.
     - Defaults to `False`.
     - Note that the `device` argument which installs your model on a specific device or rank will be deactivated when `init_model_with_meta_device=True`.
@@ -207,6 +222,9 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
 - `nccl_ub` will allocate and register the NCCL userbuffer for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with SHARP if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`.
+    - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registraion.
+- `disable_symmetric_registration` will disable NCCL window (i.e. symmetric) registraion when using `nccl_ub`. 
+    - Dafaults to `False`.
 - `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
