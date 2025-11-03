@@ -168,6 +168,23 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             _allgather_helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
 
     @torch.no_grad()
+    def broadcast_params(self):
+        """All rank broadcast updated local params."""
+        # Broadcast linear layer weights to all other ranks. Kept as reference test.
+        if self.dp_cp_params_list is None:
+            return
+        for i, params in enumerate(self.dp_cp_params_list):
+            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+            for p in params:
+                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+        if self.expt_dp_params_list is None:
+            return
+        for i, params in enumerate(self.expt_dp_params_list):
+            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+            for p in params:
+                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+
+    @torch.no_grad()
     def get_grad_norm(self):
         # similar to dist opt, always aggregate globally
         grads_for_norm = []
