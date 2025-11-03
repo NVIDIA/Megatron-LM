@@ -579,6 +579,13 @@ class TextGenerationController:
             ]
         sampling_hash_map = context.sampling_hash_map or sampling_hash_map
 
+        # Special-case for static sampling.
+        if getattr(self, "static_sampling", False):
+            assert len(sampling_hash_map) == 1
+            sampling_params = next(iter(sampling_hash_map.values()))
+            self.torch_sampling_groups[sampling_params] = None
+            return
+
         # Loop over all unique sampling hashes.
         for sampling_hash, sampling_params in sampling_hash_map.items():
             mask = active_sampling_hashes == sampling_hash
@@ -618,6 +625,19 @@ class TextGenerationController:
         else:
             last_token_logits = context.last_token_logits(logits)
         batch_size = last_token_logits.size(0)
+
+        # Special-case for static sampling.
+        if getattr(self, "static_sampling", False):
+            assert len(self.torch_sampling_groups) == 1
+            sampling_params = next(iter(self.torch_sampling_groups.keys()))
+            new_sample = self._torch_sampling_func(
+                last_token_logits,
+                sampling_params.temperature,
+                sampling_params.top_k,
+                sampling_params.top_p,
+            )
+            termination_id = sampling_params.termination_id or self.tokenizer.eod
+            return new_sample, termination_id
 
         if backend == "torch":
             self.cu_termination_id.copy_(self.cpu_termination_id, non_blocking=True)

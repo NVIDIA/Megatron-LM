@@ -136,6 +136,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.static_sampling = static_sampling
+        if self.static_sampling:
+            self.sampling_params: Optional[SamplingParams] = None
+            self.text_generation_controller.static_sampling = True
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -424,6 +427,14 @@ class DynamicInferenceEngine(AbstractEngine):
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
+
+        if self.static_sampling:
+            if self.sampling_params is None:
+                self.sampling_params = request.sampling_params
+            else:
+                assert (
+                    self.sampling_params == request.sampling_params
+                ), "All requests must have the same sampling parameters in static_sampling mode."
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
