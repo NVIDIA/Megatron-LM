@@ -107,6 +107,7 @@ def common_test_parallel_reconfiguration_e2e(
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None
+
         state_dict, missing_keys, unexpected_keys = load(
             gpt_model_B.sharded_state_dict(metadata=metadata),
             ckpt_dir_A,
@@ -116,6 +117,7 @@ def common_test_parallel_reconfiguration_e2e(
         # Potential mismatch is because of extra states which is ok
         assert all('_extra_state' in k for k in missing_keys)
         assert all('_extra_state' in k for k in unexpected_keys)
+
         gpt_model_B.load_state_dict(state_dict)
         save(gpt_model_B.sharded_state_dict(metadata=metadata), ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()

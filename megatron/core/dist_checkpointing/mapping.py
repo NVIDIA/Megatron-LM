@@ -10,10 +10,11 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from itertools import chain
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
+from torch._utils import _get_device_module
 
 from .core import CheckpointingException
 from .dict_utils import dict_list_map_inplace
@@ -90,6 +91,35 @@ class ShardedTensor(ShardedBase):
     prepend_axis_num: int = 0
     allow_shape_mismatch: bool = False
     flattened_range: Optional[slice] = None
+    # These are just helper fields to help transform it into a DTensor:
+    dtensor_ckpt_device_mesh: Optional['DeviceMesh'] = None
+    dtensor_ckpt_placements: Optional[List['Placement']] = None
+
+    def to_dtensor(self):
+        from torch.distributed.tensor import DTensor
+
+        assert self.dtensor_ckpt_device_mesh is not None
+        if self.data is None:
+            self.init_data(device="cuda")  # TODO: this is just for the tests to pass
+        return DTensor.from_local(self.data, self.dtensor_ckpt_device_mesh, self.dtensor_ckpt_placements, run_check=False) # TODO: set to True but there are PyT errors
+
+    def to_checkpointable(self) -> 'CheckpointableShardedTensor':
+        """TODO. """
+        if self.data is None:
+            # TODO: we should do that only for loading, saving shouldn't have `data=None`
+            device_type = torch.distributed.distributed_c10d._get_pg_default_device().type
+            device = cast(
+                torch.device, _get_device_module(device_type).current_device()
+            )
+            self.init_data(
+                device,
+                init_fn=torch.zeros if self.allow_shape_mismatch else torch.empty,
+            )
+        else:
+            # TODO: check if this is necessary
+            self.data = self.data.detach()
+            # TODO: this doesn't account for allow_shape_mismatch which requires zero padding
+        return CheckpointableShardedTensor.from_sh_ten(self)
 
     def __post_init__(self):
         self.validate_metadata_integrity()
@@ -498,6 +528,62 @@ class ShardedTensor(ShardedBase):
             ]
 
 
+class CheckpointableShardedTensor(torch.Tensor):
+    def __new__(
+        cls,
+        data: torch.Tensor,
+        sh_ten: ShardedTensor,
+    ):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            torch.Size(sh_ten.global_shape),
+            strides=data.stride(),
+            storage_offset=data.storage_offset(),
+            dtype=data.dtype,
+            layout=data.layout,
+            requires_grad=data.requires_grad,
+            device=data.device,
+        )
+
+    def __init__(self, data: torch.Tensor, sh_ten: ShardedTensor):
+        self._data = data
+        self._sh_ten = sh_ten
+
+    def __create_write_items__(self, fqn: str, sh_ten: 'CheckpointableShardedTensor') -> list[object]:
+        # NOTE: this can be implemented directly in terms of DCP (not going through PyT ShTen)
+        from torch.distributed.checkpoint.planner_helpers import _create_write_items
+        from .strategies.torch import sharded_tensor_to_torch_sharded_tensor
+        pyt_sh_ten = sharded_tensor_to_torch_sharded_tensor([sh_ten._sh_ten])
+        return _create_write_items(fqn, pyt_sh_ten)
+
+    def __create_chunk_list__(self) -> list[object]:
+        # NOTE: this can be implemented directly in terms of DCP (not going through PyT ShTen)
+        from torch.distributed.checkpoint.planner_helpers import _create_chunk_list
+        from .strategies.torch import sharded_tensor_to_torch_sharded_tensor
+        pyt_sh_ten = sharded_tensor_to_torch_sharded_tensor([self._sh_ten])
+        return _create_chunk_list(pyt_sh_ten)
+
+    def __get_tensor_shard__(self, index: int) -> torch.Tensor:
+        return self._sh_ten.data
+
+    @classmethod
+    def from_sh_ten(cls, sh_ten):
+        return cls(sh_ten.data, sh_ten)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        """Unwrap, apply `func` and wrap again. """
+        is_ckpt_arg = [isinstance(arg, CheckpointableShardedTensor) for arg in args]
+        selected_args = [arg._data if is_ckpt else arg
+                         for arg, is_ckpt in zip(args, is_ckpt_arg)]
+        out = func(*selected_args, **kwargs)
+        sh_ten = args[is_ckpt_arg.index(True)]._sh_ten
+        return CheckpointableShardedTensor(out, sh_ten)
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self._sh_ten.__repr__()})'
+
+
 def is_main_replica(replica_id: ReplicaId):
     """Checks if given `replica_id` is considered as main.
 
@@ -585,7 +671,7 @@ class ShardedObject(ShardedBase):
         return f"{self.__class__.__name__}(key='{self.key}')"
 
     @classmethod
-    def empty_from_unique_key(cls, unique_key, replica_id: ReplicaId = 0) -> "ShardedObject":
+    def empty_from_unique_key(cls, unique_key: str, replica_id: ReplicaId = 0) -> "ShardedObject":
         """Instantiates a ShardedObject from a unique key.
 
         Args:
@@ -607,6 +693,28 @@ class ShardedObject(ShardedBase):
             # element of global shape so set it to -1.
             shape += (-1,)
         return cls(key, None, shape, offset, replica_id)
+
+    @classmethod
+    def empty_from_key(cls, key: str, replica_id: ReplicaId = 0) -> 'ShardedObject':
+        """Instantiates a ShardedObject from key.
+
+        # TODO: explain.
+
+        Args:
+            key: ShardedObject key
+            replica_id: indicates local object replication wrt.
+                local objects in different processes
+
+        Returns:
+            a ShardedObject with data=None
+        """
+        if '/' in key:
+            # TODO: implement explicit validation
+            try:
+                return cls.empty_from_unique_key(key, replica_id)
+            except (TypeError, AssertionError):
+                pass
+        return cls(key, None, (1,), (0,), replica_id)
 
 
 FactoryBuildFn = Callable[[str, torch.Tensor, ReplicaId, Optional[slice]], ShardedStateDict]

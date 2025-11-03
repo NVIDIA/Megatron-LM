@@ -26,13 +26,15 @@ from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+from torch.distributed.distributed_c10d import _get_group_tag
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
 
 try:
+    from torch.distributed import DeviceMesh, get_process_group_ranks
     from torch.distributed._tensor import DTensor
-    from torch.distributed.tensor.placement_types import Shard
+    from torch.distributed.tensor.placement_types import Shard, Replicate
 
     HAVE_DTENSOR = True
 except ImportError:
@@ -65,6 +67,11 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+
+
+import os
+SH_TEN_MODE = os.getenv('MCORE_SH_TEN_MODE', 'ckptable')
+PURE_DTENSOR_CKPT = SH_TEN_MODE in ('dtensor', 'hybrid')
 
 
 @contextmanager
@@ -822,6 +829,39 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
+    if SH_TEN_MODE in ('dtensor', 'hybrid'):
+        try:
+            assert not HAVE_DTENSOR or not isinstance(tensor, DTensor)
+            if prepend_axis_num > 0:
+                for _, _, offset_dim_size in prepend_offsets:
+                    assert offset_dim_size == 1, f'Non-trivial prepended-style sharding not supported with DTensors: {prepend_offsets}'
+
+            process_group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+            mesh_shape = (
+                parallel_state.get_tensor_model_parallel_world_size(),
+                parallel_state.get_data_parallel_world_size(with_context_parallel=True),
+            )
+            with torch.device("cpu"):
+                group_ranks = get_process_group_ranks(process_group)
+                mesh = torch.tensor(group_ranks, dtype=torch.int).view(mesh_shape)
+            device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('tp', 'dp',), _init_backend=False)
+            device_mesh._dim_group_infos = [
+                (_get_group_tag(process_group), group_ranks,
+                 process_group.group_name)
+            ]
+            placements = [Shard(tp_axis), Replicate()]
+        except Exception as e:
+            if SH_TEN_MODE == 'dtensor':
+                raise
+            else:
+                assert SH_TEN_MODE == 'hybrid'
+                print('Cannot construct DTensor, falling back to ShTen')
+        else:
+            kwargs.update(dict(
+                dtensor_ckpt_device_mesh=device_mesh,
+                dtensor_ckpt_placements=placements
+            ))
+
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -854,6 +894,34 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if replica_id is None:
         replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
+
+    if SH_TEN_MODE in ('dtensor',):  # NOTE: for hybrid we ensure mixture
+        try:
+            assert not HAVE_DTENSOR or not isinstance(tensor, DTensor)
+
+            process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+            mesh_shape = (parallel_state.get_data_parallel_world_size(with_context_parallel=True),)
+            with torch.device("cpu"):
+                group_ranks = get_process_group_ranks(process_group)
+                mesh = torch.tensor(group_ranks, dtype=torch.int).view(mesh_shape)
+
+            device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('dp',), _init_backend=False)
+            device_mesh._dim_group_infos = [
+                (_get_group_tag(process_group), group_ranks,
+                 process_group.group_name)
+            ]
+            placements = [Replicate()]
+        except Exception as e:
+            if SH_TEN_MODE == 'dtensor':
+                raise
+            else:
+                assert SH_TEN_MODE == 'hybrid'
+                print('Cannot construct DTensor, falling back to ShTen')
+        else:
+            kwargs.update(dict(
+                dtensor_ckpt_device_mesh=device_mesh,
+                dtensor_ckpt_placements=placements
+            ))
 
     return ShardedTensor.from_rank_offsets(
         key,
