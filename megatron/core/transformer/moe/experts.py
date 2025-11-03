@@ -1087,7 +1087,7 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             expert.backward_dw()
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
@@ -1112,7 +1112,7 @@ class SequentialMLP(MegatronModule):
                 )
 
             expert_state_dict = expert.sharded_state_dict(
-                expert_state_dict_prefix, expert_sharded_offsets, metadata, tp_group
+                expert_state_dict_prefix, expert_sharded_offsets, metadata, self.tp_group
             )
             # Remove expert layers indexing from sharded keys
             replace_prefix_for_sharding(
