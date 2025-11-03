@@ -96,15 +96,7 @@ class TextGenerationController:
         )
         self.cu_sampled_tokens = torch.empty(max_requests, dtype=torch.int64, device=device)
 
-        self.cpu_termination_id = torch.empty(max_requests, dtype=torch.int64).pin_memory()
-        self.cpu_temperature = torch.empty(max_requests, dtype=torch.float32).pin_memory()
-        self.cpu_topk = torch.empty(max_requests, dtype=torch.int32).pin_memory()
-        self.cpu_topp = torch.empty(max_requests, dtype=torch.float32).pin_memory()
-
         self.cu_termination_id = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self.cu_temperatures = torch.empty(max_requests, dtype=torch.float32, device=device)
-        self.cu_topk = torch.empty(max_requests, dtype=torch.int32, device=device)
-        self.cu_topp = torch.empty(max_requests, dtype=torch.float32, device=device)
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -573,11 +565,12 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
 
-        if not active_sampling_hashes:
+        if active_sampling_hashes is None:
             active_sampling_hashes = context.request_sampling_hashes[
                 context.paused_request_count : context.total_request_count
             ]
-        sampling_hash_map = context.sampling_hash_map or sampling_hash_map
+        if sampling_hash_map is None:
+            sampling_hash_map = context.sampling_hash_map
 
         # Special-case for static sampling.
         if getattr(self, "static_sampling", False):
@@ -588,18 +581,14 @@ class TextGenerationController:
 
         # Loop over all unique sampling hashes.
         for sampling_hash, sampling_params in sampling_hash_map.items():
-            mask = active_sampling_hashes == sampling_hash
-            # Needed for inefficient torch sampling.
-            self.torch_sampling_groups[sampling_params] = mask.to(
-                device=active_sampling_hashes.device, non_blocking=True
-            )
+            indices = (active_sampling_hashes == sampling_hash).nonzero(as_tuple=True)[0]
 
-            # Write data to CPU tensors.
+            # Write data to tensors.
             termination_id = sampling_params.termination_id or self.tokenizer.eod
-            self.cpu_termination_id.index_fill_(0, mask, termination_id)
-            self.cpu_temperature.index_fill_(0, mask, sampling_params.temperature)
-            self.cpu_topk.index_fill_(0, mask, sampling_params.top_k)
-            self.cpu_topp.index_fill_(0, mask, sampling_params.top_p)
+            self.cu_termination_id[indices] = termination_id
+
+            # Needed for inefficient torch sampling.
+            self.torch_sampling_groups[sampling_params] = indices
 
     def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
         """Sample logits for dynamic batching.
@@ -624,7 +613,6 @@ class TextGenerationController:
             last_token_logits = logits.squeeze(0)
         else:
             last_token_logits = context.last_token_logits(logits)
-        batch_size = last_token_logits.size(0)
 
         # Special-case for static sampling.
         if getattr(self, "static_sampling", False):
@@ -639,24 +627,17 @@ class TextGenerationController:
             termination_id = sampling_params.termination_id or self.tokenizer.eod
             return new_sample, termination_id
 
+        batch_size = last_token_logits.size(0)
+        self.cu_sampling_logits[:batch_size].copy_(last_token_logits)
+
         if backend == "torch":
-            self.cu_termination_id.copy_(self.cpu_termination_id, non_blocking=True)
-            # Loop.
-            for sampling_params, mask in torch_sampling_groups.items():
-                self.cu_sampled_tokens[mask] = self._torch_sampling_func(
-                    last_token_logits[mask],
+            for sampling_params, indices in self.torch_sampling_groups.items():
+                self.cu_sampled_tokens[indices] = self._torch_sampling_func(
+                    self.cu_sampling_logits[indices, :],
                     sampling_params.temperature,
                     sampling_params.top_k,
                     sampling_params.top_p,
                 )
-        else:
-            self.cu_sampling_logits[:batch_size].copy_(last_token_logits, non_blocking=False)
-            # Copy pinned tensors to GPU.
-            self.cu_termination_id.copy_(self.cpu_termination_id, non_blocking=False)
-            self.cu_temperatures.copy_(self.cpu_temperature, non_blocking=False)
-            self.cu_topk.copy_(self.cpu_topk, non_blocking=False)
-            self.cu_topp.copy_(self.cpu_topp, non_blocking=False)
-            raise NotImplementedError
 
         return self.cu_sampled_tokens[:batch_size], self.cu_termination_id[:batch_size]
 
@@ -691,7 +672,7 @@ class TextGenerationController:
         return log_probs
 
     def _dynamic_step_context_bookkeeping(
-        self, new_sample: Tensor, termination_id: int
+        self, new_sample: Tensor, termination_id: Tensor | int
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Update the dynamic inference context after sampling.
 

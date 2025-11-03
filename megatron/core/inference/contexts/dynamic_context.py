@@ -348,7 +348,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
         # Hashes of SamplingParams for each request.
-        self.request_sampling_hashes = torch.empty_like(self.request_ids)
+        self.request_sampling_hashes = torch.empty_like(self.request_ids, dtype=torch.int64)
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
@@ -1204,7 +1204,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Update the reverse hash map if there are no more requests with this sampling hash.
         # We do this to prevent unbounded growth of the hash map.
         if (self.request_sampling_hashes != old_sampling_hash).all().item():
-            del self.sampling_hash_map[old_sampling_hash]
+            if old_sampling_hash in self.sampling_hash_map:
+                del self.sampling_hash_map[old_sampling_hash]
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
