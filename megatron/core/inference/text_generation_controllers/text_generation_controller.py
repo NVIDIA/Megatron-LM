@@ -562,6 +562,9 @@ class TextGenerationController:
     ):
         """Perform bookkeeping necessary to sample logits for dynamic batching.
 
+        The ability to override the context's data is solely intended for
+            standalone use or testing, and should never be used in a running system.
+
         Args:
             active_sampling_hashes (Optional[Tensor]): An override for the tensor that stores
                 hashes of the sampling parameters corresponding to each request in the context.
