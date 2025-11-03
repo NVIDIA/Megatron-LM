@@ -5,7 +5,7 @@ import itertools
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +49,13 @@ try:
 except ImportError:
 
     HAVE_TE = False
+
+try:
+    from transformer_engine.pytorch.tensor import QuantizedTensor
+except ImportError:
+    HAVE_TE_QUANTIZED_TENSOR = False
+else:
+    HAVE_TE_QUANTIZED_TENSOR = True
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -668,6 +675,19 @@ class GroupedMLP(MegatronModule):
         pass
 
 
+class DummyFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight_shape):
+        ctx.input = x
+        dummy_weight = torch.empty(weight_shape, dtype=x.dtype, device=x.device)
+        # dummy_weight = torch.zeros(weight_shape, dtype=x.dtype, device=x.device)
+        return dummy_weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return torch.zeros_like(ctx.input), None
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -680,6 +700,7 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        wgrad_accumulation_mask: Optional[torch.Tensor] = None,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
@@ -708,7 +729,9 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc1',
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
+            wgrad_accumulation_mask=wgrad_accumulation_mask,
         )
+        self.fc1_weight_shape = self.linear_fc1.weight0.shape
 
         self.activation_func = self.config.activation_func
         self.activation_recompute = (
@@ -729,18 +752,67 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
+            wgrad_accumulation_mask=wgrad_accumulation_mask,
         )
+        self.fc2_weight_shape = self.linear_fc2.weight0.shape
 
         if self.config.fp8:
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
+    def free_expert_parameters(self, expert_indices: List[int]):
+        """Free echo expert parameters."""
+        to_free_weight_names = [f'weight{i}' for i in expert_indices]
+        for module in [self.linear_fc1, self.linear_fc2]:
+            # Clear all parameters in the module
+            for name, param in list(module.named_parameters()):
+                if name in to_free_weight_names:
+                    delattr(module, name)
+                    module._parameters.pop(name, None)
+
+    def get_expert_weights(
+        self, module, expert_indices: List[int]
+    ) -> List[torch.Tensor]:
+        """Get the weights of the experts."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
+        weight_list = []
+        for i in expert_indices:
+            weight = getattr(expert_layer, f"weight{i}")
+            weight_list.append(weight)
+        return weight_list
+
+    def set_expert_weights(
+        self,
+        module,
+        expert_weights: List[torch.Tensor],
+        expert_indices: List[int],
+    ):
+        """Set the weights of the experts."""
+        expert_layer = self.linear_fc1 if module == "fc1" else self.linear_fc2
+        weight_shape = self.fc1_weight_shape if module == "fc1" else self.fc2_weight_shape
+        for i, expert_index in enumerate(expert_indices):
+            if expert_weights[i].numel() == 0:
+                setattr(
+                    expert_layer,
+                    f"weight{expert_index}",
+                    DummyFunction.apply(expert_weights[i], weight_shape),
+                )
+            else:
+                setattr(
+                    expert_layer,
+                    f"weight{expert_index}",
+                    expert_weights[i],
+                )
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        fc1_expert_dispatch_event: Optional[torch.cuda.Event] = None,
+        fc2_expert_dispatch_event: Optional[torch.cuda.Event] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -753,9 +825,13 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
-        tokens_per_expert = tokens_per_expert.tolist()
-        if self.config.fp8:
-            actual_tokens_per_expert = tokens_per_expert
+        if self.config.moe_use_device_initiated_grouped_gemm:
+            tokens_per_expert = tokens_per_expert.long().cuda()
+        else:
+            tokens_per_expert = tokens_per_expert.long().cpu().tolist()
+        actual_tokens_per_expert = tokens_per_expert
+        if self.config.fp8 and not self.config.moe_enable_hybridep:
+            # Without hybridep, we need to do manual padding for FP8 tensor before grouped gemm.
             permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
@@ -764,6 +840,16 @@ class TEGroupedMLP(MegatronModule):
             )
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
+
+        permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+        received_num_tokens = permuted_local_hidden_states.shape[0]
+        if (
+            self.config.moe_received_token_capacity is not None
+            and not self.config.moe_use_device_initiated_grouped_gemm
+        ):
+            # Without device-initiated grouped gemm, we need to make sure the tensor size dones't exceed sum of tokens_per_expert.
+            permuted_local_hidden_states = permuted_local_hidden_states[: sum(tokens_per_expert)]
+            permuted_probs = permuted_probs[: sum(tokens_per_expert)]
 
         if self.config.moe_apply_probs_on_input:
             assert (
@@ -775,6 +861,8 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        if fc1_expert_dispatch_event is not None:
+            fc1_expert_dispatch_event.wait(torch.cuda.current_stream())
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
@@ -819,6 +907,8 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
+        if fc2_expert_dispatch_event is not None:
+            fc2_expert_dispatch_event.wait(torch.cuda.current_stream())
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             intermediate_parallel = self.activation_checkpoint.checkpoint(
@@ -831,9 +921,25 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel, bias_parallel, permuted_probs
             )
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+            if (
+                self.config.moe_received_token_capacity is not None
+                and not self.config.moe_use_device_initiated_grouped_gemm
+            ):
+                output = torch.cat(
+                    [
+                        output,
+                        torch.zeros(
+                            received_num_tokens - output.shape[0],
+                            output.shape[1],
+                            dtype=output.dtype,
+                            device=output.device,
+                        ),
+                    ],
+                    dim=0,
+                )
 
         # upad and concat the output
-        if self.config.fp8:
+        if self.config.fp8 and not self.config.moe_enable_hybridep:
             output = self.fp8_unpadding(output, actual_tokens_per_expert)
 
         return output, output_bias
@@ -847,13 +953,16 @@ class TEGroupedMLP(MegatronModule):
         The sharded state dict is interchangable with SequentialMLP's.
         """
         sharded_state_dict = {}
+        num_local_experts = self.num_local_experts
+        if self.config.moe_enable_echo:
+            num_local_experts = self.config.moe_num_echo_experts // self.ep_group.size()
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                num_global_experts = self.ep_group.size() * self.num_local_experts
-                local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+                num_global_experts = self.ep_group.size() * num_local_experts
+                local_expert_indices_offset = self.ep_group.rank() * num_local_experts
                 ep_axis = len(sharded_offsets)
-                for i in range(self.num_local_experts):
+                for i in range(num_local_experts):
                     new_sharded_offsets = (
                         *sharded_offsets,
                         (ep_axis, local_expert_indices_offset + i, num_global_experts),
@@ -918,6 +1027,9 @@ class SequentialMLP(MegatronModule):
                 tp_group=parallel_state.get_expert_tensor_parallel_group(),
             )
             self.local_experts.append(expert)
+        
+        self.fc1_weight_shape = self.local_experts[0].linear_fc1.weight.shape
+        self.fc2_weight_shape = self.local_experts[0].linear_fc2.weight.shape
 
     def _pad_tensor_for_fp8(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
@@ -1037,3 +1149,46 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
+
+
+    def free_expert_parameters(self, expert_indices: List[int]):
+        """Free the parameters of the experts."""
+        for expert_idx in expert_indices:
+            expert = self.local_experts[expert_idx]
+            for layer_name in ['linear_fc1', 'linear_fc2']:
+                layer = getattr(expert, layer_name)
+                # Clear all parameters in the layer
+                for param_name in list(layer._parameters.keys()):
+                    if getattr(layer, param_name) is not None:
+                        delattr(layer, param_name)
+                        layer._parameters.pop(param_name, None)
+
+
+    def get_expert_weights(
+        self, module, expert_indices: List[int]
+    ) -> List[torch.Tensor]:
+        """Get the weights of the experts."""
+        assert module in ["fc1", "fc2"], f"Invalid module: {module}"
+        expert_layer_name = "linear_fc1" if module == "fc1" else "linear_fc2"
+        weight_list = []
+        for i in expert_indices:
+            weight = getattr(self.local_experts[i], expert_layer_name).weight
+            weight_list.append(weight)
+        return weight_list
+
+    def set_expert_weights(
+        self,
+        module,
+        expert_weights: List[torch.Tensor],
+        expert_indices: List[int],
+    ):
+        """Set the weights of the experts."""
+        expert_layer_name = "linear_fc1" if module == "fc1" else "linear_fc2"
+        for i, expert_index in enumerate(expert_indices):
+            if expert_weights[i].numel() == 0:
+                getattr(self.local_experts[expert_index], expert_layer_name).weight = DummyFunction.apply(
+                    expert_weights[i], 
+                    self.fc1_weight_shape if module == "fc1" else self.fc2_weight_shape
+                )
+            else:
+                getattr(self.local_experts[expert_index], expert_layer_name).weight = expert_weights[i]

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from functools import partial
 from typing import Callable, Optional
 
-
+import torch
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (

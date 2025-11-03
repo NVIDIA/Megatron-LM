@@ -1,4 +1,5 @@
 import torch
+from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 import triton
 import triton.language as tl
 from typing import Union
@@ -427,6 +428,12 @@ def reroute_tokens_triton(map_token_to_expert, probs_routing, count_tokens_offlo
     
     return map_token_to_all_experts, probs_rerouted
 
+def generate_random_expert_offloading_map(num_home_experts, num_spare_experts):
+    selected_home_experts = torch.randint(0, num_home_experts, (num_spare_experts,))
+    offloading_map = torch.zeros(num_home_experts, num_spare_experts, dtype=torch.bool)
+    offloading_map[selected_home_experts, torch.arange(num_spare_experts)] = True
+    return offloading_map
+
 def gen_offloading_plan(
     map_token_to_expert: torch.Tensor,
     probs_routing: torch.Tensor,
@@ -537,6 +544,28 @@ def gen_offloading_plan(
                                                          count_tokens_offloaded_from_ep_rank_from_home_expert[ep_rank].int(), 
                                                          count_tokens_offloaded_from_ep_rank_to_spare_expert[ep_rank].int().squeeze(), 
                                                          map_home_expert_to_spare)
+    
+    # postprocess TODO: fused into above kernels
+    num_experts = map_token_to_expert.shape[1]
+    ep_size = num_ep_ranks
+    num_echo_experts = num_spare_experts_per_ep_rank * ep_size
+    home_expert_routing_map = map_token_to_all_experts[:, :num_experts].reshape(
+        -1, ep_size, num_experts // ep_size
+    )
+    spare_expert_routing_map = map_token_to_all_experts[:, num_experts:].reshape(
+        -1, ep_size, num_echo_experts // ep_size
+    )
+    map_token_to_all_experts = torch.cat([home_expert_routing_map, spare_expert_routing_map], dim=-1).reshape(
+        -1, num_experts + num_echo_experts
+    )
+    
+    home_expert_probs = probs_rerouted[:, :num_experts].reshape(-1, ep_size, num_experts // ep_size)
+    spare_expert_probs = probs_rerouted[:, num_experts:].reshape(
+        -1, ep_size, num_echo_experts // ep_size
+    )
+    probs_rerouted = torch.cat([home_expert_probs, spare_expert_probs], dim=-1).reshape(
+        -1, num_experts + num_echo_experts
+    )
     return map_token_to_all_experts, probs_rerouted, map_home_expert_to_spare
 
 
@@ -704,3 +733,132 @@ def gen_intermediate(
     count_spillover_per_home_expert = torch.scatter(torch.empty_like(count_spillover_per_expert_sorted), 1, indices_local_expert_sorted, count_spillover_per_expert_sorted).view(-1)
     
     return count_spillover_per_home_expert, capacity_spare_per_ep_rank
+
+
+
+ep_group_random_generator = None # Each EP group shares the same random seed
+rank_random_generator = None # Each rank has a different random seed
+
+from megatron.core.parallel_state import get_expert_data_parallel_group
+def generate_random_expert_offloading_map(
+    num_home_experts: int,
+    num_spare_experts: int,
+    device: torch.device,
+) -> torch.Tensor:
+    # TODO: ensure 
+    global ep_group_random_generator
+    global rank_random_generator
+    if ep_group_random_generator is None:
+        # Set seed for each EP group
+        ep_group_random_generator = torch.Generator(device=device)
+        # ep_seed = 42 + get_expert_data_parallel_group().rank()
+        ep_group_random_generator.manual_seed(42)
+        # Each EP group shares the same random seed
+    selected_home_experts = torch.randint(0, num_home_experts, (num_spare_experts,), device=device, generator=ep_group_random_generator)
+    # selected_home_experts = torch.randint(0, num_home_experts, (num_spare_experts,), device=device)
+    offloading_map = torch.zeros(num_home_experts, num_spare_experts, dtype=torch.bool, device=device)
+    offloading_map[selected_home_experts, torch.arange(num_spare_experts, device=device)] = True
+    rank = torch.distributed.get_rank()
+    return offloading_map
+
+def gen_random_offloading_plan(
+    routing_map: torch.Tensor,
+    probs: torch.Tensor,
+    tokens_per_expert_from_ep_rank: torch.Tensor,
+    ep_rank: Union[torch.Tensor, int],
+    ep: int,
+    spare_expert_per_ep_rank: int = 1,
+    threshold_multiplier: float = 0.0,
+    index_dtype: torch.dtype = torch.int32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = routing_map.device
+    num_tokens, num_experts = routing_map.shape
+    num_spare_experts = spare_expert_per_ep_rank * ep
+
+    # Step 1: Generate expert offloading map
+    expert_offloading_map = generate_random_expert_offloading_map(num_experts, num_spare_experts, device)
+    global rank_random_generator
+    rank = torch.distributed.get_rank()
+    if rank_random_generator is None:
+        rank_random_generator = torch.Generator(device=device)
+        rank_random_generator.manual_seed(42)
+
+    # Step 2: Initialize extended routing map and probs
+    # Shape: [num_tokens, num_experts + num_spare_experts]
+    rerouting_map = torch.zeros(num_tokens, num_experts + num_spare_experts, 
+                                dtype=torch.bool, device=device)
+    rerouted_probs = torch.zeros(num_tokens, num_experts + num_spare_experts, 
+                                 dtype=probs.dtype, device=device)
+    
+    # Copy original routing map and probs to home expert columns
+    rerouting_map[:, :num_experts] = routing_map.clone()
+    rerouted_probs[:, :num_experts] = probs.clone()
+    
+    # Step 3: Randomly offload tokens from home experts to spare experts
+    for home_expert_idx in range(num_experts):
+        # Get tokens routed to this home expert
+        token_mask = routing_map[:, home_expert_idx]
+        token_indices = torch.where(token_mask)[0]
+        
+        if len(token_indices) == 0:
+            continue
+        
+        # Find spare experts that this home expert can offload to
+        spare_expert_mask = expert_offloading_map[home_expert_idx]
+        spare_expert_indices = torch.where(spare_expert_mask)[0]
+        
+        if len(spare_expert_indices) == 0:
+            continue
+        
+        # Randomly select a fraction of tokens to offload (e.g., 20-40%)
+        offload_ratio = torch.rand(1, device=device, generator=rank_random_generator).item() * 0.2 + 0.2  # 0.2 to 0.4
+        num_tokens_to_offload = int(len(token_indices) * offload_ratio)
+        
+        if num_tokens_to_offload == 0:
+            continue
+        
+        # Randomly select tokens to offload
+        perm = torch.randperm(len(token_indices), device=device, generator=rank_random_generator)[:num_tokens_to_offload]
+        tokens_to_offload = token_indices[perm]
+        
+        # Randomly select a spare expert for offloading
+        spare_expert_idx = spare_expert_indices[torch.randint(
+            len(spare_expert_indices), (1,), device=device, generator=rank_random_generator
+        ).item()]
+        
+        # Perform the offloading
+        spare_expert_col = num_experts + spare_expert_idx
+        
+        # Move tokens from home expert to spare expert
+        rerouting_map[tokens_to_offload, home_expert_idx] = False
+        rerouting_map[tokens_to_offload, spare_expert_col] = True
+        
+        # Move probabilities as well
+        rerouted_probs[tokens_to_offload, spare_expert_col] = \
+            rerouted_probs[tokens_to_offload, home_expert_idx]
+        rerouted_probs[tokens_to_offload, home_expert_idx] = 0.0
+    
+    # Step 4: Apply the same postprocessing as in gen_offloading_plan
+    # Reshape to interleave home and spare experts by EP rank
+    ep_size = ep
+    num_echo_experts = spare_expert_per_ep_rank * ep_size
+    
+    home_expert_routing_map = rerouting_map[:, :num_experts].reshape(
+        -1, ep_size, num_experts // ep_size
+    )
+    spare_expert_routing_map = rerouting_map[:, num_experts:].reshape(
+        -1, ep_size, num_echo_experts // ep_size
+    )
+    rerouting_map = torch.cat([home_expert_routing_map, spare_expert_routing_map], dim=-1).reshape(
+        -1, num_experts + num_echo_experts
+    )
+    
+    home_expert_probs = rerouted_probs[:, :num_experts].reshape(-1, ep_size, num_experts // ep_size)
+    spare_expert_probs = rerouted_probs[:, num_experts:].reshape(
+        -1, ep_size, num_echo_experts // ep_size
+    )
+    rerouted_probs = torch.cat([home_expert_probs, spare_expert_probs], dim=-1).reshape(
+        -1, num_experts + num_echo_experts
+    )
+    
+    return rerouting_map, rerouted_probs, expert_offloading_map

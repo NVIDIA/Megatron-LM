@@ -952,6 +952,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
             tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            wgrad_accumulation_mask: Optional[torch.Tensor] = None,
         ):
             self.config = config
 
@@ -975,6 +976,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     )
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
+            if wgrad_accumulation_mask is not None and config.moe_use_device_initiated_grouped_gemm:
+                extra_kwargs["wgrad_accumulation_mask"] = wgrad_accumulation_mask
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
             if is_expert:
@@ -1109,11 +1112,19 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-            )
+            # Don't cache fp8 weights for echo experts
+            # TODO: support fp8 weights dispatch to prevent cast fp8 weights for every micro-batch
+            if self.config.moe_enable_echo:
+                _is_first_microbatch = None
+            else:
+                _is_first_microbatch = (
+                    None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+                )
             out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
-            self.is_first_microbatch = False
+            if not self.config.moe_enable_echo:
+                # For echo experts, the fp8 weights should be updated in each microbatch.
+                # TODO: FP8 expert dispatch and FP8 primary weights support for echo, which will remove this constraint.
+                self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
             # it returns a single Tensor, we always want to return two
@@ -1193,12 +1204,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             prefix should be module_name to make keys identical to sequetial ones.
             """
             sharded_state_dict = {}
+            num_gemms = self.num_gemms
+            if self.config.moe_enable_echo:
+                num_gemms = self.config.moe_num_echo_experts // self.config.expert_model_parallel_size
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
-            num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
-            local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
+            num_global_experts = get_expert_model_parallel_world_size() * num_gemms
+            local_expert_indices_offset = get_expert_model_parallel_rank() * num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(num_gemms):
                 state_dict = {
                     f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
@@ -1266,6 +1280,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            wgrad_accumulation_mask: Optional[torch.tensor] = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -1279,6 +1294,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
+                wgrad_accumulation_mask=wgrad_accumulation_mask,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -1312,6 +1328,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             tp_group: Optional[torch.distributed.ProcessGroup] = None,
+            wgrad_accumulation_mask: Optional[torch.Tensor] = None,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -1325,6 +1342,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
+                wgrad_accumulation_mask=wgrad_accumulation_mask,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):

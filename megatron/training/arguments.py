@@ -2736,6 +2736,8 @@ def _add_moe_args(parser):
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    group.add_argument('--moe-use-device-initiated-grouped-gemm', action='store_true',
+                       help='Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU. This can prevent the GPU-CPU synchronization during the grouped gemm.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-layer-recompute', action='store_true',
@@ -2803,10 +2805,35 @@ def _add_moe_args(parser):
                        choices=['allgather', 'alltoall', 'flex'],
                        default='allgather',
                        help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+    group.add_argument('--moe-enable-echo', action='store_true',
+                       help='[Experimental] Enable Elastic Cloning for Hot Experts (ECHO). '
+                       'This feature dynamically clones frequently used experts to spare/echo experts '
+                       'for better load balancing and reduced communication overhead.')
+    group.add_argument('--moe-echo-recompute-expert-dispatch', action='store_true', 
+                       help='[Experimental] Recompute the expert dispatch for echo experts in the backward pass to reduce the memory overhead. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatch-overlap', action='store_true',
+                       help='Enable overlap of echo expert dispatch and expert computation. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-enable-random-offloading', action='store_true',
+                       help='[Experimental] Enable random offloading for echo experts in the backward pass to reduce the memory overhead. '
+                       'It is only effective when --moe-enable-echo is enabled.')
+    group.add_argument('--moe-echo-expert-dispatcher-type', type=str, default='hybridep', choices=['hybridep', 'alltoall'],
+                       help='The type of expert dispatcher to use for echo experts. Can be either "hybridep" or "alltoall".')
+    group.add_argument('--moe-received-token-capacity', type=float, default=None,
+                       help='The capacity of total received tokens on each ep rank.')
+    group.add_argument('--moe-num-echo-experts', type=int, default=None,
+                       help='[Experimental] Number of echo experts to use for elastic expert cloning. '
+                       'These are spare experts that can receive overflow tokens from overloaded experts. '
+                       'If None, the number of echo experts is set to the number of experts.')
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
+    group.add_argument('--moe-enable-hybridep', action='store_true',
+                       help='[Experimental] Enable HybridEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
     group.add_argument('--moe-deepep-num-sms', type=int, default=20,
                        help='Number of SMs to use for DeepEP.')
+    group.add_argument('--moe-hybridep-num-sms', type=int, default=16,
+                       help='Number of SMs to use for HybridEP.')
     group.add_argument('--moe-permute-fusion', action='store_true',
                        help='Fuse token rearrangement ops during token dispatching.')
     # Token dropping arguments
