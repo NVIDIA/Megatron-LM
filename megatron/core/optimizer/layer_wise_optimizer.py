@@ -4,14 +4,6 @@ from typing import Callable, List, Optional
 
 import torch
 
-try:
-    from emerging_optimizers.orthogonalized_optimizers import OrthogonalizedOptimizer
-
-    HAVE_EMERGING_OPTIMIZERS = True
-except ImportError:
-    HAVE_EMERGING_OPTIMIZERS = False
-    OrthogonalizedOptimizer = object
-
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
