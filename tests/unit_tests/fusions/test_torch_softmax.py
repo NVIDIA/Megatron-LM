@@ -21,9 +21,6 @@ class TestTorchSoftmax:
             scale=None,
         )
 
-    def teardown_method(self):
-        get_default_causal_mask.cache_clear()
-
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
         y = self.softmax(x, None, None)
@@ -125,9 +122,6 @@ class TestSoftmaxOne:
 
 class TestFusedScaleMaskSoftmaxComprehensive:
     """Comprehensive tests for FusedScaleMaskSoftmax including window attention and scaling."""
-
-    def teardown_method(self):
-        get_default_causal_mask.cache_clear()
 
     def test_scaling_factor(self):
         """Test softmax with different scaling factors."""
