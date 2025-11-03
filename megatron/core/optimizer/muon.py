@@ -50,6 +50,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         use_nesterov: bool = True,
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
+        use_independent_weight_decay: bool = False,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: tuple[int, int, int] | None = None,
@@ -102,6 +103,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             use_nesterov,
             weight_decay,
             use_decoupled_weight_decay,
+            use_independent_weight_decay,
             fp32_matmul_prec,
             scaled_orthogonalize_fn,
         )
@@ -255,7 +257,7 @@ def get_megatron_muon_optimizer(
         decoupled_lr=config.decoupled_lr,
         decoupled_min_lr=config.decoupled_min_lr,
     )
-
+    print(f"aaaa{config.muon_fp32_matmul_prec}")
     optimizer = TensorParallelMuon(
         linear_param_groups,
         lr=config.lr,
