@@ -416,6 +416,7 @@ jobs:
           else
             ARGS=(
               --scope mr-slim
+              --enable-lightweight-mode
             )
           fi
 
