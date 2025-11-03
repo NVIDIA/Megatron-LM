@@ -48,4 +48,4 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ---
 
-*For complete installation instructions, performance benchmarks, and ecosystem information, see the [main README](../README.md).*
+*For complete installation instructions, performance benchmarks, and ecosystem information, see the [main README](../../README.md).*
