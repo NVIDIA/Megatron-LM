@@ -90,3 +90,7 @@ class BlockAllocator:
         (except for the dummy block).
         """
         self.block_count_avail = self.block_count_total - 1
+
+    def get_available_block_count(self) -> int:
+        """Return number of free blocks (excluding reserved dummy block)."""
+        return self.block_count_avail

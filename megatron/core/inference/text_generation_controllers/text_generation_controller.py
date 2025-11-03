@@ -28,7 +28,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
-from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
+from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model, nvtx_range_push, nvtx_range_pop
+import logging
+logger = logging.getLogger(__name__)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -418,12 +420,35 @@ class TextGenerationController:
     ) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
         """Forward step the model and update the inference context.
 
+        Dispatches to sync or async implementation based on context settings.
+
         Args:
             sampling_params (SamplingParams): Parameters for sampling logits.
+            termination_id (int): Token ID that marks end of sequence.
 
         Return:
-            (Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]) Current request IDs,
-                paused request IDs, finished request IDs, new sample.
+            (Optional[Dict]) Dictionary with keys: active_request_ids,
+                newly_paused_request_ids, finished_request_ids, sample,
+                log_probs, cuda_graph_request_count.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        if context.enable_async_scheduling:
+            return await self._generate_async(sampling_params, termination_id)
+        else:
+            return await self._generate_sync(sampling_params, termination_id)
+
+    async def _generate_sync(
+        self, sampling_params: SamplingParams, termination_id: int
+    ) -> Optional[Dict]:
+        """Original synchronous generation logic.
+
+        Args:
+            sampling_params (SamplingParams): Parameters for sampling logits.
+            termination_id (int): Token ID that marks end of sequence.
+
+        Return:
+            (Optional[Dict]) Generation results dictionary.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -546,6 +571,11 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        # logger.info(f"active_sequence_lengths: {active_sequence_lengths}")
+        # logger.info(f"max_sequence_lengths: {max_sequence_lengths}")
+        # logger.info(f"active_request_mask: {active_request_mask}")
+
+
         # New sample gets updated in update_requests, so we pass in a clone
         new_sample_copy = new_sample.clone()
 
@@ -566,6 +596,253 @@ class TextGenerationController:
             "log_probs": log_probs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+
+    async def _generate_async(
+        self, sampling_params: SamplingParams, termination_id: int
+    ) -> Optional[Dict]:
+        """Asynchronous generation with stream overlap.
+
+        CPU metadata preparation overlaps with GPU execution by using double-buffered
+        metadata slots. While GPU processes step N, CPU prepares metadata for step N+1.
+
+        Args:
+            sampling_params (SamplingParams): Parameters for sampling logits.
+            termination_id (int): Token ID that marks end of sequence.
+
+        Return:
+            (Optional[Dict]) Generation results dictionary.
+        """
+        nvtx_range_push("prev 1")
+        context = self.inference_wrapped_model.inference_context
+        metadata = context.context_metadata
+
+        # Remove Float16Module wrapper if it exists
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+
+        new_paused_count = context.paused_request_count
+        new_total_count = context.total_request_count
+
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+        if sampling_params.return_log_probs:
+            skip_prompt_log_probs_for_dynamic_inference = getattr(
+                sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
+            )
+            assert (
+                skip_prompt_log_probs_for_dynamic_inference
+                or materialize_only_last_token_logits is False
+            ), "Materialize only last token logits must be false for returning log probs"
+
+        # No tokens? TODO: in async , we may need to change this.
+        # if context.active_token_count == 0:
+        #     return None
+
+        # Initialize attention state
+        nvtx_range_pop("prev 1")
+        nvtx_range_push("initialize_attention_state")
+        context.initialize_attention_state()
+        nvtx_range_pop("initialize_attention_state")
+
+        nvtx_range_push("prev2")
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
+
+        # Get flat tokens, position ids
+        input_ids, position_ids = context.current_input_and_position_ids()
+
+        model_config = get_model_config(unwrapped_model)
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+
+        # Configure MoE and symmetric AR
+        symmetric_ar_type = model_config.symmetric_ar_type
+        nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
+        moe_pad_experts_for_cuda_graph_inference = (
+            inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
+        )
+        if moe_pad_experts_for_cuda_graph_inference:
+            if context.is_decode_only():
+                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
+                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
+            else:
+                set_decode_expert_padding(unwrapped_model, False)
+
+        if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
+            if context.is_decode_only():
+                unwrapped_model.set_symmetric_ar(symmetric_ar_type)
+            else:
+                unwrapped_model.set_symmetric_ar(None)
+        nvtx_range_pop("prev2")
+
+        nvtx_range_push("record_metadata_ready")
+        context.context_metadata.meta_data_ready.record(torch.cuda.current_stream())
+        nvtx_range_pop("record_metadata_ready")
+        # Step 2: Launch GPU forward pass on execution stream
+        # IMPORTANT: Pipeline parallel broadcast is a collective operation.
+        # All ranks must participate, so this entire block executes on execution_stream.
+        with torch.cuda.stream(metadata.execution_stream):
+            with torch.inference_mode():
+                nvtx_range_push("pipeline_broadcast_and_sample")
+                # Pipeline parallel: broadcast logits from last stage to all stages
+                # This is a collective operation queued on execution_stream
+                if self.model_is_pipeline_parallel:
+                    batch_size = context.context_metadata.total_request_count_old - context.context_metadata.paused_request_count_old
+                    logits_seq_len = (
+                        batch_size if materialize_only_last_token_logits else context.context_metadata.logits.shape[1]
+                    )
+                    vocab_size = inference_wrapper_config.padded_vocab_size
+                    logits_shape = [1, logits_seq_len, vocab_size]
+
+                    # Only last stage has logits at this point
+                    if is_pipeline_last_stage(self.pp_group):
+                        assert context.context_metadata.logits is not None and torch.Size(logits_shape) == context.context_metadata.logits.shape
+
+                    # Collective broadcast on execution_stream - all ranks participate
+                    # This will create logits tensor on non-last stages
+                    metadata.logits = broadcast_from_last_pipeline_stage(
+                        logits_shape,
+                        dtype=inference_wrapper_config.params_dtype,
+                        tensor=metadata.logits,
+                        pp_group=self.pp_group,
+                    )
+
+                # Process OLD logits from previous iteration
+                if materialize_only_last_token_logits:
+                    last_token_logits = metadata.logits.squeeze(0)
+                else:
+                    last_token_logits = context.last_token_logits_old(metadata.logits)
+
+                # Sample from OLD logits
+                vocab_size = inference_wrapper_config.padded_vocab_size
+                new_sample = self.sample_from_logits(
+                    last_token_logits, sampling_params, vocab_size=vocab_size
+                )
+                metadata.old_logits = metadata.logits
+
+                # Wait for metadata to be ready
+                nvtx_range_push("wait_for_metadata_ready")
+                metadata.execution_stream.wait_event(metadata.meta_data_ready)
+                nvtx_range_pop("wait_for_metadata_ready")
+
+                # Get old and active tensors for accessing request_last_token_ids
+                old_tensors = metadata.get_old_tensors()
+                new_tensors = metadata.get_active_tensors()
+
+                # Update request_last_token_ids with new samples in old slot
+                old_tensors['request_last_token_ids'][
+                    metadata.paused_request_count_old:metadata.total_request_count_old
+                ] = new_sample
+
+                # Copy to active slot with reordering via select_map
+                new_tensors['request_last_token_ids'][:len(metadata.select_map)] = \
+                    old_tensors['request_last_token_ids'][metadata.select_map]
+
+                # Extract decode tokens in current order for forward pass
+                new_sample_current_order = new_tensors['request_last_token_ids'][
+                    context.paused_request_count:context.paused_request_count + context.num_decode_requests
+                ]
+
+                # Construct input for forward pass
+                true_input_ids = torch.cat(
+                    [new_sample_current_order.unsqueeze(0),
+                     input_ids[:, context.num_decode_requests:]],
+                    dim=1
+                )
+
+                # Record GPU finished event (samples are now visible to host)
+                nvtx_range_push("record_gpu_finished")
+                metadata.gpu_finished.record(metadata.execution_stream)
+                nvtx_range_pop("record_gpu_finished")
+
+                # Run forward pass with NEW tokens
+                nvtx_range_push("forward_step")
+                context.logits = self.inference_wrapped_model.run_one_forward_step(
+                    {"tokens": true_input_ids, "position_ids": position_ids, "attention_mask": None}
+                )
+                # Keep controller-side copy in metadata for the next iteration
+                metadata.logits = context.logits
+                nvtx_range_pop("forward_step")
+                nvtx_range_pop("pipeline_broadcast_and_sample")
+
+        # Back to main stream - wait for GPU to finish sampling
+        nvtx_range_push("wait_for_gpu_finished")
+        torch.cuda.current_stream().wait_event(metadata.gpu_finished)
+        nvtx_range_pop("wait_for_gpu_finished")
+
+        nvtx_range_push("post 1")
+        # Calculate active sequence lengths from OLD metadata
+        active_sequence_lengths = context.get_active_sequence_lengths_old()
+        active_sequence_lengths = active_sequence_lengths + 1  # Account for new token
+
+        max_sequence_lengths = context.get_max_sequence_lengths_old()
+
+        # Build boolean masks for determining finished requests
+        terminated_mask = (new_sample == termination_id)
+        length_ok_mask = active_sequence_lengths < max_sequence_lengths
+
+        # logger.info(f"active_sequence_lengths: {active_sequence_lengths}")
+        # logger.info(f"max_sequence_lengths: {max_sequence_lengths}")
+        # logger.info(f"terminated_mask: {terminated_mask}")
+        # logger.info(f"length_ok_mask: {length_ok_mask}")
+
+        active_request_mask = (~terminated_mask) & length_ok_mask
+
+        # Window of currently considered requests: [paused_old, total_old)
+        start = metadata.paused_request_count_old
+        end = metadata.total_request_count_old
+
+        # Mark requests that were already finished before this iteration
+        prev_finished_mask_full = torch.zeros(
+            metadata.total_request_count_old, dtype=torch.bool, device=new_sample.device
+        )
+        prev_finished_mask_full[metadata.finished_map] = True
+        prev_finished_mask = prev_finished_mask_full[start:end]
+
+        # Indices of useful (not previously finished) requests within the window
+        useful_request_idx = (~prev_finished_mask).nonzero(as_tuple=True)[0]
+
+        # Requests that finished in THIS iteration (newly finished)
+        current_finished_mask = ~active_request_mask
+        additional_finished_mask = (~prev_finished_mask) & current_finished_mask
+        additional_finished_idxs = additional_finished_mask.nonzero(as_tuple=True)[0] + start
+
+        # Get finished request IDs from old tensors
+        old_tensors = metadata.get_old_tensors()
+        finished_request_ids = old_tensors['request_ids'][additional_finished_idxs]
+
+        # Clone new_sample for update_requests
+        new_sample_copy = new_sample.clone()
+
+        # Calculate log probs if needed
+        log_probs = None
+        useful_log_probs = None
+        if sampling_params.return_log_probs:
+            log_probs = context.calculate_log_probs(
+                metadata.old_logits, new_sample_copy,
+                only_last_token_logits=materialize_only_last_token_logits
+            )
+            useful_log_probs = [log_probs[i] for i in useful_request_idx.tolist()]
+
+        # Extract useful samples and request IDs (excluding previously finished)
+        current_request_ids_old = old_tensors['request_ids'][useful_request_idx + start]
+        useful_new_sample = new_sample_copy[useful_request_idx]
+
+        # Final active mask excludes anything previously finished
+        final_active_mask = active_request_mask & (~prev_finished_mask)
+        nvtx_range_pop("post 1")
+        nvtx_range_push("update_requests")
+        # Update requests with final active mask
+        newly_paused_request_ids = context.update_requests(final_active_mask, new_sample_copy)
+        nvtx_range_pop("update_requests")
+
+        return {
+            "active_request_ids": current_request_ids_old,
+            "newly_paused_request_ids": newly_paused_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "sample": useful_new_sample,
+            "log_probs": useful_log_probs,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
+
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

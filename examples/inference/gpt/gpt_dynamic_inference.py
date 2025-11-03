@@ -171,6 +171,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_max_prefill_requests=args.inference_dynamic_batching_cuda_graph_max_prefill_requests,
         attention_backend=getattr(args, 'attention_backend', AttnBackend.flash),
+        enable_async_scheduling=args.enable_async_scheduling,
     )
 
     return context

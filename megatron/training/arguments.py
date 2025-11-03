@@ -1498,6 +1498,13 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-prefill-requests',
                        type=int, default=16,
                        help='Maximum number of prefill requests to capture in a cuda graph.')
+    group.add_argument('--enable-async-scheduling',
+                       action='store_true', default=False,
+                       help='Enable asynchronous scheduling with double-buffered metadata. '
+                       'This overlaps CPU metadata preparation with GPU execution, improving '
+                       'throughput for dynamic batching. When enabled, the inference context '
+                       'uses two metadata slots and switches between them to allow concurrent '
+                       'CPU and GPU work.')
     return parser
 
 

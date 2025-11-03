@@ -484,7 +484,12 @@ class DynamicInferenceEngine(AbstractEngine):
             request_ids.tolist(), sample.tolist(), log_probs_iter
         ):
             request: DynamicInferenceRequest = self.requests[request_id]
-            if request_id != self.context.chunked_prefill_request_id:
+            if self.context.enable_async_scheduling:
+                chunked_prefill_guard_id = self.context.chunked_prefill_request_id_post_process
+            else:
+                chunked_prefill_guard_id = self.context.chunked_prefill_request_id
+
+            if request_id != chunked_prefill_guard_id:
                 request.generated_tokens.append(token)
                 if request.tpot is None:
                     request.tpot = []
@@ -596,7 +601,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
+            if self.context.enable_async_scheduling:
+                is_continuing_chunked_prefill = self.context.chunked_prefill_request_id_old > 0
+            else:
+                is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -986,7 +994,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # care of the post-processing.
                     request_ids, finished_request_ids, sample, logprobs = engine_output
                     # Include chunked prefill request id, use -1 if None
-                    chunked_prefill_id = self.context.chunked_prefill_request_id
+                    if self.context.enable_async_scheduling:
+                        chunked_prefill_id = self.context.chunked_prefill_request_id_post_process
+                    else:
+                        chunked_prefill_id = self.context.chunked_prefill_request_id
                     materialize_only_last_token_logits = (
                         self.context.materialize_only_last_token_logits
                     )

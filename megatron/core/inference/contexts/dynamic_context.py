@@ -1,9 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import math
 import warnings
 from contextlib import nullcontext
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -30,6 +31,7 @@ from .attention_context.mha_flashinfer_metadata import (
     NonGraphMHAFlashInferMetadata
 )
 from .base_context import BaseInferenceContext
+from .context_metadata import SyncContextMetadata, AsyncContextMetadata
 from .dynamic_block_allocator import BlockAllocator
 from ..kv_cache import KVCacheBase, KVCacheLayout, MLACache, create_mhagqa_cache
 
@@ -37,6 +39,8 @@ try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
 except ImportError:
     triton_append_key_value_cache = None
+
+logger = logging.getLogger(__name__)
 
 try:
     from packaging.version import Version as PkgVersion
@@ -214,8 +218,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_max_tokens: Optional[int] = None,
         cuda_graph_max_prefill_requests: Optional[int] = 16,
         attention_backend: AttnBackend = AttnBackend.flash,
+        enable_async_scheduling: bool = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        # Store async scheduling flag
+        self.enable_async_scheduling = enable_async_scheduling
 
         self.attention_backend = attention_backend
         self.cache_mla_latent = cache_mla_latent
@@ -309,42 +317,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.unified_memory_mempool = create_unified_mempool()
 
-        self.total_request_count = 0
-        self.active_token_count = 0
-        self.paused_request_count = 0
-        self.real_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
-        self.padded_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
-        self.padded_active_token_count = 0
-        self.padded_active_request_count = 0
-        self.paused_tokens = None
+        # Initialize context metadata manager (handles request/token state)
+        if enable_async_scheduling:
+            self.context_metadata = AsyncContextMetadata()
+        else:
+            self.context_metadata = SyncContextMetadata()
 
-        # Per-request state.
-        self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        # Note: context_metadata.initialize() will be called after memory buffer
+        # creation, as it needs block_allocator to be set up first.
+        # Temporarily initialize placeholders for compatibility with memory buffer setup
+        self.real_config = CUDAGraphConfig(
+            token_count=0, prefill_req_count=0, decode_req_count=0, copy_id=0
         )
-        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_query_lengths = torch.empty_like(self.request_ids)
-        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
-        self.request_output_lengths = torch.empty_like(self.request_ids)
-        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
-        self.request_kv_block_counts = torch.empty_like(self.request_ids)
-        self.request_last_kv_block_id = torch.empty_like(self.request_ids)
-        # request_last_kv_block_offset represents number of tokens in the last kv block
-        self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
-
-        # Per-token state.
-        self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+        self.padded_config = CUDAGraphConfig(
+            token_count=0, prefill_req_count=0, decode_req_count=0, copy_id=0
         )
-        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
-        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
-        self.token_to_block_idx = torch.empty_like(self.token_to_input_ids)
-        # i.e For a set of tokens A B C D E F ..  and block_size 4:
-        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
-        # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
-        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
-        self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
         # Memory buffer - now a list of cache objects, one per layer.
         # Determine layout based on backend
@@ -388,86 +375,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
-        self.request_to_kv_block_ids = torch.full(
-            (self.max_requests, self.max_kv_block_count),
-            -1,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
-        
-        # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
-        self.num_prefill_requests = 0
-        self.graph_attn_metadata = {}
-        self.non_graph_attn_metadata = {}
-        self.active_attn_metadata = None
-
-        if attention_backend in [AttnBackend.flash, AttnBackend.auto]:
-            self.graph_attn_metadata["mha_metadata"] = GraphMHAMetadata(
-                block_count_total=block_count_total,
-                max_kv_block_count=self.max_kv_block_count,
-                max_requests=self.max_requests,
-                block_size_tokens=self.block_size_tokens,
-                max_seqlen=self.max_sequence_length,
-            )
-
-            self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAMetadata(
-                block_count_total=block_count_total,
-                max_kv_block_count=self.max_kv_block_count,
-                max_requests=self.max_requests,
-                block_size_tokens=self.block_size_tokens,
-                max_seqlen=self.max_sequence_length,
-            )
-        elif attention_backend == AttnBackend.flash_split:
-            self.graph_attn_metadata["mha_metadata"] = MHASplitPDMetadata(
-                block_count_total=block_count_total,
-                max_kv_block_count=self.max_kv_block_count,
-                max_requests=self.max_requests,
-                block_size_tokens=self.block_size_tokens,
-                max_seqlen=self.max_sequence_length,
-            )
-            self.non_graph_attn_metadata["mha_metadata"] = MHASplitPDMetadata(
-                block_count_total=block_count_total,
-                max_kv_block_count=self.max_kv_block_count,
-                max_requests=self.max_requests,
-                block_size_tokens=self.block_size_tokens,
-                max_seqlen=self.max_sequence_length,
-            )
-        elif attention_backend in [AttnBackend.flashinfer_fa2,
-                                   AttnBackend.flashinfer_fa3,
-                                   AttnBackend.flashinfer_trt]:
-            # Create FlashInfer metadata for both graph and non-graph modes
-            self.graph_attn_metadata["mha_metadata"] = GraphMHAFlashInferMetadata(
-                block_count_total=block_count_total,
-                max_kv_block_count=self.max_kv_block_count,
-                max_requests=self.max_requests,
-                block_size_tokens=self.block_size_tokens,
-                max_seqlen=self.max_sequence_length,
-                backend=attention_backend,
-                prefill_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
-                decode_workspace_size=1 * 1024 * 1024 * 1024,   # 1GB
-            )
-
-            self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAFlashInferMetadata(
-                block_count_total=block_count_total,
-                max_kv_block_count=self.max_kv_block_count,
-                max_requests=self.max_requests,
-                block_size_tokens=self.block_size_tokens,
-                max_seqlen=self.max_sequence_length,
-                backend=attention_backend,
-                prefill_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
-                decode_workspace_size=1 * 1024 * 1024 * 1024,   # 1GB
-            )
-
-            # Set model parameters for FlashInfer planning
-            for metadata in [self.graph_attn_metadata["mha_metadata"],
-                             self.non_graph_attn_metadata["mha_metadata"]]:
-                metadata.set_model_params(
-                    num_qo_heads=self.num_attention_qo_heads_per_partition,
-                    num_kv_heads=self.num_attention_kv_heads_per_partition,
-                    head_dim=self.hidden_size_per_attention_head,
-                    params_dtype=self.params_dtype,
-                )
+        # Note: Block mapping and attention metadata initialization moved to
+        # context_metadata.initialize() which will be called after block_allocator setup
 
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
@@ -493,6 +403,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count_total=block_count_total, gtd_block_count=self.gtd_block_count
         )
 
+        # Initialize context metadata (request/token tensors and attention metadata)
+        # This must be done after block_allocator is set up
+        self.context_metadata.initialize(self)
+
         # CUDA graph config list
         self.populate_cudagraph_config_list(
             tp_size,
@@ -508,9 +422,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Store the dummy block idx reference for convenience
         self.dummy_block_idx = self.block_allocator.dummy_block_idx
 
-        # Deal with chunked prefill
-        self.chunked_prefill_request_id = -1
-
         # Reset attention state.
         self.reset_attention_state()
 
@@ -519,6 +430,158 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif use_flashinfer_fused_rope is None:
             use_flashinfer_fused_rope = HAVE_FLASHINFER
         self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+
+    # ===== PROPERTY WRAPPERS FOR BACKWARD COMPATIBILITY =====
+    # These delegate to context_metadata while maintaining the existing API
+
+    # Helper method
+    def _get_tensor(self, name: str):
+        """Get tensor from active context metadata."""
+        return self.context_metadata.get_active_tensors()[name]
+
+    # Per-request tensor properties (7)
+    @property
+    def request_ids(self):
+        return self._get_tensor('request_ids')
+
+    @property
+    def request_query_lengths(self):
+        return self._get_tensor('request_query_lengths')
+
+    @property
+    def request_output_lengths(self):
+        return self._get_tensor('request_output_lengths')
+
+    @property
+    def request_kv_length_offsets(self):
+        return self._get_tensor('request_kv_length_offsets')
+
+    @property
+    def request_kv_block_counts(self):
+        return self._get_tensor('request_kv_block_counts')
+
+    @property
+    def request_last_kv_block_id(self):
+        return self._get_tensor('request_last_kv_block_id')
+
+    @property
+    def request_last_kv_block_offset(self):
+        return self._get_tensor('request_last_kv_block_offset')
+
+    @property
+    def request_last_token_ids(self):
+        return self._get_tensor('request_last_token_ids')
+
+    # Per-token tensor properties (6)
+    @property
+    def token_to_input_ids(self):
+        return self._get_tensor('token_to_input_ids')
+
+    @property
+    def token_to_pos_ids(self):
+        return self._get_tensor('token_to_pos_ids')
+
+    @property
+    def token_to_request_idx(self):
+        return self._get_tensor('token_to_request_idx')
+
+    @property
+    def token_to_block_idx(self):
+        return self._get_tensor('token_to_block_idx')
+
+    @property
+    def token_to_position_in_request(self):
+        return self._get_tensor('token_to_position_in_request')
+
+    @property
+    def token_to_local_position_within_kv_block(self):
+        return self._get_tensor('token_to_local_position_within_kv_block')
+
+    # Block mapping property (1)
+    @property
+    def request_to_kv_block_ids(self):
+        return self._get_tensor('request_to_kv_block_ids')
+
+    # Scalar count properties with setters (7)
+    @property
+    def total_request_count(self):
+        return self.context_metadata.total_request_count
+
+    @total_request_count.setter
+    def total_request_count(self, value):
+        self.context_metadata.total_request_count = value
+
+    @property
+    def active_token_count(self):
+        return self.context_metadata.active_token_count
+
+    @active_token_count.setter
+    def active_token_count(self, value):
+        self.context_metadata.active_token_count = value
+
+    @property
+    def paused_request_count(self):
+        return self.context_metadata.paused_request_count
+
+    @paused_request_count.setter
+    def paused_request_count(self, value):
+        self.context_metadata.paused_request_count = value
+
+    @property
+    def padded_active_token_count(self):
+        return self.context_metadata.padded_active_token_count
+
+    @padded_active_token_count.setter
+    def padded_active_token_count(self, value):
+        self.context_metadata.padded_active_token_count = value
+
+    @property
+    def padded_active_request_count(self):
+        return self.context_metadata.padded_active_request_count
+
+    @padded_active_request_count.setter
+    def padded_active_request_count(self, value):
+        self.context_metadata.padded_active_request_count = value
+
+    @property
+    def num_prefill_requests(self):
+        return self.context_metadata.num_prefill_requests
+
+    @num_prefill_requests.setter
+    def num_prefill_requests(self, value):
+        self.context_metadata.num_prefill_requests = value
+
+    @property
+    def paused_tokens(self):
+        return self.context_metadata.paused_tokens
+
+    @paused_tokens.setter
+    def paused_tokens(self, value):
+        self.context_metadata.paused_tokens = value
+
+    @property
+    def chunked_prefill_request_id(self):
+        return self.context_metadata.chunked_prefill_request_id
+
+    @chunked_prefill_request_id.setter
+    def chunked_prefill_request_id(self, value):
+        self.context_metadata.chunked_prefill_request_id = value
+
+    @property
+    def chunked_prefill_request_id_old(self):
+        return self.context_metadata.chunked_prefill_request_id_old
+
+    # Attention metadata properties
+    @property
+    def graph_attn_metadata(self):
+        return self.context_metadata.get_active_attention_metadata()['graph']
+
+    @property
+    def non_graph_attn_metadata(self):
+        return self.context_metadata.get_active_attention_metadata()['non_graph']
+
+    # Note: active_attn_metadata is managed by existing reset_attention_state() logic
+    # and points to either graph_attn_metadata or non_graph_attn_metadata
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
@@ -591,23 +654,32 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.cuda_graph_token_counts.append(cuda_graph_max_tokens)
                 self.cuda_graph_token_counts.reverse()
 
-        self.cudagraph_config_list = []
+        def _append_configs(token_count: int, prefill_count: int, decode_count: int):
+            if self.enable_async_scheduling:
+                for copy_id in (0, 1):
+                    configs.append(
+                        CUDAGraphConfig(token_count, prefill_count, decode_count, copy_id)
+                    )
+            else:
+                configs.append(
+                    CUDAGraphConfig(token_count, prefill_count, decode_count, copy_id=0)
+                )
+
+        configs: List[CUDAGraphConfig] = []
         if num_cuda_graphs is None:
-            self.cudagraph_config_list = []
+            configs = []
         elif (
             not cuda_graph_max_prefill_requests or cuda_graph_max_prefill_requests <= 0 or not use_cuda_graphs_for_non_decode_steps
         ):  # decode only
             for size in self.cuda_graph_token_counts:
-                self.cudagraph_config_list.append(CUDAGraphConfig(size, 0, size))
+                _append_configs(size, 0, size)
         else:
             for size in self.cuda_graph_token_counts:
-                self.cudagraph_config_list.append(CUDAGraphConfig(size, 0, size))
-                self.cudagraph_config_list.append(
-                    CUDAGraphConfig(
-                        size,
-                        cuda_graph_max_prefill_requests,
-                        size - cuda_graph_max_prefill_requests,
-                    )
+                _append_configs(size, 0, size)
+                _append_configs(
+                    size,
+                    cuda_graph_max_prefill_requests,
+                    size - cuda_graph_max_prefill_requests,
                 )
                 # We need to ensure the prefill requests are shorter than the max sequence length, considering the one decode token is used for prefill request construction
                 prefill_only_minimal_num = max(
@@ -615,15 +687,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                     math.ceil(size / max(1, self.max_sequence_length - 1)),
                 )
                 if prefill_only_minimal_num < self.max_requests:
-                    self.cudagraph_config_list.append(
-                        CUDAGraphConfig(
-                            size, max(prefill_only_minimal_num, min(self.max_requests, size)), 0
-                        )
+                    _append_configs(
+                        size,
+                        max(prefill_only_minimal_num, min(self.max_requests, size)),
+                        0,
                     )
 
         # filter out configurations that have too many requests or too many blocks
         filtered_cudagraph_config_list = []
-        for config in self.cudagraph_config_list:
+        for config in configs:
             if config.prefill_req_count + config.decode_req_count > self.max_requests:
                 continue
             if config.prefill_req_count < 0 or config.decode_req_count < 0:
@@ -740,6 +812,62 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
         return self.request_output_lengths[self.paused_request_count : self.total_request_count]
+
+    def get_active_sequence_lengths_old(self) -> Tensor:
+        """Total sequence length (query + key) for active requests in OLD metadata slot.
+
+        Used in async mode to check termination conditions for requests whose logits
+        were computed in the previous iteration using the OLD metadata slot.
+        """
+        if not self.enable_async_scheduling:
+            # In sync mode, there is no "old" slot, just return current
+            return self.get_active_sequence_lengths()
+
+        metadata = self.context_metadata
+        old_tensors = metadata.get_old_tensors()
+        old_paused_count = metadata.paused_request_count_old
+        old_total_count = metadata.total_request_count_old
+
+        lengths = old_tensors['request_kv_length_offsets'] + old_tensors['request_query_lengths']
+        lengths = lengths[old_paused_count:old_total_count]
+        return lengths
+
+    def get_max_sequence_lengths_old(self) -> Tensor:
+        """Maximum sequence length for active requests in OLD metadata slot.
+
+        Used in async mode to check termination conditions for requests whose logits
+        were computed in the previous iteration using the OLD metadata slot.
+        """
+        if not self.enable_async_scheduling:
+            # In sync mode, there is no "old" slot, just return current
+            return self.get_max_sequence_lengths()
+
+        metadata = self.context_metadata
+        old_tensors = metadata.get_old_tensors()
+        old_paused_count = metadata.paused_request_count_old
+        old_total_count = metadata.total_request_count_old
+
+        return old_tensors['request_output_lengths'][old_paused_count:old_total_count]
+
+    @property
+    def request_ids_old(self):
+        if not self.enable_async_scheduling:
+            return self.request_ids
+        return self.context_metadata.get_old_tensors()['request_ids']
+
+    @property
+    def request_last_token_ids_old(self):
+        if not self.enable_async_scheduling:
+            return self.request_last_token_ids
+        return self.context_metadata.get_old_tensors()['request_last_token_ids']
+
+    @property
+    def chunked_prefill_request_id_post_process(self) -> int:
+        if not self.enable_async_scheduling:
+            return -1
+        return getattr(
+            self.context_metadata, "chunked_prefill_request_id_post_process", -1
+        )
 
     def get_active_request_count(self):
         """Returns the current number of active requests."""
@@ -1014,6 +1142,9 @@ class DynamicInferenceContext(BaseInferenceContext):
          # if in recording mode, add dummy requests for cuda graph capture
         if construct_graph_config is not None:
             self.reset()
+            if self.enable_async_scheduling:
+                self.context_metadata.activate_metadata(construct_graph_config.copy_id)
+
             if (
                 construct_graph_config.prefill_req_count + construct_graph_config.decode_req_count
                 > self.max_requests
@@ -1029,6 +1160,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
+            copy_id=self.context_metadata.active_id
         )
         self.real_config = real_config
         best_graph = self.graph_matching(real_config)
@@ -1109,7 +1241,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = 0
         self.active_token_count = 0
         self.paused_request_count = 0
-        self.real_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
+        self.real_config = CUDAGraphConfig(
+            token_count=0, prefill_req_count=0, decode_req_count=0, copy_id=self.context_metadata.active_id
+        )
         self.padded_active_token_count = 0
         self.padded_active_request_count = 0
         self.paused_tokens = None
@@ -1122,6 +1256,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts.fill_(0)
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
+        self.request_last_token_ids.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset token indexes.
@@ -1141,7 +1276,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
-        self.padded_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
+        self.padded_config = CUDAGraphConfig(
+            token_count=0, prefill_req_count=0, decode_req_count=0, copy_id=self.context_metadata.active_id
+        )
+        if hasattr(self.context_metadata, "chunked_prefill_request_id_post_process"):
+            self.context_metadata.chunked_prefill_request_id_post_process = -1
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -1189,6 +1328,35 @@ class DynamicInferenceContext(BaseInferenceContext):
             - 1
         )
         last_token_logits = logits[last_token_idxs, :]
+
+        return last_token_logits
+
+    def last_token_logits_old(self, logits: Tensor) -> Tensor:
+        """Last tokens of logits using OLD metadata slot.
+
+        Used in async mode to extract last token logits when processing logits
+        that were produced in the previous iteration using the OLD metadata slot.
+
+        Args:
+            logits (Tensor): Output logits of forward pass from previous iteration.
+
+        Return:
+            (Tensor) Last token logits for OLD active requests.
+        """
+        if not self.enable_async_scheduling:
+            # In sync mode, delegate to regular method
+            return self.last_token_logits(logits)
+
+        metadata = self.context_metadata
+        old_tensors = metadata.get_old_tensors()
+        old_paused_count = metadata.paused_request_count_old
+        old_total_count = metadata.total_request_count_old
+
+        # Last token logits from OLD metadata
+        logits_squeezed = logits.squeeze(0)
+        old_query_lengths = old_tensors['request_query_lengths'][old_paused_count:old_total_count]
+        last_token_idxs = torch.cumsum(old_query_lengths, dim=0) - 1
+        last_token_logits = logits_squeezed[last_token_idxs, :]
 
         return last_token_logits
 
@@ -1249,6 +1417,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_blocks_needed, safe=not is_chunked_prefill
             )
             if new_block_ids is None or len(new_block_ids) != num_blocks_needed:
+                logger.warning(
+                    "Unable to allocate %d KV blocks (safe=%s) for request %s; available=%d",
+                    num_blocks_needed,
+                    not is_chunked_prefill,
+                    req.request_id,
+                    self.block_allocator.get_available_block_count(),
+                )
                 raise BlockOverflowError(req.request_id)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
@@ -1332,6 +1507,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
         self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
         self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
+        self.request_last_token_ids[dst_idxs] = self.request_last_token_ids[src_idxs]
 
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
@@ -1346,9 +1522,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+        tensor_swap(self.request_last_token_ids, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
+        """Dispatch to sync or async implementations."""
+        if self.enable_async_scheduling:
+            return self._update_requests_async(active_requests_mask, new_tokens)
+        return self._update_requests_sync(active_requests_mask, new_tokens)
+
+    def _update_requests_sync(
+        self, active_requests_mask: Tensor, new_tokens: Tensor
+    ) -> Tensor:
         """Update context state after calling engine.step().
 
         This method is responsible for:
@@ -1396,6 +1581,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.chunked_prefill_request_id != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
+            )
+        if hasattr(self.context_metadata, "chunked_prefill_request_id_post_process"):
+            self.context_metadata.chunked_prefill_request_id_post_process = (
+                self.chunked_prefill_request_id
             )
 
         active_request_count = (active_requests_mask == 1).sum().item()
@@ -1577,6 +1766,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.paused_request_count > 0:
             self.paused_tokens = next_tokens[: self.paused_request_count]
+            self.request_last_token_ids[: self.paused_request_count] = next_tokens[
+                : self.paused_request_count
+            ]
+
+        if self.active_token_count > 0:
+            self.request_last_token_ids[self.paused_request_count : self.total_request_count] = (
+                next_tokens[self.paused_request_count : self.total_request_count]
+            )
 
         # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
         # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
@@ -1603,6 +1800,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step. "
 
             block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
+            if block_ids is None or block_ids.size(0) != resume_request_count:
+                logger.warning(
+                    "Unable to allocate %d KV blocks during sync resume; available=%d in_use=%d",
+                    resume_request_count,
+                    self.block_allocator.get_available_block_count(),
+                    int(self.request_kv_block_counts[:self.total_request_count].sum().item()),
+                )
+                raise BlockOverflowError(None)
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
@@ -1702,3 +1907,281 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Convert each log prob tensor into a list
         return [lp.tolist() for lp in selected_log_probs_list]
+
+    def _update_requests_async(
+        self, active_requests_mask: Tensor, new_tokens: Tensor
+    ) -> Tensor:
+        """Asynchronous update path with double-buffered metadata.
+
+        This implements the 9-step algorithm with logical request reordering and double-buffered
+        metadata slots. Requests are organized as: [Paused | Active] (Finished are removed).
+
+        Args:
+            active_requests_mask: Mask indicating which active requests are still running
+            new_tokens: Newly sampled tokens for active requests
+
+        Returns:
+            Tensor of newly paused request IDs (or None)
+        """
+        metadata = self.context_metadata
+
+        # =============================================================================
+        # STEP 1: Create ext_active_mask and identify finished (BEFORE slot switch)
+        # =============================================================================
+        # Save chunked prefill state for post-processing
+        metadata.chunked_prefill_request_id_post_process = metadata.chunked_prefill_request_id_old
+        if metadata.chunked_prefill_request_id_old != -1:
+            active_requests_mask[-1] = 1  # Keep chunked prefill request active
+
+        # Validate counts
+        active_request_count = (active_requests_mask == 1).sum().item()
+        finished_request_count = (active_requests_mask == 0).sum().item()
+        total_request_count_old = metadata.total_request_count_old
+        paused_request_count_old = metadata.paused_request_count_old
+
+        assert (
+            active_request_count + finished_request_count + paused_request_count_old
+            == total_request_count_old
+        ), f"Request count mismatch: {active_request_count} + {finished_request_count} + {paused_request_count_old} != {total_request_count_old}"
+
+        # Create extended active mask covering ALL old requests (paused + active)
+        device = torch.cuda.current_device()
+        ext_active_mask = torch.ones(
+            total_request_count_old, dtype=torch.bool, device=device
+        )
+        ext_active_mask[paused_request_count_old:total_request_count_old] = active_requests_mask.to(device)
+
+        # Use OLD select_map to reorder mask (this gives us the correct positions)
+        if hasattr(metadata, 'select_map') and metadata.select_map is not None and metadata.select_map.numel() > 0:
+            swapped_ext_active_mask = ext_active_mask[metadata.select_map]
+        else:
+            swapped_ext_active_mask = ext_active_mask
+
+        # Identify finished requests in the NEW coordinate system
+        finished_idxs = torch.nonzero(swapped_ext_active_mask == 0, as_tuple=True)[0]
+
+        # =============================================================================
+        # STEP 2: Switch metadata slot and copy counts
+        # =============================================================================
+        old_id = metadata.active_id
+        metadata.activate_metadata(1 - old_id)
+        metadata.copy_old_counts()
+
+        # Get old tensors
+        old_tensors = metadata.get_old_tensors()
+
+        # =============================================================================
+        # STEP 3: Reset attention and create request states
+        # =============================================================================
+        self.reset_attention_state()
+        metadata.num_prefill_requests = 0  # All turn to decode
+
+        # Define RequestState enum
+        class RequestState(IntEnum):
+            ACTIVE = 1
+            PAUSED = 2
+            FINISHED = 3
+
+        # Create request_states tensor for the NEW slot
+        request_states = torch.zeros(
+            metadata.total_request_count, dtype=torch.int32, device=device
+        )
+        request_states[:metadata.paused_request_count] = RequestState.PAUSED.value
+        request_states[metadata.paused_request_count:metadata.total_request_count] = RequestState.ACTIVE.value
+
+        # =============================================================================
+        # STEP 4: Release memory for finished requests and mark them
+        # =============================================================================
+        if finished_request_count > 0:
+            kv_blocks_assigned = old_tensors['request_to_kv_block_ids'][finished_idxs]
+            non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
+            if non_zero_values_in_kv_memory.numel() > 0:
+                self.block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
+
+            # Mark finished in request_states
+            request_states[finished_idxs] = RequestState.FINISHED.value
+
+        active_request_count = request_states.eq(RequestState.ACTIVE.value).sum().item()
+
+        # =============================================================================
+        # STEP 5: Identify requests requiring new blocks → mark PAUSED
+        # =============================================================================
+        newly_paused_global_idxs = None
+        if active_request_count > 0:
+            num_tokens_in_last_block = old_tensors['request_last_kv_block_offset'][
+                metadata.paused_request_count:metadata.total_request_count
+            ]
+            requests_requiring_new_block = (
+                num_tokens_in_last_block == self.block_size_tokens - 1
+            )
+
+            # Don't pause chunked prefill request
+            if metadata.chunked_prefill_request_id != -1:
+                requests_requiring_new_block[-1] = False
+
+            # Mark as PAUSED (only those not already finished)
+            active_slice_states = request_states[metadata.paused_request_count:metadata.total_request_count]
+            changing_to_paused_mask = requests_requiring_new_block & (active_slice_states != RequestState.FINISHED.value)
+
+            if changing_to_paused_mask.any():
+                newly_paused_global_idxs = torch.where(changing_to_paused_mask)[0] + metadata.paused_request_count
+                request_states[newly_paused_global_idxs] = RequestState.PAUSED.value
+
+        metadata.paused_request_count = request_states.eq(RequestState.PAUSED.value).sum().item()
+        active_request_count = request_states.eq(RequestState.ACTIVE.value).sum().item()
+
+        # =============================================================================
+        # STEP 6: Determine resume count and mark resumed requests
+        # =============================================================================
+        # Calculate resume count based on available blocks
+        num_non_gtd_blocks = max(0, self.block_allocator.get_available_block_count() - self.gtd_block_count)
+        if num_non_gtd_blocks:
+            resume_request_count = min(num_non_gtd_blocks, metadata.paused_request_count)
+        else:
+            resume_request_count = min(
+                max(self.gtd_request_count - active_request_count, 0),
+                metadata.paused_request_count
+            )
+
+        # Update counts
+        metadata.paused_request_count -= resume_request_count
+        active_request_count += resume_request_count
+
+        # Resume paused requests (LIFO: last resume_request_count paused → active)
+        paused_indices = torch.where(request_states == RequestState.PAUSED.value)[0]
+
+        # Handle resume_request_count = 0 case explicitly (paused_indices[-0:] would return all elements!)
+        if resume_request_count > 0:
+            resume_indices = paused_indices[-resume_request_count:]
+            request_states[resume_indices] = RequestState.ACTIVE.value
+        else:
+            resume_indices = torch.tensor([], dtype=torch.long, device=device)
+
+        # Create resume tracking mask
+        resume_mask = torch.zeros(metadata.total_request_count, dtype=torch.int32, device=device)
+        if resume_request_count > 0:
+            resume_mask[resume_indices] = 1
+
+        # =============================================================================
+        # STEP 7: Create select_map and tracking maps
+        # =============================================================================
+        paused_indices = torch.where(request_states == RequestState.PAUSED.value)[0]
+        active_indices = torch.where(request_states == RequestState.ACTIVE.value)[0]
+        finished_indices = torch.where(request_states == RequestState.FINISHED.value)[0]
+
+        # Order: [Paused | Active] (Finished are dropped)
+        select_map = torch.cat((paused_indices, active_indices))
+
+        # Store tracking maps
+        metadata.select_map = select_map
+        metadata.active_map = active_indices
+        metadata.paused_map = paused_indices
+        metadata.finished_map = finished_indices
+
+        # =============================================================================
+        # STEP 8: Copy tensors and find resume positions in NEW coordinates
+        # =============================================================================
+        # Copy selected tensors from old to new slot
+        metadata.select_old_tensors_to_active(select_map)
+
+        # Find resumed requests in NEW coordinate system (after reordering)
+        resume_idx_new = torch.where(resume_mask[select_map] == 1)[0]
+
+        # Clear unused portion of block mapping
+        new_tensors = metadata.get_active_tensors()
+        new_tensors['request_to_kv_block_ids'][len(select_map):].fill_(-1)
+
+        # Update final counts
+        metadata.total_request_count = active_request_count + metadata.paused_request_count
+        metadata.active_token_count = active_request_count  # All active are decode (1 token each)
+
+        # Track newly paused request IDs
+        newly_paused_request_ids = None
+        if newly_paused_global_idxs is not None and newly_paused_global_idxs.numel() > 0:
+            # Map newly paused indices from OLD to NEW coordinate system
+            # Create inverse mapping: old_idx -> new_idx
+            old_to_new = torch.full((len(request_states),), -1, dtype=torch.long, device=device)
+            old_to_new[select_map] = torch.arange(len(select_map), device=device)
+
+            # Get new positions of newly paused requests
+            newly_paused_new_idxs = old_to_new[newly_paused_global_idxs]
+
+            # Filter out any that weren't selected (shouldn't happen, but be safe)
+            valid_mask = newly_paused_new_idxs >= 0
+            newly_paused_new_idxs = newly_paused_new_idxs[valid_mask]
+
+            # Extract request IDs
+            if newly_paused_new_idxs.numel() > 0:
+                newly_paused_request_ids = new_tensors['request_ids'][newly_paused_new_idxs]
+
+                # Remove resumed requests (LIFO: they are at the end of paused section)
+                if resume_request_count > 0 and newly_paused_request_ids.numel() > 0:
+                    # Truncate the last resume_request_count entries
+                    num_to_keep = max(0, newly_paused_request_ids.numel() - resume_request_count)
+                    if num_to_keep > 0:
+                        newly_paused_request_ids = newly_paused_request_ids[:num_to_keep]
+                    else:
+                        newly_paused_request_ids = None
+
+        # =============================================================================
+        # STEP 9: Update bookkeeping tensors and allocate blocks
+        # =============================================================================
+        # Update request bookkeeping tensors
+        active_slice = slice(metadata.paused_request_count, metadata.total_request_count)
+
+        new_tensors['request_kv_length_offsets'][active_slice].add_(
+            new_tensors['request_query_lengths'][active_slice]
+        )
+        new_tensors['request_query_lengths'][active_slice].fill_(1)
+
+        new_tensors['token_to_pos_ids'][:metadata.active_token_count] = (
+            new_tensors['request_kv_length_offsets'][active_slice]
+        )
+
+        # Update last block offsets (increment and wrap)
+        new_tensors['request_last_kv_block_offset'][active_slice] = (
+            new_tensors['request_last_kv_block_offset'][active_slice] + 1
+        ) % self.block_size_tokens
+
+        # Allocate blocks for resumed requests (those with offset=0 after increment)
+        if resume_request_count > 0:
+            # Verify resumed requests have offset 0 (just wrapped around)
+            assert torch.all(
+                new_tensors['request_last_kv_block_offset'][resume_idx_new] == 0
+            ), f"Resumed requests should have offset 0, got {new_tensors['request_last_kv_block_offset'][resume_idx_new]}"
+
+            # Allocate new blocks
+            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
+            if block_ids is None or block_ids.size(0) != resume_request_count:
+                logger.warning(
+                    "Unable to allocate %d KV blocks for resumed requests; available=%d",
+                    resume_request_count,
+                    self.block_allocator.get_available_block_count(),
+                )
+                raise BlockOverflowError(None)
+
+            # Assign blocks to resumed requests
+            row_idx = resume_idx_new
+            col_idx = new_tensors['request_kv_block_counts'][resume_idx_new]
+            new_tensors['request_to_kv_block_ids'][row_idx, col_idx] = block_ids
+            new_tensors['request_kv_block_counts'][resume_idx_new] += 1
+            new_tensors['request_last_kv_block_id'][resume_idx_new] = block_ids
+
+        # Update token bookkeeping tensors
+        new_tensors['token_to_request_idx'][:metadata.active_token_count] = torch.arange(
+            metadata.paused_request_count, metadata.total_request_count, device=device
+        )
+        new_tensors['token_to_position_in_request'][:metadata.active_token_count] = (
+            new_tensors['request_kv_length_offsets'][active_slice]
+        )
+        new_tensors['token_to_block_idx'][:metadata.active_token_count] = (
+            new_tensors['request_last_kv_block_id'][active_slice]
+        )
+        new_tensors['token_to_local_position_within_kv_block'][:metadata.active_token_count] = (
+            new_tensors['request_last_kv_block_offset'][active_slice]
+        )
+
+        # Signal metadata ready for GPU consumption
+        metadata.record_metadata_ready()
+
+        return newly_paused_request_ids

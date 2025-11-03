@@ -144,6 +144,7 @@ class CUDAGraphConfig:
         token_count : number of total input tokens
         prefill_req_count : number of prefill requests
         decode_req_count : number of decode requests
+        copy_id : identifier for the metadata copy (0 == sync/default)
 
     The graphs are ordered by token_count, then by prefill_req_count, then by decode_req_count.
 
@@ -156,12 +157,16 @@ class CUDAGraphConfig:
     token_count: int = 0
     prefill_req_count: int = 0
     decode_req_count: int = 0
+    copy_id: int = 0
 
     def __str__(self):
         """
         Returns a string representation of the graph config.
         """
-        return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
+        return (
+            f"[{self.token_count}]: {self.prefill_req_count} P + "
+            f"{self.decode_req_count} D (v{self.copy_id})"
+        )
 
     def valid(self, real_config, strict=False) -> bool:
         """
@@ -173,6 +178,8 @@ class CUDAGraphConfig:
         for prefill or decode requests. Otherwise, prefill slots
         can only be used for prefill requests.
         """
+        if self.copy_id != real_config.copy_id:
+            return False
         if real_config.prefill_req_count == 0:
             return (
                 self.token_count >= real_config.token_count
@@ -197,7 +204,9 @@ class CUDAGraphConfig:
         """
         Returns a hash of the graph config.
         """
-        return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
+        return hash(
+            (self.token_count, self.prefill_req_count, self.decode_req_count, self.copy_id)
+        )
 
     def __eq__(self, other):
         """
@@ -205,10 +214,16 @@ class CUDAGraphConfig:
         """
         if other is None:
             return False
-        return (self.token_count, self.prefill_req_count, self.decode_req_count) == (
+        return (
+            self.token_count,
+            self.prefill_req_count,
+            self.decode_req_count,
+            self.copy_id,
+        ) == (
             other.token_count,
             other.prefill_req_count,
             other.decode_req_count,
+            other.copy_id,
         )
     
     @property

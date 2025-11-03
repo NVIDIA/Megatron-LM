@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import torch
 
 try:
@@ -11,6 +12,8 @@ from .mha_splitpd_metadata import MHASplitPDMetadata
 from megatron.core.transformer.enums import AttnBackend
 from .triton import attn_partial_copy_triton, attn_merge_triton
 from megatron.core.utils import nvtx_range_push, nvtx_range_pop
+
+logger = logging.getLogger(__name__)
 
 
 class MHAFlashInferMetadata(MHASplitPDMetadata):
@@ -26,6 +29,7 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
         max_requests,
         block_size_tokens,
         max_seqlen,
+        max_num_tokens=None,
         backend: AttnBackend = AttnBackend.flashinfer_fa2
     ):
         super().__init__(
@@ -38,6 +42,9 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
             )
 
         self.backend = backend
+        if max_num_tokens is None:
+            max_num_tokens = max_requests * max_seqlen
+        self._max_num_tokens = max_num_tokens
         # Map backend enum to FlashInfer backend strings
         self.flashinfer_backend_map = {
             AttnBackend.flashinfer_fa2: "fa2",
@@ -237,12 +244,13 @@ class GraphMHAFlashInferMetadata(MHAFlashInferMetadata):
         max_requests,
         block_size_tokens,
         max_seqlen,
+        max_num_tokens,
         backend: AttnBackend = AttnBackend.flashinfer_fa2,
         prefill_workspace_size: int = 128 * 1024 * 1024,  # 128MB default
         decode_workspace_size: int = 128 * 1024 * 1024,   # 128MB default
     ):
         super().__init__(
-            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen, backend
+            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen, max_num_tokens, backend
         )
 
         device = torch.cuda.current_device()
@@ -289,6 +297,65 @@ class GraphMHAFlashInferMetadata(MHAFlashInferMetadata):
                 backend=self.flashinfer_backend_map[self.backend],
             )
             self._prefill_wrappers_by_bs[batch_size] = wrapper
+            # Warm up the wrapper to avoid first-iteration planning overhead
+            # try:
+            #     token_count = int(self._max_num_tokens)
+            #     warmup_qo_indptr = torch.zeros(
+            #         batch_size + 1, dtype=torch.int32, device=torch.cuda.current_device()
+            #     )
+            #     warmup_qo_indptr[-1] = token_count
+
+            #     num_pages = max(1, (token_count + self.block_size_tokens - 1) // self.block_size_tokens)
+            #     warmup_paged_kv_indptr = torch.zeros(
+            #         batch_size + 1, dtype=torch.int32, device=torch.cuda.current_device()
+            #     )
+            #     warmup_paged_kv_indptr[-1] = num_pages
+
+            #     warmup_paged_kv_indices = torch.zeros(
+            #         num_pages, dtype=torch.int32, device=torch.cuda.current_device()
+            #     )
+            #     warmup_last_page_len = torch.zeros(
+            #         batch_size, dtype=torch.int32, device=torch.cuda.current_device()
+            #     )
+            #     warmup_last_page_len[-1] = (
+            #         token_count % self.block_size_tokens or self.block_size_tokens
+            #     )
+
+            #     wrapper.plan(
+            #         qo_indptr=warmup_qo_indptr,
+            #         paged_kv_indptr=warmup_paged_kv_indptr,
+            #         paged_kv_indices=warmup_paged_kv_indices,
+            #         paged_kv_last_page_len=warmup_last_page_len,
+            #         num_qo_heads=self._num_qo_heads,
+            #         num_kv_heads=self._num_kv_heads,
+            #         head_dim_qk=self._head_dim,
+            #         page_size=self.block_size_tokens,
+            #         q_data_type=self._params_dtype,
+            #         kv_data_type=self._params_dtype,
+            #         causal=True,
+            #     )
+
+            #     dummy_q = torch.zeros(
+            #         (token_count, self._num_qo_heads, self._head_dim),
+            #         dtype=self._params_dtype,
+            #         device=torch.cuda.current_device(),
+            #     )
+            #     dummy_kv = torch.zeros(
+            #         (
+            #             num_pages,
+            #             2,
+            #             self._num_kv_heads,
+            #             self.block_size_tokens,
+            #             self._head_dim,
+            #         ),
+            #         dtype=self._params_dtype,
+            #         device=torch.cuda.current_device(),
+            #     )
+            #     wrapper.run(dummy_q, dummy_kv)
+            #     torch.cuda.synchronize()
+                
+            # except Exception:  # noqa: BLE001
+            #     logger.error("FlashInfer prefill wrapper warmup failed", exc_info=True)
 
         return self._prefill_wrappers_by_bs[batch_size]
 
@@ -360,12 +427,19 @@ class NonGraphMHAFlashInferMetadata(MHAFlashInferMetadata):
         max_requests,
         block_size_tokens,
         max_seqlen,
+        max_num_tokens,
         backend: AttnBackend = AttnBackend.flashinfer_fa2,
         prefill_workspace_size: int = 128 * 1024 * 1024,  # 128MB default
         decode_workspace_size: int = 128 * 1024 * 1024,   # 128MB default
     ):
         super().__init__(
-            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen, backend
+            block_count_total,
+            max_kv_block_count,
+            max_requests,
+            block_size_tokens,
+            max_seqlen,
+            max_num_tokens,
+            backend,
         )
 
         device = torch.cuda.current_device()

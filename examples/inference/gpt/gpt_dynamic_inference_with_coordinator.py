@@ -132,10 +132,11 @@ if __name__ == "__main__":
         engine = DynamicInferenceEngine(
             controller,
             context,
-            termination_id=tokenizer.eod,
+            termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
-            enable_chunked_prefill=not args.disable_chunked_prefill
+            track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+            enable_chunked_prefill=not args.disable_chunked_prefill,
         )
 
         
