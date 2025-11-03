@@ -256,6 +256,7 @@ class TestLayerWiseOptimizer:
                 assert (
                     sh_base.replica_id[2] == 0
                 ), f'Expected DP replica_id to be 0 for layer-wise optimizer, got: {sh_base.replica_id[2]}'
+
     def test_multiple_optimizers(self):
         """Test LayerWiseDistributedOptimizer with multiple chained optimizers.
 
