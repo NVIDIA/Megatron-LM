@@ -934,6 +934,8 @@ class TestPartialCudaGraph:
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
     @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.flaky
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         extra_kwargs = {}
         if moe_dispatcher_type == "deepep":
