@@ -966,9 +966,7 @@ class MLASelfAttention(MultiLatentAttention):
 
         # only update the weight if any head has
         # current_max_attn_logits > qk_clip_threshold
-        if torch.any(
-            self.core_attention.current_max_attn_logits > self.config.qk_clip_threshold
-        ):
+        if torch.any(self.core_attention.current_max_attn_logits > self.config.qk_clip_threshold):
             # Use num_attention_heads_per_partition for tensor parallel scenarios
 
             # qk_clip_balancing_eta (n, 1, 1)
@@ -977,9 +975,7 @@ class MLASelfAttention(MultiLatentAttention):
             ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
                 but {self.core_attention.current_max_attn_logits.shape}"
             qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_threshold
-                / self.core_attention.current_max_attn_logits,
-                max=1.0,
+                self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
             ).view(self.num_attention_heads_per_partition, 1, 1)
             assert torch.all(qk_clip_balancing_eta <= 1.0)
 
@@ -1047,9 +1043,7 @@ class MLASelfAttention(MultiLatentAttention):
             weight_v = weight_reshaped[:, self.config.qk_head_dim :, :]
 
             # Clipping
-            weight_k = weight_k * torch.pow(
-                qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha
-            )
+            weight_k = weight_k * torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha)
 
             # Concatenate back and reshape to original shape
             weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
