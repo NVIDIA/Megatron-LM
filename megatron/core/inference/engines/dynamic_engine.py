@@ -138,7 +138,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.static_sampling = static_sampling
         if self.static_sampling:
             self.sampling_params: Optional[SamplingParams] = None
-            self.text_generation_controller.static_sampling = True
+            self.controller.static_sampling = True
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
