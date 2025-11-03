@@ -37,7 +37,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   # Data args
   --data-path: ${DATA_BLEND}
-  --vocab-file: ${DATA_PATH}/text/t5_mcore/release_test/v0/bert-large-cased-vocab.txt
+  --vocab-file: ${DATA_PATH}/bert-large-cased-vocab.txt
   --tokenizer-type: BertWordPieceCase
   --split: 99982,9,9
   --data-cache-path: ${DATA_CACHE_PATH}
