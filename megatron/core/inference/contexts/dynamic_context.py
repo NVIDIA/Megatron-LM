@@ -16,7 +16,10 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
+from megatron.core.inference.unified_memory import (
+    UnifiedMemoryUnsupportedError,
+    create_unified_mempool,
+)
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
@@ -322,16 +325,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.params_dtype = params_dtype
         self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
+
+        # Unified memory.
         self.unified_memory_level = unified_memory_level
         if unified_memory_level > 0:
-            if not has_unified_memory and torch.distributed.get_rank() == 0:
-                warnings.warn(
-                    "Unified memory requested but not available; defaulting to GPU memory."
-                )
-                self.unified_memory_level = 0
-            else:
+            try:
                 self.unified_memory_mempool = create_unified_mempool()
+            except UnifiedMemoryUnsupportedError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Unified memory requested but not available; defaulting to GPU memory."
+                    )
+                self.unified_memory_level = 0
 
+        # Request and token counts.
         self.total_request_count = 0
         self.active_token_count = 0
         self.paused_request_count = 0
