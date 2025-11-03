@@ -21,11 +21,7 @@ def test_resume_checkpoint_pipeline(
     with open(model_config_path) as f:
         model_config = yaml.safe_load(f)
 
-    checks_types = (
-        model_config["METRICS"]
-        if "METRICS" in model_config
-        else ["lm loss", "num-zeros"]
-    )
+    checks_types = model_config["METRICS"] if "METRICS" in model_config else ["iteration-time", "lm loss", "num-zeros"]
     checks = {
         metric: test_pretraining_regular_pipeline.CHECK_THRESHOLDS[metric]
         for metric in checks_types
