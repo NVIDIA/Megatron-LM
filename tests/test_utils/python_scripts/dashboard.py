@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
-DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
+DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT", "")
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
