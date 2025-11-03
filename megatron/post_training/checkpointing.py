@@ -1,26 +1,58 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
+import modelopt.torch.opt as mto
+import torch
 import torch.nn as nn
+from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 
 from megatron.core import dist_checkpointing
+from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME
+from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 
-try:
-    import modelopt.torch.opt as mto
-    from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
-except ImportError as e:
-    raise ImportError("Required `\"nvidia-modelopt[torch]\"` is not installed!") from e
-
+logger = logging.getLogger(__name__)
 
 NEMO_WEIGHT_DIR_NAMES = {"model_weights": "model.", "weights": "module."}
 
 
-def get_sharded_load_dir(load_dir: str) -> Tuple[Union[str, None], str]:
+def has_modelopt_state(checkpoint_path: str, ignore_kd_state: bool = False) -> bool:
+    """Check if modelopt_state folder exists inside the checkpoint path.
+    Args:
+        checkpoint_path: Path to the checkpoint directory
+        ignore_kd_state: If True, ignore the knowledge distillation state
+
+    Returns:
+        True if modelopt_state folder exists when ignore_kd_state is False,
+        True if modelopt_state folder exists when ignore_kd_state is True and has only
+        distillation state, False otherwise
+    """
+    load_dir, _ = get_sharded_load_dir(checkpoint_path)
+    if load_dir is None:
+        return False
+    modelopt_state_path = load_dir / "modelopt_state"
+    if not modelopt_state_path.is_dir():
+        return False
+    elif ignore_kd_state:
+        return _has_only_kd_state(modelopt_state_path)
+    else:
+        return True
+
+
+def _has_only_kd_state(modelopt_state_path: Path) -> bool:
+    modelopt_state = torch.load(modelopt_state_path / COMMON_STATE_FNAME, weights_only=False)
+    modes_dict = modelopt_state["modelopt_state_dict"]
+    if len(modes_dict) == 1 and modes_dict[0][0] == "kd_loss":
+        return True
+    return False
+
+
+def get_sharded_load_dir(load_dir: str) -> Tuple[Union[Path, None], str]:
     """Helper to retrieve the sharded load directory and its prefix, if any."""
     load_dir = Path(load_dir)
 
@@ -146,7 +178,21 @@ def load_modelopt_checkpoint(
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
     elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
-        sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix)
+
+        force_pre_mcore_014 = not is_torch_min_version("2.6a0")
+        if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
+            logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
+                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
+
+        # NOTE: singleton_local_shards only take care of the weight and bias. There are be issue when linear_fc1._amax
+        #       is a matrix such as NVFP4 real quant, awq, and blockwise 128.
+        if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
+            metadata = {"singleton_local_shards": False}
+        else:
+            metadata = {"singleton_local_shards": True}
+
+        sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix, metadata=metadata)
+
         if additional_sharded_prefix:
             unwrapped_model[0]._register_load_state_dict_pre_hook(
                 _remove_prefix_state_dict_pre_hook

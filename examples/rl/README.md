@@ -69,7 +69,7 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --bf16 \
     --te-rng-tracker \
-    --enable-cuda-graph \
+    --cuda-graph-impl local \
     --inference-dynamic-batching-num-cuda-graphs 1 \
     --inference-dynamic-batching-buffer-size-gb 20 \
     --data-parallel-random-init \
@@ -172,7 +172,7 @@ torchrun \
     --save $CHECKPOINT_DIR \
     --load $CHECKPOINT_DIR \
     --tensorboard-dir $TB_DIR \
-    --inference-server-type inplace_megatron \
+    --langrl-inference-server-type inplace_megatron \
     --seed $SEED \
     --sequence-parallel \
     --finetune \

@@ -6,7 +6,7 @@
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
   FUNCTIONAL_TEST_SCOPE: mr-slim
-  FUNCTIONAL_TEST_REPEAT: 5
+  FUNCTIONAL_TEST_REPEAT: 1
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
   CLUSTER_A100: ""
   CLUSTER_H100: ""
@@ -17,6 +17,8 @@ workflow:
     # Do not trigger for forks
     - if: $CI_PROJECT_NAMESPACE != "ADLR" || ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_PROJECT_PATH != "ADLR/megatron-lm")
       when: never
+
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
 
     # ci-branches only for schedule
     - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
@@ -31,7 +33,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_REF_PROTECTED == "true"
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^core_/)
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -39,7 +41,7 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
-        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        FUNCTIONAL_TEST_TIME_LIMIT: 3600
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
@@ -72,7 +74,7 @@ workflow:
         INTEGRATION_TEST_SCOPE: mr
         FUNCTIONAL_TEST: "no"
         FUNCTIONAL_TEST_SCOPE: mr-slim
-        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
@@ -119,7 +121,7 @@ workflow:
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
-        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
@@ -154,6 +156,8 @@ default:
     when: runner_system_failure
 
 variables:
+  BUILD:
+    value: "yes"
   UNIT_TEST:
     value: "yes"
     options:

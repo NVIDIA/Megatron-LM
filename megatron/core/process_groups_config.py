@@ -127,8 +127,11 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
     def __init__(self, **kwargs):
         for key in kwargs:
@@ -161,29 +164,71 @@ class ProcessGroupCollection:
 
         # Mapping of attribute names to their initialization functions
         pg_to_func = {
-            'tp': parallel_state.get_tensor_model_parallel_group,
-            'pp': parallel_state.get_pipeline_model_parallel_group,
-            'mp': parallel_state.get_model_parallel_group,
-            'cp': parallel_state.get_context_parallel_group,
-            'tp_cp': parallel_state.get_tensor_and_context_parallel_group,
-            'hcp': parallel_state.get_hierarchical_context_parallel_groups,
-            'ep': parallel_state.get_expert_model_parallel_group,
-            'expt_tp': parallel_state.get_expert_tensor_parallel_group,
-            'tp_ep': parallel_state.get_expert_tensor_and_model_parallel_group,
-            'tp_ep_pp': parallel_state.get_expert_tensor_model_pipeline_parallel_group,
-            'embd': parallel_state.get_embedding_group,
-            'pos_embd': parallel_state.get_position_embedding_group,
+            'tp': partial(parallel_state.get_tensor_model_parallel_group, check_initialized=False),
+            'pp': partial(
+                parallel_state.get_pipeline_model_parallel_group, check_initialized=False
+            ),
+            'mp': partial(parallel_state.get_model_parallel_group, check_initialized=False),
+            'cp': partial(parallel_state.get_context_parallel_group, check_initialized=False),
+            'tp_cp': partial(
+                parallel_state.get_tensor_and_context_parallel_group, check_initialized=False
+            ),
+            'hcp': partial(
+                parallel_state.get_hierarchical_context_parallel_groups, check_initialized=False
+            ),
+            'ep': partial(parallel_state.get_expert_model_parallel_group, check_initialized=False),
+            'expt_tp': partial(
+                parallel_state.get_expert_tensor_parallel_group, check_initialized=False
+            ),
+            'tp_ep': partial(
+                parallel_state.get_expert_tensor_and_model_parallel_group, check_initialized=False
+            ),
+            'tp_ep_pp': partial(
+                parallel_state.get_expert_tensor_model_pipeline_parallel_group,
+                check_initialized=False,
+            ),
+            'embd': partial(parallel_state.get_embedding_group, check_initialized=False),
+            'pos_embd': partial(
+                parallel_state.get_position_embedding_group, check_initialized=False
+            ),
+            'dp': parallel_state.get_data_parallel_group,
+            'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'intra_dp_cp': partial(
+                parallel_state.get_data_parallel_group,
+                with_context_parallel=True,
+                partial_data_parallel=True,
+            ),
+            'intra_expt_dp': partial(
+                parallel_state.get_expert_data_parallel_group,
+                check_initialized=False,
+                partial_expert_data_parallel=True,
+            ),
+            'inter_dist_opt': partial(
+                parallel_state.get_inter_distributed_optimizer_instance_group,
+                check_initialized=False,
+            ),
+            'intra_dist_opt': partial(
+                parallel_state.get_intra_distributed_optimizer_instance_group,
+                check_initialized=False,
+            ),
             # TODO (Hepteract): remove this once distributed checkpoint is refactored
-            'expt_dp': parallel_state.get_expert_data_parallel_group,
+            'expt_dp': partial(
+                parallel_state.get_expert_data_parallel_group, check_initialized=False
+            ),
             'tp_dp_cp': partial(
-                parallel_state.get_tensor_and_data_parallel_group, with_context_parallel=True
+                parallel_state.get_tensor_and_data_parallel_group,
+                check_initialized=False,
+                with_context_parallel=True,
             ),
         }
 
+        assert all(
+            pg in pg_to_func for pg in required_pgs
+        ), f"Initialization function for process group not defined for all \
+        ProcessGroupCollection fields"
+
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {
-            pg: pg_to_func[pg](check_initialized=False) for pg in required_pgs if pg in pg_to_func
-        }
+        init_dict = {pg: pg_to_func[pg]() for pg in required_pgs}
 
         return cls(**init_dict)
 
@@ -212,6 +257,7 @@ class ProcessGroupCollection:
                 - mp_group: Model parallel group
                 - expt_tp_pp_group: Expert tensor-model-pipeline parallel group
                 - inter_dist_opt_group: Inter distributed optimizer group (may be None)
+                - intra_dist_opt_group: Intra distributed optimizer group (may be None)
                 - intra_dp_cp_group_gloo: Gloo version of intra_dp_cp_group (may be None)
                 - intra_expt_dp_group_gloo: Gloo version of intra_expt_dp_group (may be None)
         """
@@ -233,6 +279,7 @@ class ProcessGroupCollection:
             intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
                 partial_expert_data_parallel=True
             )
+            intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
 
             # Gloo groups
             if use_gloo_process_groups:
@@ -310,20 +357,32 @@ class ProcessGroupCollection:
                         hasattr(pg_collection, 'intra_dp_cp')
                         and hasattr(pg_collection, 'intra_expt_dp')
                         and hasattr(pg_collection, 'inter_dist_opt')
+                        and hasattr(pg_collection, 'intra_dist_opt')
                     ):
                         raise ValueError(
-                            "intra_dp_cp, intra_expt_dp, and inter_dist_opt "
+                            "intra_dp_cp, intra_expt_dp, inter_dist_opt, and intra_dist_opt "
                             "process groups are required when using multiple optimizer "
                             "instances (>1) but not provided in pg_collection"
                         )
                     intra_dp_cp_group = pg_collection.intra_dp_cp
                     intra_expt_dp_group = pg_collection.intra_expt_dp
                     inter_dist_opt_group = pg_collection.inter_dist_opt
+
+                if ddp_config.use_distributed_optimizer:
+                    if not hasattr(pg_collection, 'intra_dist_opt'):
+                        raise ValueError(
+                            "intra_dist_opt process group is required but not provided in "
+                            "pg_collection. Please explicitly set it to None if you don't need it."
+                        )
+                    intra_dist_opt_group = pg_collection.intra_dist_opt
+                else:
+                    intra_dist_opt_group = None
             else:
                 # No ddp_config available - use simple fallback
                 intra_dp_cp_group = dp_cp_group
                 intra_expt_dp_group = expt_dp_group
                 inter_dist_opt_group = None
+                intra_dist_opt_group = None
 
             # 5. Model communication groups
             if not hasattr(pg_collection, 'mp'):
@@ -359,6 +418,7 @@ class ProcessGroupCollection:
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
             'inter_dist_opt_group': inter_dist_opt_group,
+            'intra_dist_opt_group': intra_dist_opt_group,
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,
             'intra_expt_dp_group_gloo': intra_expt_dp_group_gloo,
         }
@@ -409,6 +469,11 @@ class ProcessGroupCollection:
                 'inter_dist_opt_group': (
                     parallel_state.get_inter_distributed_optimizer_instance_group()
                     if ddp_config.num_distributed_optimizer_instances > 1
+                    else None
+                ),
+                'intra_dist_opt_group': (
+                    parallel_state.get_intra_distributed_optimizer_instance_group()
+                    if ddp_config.use_distributed_optimizer
                     else None
                 ),
             }

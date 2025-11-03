@@ -28,7 +28,7 @@ except ImportError:
 
         USING_APEX_OPTIMIZER = True
     except ImportError:
-        from torch.optim import AdamW as Adam
+        from torch.optim import Adam as Adam
 
         HAVE_APEX_OR_TE = False
 
@@ -47,6 +47,7 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
@@ -507,7 +508,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
+        assert (
+            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            or optimizer is None
+        ), (
             "Only Adam and HybridDeviceOptimizer currently supported, "
             "due to checkpointing requirements."
         )
@@ -637,7 +641,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             step = None
             for optimizer in self.optimizer.sub_optimizers:
-                if isinstance(optimizer, torch.optim.AdamW):
+                if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
                     if len(optimizer.state) == 0:
                         continue
                     steps = list(set([s["step"].item() for s in optimizer.state.values()]))
@@ -1149,6 +1153,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         "Ensure that each model chunk has unique parameter names."
                     )
                 name_to_param.update(_name_to_param)
+            name_to_param = handle_experts_in_state_dict(name_to_param)
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
             param in self.param_to_name

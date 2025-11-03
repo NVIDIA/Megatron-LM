@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 from abc import abstractmethod
@@ -7,6 +7,7 @@ from typing import Annotated, Any, ClassVar
 
 from pydantic import BaseModel, BeforeValidator, ValidationError
 
+from ..__init__ import GenericGenerationArgs
 from ..inference.api import (
     ChatInferenceRequest,
     ChatInferenceResponse,
@@ -14,6 +15,7 @@ from ..inference.api import (
     GroupedInferenceResponse,
     InferenceRequest,
     InferenceResponse,
+    LLMChatMessage,
 )
 from ..inference.chat_templates import ConversationTemplate
 
@@ -33,7 +35,12 @@ class InferenceInterface(BaseModel):
 
     supports_n: ClassVar[bool] = False
 
-    @abstractmethod
+    def prepare_request(
+        self, prompts: list[str], generation_args: GenericGenerationArgs
+    ) -> InferenceRequest:
+        assert all(isinstance(p, str) for p in prompts), "Prompt must be a list of strings"
+        return InferenceRequest(prompt=prompts, generation_args=generation_args)
+
     async def base_generate(self, request: InferenceRequest) -> list[InferenceResponse]:
         raise NotImplementedError(
             "Direct Inference Classes must implement the base_generate method."
@@ -85,7 +92,7 @@ def ensure_template(value: Any) -> ConversationTemplate:
     elif isinstance(value, str):
         return ConversationTemplate.from_string(value)
     else:
-        raise ValidationError(f"Invalid conversation template: {value}")
+        raise ValueError(f"Invalid conversation template: {value}")
 
 
 class ChatInferenceInterface(InferenceInterface):
@@ -93,10 +100,21 @@ class ChatInferenceInterface(InferenceInterface):
 
     conversation_template: Annotated[ConversationTemplate, BeforeValidator(ensure_template)]
 
+    def prepare_request(
+        self, prompts: list[str | list[LLMChatMessage]], generation_args: GenericGenerationArgs
+    ) -> ChatInferenceRequest:
+        prompt = [
+            [LLMChatMessage(role='user', content=p)] if isinstance(p, str) else p for p in prompts
+        ]
+        return ChatInferenceRequest(prompt=prompt, generation_args=generation_args)
+
     async def base_generate(self, request: ChatInferenceRequest) -> list[ChatInferenceResponse]:
         base_generate_results = await super().base_generate(
             InferenceRequest(
-                prompt=[self.conversation_template.format(messages) for messages in request.prompt],
+                prompt=[
+                    self.conversation_template.format(messages, request.tools)
+                    for messages in request.prompt
+                ],
                 generation_args=request.generation_args,
             )
         )

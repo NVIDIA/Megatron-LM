@@ -51,8 +51,6 @@ class DistributedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        self.module = module
-
         # If bucket_size is not provided as an input, use sane default.
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
@@ -121,9 +119,7 @@ class DistributedDataParallel(_BaseDataParallel):
             pp_rank = self.pp_group[0].rank()
         else:
             pp_rank = self.pp_group.rank()
-        if pp_rank > 0:
-            self.bucket_size = None
-        if disable_bucketing:
+        if disable_bucketing or pp_rank > 0:
             self.bucket_size = None
 
         self.param_to_bucket_group = {}
@@ -519,8 +515,11 @@ class DistributedDataParallel(_BaseDataParallel):
                         param_slice = bucket.param_data.view(-1)[param_start:param_end]
                         param.data.copy_(param_slice.view(param.data.shape))
                     # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
-                    bucket.grad_data.zero_()
+                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                    # We cannot zero out the entire grad buffer because one grad buffer may
+                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                    # it would clear the data of those param buffers that have not yet completed AG.
+                    bucket.param_data.zero_()
 
     def start_grad_sync(self, *unused):
         """
@@ -556,22 +555,14 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
-        if not getattr(self.config, 'external_cuda_graph', False):
+        if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
             # Don't reset grad_added_to_main_grad when CUDA Graph is used.
             # Because in CUDA Graph it no longer has the opportunity to set it back
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        # In the case of "reuse_grad_buf_for_mxfp8_param_ag=True & overlap_param_gather=True",
-        # the grad buffer is not reset here because the grad buffer is shared with the param buffer.
-        # The grad buffer is zeroed by "bucket.grad_data.zero_()" in the "finish_param_sync" stage
-        # after the param all-gather.
-        if not (
-            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-            and self.ddp_config.overlap_param_gather
-        ):
-            for buffer in self.buffers + self.expert_parallel_buffers:
-                buffer.reset()
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.reset()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.reset()
 

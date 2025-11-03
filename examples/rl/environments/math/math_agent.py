@@ -1,6 +1,10 @@
-import re
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from megatron.rl.agent.reward_only_agent import PassAtEvaluationAgent
+import re
+import traceback
+
+from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationAgent
+from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
 try:
     from math_verify import parse, verify
@@ -17,8 +21,10 @@ assert (
     MATHVERIFY_AVAILABLE
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
 
+NEGATIVE_REWARD = 0.0
 
-class MathAgent(PassAtEvaluationAgent):
+
+class MathAgent(RewardOnlyAgent):
     def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
         super().__init__(**kwargs)
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"
@@ -42,9 +48,15 @@ class MathAgent(PassAtEvaluationAgent):
                 break
         else:
             # Did not format the answer correctly
-            return 0.0
+            return NEGATIVE_REWARD
 
-        parsed_answer = parse(final_answer)
+        try:
+            parsed_answer = parse(final_answer)
+        except ValueError as e:
+            print("Failed to parse the answer.")
+            traceback.print_stack()
+            return NEGATIVE_REWARD
+
         correct_answer = verify(str(golden[golden_key]), parsed_answer)
         if correct_answer:
             return 1.0

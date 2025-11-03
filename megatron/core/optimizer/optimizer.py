@@ -1402,7 +1402,8 @@ class ChainedOptimizer(MegatronOptimizer):
         step = steps[0] if len(steps) == 1 else None
         for optimizer in self.chained_optimizers:
             for param_group in optimizer.optimizer.param_groups:
-                param_group['step'] = step
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    param_group['step'] = step
 
         return step
 
