@@ -67,8 +67,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if init_state_fn_list is None:
             init_state_fn_list = [None] * len(optimizers)
         else:
-            assert len(init_state_fn_list) == len(optimizers), "init_state_fn_list must be the " \
-                "same length as optimizers if provided"
+            assert len(init_state_fn_list) == len(optimizers), (
+                "init_state_fn_list must be the " "same length as optimizers if provided"
+            )
 
         if config.bf16:
             if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
@@ -195,7 +196,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if isinstance(sh_base, ShardedTensor):
-                assert len(sh_base.replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {sh_base}'
+                assert (
+                    len(sh_base.replica_id) == 3
+                ), f'Expected replica_id format (PP, TP, DP), got: {sh_base}'
                 sh_base.replica_id = (*sh_base.replica_id[:2], 0)
 
         return sharded_state_dict
