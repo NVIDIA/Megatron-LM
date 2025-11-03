@@ -15,9 +15,9 @@ CHECK_ONLY=${CHECK_ONLY:-false}
 SKIP_DOCS=${SKIP_DOCS:-false}
 
 BASE_REF=${BASE_REF:-main}
-git remote set-url origin "https://github.com/NVIDIA/Megatron-LM.git"
-git fetch origin ${BASE_REF}
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
+git remote add autoformatter-remote "https://github.com/NVIDIA/Megatron-LM.git" || true
+git fetch autoformatter-remote ${BASE_REF}
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base autoformatter-remote/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
 ADDITIONAL_PYLINT_ARGS=""

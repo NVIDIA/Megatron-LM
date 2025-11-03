@@ -87,11 +87,11 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         if not _special_tokens_list:
             try:
                 _special_tokens_list.append(self.config.tokenizer.eos)
-            except AttributeError:
+            except (AttributeError, NotImplementedError):
                 pass
             try:
                 _special_tokens_list.append(self.config.tokenizer.eod)
-            except AttributeError:
+            except (AttributeError, NotImplementedError):
                 pass
 
         if self._pad_token_id in _special_tokens_list:

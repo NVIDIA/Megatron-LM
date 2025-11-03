@@ -1,0 +1,5 @@
+- agent_type: examples.rl.environments.math.gsm8k_agent.GSM8KAgent
+  agent_args:
+    answer_format: "boxed"
+  weight: 1.0
+  evaluation_only: false

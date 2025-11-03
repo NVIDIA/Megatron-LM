@@ -122,5 +122,13 @@ def add_modelopt_args(parser):
         action="store_true",
         help='Will be set automatically when loading a ModelOpt checkpoint.',
     )
+    
+    # GPT-OSS YaRN RoPE support
+    group.add_argument(
+        '--enable-gpt-oss',
+        action="store_true",
+        help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
+             'configures all YaRN parameters with GPT-OSS defaults.',
+    )
 
     return parser

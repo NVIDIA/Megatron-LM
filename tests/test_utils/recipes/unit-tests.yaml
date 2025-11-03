@@ -51,14 +51,21 @@ spec:
       --unit-test-repeat $UNIT_TEST_REPEAT \
       --log-dir {assets_dir}/logs/1/
 
-    ls -al 
+    ls -al
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
+    /opt/venv/bin/coverage xml
     cp .coverage {assets_dir}/coverage_report
     cp coverage.xml {assets_dir}
 
 products:
+  - test_case: [tests/unit_tests/test_model_configs.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/test_fp8_param.py]
     products:
       - environment: [lts, dev]

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 import warnings
@@ -13,6 +13,9 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -56,8 +59,10 @@ class ContextOverflowError(Exception):
         self, request_id: Optional[int], message: Optional[str] = None, *, is_transient: bool = True
     ):
         request_str = '--' if request_id is None else str(request_id)
-        message = "" if message is None else f" | {message}"
-        super().__init__(f"request {request_str}{message}")
+        _message = "" if message is None else f" | {message}"
+        super().__init__(f"request {request_str}{_message}")
+        self.request_id = request_id
+        self.message = message
         self.is_transient = is_transient
 
 
@@ -97,6 +102,50 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
             "active_request_count (%d) > max_request_count (%d)."
             % (active_request_count, max_request_count),
         )
+
+
+class ContextErrorFactory:
+    """Factory class for serializing/deserializing context errors."""
+
+    @classmethod
+    def serialize(cls, error: ContextOverflowError) -> dict:
+        """Serialize error.
+
+        Args:
+            error (ContextOverflowError): Error.
+
+        Returns:
+            (dict) Serialized error data.
+        """
+        assert isinstance(error, ContextOverflowError)
+        return {
+            "type": type(error).__name__,
+            "request_id": error.request_id,
+            "message": error.message,
+            "is_transient": error.is_transient,
+        }
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> ContextOverflowError:
+        """Deserialize error.
+
+        Args:
+            obj (dict): Serialized error data.
+
+        Returns:
+            (ContextOverflowError) Deserialized error.
+        """
+        error_cls = {
+            "ContextOverflowError": ContextOverflowError,
+            "RequestOverflowError": RequestOverflowError,
+            "TokenOverflowError": TokenOverflowError,
+            "MaxSequenceLengthOverflowError": MaxSequenceLengthOverflowError,
+            "BlockOverflowError": BlockOverflowError,
+            "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
+        }[obj["type"]]
+        error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
+        error.__class__ = error_cls  # todo (@lmcafe): better/safer alternative?
+        return error
 
 
 class WarmupEngineMode(Enum):
@@ -488,6 +537,40 @@ class DynamicInferenceContext(BaseInferenceContext):
         return token_rounder * int(math.ceil(int(value) / token_rounder))
 
     @classmethod
+    def from_config(
+        cls,
+        inference_config: InferenceWrapperConfig,
+        model,
+        max_batch_size: int,
+        buffer_size_gb: float = 40,
+        num_cuda_graphs: int = None,
+    ):
+        """
+        Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
+        """
+        # TODO: Add other necessary configs from inference_config
+
+        buffer_guaranteed_fraction = 0.1
+        model_config = model.config
+        max_sequence_length = (
+            inference_config.inference_max_seq_length or model_config.max_sequence_length
+        )
+        max_sequence_length = max(max_sequence_length, max_batch_size)
+        return cls(
+            params_dtype=inference_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=inference_config.inference_max_seq_length,
+            buffer_size_gb=buffer_size_gb,
+            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            materialize_only_last_token_logits=False,
+            max_requests_override=max_batch_size,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
+        )
+
+    @classmethod
     def round_up_requests(cls, value, tp_size=None):
         """Round up to nearest multiple of `REQUEST_ROUNDER` (above) that is also divisible by tensor model parallel size."""
         if not HAVE_PACKAGING:
@@ -769,7 +852,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 warming up cuda graphs. Must be less than or equal to
                 `max_requests`.
             warmup_engine_mode (WarmupEngineMode): Denote whether to setup
-            for a decode or a non-decode cuda-graph warmup.
+                for a decode or a non-decode cuda-graph warmup.
             num_warmup_requests (Optional[int]): [DEPRECATED] Use num_warmup_tokens instead.
             This argument is kept for backward compatibility with the legacy API.
         Return:
@@ -1008,7 +1091,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # todo: @lmcafee, remove these asserts?
-        assert logits.size(0) == 1
+        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
         assert logits.size(1) == self.padded_active_token_count, (
             f"logits.size(1) ({tuple(logits.shape)}) != "
             f"padded_active_token_count ({self.padded_active_token_count})."

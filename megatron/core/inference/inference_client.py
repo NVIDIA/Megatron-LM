@@ -1,6 +1,7 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
 import os
 import time
 from typing import List, Union
@@ -123,7 +124,7 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequest(**reply))
+                completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -150,7 +151,7 @@ class InferenceClient:
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """
-        print("Client: Connecting to InferenceCoordinator...")
+        logging.info("Client: Connecting to InferenceCoordinator...")
         self._connect_with_inference_coordinator()
         self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
 

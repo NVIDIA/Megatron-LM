@@ -78,7 +78,7 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         pip install --no-cache-dir uv
-        uv sync --only-group test 
+        uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
@@ -90,7 +90,7 @@ runs:
 
         RUN_TEST_EOF
         )
-        echo "$cmd" | tee "job.sh"        
+        echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
     - name: Get PR info
@@ -125,23 +125,34 @@ runs:
         #!/bin/bash
         set -euxo pipefail
 
+        if [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
+            ARGS=(
+              --scope mr-github
+              --enable-lightweight-mode
+            )
+          else
+            ARGS=(
+              --scope mr-slim
+              --enable-lightweight-mode
+            )
+          fi
+
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         pip install --no-cache-dir uv
-        uv sync --only-group test 
+        uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
-          --scope mr \
+          ${ARGS[@]} \
           --model ${{ inputs.model }} \
           --test-case ${{ inputs.test_case }} \
           --environment dev \
           --platform dgx_h100 \
           --container-image ${{ inputs.container-image }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
-          --enable-lightweight-mode
 
         RUN_TEST_EOF
         )
-        echo "$cmd" | tee "job.sh"        
+        echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
     - name: Set timeout

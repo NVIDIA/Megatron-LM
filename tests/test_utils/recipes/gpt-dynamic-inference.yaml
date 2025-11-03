@@ -40,7 +40,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
         "DATA_PATH=/mnt/artifacts/"
-        "DATA_CACHE_PATH=/workspace/data/cache" 
+        "DATA_CACHE_PATH=/workspace/data/cache"
         "TRAINING_SCRIPT_PATH=examples/inference/gpt/gpt_dynamic_inference.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
@@ -57,7 +57,7 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr-broken, mr-github] # Broken since: [Was PR1912][Dev] feat(moe): Fine-grained activation offloading (#1969)
+        scope: [mr-broken, mr-github-broken] # this test takes too long for github CI
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp8_pp1_583m_logitsmatch]
     products:
