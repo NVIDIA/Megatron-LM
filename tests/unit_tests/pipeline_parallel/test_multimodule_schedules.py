@@ -1,34 +1,32 @@
 import logging
 import os
-from typing import Dict, List
 from contextlib import contextmanager
+from typing import Dict, List
+
 import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
-
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
-
-from megatron.core.pipeline_parallel.multimodule_communicator import (
-    MultiModulePipelineCommunicator,
-)
-
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-
-from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
     _get_pg_collection_from_grid,
     get_transformer_block_and_grid,
 )
-from tests.unit_tests.pipeline_parallel.test_schedules import _populate_embedding_and_position_groups
+from tests.unit_tests.pipeline_parallel.test_schedules import (
+    _populate_embedding_and_position_groups,
+)
+from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class DataIterator:
 
@@ -48,7 +46,6 @@ class DataIterator:
             device='cuda',
             dtype=torch.bfloat16,
         )
-
 
 
 class SingleEncoderModel(torch.nn.Module):
@@ -86,21 +83,18 @@ class SingleEncoderModel(torch.nn.Module):
         )
 
         # Simple list for iteration
-        self.modules_and_grids = [
-            (self.encoder, self.encoder_grid),
-            (self.llm, self.llm_grid)
-        ]
+        self.modules_and_grids = [(self.encoder, self.encoder_grid), (self.llm, self.llm_grid)]
 
         self.current_rank = dist.get_rank()
         self.encoder_input_tensor = None
         self.llm_input_tensor = None
-
 
     def finish_grad_sync(self):
         """Finish gradient synchronization for all active modules on this rank."""
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
                 module.finish_grad_sync()
+
     @contextmanager
     def no_sync(self):
         contexts = []
@@ -108,11 +102,11 @@ class SingleEncoderModel(torch.nn.Module):
             contexts.append(self.encoder.no_sync())
         if self.is_current_rank_in_grid(self.llm_grid):
             contexts.append(self.llm.no_sync())
-        
+
         # Enter all contexts
         for ctx in contexts:
             ctx.__enter__()
-        
+
         try:
             yield
         finally:
@@ -126,9 +120,7 @@ class SingleEncoderModel(torch.nn.Module):
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
                 return module.ddp_config
-        raise AttributeError(
-            f"No active modules with ddp_config found on rank {self.current_rank}"
-        )
+        raise AttributeError(f"No active modules with ddp_config found on rank {self.current_rank}")
 
     def scale_gradients(self, scaling_factor: float):
         """Scale gradients for all active modules on this rank."""
@@ -139,11 +131,15 @@ class SingleEncoderModel(torch.nn.Module):
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
         return grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size)
-    
+
     def finalize_model_grads(self, module=None, num_tokens=None, pg_collection=None):
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
-                finalize_model_grads([module], num_tokens=None, pg_collection=_get_pg_collection_with_embedding_groups(grid))
+                finalize_model_grads(
+                    [module],
+                    num_tokens=None,
+                    pg_collection=_get_pg_collection_with_embedding_groups(grid),
+                )
 
     @contextmanager
     def no_sync(self):
@@ -151,11 +147,11 @@ class SingleEncoderModel(torch.nn.Module):
         for module, grid in self.modules_and_grids:
             if module is not None and self.is_current_rank_in_grid(grid):
                 contexts.append(module.no_sync())
-        
+
         # Enter all contexts
         for ctx in contexts:
             ctx.__enter__()
-        
+
         try:
             yield
         finally:
@@ -223,7 +219,6 @@ class SingleEncoderModel(torch.nn.Module):
         return output_dict
 
 
-
 def _get_pg_collection_with_embedding_groups(grid):
     pg_collection = _get_pg_collection_from_grid(grid)
     if pg_collection.pp:
@@ -246,15 +241,10 @@ def _get_pg_collection_with_embedding_groups(grid):
 )
 @pytest.mark.parametrize(
     "encoder_tp,encoder_pp,encoder_dp,llm_tp,llm_pp,llm_dp,llm_grid_offset",
-    [
-        (2, 2, 1, 2, 2, 1, 4),
-        (4, 1, 1, 2, 2, 1, 4),
-        (2, 1, 1, 1, 6, 1, 2),
-        (2, 2, 1, 1, 4, 1, 4)
-    ],
+    [(2, 2, 1, 2, 2, 1, 4), (4, 1, 1, 2, 2, 1, 4), (2, 1, 1, 1, 6, 1, 2), (2, 2, 1, 1, 4, 1, 4)],
 )
 def test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
- encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
+    encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
 ):
 
     Utils.initialize_distributed()
@@ -310,7 +300,6 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
     config.no_sync_func = model.no_sync
     config.finalize_model_grads_func = model.finalize_model_grads
     config.fine_grained_activation_offloading = False
-    
 
     # Add grad scale function to convert float losses to tensors
     def grad_scale_func(loss):
@@ -358,18 +347,11 @@ def test_forward_backward_pipelining_without_interleaving_multi_module_single_en
     logging.info(f"Losses reduced explicit: {losses_reduced_explicit}")
 
 
-
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
     test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
-        encoder_tp=2, 
-        encoder_pp=2,
-        encoder_dp=1, 
-        llm_tp=2, 
-        llm_pp=2, 
-        llm_dp=1, 
-        llm_grid_offset=4
+        encoder_tp=2, encoder_pp=2, encoder_dp=1, llm_tp=2, llm_pp=2, llm_dp=1, llm_grid_offset=4
     )

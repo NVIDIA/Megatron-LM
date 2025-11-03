@@ -7,19 +7,17 @@ import torch
 import torch.distributed as dist
 from packaging import version
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_tensor_model_parallel_rank,
-)
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_rank
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+
 
 def _create_transformer_block(
     dtype=torch.bfloat16, hidden_size=4096, pg_collection=None
@@ -155,7 +153,7 @@ def _avg_params(module: torch.nn.Module, group: dist.ProcessGroup = None) -> Non
 
 
 def get_transformer_block_and_grid(
-    ref_block = None,
+    ref_block=None,
     tp_size=1,
     cp_size=1,
     pp_size=1,
@@ -187,7 +185,7 @@ def get_transformer_block_and_grid(
                 _shard_and_copy_(ref_block, block, tp_size, pg_collection.tp.rank())
         else:
             block = None
-    
+
     if wrap_with_ddp and block is not None:
         ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
         block = DistributedDataParallel(

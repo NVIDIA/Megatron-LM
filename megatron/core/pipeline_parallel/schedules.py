@@ -2,8 +2,8 @@
 
 import contextlib
 from functools import partial
-from typing import Callable, Dict, Iterator, List, Optional, Union
-from typing import Any
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+
 import torch
 from torch.autograd.variable import Variable
 
@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_reset,
 )
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -30,9 +31,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
-from megatron.core.pipeline_parallel.multimodule_communicator import (
-    MultiModulePipelineCommunicator,
-)
+
 from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
@@ -137,7 +136,10 @@ def get_forward_backward_func():
     return forward_backward_func
 
 
-def deallocate_output_tensor(out: Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]], deallocate_pipeline_outputs=False):
+def deallocate_output_tensor(
+    out: Union[torch.Tensor, List[torch.Tensor], Dict[str, torch.Tensor]],
+    deallocate_pipeline_outputs=False,
+):
     '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
 
     This method should be called right after the output tensor has been
@@ -149,12 +151,12 @@ def deallocate_output_tensor(out: Union[torch.Tensor, List[torch.Tensor], Dict[s
     if isinstance(out, torch.Tensor):
         assert out._base is None, "counter-productive to free a view of another tensor."
         out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
-    
+
     if isinstance(out, dict):
         for v in out.values():
             deallocate_output_tensor(v, deallocate_pipeline_outputs)
         return
-    
+
     if isinstance(out, (list, tuple)):
         for v in out:
             deallocate_output_tensor(v, deallocate_pipeline_outputs)
@@ -501,7 +503,13 @@ def backward_step_tensor(input_tensor, output_tensor, output_tensor_grad, model_
     return input_tensor_grad
 
 
-def _backward_step_dict(input_tensor: Dict[str, torch.Tensor], output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]], output_tensor_grad: Union[torch.Tensor, Dict[str, torch.Tensor]], model_type: str, config: Any):
+def _backward_step_dict(
+    input_tensor: Dict[str, torch.Tensor],
+    output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor_grad: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    model_type: str,
+    config: Any,
+):
     """Backward step implementation when inputs/outputs are dictionaries (multi module case)."""
 
     if config.timers is not None:
@@ -564,7 +572,13 @@ def _backward_step_dict(input_tensor: Dict[str, torch.Tensor], output_tensor: Un
     return input_tensor_grad
 
 
-def backward_step(input_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]], output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]], output_tensor_grad: Union[torch.Tensor, Dict[str, torch.Tensor]], model_type: str, config: Any):
+def backward_step(
+    input_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor_grad: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    model_type: str,
+    config: Any,
+):
     """Backward step wrapper support both tensor and dictionary formats
 
     The inputs and outputs are dictionaries for multimodule case.
@@ -575,9 +589,13 @@ def backward_step(input_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]], ou
     """
 
     if isinstance(input_tensor, dict):
-        return _backward_step_dict(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        return _backward_step_dict(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
     else:
-        return backward_step_tensor(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        return backward_step_tensor(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
 
 
 def check_first_val_step(first_val_step, forward_only, cond):
@@ -2040,7 +2058,9 @@ def get_tensor_shapes(
         tensor_shapes.append(())
         return tensor_shapes
     else:
-        assert tp_group is not None and cp_group is not None, "tp_group and cp_group must be provided"
+        assert (
+            tp_group is not None and cp_group is not None
+        ), "tp_group and cp_group must be provided"
         # Use decoder_seq_length if provided, otherwise use seq_length
         effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
         effective_seq_length = effective_seq_length // cp_group.size()
@@ -2087,7 +2107,7 @@ def forward_backward_pipelining_without_interleaving(
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
         )
-    tp_group, cp_group, llm_cp_size  = None, None, None
+    tp_group, cp_group, llm_cp_size = None, None, None
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
@@ -2111,9 +2131,12 @@ def forward_backward_pipelining_without_interleaving(
     elif p2p_communicator is not None and pg_collection is not None:
         if isinstance(pg_collection, list):
             # cases when multiple modules are colocated
-            assert config.variable_seq_lengths, "variable seq_lengths is required when multiple modules are colocated"
+            assert (
+                config.variable_seq_lengths
+            ), "variable seq_lengths is required when multiple modules are colocated"
             # when llm is colocated for now assume last collection in the list is the llm
-            # TODO: ykarnati: Have a better interface to handle this (without breaking backward compatibility)
+            # TODO: ykarnati: Have a better interface to handle this
+            # (without breaking backward compatibility)
             assert hasattr(pg_collection[-1], 'cp'), "pg_collection must have cp_group"
             llm_cp_size = pg_collection[-1].cp.size()
         else:
@@ -2289,9 +2312,7 @@ def forward_backward_pipelining_without_interleaving(
         total_num_tokens += num_tokens
 
         if forward_only:
-            p2p_communicator.send_forward(
-                output_tensor, p2p_communicator.is_pp_last_stage
-            )
+            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
@@ -2328,9 +2349,7 @@ def forward_backward_pipelining_without_interleaving(
                 )
             else:
                 input_tensor = p2p_communicator.send_backward_recv_forward(
-                    input_tensor_grad,
-                    recv_tensor_shapes,
-                    p2p_communicator.is_pp_first_stage,
+                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
 
     # Run cooldown backward passes.
@@ -2357,9 +2376,7 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
-            p2p_communicator.send_backward(
-                input_tensor_grad, p2p_communicator.is_pp_first_stage
-            )
+            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
