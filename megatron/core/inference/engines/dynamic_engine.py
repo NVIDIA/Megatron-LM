@@ -165,6 +165,17 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
+        config = controller.inference_wrapped_model.inference_wrapper_config
+        moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
+
+        if moe_pad_experts and context.non_decode_cuda_graphs:
+            context.non_decode_cuda_graphs = False
+            if torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    "MoE models do not support non-decode cuda graphs. "
+                    "Forcing non_decode_cuda_graphs to False."
+                )
+
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
@@ -174,15 +185,18 @@ class DynamicInferenceEngine(AbstractEngine):
             context.cuda_graph_token_counts,
         )
         for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
-            # Iterate cuda graph dims.
+            # Check whether to skip non-decode graphs.
             if (
                 warmup_engine_mode == WarmupEngineMode.NON_DECODE
                 and not context.non_decode_cuda_graphs
             ):
                 continue
+
             tbar = enumerate(context.cuda_graph_token_counts)
             if HAVE_TQDM:
                 tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+
+            # Iterate cuda graph dims.
             for tbar_idx, cuda_graph_token_count in tbar:
                 if (
                     cuda_graph_token_count == 1
