@@ -93,6 +93,7 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
   # Add mixed precision args
   --bf16: true
   --exit-interval: 24000
