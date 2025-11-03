@@ -1,5 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import logging
 from typing import Dict
 

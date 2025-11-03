@@ -1,5 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """Generate launch scripts for local execution.
 
 This script allows to generate pre-filled launch scripts that allow for local execution of Megatron-LM functional tests inside containerized enviroments (i.e. Slurm enroot or Docker).
