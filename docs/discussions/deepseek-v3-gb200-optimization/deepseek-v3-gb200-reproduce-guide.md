@@ -73,6 +73,10 @@ RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git && \
 RUN rm -rf /root/.cache /tmp/*
 ```
 
+> [!Tip]
+>
+> If you prefer to use CUDA 12.9, please change the base container to `nvcr.io/nvidia/pytorch:25.06-py3` and the cuDNN to be installed to `libcudnn9-cuda-12`. 
+
 ## 2. Megatron-Core
 
 We recommend using the [dev branch](https://github.com/NVIDIA/Megatron-LM/tree/dev) after PR [1917](https://github.com/NVIDIA/Megatron-LM/pull/1917).
@@ -85,7 +89,12 @@ git checkout effebd81f410bc6566fffee6c320b6f8f762e06d
 
 ## 3. Cluster Configuration
 
-Since we're using EP 32 on NVL72, it's important to make sure \*\*\***every 32 GB200 GPUs (8 nodes) are in the same NVL domain (or rack)**\*\*\*. Usually you can make it via your cluster workload manager. Taking Slurm as an example, you could pass `--segment 8` to the sbatch command to ensure every segment of 8 nodes will be scheduled to a rack.
+Since we're using EP 32 on NVL72, it's important to make sure
+
+> [!Important]
+> **Every 32 GB200 GPUs (8 nodes) are in the same NVL domain (or rack)**.
+
+Usually you can make it via your cluster workload manager. Taking Slurm as an example, you could pass `--segment 8` to the sbatch command to ensure that every segment of 8 nodes will be scheduled to a rack.
 
 ## 4. Training scripts
 
@@ -109,12 +118,29 @@ NCCL_GRAPH_REGISTER=0
 
 ### bindpcie
 
-Download [bindpcie](https://github.com/NVIDIA/mlperf-common/blob/main/client/bindpcie) to your workdir, make it executable, and \*\*\***place it at the beginning of your launch command in every process\*\*\***. This is a very important step on GB200.
+Download [bindpcie](https://github.com/NVIDIA/mlperf-common/blob/main/client/bindpcie) to your workdir, make it executable, 
 
 ```bash
 wget https://raw.githubusercontent.com/NVIDIA/mlperf-common/refs/heads/main/client/bindpcie &&
 chmod 755 bindpcie
 ```
+
+and then
+
+> [!Important]
+> **Place it at the beginning of your launch command in every process.**
+
+Taking Slurm as an example, your script should look like
+
+```bash
+#!/bin/bash
+
+#SBATCH [... sbatch args]
+
+srun [... srun args] /path/to/bindpcie /path/to/pretrain_gpt.py [... mcore arguments]
+```
+
+This is a very important step on GB200.
 
 ### Launch script
 
