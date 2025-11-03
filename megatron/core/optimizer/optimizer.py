@@ -788,7 +788,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         state_dict = {}
         state_dict['optimizer'] = self.optimizer.state_dict()
-        # print(f"state_dict: {self.optimizer}, {state_dict['optimizer'].keys()}")
         if self.grad_scaler:
             state_dict['grad_scaler'] = self.grad_scaler.state_dict()
         state_dict['fp32_from_fp16_params'] = self.fp32_from_float16_groups
