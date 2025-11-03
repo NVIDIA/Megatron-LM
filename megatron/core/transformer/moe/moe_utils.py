@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
+from enum import Enum
 from typing import List, Optional, Union
 
 import torch
@@ -519,6 +520,102 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
+class RoutingMode(Enum):
+    NONE = "none"
+    RECORD = "record"
+    REPLAY_FORWARD = "replay_forward"
+    REPLAY_BACKWARD = "replay_backward"
+    FALLTHROUGH = "fallthrough"
+
+
+class RouterReplay:
+    """
+    A class to manage the recording and replaying of MoE routing decisions.
+    It holds all router instances and provides static methods to globally
+    control recording and replaying.
+    """
+
+    # Static variable to hold all router instances, one per MoE layer.
+    router_instances = []
+
+    @staticmethod
+    def set_replay_data(all_layers_topk_indices: list):
+        """
+        Distributes the topk indices for all layers to their respective RouterReplay instances.
+        :param all_layers_topk_indices: A list of tensors, where each tensor contains the
+                                        topk indices for a specific layer. The order
+                                        must match the instantiation order of the routers.
+        """
+        if len(all_layers_topk_indices) != len(RouterReplay.router_instances):
+            raise ValueError(
+                f"The number of replay tensors ({len(all_layers_topk_indices)}) "
+                f"does not match the number of router instances ({len(RouterReplay.router_instances)})."
+            )
+        for i, router_instance in enumerate(RouterReplay.router_instances):
+            router_instance.set_target_indices(all_layers_topk_indices[i])
+
+    @staticmethod
+    def get_recorded_data() -> list:
+        """
+        Collects the recorded topk indices from all RouterReplay instances.
+        :return: A list of tensors, each containing the recorded topk indices for a layer.
+        """
+        return [router.get_recorded_indices() for router in RouterReplay.router_instances]
+
+    @staticmethod
+    def clear_global_indices():
+        """Clears the recorded and target topk indices in all instances."""
+        for router in RouterReplay.router_instances:
+            router.clear_indices()
+
+    def __init__(self):
+        """Initializes a RouterReplay instance for a specific layer."""
+        self.target_topk_idx = None  # For replay
+        self.recorded_topk_idx = None  # For recording
+        self.routing_mode = None  # Routing mode for this layer
+        self.replay_backward_list = []  # List of tensors for backward pass replay
+        RouterReplay.router_instances.append(self)
+
+    def set_target_indices(self, topk_indices: torch.Tensor):
+        """Sets the target topk indices for replay."""
+        self.target_topk_idx = topk_indices
+        self.replay_backward_list.append(topk_indices)
+
+    def get_recorded_indices(self) -> Optional[torch.Tensor]:
+        """Returns the recorded topk indices."""
+        return self.recorded_topk_idx
+
+    def record_indices(self, topk_indices: torch.Tensor):
+        """Records the topk indices."""
+        self.recorded_topk_idx = topk_indices
+
+    def clear_indices(self):
+        """Clears the recorded and target topk indices."""
+        self.recorded_topk_idx = None
+        self.target_topk_idx = None
+        self.replay_backward_list = []
+
+    def set_routing_mode(self, routing_mode: RoutingMode):
+        """Sets the routing mode for this layer."""
+        self.routing_mode = routing_mode
+
+    def clear_routing_mode(self):
+        """Clears the routing mode for this layer."""
+        self.routing_mode = None
+
+    @staticmethod
+    def set_global_routing_mode(routing_mode: RoutingMode):
+        """Sets the routing mode for all router instances."""
+        for router in RouterReplay.router_instances:
+            router.set_routing_mode(routing_mode)
+
+    @staticmethod
+    def clear_global_routing_mode():
+        """Clears the routing mode for all router instances."""
+        for router in RouterReplay.router_instances:
+            router.clear_routing_mode()
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -529,6 +626,7 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
+    router_replay: Optional['RouterReplay'] = None,
 ):
     """Compute the routing probabilities and map for top-k selection with score function.
     Args:
@@ -540,6 +638,10 @@ def topk_routing_with_score_function(
         scaling_factor (float): Scaling factor of routing score in top-k selection.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        router_replay (Optional['RouterReplay']): For debugging and development, allows for
+                                             deterministic routing by replaying a previously
+                                             recorded routing sequence.
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -566,7 +668,7 @@ def topk_routing_with_score_function(
             expert_bias=expert_bias,
         )
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+    def _compute_topk(scores, topk, num_groups=None, group_topk=None):
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -578,6 +680,49 @@ def topk_routing_with_score_function(
             )
         else:
             return torch.topk(scores, k=topk, dim=1)
+
+    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        # Default behavior if no replay is active
+
+        routing_action = router_replay.routing_mode.value if router_replay is not None else None
+
+        if routing_action is None or routing_action == "fallthrough":
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+
+        if routing_action == "record":
+            probs, top_indices = _compute_topk(
+                scores, topk, num_groups=num_groups, group_topk=group_topk
+            )
+            if router_replay is not None:
+                router_replay.record_indices(top_indices)
+            return probs, top_indices
+
+        elif routing_action == "forward_replay":
+            if router_replay is None or router_replay.target_topk_idx is None:
+                # Fallback if replay data is not available
+                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+
+            # Use the provided indices for replay
+            top_indices = router_replay.target_topk_idx
+            # Ensure indices are on the correct device
+            top_indices = top_indices.to(scores.device)
+            # Gather the scores for the replayed indices to get the probabilities
+            probs = scores.gather(1, top_indices)
+            return probs, top_indices
+        elif routing_action == "backward_replay":
+            if router_replay is None or not router_replay.replay_backward_list:
+                # Fallback if replay data is not available
+                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+
+            # Use the last recorded indices for backward replay
+            top_indices = router_replay.replay_backward_list.pop()
+            # Ensure indices are on the correct device
+            top_indices = top_indices.to(scores.device)
+            # Gather the scores for the replayed indices to get the probabilities
+            probs = scores.gather(1, top_indices)
+            return probs, top_indices
+        else:  # Unknown action, fallback
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
     if score_function == "softmax":
         if use_pre_softmax:

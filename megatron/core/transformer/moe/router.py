@@ -10,6 +10,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
+    RouterReplay,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -197,6 +198,10 @@ class TopKRouter(Router):
         else:
             self.global_tokens_per_expert = None
             self.ga_steps = None
+
+        self.router_replay = None
+        if self.config.enable_routing_replay:
+            self.router_replay = RouterReplay()
 
     def _maintain_float32_expert_bias(self):
         """
@@ -497,6 +502,7 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
+                router_replay=self.router_replay,
             )
 
         # Apply token dropping to probs and routing_map.
