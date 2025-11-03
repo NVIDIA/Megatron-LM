@@ -137,12 +137,12 @@ runs:
 
         if [ "${{ steps.has-run-tests-label.outputs.main }}" == "has-tests-label" ]; then
           ARGS=(
-            --scope mr-github
+            --scope mr
             --enable-lightweight-mode
           )
         elif [ "${{ steps.has-run-tests-label.outputs.main }}" == "has-functional-tests-label" ]; then
           ARGS=(
-            --scope mr-github
+            --scope mr
           )
         else
           ARGS=(
