@@ -57,12 +57,6 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
-# >>>
-from lutil import pax as _pax
-import builtins
-builtins.pax = _pax
-# <<<
-
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Dynamic inference arguments."""
@@ -339,9 +333,6 @@ def run_inference(
             for finished_request_record in finished_request_records:
 
                 finished_request = finished_request_record.merge(engine.controller.tokenizer)
-                # >>>
-                pax("finished_request")
-                # <<<
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
@@ -351,9 +342,7 @@ def run_inference(
 
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens
-                request.prompt_text = engine.controller.tokenizer.detokenize(
-                    finished_request.prompt_tokens.tolist()
-                )
+                request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.
                 request.output_tokens = finished_request.generated_tokens

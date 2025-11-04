@@ -314,7 +314,6 @@ class DynamicInferenceRequest(InferenceRequest):
         return self.status == Status.FAILED
 
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 @dataclass(kw_only=True)
 class DynamicInferenceRequestRecord:
     """History of DynamicInferenceRequest objects over multiple suspend and
@@ -411,15 +410,7 @@ class DynamicInferenceRequestRecord:
             events=merge_lists("events"),
         )
 
-        # >>>
-        pax({
-            "requests" : self.requests,
-            "requests / -1" : self.requests[-1],
-        }, "request")
-        # <<<
-
         return request
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 @dataclass(kw_only=True)
