@@ -6,6 +6,7 @@ from functools import partial
 from typing import Optional
 
 import torch
+from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -16,6 +17,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
@@ -343,21 +345,53 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
-        Performs same attnention forward logic as GPT Model.
+        Performs same attnention forward logic as GPT Model and forward pass for 
+        computations between attention and dispatch:
+            pre mlp layernorm->router->dispatch preprocess
         """
+
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             assert (
-                layer.config.cuda_graph_scope == ["attn"]
-            ), "CUDA graph scope must be attn for fine grained callables, got {}".format(
+                "mlp" not in layer.config.cuda_graph_scope and "moe" not in layer.config.cuda_graph_scope
+            ), "Supported CUDA graph scope with EP overlap: attn, moe_router, moe_preprocess, got {}".format(
                 layer.config.cuda_graph_scope
             )
-            forward_fun = layer._te_cuda_graph_replay
+            forward_func = layer._te_cuda_graph_replay
             attn_backward_dw_wrapper.set_backward_dw_callable(
                 partial(layer.backward_dw_cudagraph, layer.current_microbatch)
             )
         else:
-            forward_fun = layer._forward_attention
-        hidden_states, _ = forward_fun(
+            # wrapper function that keeps consistent api with cuda graph replay
+            def forward_func(
+                hidden_states: Tensor,
+                attention_mask: Optional[Tensor] = None,
+                rotary_pos_emb: Optional[Tensor] = None,
+                rotary_pos_cos: Optional[Tensor] = None,
+                rotary_pos_sin: Optional[Tensor] = None,
+                packed_seq_params: Optional[PackedSeqParams] = None,
+                sequence_len_offset: Optional[Tensor] = None,
+            ):
+                hidden_states, _ = layer._forward_attention(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
+                if layer.recompute_pre_mlp_layernorm:
+                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                    pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                        layer.pre_mlp_layernorm, hidden_states
+                    )
+                else:
+                    pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+
+                local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+                return hidden_states, local_tokens, probs, pre_mlp_layernorm_output
+
+        hidden_states, local_tokens, probs, pre_mlp_layernorm_output = forward_func(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -366,27 +400,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
-        return hidden_states
-
-    def submodule_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
-        """
-        Run forward pass for computations between attention and dispatch:
-            pre mlp layernorm->router->dispatch preprocess
-        """
-        if layer.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
-        if layer.recompute_pre_mlp_layernorm:
-            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
-                pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                    layer.pre_mlp_layernorm, hidden_states
-                )
-        else:
-            with get_fine_grained_offloading_context(layer.offload_mlp_norm):
-                pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
-
-        probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-        local_tokens, probs, _ = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -496,12 +509,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     # Build forward and backward callable functions
     attn_func = submodule_attn_forward
-    post_attn_func = submodule_post_attn_forward if is_moe else raise_not_implemented
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
 
-    forward_funcs = [attn_func, post_attn_func, dispatch_func, mlp_func, combine_func, None]
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
     backward_dw = {"attn": attn_backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
@@ -514,7 +526,7 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
-    attn_forward, post_attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = (
+    attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = (
         forward_funcs
     )
     is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
@@ -577,7 +589,6 @@ def build_mtp_layer_callables(layer):
     # Build forward and backward callable functions
     # attn_forward already has rng context, no need to wrap
     attn_func = submodule_mtp_attn_forward
-    post_attn_func = partial(rng_context_wrapper, post_attn_forward)
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
@@ -585,7 +596,6 @@ def build_mtp_layer_callables(layer):
 
     forward_funcs = [
         attn_func,
-        post_attn_func,
         dispatch_func,
         mlp_func,
         combine_func,
