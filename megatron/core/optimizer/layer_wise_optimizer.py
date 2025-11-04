@@ -193,4 +193,4 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ), f'Expected replica_id format (PP, TP, DP), got: {sh_base}'
                 sh_base.replica_id = (*sh_base.replica_id[:2], 0)
 
-        return sharded_state_dict
+        # return sharded_state_dict
