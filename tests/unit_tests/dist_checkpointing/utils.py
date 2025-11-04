@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 from functools import partial
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
