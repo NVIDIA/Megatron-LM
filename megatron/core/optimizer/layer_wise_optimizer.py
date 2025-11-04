@@ -5,14 +5,13 @@ from typing import Callable, List, Optional
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
-from .optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params, MegatronOptimizer
+from .optimizer import ChainedOptimizer, FP32Optimizer, Float16OptimizerWithFloat16Params, MegatronOptimizer
 from .optimizer_config import OptimizerConfig
 
 
@@ -51,9 +50,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
-        # wrap optimizer after sharding to avoid unnecessary master weight creation
-        # TODO(deyuf): check if underlying optimizer.config need to fixed and if so can use
-        # that instead of passing
         if init_state_fn_list is None:
             init_state_fn_list = [None] * len(optimizers)
         else:
@@ -61,13 +57,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 "init_state_fn_list must be the " "same length as optimizers if provided"
             )
 
+        # wrap optimizer after sharding to avoid unnecessary master weight creation
+        # for higher precision, optimizers are wrapped with megatron already
         if config.bf16:
             if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
                 raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
-            optimizers = [
-                Float16OptimizerWithFloat16Params(optim, config, None, init_state_fn_list[idx])
-                for idx, optim in enumerate(optimizers)
-            ]
+            # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
+            for i, opt in enumerate(optimizers):
+                if isinstance(opt, Float16OptimizerWithFloat16Params):
+                    raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
+                # unwrap FP32 optimizer from reusing get_megatron_optimizer for adam
+                if isinstance(opt, FP32Optimizer):
+                    opt = opt.optimizer
+                optimizers[i] = Float16OptimizerWithFloat16Params(opt, config, None, init_state_fn_list[i])
+
         super().__init__(optimizers)
 
         # TODO(kunlun, deyuf): potential future perf optimization
@@ -227,10 +230,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
-            if isinstance(sh_base, ShardedTensor):
+            if hasattr(sh_base, 'replica_id'):
                 assert (
-                    len(sh_base.replica_id) == 3
-                ), f'Expected replica_id format (PP, TP, DP), got: {sh_base}'
-                sh_base.replica_id = (*sh_base.replica_id[:2], 0)
+                    isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
+                ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
+                sh_base.replica_id = (
+                    0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
+                )
 
         return sharded_state_dict
