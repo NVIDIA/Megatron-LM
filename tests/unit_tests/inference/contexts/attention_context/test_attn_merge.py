@@ -38,13 +38,15 @@ def attn_merge_pytorch(
             if pf_useful_from_beginning:
                 # Mode 1: Copy prefill_tensor from beginning
                 # output[device_dc:device_dc+copy_size] = prefill_tensor[0:copy_size]
-                output_tensor[device_dc_val:device_dc_val + copy_size].copy_(prefill_tensor[:copy_size])
+                output_tensor[device_dc_val : device_dc_val + copy_size].copy_(
+                    prefill_tensor[:copy_size]
+                )
             else:
                 # Mode 2: Copy prefill_tensor from device_dc to end
                 # output[device_dc:device_dc+copy_size] = prefill_tensor[device_dc:device_dc+copy_size]
                 if device_dc_val + copy_size <= prefill_batch_size:
-                    output_tensor[device_dc_val:device_dc_val + copy_size].copy_(
-                        prefill_tensor[device_dc_val:device_dc_val + copy_size]
+                    output_tensor[device_dc_val : device_dc_val + copy_size].copy_(
+                        prefill_tensor[device_dc_val : device_dc_val + copy_size]
                     )
 
 
@@ -59,12 +61,7 @@ def device():
 @pytest.fixture
 def test_params():
     """Common test parameters."""
-    return {
-        'decode_batch': 8,
-        'prefill_batch': 12,
-        'output_batch': 32,
-        'feature_dim': 256,
-    }
+    return {'decode_batch': 8, 'prefill_batch': 12, 'output_batch': 32, 'feature_dim': 256}
 
 
 def test_mode1_pf_useful_from_beginning(device, test_params):
@@ -84,40 +81,43 @@ def test_mode1_pf_useful_from_beginning(device, test_params):
     output_pt = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_pt[15:25] = 999.0  # Fill some area that should remain unchanged
 
-    attn_merge_pytorch(decode_tensor, prefill_tensor, output_pt, device_dc, pf_useful_from_beginning=True)
+    attn_merge_pytorch(
+        decode_tensor, prefill_tensor, output_pt, device_dc, pf_useful_from_beginning=True
+    )
 
     # Test with Triton implementation
     output_tr = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_tr[15:25] = 999.0  # Fill some area that should remain unchanged
 
-    attn_merge_triton(decode_tensor, prefill_tensor, output_tr, device_dc, pf_useful_from_beginning=True)
+    attn_merge_triton(
+        decode_tensor, prefill_tensor, output_tr, device_dc, pf_useful_from_beginning=True
+    )
 
     # Verify results
     device_dc_val = device_dc[0].item()
 
     # Check decode region
-    assert torch.equal(output_pt[:device_dc_val], output_tr[:device_dc_val]), \
-        "Decode region mismatch between PyTorch and Triton"
-    assert torch.equal(output_pt[:device_dc_val], decode_tensor[:device_dc_val]), \
-        "Decode region incorrect in output"
+    assert torch.equal(
+        output_pt[:device_dc_val], output_tr[:device_dc_val]
+    ), "Decode region mismatch between PyTorch and Triton"
+    assert torch.equal(
+        output_pt[:device_dc_val], decode_tensor[:device_dc_val]
+    ), "Decode region incorrect in output"
 
     # Check prefill region
     assert torch.equal(
-        output_pt[device_dc_val:device_dc_val + prefill_batch],
-        output_tr[device_dc_val:device_dc_val + prefill_batch]
+        output_pt[device_dc_val : device_dc_val + prefill_batch],
+        output_tr[device_dc_val : device_dc_val + prefill_batch],
     ), "Prefill region mismatch between PyTorch and Triton"
     assert torch.equal(
-        output_pt[device_dc_val:device_dc_val + prefill_batch],
-        prefill_tensor
+        output_pt[device_dc_val : device_dc_val + prefill_batch], prefill_tensor
     ), "Prefill region incorrect in output"
 
     # Check unchanged region
-    assert torch.equal(output_pt[15:25], output_tr[15:25]), \
-        "Unchanged region mismatch"
+    assert torch.equal(output_pt[15:25], output_tr[15:25]), "Unchanged region mismatch"
 
     # Check full output
-    assert torch.equal(output_pt, output_tr), \
-        "Full output mismatch between PyTorch and Triton"
+    assert torch.equal(output_pt, output_tr), "Full output mismatch between PyTorch and Triton"
 
 
 def test_mode2_pf_useful_from_device_dc(device, test_params):
@@ -130,48 +130,54 @@ def test_mode2_pf_useful_from_device_dc(device, test_params):
 
     # Create test tensors
     decode_tensor = torch.randn(decode_batch, feature_dim, dtype=torch.float32, device=device)
-    prefill_tensor_large = torch.randn(output_batch, feature_dim, dtype=torch.float32, device=device)
+    prefill_tensor_large = torch.randn(
+        output_batch, feature_dim, dtype=torch.float32, device=device
+    )
 
     # Test with PyTorch implementation
     output_pt = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_pt[20:30] = 888.0  # Fill some area that should remain unchanged
 
-    attn_merge_pytorch(decode_tensor, prefill_tensor_large, output_pt, device_dc, pf_useful_from_beginning=False)
+    attn_merge_pytorch(
+        decode_tensor, prefill_tensor_large, output_pt, device_dc, pf_useful_from_beginning=False
+    )
 
     # Test with Triton implementation
     output_tr = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_tr[20:30] = 888.0  # Fill some area that should remain unchanged
 
-    attn_merge_triton(decode_tensor, prefill_tensor_large, output_tr, device_dc, pf_useful_from_beginning=False)
+    attn_merge_triton(
+        decode_tensor, prefill_tensor_large, output_tr, device_dc, pf_useful_from_beginning=False
+    )
 
     # Verify results
     device_dc_val = device_dc[0].item()
 
     # Check decode region
-    assert torch.equal(output_pt[:device_dc_val], output_tr[:device_dc_val]), \
-        "Decode region mismatch between PyTorch and Triton"
-    assert torch.equal(output_pt[:device_dc_val], decode_tensor[:device_dc_val]), \
-        "Decode region incorrect in output"
+    assert torch.equal(
+        output_pt[:device_dc_val], output_tr[:device_dc_val]
+    ), "Decode region mismatch between PyTorch and Triton"
+    assert torch.equal(
+        output_pt[:device_dc_val], decode_tensor[:device_dc_val]
+    ), "Decode region incorrect in output"
 
     # Check prefill region
     copy_size = min(prefill_tensor_large.shape[0] - device_dc_val, output_batch - device_dc_val)
     if copy_size > 0:
         assert torch.equal(
-            output_pt[device_dc_val:device_dc_val + copy_size],
-            output_tr[device_dc_val:device_dc_val + copy_size]
+            output_pt[device_dc_val : device_dc_val + copy_size],
+            output_tr[device_dc_val : device_dc_val + copy_size],
         ), "Prefill region mismatch between PyTorch and Triton"
         assert torch.equal(
-            output_pt[device_dc_val:device_dc_val + copy_size],
-            prefill_tensor_large[device_dc_val:device_dc_val + copy_size]
+            output_pt[device_dc_val : device_dc_val + copy_size],
+            prefill_tensor_large[device_dc_val : device_dc_val + copy_size],
         ), "Prefill region incorrect in output"
 
     # Check unchanged region
-    assert torch.equal(output_pt[20:30], output_tr[20:30]), \
-        "Unchanged region mismatch"
+    assert torch.equal(output_pt[20:30], output_tr[20:30]), "Unchanged region mismatch"
 
     # Check full output
-    assert torch.equal(output_pt, output_tr), \
-        "Full output mismatch between PyTorch and Triton"
+    assert torch.equal(output_pt, output_tr), "Full output mismatch between PyTorch and Triton"
 
 
 def test_edge_case_device_dc_zero_mode1(device, test_params):
@@ -190,11 +196,12 @@ def test_edge_case_device_dc_zero_mode1(device, test_params):
         prefill_tensor,
         output_tensor,
         torch.tensor([0, 0], device=device),
-        pf_useful_from_beginning=True
+        pf_useful_from_beginning=True,
     )
 
-    assert torch.equal(output_tensor[:prefill_batch], prefill_tensor), \
-        "device_dc=0 Mode 1 test failed"
+    assert torch.equal(
+        output_tensor[:prefill_batch], prefill_tensor
+    ), "device_dc=0 Mode 1 test failed"
 
 
 def test_edge_case_device_dc_zero_mode2(device, test_params):
@@ -204,7 +211,9 @@ def test_edge_case_device_dc_zero_mode2(device, test_params):
     feature_dim = test_params['feature_dim']
 
     decode_tensor = torch.randn(decode_batch, feature_dim, dtype=torch.float32, device=device)
-    prefill_tensor_large = torch.randn(output_batch, feature_dim, dtype=torch.float32, device=device)
+    prefill_tensor_large = torch.randn(
+        output_batch, feature_dim, dtype=torch.float32, device=device
+    )
     output_tensor = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
 
     attn_merge_triton(
@@ -212,12 +221,13 @@ def test_edge_case_device_dc_zero_mode2(device, test_params):
         prefill_tensor_large,
         output_tensor,
         torch.tensor([0, 0], device=device),
-        pf_useful_from_beginning=False
+        pf_useful_from_beginning=False,
     )
 
     copy_size = min(prefill_tensor_large.shape[0], output_batch)
-    assert torch.equal(output_tensor[:copy_size], prefill_tensor_large[:copy_size]), \
-        "device_dc=0 Mode 2 test failed"
+    assert torch.equal(
+        output_tensor[:copy_size], prefill_tensor_large[:copy_size]
+    ), "device_dc=0 Mode 2 test failed"
 
 
 def test_edge_case_device_dc_full_mode1(device, test_params):
@@ -236,14 +246,12 @@ def test_edge_case_device_dc_full_mode1(device, test_params):
         prefill_tensor,
         output_tensor,
         torch.tensor([decode_batch, 0], device=device),
-        pf_useful_from_beginning=True
+        pf_useful_from_beginning=True,
     )
 
-    assert torch.equal(output_tensor[:decode_batch], decode_tensor), \
-        "Decode region incorrect"
+    assert torch.equal(output_tensor[:decode_batch], decode_tensor), "Decode region incorrect"
     assert torch.equal(
-        output_tensor[decode_batch:decode_batch + prefill_batch],
-        prefill_tensor
+        output_tensor[decode_batch : decode_batch + prefill_batch], prefill_tensor
     ), "Prefill region incorrect"
 
 
@@ -254,7 +262,9 @@ def test_edge_case_device_dc_full_mode2(device, test_params):
     feature_dim = test_params['feature_dim']
 
     decode_tensor = torch.randn(decode_batch, feature_dim, dtype=torch.float32, device=device)
-    prefill_tensor_large = torch.randn(output_batch, feature_dim, dtype=torch.float32, device=device)
+    prefill_tensor_large = torch.randn(
+        output_batch, feature_dim, dtype=torch.float32, device=device
+    )
     output_tensor = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
 
     attn_merge_triton(
@@ -262,17 +272,16 @@ def test_edge_case_device_dc_full_mode2(device, test_params):
         prefill_tensor_large,
         output_tensor,
         torch.tensor([decode_batch, 0], device=device),
-        pf_useful_from_beginning=False
+        pf_useful_from_beginning=False,
     )
 
-    assert torch.equal(output_tensor[:decode_batch], decode_tensor), \
-        "Decode region incorrect"
+    assert torch.equal(output_tensor[:decode_batch], decode_tensor), "Decode region incorrect"
 
     copy_size = min(prefill_tensor_large.shape[0] - decode_batch, output_batch - decode_batch)
     if copy_size > 0:
         assert torch.equal(
-            output_tensor[decode_batch:decode_batch + copy_size],
-            prefill_tensor_large[decode_batch:decode_batch + copy_size]
+            output_tensor[decode_batch : decode_batch + copy_size],
+            prefill_tensor_large[decode_batch : decode_batch + copy_size],
         ), "Prefill region incorrect"
 
 
@@ -289,13 +298,15 @@ def test_small_tensors_mode1(device):
         small_prefill,
         small_output,
         torch.tensor([2, 0], device=device),
-        pf_useful_from_beginning=True
+        pf_useful_from_beginning=True,
     )
 
-    assert torch.equal(small_output[:2], small_decode[:2]), \
-        "Small tensor Mode 1 decode region incorrect"
-    assert torch.equal(small_output[2:7], small_prefill), \
-        "Small tensor Mode 1 prefill region incorrect"
+    assert torch.equal(
+        small_output[:2], small_decode[:2]
+    ), "Small tensor Mode 1 decode region incorrect"
+    assert torch.equal(
+        small_output[2:7], small_prefill
+    ), "Small tensor Mode 1 prefill region incorrect"
 
 
 def test_small_tensors_mode2(device):
@@ -311,13 +322,15 @@ def test_small_tensors_mode2(device):
         small_prefill,
         small_output,
         torch.tensor([2, 0], device=device),
-        pf_useful_from_beginning=False
+        pf_useful_from_beginning=False,
     )
 
-    assert torch.equal(small_output[:2], small_decode[:2]), \
-        "Small tensor Mode 2 decode region incorrect"
-    assert torch.equal(small_output[2:5], small_prefill[2:5]), \
-        "Small tensor Mode 2 prefill region incorrect"
+    assert torch.equal(
+        small_output[:2], small_decode[:2]
+    ), "Small tensor Mode 2 decode region incorrect"
+    assert torch.equal(
+        small_output[2:5], small_prefill[2:5]
+    ), "Small tensor Mode 2 prefill region incorrect"
 
 
 if __name__ == '__main__':
@@ -346,41 +359,59 @@ if __name__ == '__main__':
     output_pt1 = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_pt1[15:25] = 999.0
 
-    attn_merge_pytorch(decode_tensor, prefill_tensor, output_pt1, device_dc, pf_useful_from_beginning=True)
+    attn_merge_pytorch(
+        decode_tensor, prefill_tensor, output_pt1, device_dc, pf_useful_from_beginning=True
+    )
 
     output_tr1 = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_tr1[15:25] = 999.0
 
-    attn_merge_triton(decode_tensor, prefill_tensor, output_tr1, device_dc, pf_useful_from_beginning=True)
+    attn_merge_triton(
+        decode_tensor, prefill_tensor, output_tr1, device_dc, pf_useful_from_beginning=True
+    )
 
     # Test Mode 2
     print(f"\n=== Testing Mode 2: pf_useful_from_beginning=False ===")
 
-    prefill_tensor_large = torch.randn(output_batch, feature_dim, dtype=torch.float32, device=device)
+    prefill_tensor_large = torch.randn(
+        output_batch, feature_dim, dtype=torch.float32, device=device
+    )
 
     output_pt2 = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_pt2[20:30] = 888.0
 
-    attn_merge_pytorch(decode_tensor, prefill_tensor_large, output_pt2, device_dc, pf_useful_from_beginning=False)
+    attn_merge_pytorch(
+        decode_tensor, prefill_tensor_large, output_pt2, device_dc, pf_useful_from_beginning=False
+    )
 
     output_tr2 = torch.zeros(output_batch, feature_dim, dtype=torch.float32, device=device)
     output_tr2[20:30] = 888.0
 
-    attn_merge_triton(decode_tensor, prefill_tensor_large, output_tr2, device_dc, pf_useful_from_beginning=False)
+    attn_merge_triton(
+        decode_tensor, prefill_tensor_large, output_tr2, device_dc, pf_useful_from_beginning=False
+    )
 
     # Verify results
     print(f"\n--- Mode 1 Results ---")
     device_dc_val = device_dc[0].item()
     print(f"Mode 1 - Full output match: {torch.equal(output_pt1, output_tr1)}")
-    print(f"Mode 1 - Decode region correct: {torch.equal(output_pt1[:device_dc_val], decode_tensor[:device_dc_val])}")
-    print(f"Mode 1 - Prefill region correct: {torch.equal(output_pt1[device_dc_val:device_dc_val + prefill_batch], prefill_tensor)}")
+    print(
+        f"Mode 1 - Decode region correct: {torch.equal(output_pt1[:device_dc_val], decode_tensor[:device_dc_val])}"
+    )
+    print(
+        f"Mode 1 - Prefill region correct: {torch.equal(output_pt1[device_dc_val:device_dc_val + prefill_batch], prefill_tensor)}"
+    )
 
     print(f"\n--- Mode 2 Results ---")
     print(f"Mode 2 - Full output match: {torch.equal(output_pt2, output_tr2)}")
-    print(f"Mode 2 - Decode region correct: {torch.equal(output_pt2[:device_dc_val], decode_tensor[:device_dc_val])}")
+    print(
+        f"Mode 2 - Decode region correct: {torch.equal(output_pt2[:device_dc_val], decode_tensor[:device_dc_val])}"
+    )
 
     copy_size2 = min(prefill_tensor_large.shape[0] - device_dc_val, output_batch - device_dc_val)
     if copy_size2 > 0:
-        print(f"Mode 2 - Prefill region correct: {torch.equal(output_pt2[device_dc_val:device_dc_val + copy_size2], prefill_tensor_large[device_dc_val:device_dc_val + copy_size2])}")
+        print(
+            f"Mode 2 - Prefill region correct: {torch.equal(output_pt2[device_dc_val:device_dc_val + copy_size2], prefill_tensor_large[device_dc_val:device_dc_val + copy_size2])}"
+        )
 
     print("\n✅ All tests completed!")

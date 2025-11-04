@@ -132,10 +132,7 @@ class MLACache(KVCacheBase):
         )
         self.kv_reduced_dim = kv_reduced_dim
         self.cache: Tensor = torch.full(
-            (num_chunks, chunk_size, kv_reduced_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, chunk_size, kv_reduced_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -184,10 +181,7 @@ class KVCacheM2NCHD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.cache: Tensor = torch.full(
-            (2, num_chunks, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (2, num_chunks, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -235,10 +229,7 @@ class KVCacheMN2CHD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.cache: Tensor = torch.full(
-            (num_chunks, 2, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, 2, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -287,10 +278,7 @@ class KVCacheMN2HCD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.cache: Tensor = torch.full(
-            (num_chunks, 2, num_kv_heads, chunk_size, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, 2, num_kv_heads, chunk_size, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -339,16 +327,10 @@ class KVCacheSNCHD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.k_cache: Tensor = torch.full(
-            (num_chunks, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
         self.v_cache: Tensor = torch.full(
-            (num_chunks, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tuple[Tensor, Tensor]:
@@ -396,16 +378,10 @@ class KVCacheSNHCD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.k_cache: Tensor = torch.full(
-            (num_chunks, num_kv_heads, chunk_size, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, num_kv_heads, chunk_size, head_dim), -1, dtype=dtype, device=device
         )
         self.v_cache: Tensor = torch.full(
-            (num_chunks, num_kv_heads, chunk_size, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, num_kv_heads, chunk_size, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tuple[Tensor, Tensor]:

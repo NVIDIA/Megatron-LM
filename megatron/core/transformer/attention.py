@@ -890,19 +890,21 @@ class Attention(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 if inference_context.attention_backend == AttnBackend.flash_split:
-                    core_attn_out = inference_context.active_attn_metadata["mha_metadata"].attention(
-                        q, k, v
-                    )
+                    core_attn_out = inference_context.active_attn_metadata[
+                        "mha_metadata"
+                    ].attention(q, k, v)
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                elif inference_context.attention_backend in [AttnBackend.flashinfer_fa2,
-                                                               AttnBackend.flashinfer_fa3,
-                                                               AttnBackend.flashinfer_trt]:
+                elif inference_context.attention_backend in [
+                    AttnBackend.flashinfer_fa2,
+                    AttnBackend.flashinfer_fa3,
+                    AttnBackend.flashinfer_trt,
+                ]:
                     # FlashInfer attention using KV cache directly
                     kv_cache = inference_context.memory_buffer[self.layer_number - 1].get_content()
-                    core_attn_out = inference_context.active_attn_metadata["mha_metadata"].attention(
-                        q, kv_cache, layer_idx=self.layer_number - 1
-                    )
+                    core_attn_out = inference_context.active_attn_metadata[
+                        "mha_metadata"
+                    ].attention(q, kv_cache, layer_idx=self.layer_number - 1)
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
                 else:

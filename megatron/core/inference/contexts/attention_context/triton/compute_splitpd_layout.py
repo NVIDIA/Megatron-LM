@@ -13,8 +13,9 @@ def _assert_1d(t: torch.Tensor, name: str):
 
 def _assert_2d(t: torch.Tensor, rows_min: int, cols_min: int, name: str):
     assert t.dim() == 2, f"{name} must be 2D, got shape {tuple(t.shape)}"
-    assert t.size(0) >= rows_min and t.size(1) >= cols_min, \
-        f"{name} must be at least {(rows_min, cols_min)}, got {tuple(t.shape)}"
+    assert (
+        t.size(0) >= rows_min and t.size(1) >= cols_min
+    ), f"{name} must be at least {(rows_min, cols_min)}, got {tuple(t.shape)}"
     assert t.is_contiguous(), f"{name} must be contiguous"
 
 
@@ -54,8 +55,9 @@ def _validate_preflight(
 ):
     # Basic params
     assert chunk_size_tokens > 0, "CHUNK_SIZE_TOKENS must be > 0"
-    assert MAX_BATCH_SIZE_CONST >= batch_size, \
-        f"MAX_BATCH_SIZE_CONST ({MAX_BATCH_SIZE_CONST}) must be >= BATCH_SIZE ({batch_size})"
+    assert (
+        MAX_BATCH_SIZE_CONST >= batch_size
+    ), f"MAX_BATCH_SIZE_CONST ({MAX_BATCH_SIZE_CONST}) must be >= BATCH_SIZE ({batch_size})"
 
     # Dtype/device/1D checks
     for name, t in [
@@ -80,39 +82,45 @@ def _validate_preflight(
 
     # Capacity rules (allow oversizing)
     # +1 arrays may write up to index MAX_BATCH_SIZE_CONST → need len >= MAX_BATCH_SIZE_CONST + 1
-    assert qo_indptr.numel()      >= MAX_BATCH_SIZE_CONST + 1, \
-        f"qo_indptr too small (need >= {MAX_BATCH_SIZE_CONST + 1})"
-    assert indptr.numel()         >= MAX_BATCH_SIZE_CONST + 1, \
-        f"indptr too small (need >= {MAX_BATCH_SIZE_CONST + 1})"
-    assert cum_kv_seq_len.numel() >= MAX_BATCH_SIZE_CONST + 1, \
-        f"cum_kv_seq_len too small (need >= {MAX_BATCH_SIZE_CONST + 1})"
+    assert (
+        qo_indptr.numel() >= MAX_BATCH_SIZE_CONST + 1
+    ), f"qo_indptr too small (need >= {MAX_BATCH_SIZE_CONST + 1})"
+    assert (
+        indptr.numel() >= MAX_BATCH_SIZE_CONST + 1
+    ), f"indptr too small (need >= {MAX_BATCH_SIZE_CONST + 1})"
+    assert (
+        cum_kv_seq_len.numel() >= MAX_BATCH_SIZE_CONST + 1
+    ), f"cum_kv_seq_len too small (need >= {MAX_BATCH_SIZE_CONST + 1})"
 
     # 0-index arrays extended up to MAX_BATCH_SIZE_CONST-1 → need len >= MAX_BATCH_SIZE_CONST
-    assert last_page_len.numel()  >= MAX_BATCH_SIZE_CONST, \
-        f"last_page_len too small (need >= {MAX_BATCH_SIZE_CONST})"
+    assert (
+        last_page_len.numel() >= MAX_BATCH_SIZE_CONST
+    ), f"last_page_len too small (need >= {MAX_BATCH_SIZE_CONST})"
 
     # kv_seq_lengths writes only first BATCH_SIZE
-    assert kv_seq_lengths.numel() >= batch_size, \
-        f"kv_seq_lengths must be >= BATCH_SIZE ({batch_size})"
+    assert (
+        kv_seq_lengths.numel() >= batch_size
+    ), f"kv_seq_lengths must be >= BATCH_SIZE ({batch_size})"
 
     # PF/DC partition metadata
-    assert pf_qo_indptr.numel()     >= pf_target_size + 1, "pf_qo_indptr too small"
-    assert pf_indptr.numel()        >= pf_target_size + 1, "pf_indptr too small"
-    assert pf_last_page_len.numel() >= pf_target_size,     "pf_last_page_len too small"
+    assert pf_qo_indptr.numel() >= pf_target_size + 1, "pf_qo_indptr too small"
+    assert pf_indptr.numel() >= pf_target_size + 1, "pf_indptr too small"
+    assert pf_last_page_len.numel() >= pf_target_size, "pf_last_page_len too small"
     assert pf_cum_kv_seq_len.numel() >= pf_target_size + 1, "pf_cum_kv_seq_len too small"
 
-    assert dc_qo_indptr.numel()     >= dc_target_size + 1, "dc_qo_indptr too small"
-    assert dc_indptr.numel()        >= dc_target_size + 1, "dc_indptr too small"
-    assert dc_last_page_len.numel() >= dc_target_size,     "dc_last_page_len too small"
+    assert dc_qo_indptr.numel() >= dc_target_size + 1, "dc_qo_indptr too small"
+    assert dc_indptr.numel() >= dc_target_size + 1, "dc_indptr too small"
+    assert dc_last_page_len.numel() >= dc_target_size, "dc_last_page_len too small"
 
     # Block tables
     _assert_2d(prefill_block_table, pf_target_size, max_num_blocks, "prefill_block_table")
     _assert_2d(decode_block_table, dc_target_size, max_num_blocks, "decode_block_table")
-    _assert_2d(full_block_table,   batch_size,     max_num_blocks, "full_block_table")
+    _assert_2d(full_block_table, batch_size, max_num_blocks, "full_block_table")
 
     # kv_indices conservative bound
-    assert kv_indices.numel() >= MAX_BATCH_SIZE_CONST * max_num_blocks, \
-        f"kv_indices too small (need >= {MAX_BATCH_SIZE_CONST * max_num_blocks})"
+    assert (
+        kv_indices.numel() >= MAX_BATCH_SIZE_CONST * max_num_blocks
+    ), f"kv_indices too small (need >= {MAX_BATCH_SIZE_CONST * max_num_blocks})"
 
     assert max_metadata.numel() == 2, "max_metadata must be 2 elements"
     assert device_decode_prefill.numel() == 2, "device_decode_prefill must be 2 elements"
@@ -121,12 +129,23 @@ def _validate_preflight(
 @triton.jit
 def _compute_layout_kernel(
     # --- Input Pointers ---
-    REQUEST_QUERY_LENGTHS, KV_LENGTH_OFFSETS,
+    REQUEST_QUERY_LENGTHS,
+    KV_LENGTH_OFFSETS,
     # --- Full Output Pointers ---
-    QO_INDPTR, LAST_PAGE_LEN, INDPTR, CUM_KV_SEQ_LEN, MAX_METADATA, KV_SEQ_LENGTHS_OUT,
+    QO_INDPTR,
+    LAST_PAGE_LEN,
+    INDPTR,
+    CUM_KV_SEQ_LEN,
+    MAX_METADATA,
+    KV_SEQ_LENGTHS_OUT,
     # --- Output Pointers ---
-    PF_QO_INDPTR, PF_LAST_PAGE_LEN, PF_INDPTR, PF_CUM_KV_SEQ_LEN,
-    DC_QO_INDPTR, DC_LAST_PAGE_LEN, DC_INDPTR,
+    PF_QO_INDPTR,
+    PF_LAST_PAGE_LEN,
+    PF_INDPTR,
+    PF_CUM_KV_SEQ_LEN,
+    DC_QO_INDPTR,
+    DC_LAST_PAGE_LEN,
+    DC_INDPTR,
     DEVICE_DECODE_PREFILL,
     # --- Tensor Metadata ---
     BATCH_SIZE,
@@ -218,7 +237,6 @@ def _compute_layout_kernel(
     tl.store(DC_LAST_PAGE_LEN + dc_range, decode_last_page_len, mask=dc_mask)
     tl.store(DC_LAST_PAGE_LEN + dc_range, 0, mask=ext_mask)
 
-
     # --- Phase 5: Save prefill ---
     tl.store(PF_QO_INDPTR, 0)  # Start prefill qo_indptr from 0 for relative indexing
     tl.store(PF_INDPTR, last_indptr)
@@ -231,7 +249,9 @@ def _compute_layout_kernel(
     prefill_qo_indptr = prefill_qo_indptr - last_qo
     last_qo_end = tl.load(QO_INDPTR + DC_COUNT + PF_COUNT)
     tl.store(PF_QO_INDPTR + 1 + pf_range, prefill_qo_indptr, mask=pf_mask)
-    tl.store(PF_QO_INDPTR + 1 + pf_range, last_qo_end - last_qo, mask=ext_mask)  # Use relative end value
+    tl.store(
+        PF_QO_INDPTR + 1 + pf_range, last_qo_end - last_qo, mask=ext_mask
+    )  # Use relative end value
     # store prefill indptr
     prefill_indptr = tl.load(INDPTR + 1 + DC_COUNT + pf_range, mask=pf_mask)
     last_indptr_end = tl.load(INDPTR + DC_COUNT + PF_COUNT)
@@ -277,16 +297,30 @@ def _block_transform(
     start = tl.load(kv_indptr_ptr + pid)
     end = tl.load(kv_indptr_ptr + pid + 1)
     block_table_range = tl.arange(0, MAX_BLOCKS_PW2)
-    block_table = tl.load(block_table_ptr + num_blocks * pid + block_table_range, mask=block_table_range < num_blocks)
+    block_table = tl.load(
+        block_table_ptr + num_blocks * pid + block_table_range, mask=block_table_range < num_blocks
+    )
     kv_indptr_range = tl.arange(0, MAX_BLOCKS_PW2) + start
     tl.store(kv_indices_ptr + kv_indptr_range, block_table, mask=kv_indptr_range < end)
     # full copy of the input block table row
-    tl.store(full_block_table_ptr + pid * num_blocks + block_table_range, block_table, mask=block_table_range < num_blocks)
+    tl.store(
+        full_block_table_ptr + pid * num_blocks + block_table_range,
+        block_table,
+        mask=block_table_range < num_blocks,
+    )
     if pid < DC_COUNT:
-        tl.store(decode_block_table_ptr + pid * num_blocks + block_table_range, block_table, mask=block_table_range < num_blocks)
+        tl.store(
+            decode_block_table_ptr + pid * num_blocks + block_table_range,
+            block_table,
+            mask=block_table_range < num_blocks,
+        )
     elif pid < PF_COUNT + DC_COUNT:
         offset = pid - DC_COUNT
-        tl.store(prefill_block_table_ptr + offset * num_blocks + block_table_range, block_table, mask=block_table_range < num_blocks)
+        tl.store(
+            prefill_block_table_ptr + offset * num_blocks + block_table_range,
+            block_table,
+            mask=block_table_range < num_blocks,
+        )
 
 
 def compute_layout_triton(
@@ -379,11 +413,27 @@ def compute_layout_triton(
         block_table = block_table.to(torch.int32)
 
         # Validate outputs presence
-        assert qo_indptr is not None and last_page_len is not None and indptr is not None and kv_indices is not None
-        assert pf_qo_indptr is not None and pf_last_page_len is not None and pf_indptr is not None and pf_cum_kv_seq_len is not None
+        assert (
+            qo_indptr is not None
+            and last_page_len is not None
+            and indptr is not None
+            and kv_indices is not None
+        )
+        assert (
+            pf_qo_indptr is not None
+            and pf_last_page_len is not None
+            and pf_indptr is not None
+            and pf_cum_kv_seq_len is not None
+        )
         assert dc_qo_indptr is not None and dc_last_page_len is not None and dc_indptr is not None
-        assert prefill_block_table is not None and decode_block_table is not None and full_block_table is not None
-        assert cum_kv_seq_len is not None and max_metadata is not None and kv_seq_lengths is not None
+        assert (
+            prefill_block_table is not None
+            and decode_block_table is not None
+            and full_block_table is not None
+        )
+        assert (
+            cum_kv_seq_len is not None and max_metadata is not None and kv_seq_lengths is not None
+        )
         assert device_decode_prefill is not None
 
         # Validate dtype/device/shapes
@@ -414,7 +464,9 @@ def compute_layout_triton(
     with nvtx.annotate("kernel launch"):
         # 2. Define constants for the kernel.
         # MAX_BATCH_SIZE_CONST = dc_target_size + pf_target_size
-        MAX_BATCH_SIZE_CONST_PW2 = triton.next_power_of_2(MAX_BATCH_SIZE_CONST) if MAX_BATCH_SIZE_CONST > 1 else 2
+        MAX_BATCH_SIZE_CONST_PW2 = (
+            triton.next_power_of_2(MAX_BATCH_SIZE_CONST) if MAX_BATCH_SIZE_CONST > 1 else 2
+        )
 
         # Per the request, use 8 warps.
         NUM_WARPS = 8

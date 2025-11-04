@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 import warnings
@@ -15,7 +15,13 @@ from megatron.core import parallel_state
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.inference.utils import CUDAGraphConfig
-from megatron.core.inference.unified_memory import create_unified_mempool, has_unified_memory
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.unified_memory import (
+    UnifiedMemoryUnsupportedError,
+    create_unified_mempool,
+)
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
@@ -27,7 +33,7 @@ from .attention_context.mha_metadata import GraphMHAMetadata, NonGraphMHAMetadat
 from .attention_context.mha_splitpd_metadata import MHASplitPDMetadata
 from .attention_context.mha_flashinfer_metadata import (
     GraphMHAFlashInferMetadata,
-    NonGraphMHAFlashInferMetadata
+    NonGraphMHAFlashInferMetadata,
 )
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
@@ -66,8 +72,10 @@ class ContextOverflowError(Exception):
         self, request_id: Optional[int], message: Optional[str] = None, *, is_transient: bool = True
     ):
         request_str = '--' if request_id is None else str(request_id)
-        message = "" if message is None else f" | {message}"
-        super().__init__(f"request {request_str}{message}")
+        _message = "" if message is None else f" | {message}"
+        super().__init__(f"request {request_str}{_message}")
+        self.request_id = request_id
+        self.message = message
         self.is_transient = is_transient
 
 
@@ -107,6 +115,50 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
             "active_request_count (%d) > max_request_count (%d)."
             % (active_request_count, max_request_count),
         )
+
+
+class ContextErrorFactory:
+    """Factory class for serializing/deserializing context errors."""
+
+    @classmethod
+    def serialize(cls, error: ContextOverflowError) -> dict:
+        """Serialize error.
+
+        Args:
+            error (ContextOverflowError): Error.
+
+        Returns:
+            (dict) Serialized error data.
+        """
+        assert isinstance(error, ContextOverflowError)
+        return {
+            "type": type(error).__name__,
+            "request_id": error.request_id,
+            "message": error.message,
+            "is_transient": error.is_transient,
+        }
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> ContextOverflowError:
+        """Deserialize error.
+
+        Args:
+            obj (dict): Serialized error data.
+
+        Returns:
+            (ContextOverflowError) Deserialized error.
+        """
+        error_cls = {
+            "ContextOverflowError": ContextOverflowError,
+            "RequestOverflowError": RequestOverflowError,
+            "TokenOverflowError": TokenOverflowError,
+            "MaxSequenceLengthOverflowError": MaxSequenceLengthOverflowError,
+            "BlockOverflowError": BlockOverflowError,
+            "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
+        }[obj["type"]]
+        error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
+        error.__class__ = error_cls  # todo (@lmcafe): better/safer alternative?
+        return error
 
 
 class WarmupEngineMode(Enum):
@@ -286,7 +338,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         if max_tokens_override is not None:
-            self.max_tokens = max_tokens_override # self.round_up_tokens(max_tokens_override, tp_size=tp_size)
+            self.max_tokens = (
+                max_tokens_override  # self.round_up_tokens(max_tokens_override, tp_size=tp_size)
+            )
 
         self.max_requests = min(self.max_requests, self.max_tokens)  # e.g., decode only.
 
@@ -299,16 +353,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_attention_qo_heads_per_partition = core_divide(num_attention_qo_heads, tp_size)
         self.num_attention_kv_heads_per_partition = num_attention_kv_heads_per_partition
         self.hidden_size_per_attention_head = hidden_size_per_attention_head
+
+        # Unified memory.
         self.unified_memory_level = unified_memory_level
         if unified_memory_level > 0:
-            if not has_unified_memory and torch.distributed.get_rank() == 0:
-                warnings.warn(
-                    "Unified memory requested but not available; defaulting to GPU memory."
-                )
-                self.unified_memory_level = 0
-            else:
+            try:
                 self.unified_memory_mempool = create_unified_mempool()
+            except UnifiedMemoryUnsupportedError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Unified memory requested but not available; defaulting to GPU memory."
+                    )
+                self.unified_memory_level = 0
 
+        # Request and token counts.
         self.total_request_count = 0
         self.active_token_count = 0
         self.paused_request_count = 0
@@ -350,12 +408,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Determine layout based on backend
         if cache_mla_latent:
             layout = None  # MLA uses single canonical layout
-        elif attention_backend in [AttnBackend.flashinfer_fa2,
-                                   AttnBackend.flashinfer_fa3,
-                                   AttnBackend.flashinfer_trt]:
-            layout = KVCacheLayout.M_N2HCD  
+        elif attention_backend in [
+            AttnBackend.flashinfer_fa2,
+            AttnBackend.flashinfer_fa3,
+            AttnBackend.flashinfer_trt,
+        ]:
+            layout = KVCacheLayout.M_N2HCD
         else:  # Flash backend
-            layout = KVCacheLayout.M_2NCHD 
+            layout = KVCacheLayout.M_2NCHD
 
         ctx_manager = (
             torch.cuda.use_mem_pool(self.unified_memory_mempool)
@@ -394,7 +454,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             dtype=torch.int,
             device=torch.cuda.current_device(),
         )
-        
+
         # Attention metadata initialization (tensors are now handled by MHAMetadata classes)
 
         self.num_prefill_requests = 0
@@ -433,9 +493,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_size_tokens=self.block_size_tokens,
                 max_seqlen=self.max_sequence_length,
             )
-        elif attention_backend in [AttnBackend.flashinfer_fa2,
-                                   AttnBackend.flashinfer_fa3,
-                                   AttnBackend.flashinfer_trt]:
+        elif attention_backend in [
+            AttnBackend.flashinfer_fa2,
+            AttnBackend.flashinfer_fa3,
+            AttnBackend.flashinfer_trt,
+        ]:
             # Create FlashInfer metadata for both graph and non-graph modes
             self.graph_attn_metadata["mha_metadata"] = GraphMHAFlashInferMetadata(
                 block_count_total=block_count_total,
@@ -445,7 +507,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_seqlen=self.max_sequence_length,
                 backend=attention_backend,
                 prefill_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
-                decode_workspace_size=1 * 1024 * 1024 * 1024,   # 1GB
+                decode_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
             )
 
             self.non_graph_attn_metadata["mha_metadata"] = NonGraphMHAFlashInferMetadata(
@@ -456,12 +518,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_seqlen=self.max_sequence_length,
                 backend=attention_backend,
                 prefill_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
-                decode_workspace_size=1 * 1024 * 1024 * 1024,   # 1GB
+                decode_workspace_size=1 * 1024 * 1024 * 1024,  # 1GB
             )
 
             # Set model parameters for FlashInfer planning
-            for metadata in [self.graph_attn_metadata["mha_metadata"],
-                             self.non_graph_attn_metadata["mha_metadata"]]:
+            for metadata in [
+                self.graph_attn_metadata["mha_metadata"],
+                self.non_graph_attn_metadata["mha_metadata"],
+            ]:
                 metadata.set_model_params(
                     num_qo_heads=self.num_attention_qo_heads_per_partition,
                     num_kv_heads=self.num_attention_kv_heads_per_partition,
@@ -500,7 +564,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             cuda_graph_max_tokens,
             cuda_graph_max_prefill_requests,
             block_count_total - self.gtd_block_count,
-            use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps,
+            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
         )
 
         self._using_cuda_graph_this_step = False
@@ -595,7 +659,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_cuda_graphs is None:
             self.cudagraph_config_list = []
         elif (
-            not cuda_graph_max_prefill_requests or cuda_graph_max_prefill_requests <= 0 or not use_cuda_graphs_for_non_decode_steps
+            not cuda_graph_max_prefill_requests
+            or cuda_graph_max_prefill_requests <= 0
+            or not use_cuda_graphs_for_non_decode_steps
         ):  # decode only
             for size in self.cuda_graph_token_counts:
                 self.cudagraph_config_list.append(CUDAGraphConfig(size, 0, size))
@@ -644,7 +710,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.cudagraph_config_list = filtered_cudagraph_config_list
 
-
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
         """Round up to nearest multiple of `TOKEN_ROUNDER` (above) that is also divisible by tensor model parallel size."""
@@ -665,6 +730,40 @@ class DynamicInferenceContext(BaseInferenceContext):
         token_rounder = math.ceil(cls.TOKEN_ROUNDER / tp_size) * tp_size
 
         return token_rounder * int(math.ceil(int(value) / token_rounder))
+
+    @classmethod
+    def from_config(
+        cls,
+        inference_config: InferenceWrapperConfig,
+        model,
+        max_batch_size: int,
+        buffer_size_gb: float = 40,
+        num_cuda_graphs: int = None,
+    ):
+        """
+        Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
+        """
+        # TODO: Add other necessary configs from inference_config
+
+        buffer_guaranteed_fraction = 0.1
+        model_config = model.config
+        max_sequence_length = (
+            inference_config.inference_max_seq_length or model_config.max_sequence_length
+        )
+        max_sequence_length = max(max_sequence_length, max_batch_size)
+        return cls(
+            params_dtype=inference_config.params_dtype,
+            num_layers=model_config.num_layers,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            max_sequence_length=inference_config.inference_max_seq_length,
+            buffer_size_gb=buffer_size_gb,
+            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            materialize_only_last_token_logits=False,
+            max_requests_override=max_batch_size,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
+        )
 
     @classmethod
     def round_up_requests(cls, value, tp_size=None):
@@ -706,7 +805,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return if this iteration we run decode only implementation.
         """
         return self.num_prefill_requests == 0
-
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -760,9 +858,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         cache = self.memory_buffer[layer_number - 1]
 
         # Use Triton kernel for M_2NCHD and S_NCHD layouts only
-        if (triton_append_key_value_cache is not None
+        if (
+            triton_append_key_value_cache is not None
             and not self.cache_mla_latent
-            and cache.supports_triton()):
+            and cache.supports_triton()
+        ):
             return triton_append_key_value_cache(
                 key=key,
                 value=value,
@@ -935,7 +1035,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             attn_metadata.reset()
         self.active_attn_metadata = None
 
-
     def add_dummy_requests_for_cudagraph_capture(self, graph_config: CUDAGraphConfig) -> None:
         """
         Adds dummy requests to reflect the number of prefill and decode requests in the graph config.
@@ -947,9 +1046,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.add_request(
                 DynamicInferenceRequest(
                     request_id=i,
-                    prompt_tokens=torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device()),
+                    prompt_tokens=torch.zeros(
+                        1, dtype=torch.long, device=torch.cuda.current_device()
+                    ),
                     sampling_params=SamplingParams(num_tokens_to_generate=1),
-                ),
+                )
             )
         if graph_config.prefill_req_count == 0:
             self.num_prefill_requests = 0
@@ -970,27 +1071,31 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.add_request(
                 DynamicInferenceRequest(
                     request_id=i + graph_config.decode_req_count,
-                    prompt_tokens=torch.zeros(prefill_token_counts[i], dtype=torch.long, device=torch.cuda.current_device()),
+                    prompt_tokens=torch.zeros(
+                        prefill_token_counts[i],
+                        dtype=torch.long,
+                        device=torch.cuda.current_device(),
+                    ),
                     sampling_params=SamplingParams(num_tokens_to_generate=1),
-                ),
+                )
             )
         self.num_prefill_requests = graph_config.prefill_req_count
 
     def graph_matching(self, real_config: CUDAGraphConfig) -> Optional[CUDAGraphConfig]:
-            """
-            Matches the best graph for the given token count, prefill request count, and decode request count.
-            """
-            # first filter out graphs with smaller token count, prefill req count, or decode req count, as they are not valid
-            graph_configs_valid = [
-                graph_config
-                for graph_config in self.cudagraph_config_list
-                if graph_config.valid(real_config)
-            ]
-            if len(graph_configs_valid) == 0:
-                return None
-            # then find the best graph
-            best_graph = min(graph_configs_valid)
-            return best_graph
+        """
+        Matches the best graph for the given token count, prefill request count, and decode request count.
+        """
+        # first filter out graphs with smaller token count, prefill req count, or decode req count, as they are not valid
+        graph_configs_valid = [
+            graph_config
+            for graph_config in self.cudagraph_config_list
+            if graph_config.valid(real_config)
+        ]
+        if len(graph_configs_valid) == 0:
+            return None
+        # then find the best graph
+        best_graph = min(graph_configs_valid)
+        return best_graph
 
     @property
     def num_decode_requests(self) -> int:
@@ -1000,18 +1105,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
     def initialize_attention_state(
-        self,
-        *,
-        construct_graph_config: Optional[CUDAGraphConfig] = None,
+        self, *, construct_graph_config: Optional[CUDAGraphConfig] = None
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
         Args:
-            construct_graph_config (Optional[CUDAGraphConfig]): The graph config to use for constructing the cuda graphs.
-        Return:
-            None.
+            construct_graph_config (Optional[CUDAGraphConfig]): The graph config to use
+                for constructing the cuda graphs.
         """
-         # if in recording mode, add dummy requests for cuda graph capture
+        # if in recording mode, add dummy requests for cuda graph capture
         if construct_graph_config is not None:
             self.reset()
             if (
@@ -1049,9 +1151,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.padded_config.decode_req_count = self.padded_config.token_count
                 self.padded_config.prefill_req_count = 0
             else:
-                target_padding_req_count = self.round_up_requests(self.total_request_count - self.paused_request_count)
+                target_padding_req_count = self.round_up_requests(
+                    self.total_request_count - self.paused_request_count
+                )
                 self.padded_config.decode_req_count = self.num_decode_requests
-                self.padded_config.prefill_req_count = target_padding_req_count - self.padded_config.decode_req_count
+                self.padded_config.prefill_req_count = (
+                    target_padding_req_count - self.padded_config.decode_req_count
+                )
             self.padded_active_token_count = self.padded_config.token_count
             self.padded_active_request_count = self.padded_config.req_count
 
@@ -1080,15 +1186,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_config = real_config
         if real_config.decode_req_count > self.padded_config.decode_req_count:
-            attn_config.prefill_req_count = attn_config.req_count - self.padded_config.decode_req_count
+            attn_config.prefill_req_count = (
+                attn_config.req_count - self.padded_config.decode_req_count
+            )
             attn_config.decode_req_count = self.padded_config.decode_req_count
-            
+
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
             request_kv_length_offsets=request_kv_length_offsets_view,
             request_to_kv_block_ids=request_to_kv_block_ids_view,
-            real_config = attn_config,
-            padded_config = self.padded_config,
+            real_config=attn_config,
+            padded_config=self.padded_config,
         )
         # All attention metadata calculations are now handled by MHAMetadata.update()
 
@@ -1173,7 +1281,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # todo: @lmcafee, remove these asserts?
-        assert logits.size(0) == 1
+        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
         assert logits.size(1) == self.padded_active_token_count, (
             f"logits.size(1) ({tuple(logits.shape)}) != "
             f"padded_active_token_count ({self.padded_active_token_count})."
@@ -1290,7 +1398,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset[current_id] = (
             chunk_length + req.finished_chunk_token_count - 1
         ) % self.block_size_tokens
-        
+
         token_offset_range = torch.arange(
             req.finished_chunk_token_count,
             req.finished_chunk_token_count + chunk_length,
