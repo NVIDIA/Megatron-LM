@@ -78,6 +78,13 @@ except ImportError:
     Fp8Padding = None
     Fp8Unpadding = None
 
+try:
+    from transformer_engine.pytorch.tensor.utils import (
+        post_all_gather_processing as te_post_all_gather_processing,
+    )
+except ImportError:
+    te_post_all_gather_processing = None
+
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor.
@@ -172,7 +179,15 @@ if HAVE_TE and is_te_min_version("2.2"):
                 raise NotImplementedError(
                     f"FSDP with --fp8-param-gather is not supported in TE v{get_te_version()}"
                 )
-        cast_master_weights_to_fp8(*args)
+
+        # For newer TE versions (i.e., have post_all_gather_processing function), we keep the
+        # columnwise data and manually call post_all_gather_processing after all-gather, this
+        # makes fp8 params compatible with CUDA graph.
+        kwargs = {}
+        if te_post_all_gather_processing is not None:
+            kwargs["keep_columnwise"] = True
+
+        cast_master_weights_to_fp8(*args, **kwargs)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
         pass
@@ -412,11 +427,11 @@ def post_all_gather_processing(model_params):
     - tensorwise: may need to create a transposed view to match backend GEMM.
     - blockwise: create column-wise storage.
     """
-    try:
-        from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
-
-        post_all_gather_processing(model_params)
-    except ImportError:
+    if te_post_all_gather_processing is not None:
+        te_post_all_gather_processing(model_params)
+    else:
+        # If the TE version is old and does not have post_all_gather_processing function, this is
+        # a no-op, and the transpose/columnwise data will be created in the next forward pass.
         pass
 
 
