@@ -243,7 +243,7 @@ def _get_pg_collection_with_embedding_groups(grid):
 )
 @pytest.mark.parametrize(
     "encoder_tp,encoder_pp,encoder_dp,llm_tp,llm_pp,llm_dp,llm_grid_offset",
-    [(2, 2, 1, 2, 2, 1, 4), (4, 1, 1, 2, 2, 1, 4), (2, 1, 1, 1, 6, 1, 2), (2, 2, 1, 1, 4, 1, 4)],
+    [(2, 2, 1, 2, 2, 1, 4), (4, 1, 1, 2, 2, 1, 4), (2, 1, 1, 1, 6, 1, 2), (2, 2, 1, 1, 4, 1, 4), (2, 1, 2, 1, 1, 4, 4),(2, 1, 2, 2, 2, 1, 4)],
 )
 def test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
     encoder_tp, encoder_pp, encoder_dp, llm_tp, llm_pp, llm_dp, llm_grid_offset
@@ -355,5 +355,5 @@ if __name__ == "__main__":
 
     # Use the same parameters as defined in the pytest.mark.parametrize decorator
     test_forward_backward_pipelining_without_interleaving_multi_module_single_encoder(
-        encoder_tp=2, encoder_pp=2, encoder_dp=1, llm_tp=2, llm_pp=2, llm_dp=1, llm_grid_offset=4
+        encoder_tp=2, encoder_pp=1, encoder_dp=2, llm_tp=1, llm_pp=1, llm_dp=4, llm_grid_offset=4
     )

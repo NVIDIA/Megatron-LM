@@ -494,7 +494,7 @@ class BridgeCommunicator:
                 received_gradients_list.append(grad_tensor)
 
             # Concatenate received gradients
-            aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+            aggregated_gradient = torch.cat(received_gradients_list, dim=self.dim_mapping['b'])
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
                 f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
@@ -615,7 +615,7 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received gradients
-                aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+                aggregated_gradient = torch.cat(received_gradients_list, dim=self.dim_mapping['b'])
                 logging.debug(
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
@@ -737,7 +737,7 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received activations
-                aggregated_activation = torch.cat(received_activations_list, dim=0)
+                aggregated_activation = torch.cat(received_activations_list, dim=self.dim_mapping['b'])
                 logging.debug(
                     f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
                     f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
