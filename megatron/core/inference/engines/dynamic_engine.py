@@ -176,15 +176,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
-        self.suspend_signal = False # suspend signal
-        self.is_suspended = False # suspend state
+        self.suspend_signal = False  # suspend signal
+        self.is_suspended = False  # suspend state
         self.resume_request_ids = None
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
         self._loop = get_asyncio_loop(self._loop)
         self._cond = asyncio.Condition()
-
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -455,11 +454,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
             process = psutil.Process()
             mem_info = process.memory_info()
-            total_mem_str = ", ".join((
-                f"cpu: {mem_info.rss / 1024**3:.1f} gb",
-                f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
-                f"res {end_mem_res / 1024**3:.1f} gb",
-            ))
+            total_mem_str = ", ".join(
+                (
+                    f"cpu: {mem_info.rss / 1024**3:.1f} gb",
+                    f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
+                    f"res {end_mem_res / 1024**3:.1f} gb",
+                )
+            )
             logging.info(
                 f"[rank {rank_str}] dynamic engine {key}, "
                 f"unified {unified_memory_level}, "
@@ -541,16 +542,19 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).
-        logging.info("    > " + ", ".join((
-            f"inner timing: alloc {alloc_time:.3f}",
-            f"add {add_time:.3f}",
-            f"capture {capture_time:.3f}.",
-        )))
+        logging.info(
+            "    > "
+            + ", ".join(
+                (
+                    f"inner timing: alloc {alloc_time:.3f}",
+                    f"add {add_time:.3f}",
+                    f"capture {capture_time:.3f}.",
+                )
+            )
+        )
 
         # Notify event loop.
-        self._loop.call_soon_threadsafe(
-            asyncio.create_task, self._notify_cond_for_new_request()
-        )
+        self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
@@ -811,8 +815,7 @@ class DynamicInferenceEngine(AbstractEngine):
         ].tolist()
         if self.static_sampling:
             return [
-                (next(iter(self.request_records.values()))[-1].sampling_params,
-                 active_request_ids),
+                (next(iter(self.request_records.values()))[-1].sampling_params, active_request_ids)
             ]
 
         # Get a map from request_id to context array index.
@@ -1047,8 +1050,8 @@ class DynamicInferenceEngine(AbstractEngine):
         result = self._loop.run_until_complete(
             self.async_step(sampling_params=sampling_params, verbose=verbose)
         )
-        active_requests = [ self.get_request(i) for i in result["active_request_ids"] ]
-        finished_requests = [ r.merge() for r in result["finished_request_records"] ]
+        active_requests = [self.get_request(i) for i in result["active_request_ids"]]
+        finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]
 
     # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
@@ -1185,11 +1188,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     await self._cond.wait_for(
                         lambda: (
                             not self.is_suspended
-                            and
-                            (
+                            and (
                                 self.context.get_active_request_count() > 0
-                                or
-                                self.waiting_request_ids
+                                or self.waiting_request_ids
                             )
                         )
                     )

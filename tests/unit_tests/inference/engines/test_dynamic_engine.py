@@ -129,10 +129,7 @@ class DynamicEngineTestEnv:
 class TestDynamicInferenceEngine:
 
     @classmethod
-    def _build_requests(
-        cls,
-        test_config: DynamicEngineTestConfig,
-    ) -> List[DynamicInferenceRequest]:
+    def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
 
         requests = []
         for request_id in range(test_config.num_requests):
@@ -457,9 +454,9 @@ class TestDynamicInferenceEngine:
 
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_requests == 32
-        assert env.engine.context.max_tokens == 256, (
-            f"expected 256; found {env.engine.context.max_tokens}."
-        )
+        assert (
+            env.engine.context.max_tokens == 256
+        ), f"expected 256; found {env.engine.context.max_tokens}."
 
         # Validate generated tokens.
         expected_generated_tokens_list = [
@@ -906,10 +903,7 @@ class TestDynamicInferenceEngine:
         for suspend_resume_interval in None, 4, 2, 1:
 
             # Run test.
-            env = self._run_test(
-                suspend_resume_interval=suspend_resume_interval,
-                num_gap_steps=1,
-            )
+            env = self._run_test(suspend_resume_interval=suspend_resume_interval, num_gap_steps=1)
 
             # Record memory usage.
             mem_usages[suspend_resume_interval] = env.mem_usage

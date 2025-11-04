@@ -13,6 +13,7 @@ import torch
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 
+
 def serialize_tensor(tensor):
     """Serialize tensor to bytes."""
     buffer = io.BytesIO()
@@ -357,13 +358,15 @@ class DynamicInferenceRequestRecord:
         new_prompt_str = tokenizer.detokenize(new_prompt_tokens.tolist())
 
         # New sampling params.
-        new_sampling_params = SamplingParams(**{
-            **asdict(old_request.sampling_params),
-            "num_tokens_to_generate" : (
-                old_request.sampling_params.num_tokens_to_generate
-                - len(old_request.generated_tokens)
-            ),
-        })
+        new_sampling_params = SamplingParams(
+            **{
+                **asdict(old_request.sampling_params),
+                "num_tokens_to_generate": (
+                    old_request.sampling_params.num_tokens_to_generate
+                    - len(old_request.generated_tokens)
+                ),
+            }
+        )
 
         # New request.
         new_request = DynamicInferenceRequest(
@@ -388,7 +391,7 @@ class DynamicInferenceRequestRecord:
             if getattr(self.requests[0], key) is None:
                 return None
             else:
-                return [ v for r in self.requests for v in getattr(r, key) ]
+                return [v for r in self.requests for v in getattr(r, key)]
 
         prompt_tokens = self.requests[0].prompt_tokens
         generated_tokens = merge_lists("generated_tokens")
@@ -398,12 +401,13 @@ class DynamicInferenceRequestRecord:
             request_id=self.requests[0].request_id,
             prompt=tokenizer.detokenize(prompt_tokens.tolist()),
             prompt_tokens=prompt_tokens,
-            prompt_log_probs=merge_lists("prompt_log_probs"),
-            prompt_top_n_logprobs=merge_lists("prompt_top_n_logprobs"),
+            prompt_log_probs=self.requests[0].prompt_log_probs,
+            prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=tokenizer.detokenize(generated_tokens),
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),
+            generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
