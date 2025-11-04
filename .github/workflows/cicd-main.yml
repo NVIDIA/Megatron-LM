@@ -232,6 +232,12 @@ jobs:
         with:
           python-version: 3.12
 
+      - name: Install GH CLI
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y gh
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/')
@@ -416,6 +422,12 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
+      - name: Install GH CLI
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y gh
+
       - name: Has Run tests label
         id: has-run-tests-label
         env:
@@ -524,6 +536,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install GH CLI
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y gh
 
       - name: Get workflow result
         id: result
