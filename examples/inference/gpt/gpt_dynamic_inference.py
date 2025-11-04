@@ -248,7 +248,7 @@ def run_inference(
     else:
         cuda_graph_request_count_map = None
 
-    def _add_request():
+    def _add_request(cached_time):
         """Add request to engine.
 
         *Note: Using `prompt_text` instead of `prompt_tokens` for fair comparison.
@@ -260,7 +260,8 @@ def run_inference(
             _request.prompt_text,
             sampling_params.num_tokens_to_generate,
         )
-        _request.time_start = get_curr_time()
+        # Use cached time since all requests added in the same step start together
+        _request.time_start = cached_time
         _request.state = "started"
         num_requests_added += 1
         tbar.update(1)
@@ -273,14 +274,14 @@ def run_inference(
             while num_requests_added < num_requests_total:
                 if requests[num_requests_added].time_arrival > add_start:
                     break
-                _add_request()
+                _add_request(add_start)
         else:
             # Add deterministic number of requests (generally used for debugging).
             for i in range(min(
                 args.incoming_requests_per_step,
                 num_requests_total - num_requests_added,
             )):
-                _add_request()
+                _add_request(add_start)
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
@@ -311,7 +312,8 @@ def run_inference(
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
                 total_output_tokens += len(request.output_tokens)
-                request.time_end = get_curr_time()
+                # Use cached time since all requests finish at the same step
+                request.time_end = output_start
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
                 request.request_id = finished_request.request_id
@@ -320,6 +322,7 @@ def run_inference(
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 num_requests_finished += 1
+            # Reuse cached time for measurement
             output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.

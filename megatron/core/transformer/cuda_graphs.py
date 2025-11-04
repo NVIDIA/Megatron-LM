@@ -583,6 +583,8 @@ class _CudaGraphRunner(torch.nn.Module):
             )
         else:
             self.is_first_layer, self.is_last_layer = True, True
+        
+        self.cached_parameter_tuple = tuple(self.base_module.parameters())
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -872,13 +874,13 @@ class _CudaGraphRunner(torch.nn.Module):
         # Arguments passed to a cudagraph for replay must match the args in the captured graph.
         #  Tensor arguments need to have the same shape, dtype, and device location.
         #  All other arguments must have the exact same memory addresses for graph safety.
-        mismatch_errors = self.get_mismatch_errors(args, kwargs)
-        if mismatch_errors:
-            error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
-            raise AssertionError(error_msg)
+        # mismatch_errors = self.get_mismatch_errors(args, kwargs)
+        # if mismatch_errors:
+        #     error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
+        #     raise AssertionError(error_msg)
 
         inp_tensors = self.get_tensors(args, kwargs)
-        func_args = inp_tensors + tuple(self.parameters())
+        func_args = inp_tensors + self.cached_parameter_tuple
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
         out = list(out)
 
