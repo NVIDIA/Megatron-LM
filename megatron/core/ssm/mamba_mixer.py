@@ -268,60 +268,66 @@ class MambaMixer(MegatronModule):
             )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
-        with get_cuda_rng_tracker().fork():
-            # weight shape: [conv_dim, 1, d_conv]
-            # bias shape: [conv_dim]
-            self.conv1d = nn.Conv1d(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                bias=conv_bias,
-                kernel_size=d_conv,
-                groups=conv_dim,
-                padding=d_conv - 1,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
-            setattr(self.conv1d.weight, "tensor_model_parallel", True)
-            setattr(self.conv1d.bias, "tensor_model_parallel", True)
+        # weight shape: [conv_dim, 1, d_conv]
+        # bias shape: [conv_dim]
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=conv_dim,
+            padding=d_conv - 1,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
+        setattr(self.conv1d.weight, "tensor_model_parallel", True)
+        setattr(self.conv1d.bias, "tensor_model_parallel", True)
 
-            if self.conv_init is not None:
+        if self.config.perform_initialization and self.conv_init is not None:
+            with get_cuda_rng_tracker().fork():
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        with get_cuda_rng_tracker().fork():
-            # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
-            dt = torch.exp(
-                torch.rand(
-                    self.nheads_local_tp,
-                    device=torch.cuda.current_device(),
-                    dtype=config.params_dtype,
-                )
-                * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            ).clamp(min=dt_init_floor)
-            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-            inv_dt = dt + torch.log(-torch.expm1(-dt))
-            self.dt_bias = nn.Parameter(inv_dt)
-            # Our initialization would set all Linear.bias to zero,
-            # need to mark this one as _no_reinit
-            self.dt_bias._no_reinit = True
-            # Just to be explicit. Without this we already don't
-            # put wd on dt_bias because of the check
-            # name.endswith("bias") in param_grouping.py
-            self.dt_bias._no_weight_decay = True
-            setattr(self.dt_bias, "tensor_model_parallel", True)
+        if self.config.perform_initialization:
+            with get_cuda_rng_tracker().fork():
+                # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+                dt = torch.exp(
+                    torch.rand(
+                        self.nheads_local_tp,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                    * (math.log(dt_max) - math.log(dt_min))
+                    + math.log(dt_min)
+                ).clamp(min=dt_init_floor)
+                # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+                inv_dt = dt + torch.log(-torch.expm1(-dt))
+        else:
+            inv_dt = torch.empty(self.nheads_local_tp)
 
-            # A parameter
-            assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-            A = torch.empty(
-                self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-            ).uniform_(*A_init_range)
-            A_log = torch.log(A)  # Keep A_log in fp32
-            self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
-            setattr(self.A_log, "tensor_model_parallel", True)
+        self.dt_bias = nn.Parameter(inv_dt)
+        # Our initialization would set all Linear.bias to zero,
+        # need to mark this one as _no_reinit
+        self.dt_bias._no_reinit = True
+        # Just to be explicit. Without this we already don't
+        # put wd on dt_bias because of the check
+        # name.endswith("bias") in param_grouping.py
+        self.dt_bias._no_weight_decay = True
+        setattr(self.dt_bias, "tensor_model_parallel", True)
+
+        # A parameter
+        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+        A = torch.empty(
+            self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
+        )
+        if self.config.perform_initialization:
+            A = A.uniform_(*A_init_range)
+        A_log = torch.log(A)  # Keep A_log in fp32
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+        setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
         self.D = nn.Parameter(
