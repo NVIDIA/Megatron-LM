@@ -168,7 +168,7 @@ class TestDynamicContext:
             num_attention_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
-            active_buffer_size_gb=0.1,
+            active_buffer_size_gb=0.015,
             block_size_tokens=128,
             max_tokens=20,  # Setting a very low token limit
         )
@@ -888,9 +888,9 @@ class TestDynamicContext:
                 contexts.append(
                     DynamicInferenceContext(
                         params_dtype=torch.float32,
-                        num_layers=4,
-                        kv_channels=8,
-                        num_attention_heads=2,
+                        num_layers=64,
+                        kv_channels=16,
+                        num_attention_heads=4,
                         max_sequence_length=512,
                         active_buffer_size_gb=active_buffer_size_gb,
                         unified_memory_level=unified_memory_level,
