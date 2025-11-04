@@ -12,11 +12,12 @@ from torch.utils.data import Dataset
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
 
+from megatron.training import get_args
+from megatron.training.dist_signal_handler import DistributedSignalHandler
+
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
-    from megatron.training import get_args
-    from megatron.training.dist_signal_handler import DistributedSignalHandler
 
     if dataset is None:
         return None
@@ -167,10 +168,9 @@ class RandomSeedDataset(Dataset):
         __getitem__(idx): Sets the seed based on the sample index and current epoch.
     """
 
-    def __init__(self, dataset):
-        args = get_args()
-        self.base_seed = args.seed
-        self.curr_seed = args.seed
+    def __init__(self, dataset, seed):
+        self.base_seed = seed
+        self.curr_seed = seed
         self.dataset = dataset
 
     def __len__(self):

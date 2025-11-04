@@ -236,7 +236,7 @@ def build_train_valid_datasets(data_path, image_size=224):
         classes_fraction=args.classes_fraction,
         data_per_class_fraction=args.data_per_class_fraction
     )
-    train_data = RandomSeedDataset(train_data)
+    train_data = RandomSeedDataset(train_data, args.seed)
 
     # validation dataset
     val_data_path = data_path[1]
@@ -244,6 +244,6 @@ def build_train_valid_datasets(data_path, image_size=224):
         root=val_data_path,
         transform=val_transform
     )
-    val_data = RandomSeedDataset(val_data)
+    val_data = RandomSeedDataset(val_data, args.seed)
 
     return train_data, val_data
