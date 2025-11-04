@@ -298,23 +298,6 @@ def run_inference(
         # After step, we lost track of last iteration's is_decode_only, so we need to get it from the engine
         is_decode_only = engine.is_decode_only 
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # # Test suspending and resuming engine.
-        # if (
-        #     args.suspend_resume_interval is not None
-        #     and
-        #     engine.step_count % args.suspend_resume_interval == 0
-        # ):
-        #     active_token_count_0 = engine.context.active_token_count
-        #     engine.suspend()
-        #     engine.resume()
-        #     active_token_count_1 = engine.context.active_token_count
-        #     print("**** step %d, suspend + resume [ active tokens %d -> %d ]." % (
-        #         engine.step_count,
-        #         active_token_count_0,
-        #         active_token_count_1,
-        #     ))
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # Test suspending and resuming engine.
         if args.suspend_resume_interval is not None:
 
@@ -331,7 +314,6 @@ def run_inference(
             ):
                 print("**** step %d/%d ... resume." % (engine.step_count, attempted_step_count))
                 engine.resume()
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # If engine suspended, continue to next iter.
         if isinstance(result, EngineSuspendedError):

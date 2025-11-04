@@ -7,7 +7,7 @@ from multiprocessing import Event
 
 import torch
 
-from megatron.core.inference.headers import Headers
+from megatron.core.inference.headers import Headers, UnknownHeaderError
 
 try:
     import zmq
@@ -186,7 +186,13 @@ class DataParallelInferenceCoordinator:
                         ),
                     ]
                 )
-            elif header in [Headers.PAUSE, Headers.UNPAUSE, Headers.STOP]:
+            elif header in [
+                Headers.PAUSE,
+                Headers.UNPAUSE,
+                Headers.SUSPEND,
+                Headers.RESUME,
+                Headers.STOP,
+            ]:
                 # control signals for the engine
                 # broadcast to all data parallel ranks
                 if sender_identity not in known_clients:
@@ -215,6 +221,9 @@ class DataParallelInferenceCoordinator:
                             ),
                         ]
                     )
+
+            else:
+                raise UnknownHeaderError(header)
 
     @classmethod
     def entrypoint(

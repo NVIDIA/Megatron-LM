@@ -101,9 +101,9 @@ async def main(
 
                 # Test suspend/resume.
                 if num_requests_added in suspend_idxs:
-                    client.pause_engines()
+                    client.suspend_engines()
                 if num_requests_added in resume_idxs:
-                    client.unpause_engines()
+                    client.resume_engines()
 
             if num_requests_added == num_requests_total:
                 break

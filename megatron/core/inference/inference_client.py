@@ -174,6 +174,16 @@ class InferenceClient:
         """Sends a signal to unpause all inference engines."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
+    def suspend_engines(self):
+        """Sends a signal to pause all inference engines."""
+        self._send_signal_to_engines(Headers.PAUSE)
+        self._send_signal_to_engines(Headers.SUSPEND)
+
+    def resume_engines(self):
+        """Sends a signal to unpause all inference engines."""
+        self._send_signal_to_engines(Headers.RESUME)
+        self._send_signal_to_engines(Headers.UNPAUSE)
+
     def stop_engines(self):
         """Sends a signal to gracefully stop all inference engines."""
         self._send_signal_to_engines(Headers.STOP)

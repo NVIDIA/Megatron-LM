@@ -30,7 +30,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.headers import Headers
+from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -130,7 +130,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.static_sampling = static_sampling
         self.unified_memory_level = context.unified_memory_level
         self.capture_stats = None
-        self.is_suspended = False
         self._loop = None
 
         # Deprecate `enable_cuda_graph`.
@@ -184,6 +183,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
+        self.suspend_signal = False # suspend signal
+        self.is_suspended = False # suspend state
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -564,6 +565,11 @@ class DynamicInferenceEngine(AbstractEngine):
             f"add {add_time:.3f}",
             f"capture {capture_time:.3f}.",
         )))
+
+        # Notify event loop.
+        self._loop.call_soon_threadsafe(
+            asyncio.create_task, self._notify_cond_for_new_request()
+        )
 
         return futures
 
@@ -1079,7 +1085,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Once all ranks have the same batch of messages, they are unpacked and
         processed. New requests are added to the engine's queue, and control
-        signals (PAUSE, STOP, UNPAUSE) update the engine's internal state.
+        signals (PAUSE, UNPAUSE, SUSPEND, RESUME, STOP) update the engine's
+        internal state.
 
         Note:
             This function is synchronous and must be called collectively by all
@@ -1133,10 +1140,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
                 self.paused = True
-            elif header == Headers.STOP:
-                self.stopped = True
             elif header == Headers.UNPAUSE:
                 self.paused = False
+            elif header == Headers.SUSPEND:
+                self.suspend_signal = True
+            elif header == Headers.RESUME:
+                self.suspend_signal = False
+            elif header == Headers.STOP:
+                self.stopped = True
+            else:
+                raise UnknownHeaderError(header)
 
         return len(all_messages)
 
@@ -1163,8 +1176,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Wait until there are active requests before proceeding.
                 async with self._cond:
                     await self._cond.wait_for(
-                        lambda: self.context.get_active_request_count() > 0
-                        or self.waiting_request_ids
+                        lambda: (
+                            not self.is_suspended
+                            and
+                            (
+                                self.context.get_active_request_count() > 0
+                                or
+                                self.waiting_request_ids
+                            )
+                        )
                     )
 
                 await self.async_step(verbose=verbose)
@@ -1193,6 +1213,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
                 if self.paused:
+                    await asyncio.sleep(0.02)
+                    continue
+
+                # Suspend, resume.
+                if self.suspend_signal:
                     self.suspend()
                     await asyncio.sleep(0.02)
                     continue
@@ -1200,6 +1225,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     self.resume()
 
+                # No requests.
                 if (
                     self.context.get_active_request_count() == 0
                     and len(self.waiting_request_ids) == 0
@@ -1207,8 +1233,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
                     continue
 
+                # Step.
                 engine_output = await self.async_step(verbose=verbose)
 
+                # Send finished requests.
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
                     and parallel_state.get_pipeline_model_parallel_rank() == 0
