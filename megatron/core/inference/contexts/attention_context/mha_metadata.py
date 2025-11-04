@@ -6,6 +6,8 @@ import torch
 
 from .metadata_base import MetadataBase
 
+from megatron.core.inference.utils import CUDAGraphConfig
+
 
 class MHAMetadata(MetadataBase):
     """
@@ -40,8 +42,8 @@ class MHAMetadata(MetadataBase):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        real_config,
-        padded_config,
+        real_config: CUDAGraphConfig,
+        padded_config: CUDAGraphConfig,
     ):
         """
         Args:
@@ -98,9 +100,12 @@ class MHAMetadata(MetadataBase):
             padded_active_request_count,
             is_cumulative_tensor=True,
         )
-        self._max_seqlen_q = padded_active_token_count
-        if torch.all(self._query_lengths_buf[:padded_active_request_count] <= 1):
+        
+        if padded_config.prefill_req_count == 0:
             self._max_seqlen_q = 1
+        else:
+            self._max_seqlen_q = max(2, padded_config.token_count)
+
         self._max_seqlen_k = self.max_seqlen
 
         self.state_data = {
@@ -178,8 +183,8 @@ class NonGraphMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        real_config,
-        padded_config,
+        real_config: CUDAGraphConfig,
+        padded_config: CUDAGraphConfig,
     ):
         """
         Args:
