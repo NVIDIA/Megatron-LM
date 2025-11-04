@@ -4,7 +4,7 @@
 
 ---
 
-This guide describes how we used Megatron Core (MCore) and Transformer Engine (TE) to pre-train the DeepSeek-V3 model with MXFP8 precision on 256 GB200 GPUs. We will detail the step-by-step process of optimizing performance to **970 TFLOPS/GPU**, which is a **2.55x** speedup compared to the estimated 380 TFLOPS on H100/H800 (refer to the estimation in this article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] in Chinese). The related features have been or will be open-sourced to the [Megatron Core](https://github.com/NVIDIA/Megatron-LM) and [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) repositories.
+This guide describes how we used Megatron Core (MCore) and Transformer Engine (TE) to pre-train the DeepSeek-V3 model with MXFP8 precision on 256 GB200 GPUs. We will detail the step-by-step process of optimizing performance to **970 TFLOPS/GPU**, which is a **2.55x** speedup compared to the estimated 380 TFLOPS on H100/H800 (refer to the estimation in this article \[[1](https://zhuanlan.zhihu.com/p/16480858047)\] in Chinese). The related features have been or will be open-sourced to the [Megatron Core](https://github.com/NVIDIA/Megatron-LM) and [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) repositories. Refer to [the guide](./deepseek-v3-gb200-reproduce-guide.md) to reproduce the performance.
 
 ## **0. Methodology**
 
@@ -20,7 +20,7 @@ DeepSeek-V3 innovatively uses FP8 mixed precision for pre-training, which saves 
 
 On the Blackwell platform, thanks to the native support of the fifth-generation Tensor Core for the MXFP8 format, we adopted the MXFP8 recipe, a more fine-grained quantization scheme for training. Both activations and weights are quantized at a 1x32 granularity, and E8M0 is used as the format for the scaling factor.
 
-Here, we will briefly introduce the difference in implementation between MXFP8 GEMM on the Blackwell platform and Blockwise FP8 GEMM on the Hopper platform. On the Hopper platform, since the Tensor Core itself does not support multiplication with a scale, after the matrix multiplication of each tile, it is necessary to multiply by the scale and accumulate the result with the CUDA Core. This also determines that on the Hopper platform, 1x128 is almost the finest quantization granularity available. If a finer granularity was used for quantization, the GEMM performance would suffer a great loss. On the other hand, since the Blackwell platform natively supports MXFP8, the dequantization process in GEMM (i.e., multiplying by the scale) is completed inside the Tensor Core, so the CUDA Core is not involved throughout the process, which can achieve better performance and support finer-grained quantization (1x32).
+Here, we will briefly introduce the difference in implementation between MXFP8 GEMM on the Blackwell platform and Blockwise FP8 GEMM on the Hopper platform. On the Hopper platform, since the Tensor Core does not support multiplication with vectors of scales, the quantization granularity must be greater or equal to the GEMM tiles. This also determines that on the Hopper platform, 1x128 is almost the finest quantization granularity available. If a finer granularity was used for quantization, the GEMM performance would suffer a great loss due to small GEMM tiles. On the other hand, since the Blackwell platform natively supports MXFP8, the dequantization process in GEMM (i.e., multiplying by the scale) is completed inside the Tensor Core, so the CUDA Core is not involved throughout the process, which can achieve better performance and support finer-grained quantization (1x32).
 
 When we started optimizing DeepSeek-V3 on the GB200 NVL72 platform with MCore, our baseline already included the following features:
 
@@ -242,7 +242,8 @@ We started from a baseline of 494 TFLOPS, and through multiple rounds of perform
 
 **Complete Training Examples**
 
-* [DeepSeek-V3 Training Scripts](https://github.com/yanring/Megatron-MoE-ModelZoo) \- End-to-end training configurations and launch scripts
+* [Reproduce Guide](./deepseek-v3-gb200-reproduce-guide.md), including the Dockerfile, dependencies, cluster configuration and launch scripts.
+* [Megatron-MoE-ModelZoo](https://github.com/yanring/Megatron-MoE-ModelZoo) \- End-to-end training configurations and launch scripts for popular MoE models, including Deepseek-V3, Qwen3, etc.
 
 **Papers and Technical Reports**
 
