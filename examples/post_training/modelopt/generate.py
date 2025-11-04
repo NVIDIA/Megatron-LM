@@ -19,6 +19,8 @@ from megatron.post_training.utils import report_current_memory_info, to_empty_if
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
 
+import modelopt.torch.quantization as mtq
+
 warnings.filterwarnings('once')
 
 
@@ -127,6 +129,9 @@ if __name__ == "__main__":
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
+
+    mtq.disable_quantizer(unwrapped_model, "*mixer.conv1d.*")
+    mtq.fold_weight(unwrapped_model)
 
     for idx, example in enumerate(dataset):
         if idx > args.fraction * len(dataset):

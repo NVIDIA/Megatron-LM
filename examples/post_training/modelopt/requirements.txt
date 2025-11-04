@@ -1,3 +1,4 @@
+diskcache
 datasets
 jsonlines
 nvidia-modelopt

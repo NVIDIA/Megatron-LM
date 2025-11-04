@@ -46,6 +46,7 @@ def add_modelopt_args(parser):
         "--export-quant-cfg",
         type=str,
         default=None,
+        # TODO figure out how to support these choices for backward compatibility + new formats
         choices=[
             "int8_sq",
             "fp8",

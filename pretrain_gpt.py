@@ -23,7 +23,7 @@ from megatron.training.utils import (
     is_first_or_last_pipeline_stage,
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
-from model_provider import model_provider
+from megatron.post_training.model_provider import model_provider
 from gpt_builders import gpt_builder
 
 try:
@@ -233,7 +233,7 @@ if __name__ == "__main__":
 
     pretrain(
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
+        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},

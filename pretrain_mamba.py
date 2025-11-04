@@ -6,7 +6,7 @@ import torch
 from functools import partial
 from typing import List, Optional, Tuple
 
-from model_provider import model_provider
+from megatron.post_training.model_provider import model_provider
 from mamba_builders import mamba_builder
 
 from megatron.training import get_args
@@ -222,7 +222,7 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     pretrain(train_valid_test_datasets_provider,
-             partial(model_provider, mamba_builder),
+             model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
