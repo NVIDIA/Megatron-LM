@@ -420,34 +420,13 @@ class TestDynamicInferenceEngine:
                 f"expected ({expected_generated_tokens})."
             )
 
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    def test_overflow_factor(self) -> None:
-        """Test overflow factor arg."""
-        # Run test.
-        env = self._run_test(context_buffer_overflow_factor=0.1, context_max_tokens=None)
-
-        # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 420
-        assert env.engine.context.max_tokens == 420
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    def test_request_overflow(self) -> None:
-        """Test request overflow."""
-        self._run_test(context_max_requests_override=4)
-
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_token_overflow_transient(self) -> None:
         """Test token overflow."""
         test_config = DynamicEngineTestConfig(
-            num_requests=2, min_prompt_length=8, max_prompt_length=8, context_max_tokens=12
+            num_requests=2, min_prompt_length=512, max_prompt_length=512, context_max_tokens=900
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -515,19 +494,22 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [64]),
-            (1, [64]),
-            (2, [64, 32]),
-            (4, [64, 48, 32, 16]),
-            (8, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (16, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (64, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (64, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (1024, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
-                DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
+                DynamicEngineTestConfig(
+                    context_active_buffer_size_gb=0.01,
+                    num_cuda_graphs=num_cuda_graphs,
+                )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
             assert (
@@ -573,7 +555,11 @@ class TestDynamicInferenceEngine:
 
         # Initialize context.
         env = self._build_test_env(
-            DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8, num_tokens_to_generate=1)
+            DynamicEngineTestConfig(
+                context_active_buffer_size_gb=0.0041,
+                num_cuda_graphs=8,
+                num_tokens_to_generate=1,
+            )
         )
 
         context = env.engine.context
