@@ -257,7 +257,7 @@ def get_megatron_muon_optimizer(
         decoupled_lr=config.decoupled_lr,
         decoupled_min_lr=config.decoupled_min_lr,
     )
-    print(f"aaaa{config.muon_fp32_matmul_prec}")
+
     optimizer = TensorParallelMuon(
         linear_param_groups,
         lr=config.lr,
