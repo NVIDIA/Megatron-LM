@@ -562,7 +562,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
-        success = self.step_with_ready_grads()
+        if self.config.grad_norm_threshold_to_skip and grad_norm > self.config.grad_norm_threshold_to_skip:
+            success = False
+        else:
+            success = self.step_with_ready_grads()
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
@@ -932,7 +935,10 @@ class FP32Optimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
-        success = self.step_with_ready_grads()
+        if self.config.grad_norm_threshold_to_skip and grad_norm > self.config.grad_norm_threshold_to_skip:
+            success = False
+        else:
+            success = self.step_with_ready_grads()
 
         # No overflow for FP32 optimizer.
         return success, grad_norm, num_zeros_in_grad
@@ -1232,7 +1238,10 @@ class ChainedOptimizer(MegatronOptimizer):
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
 
-        update_successful = self.step_with_ready_grads()
+        if self.config.grad_norm_threshold_to_skip and grad_norm > self.config.grad_norm_threshold_to_skip:
+            update_successful = False
+        else:
+            update_successful = self.step_with_ready_grads()
 
         return update_successful, grad_norm, num_zeros_in_grad
 

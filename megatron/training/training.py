@@ -1348,12 +1348,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
-    if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
-        opt_param_scheduler.step(increment=increment)
-        skipped_iter = 0
-    else:
-        skipped_iter = 1
+    # Updates lr even when iteration is skipped.
+    increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+    opt_param_scheduler.step(increment=increment)
+
+    skipped_iter = 0 if update_successful else 1
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
@@ -2246,13 +2245,17 @@ def train(
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
         args.consumed_train_samples += batch_size
-        num_skipped_samples_in_batch = (
-            get_current_global_batch_size() - get_current_running_global_batch_size()
-        )
-        if args.decrease_batch_size_if_needed:
-            assert num_skipped_samples_in_batch >= 0
+
+        if skipped_iter:
+            num_skipped_samples_in_batch = batch_size
         else:
-            assert num_skipped_samples_in_batch == 0
+            num_skipped_samples_in_batch = (
+                get_current_global_batch_size() - get_current_running_global_batch_size()
+            )
+            if args.decrease_batch_size_if_needed:
+                assert num_skipped_samples_in_batch >= 0
+            else:
+                assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
         num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch

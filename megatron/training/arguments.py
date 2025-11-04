@@ -2203,6 +2203,8 @@ def _add_training_args(parser):
                        choices=['nccl', 'ucc'],
                        help='Select a communicator backend for pipeline parallel communication. '
                        'If None, the default backend will be used.')
+    group.add_argument('--grad-norm-threshold-to-skip', type=float, default=None,
+                       help='Skip optimizer step if grad-norm is over specified value.')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
 

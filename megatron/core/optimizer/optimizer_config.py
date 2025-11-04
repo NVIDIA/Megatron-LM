@@ -169,6 +169,9 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    grad_norm_threshold_to_skip: Optional[float] = None
+    """If set, optimizer step is skipped if grad-norm is over specified value."""
+
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
 
