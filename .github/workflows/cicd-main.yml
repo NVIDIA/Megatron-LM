@@ -243,7 +243,7 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
-      - name: Has Run tests label
+      - name: Has lts label
         id: has-lts-label
         env:
           GH_TOKEN: ${{ secrets.PAT }}
