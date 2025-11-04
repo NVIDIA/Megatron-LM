@@ -31,7 +31,11 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
-from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+    Status,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -496,7 +500,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.request_records[request_id].suspend()
+            self.request_records[request_id].suspend(self.controller.tokenizer)
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -669,6 +673,17 @@ class DynamicInferenceEngine(AbstractEngine):
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
 
+    def get_request(self, request_id: int) -> DynamicInferenceRequest:
+        """Get most recent request from a request record.
+
+        Args:
+            request_id (int): Request id.
+
+        Returns:
+            (DynamicInferenceRequest) The most recent request in the record.
+        """
+        return self.request_records[request_id][-1]
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
@@ -680,7 +695,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if request_id not in self.request_records:
             # >>>
             # self.requests[request_id] = request
-            self.request_records[request_id] = DynamicInferenceRequestRecord(request)
+            # +++
+            self.request_records[request_id] = DynamicInferenceRequestRecord()
+            self.request_records[request_id].requests.append(request)
+            # <<<
+            # >>>
+            # pax({"record": self.request_records[request_id]})
             # <<<
 
         if request.status is None:
@@ -766,8 +786,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize request.
         request = DynamicInferenceRequest(
-            prompt=prompt_str,
             request_id=request_id,
+            prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
         )

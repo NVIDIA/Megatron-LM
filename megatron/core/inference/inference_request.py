@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
-
+from megatron.core.tokenizers import MegatronTokenizer
 
 def serialize_tensor(tensor):
     """Serialize tensor to bytes."""
@@ -314,41 +314,71 @@ class DynamicInferenceRequest(InferenceRequest):
         return self.status == Status.FAILED
 
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 @dataclass(kw_only=True)
-class DynamicInferenceRequest(InferenceRequest):
-    """Class for one inference request
+class DynamicInferenceRequestRecord:
+    """History of DynamicInferenceRequest objects over multiple suspend and
+    resumes."""
 
-    Containing relevant data for an dynamic inference request
-    """
+    requests: list[DynamicInferenceRequest] = field(default_factory=list)
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    def suspend(self):
+    def __getitem__(self, idx: int) -> DynamicInferenceRequest:
+        """Get request by index.
+
+        Args:
+            idx (int): Request index.
+
+        Returns:
+            (DynamicInferenceRequest) Request object.
+        """
+        return self.requests[idx]
+
+    def suspend(self, tokenizer: MegatronTokenizer):
         """Suspend request by storing references to previous prompt, generations,
-        and sampling params."""
+        and sampling params.
 
-        # Concatenate prompt + generated tokens.
-        tokens = torch.cat(
+        Args:
+            tokenizer (MegatronTokenizer): The tokenizer.
+        """
+
+        old_request = self[-1]
+
+        # New prompt (concatenate prompt + generated tokens).
+        new_prompt_tokens = torch.cat(
             (
-                request.prompt_tokens,
+                old_request.prompt_tokens,
                 torch.tensor(
-                    request.generated_tokens,
-                    dtype=request.prompt_tokens.dtype,
-                    device=request.prompt_tokens.device,
+                    old_request.generated_tokens,
+                    dtype=old_request.prompt_tokens.dtype,
+                    device=old_request.prompt_tokens.device,
                 ),
             ),
             dim=0,
         )
+        new_prompt_str = tokenizer.detokenize(new_prompt_tokens.tolist())
 
-        # Add request.
+        # New sampling params.
         new_sampling_params = SamplingParams(**{
-            **asdict(request.sampling_params),
-            "num_tokens_to_generate" : request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+            **asdict(old_request.sampling_params),
+            "num_tokens_to_generate" : (
+                old_request.sampling_params.num_tokens_to_generate
+                - len(old_request.generated_tokens)
+            ),
         })
 
+        # New request.
+        new_request = DynamicInferenceRequest(
+            request_id=old_request.request_id,
+            prompt=new_prompt_str,
+            prompt_tokens=new_prompt_tokens,
+            sampling_params=new_sampling_params,
+        )
+        self.requests.append(new_request)
+
         # >>>
-        raise Exception("request suspended.")
+        pax("old_request, new_request")
         # <<<
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 @dataclass(kw_only=True)
