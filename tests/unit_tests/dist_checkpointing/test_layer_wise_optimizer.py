@@ -278,13 +278,7 @@ class TestLayerWiseOptimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_layer_wise_moe', sync=True) as ckpt_dir:
             # Create MoE model with optimizer
             model, optimizer = setup_moe_model_and_optimizer(
-                seed=2,
-                tp=tp,
-                pp=pp,
-                ep=ep,
-                bf16=True,
-                dist_opt=False,
-                optimizer='dist_muon',
+                seed=2, tp=tp, pp=pp, ep=ep, bf16=True, dist_opt=False, optimizer='dist_muon'
             )
 
             # Test that optimizer handles expert parallel parameters
@@ -300,13 +294,7 @@ class TestLayerWiseOptimizer:
 
             # Create new optimizer and load
             model_new, optimizer_new = setup_moe_model_and_optimizer(
-                seed=3,
-                tp=tp,
-                pp=pp,
-                ep=ep,
-                bf16=True,
-                dist_opt=False,
-                optimizer='dist_muon',
+                seed=3, tp=tp, pp=pp, ep=ep, bf16=True, dist_opt=False, optimizer='dist_muon'
             )
 
             model_sharded_sd = model_new[0].sharded_state_dict()

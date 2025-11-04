@@ -161,13 +161,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
 
 
 def setup_model_and_optimizer(
-    seed,
-    tp,
-    pp,
-    initialize_fn=initialize_gpt_model,
-    bf16=True,
-    dist_opt=True,
-    optimizer='adam',
+    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True, optimizer='adam'
 ):
     if 'muon' in optimizer and dist_opt:
         raise ValueError(
