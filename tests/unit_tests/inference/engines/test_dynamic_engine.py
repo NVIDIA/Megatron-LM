@@ -507,8 +507,7 @@ class TestDynamicInferenceEngine:
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
-                    context_active_buffer_size_gb=0.01,
-                    num_cuda_graphs=num_cuda_graphs,
+                    context_active_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
@@ -556,9 +555,7 @@ class TestDynamicInferenceEngine:
         # Initialize context.
         env = self._build_test_env(
             DynamicEngineTestConfig(
-                context_active_buffer_size_gb=0.0041,
-                num_cuda_graphs=8,
-                num_tokens_to_generate=1,
+                context_active_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
             )
         )
 
