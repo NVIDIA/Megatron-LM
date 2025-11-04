@@ -11,10 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.optimizer import (
-    OptimizerConfig,
-    get_megatron_optimizer,
-)
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -170,9 +167,9 @@ def setup_model_and_optimizer(
     initialize_fn=initialize_gpt_model,
     bf16=True,
     dist_opt=True,
-    layer_wise_dist_opt_with_muon=False,
+    optimizer='adam',
 ):
-    if layer_wise_dist_opt_with_muon and dist_opt:
+    if 'muon' in optimizer and dist_opt:
         raise ValueError(
             "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."
         )
@@ -195,10 +192,10 @@ def setup_model_and_optimizer(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
-        optimizer='dist_muon' if layer_wise_dist_opt_with_muon else 'adam',
+        optimizer=optimizer,
     )
 
-    if layer_wise_dist_opt_with_muon:
+    if 'muon' in optimizer:
         # Use layer-wise distributed optimizer with Muon
         optimizer = get_megatron_muon_optimizer(config, model)
     else:
@@ -207,7 +204,7 @@ def setup_model_and_optimizer(
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    if not layer_wise_dist_opt_with_muon:
+    if not 'muon' in optimizer:
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
                 if len(optimizer.optimizer.state[p]) == 0:
@@ -261,9 +258,9 @@ def setup_moe_model_and_optimizer(
     use_te=False,
     use_grouped_mlp=False,
     use_glu=False,
-    layer_wise_dist_opt_with_muon=False,
+    optimizer='adam',
 ):
-    if layer_wise_dist_opt_with_muon and dist_opt:
+    if 'muon' in optimizer and dist_opt:
         raise ValueError(
             "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."
         )
@@ -290,10 +287,10 @@ def setup_moe_model_and_optimizer(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
-        optimizer='dist_muon' if layer_wise_dist_opt_with_muon else 'adam',
+        optimizer=optimizer,
     )
 
-    if layer_wise_dist_opt_with_muon:
+    if 'muon' in optimizer:
         optimizer = get_megatron_muon_optimizer(config, model)
     else:
         optimizer = get_megatron_optimizer(config, model)
@@ -301,7 +298,7 @@ def setup_moe_model_and_optimizer(
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    if not layer_wise_dist_opt_with_muon:
+    if not 'muon' in optimizer:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:
                 for p in group['params']:

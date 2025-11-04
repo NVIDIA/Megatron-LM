@@ -53,7 +53,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         # Check if optimizer is ChainedOptimizer (expected for standard setup)
@@ -77,7 +77,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         # If this is a LayerWiseDistributedOptimizer, test broadcast
@@ -114,7 +114,7 @@ class TestLayerWiseOptimizer:
                     bf16=bf16,
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
-                    layer_wise_dist_opt_with_muon=True,
+                    optimizer='dist_muon',
                 )
 
                 # Save checkpoint A
@@ -130,7 +130,7 @@ class TestLayerWiseOptimizer:
                     bf16=bf16,
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
-                    layer_wise_dist_opt_with_muon=True,
+                    optimizer='dist_muon',
                 )
 
                 # Load checkpoint A into optimizer B
@@ -169,7 +169,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         # Create dummy gradients
@@ -195,7 +195,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         # Create dummy gradients with some zeros
@@ -228,7 +228,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 dist_opt=False,
                 initialize_fn=initialize_gpt_model,
-                layer_wise_dist_opt_with_muon=True,
+                optimizer='dist_muon',
             )
 
             model_sharded_sd = model_A[0].sharded_state_dict()
@@ -246,7 +246,7 @@ class TestLayerWiseOptimizer:
                 bf16=True,
                 dist_opt=False,
                 initialize_fn=initialize_gpt_model,
-                layer_wise_dist_opt_with_muon=True,
+                optimizer='dist_muon',
             )
 
             model_sharded_sd = model_B[0].sharded_state_dict()
@@ -284,7 +284,7 @@ class TestLayerWiseOptimizer:
                 ep=ep,
                 bf16=True,
                 dist_opt=False,
-                layer_wise_dist_opt_with_muon=True,
+                optimizer='dist_muon',
             )
 
             # Test that optimizer handles expert parallel parameters
@@ -306,7 +306,7 @@ class TestLayerWiseOptimizer:
                 ep=ep,
                 bf16=True,
                 dist_opt=False,
-                layer_wise_dist_opt_with_muon=True,
+                optimizer='dist_muon',
             )
 
             model_sharded_sd = model_new[0].sharded_state_dict()
@@ -325,7 +325,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         if isinstance(optimizer, LayerWiseDistributedOptimizer):
@@ -365,7 +365,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         if isinstance(optimizer, LayerWiseDistributedOptimizer):
@@ -392,7 +392,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
-            layer_wise_dist_opt_with_muon=True,
+            optimizer='dist_muon',
         )
 
         # Create dummy gradients
@@ -442,7 +442,7 @@ class TestLayerWiseOptimizerIntegration:
                     bf16=bf16,
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
-                    layer_wise_dist_opt_with_muon=True,
+                    optimizer='dist_muon',
                 )
 
                 # Save checkpoint
@@ -456,7 +456,7 @@ class TestLayerWiseOptimizerIntegration:
                     bf16=bf16,
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
-                    layer_wise_dist_opt_with_muon=True,
+                    optimizer='dist_muon',
                 )
 
                 # Load checkpoint
