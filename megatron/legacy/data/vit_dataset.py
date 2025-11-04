@@ -1,15 +1,17 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import os
 import random
+
 import numpy as np
 import torch
 import torchvision.transforms as T
-from torchvision import datasets
-from megatron.training import get_args
-from megatron.legacy.data.image_folder import ImageFolder
-from megatron.legacy.data.autoaugment import ImageNetPolicy
-from megatron.core.datasets.data_samplers import RandomSeedDataset
 from PIL import Image, ImageFilter, ImageOps
+from torchvision import datasets
+
+from megatron.legacy.data.autoaugment import ImageNetPolicy
+from megatron.legacy.data.image_folder import ImageFolder
+from megatron.training import get_args
+from megatron.training.datasets.data_samplers import RandomSeedDataset
 
 
 class GaussianBlur(object):
