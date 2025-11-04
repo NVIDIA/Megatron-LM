@@ -13,8 +13,8 @@ from megatron.core.utils import get_pg_rank, get_pg_size
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
     ChainedOptimizer,
-    FP32Optimizer,
     Float16OptimizerWithFloat16Params,
+    FP32Optimizer,
     MegatronOptimizer,
 )
 from .optimizer_config import OptimizerConfig
@@ -55,9 +55,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
-        if init_state_fn_list is None:
-            init_state_fn_list = [None] * len(optimizers)
-        else:
+        if init_state_fn_list:
             assert len(init_state_fn_list) == len(optimizers), (
                 "init_state_fn_list must be the " "same length as optimizers if provided"
             )
@@ -77,7 +75,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if isinstance(opt, FP32Optimizer):
                     opt = opt.optimizer
                 optimizers[i] = Float16OptimizerWithFloat16Params(
-                    opt, config, None, init_state_fn_list[i]
+                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
         super().__init__(optimizers)
@@ -174,6 +172,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 
+        if self.pg_collection is None:
+            return
         if self.dp_cp_params_list:
             _allgather_helper(self.dp_cp_params_list, self.pg_collection.dp_cp)
         if self.expt_dp_params_list:
