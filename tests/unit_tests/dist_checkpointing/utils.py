@@ -9,7 +9,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    get_megatron_optimizer,
+    get_megatron_muon_optimizer,
+)
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -164,8 +168,11 @@ def setup_model_and_optimizer(
     initialize_fn=initialize_gpt_model,
     bf16=True,
     dist_opt=True,
-    data_parallel_sharding_strategy="optim_grads_params",
+    layer_wise_dist_opt_with_muon=False,
 ):
+    if layer_wise_dist_opt_with_muon and dist_opt:
+        raise ValueError("Layer-wise distributed optimizer with Muon is not supported with distributed optimizer.")
+
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
@@ -184,17 +191,29 @@ def setup_model_and_optimizer(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
+        optimizer='dist_muon' if layer_wise_dist_opt_with_muon else 'adam',
     )
-    optimizer = get_megatron_optimizer(config, model)
+
+    if layer_wise_dist_opt_with_muon:
+        # Use layer-wise distributed optimizer with Muon
+        optimizer = get_megatron_muon_optimizer(config, model)
+    else:
+        optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for group in optimizer.optimizer.param_groups:
-        for p in group['params']:
-            if len(optimizer.optimizer.state[p]) == 0:
-                optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if not layer_wise_dist_opt_with_muon:
+        for group in optimizer.optimizer.param_groups:
+            for p in group['params']:
+                if len(optimizer.optimizer.state[p]) == 0:
+                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
+                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    else:
+        for group in optimizer.chained_optimizers[0].param_groups:
+            for p in group['params']:
+                if len(optimizer.chained_optimizers[0].state[p]) == 0:
+                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
 
