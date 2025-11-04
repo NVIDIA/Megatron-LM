@@ -315,6 +315,43 @@ class DynamicInferenceRequest(InferenceRequest):
 
 
 @dataclass(kw_only=True)
+class DynamicInferenceRequest(InferenceRequest):
+    """Class for one inference request
+
+    Containing relevant data for an dynamic inference request
+    """
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def suspend(self):
+        """Suspend request by storing references to previous prompt, generations,
+        and sampling params."""
+
+        # Concatenate prompt + generated tokens.
+        tokens = torch.cat(
+            (
+                request.prompt_tokens,
+                torch.tensor(
+                    request.generated_tokens,
+                    dtype=request.prompt_tokens.dtype,
+                    device=request.prompt_tokens.device,
+                ),
+            ),
+            dim=0,
+        )
+
+        # Add request.
+        new_sampling_params = SamplingParams(**{
+            **asdict(request.sampling_params),
+            "num_tokens_to_generate" : request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+        })
+
+        # >>>
+        raise Exception("request suspended.")
+        # <<<
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+@dataclass(kw_only=True)
 class VLMInferenceRequest(InferenceRequest):
     """Class for a VLM inference request"""
 

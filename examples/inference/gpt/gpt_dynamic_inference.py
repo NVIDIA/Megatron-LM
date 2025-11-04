@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -13,9 +14,18 @@ from functools import partial
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
-import torch
-from tqdm import tqdm
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
 
+import megatron
+from examples.inference.gpt.utils import (
+    Request,
+    add_common_inference_args,
+    build_dynamic_engine_setup_prefix,
+    build_requests,
+    get_curr_time,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
@@ -30,39 +40,28 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+from megatron.training import (
+    get_args,
+    get_model as _get_model,
+    get_tokenizer,
+    initialize_megatron,
 )
-from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
+from pretrain_gpt import model_provider
 
 from megatron.core.utils import configure_nvtx_profiling
 from model_provider import model_provider
 from gpt_builders import gpt_builder
 
-import json
-
-from examples.inference.gpt.utils import (
-    Request,
-    add_common_inference_args,
-    build_dynamic_engine_setup_prefix,
-    build_requests,
-    get_curr_time,
-)
-from megatron.training import get_args
-from megatron.training import get_model as _get_model
-from megatron.training import get_tokenizer, initialize_megatron
-from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider
-
-import torch
-import io
-import megatron
-
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -306,11 +305,12 @@ def run_inference(
                 print("**** step %d/%d ... suspend." % (engine.step_count, attempted_step_count))
                 engine.suspend()
 
-            # Resume, 4 (attempted) steps later.
+            # Resume, 0+ attempted steps later.
             if (
                 attempted_step_count > 0
                 and
-                (attempted_step_count - 4) % args.suspend_resume_interval == 0
+                (attempted_step_count - args.suspend_resume_interval // 2)
+                    % args.suspend_resume_interval == 0
             ):
                 print("**** step %d/%d ... resume." % (engine.step_count, attempted_step_count))
                 engine.resume()

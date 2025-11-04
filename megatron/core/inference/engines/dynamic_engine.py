@@ -177,7 +177,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
-        self.requests: Dict[int, DynamicInferenceRequest] = {}
+        # >>>
+        # self.requests: Dict[int, DynamicInferenceRequest] = {}
+        self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
+        # <<<
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
@@ -185,6 +188,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stopped = False
         self.suspend_signal = False # suspend signal
         self.is_suspended = False # suspend state
+        self.resume_request_ids = None
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -483,6 +487,121 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.unified_memory_level == 0:
             delete_cuda_graphs()
 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # Maintain references to requests before reset.
+        waiting_request_ids = list(self.waiting_request_ids)
+        active_request_ids = set(self.request_records.keys()) - set(waiting_request_ids)
+        self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
+        self.waiting_request_ids.clear()
+
+        # Suspend requests objects.
+        for request_id in active_request_ids:
+            self.request_records[request_id].suspend()
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def resume(self):
+    #     """Resume engine by reallocating context's GPU state."""
+
+    #     # Skip if not suspended, which can happen when using the inference
+    #     # coordinator.
+    #     if not self.is_suspended:
+    #         return
+    #     self.is_suspended = False
+
+    #     # >>>
+    #     pax({"request_completion_futures": self.request_completion_futures})
+    #     # <<<
+
+    #     # Resume.
+    #     with self.__class__.suspend_resume_ctx(
+    #         "resumed", unified_memory_level=self.unified_memory_level
+    #     ):
+
+    #         # Maintain references to requests before reset.
+    #         waiting_request_ids = list(self.waiting_request_ids)
+    #         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
+    #         request_ids = [*active_request_ids, *waiting_request_ids]
+    #         # >>>
+    #         # requests = dict(self.requests)
+    #         # <<<
+
+    #         # Allocate context tensors.
+    #         alloc_time = time.time()
+    #         torch.cuda.synchronize()
+    #         self.context.allocate_all_tensors(is_init=False)
+    #         torch.cuda.synchronize()
+    #         alloc_time = time.time() - alloc_time
+
+    #         # Reset context and request data.
+    #         self.context.reset()
+    #         self.waiting_request_ids = deque()
+    #         # >>>
+    #         # self.requests: Dict[int, DynamicInferenceRequest] = {}
+    #         # self.request_completion_futures: Dict[int, asyncio.Future] = {}
+    #         # <<<
+
+    #         # Create cuda graphs (before adding requests, to be in decode mode).
+    #         # Only create cuda graphs when not using unified memory at all (level
+    #         # 0). For levels 1 and 2, the context's tensors maintain static
+    #         # memory addresses, so the cuda graphs are re-used.
+    #         capture_time = time.time()
+    #         if self.unified_memory_level == 0:
+    #             self.create_cuda_graphs()
+    #         capture_time = time.time() - capture_time
+
+    #         # Add requests.
+    #         # >>>
+    #         # futures = {}
+    #         # <<<
+    #         add_time = time.time()
+    #         torch.cuda.synchronize()
+    #         for request_id in request_ids:
+
+    #             request = requests[request_id]
+
+    #             # Concatenate prompt + generated tokens.
+    #             tokens = torch.cat(
+    #                 (
+    #                     request.prompt_tokens,
+    #                     torch.tensor(
+    #                         request.generated_tokens,
+    #                         dtype=request.prompt_tokens.dtype,
+    #                         device=request.prompt_tokens.device,
+    #                     ),
+    #                 ),
+    #                 dim=0,
+    #             )
+
+    #             # Add request.
+    #             new_sampling_params = SamplingParams(**{
+    #                 **asdict(request.sampling_params),
+    #                 "num_tokens_to_generate" : request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+    #             })
+    #             futures[request_id] = self.add_request(
+    #                 request_id,
+    #                 tokens,
+    #                 new_sampling_params,
+    #             )
+    #         torch.cuda.synchronize()
+    #         add_time = time.time() - add_time
+
+    #     # Print inner timing (must be outside context manager above for correct formatting).
+    #     logging.info(", ".join((
+    #         f"    > inner timing: alloc {alloc_time:.3f}",
+    #         f"add {add_time:.3f}",
+    #         f"capture {capture_time:.3f}.",
+    #     )))
+
+    #     # Notify event loop.
+    #     self._loop.call_soon_threadsafe(
+    #         asyncio.create_task, self._notify_cond_for_new_request()
+    #     )
+
+    #     # >>>
+    #     # return futures
+    #     # <<<
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
@@ -497,12 +616,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "resumed", unified_memory_level=self.unified_memory_level
         ):
 
-            # Maintain references to requests before reset.
-            waiting_request_ids = list(self.waiting_request_ids)
-            active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-            request_ids = [*active_request_ids, *waiting_request_ids]
-            requests = dict(self.requests)
-
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
@@ -512,9 +625,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Reset context and request data.
             self.context.reset()
-            self.waiting_request_ids = deque()
-            self.requests: Dict[int, DynamicInferenceRequest] = {}
-            self.request_completion_futures: Dict[int, asyncio.Future] = {}
 
             # Create cuda graphs (before adding requests, to be in decode mode).
             # Only create cuda graphs when not using unified memory at all (level
@@ -526,42 +636,16 @@ class DynamicInferenceEngine(AbstractEngine):
             capture_time = time.time() - capture_time
 
             # Add requests.
-            futures = {}
             add_time = time.time()
             torch.cuda.synchronize()
-            for request_id in request_ids:
-
-                request = requests[request_id]
-
-                # Concatenate prompt + generated tokens.
-                tokens = torch.cat(
-                    (
-                        request.prompt_tokens,
-                        torch.tensor(
-                            request.generated_tokens,
-                            dtype=request.prompt_tokens.dtype,
-                            device=request.prompt_tokens.device,
-                        ),
-                    ),
-                    dim=0,
-                )
-
-                # Add request.
-                new_sampling_params = SamplingParams(**{
-                    **asdict(request.sampling_params),
-                    "num_tokens_to_generate" : request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
-                })
-                futures[request_id] = self.add_request(
-                    request_id,
-                    tokens,
-                    new_sampling_params,
-                )
+            for request_id in self.resume_request_ids:
+                self._add_request(requests[request_id])
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).
-        logging.info(", ".join((
-            f"    > inner timing: alloc {alloc_time:.3f}",
+        logging.info("    > " + ", ".join((
+            f"inner timing: alloc {alloc_time:.3f}",
             f"add {add_time:.3f}",
             f"capture {capture_time:.3f}.",
         )))
@@ -571,7 +655,10 @@ class DynamicInferenceEngine(AbstractEngine):
             asyncio.create_task, self._notify_cond_for_new_request()
         )
 
-        return futures
+        # >>>
+        # return futures
+        # <<<
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
@@ -587,7 +674,15 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
-        self.requests[request_id] = request
+
+        # Add request to self.request_records. If the engine has previously been
+        # suspended, then the request may already exist.
+        if request_id not in self.request_records:
+            # >>>
+            # self.requests[request_id] = request
+            self.request_records[request_id] = DynamicInferenceRequestRecord(request)
+            # <<<
+
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
@@ -618,8 +713,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
 
-        # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
+        # Create a new asyncio Future to notify the user when the request has
+        # completed. If the engine has previously been suspended, then the future
+        # may already exist.
+        if request_id not in self.request_completion_futures:
+            self.request_completion_futures[request_id] = asyncio.Future()
+
         return self.request_completion_futures[request_id]
 
     def add_request(
@@ -707,7 +806,10 @@ class DynamicInferenceEngine(AbstractEngine):
         for request_id, token, request_log_probs in zip(
             request_ids.tolist(), sample.tolist(), log_probs_iter
         ):
-            request: DynamicInferenceRequest = self.requests[request_id]
+            # >>>
+            # request: DynamicInferenceRequest = self.requests[request_id]
+            request: DynamicInferenceRequest = self.get_request(request_id)
+            # <<<
             if request_id != self.context.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
                 if request.tpot is None:
@@ -741,7 +843,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    finished_request = self.requests.pop(request_id)
+                    # >>>
+                    # finished_request = self.requests.pop(request_id)
+                    finished_request_record = self.request_records.pop(request_id)
+                    # <<<
                     if finished_request.prompt is None:
                         finished_request.prompt = self.controller.tokenizer.detokenize(
                             finished_request.prompt_tokens.tolist()
@@ -787,7 +892,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Perform the same original scheduling logic for non-chunked runs
         """
         while self.waiting_request_ids:
-            req = self.requests[self.waiting_request_ids[0]]
+            # >>>
+            # req = self.requests[self.waiting_request_ids[0]]
+            req = self.get_requests(self.waiting_request_ids[0])
+            # <<<
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req, safe=True)
             )
@@ -809,18 +917,31 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.paused_request_count : self.context.total_request_count
         ].tolist()
         if self.static_sampling:
-            return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
+            # >>>
+            # return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
+            # +++
+            return [
+                (next(iter(self.request_records.values()))[-1].sampling_params,
+                 active_request_ids),
+            ]
+            # <<<
 
         # Get a map from request_id to context array index.
         context_id_map = {r: i for i, r in enumerate(active_request_ids)}
 
         # Create map of sampling methods to context array indices.
         sampling_map: List[Tuple[SamplingParams, List[int]]] = []
-        for request_id, request in self.requests.items():
+        # >>>
+        # for request_id, request in self.requests.items():
+        for request_id, request_record in self.request_records.items():
+        # <<<
             if request_id not in context_id_map:
                 continue
             context_id = context_id_map[request_id]
-            sp = request.sampling_params
+            # >>>
+            # sp = request.sampling_params
+            sp = request_record[-1].sampling_params
+            # <<<
 
             # Look for a pre-existing group with these sampling parameters.
             for sampling, indices in sampling_map:
@@ -851,7 +972,10 @@ class DynamicInferenceEngine(AbstractEngine):
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
-            req = self.requests[self.waiting_request_ids[0]]
+            # >>>
+            # req = self.requests[self.waiting_request_ids[0]]
+            req = self.get_request(self.waiting_request_ids[0])
+            # <<<
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
@@ -952,10 +1076,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Add paused events.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
-                [self.requests[i].add_event_pause() for i in newly_paused_request_ids]
+                [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Mark requests finished.
-            [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
+            [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
 
             # Add finished events.
             (active_requests, finished_requests) = self.post_process_requests(
@@ -968,7 +1092,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Failed requests.
         for failed_request_id in self.failed_request_ids:
-            failed_request = self.requests.pop(failed_request_id)
+            # >>>
+            # failed_request = self.requests.pop(failed_request_id)
+            failed_request_record = self.request_records.pop(failed_request_id)
+            # <<<
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
             finished_requests.append(failed_request)
