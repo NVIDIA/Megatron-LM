@@ -829,6 +829,9 @@ def generate_state_dict(
             else:
                 optimizer_sd = optimizer.state_dict()
 
+            # check if optimizer_sd is not None
+            assert optimizer_sd is not None, f"optimizer_sd is None for rank {torch.distributed.get_rank()}"
+
             state_dict['optimizer'] = optimizer_sd
 
         if opt_param_scheduler is not None:
