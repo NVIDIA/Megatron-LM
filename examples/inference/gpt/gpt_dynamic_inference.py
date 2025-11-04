@@ -509,7 +509,7 @@ def main():
     #     f"count [ p {p_count}, d {d_count} ]."
     # )
     capture_str = (
-        f"{engine.capture_stats["time"]:.2f} sec"
+        f"{engine.capture_stats['time']:.2f} sec"
         if engine.capture_stats else
         "--"
     )
