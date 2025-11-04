@@ -16,7 +16,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import CoreParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -347,14 +347,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = None
         self.paused_tokens = None
 
-        # Keep a reverse hash map for SamplingParams that correspond to active & paused requests.
-        self.sampling_hash_map: Dict[int, SamplingParams] = {}
+        # Keep a reverse hash map for sampling params that correspond to active & paused requests.
+        self.sampling_hash_map: Dict[int, CoreParams] = {}
 
         # Per-request state.
         self.request_ids = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        # Hashes of SamplingParams for each request.
+        # Hashes of sampling params for each request.
         self.request_sampling_hashes = torch.empty_like(self.request_ids, dtype=torch.int64)
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
@@ -1203,11 +1203,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
+        # Get immutable core of sampling_params.
+        core_params = req.sampling_params.core_params
         # Handle the sampling parameters hash.
         old_sampling_hash = self.request_sampling_hashes[current_id].item()
-        new_sampling_hash = hash(req.sampling_params)
+        new_sampling_hash = hash(core_params)
         self.request_sampling_hashes[current_id] = new_sampling_hash
-        self.sampling_hash_map[new_sampling_hash] = req.sampling_params
+        self.sampling_hash_map[new_sampling_hash] = core_params
         # Update the reverse hash map if there are no more requests with this sampling hash.
         # We do this to prevent unbounded growth of the hash map.
         if (self.request_sampling_hashes != old_sampling_hash).all().item():

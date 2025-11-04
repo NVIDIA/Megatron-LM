@@ -1,10 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Optional
 
+CoreParams = namedtuple("CoreParams", ["temperature", "top_k", "top_p"])
 
-@dataclass(unsafe_hash=True)
+@dataclass
 class SamplingParams:
     """Inference parameters sent along with the prompts.
     This class contains request-level attributes that control the sampling techniques used when
@@ -42,6 +44,11 @@ class SamplingParams:
         """
         for key, value in attribute_value_pair.items():
             setattr(self, key, value)
+
+    @property
+    def core_params(self):
+        """Return a tuple of core parameters used to sample tokens from logits."""
+        return CoreParams(temperature=self.temperature, top_k=self.top_k, top_p=self.top_p)
 
     def serializable(self) -> dict:
         """Return a dictionary that is msgpack-serializable."""

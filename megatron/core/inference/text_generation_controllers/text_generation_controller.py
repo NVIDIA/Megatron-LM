@@ -27,7 +27,7 @@ from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import CoreParams, SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -88,7 +88,7 @@ class TextGenerationController:
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         # Used for inefficient torch sampling.
-        self.torch_sampling_groups: Dict[SamplingParams, torch.Tensor] = {}
+        self.torch_sampling_groups: Dict[CoreParams, torch.Tensor] = {}
 
         # Used for efficient, graphed, sampling.
         self.cu_sampling_logits = torch.empty(
@@ -550,7 +550,7 @@ class TextGenerationController:
         self,
         *,
         active_sampling_hashes: Optional[Tensor] = None,
-        sampling_hash_map: Optional[Dict[int, SamplingParams]] = None,
+        sampling_hash_map: Optional[Dict[int, CoreParams]] = None,
     ):
         """Perform bookkeeping necessary to sample logits for dynamic batching.
 
@@ -560,7 +560,7 @@ class TextGenerationController:
         Args:
             active_sampling_hashes (Optional[Tensor]): An override for the tensor that stores
                 hashes of the sampling parameters corresponding to each request in the context.
-            sampling_hash_map (Optional[Dict[int, SamplingParams]]): An override for the reverse
+            sampling_hash_map (Optional[Dict[int, CoreParams]]): An override for the reverse
                 hash map between sampling parameters and their hashes.
         """
         context = self.inference_wrapped_model.inference_context
@@ -575,20 +575,20 @@ class TextGenerationController:
         # Special-case for static sampling.
         if getattr(self, "static_sampling", False):
             assert len(sampling_hash_map) == 1
-            sampling_params = next(iter(sampling_hash_map.values()))
-            self.torch_sampling_groups[sampling_params] = None
+            core_params = next(iter(sampling_hash_map.values()))
+            self.torch_sampling_groups[core_params] = None
             return
 
         # Loop over all unique sampling hashes.
-        for sampling_hash, sampling_params in sampling_hash_map.items():
+        for sampling_hash, core_params in sampling_hash_map.items():
             indices = (active_sampling_hashes == sampling_hash).nonzero(as_tuple=True)[0]
 
             # Write data to tensors.
-            termination_id = sampling_params.termination_id or self.tokenizer.eod
+            termination_id = self.tokenizer.eod
             self.cu_termination_id[indices] = termination_id
 
             # Needed for inefficient torch sampling.
-            self.torch_sampling_groups[sampling_params] = indices
+            self.torch_sampling_groups[core_params] = indices
 
     def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
         """Sample logits for dynamic batching.
@@ -617,26 +617,26 @@ class TextGenerationController:
         # Special-case for static sampling.
         if getattr(self, "static_sampling", False):
             assert len(self.torch_sampling_groups) == 1
-            sampling_params = next(iter(self.torch_sampling_groups.keys()))
+            core_params = next(iter(self.torch_sampling_groups.keys()))
             new_sample = self._torch_sampling_func(
                 last_token_logits,
-                sampling_params.temperature,
-                sampling_params.top_k,
-                sampling_params.top_p,
+                core_params.temperature,
+                core_params.top_k,
+                core_params.top_p,
             )
-            termination_id = sampling_params.termination_id or self.tokenizer.eod
+            termination_id = self.tokenizer.eod
             return new_sample, termination_id
 
         batch_size = last_token_logits.size(0)
         self.cu_sampling_logits[:batch_size].copy_(last_token_logits)
 
         if backend == "torch":
-            for sampling_params, indices in self.torch_sampling_groups.items():
+            for core_params, indices in self.torch_sampling_groups.items():
                 self.cu_sampled_tokens[indices] = self._torch_sampling_func(
                     self.cu_sampling_logits[indices, :],
-                    sampling_params.temperature,
-                    sampling_params.top_k,
-                    sampling_params.top_p,
+                    core_params.temperature,
+                    core_params.top_k,
+                    core_params.top_p,
                 )
 
         return self.cu_sampled_tokens[:batch_size], self.cu_termination_id[:batch_size]
@@ -648,15 +648,16 @@ class TextGenerationController:
     def _dynamic_step_calculate_log_probs(
         self, logits: Tensor, new_sample: Tensor
     ) -> Optional[Tensor]:
+        return
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
         log_probs = None
         return_log_probs = False
-        for sampling_params, mask in self.torch_sampling_groups.items():
-            if sampling_params.return_log_probs:
+        for core_params, mask in self.torch_sampling_groups.items():
+            if core_params.return_log_probs:
                 skip_prompt_log_probs_for_dynamic_inference = getattr(
-                    sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
+                    core_params, "skip_prompt_log_probs_for_dynamic_inference", False
                 )
                 assert (
                     skip_prompt_log_probs_for_dynamic_inference

@@ -433,8 +433,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.sampling_params = request.sampling_params
             else:
                 assert (
-                    self.sampling_params == request.sampling_params
-                ), "All requests must have the same sampling parameters in static_sampling mode."
+                    self.sampling_params.core_params == request.sampling_params.core_params
+                ), "All requests must have the same core sampling parameters for static_sampling."
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
