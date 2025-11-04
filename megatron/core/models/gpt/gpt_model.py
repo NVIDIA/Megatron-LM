@@ -537,7 +537,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None and self.mtp_process:
+        if self.config.mtp_num_layers is not None:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
