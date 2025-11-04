@@ -26,6 +26,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
@@ -774,6 +775,12 @@ class TestPartialCudaGraph:
         args = get_args()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn()
+        if args.mtp_num_layers:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config, transformer_layer_spec, use_transformer_engine=True
+            )
+        else:
+            mtp_block_spec = None
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -786,6 +793,7 @@ class TestPartialCudaGraph:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            mtp_block_spec=mtp_block_spec,
         )
 
     def create_test_args(
@@ -934,8 +942,6 @@ class TestPartialCudaGraph:
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
     @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
-    @pytest.mark.flaky_in_dev
-    @pytest.mark.flaky
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         extra_kwargs = {}
         if moe_dispatcher_type == "deepep":
