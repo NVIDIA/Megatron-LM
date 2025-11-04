@@ -531,12 +531,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install GH CLI
-        shell: bash -x -e -u -o pipefail {0}
-        run: |
-          apt-get update
-          apt-get install -y gh
-
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}
