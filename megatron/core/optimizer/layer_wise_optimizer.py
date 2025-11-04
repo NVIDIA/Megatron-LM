@@ -11,7 +11,12 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
-from .optimizer import ChainedOptimizer, FP32Optimizer, Float16OptimizerWithFloat16Params, MegatronOptimizer
+from .optimizer import (
+    ChainedOptimizer,
+    FP32Optimizer,
+    Float16OptimizerWithFloat16Params,
+    MegatronOptimizer,
+)
 from .optimizer_config import OptimizerConfig
 
 
@@ -65,11 +70,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
             for i, opt in enumerate(optimizers):
                 if isinstance(opt, Float16OptimizerWithFloat16Params):
-                    raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
+                    raise TypeError(
+                        'LayerWiseDistributedOptimizer received Float16 optimizer already.'
+                    )
                 # unwrap FP32 optimizer from reusing get_megatron_optimizer for adam
                 if isinstance(opt, FP32Optimizer):
                     opt = opt.optimizer
-                optimizers[i] = Float16OptimizerWithFloat16Params(opt, config, None, init_state_fn_list[i])
+                optimizers[i] = Float16OptimizerWithFloat16Params(
+                    opt, config, None, init_state_fn_list[i]
+                )
 
         super().__init__(optimizers)
 
