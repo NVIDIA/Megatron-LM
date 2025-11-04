@@ -584,7 +584,7 @@ class TextGenerationController:
             indices = (active_sampling_hashes == sampling_hash).nonzero(as_tuple=True)[0]
 
             # Write data to tensors.
-            termination_id = core_params.termination_id or self.tokenizer.eod
+            termination_id = self.tokenizer.eod
             self.cu_termination_id[indices] = termination_id
 
             # Needed for inefficient torch sampling.
@@ -624,7 +624,7 @@ class TextGenerationController:
                 core_params.top_k,
                 core_params.top_p,
             )
-            termination_id = core_params.termination_id or self.tokenizer.eod
+            termination_id = self.tokenizer.eod
             return new_sample, termination_id
 
         batch_size = last_token_logits.size(0)
@@ -646,8 +646,9 @@ class TextGenerationController:
         pass
 
     def _dynamic_step_calculate_log_probs(
-        self, logits: Tensor, new_sample: Tensor,
+        self, logits: Tensor, new_sample: Tensor
     ) -> Optional[Tensor]:
+        return
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
