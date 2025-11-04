@@ -579,6 +579,7 @@ class CheckpointWithoutOutput(object):
 
             # Store the inputs for backward pass
             inputs = self.ctx.saved_tensors
+
             def detach(t):
                 if isinstance(t, torch.Tensor):
                     requires_grad = t.requires_grad
