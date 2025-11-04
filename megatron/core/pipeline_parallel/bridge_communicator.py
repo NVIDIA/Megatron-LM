@@ -737,7 +737,9 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received activations
-                aggregated_activation = torch.cat(received_activations_list, dim=self.dim_mapping['b'])
+                aggregated_activation = torch.cat(
+                    received_activations_list, dim=self.dim_mapping['b']
+                )
                 logging.debug(
                     f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
                     f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
