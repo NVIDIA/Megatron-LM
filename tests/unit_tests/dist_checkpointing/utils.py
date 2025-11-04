@@ -13,9 +13,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.optimizer import (
     OptimizerConfig,
-    get_megatron_muon_optimizer,
     get_megatron_optimizer,
 )
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
