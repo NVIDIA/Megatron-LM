@@ -693,7 +693,7 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_scope: Optional[List[str]] = None
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
-    "moe_router", "moe_preprocess", "mamba". None means ["attn", "mlp"].
+    "moe_router", "moe_preprocess", "mamba". None means the full layer.
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
