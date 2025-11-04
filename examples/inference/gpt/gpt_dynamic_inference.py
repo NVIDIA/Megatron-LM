@@ -325,10 +325,10 @@ def run_inference(
             cuda_graph_request_count_map[cuda_graph_request_count] += 1
 
         # Update requests.
-        active_requests = result["active_requests"]
-        finished_requests = result["finished_requests"]
+        active_request_ids = result["active_request_ids"]
+        finished_request_records = result["finished_request_records"]
         step_time = result["step_time"]
-        if len(active_requests) > 0 or len(finished_requests) > 0:
+        if len(active_request_ids) > 0 or len(finished_request_records) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -336,7 +336,12 @@ def run_inference(
 
             # Append output tokens.
             output_start = get_curr_time()
-            for finished_request in finished_requests:
+            for finished_request_record in finished_request_records:
+
+                finished_request = finished_request_record.merge()
+                # >>>
+                pax("finished_request")
+                # <<<
 
                 # Update local request object.
                 request = requests[finished_request.request_id]

@@ -802,9 +802,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
         """
-        active_requests: List[DynamicInferenceRequest] = []
-        finished_requests: List[DynamicInferenceRequest] = []
+        active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
+        finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
 
         log_probs_iter = log_probs if log_probs else repeat(None)
@@ -853,13 +853,13 @@ class DynamicInferenceEngine(AbstractEngine):
                             finished_request.prompt_tokens.tolist()
                         )
                     finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_requests.append(finished_request)
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
                         finished_request.generated_tokens
                     )
+                    finished_request_records.append(finished_request_record)
                     self.request_completion_futures[request_id].set_result(finished_request_record)
                 else:
-                    active_requests.append(request)
+                    active_request_ids.append(request_id)
             else:
                 # The chunked prefill produces useless tokens
                 # so we are not appending them to the generated tokens.
@@ -877,9 +877,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_log_probs = []
                         request.prompt_log_probs.extend(request_log_probs)
                         request.generated_log_probs = []
-                    active_requests.append(request)
+                    active_request_ids.append(request_id)
 
-        return active_requests, finished_requests
+        # >>>
+        # return active_requests, finished_requests
+        return active_request_ids, finished_request_records
+        # <<<
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1067,13 +1070,21 @@ class DynamicInferenceEngine(AbstractEngine):
             [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
 
             # Add finished events.
-            (active_requests, finished_requests) = self.post_process_requests(
+            # >>>
+            # (active_requests, finished_requests) = self.post_process_requests(
+            active_request_ids, finished_request_records = self.post_process_requests(
+            # <<<
                 active_request_ids, finished_request_ids, step_time, sample, log_probs
             )
 
         else:
-            active_requests: List[DynamicInferenceRequest] = []
-            finished_requests: List[DynamicInferenceRequest] = []
+            # >>>
+            # active_requests: List[DynamicInferenceRequest] = []
+            # finished_requests: List[DynamicInferenceRequest] = []
+            # +++
+            active_request_ids: list[int] = []
+            finished_request_records: list[DynamicInferenceRequestRecord] = []
+            # <<<
 
         # Failed requests.
         for failed_request_id in self.failed_request_ids:
@@ -1081,7 +1092,7 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_request = failed_request_record[-1]
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
-            finished_requests.append(failed_request)
+            finished_request_records.append(failed_request_record)
             self.request_completion_futures[failed_request_id].set_result(failed_request_record)
         self.failed_request_ids.clear()
 
@@ -1128,8 +1139,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         range_pop()
         return {
-            "active_requests": active_requests,
-            "finished_requests": finished_requests,
+            "active_request_ids": active_request_ids,
+            "finished_request_records": finished_request_records,
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
@@ -1152,7 +1163,9 @@ class DynamicInferenceEngine(AbstractEngine):
         result = self._loop.run_until_complete(
             self.async_step(sampling_params=sampling_params, verbose=verbose)
         )
-        return (result["active_requests"], result["finished_requests"], result["step_time"])
+        active_requests = [ self.get_request(i) for i in result["active_request_ids"] ]
+        finished_requests = [ r.merge() for r in result["finished_request_records"] ]
+        return active_requests, finished_requests, result["step_time"]
 
     # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
     # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
