@@ -181,10 +181,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
-        # >>>
-        # self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
-        # <<<
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
@@ -658,10 +655,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self._loop.call_soon_threadsafe(
             asyncio.create_task, self._notify_cond_for_new_request()
         )
-
-        # >>>
-        # return futures
-        # <<<
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
@@ -693,15 +686,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Add request to self.request_records. If the engine has previously been
         # suspended, then the request may already exist.
         if request_id not in self.request_records:
-            # >>>
-            # self.requests[request_id] = request
-            # +++
             self.request_records[request_id] = DynamicInferenceRequestRecord()
             self.request_records[request_id].requests.append(request)
-            # <<<
-            # >>>
-            # pax({"record": self.request_records[request_id]})
-            # <<<
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -826,10 +812,7 @@ class DynamicInferenceEngine(AbstractEngine):
         for request_id, token, request_log_probs in zip(
             request_ids.tolist(), sample.tolist(), log_probs_iter
         ):
-            # >>>
-            # request: DynamicInferenceRequest = self.requests[request_id]
             request: DynamicInferenceRequest = self.get_request(request_id)
-            # <<<
             if request_id != self.context.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
                 if request.tpot is None:
@@ -863,12 +846,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    # >>>
-                    # finished_request = self.requests.pop(request_id)
-                    # +++
                     finished_request_record = self.request_records.pop(request_id)
                     finished_request = finished_request_record[-1]
-                    # <<<
                     if finished_request.prompt is None:
                         finished_request.prompt = self.controller.tokenizer.detokenize(
                             finished_request.prompt_tokens.tolist()
@@ -914,10 +893,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Perform the same original scheduling logic for non-chunked runs
         """
         while self.waiting_request_ids:
-            # >>>
-            # req = self.requests[self.waiting_request_ids[0]]
             req = self.get_requests(self.waiting_request_ids[0])
-            # <<<
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req, safe=True)
             )
@@ -939,31 +915,21 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.paused_request_count : self.context.total_request_count
         ].tolist()
         if self.static_sampling:
-            # >>>
-            # return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
-            # +++
             return [
                 (next(iter(self.request_records.values()))[-1].sampling_params,
                  active_request_ids),
             ]
-            # <<<
 
         # Get a map from request_id to context array index.
         context_id_map = {r: i for i, r in enumerate(active_request_ids)}
 
         # Create map of sampling methods to context array indices.
         sampling_map: List[Tuple[SamplingParams, List[int]]] = []
-        # >>>
-        # for request_id, request in self.requests.items():
         for request_id, request_record in self.request_records.items():
-        # <<<
             if request_id not in context_id_map:
                 continue
             context_id = context_id_map[request_id]
-            # >>>
-            # sp = request.sampling_params
             sp = request_record[-1].sampling_params
-            # <<<
 
             # Look for a pre-existing group with these sampling parameters.
             for sampling, indices in sampling_map:
@@ -994,10 +960,7 @@ class DynamicInferenceEngine(AbstractEngine):
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
-            # >>>
-            # req = self.requests[self.waiting_request_ids[0]]
             req = self.get_request(self.waiting_request_ids[0])
-            # <<<
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
@@ -1114,12 +1077,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Failed requests.
         for failed_request_id in self.failed_request_ids:
-            # >>>
-            # failed_request = self.requests.pop(failed_request_id)
-            # +++
             failed_request_record = self.request_records.pop(failed_request_id)
             failed_request = failed_request_record[-1]
-            # <<<
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
             finished_requests.append(failed_request)
