@@ -110,7 +110,7 @@ def compile_allocator():
             _compilation_state = CompilationState.FAILURE
 
 
-def create_unified_mempool() -> MemPool:
+def create_unified_mempool() -> "MemPool":
     """Create a unified memory mempool using CUDA managed memory.
 
     Returns:
