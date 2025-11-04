@@ -376,7 +376,7 @@ class DynamicInferenceRequestRecord:
         self.requests.append(new_request)
 
         # >>>
-        pax("old_request, new_request")
+        # pax("old_request, new_request")
         # <<<
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 

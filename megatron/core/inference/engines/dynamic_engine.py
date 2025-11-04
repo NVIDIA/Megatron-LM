@@ -643,7 +643,7 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(requests[request_id])
+                self._add_request(self.get_request(request_id))
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -865,7 +865,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.status = Status.COMPLETED
                     # >>>
                     # finished_request = self.requests.pop(request_id)
+                    # +++
                     finished_request_record = self.request_records.pop(request_id)
+                    finished_request = finished_request_record[-1]
                     # <<<
                     if finished_request.prompt is None:
                         finished_request.prompt = self.controller.tokenizer.detokenize(
@@ -876,7 +878,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
                         finished_request.generated_tokens
                     )
-                    self.request_completion_futures[request_id].set_result(finished_request)
+                    self.request_completion_futures[request_id].set_result(finished_request_record)
                 else:
                     active_requests.append(request)
             else:
@@ -1114,12 +1116,14 @@ class DynamicInferenceEngine(AbstractEngine):
         for failed_request_id in self.failed_request_ids:
             # >>>
             # failed_request = self.requests.pop(failed_request_id)
+            # +++
             failed_request_record = self.request_records.pop(failed_request_id)
+            failed_request = failed_request_record[-1]
             # <<<
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
             finished_requests.append(failed_request)
-            self.request_completion_futures[failed_request_id].set_result(failed_request)
+            self.request_completion_futures[failed_request_id].set_result(failed_request_record)
         self.failed_request_ids.clear()
 
         # Print context state.
