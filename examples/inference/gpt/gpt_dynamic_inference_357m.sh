@@ -75,6 +75,10 @@ if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
         --cuda-graph-impl local \
         --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
     "
+else
+    ARGS+=" \
+        --cuda-graph-impl none \
+    "
 fi
 
 # Prompts.

@@ -158,8 +158,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.reset()
 
         # Create cuda graphs.
-        if self.cuda_graph_impl == "local":
-            self.create_cuda_graphs()
+        self.create_cuda_graphs()
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -196,6 +195,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             reset_context (bool): Whether to reset the context after building cuda graphs.
         """
+
+        if self.cuda_graph_impl != "local":
+            return
+
         context = self.context
         controller = self.controller
 
