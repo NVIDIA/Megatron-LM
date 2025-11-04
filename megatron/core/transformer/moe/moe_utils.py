@@ -772,7 +772,7 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
             )
         # Average aux losses across data parallel ranks.
         # The `global_load_balancing_loss` already uses `tp_dp_cp_group` in `reduce_group`,
-        # so we don't need to reduce it again. Others use tp_cp_group in `reduce_group`.
+        # so we don't need to reduce it again. Others use `tp_cp_group` in `reduce_group`.
         if name != "global_load_balancing_loss":
             torch.distributed.all_reduce(
                 values,
