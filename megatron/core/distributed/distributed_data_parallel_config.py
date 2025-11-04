@@ -49,6 +49,11 @@ class DistributedDataParallelConfig:
        message size (which for ring algorithms is bucket_size / dp_size) apparently needs
        to be divisible by a power of 2 for high busbw."""
 
+    reduce_scatter_with_fp32_accumulation: bool = False
+    """If true, use a reduce-scatter implementation which sends lower-precision values
+       over the wire (using an all-to-all to keep total communication overhead in line
+       with the standard ring implementation) but performs accumulation locally in FP32."""
+
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
        dp_size first and then computing sum in the collective."""
