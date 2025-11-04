@@ -396,22 +396,6 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
-@dataclass
-class MCoreMetadata(Metadata):
-    """Metadata with mcore specific data."""
-
-    # holds data related to flattened_range
-    # TODO: remove when flattened_range is properly removed
-    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
-
-
-@dataclass(frozen=True)
-class MCoreSavePlan(SavePlan):
-    """SavePlan with MCore specific data."""
-
-    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
-
-
 class MCoreSavePlanner(DefaultSavePlanner):
     """Differs with the default planner by saving BytesIO objects on all ranks.
 
@@ -427,7 +411,6 @@ class MCoreSavePlanner(DefaultSavePlanner):
         self,
         *args,
         dedup_replicated_tensors: Optional[bool] = None,
-        nd_flattened_global_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
         can_run_decentralized_global_plan: bool = True,
         **kwargs,
     ) -> None:
@@ -436,7 +419,6 @@ class MCoreSavePlanner(DefaultSavePlanner):
         if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
-        self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
         self.can_run_decentralized_global_plan = can_run_decentralized_global_plan
         if can_run_decentralized_global_plan:
             assert (
@@ -463,25 +445,11 @@ class MCoreSavePlanner(DefaultSavePlanner):
             # For MCore, these should be already non-duplicates.
             write_items += _create_write_items(fqn, obj)
 
-        self.plan = MCoreSavePlan(
+        self.plan = SavePlan(
             items=write_items,
             planner_data=self.mappings,
-            mcore_data={
-                k: sh_ten.mcore_metadata
-                for k, sh_ten in self.state_dict.items()
-                if isinstance(sh_ten, TorchShardedTensor)
-            },
         )
         return self.plan
-
-    def create_global_plan(self, all_plans: List[MCoreSavePlan]) -> Tuple[List[SavePlan], Metadata]:
-        """Merges MCore data for all plans."""
-        global_plan, metadata = super().create_global_plan(all_plans)
-        mcore_data = dict(
-            ChainMap(*(plan.mcore_data for plan in all_plans))  # type: ignore[arg-type]
-        )
-        metadata = MCoreMetadata(mcore_data=mcore_data, **vars(metadata))
-        return global_plan, metadata
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
         """Nothing to do, just some checks.
