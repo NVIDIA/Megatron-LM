@@ -243,7 +243,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_LTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "container:lts")') || echo "false"
+          HAS_LTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "container::lts")') || echo "false"
           echo "main=$HAS_LTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Download test data
