@@ -4,7 +4,9 @@ from collections import namedtuple
 from dataclasses import dataclass
 from typing import Optional
 
-CoreParams = namedtuple("CoreParams", ["temperature", "top_k", "top_p"])
+CoreParams = namedtuple("CoreParams", [
+    "temperature", "top_k", "top_p", "termination_id", "return_log_probs", "skip_prompt_log_probs"
+    ])
 
 @dataclass
 class SamplingParams:
@@ -48,7 +50,14 @@ class SamplingParams:
     @property
     def core_params(self):
         """Return a tuple of core parameters used to sample tokens from logits."""
-        return CoreParams(temperature=self.temperature, top_k=self.top_k, top_p=self.top_p)
+        return CoreParams(
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            termination_id=self.termination_id,
+            return_log_probs=self.return_log_probs,
+            skip_prompt_log_probs=getattr(self, "skip_prompt_log_probs", False)
+        )
 
     def serializable(self) -> dict:
         """Return a dictionary that is msgpack-serializable."""
