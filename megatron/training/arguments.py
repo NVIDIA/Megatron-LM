@@ -1970,7 +1970,7 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
-    group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
+    group.add_argument('--muon-extra-scale-factor', type=float, default=0.2,
                        help='Additional scale factor for the muon update')
 
     return parser
