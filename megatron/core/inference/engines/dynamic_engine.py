@@ -190,7 +190,7 @@ class DynamicInferenceEngine(AbstractEngine):
         for tbar_idx, cudagraph_config in tbar:
             # Initialize context.
             input_ids, position_ids = self.controller._dynamic_step_context_init(
-                num_warmup_tokens=cudagraph_config.token_count
+                num_warmup_tokens=cudagraph_config.token_count,
                 construct_graph_config=cudagraph_config,
             )
             # Progress.

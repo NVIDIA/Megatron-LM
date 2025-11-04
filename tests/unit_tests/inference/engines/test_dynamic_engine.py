@@ -75,6 +75,7 @@ class DynamicEngineTestConfig:
     expert_model_parallel_size: int = 1
     sequence_parallel: bool = False
 
+    group_query_attention: bool = False
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
     return_log_probs: bool = False
@@ -194,12 +195,17 @@ class TestDynamicInferenceEngine:
     ):
         """The inference context manages the KV cache and other inference state."""
 
+        if test_config.group_query_attention:
+            num_attention_kv_heads = transformer_config.num_query_groups
+        else:
+            num_attention_kv_heads = transformer_config.num_attention_heads
         # Inference context.
         context = DynamicInferenceContext(
             params_dtype=transformer_config.params_dtype,
             num_layers=transformer_config.num_layers,
             kv_channels=transformer_config.kv_channels,
-            num_attention_heads=transformer_config.num_query_groups,
+            num_attention_kv_heads=num_attention_kv_heads,
+            num_attention_qo_heads=transformer_config.num_attention_heads,
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             buffer_size_gb=test_config.context_buffer_size_gb,
@@ -538,14 +544,26 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [64]),
-            (1, [64]),
-            (2, [64, 32]),
-            (4, [64, 48, 32, 16]),
-            (8, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (16, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (64, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
+            # num_cuda_graphs, updated_expected_values
+            (0,   [1280]),
+            (1,   [1280]),
+            (2,   [1280, 640]),
+            (4,   [1280, 960, 640, 320]),
+            (8,   [1280, 1120, 960, 800, 640, 480, 320, 160]),
+            (16,  [1280, 1200, 1120, 1040, 960, 880, 800, 720, 640, 560, 480, 400, 320, 240, 160, 80]),
+            (64,  [1280, 1272, 1248, 1224, 1200, 1176, 1152, 1128, 1104, 1080, 1056, 1032, 1008, 984, 960, 936,
+                   912, 888, 864, 840, 816, 792, 768, 744, 720, 696, 672, 648, 624, 600, 576, 552, 528, 504, 480,
+                   456, 432, 408, 384, 360, 336, 312, 288, 264, 240, 216, 192, 168, 144, 120, 96, 72, 48, 24]),
+            (1024, [1280, 1272, 1264, 1256, 1248, 1240, 1232, 1224, 1216, 1208, 1200, 1192, 1184, 1176, 1168,
+                    1160, 1152, 1144, 1136, 1128, 1120, 1112, 1104, 1096, 1088, 1080, 1072, 1064, 1056, 1048,
+                    1040, 1032, 1024, 1016, 1008, 1000, 992, 984, 976, 968, 960, 952, 944, 936, 928, 920, 912,
+                    904, 896, 888, 880, 872, 864, 856, 848, 840, 832, 824, 816, 808, 800, 792, 784, 776, 768,
+                    760, 752, 744, 736, 728, 720, 712, 704, 696, 688, 680, 672, 664, 656, 648, 640, 632, 624,
+                    616, 608, 600, 592, 584, 576, 568, 560, 552, 544, 536, 528, 520, 512, 504, 496, 488, 480,
+                    472, 464, 456, 448, 440, 432, 424, 416, 408, 400, 392, 384, 376, 368, 360, 352, 344, 336,
+                    328, 320, 312, 304, 296, 288, 280, 272, 264, 256, 248, 240, 232, 224, 216, 208, 200, 192,
+                    184, 176, 168, 160, 152, 144, 136, 128, 120, 112, 104, 96, 88, 80, 72, 64, 56, 48, 40, 32,
+                    24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).

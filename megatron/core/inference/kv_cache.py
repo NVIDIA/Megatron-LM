@@ -98,6 +98,11 @@ class KVCacheBase(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def reset(self):
+        """Resets the cache."""
+        raise NotImplementedError
+
     def supports_triton(self) -> bool:
         """
         Returns True if this cache layout is compatible with Triton kernels.
@@ -158,6 +163,10 @@ class MLACache(KVCacheBase):
         kv_concat = key.squeeze(1)
         self.cache[block_idx, local_kv_seq_idx] = kv_concat[:padded_active_token_count]
 
+    def reset(self):
+        """Resets the MLA cache."""
+        self.cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """MLA is Triton-compatible."""
         return True
@@ -207,6 +216,10 @@ class KVCacheM2NCHD(KVCacheBase):
         self.cache[0, block_idx, local_kv_seq_idx] = key[:padded_active_token_count]
         self.cache[1, block_idx, local_kv_seq_idx] = value[:padded_active_token_count]
 
+    def reset(self):
+        """Resets the merged cache."""
+        self.cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """M_2NCHD is Triton-compatible."""
         return True
@@ -254,6 +267,10 @@ class KVCacheMN2CHD(KVCacheBase):
 
         self.cache[block_idx, 0, local_kv_seq_idx] = key[:padded_active_token_count]
         self.cache[block_idx, 1, local_kv_seq_idx] = value[:padded_active_token_count]
+
+    def reset(self):
+        """Resets the merged cache."""
+        self.cache.fill_(-1)
 
     def supports_triton(self) -> bool:
         """M_N2CHD is Triton-compatible."""
@@ -303,6 +320,10 @@ class KVCacheMN2HCD(KVCacheBase):
 
         self.cache[block_idx, 0, :, local_kv_seq_idx, :] = key[:padded_active_token_count]
         self.cache[block_idx, 1, :, local_kv_seq_idx, :] = value[:padded_active_token_count]
+
+    def reset(self):
+        """Resets the merged cache."""
+        self.cache.fill_(-1)
 
     def supports_triton(self) -> bool:
         """M_N2HCD is Triton-compatible."""
@@ -356,6 +377,11 @@ class KVCacheSNCHD(KVCacheBase):
         self.k_cache[block_idx, local_kv_seq_idx] = key[:padded_active_token_count]
         self.v_cache[block_idx, local_kv_seq_idx] = value[:padded_active_token_count]
 
+    def reset(self):
+        """Resets all caches."""
+        self.k_cache.fill_(-1)
+        self.v_cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """S_NCHD is Triton-compatible."""
         return True
@@ -387,6 +413,11 @@ class KVCacheSNHCD(KVCacheBase):
     def get_content(self) -> Tuple[Tensor, Tensor]:
         """Returns (k_cache, v_cache) tuple."""
         return (self.k_cache, self.v_cache)
+
+    def reset(self):
+        """Resets all caches."""
+        self.k_cache.fill_(-1)
+        self.v_cache.fill_(-1)
 
     def append(
         self,
