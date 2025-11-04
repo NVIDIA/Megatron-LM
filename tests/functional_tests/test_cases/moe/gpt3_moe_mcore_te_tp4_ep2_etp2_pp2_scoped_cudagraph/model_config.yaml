@@ -1,0 +1,96 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  --num-layers: 13
+  --hidden-size: 512
+  --num-attention-heads: 8
+  --mtp-num-layers: 1
+  --micro-batch-size: 2
+  --global-batch-size: 32
+  --seq-length: 1024
+  --max-position-embeddings: 1024
+  --position-embedding-type: rope
+  --rotary-base: 10000
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --train-iters: 100
+  --lr-decay-iters: 320000
+  --split: 949,50,1
+  --distributed-backend: nccl
+  --lr: 0.00015
+  --lr-decay-style: cosine
+  --min-lr: 1.0e-5
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --lr-warmup-fraction: .01
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 4
+  --pipeline-model-parallel-size: 2
+  --expert-model-parallel-size: 2
+  --expert-tensor-parallel-size: 2
+  --pipeline-model-parallel-layout: Et\\|\\(tt\\|\\)*6mL # Et|(tt|)*6mL
+  --sequence-parallel: true
+  --num-experts: 8
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --moe-token-dispatcher-type: alltoall
+  --moe-router-load-balancing-type: global_aux_loss
+  --moe-router-topk: 2
+  --moe-router-dtype: fp32
+  --moe-router-fusion: true
+  --moe-router-enable-expert-bias: true
+  --moe-router-score-function: sigmoid
+  --moe-router-pre-softmax: true
+  --moe-ffn-hidden-size: 1024
+  --moe-shared-expert-intermediate-size: 512
+  --moe-grouped-gemm: true
+  --moe-layer-freq: ([0]*4+[1]*9)
+  --moe-permute-fusion: true
+  --deterministic-mode: true
+  --no-gradient-accumulation-fusion: true
+  --attention-softmax-in-fp32: true
+  --use-checkpoint-opt_param-scheduler: true
+  --use-mcore-models: true
+  --bf16: true
+  --fp8-format: hybrid
+  --fp8-recipe: blockwise
+  --first-last-layers-bf16: true
+  --no-bias-gelu-fusion: true
+  --recompute-granularity: selective
+  --recompute-modules: "[moe_act]"
+  --cuda-graph-impl: transformer_engine
+  --cuda-graph-scope: "[attn mlp moe_router moe_preprocess]"
+  --log-memory-to-tensorboard: true
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --log-interval: 1
+  --timing-log-level: 0
+  --save-interval: 50
+  --eval-interval: 1000
+  --eval-iters: 10
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --ckpt-fully-parallel-load: true
+  --ckpt-format: torch_dist
+  --ckpt-assume-constant-structure: true
+TEST_TYPE: ckpt-resume
+METRICS:
+  # - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+  - "mtp_1 loss"
