@@ -415,7 +415,7 @@ class TestLayerWiseOptimizer:
         # Set same gradients on both models
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             assert torch.equal(param.data, ref_param.data)
-            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
             grad_value = torch.randn_like(param)
             torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
             param.main_grad = grad_value.clone().detach()
@@ -437,4 +437,4 @@ class TestLayerWiseOptimizer:
 
         # Verify updated values match reference optimizer
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)

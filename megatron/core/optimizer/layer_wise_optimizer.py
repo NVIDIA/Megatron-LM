@@ -33,7 +33,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     3. optimizer is already modified so only param belong to this DP rank is updated
     4. grad_norm and zero counting will reduce metrics globally in step function
     5. Do regular update with chained optimizers, modified optimizer only update shard
-    6. allgather updated params to every rank(currently through broadcast loop)
+    6. allgather updated params to every rank
     """
 
     def __init__(
@@ -56,15 +56,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
         if init_state_fn_list:
-            assert len(init_state_fn_list) == len(optimizers), (
-                "init_state_fn_list must be the " "same length as optimizers if provided"
-            )
+            assert len(init_state_fn_list) == len(
+                optimizers
+            ), "init_state_fn_list must be the same length as optimizers if provided"
 
         # wrap optimizer after sharding to avoid unnecessary master weight creation
         # for higher precision, optimizers are wrapped with megatron already
         if config.bf16:
             # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
-            for i, opt in enumerate(optimizers):
+            for i in range(len(optimizers)):
+                opt = optimizers[i]
                 if isinstance(opt, Float16OptimizerWithFloat16Params):
                     raise TypeError(
                         'LayerWiseDistributedOptimizer received Float16 optimizer already.'
