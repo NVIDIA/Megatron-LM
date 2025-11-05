@@ -249,9 +249,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Adjust dict due to possible empty rank 0 which output common_dict
         for sd in sharded_state_dict.values():
             # Drop empty group state to avoid save in common dict (non-empty rank still save)
-            sd['fp32_from_fp16_params'][:] = [
-                group for group in sd['fp32_from_fp16_params'] if group
-            ]
+            if 'fp32_from_fp16_params' in sd:
+                sd['fp32_from_fp16_params'][:] = [
+                    group for group in sd['fp32_from_fp16_params'] if group
+                ]
             # TODO(deyuf): 'common_step' code path is broken and 'step' is saved in 'param_groups'
             # Find next 'step' if present. note this still break if rank0 adam is fully empty
             step = next(
