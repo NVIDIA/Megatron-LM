@@ -133,6 +133,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.static_sampling = static_sampling
         self.inference_logging_step_interval = inference_logging_step_interval
 
         if enable_cuda_graph is not None:
@@ -168,7 +169,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Synchronize request metadata state with active batch state.
         # Please read the docstring of `get_active_request_metadata` for more details.
         self.sync_metadata_to_controller_sources: Dict[str, Callable] = {}
-        if static_sampling:
+        if self.static_sampling:
             fn_to_add = self._sync_static_sampling_params_metadata
             self.controller.static_sampling = True
         else:
@@ -313,9 +314,6 @@ class DynamicInferenceEngine(AbstractEngine):
             fn (Callable): A method that only has two parameters:
                 - requests (Dict[int, DynamicInferenceRequest]): Mapped to self.requests.
                 - active_request_ids (Tensor): The tensor of active request IDs for the next step.
-
-            fn must return (List | Tensor) of metadata aligned with active_request_ids.
-            The shape of the return value must be the same as that of active_request_ids.
         """
         self.sync_metadata_to_controller_sources[tag] = fn
 
@@ -339,6 +337,31 @@ class DynamicInferenceEngine(AbstractEngine):
         return [
             next(iter(requests.values())).sampling_params for _ in range(len(active_request_ids))
         ]
+
+    def get_active_request_metadata(self) -> Dict[str, List | Tensor]:
+        """Aligns request state with the context's currently active batch.
+
+        The controller requires two separate states to generate output tokens:
+         - The state of the active batch, which is maintained by the context.
+           - This involves information about the identity and shape of requests in the active batch.
+         - The state of all request metadata, which is maintained by the engine.
+           - This involves metadata such as termination criteria, sampling criteria, and
+               any extra processing required of the controller (logprobs, speculation, etc).
+
+        The state of the active batch is maintained entirely by the context.
+
+        The state of all request metadata does not belong in the context.
+        Since the controller is stateless by design, the engine must maintain this state.
+        """
+        # Get all active request IDs.
+        active_request_ids = self.context.request_ids[
+            self.context.paused_request_count : self.context.total_request_count
+        ]
+
+        return {
+            tag: method(requests=self.requests, active_request_ids=active_request_ids)
+            for tag, method in self.sync_metadata_to_controller_sources.items()
+        }
 
     async def start_listening_to_data_parallel_coordinator(
         self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
@@ -698,36 +721,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.waiting_request_ids.popleft()
             else:
                 break
-
-    def get_active_request_metadata(self) -> Dict[str, List | Tensor]:
-        """Aligns request state with the context's currently active batch.
-
-        The controller requires two separate states to generate output tokens:
-         - The state of the active batch, which is maintained by the context.
-           - This involves information about the identity and shape of requests in the active batch.
-         - The state of all request metadata, which is maintained by the engine.
-           - This involves metadata such as termination criteria, sampling criteria, and
-               any extra processing required of the controller (logprobs, speculation, etc).
-
-        The state of the active batch is maintained entirely by the context.
-
-        The state of all request metadata does not belong in the context.
-        Since the controller is stateless by design, the engine must maintain this state.
-        """
-        # Get all active request IDs.
-        active_request_ids = self.context.request_ids[
-            self.context.paused_request_count : self.context.total_request_count
-        ]
-        asserted_length = self.context.total_request_count - self.context.paused_request_count
-
-        # Run all state synchronization methods.
-        ret = {}
-        for tag, method in self.sync_metadata_to_controller_sources.items():
-            state = method(requests=self.requests, active_request_ids=active_request_ids)
-            assert isinstance(state, (List, Tensor))
-            assert len(state) == asserted_length
-            ret[tag] = state
-        return ret
 
     def schedule_chunked_prefill(self):
         """
