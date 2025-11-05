@@ -808,6 +808,7 @@ class MambaMixer(MegatronModule):
             sharded_offsets=sharded_offsets,
         )
         # Submodules
+        tp_group = tp_group if self.tp_group is None else self.tp_group
         for name, module in self.named_children():
             if name == "conv1d":
                 # Add TP sharding for Conv1d
