@@ -42,6 +42,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
@@ -434,7 +435,7 @@ class TELinear(te.pytorch.Linear):
             return out
         return out, None
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Replicate cross TP/DP."""
 
         # Provide the dist-ckpt support when TELinear is directly used
@@ -443,7 +444,14 @@ class TELinear(te.pytorch.Linear):
             self.parallel_mode is None
         ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
@@ -622,11 +630,17 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             return out
         return out, None
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Sharding along axis 0, bias sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -715,11 +729,16 @@ class TEColumnParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0, "bias": 0},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -809,11 +828,16 @@ class TERowParallelLinear(TELinear):
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 1}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 1},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def __repr__(self):
@@ -1070,6 +1094,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """Sharded state dict for the learnable softmax offset parameter"""
         if self.config.softmax_type == "learnable":
@@ -1077,7 +1102,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {'softmax_offset': 0},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -1341,7 +1371,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             return extra_states
 
         def _sharded_state_dict_grouped(
-            self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None
+            self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None, tp_group=None
         ):
             """
             prefix should be module_name to make keys identical to sequetial ones.
@@ -1371,7 +1401,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict, '', tp_axis_map, new_sharded_offsets
+                    state_dict,
+                    '',
+                    tp_axis_map,
+                    new_sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=metadata["dp_cp_group"],
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
@@ -1440,7 +1475,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group=tp_group,
             )
 
-        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
             """
             For each gemm, sharding along axis 0, bias sharded.
             Assume sharded_offsets[-1] is the expert parallel offset.
@@ -1449,7 +1484,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             for gemm_idx in range(self.num_gemms):
                 tp_axis_map.update({f"{gemm_idx}.weight": 0, f"{gemm_idx}.bias": 0})
             return super()._sharded_state_dict_grouped(
-                tp_axis_map, prefix, sharded_offsets, metadata
+                tp_axis_map, prefix, sharded_offsets, metadata, tp_group=tp_group
             )
 
     class TERowParallelGroupedLinear(TEGroupedLinear):
@@ -1486,14 +1521,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group=tp_group,
             )
 
-        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
             """
             For each gemm, sharding along axis 1, bias not sharded.
             Assume sharded_offsets[-1] is the expert parallel offset.
             """
             tp_axis_map = {f"{gemm_idx}.weight": 1 for gemm_idx in range(self.num_gemms)}
             return super()._sharded_state_dict_grouped(
-                tp_axis_map, prefix, sharded_offsets, metadata
+                tp_axis_map, prefix, sharded_offsets, metadata, tp_group=tp_group
             )
 
 else:

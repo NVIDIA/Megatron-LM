@@ -11,6 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -58,6 +59,7 @@ class MegatronModule(torch.nn.Module):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
 
@@ -77,13 +79,25 @@ class MegatronModule(torch.nn.Module):
         sharded_state_dict = {}
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        if not hasattr(self, 'tp_group'):
+            # some model interface hasn't updated for m4, fallback needed
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        # Guard for cases metadata is not provided
+        tp_group = tp_group if self.tp_group is None else self.tp_group
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
+            sharded_state_dict,
+            prefix,
+            sharded_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
         # Recurse into submodules
         for name, module in self.named_children():
             sharded_state_dict.update(
-                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata)
+                sharded_state_dict_default(
+                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group
+                )
             )
         return sharded_state_dict
 

@@ -281,6 +281,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
@@ -734,7 +735,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         return hidden_states
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None, tp_group=None
     ) -> ShardedStateDict:
         """
         Generate a sharded state dictionary for the transformer block.
@@ -804,11 +805,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             sharded_state_dict.update(layer_sharded_state_dict)
 
         # Add modules other than self.layers
+        tp_group = tp_group if self.tp_group is None else self.tp_group
         for name, module in self.named_children():
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group
                     )
                 )
 
