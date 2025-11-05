@@ -42,8 +42,8 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
-    is_layer_window_attention,
     ensure_metadata_has_dp_cp_group,
+    is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
 from megatron.core.utils import (
