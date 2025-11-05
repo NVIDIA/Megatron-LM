@@ -715,11 +715,11 @@ class TEColumnParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets, tp_group=tp_group, dp_cp_group=metadata["dp_cp_group"]
         )
 
     def __repr__(self):
