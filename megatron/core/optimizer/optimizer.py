@@ -929,7 +929,8 @@ class FP32Optimizer(MegatronOptimizer):
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 if hasattr(param, 'main_grad'):
-                    param.grad = param.main_grad
+                    # NOTE: need to make this contiguous for nonuniform TP
+                    param.grad = param.main_grad.contiguous()
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 

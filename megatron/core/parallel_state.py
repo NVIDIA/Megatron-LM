@@ -510,6 +510,43 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
 
 
+def _get_active_ranks_for_ntp(
+    dp_rank: int, cp_rank: int, pp_rank: int, tp_base: int, ntp_config: dict
+) -> List[int]:
+    """
+    Get the list of active local rank IDs for a given (DP, CP, PP) rank combination in NTP mode.
+    
+    Args:
+        dp_rank: The data parallel rank index
+        cp_rank: The context parallel rank index
+        pp_rank: The pipeline parallel rank index
+        tp_base: The base tensor parallel size
+        ntp_config: NTP configuration dict
+        
+    Returns:
+        List of active local rank IDs (0-indexed within the DP replica)
+    """
+    non_active_ranks_per_dp = ntp_config.get('non_active_ranks_per_dp', {})
+    if non_active_ranks_per_dp is None:
+        non_active_ranks_per_dp = {}
+    tp_spares = ntp_config.get('tp_spares', 0)
+    
+    # Look up non-active ranks for this specific (dp, cp, pp) combination
+    rank_key = (dp_rank, cp_rank, pp_rank)
+    if rank_key in non_active_ranks_per_dp:
+        # Explicit non-active ranks specified for this (dp, cp, pp) combination
+        non_active = set(non_active_ranks_per_dp[rank_key])
+        return [i for i in range(tp_base) if i not in non_active]
+    else:
+        # Default: last tp_spares ranks are non-active
+        return list(range(tp_base - tp_spares))
+
+
+def _is_ntp_enabled(ntp_config: Optional[dict]) -> bool:
+    """Check if NTP is enabled based on config."""
+    return ntp_config is not None and ntp_config.get('tp_spares', 0) > 0
+
+
 # pylint: disable=C0301
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
@@ -530,6 +567,7 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    ntp_config: Optional[dict] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -644,6 +682,15 @@ def initialize_model_parallel(
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
 
+        ntp_config (dict, default = None):
+            Configuration for Nonuniform Tensor Parallelism (NTP).
+            If provided, should contain:
+                - 'tp_base' (int): Base tensor parallel size
+                - 'tp_spares' (int): Number of spare ranks
+                - 'num_reduced_tp_dp_ranks' (int): Number of DP ranks using reduced TP
+                - 'non_active_ranks_per_dp' (Optional[Dict[int, List[int]]]): 
+                    Mapping of DP rank to non-active local rank IDs
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -710,6 +757,28 @@ def initialize_model_parallel(
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
 
     rank = torch.distributed.get_rank()
+    
+    # Initialize NTP variables if NTP is enabled
+    ntp_enabled = _is_ntp_enabled(ntp_config)
+    if ntp_enabled:
+        tp_base = ntp_config['tp_base']
+        tp_spares = ntp_config['tp_spares']
+        num_reduced_tp_dp_ranks = ntp_config.get('num_reduced_tp_dp_ranks', 0)
+        dp_replica_size = tp_base * context_parallel_size
+        num_dp_replicas = world_size // dp_replica_size
+        
+        # CRITICAL: Set DP rank based on ORIGINAL topology (tp_base), not current TP size
+        # After non-active ranks exit, the world changes but DP rank should remain based on original config
+        # Original formula: global_rank = local_tp_rank + dp_rank * tp_base * cp_size + pp_rank * ...
+        # For PP=1: dp_rank = global_rank // (tp_base * cp_size)
+        global _MPU_DATA_PARALLEL_RANK
+        _MPU_DATA_PARALLEL_RANK = rank // dp_replica_size
+    else:
+        tp_base = None
+        tp_spares = None
+        num_reduced_tp_dp_ranks = None
+        dp_replica_size = None
+        num_dp_replicas = None
 
     nccl_comm_cfgs = {}
     if nccl_communicator_config_path is not None:
@@ -903,45 +972,90 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("cp", nccl_comm_cfgs),
-            group_desc="CONTEXT_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _CONTEXT_PARALLEL_GROUP = group
-            _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
-        if hierarchical_context_parallel_sizes:
-            assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
-            global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-            hierarchical_groups, _ = create_hierarchical_groups(
-                rank,
+    
+    if ntp_enabled and context_parallel_size > 1:
+        # Create CP groups with NTP support
+        # CP groups connect TP ranks at the same RELATIVE position within active ranks
+        for dp_rank_idx in range(num_dp_replicas):
+            dp_replica_start = dp_rank_idx * dp_replica_size
+            
+            if dp_rank_idx < num_reduced_tp_dp_ranks:
+                # This DP replica uses reduced TP
+                # Get active ranks for each CP replica
+                active_ranks_per_cp = []
+                for cp_r in range(context_parallel_size):
+                    active_local_ranks = _get_active_ranks_for_ntp(dp_rank_idx, cp_r, 0, tp_base, ntp_config)
+                    active_ranks_per_cp.append(active_local_ranks)
+                
+                # Verify all CP replicas have the same number of active ranks
+                num_active = len(active_ranks_per_cp[0])
+                for cp_r in range(1, context_parallel_size):
+                    if len(active_ranks_per_cp[cp_r]) != num_active:
+                        raise ValueError(
+                            f"NTP with CP requires same number of active TP ranks across CP replicas. "
+                            f"DP rank {dp_rank_idx}: CP0 has {num_active} active, "
+                            f"CP{cp_r} has {len(active_ranks_per_cp[cp_r])} active"
+                        )
+                
+                # Create CP groups by matching relative positions
+                for relative_pos in range(num_active):
+                    cp_group_ranks = []
+                    for cp_r in range(context_parallel_size):
+                        # Get the TP rank at this relative position in this CP replica
+                        tp_rank_in_slice = active_ranks_per_cp[cp_r][relative_pos]
+                        global_rank = dp_replica_start + cp_r * tp_base + tp_rank_in_slice
+                        cp_group_ranks.append(global_rank)
+                    
+                    group = create_group(
+                        cp_group_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("cp", nccl_comm_cfgs),
+                        group_desc="CONTEXT_PARALLEL_GROUP",
+                    )
+                    if rank in cp_group_ranks:
+                        _CONTEXT_PARALLEL_GROUP = group
+                        _CONTEXT_PARALLEL_GLOBAL_RANKS = cp_group_ranks
+            else:
+                # This DP replica uses normal TP (all ranks = tp_base)
+                for tp_rank_in_slice in range(tp_base):
+                    cp_group_ranks = [
+                        dp_replica_start + tp_rank_in_slice + i * tp_base for i in range(context_parallel_size)
+                    ]
+                    group = create_group(
+                        cp_group_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("cp", nccl_comm_cfgs),
+                        group_desc="CONTEXT_PARALLEL_GROUP",
+                    )
+                    if rank in cp_group_ranks:
+                        _CONTEXT_PARALLEL_GROUP = group
+                        _CONTEXT_PARALLEL_GLOBAL_RANKS = cp_group_ranks
+    else:
+        # Standard CP group creation (no NTP or no CP)
+        for ranks in decoder_rank_generator.get_ranks('cp'):
+            group = create_group(
                 ranks,
-                hierarchical_context_parallel_sizes,
-                create_gloo_process_groups=False,
-                pg_options=get_nccl_options("hcp", nccl_comm_cfgs),
                 timeout=timeout,
+                pg_options=get_nccl_options("cp", nccl_comm_cfgs),
                 group_desc="CONTEXT_PARALLEL_GROUP",
             )
             if rank in ranks:
-                _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
-
-    # Build the model-parallel groups.
-    global _MODEL_PARALLEL_GROUP
-    global _MODEL_PARALLEL_GLOBAL_RANKS
-    assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("mp", nccl_comm_cfgs),
-            group_desc="MODEL_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _MODEL_PARALLEL_GROUP = group
-            _MODEL_PARALLEL_GLOBAL_RANKS = ranks
+                _CONTEXT_PARALLEL_GROUP = group
+                _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
+            if hierarchical_context_parallel_sizes:
+                assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
+                global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+                hierarchical_groups, _ = create_hierarchical_groups(
+                    rank,
+                    ranks,
+                    hierarchical_context_parallel_sizes,
+                    create_gloo_process_groups=False,
+                    pg_options=get_nccl_options("hcp", nccl_comm_cfgs),
+                    timeout=timeout,
+                    group_desc="CONTEXT_PARALLEL_GROUP",
+                )
+                if rank in ranks:
+                    _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
 
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
@@ -949,16 +1063,82 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp", nccl_comm_cfgs),
-            group_desc="TENSOR_MODEL_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _TENSOR_MODEL_PARALLEL_GROUP = group
-            _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+    
+    if ntp_enabled:
+        # Create TP groups with NTP support
+        # For reduced TP DP ranks, use only active ranks
+        # For normal TP DP ranks, use all ranks
+        for dp_rank_idx in range(num_dp_replicas):
+            dp_replica_start = dp_rank_idx * dp_replica_size
+            
+            if dp_rank_idx < num_reduced_tp_dp_ranks:
+                # This DP replica uses reduced TP
+                # Create TP groups for each CP slice within this DP replica
+                for cp_rank in range(context_parallel_size):
+                    # Get active ranks for this specific (dp, cp, pp=0) combination
+                    active_local_ranks = _get_active_ranks_for_ntp(dp_rank_idx, cp_rank, 0, tp_base, ntp_config)
+                    cp_slice_start = dp_replica_start + cp_rank * tp_base
+                    tp_group_ranks = [cp_slice_start + local_tp for local_tp in active_local_ranks]
+                    
+                    group = create_group(
+                        tp_group_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+                        group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+                    )
+                    if rank in tp_group_ranks:
+                        _TENSOR_MODEL_PARALLEL_GROUP = group
+                        _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
+            else:
+                # This DP replica uses normal TP (all ranks = tp_base)
+                for cp_rank in range(context_parallel_size):
+                    cp_slice_start = dp_replica_start + cp_rank * tp_base
+                    tp_group_ranks = list(range(cp_slice_start, cp_slice_start + tp_base))
+                    
+                    group = create_group(
+                        tp_group_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+                        group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+                    )
+                    if rank in tp_group_ranks:
+                        _TENSOR_MODEL_PARALLEL_GROUP = group
+                        _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = tp_group_ranks
+    else:
+        # Standard TP group creation (no NTP)
+        for ranks in decoder_rank_generator.get_ranks('tp'):
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+                group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+            )
+            if rank in ranks:
+                _TENSOR_MODEL_PARALLEL_GROUP = group
+                _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+
+    # Build the model-parallel groups.
+    global _MODEL_PARALLEL_GROUP
+    global _MODEL_PARALLEL_GLOBAL_RANKS
+    assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
+    
+    if ntp_enabled:
+        # For NTP, MODEL_PARALLEL_GROUP is same as TENSOR_MODEL_PARALLEL_GROUP (since PP=1 typically)
+        # This was already set in the TP group creation section above
+        if _MODEL_PARALLEL_GROUP is None:
+            _MODEL_PARALLEL_GROUP = _TENSOR_MODEL_PARALLEL_GROUP
+            _MODEL_PARALLEL_GLOBAL_RANKS = _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    else:
+        for ranks in decoder_rank_generator.get_ranks('tp-pp'):
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("mp", nccl_comm_cfgs),
+                group_desc="MODEL_PARALLEL_GROUP",
+            )
+            if rank in ranks:
+                _MODEL_PARALLEL_GROUP = group
+                _MODEL_PARALLEL_GLOBAL_RANKS = ranks
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
@@ -1105,15 +1285,52 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
-        )
-        if rank in ranks:
-            _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
+    
+    if ntp_enabled and context_parallel_size > 1:
+        # Create TP-CP groups with NTP support
+        for dp_rank_idx in range(num_dp_replicas):
+            dp_replica_start = dp_rank_idx * dp_replica_size
+            
+            if dp_rank_idx < num_reduced_tp_dp_ranks:
+                # This DP replica uses reduced TP
+                # Create combined TP-CP group with all active ranks across all CP replicas
+                tp_cp_group_ranks = []
+                for cp_r in range(context_parallel_size):
+                    # Get active ranks for this specific (dp, cp, pp=0) combination
+                    active_local_ranks = _get_active_ranks_for_ntp(dp_rank_idx, cp_r, 0, tp_base, ntp_config)
+                    for active_tp in active_local_ranks:
+                        tp_cp_group_ranks.append(dp_replica_start + cp_r * tp_base + active_tp)
+                
+                group = create_group(
+                    tp_cp_group_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                    group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
+                )
+                if rank in tp_cp_group_ranks:
+                    _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
+            else:
+                # This DP replica uses normal TP
+                tp_cp_group_ranks = list(range(dp_replica_start, dp_replica_start + dp_replica_size))
+                group = create_group(
+                    tp_cp_group_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                    group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
+                )
+                if rank in tp_cp_group_ranks:
+                    _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
+    else:
+        # Standard TP-CP group creation (no NTP or no CP)
+        for ranks in decoder_rank_generator.get_ranks('tp-cp'):
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
+            )
+            if rank in ranks:
+                _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
@@ -1283,6 +1500,30 @@ def initialize_model_parallel(
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
     _set_global_memory_buffer()
+    
+    # Handle NTP spare ranks - they should exit after all groups are created
+    if ntp_enabled:
+        # Check if current rank is a spare rank
+        dp_replica_id = rank // dp_replica_size
+        if dp_replica_id < num_reduced_tp_dp_ranks:
+            local_rank_in_dp = rank % dp_replica_size
+            # Calculate CP, PP, and TP ranks within the DP replica
+            # Rank organization: rank = dp * dp_replica_size + cp * (tp_base * pp_size) + pp * tp_base + tp
+            cp_rank_in_dp = local_rank_in_dp // (tp_base * pipeline_model_parallel_size)
+            pp_rank_in_dp = (local_rank_in_dp % (tp_base * pipeline_model_parallel_size)) // tp_base
+            tp_rank_in_slice = local_rank_in_dp % tp_base
+            
+            # Get active ranks for this specific (dp, cp, pp) combination
+            active_local_ranks = _get_active_ranks_for_ntp(
+                dp_replica_id, cp_rank_in_dp, pp_rank_in_dp, tp_base, ntp_config
+            )
+            
+            if tp_rank_in_slice not in active_local_ranks:
+                # This is a spare rank - exit gracefully
+                print(f"[NTP] Rank {rank} is a spare rank (DP={dp_replica_id}, CP={cp_rank_in_dp}, "
+                      f"PP={pp_rank_in_dp}, TP={tp_rank_in_slice}) in NTP configuration, exiting.", flush=True)
+                import sys
+                sys.exit(0)
 
 
 def is_initialized():
