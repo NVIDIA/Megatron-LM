@@ -207,11 +207,16 @@ def setup_model_and_optimizer(
                     optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
                     optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
     else:
-        for opt in optimizer.chained_optimizers:
-            for group in opt.param_groups:
-                for p in group['params']:
-                    if len(opt.state[p]) == 0:
-                        opt.state[p]['momentum_buffer'] = torch.rand_like(p.data)
+        for group in optimizer.chained_optimizers[0].param_groups:
+            for p in group['params']:
+                if len(optimizer.chained_optimizers[0].state[p]) == 0:
+                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(p.data)
+        
+        for group in optimizer.chained_optimizers[1].param_groups:
+            for p in group['params']:
+                if len(optimizer.chained_optimizers[1].state[p]) == 0:
+                    optimizer.chained_optimizers[1].state[p]['exp_avg'] = torch.rand_like(p.data)
+                    optimizer.chained_optimizers[1].state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
 
@@ -304,11 +309,16 @@ def setup_moe_model_and_optimizer(
                         opt.state[p]['exp_avg'] = torch.rand_like(p.data)
                         opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
     else:
-        for opt in optimizer.chained_optimizers:
-            for group in opt.param_groups:
-                for p in group['params']:
-                    if len(opt.state[p]) == 0:
-                        opt.state[p]['momentum_buffer'] = torch.rand_like(p.data)
+        for group in optimizer.chained_optimizers[0].param_groups:
+            for p in group['params']:
+                if len(optimizer.chained_optimizers[0].state[p]) == 0:
+                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(p.data)
+        
+        for group in optimizer.chained_optimizers[1].param_groups:
+            for p in group['params']:
+                if len(optimizer.chained_optimizers[1].state[p]) == 0:
+                    optimizer.chained_optimizers[1].state[p]['exp_avg'] = torch.rand_like(p.data)
+                    optimizer.chained_optimizers[1].state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
 
