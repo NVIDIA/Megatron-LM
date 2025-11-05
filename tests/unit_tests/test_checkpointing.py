@@ -206,7 +206,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
-    args.use_megatron_fsdp = ckpt_format == "fsdp_dtensor"
 
     iteration = 123
     config = TransformerConfig(num_layers=1, kv_channels=1)
@@ -240,9 +239,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         expected_ckpt_path = None
         if ckpt_format == "torch":
             expected_ckpt_path = ckpt_dir / "mp_rank_00" / "model_optim_rng.pt"
-        elif ckpt_format == "torch_dcp":
-            expected_ckpt_path = ckpt_dir / ".metadata"
-        elif ckpt_format == "fsdp_dtensor":
+        elif ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
