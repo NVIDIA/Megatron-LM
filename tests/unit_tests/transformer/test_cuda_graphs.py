@@ -5,6 +5,7 @@ import random
 import sys
 import time
 import types
+import gc
 
 import pytest
 import torch
@@ -763,6 +764,7 @@ class TestPartialCudaGraph:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        gc.collect()
 
     def model_provider(
         self,

@@ -3,6 +3,7 @@
 import contextlib
 import os
 import sys
+import gc
 
 import pytest
 import torch
@@ -72,6 +73,7 @@ class TestFP8Param:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        gc.collect()
 
     def model_provider(
         self,
