@@ -3,38 +3,57 @@
 ARG FROM_IMAGE_NAME
 ARG WHEEL_DIR=/workspace/wheels
 
-FROM ${FROM_IMAGE_NAME} as main
-ENV PIP_CONSTRAINT=""
+FROM $FROM_IMAGE_NAME as build_mamba
+WORKDIR /opt
+ARG WHEEL_DIR
+RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.0.3 -w $WHEEL_DIR
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as build_causalconv1d
+WORKDIR /opt
+ARG WHEEL_DIR
+RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/Dao-AILab/causal-conv1d.git@v1.2.2.post1 -w $WHEEL_DIR
+
+FROM $FROM_IMAGE_NAME as build_groupedgemm
+WORKDIR /opt
+ARG WHEEL_DIR
+RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2 -w $WHEEL_DIR
+
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
-ARG UV_VERSION=0.7.2
-ARG YQ_VERSION=4.44.1
-ENV PATH="/root/.local/bin:$PATH"
-ARG UV_PROJECT_ENVIRONMENT=/opt/venv
-ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
-ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
-ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
-ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
     apt-get update
     apt-get install -y --no-install-recommends gettext python3-venv psmisc
     apt-get clean
     python -m venv /opt/jet
-    wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
+    wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
-    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
+ARG UV_VERSION=0.7.2
+ENV PATH="/root/.local/bin:$PATH"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
+ENV UV_LINK_MODE=copy
+
+RUN
 ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    bash -ex <<"EOF"
-    export NVTE_CUDA_ARCHS="80;90;100"
+COPY docker/common/ /workspace/docker/common/
+COPY --from=build_mamba $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_causalconv1d $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
+RUN bash -ex <<"EOF"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
-    uv sync --only-group build
-    uv sync --extra dev --extra mlm --link-mode copy --locked \
+
+    uv sync --extra lts --extra mlm --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -50,26 +69,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
+
+    bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment lts
 EOF
-
-# Install DeepEP
-COPY docker/patches/deepep.patch /workspace/deepep.patch
-RUN bash -ex <<"EOF"
-    cd /workspace
-    uv pip install nvidia-nvshmem-cu13
-    pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
-        ln -s libnvshmem_host.so.3 libnvshmem_host.so
-    popd
-
-    git clone https://github.com/deepseek-ai/DeepEP.git
-    pushd DeepEP
-        git checkout ef73fd9a4c098e09929e48dfd696505ddc8e2043
-        patch -p1 < /workspace/deepep.patch
-    popd
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
-    rm -rf DeepEP
-EOF
-
+ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
