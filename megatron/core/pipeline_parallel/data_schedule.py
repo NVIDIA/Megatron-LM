@@ -307,10 +307,9 @@ def wrap_dataloader(
     total_hdp_gpus = dp_cp_group.size()
     dev = torch.cuda.current_device()
 
-    # TODO(tailaim): handle the case when data_iterator is None
     if data_iterator is None:
         # TP-0 reads from data_iterator, others receive via broadcast.
-        sample_id_groups, batch = None, None, None
+        sample_id_groups, batch = None, None
         num_total_groups_broadcast = torch.tensor([0], dtype=torch.int32, device=dev)
         _broadcast(num_total_groups_broadcast)
         num_micro_batches = int(num_total_groups_broadcast.item())
@@ -352,6 +351,10 @@ def wrap_dataloader(
         )
         _broadcast(num_total_groups_broadcast)
 
+        # TODO(tailaim): calculate this two values properly
+        # num_total_tokens_this_GA = losses_reduced.pop(0)
+        # sequence_square_sum_this_GA = losses_reduced.pop(0)
+
         # pack sequences in the same group and create a new data iterator
         new_samples = []
         for i in range(num_micro_batches):
@@ -375,10 +378,10 @@ def wrap_dataloader(
 
             # TODO(tailaim): do we need attention_mask for sequence packing?
             new_sample = {}
-            new_sample["tokens"] = tokens.unsqueeze(0)
-            new_sample["labels"] = labels.unsqueeze(0)
-            new_sample["loss_mask"] = loss_mask.unsqueeze(0)
-            new_sample["position_ids"] = position_ids.unsqueeze(0)
+            new_sample["tokens"] = tokens
+            new_sample["labels"] = labels
+            new_sample["loss_mask"] = loss_mask
+            new_sample["position_ids"] = position_ids
             new_sample["local_cp_size"] = torch.tensor(
                 partner_cp_size, dtype=torch.int32, device=dev
             )
@@ -442,6 +445,7 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         super().__init__(config)
         self.max_seq_len_all_ranks = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
         self.dp_size = parallel_state.get_data_parallel_world_size()
+        self.cp_size = parallel_state.get_context_parallel_world_size()
 
     def get_groups_and_subsamples(self, sample_id_seqlens, config):
         """
@@ -451,35 +455,44 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         """
         groups = []
         sample_id_groups = []
+        packed_id_groups = []
         sum_seqlen = 0
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i] <= self.max_seq_len_all_ranks:
+            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
                 single_microbatch.append(i)
                 sum_seqlen += sample_id_seqlens[i][1]
             else:
                 groups.append(single_microbatch)
-                sample_id_groups.append(single_microbatch)
+                packed_id_groups.append(single_microbatch)
                 single_microbatch = [i]
                 sum_seqlen = sample_id_seqlens[i][1]
 
-        # we want the number of microbatches to be multiple of dp_size
+        # we want the number of packed sequences to be multiple of dp_size
         # so we move few samples from previous microbatch
         # to the end of the microbatches if needed
-        num_microbatches_before = len(sample_id_groups)
-        if num_microbatches_before % self.dp_size != 0:
-            remainder = num_microbatches_before % self.dp_size
+        num_packed_sequence = len(packed_id_groups)
+        if num_packed_sequence % self.dp_size != 0:
+            remainder = num_packed_sequence % self.dp_size
             num_to_move = self.dp_size - remainder
-            i = num_microbatches_before - 1
+            i = num_packed_sequence - 1
             while num_to_move > 0:
                 assert i > 0, "Not enough samples to move"
-                if len(sample_id_groups[i]) > 1:
-                    seq_id = sample_id_groups[i].pop()
-                    sample_id_groups[i].append(seq_id)
+                if len(packed_id_groups[i]) > 1:
+                    seq_id = packed_id_groups[i].pop()
+                    packed_id_groups[i].append(seq_id)
                     num_to_move -= 1
                 else:
                     i -= 1
+
+        num_micro_batches = int(len(packed_id_groups) / self.dp_size)
+        for i in range(num_micro_batches):
+            sample_id_groups.append([])
+            for j in range(self.cp_size * self.dp_size):
+                seq_id = int(i * self.dp_size + j / self.cp_size)
+                sample_id_groups[i].append(packed_id_groups[seq_id])
+
         return groups, sample_id_groups
 
 
