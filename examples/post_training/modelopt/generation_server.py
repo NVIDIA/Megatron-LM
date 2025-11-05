@@ -11,14 +11,7 @@ import sys
 from argparse import Namespace
 from contextlib import nullcontext
 
-import torch
-
-from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-    GPTInferenceWrapper,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
@@ -26,16 +19,20 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.text_generation_server import MegatronServer
-from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
-from megatron.core.transformer.module import MegatronModule
-from megatron.training import get_model, print_rank_0
-
+import torch
 
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
+from megatron.training import get_model
+from megatron.core.transformer.module import MegatronModule
+from megatron.inference.text_generation import beam_search_and_post_process
+from megatron.inference.text_generation.mcore_engine_server import (
+    ModelInferenceWrapperServer,
+    run_mcore_engine,
+)
+from megatron.inference.text_generation_server import MegatronServer
 from megatron.training import print_rank_0
 
 from megatron.core import mpu
@@ -72,10 +69,8 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         inference_max_requests=args.inference_max_batch_size,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
     )
-    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
-    inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_wrapper_config, inference_context
-    )
+
+    inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
@@ -116,7 +111,7 @@ def add_text_generate_args(parser):
     group.add_argument(
         "--max-batch-size",
         type=int,
-        default=64,
+        default=None,
         help='Deprecated in favor of `--inference-max-batch-size`',
     )
     add_modelopt_args(parser)
@@ -124,7 +119,7 @@ def add_text_generate_args(parser):
 
 
 @torch.inference_mode()
-def main():
+def main(model_provider: str = "gpt"):
     """Runs the text generation server with the specified model provider."""
     initialize_megatron(
         extra_args_provider=add_text_generate_args,
@@ -148,8 +143,14 @@ def main():
 
         load_context = fp8_model_init()
     with load_context:
+
         from megatron.post_training.model_provider import model_provider as modelopt_model_provider
-        model = get_model(modelopt_model_provider, wrap_with_ddp=False)
+        if model_provider == "gpt":
+            model = get_model(modelopt_model_provider, wrap_with_ddp=False)
+        elif model_provider == "mamba":
+            pass
+        else:
+            raise ValueError(f"Invalid model provider {model_provider}")
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)
@@ -159,14 +160,12 @@ def main():
     model.eval()
 
     if args.max_batch_size is not None:
-        if args.inference_max_batch_size is None or args.inference_max_batch_size < args.max_batch_size:
-            args.inference_max_batch_size = args.max_batch_size
-        else:
-            args.inference_max_batch_size = args.max_batch_size
-            warnings.warn(
-                "`--inference-max-batch-size` has been deprecated in favor of `--max-batch-size`, "
-                f"setting maximum batch size to {args.max_batch_size}"
-            )
+        assert args.inference_max_batch_size is not None
+        args.inference_max_batch_size = max(args.inference_max_batch_size, args.max_batch_size)
+        warnings.warn(
+            "`--max-batch-size` has been deprecated in favor of `--inference-max-requests`, "
+            f"setting maximum batch size to {args.inference_max_batch_size}"
+        )
 
     inference_engine = get_inference_engine(args, model)
 
@@ -193,9 +192,13 @@ def main():
             except ValueError as ve:
                 pass
         elif choice.item() == 1:
-            raise NotImplementedError(f"Beam search is not supported")
+            try:
+                beam_search_and_post_process(
+                    inference_engine.text_generation_controller.inference_wrapped_model.model
+                )
+            except ValueError as ve:
+                pass
 
 
 if __name__ == "__main__":
-    main()
-
+    main(model_provider="gpt")
