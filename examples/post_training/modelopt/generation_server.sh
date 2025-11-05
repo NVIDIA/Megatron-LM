@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(realpath $(dirname "$(readlink -f "$0")")/../../../tools)"
 
 # Common arguments and base model specific arguments
 source "${SCRIPT_DIR}/conf/arguments.sh"
@@ -18,7 +18,7 @@ if [ -z ${DRAFT_LEN} ]; then
     DRAFT_LEN=0
 fi
 
-${LAUNCH_SCRIPT} ${SCRIPT_DIR}/generation_server.py \
+${LAUNCH_SCRIPT} ${SCRIPT_DIR}/run_text_generation_server.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
