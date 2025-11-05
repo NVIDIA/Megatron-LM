@@ -70,6 +70,9 @@ class TestParallelMLPWithGLU:
             mlp_A = initialize_mlp()
             save(mlp_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_A)
             Utils.destroy_model_parallel()
+            
+            if "dp_cp_group" in list(metadata.keys()):
+                del metadata["dp_cp_group"]
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
             Utils.initialize_model_parallel(*dest_tp_pp)
