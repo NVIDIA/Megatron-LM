@@ -63,8 +63,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # wrap optimizer after sharding to avoid unnecessary master weight creation
         # for higher precision, optimizers are wrapped with megatron already
         if config.bf16:
-            if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
-                raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
             # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
             for i, opt in enumerate(optimizers):
                 if isinstance(opt, Float16OptimizerWithFloat16Params):
