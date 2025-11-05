@@ -735,7 +735,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         return hidden_states
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None, tp_group = None
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None, tp_group=None
     ) -> ShardedStateDict:
         """
         Generate a sharded state dictionary for the transformer block.
@@ -810,11 +810,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module,
-                        f'{prefix}{name}.',
-                        sharded_offsets,
-                        metadata,
-                        tp_group=tp_group,
+                        module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group
                     )
                 )
 

@@ -189,7 +189,7 @@ class TestExpertLayerReconfiguration:
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
-            
+
             if "dp_cp_group" in list(metadata.keys()):
                 del metadata["dp_cp_group"]
 
@@ -278,7 +278,7 @@ class TestExpertLayerReconfiguration:
             save_strategy = get_default_save_sharded_strategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
-            
+
             if "dp_cp_group" in list(metadata.keys()):
                 del metadata["dp_cp_group"]
 
@@ -356,7 +356,7 @@ class TestExpertLayerReconfiguration:
             save_strategy = get_default_save_sharded_strategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
-            
+
             if "dp_cp_group" in list(metadata.keys()):
                 del metadata["dp_cp_group"]
 

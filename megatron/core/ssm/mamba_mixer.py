@@ -78,7 +78,12 @@ class ExtendedRMSNorm(RMSNormGated):
         """Sharding along axis 0, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets, tp_group=tp_group, dp_cp_group=metadata["dp_cp_group"]
+            state_dict,
+            prefix,
+            {"weight": 0},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
