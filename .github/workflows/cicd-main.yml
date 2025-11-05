@@ -232,25 +232,10 @@ jobs:
         with:
           python-version: 3.12
 
-      - name: Install GH CLI
-        shell: bash -x -e -u -o pipefail {0}
-        run: |
-          apt-get update
-          apt-get install -y gh
-
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
-
-      - name: Has lts label
-        id: has-lts-label
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_LTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "container::lts")') || echo "false"
-          echo "main=$HAS_LTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Download test data
         shell: bash
@@ -290,22 +275,6 @@ jobs:
           echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
           echo "EOF" | tee -a $GITHUB_OUTPUT
 
-      - name: Parse baseimage
-        shell: bash
-        id: base-image
-        env:
-          HAS_LTS_LABEL: ${{ steps.has-lts-label.outputs.main }}
-        run: |
-          if [ "$HAS_LTS_LABEL" == "true" ]; then
-            NGC_VERSION=$(cat docker/.ngc_version.lts)
-            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
-            echo "image_type=lts" | tee -a $GITHUB_OUTPUT
-          else
-            NGC_VERSION=$(cat docker/.ngc_version.dev)
-            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
-            echo "image_type=dev" | tee -a $GITHUB_OUTPUT
-          fi
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -317,8 +286,7 @@ jobs:
           context: .
           target: main
           build-args: |
-            FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
-            IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
+            FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
           cache-from: |
             type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
             type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
