@@ -6,12 +6,12 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import torch
 import types
+import yaml
 
 from itertools import chain, starmap
-from types import SimpleNamespace
-import yaml, re, os
 from types import SimpleNamespace
 
 import torch.nn.functional as F
