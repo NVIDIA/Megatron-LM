@@ -210,8 +210,10 @@ def setup_model_and_optimizer(
         for group in optimizer.chained_optimizers[0].param_groups:
             for p in group['params']:
                 if len(optimizer.chained_optimizers[0].state[p]) == 0:
-                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(p.data)
-        
+                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(
+                        p.data
+                    )
+
         for group in optimizer.chained_optimizers[1].param_groups:
             for p in group['params']:
                 if len(optimizer.chained_optimizers[1].state[p]) == 0:
@@ -312,8 +314,10 @@ def setup_moe_model_and_optimizer(
         for group in optimizer.chained_optimizers[0].param_groups:
             for p in group['params']:
                 if len(optimizer.chained_optimizers[0].state[p]) == 0:
-                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(p.data)
-        
+                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(
+                        p.data
+                    )
+
         for group in optimizer.chained_optimizers[1].param_groups:
             for p in group['params']:
                 if len(optimizer.chained_optimizers[1].state[p]) == 0:
