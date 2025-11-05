@@ -1910,11 +1910,16 @@ def get_thd_batch_on_this_cp_rank(
         cp_group=cp_group,
     )
 
+    for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
+        if key in batch:
+            batch[key] = batch[key].unsqueeze(0)
+
     if cp_size > 1:  # slice batch along sequence dimension for context parallelism
         assert tex is not None and is_te_min_version("1.10.0"), (
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
+        # print(f"tokens shape before cp slice: {batch['tokens'].shape}")
         index = tex.thd_get_partitioned_indices(
             cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
         )

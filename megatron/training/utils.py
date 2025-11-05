@@ -563,8 +563,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             else:
                 assert isinstance(cu_seqlens, torch.Tensor)
                 assert cu_seqlens.dtype == torch.int32
-                #TODO(tailaim): verify the shape for this tensor
-                # assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
@@ -718,6 +716,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
         }
+
+    if not args.sft_sequence_packing:
+        keys_to_keep = ['tokens', 'labels', 'loss_mask', 'attention_mask', 'position_ids']
+        batch = {k: v for k, v in batch.items() if k in keys_to_keep}
 
     return batch
 

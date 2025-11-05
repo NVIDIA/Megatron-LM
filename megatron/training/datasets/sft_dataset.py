@@ -81,11 +81,14 @@ class SFTDataset(MegatronDataset):
             cp_pad = cp_pad * dp_size if hybrid_cp else cp_pad
             divisor = cp_pad * tp_pad
         """
-        cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
-        cp_pad = cp_pad * self.config.data_parallel_size if self.config.hybrid_context_parallel else cp_pad
+        if self.config.hybrid_context_parallel:
+            # Hybrid CP: consider both CP and DP
+            cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
+        else:
+            # Standard CP: only consider CP
+            cp_pad = self.context_parallel_size * 2 if self.context_parallel_size > 1 else 1
         tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
         divisor = cp_pad * tp_pad
-
         return divisor
     
     def get_padding_size(
