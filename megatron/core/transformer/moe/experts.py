@@ -2,7 +2,6 @@
 
 import copy
 import itertools
-import traceback
 from copy import deepcopy
 from functools import partial
 from math import ceil
@@ -12,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
