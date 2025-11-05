@@ -219,9 +219,12 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
-    
-    # Notice: This is a naive implementation to test the correctness, a better solution will only sync the boundary tokens once.
-    assert dims == -1 or dims == tensor.dim() - 1, "Packed sequence roll only supports the last dimension."
+
+    # Notice: This is a naive implementation to test the correctness,
+    # a better solution will only sync the boundary tokens once.
+    assert (
+        dims == -1 or dims == tensor.dim() - 1
+    ), "Packed sequence roll only supports the last dimension."
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
@@ -251,17 +254,15 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     for i in range(len(cu_seqlens) - 1):
         start_idx = cu_seqlens[i]
         end_idx = cu_seqlens[i + 1]
-        
-        # the idx has been multiplied by cp_size, so we need to divide it by cp_size to get the local idx
+
+        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
         local_end_idx = end_idx // cp_size
         tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
-        
+
         # The following code is very similar as the code in roll_tensor function
         local_chunks = tensor_slice.chunk(2, dim=dims)
-        rolled_chunks = [
-            torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks
-        ]
+        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
 
         tensor_send_list = []
         tensor_recv_list = []
@@ -292,7 +293,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             chunk[tuple(index)] = recv
 
         seq_result = torch.cat(rolled_chunks, dim=dims)
-        
+
         # update the rolled tensor
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 

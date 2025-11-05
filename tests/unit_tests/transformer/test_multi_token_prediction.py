@@ -530,7 +530,7 @@ class TestMultiTokenPrediction:
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
         """Test roll_tensor function with packed sequences, with and without CP.
-        
+
         For CP=1: Tests standard packed sequence rolling with verified expected values
         For CP=2: Tests CP-enabled rolling executes without errors
         """
@@ -558,11 +558,56 @@ class TestMultiTokenPrediction:
 
             # Expected: [2, 3, 0, 5, 0] - boundaries at indices 2 and 4 are zeroed
             expected = torch.tensor([2, 3, 0, 5, 0], dtype=torch.float32).cuda()
-            assert torch.allclose(rolled, expected), f"Expected {expected}, got {rolled}"
+            assert torch.equal(rolled, expected), f"Expected {expected}, got {rolled}"
         else:
-            pass
-            # TODO(lit): Add test for CP=2 with packed sequences.
-        
+            # Test case: Packed sequences with CP=2
+            # Two sequences:
+            #   seq1 = [1, 2, 3, 4, 5, 6, 7, 8]
+            #   seq2 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+
+            if cp_rank == 0:
+                # CP Rank 0: first half of each sequence
+                tensor = torch.tensor(
+                    [1, 2, 7, 8, 11, 12, 13, 20, 21, 22], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [2, 3, 8, 0, 12, 13, 14, 21, 22, 0], dtype=torch.float32
+                ).cuda()
+            else:
+                # CP Rank 1: second half of each sequence
+                tensor = torch.tensor(
+                    [3, 4, 5, 6, 14, 15, 16, 17, 18, 19], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [4, 5, 6, 7, 15, 16, 17, 18, 19, 20], dtype=torch.float32
+                ).cuda()
+
+            cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=6,  # max(4, 6) - max local seq length per sequence
+                max_seqlen_kv=6,
+                qkv_format='thd',
+            )
+
+            # Roll by -1 (shift left) with CP communication
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            # Verify the rolled tensor matches expected values
+            assert (
+                rolled.shape == expected.shape
+            ), f"Shape mismatch: expected {expected.shape}, got {rolled.shape}"
+            assert torch.equal(
+                rolled, expected
+            ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+
+            # Verify sum is correct
+            assert sum_val.numel() == 1, "Sum should be a scalar"
+
         Utils.destroy_model_parallel()
 
 
