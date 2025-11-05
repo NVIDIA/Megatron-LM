@@ -185,7 +185,7 @@ if HAVE_TE and is_te_min_version("2.2"):
         # makes fp8 params compatible with CUDA graph.
         kwargs = {}
         if te_post_all_gather_processing is not None:
-            kwargs["keep_columnwise"] = True
+            kwargs["manual_post_all_gather_processing"] = True
 
         cast_master_weights_to_fp8(*args, **kwargs)
 
