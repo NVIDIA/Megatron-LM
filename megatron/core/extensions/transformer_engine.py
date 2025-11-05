@@ -43,6 +43,7 @@ from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     is_layer_window_attention,
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
 )
 from megatron.core.utils import (
@@ -624,6 +625,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Sharding along axis 0, bias sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets, tp_group=tp_group, dp_cp_group=metadata["dp_cp_group"]
