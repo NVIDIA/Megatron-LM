@@ -4,7 +4,7 @@ import math
 import warnings
 from contextlib import nullcontext
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +48,17 @@ try:
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
+
+try:
+    import wandb  # pylint: disable=unused-import
+
+    HAVE_WANDB = True
+except ImportError:
+    HAVE_WANDB = False
+    wandb = None
+
+if TYPE_CHECKING:
+    import wandb as WandbModule
 
 
 class ContextOverflowError(Exception):
@@ -226,6 +237,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
         If None, defaults to using flash-infer if available.
+        metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
     """
 
     def __init__(
@@ -251,6 +263,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 0,
+        metrics_writer: Optional['WandbModule'] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -259,6 +272,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
+
+        self.metrics_writer = metrics_writer
 
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
@@ -1569,3 +1584,67 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Convert each log prob tensor into a list
         return [lp.tolist() for lp in selected_log_probs_list]
+
+    def get_kvcache_utilization_stats(self) -> dict:
+        """Compute KV cache buffer utilization stats for the current step.
+
+        Returns a dictionary with counts and percentages for both allocated block
+        usage (overall buffer occupancy) and active usage (blocks referenced by
+        currently active requests this step).
+
+        Return:
+            {
+            'total_blocks': int,
+            'allocated_blocks': int,
+            'active_unique_blocks': int,
+            'allocated_utilization': float,
+            'active_utilization': float,
+            'active_request_count': int,
+            'paused_request_count': int,
+            'gtd_block_count': int,
+            }
+        """
+        # Total usable blocks exclude the reserved dummy block.
+        total_blocks = max(self.block_allocator.block_count_total - 1, 1)
+        block_count_avail = int(self.block_allocator.block_count_avail)
+
+        # Overall allocated blocks in the buffer right now.
+        allocated_blocks = (self.block_allocator.block_count_total - 1) - block_count_avail
+        allocated_blocks = int(max(0, allocated_blocks))
+
+        # Active unique blocks referenced by current active requests only.
+        active_start = self.paused_request_count
+        active_end = self.total_request_count
+        if active_end > active_start:
+            active_rows = self.request_to_kv_block_ids[active_start:active_end]
+            # Filter valid block ids (>= 0) and count unique ids.
+            valid_ids = active_rows[active_rows >= 0]
+            if valid_ids.numel() > 0:
+                unique_ids = torch.unique(valid_ids)
+                active_unique_blocks = int(unique_ids.numel())
+            else:
+                active_unique_blocks = 0
+        else:
+            active_unique_blocks = 0
+
+        allocated_utilization = float(allocated_blocks) / float(total_blocks)
+        active_utilization = float(active_unique_blocks) / float(total_blocks)
+
+        # Diagnostic helpers
+        num_non_gtd_blocks = max(0, block_count_avail - int(self.gtd_block_count))
+        total_request_count = int(self.total_request_count)
+        return {
+            'total_blocks': int(total_blocks),
+            'allocated_blocks': int(allocated_blocks),
+            'active_unique_blocks': int(active_unique_blocks),
+            'allocated_utilization': allocated_utilization,
+            'active_utilization': active_utilization,
+            'active_request_count': int(self.get_active_request_count()),
+            'paused_request_count': int(self.paused_request_count),
+            'gtd_block_count': int(self.gtd_block_count),
+            'block_count_avail': int(block_count_avail),
+            'num_non_gtd_blocks': int(num_non_gtd_blocks),
+            'active_token_count': int(self.active_token_count),
+            'total_request_count': int(total_request_count),
+            'max_requests': int(self.max_requests),
+        }
