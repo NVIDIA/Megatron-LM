@@ -1912,11 +1912,11 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
-    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['qwen3_next'],
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
                        'None (default): param no weight decay if and only if it is 1D; or it is bias; '
                        'or it is embedding and embedding_init_method_std is not None. '
-                       '"qwen3_next": In addition to the default rules, '
+                       '"apply_wd_to_qk_layernorm": In addition to the default rules, '
                        'apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
