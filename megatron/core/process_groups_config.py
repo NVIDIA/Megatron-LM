@@ -144,9 +144,13 @@ class ProcessGroupCollection:
         """Return a concise representation showing which process groups exist and their sizes."""
         active_pgs = []
         for field_info in fields(self):
-            pg = getattr(self, field_info.name, None)
-            if pg is not None:
-                active_pgs.append(f"{field_info.name}({pg.size()})")
+            if hasattr(self, field_info.name):
+                pg = getattr(self, field_info.name)
+                if pg is not None:
+                    active_pgs.append(f"{field_info.name}({pg.size()})")
+                else:
+                    # Field exists but is None
+                    active_pgs.append(f"{field_info.name}(None)")
         return (
             f"ProcessGroupCollection({', '.join(active_pgs)})"
             if active_pgs

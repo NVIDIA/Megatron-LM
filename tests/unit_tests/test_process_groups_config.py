@@ -69,11 +69,12 @@ class TestProcessGroupsConfig:
 
     def test_repr(self, mocker):
         """Test __repr__ shows active process groups and their sizes."""
-        # Create mock process groups with known sizes
+        tp_size = 4
+        pp_size = 2
         mock_tp = mocker.Mock(spec=dist.ProcessGroup)
-        mock_tp.size.return_value = 4
+        mock_tp.size.return_value = tp_size
         mock_pp = mocker.Mock(spec=dist.ProcessGroup)
-        mock_pp.size.return_value = 2
+        mock_pp.size.return_value = pp_size
 
         # Test empty collection
         empty_pgs = ProcessGroupCollection()
@@ -86,8 +87,8 @@ class TestProcessGroupsConfig:
 
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
-        assert "tp(4)" in repr_str
-        assert "pp(2)" in repr_str
+        assert f"tp({tp_size})" in repr_str
+        assert f"pp({pp_size})" in repr_str
 
 
 class TestPGConfigDefaultInitialization:
