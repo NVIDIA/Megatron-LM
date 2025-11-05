@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import copy
 import logging
 import warnings
+from dataclasses import astuple
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -113,9 +115,11 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
+            uses_default_config = False
             # Get optimizer config for this parameter.
             if config_overrides is None:
                 config_for_param = config
+                uses_default_config = True
             else:
                 config_for_param = None
                 for param_key in config_overrides:
@@ -125,11 +129,9 @@ def _get_param_groups(
                 # Fall back to default config.
                 if config_for_param is None:
                     config_for_param = config
+                    uses_default_config = True
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
-
-            # TODO: Figure out how to support backwards compatibility with param_groups
-            # with old keys (*, is_decoupled_lr).
 
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
@@ -140,17 +142,20 @@ def _get_param_groups(
             else:
                 wd_mult = 0.0
 
-            from dataclasses import astuple
-
-            key = (wd_mult, is_expert_parallel, astuple(config_for_param))
+            # Create config_tuple that is hash-able. Remove timers object before
+            # creating config_tuple.
+            config_for_param_copy = copy.deepcopy(config_for_param)
+            config_for_param_copy.timers = None
+            config_tuple = astuple(config_for_param_copy)
+            key = (wd_mult, is_expert_parallel, config_tuple)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
 
             if key in configs_map:
-                assert config_for_param == configs_map[key]
+                assert (config_for_param, uses_default_config) == configs_map[key]
             else:
-                configs_map[key] = config_for_param
+                configs_map[key] = (config_for_param, uses_default_config)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -167,32 +172,30 @@ def _get_param_groups(
     for key in params_key:
         wd_mult, is_expert_parallel, _ = key
         params = params_map[key] if key in params_map else []
-        config = None
+        config, uses_default_config = None, True
         if key not in configs_map:
             assert params == []
         else:
-            config = configs_map[key]
+            config, uses_default_config = configs_map[key]
+            assert config is not None
+
+        # TODO: Remove "backwards compatible" fields below eventually.
         param_group = {
             'params': params,
-            'wd_mult': wd_mult,
+            'wd_mult': wd_mult,  # For backwards compatibility.
             'lr_mult': 1.0,  # For backwards compatibility.
             'is_expert_parallel': is_expert_parallel,
-            'is_decoupled_lr': False,  # For backwards compatibility. Remove eventually.
-            'config': config,
+            'is_decoupled_lr': False,  # For backwards compatibility.
+            'default_config': uses_default_config,
         }
-        # Ensure param_group has required keys for matching when loading optimizer state
-        # See MegatronOptimizer._filter_and_reorder_param_groups.
-        # TODO: Re-add this assertion.
-        # assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
-        param_groups.append(param_group)
 
-    # Update `max_lr` and `min_lr` in param_group.
-    # TODO: Also add functionality to update weight_decay?
-    for param_group in param_groups:
-        config_for_param = param_group['config']
-        if config_for_param is not None:
-            param_group['max_lr'] = config_for_param.lr
-            param_group['min_lr'] = config_for_param.min_lr
+        # Stick relevant fields into param_group from config object.
+        if config is not None:
+            param_group['max_lr'] = config.lr
+            param_group['min_lr'] = config.min_lr
+            # TODO: Add other relevant arguments (e.g., weight decay, optimizer)
+            # here as well.
+        param_groups.append(param_group)
 
     return param_groups
 
@@ -263,17 +266,13 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
-    # when freezing sub-models we may have no trainable parameters on a rank and
-    # hence an empty param_groups. However, we still need to create an optimizer
-    # for the purposes of grad stats reductions
-    # TODO: All passed-in param_groups should share the same higher-level config object
-    # parameters (e.g., optimizer, optimizer_cpu_offload, etc.)
-    # TODO: logic needs to be updated to handle different optimizer types (i.e., param_groups
+    # TODO: Logic needs to be updated to handle different optimizer types (i.e., param_groups
     # passed into this function need to correspond to the same optimizer).
 
+    # When freezing sub-models we may have no trainable parameters on a rank and
+    # hence an empty param_groups. However, we still need to create an optimizer
+    # for the purposes of grad stats reductions.
     if param_groups:
-        # TODO: Delete from param_groups object?
-        # TODO: What if optimizer is different for each config object?
         if config.optimizer_cpu_offload:
             if torch.__version__ < '2.3.0':
                 warnings.warn(
@@ -471,7 +470,11 @@ def get_megatron_optimizer(
     # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
     # Adam for other layers). This would need some more refactoring to work though (param_groups
     # filtered by optimizer passed into _get_megatron_optimizer_based_on_param_groups).
-    fields_to_check_for_consistency = ['overlap_param_gather_with_optimizer_step', 'optimizer']
+    fields_to_check_for_consistency = [
+        'overlap_param_gather_with_optimizer_step',
+        'optimizer',
+        'optimizer_cpu_offload',
+    ]
     for field_name in fields_to_check_for_consistency:
         field = getattr(config, field_name, None)
         if config_overrides is not None:

@@ -2403,7 +2403,8 @@ def train(
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            learning_rate = param_group['lr']
+            if param_group['default_config']:
+                learning_rate = param_group['lr']
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
