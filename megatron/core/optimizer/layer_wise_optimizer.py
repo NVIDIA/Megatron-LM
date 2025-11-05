@@ -246,8 +246,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
                 )
 
+        if len(self.chained_optimizers) == 1:
+            wrapped_sharded_state_dict = {1: sharded_state_dict}
+        else:
+            wrapped_sharded_state_dict = sharded_state_dict
         # Adjust dict due to possible empty rank 0 which output common_dict
-        for sd in sharded_state_dict.values():
+        for sd in wrapped_sharded_state_dict.values():
             # Drop empty group state to avoid save in common dict (non-empty rank still save)
             if 'fp32_from_fp16_params' in sd:
                 sd['fp32_from_fp16_params'][:] = [
