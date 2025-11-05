@@ -388,10 +388,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 else:
                     pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
-                local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
-                return hidden_states, local_tokens, probs, pre_mlp_layernorm_output
+                shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                local_tokens, probs, _ = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+                return hidden_states, local_tokens, probs, shared_expert_output
 
-        hidden_states, local_tokens, probs, pre_mlp_layernorm_output = forward_func(
+        hidden_states, local_tokens, probs, shared_expert_output = forward_func(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -404,8 +406,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
-            # Detach here for shared expert connection
-            node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
+            # Detach here for shared expert connection in moe_combine
+            node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
         return local_tokens, probs
 
@@ -430,7 +432,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
-        shared_expert_output = None
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep:
@@ -438,10 +439,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
-        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
-        shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-        expert_output, mlp_bias = layer.mlp.routed_experts_compute(
-            dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
+        expert_output, _ = layer.mlp.routed_experts_compute(
+            dispatched_tokens, dispatched_probs, None
         )
 
         if layer.recompute_pre_mlp_layernorm:
@@ -451,15 +450,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # release tensor reference after use
         node.layer_state.dispatched_probs = None
         node.layer_state.pre_mlp_layernorm_output = None
-        if shared_expert_output is None:
-            # Return only expert_output, since shared_expert_output causes backward on None
-            return expert_output
-        return expert_output, shared_expert_output
+        
+        return expert_output
 
     def submodule_combine_forward(
         node: ScheduleNode,
         output: torch.Tensor,
-        shared_expert_output: Optional[torch.Tensor] = None,
     ):
         """
         # Triggers token combine and the remaining computation in the transformer layer.
@@ -471,9 +467,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         residual = node.layer_state.residual
 
-        output = layer.mlp.combine(output, shared_expert_output)
+        output = layer.mlp.combine(output, node.layer_state.shared_expert_output)
         mlp_output_with_bias = (output, None)
-
+        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
+            layer.mlp.cudagraph_tensor_store.clear()
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout

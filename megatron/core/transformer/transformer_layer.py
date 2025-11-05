@@ -897,15 +897,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, probs, routing_map = func_output
                 assert not attr_outputs, "cuda_graph_attr_outputs should be empty"
 
-            # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables and 
-            # should be skipped here.
-            if self.config.overlap_moe_expert_parallel_comm:
-                return mlp_residual, *(self.mlp.router_and_preprocess(
-                    hidden_states,
-                    probs=probs,
-                    routing_map=routing_map,
-                    residual=residual,
-                ))
 
             # Resume the MoELayer forward pass from the end of the CUDA graph scope.
             # The MoE layer will skip redundant computations when we pass in the calculated values
@@ -918,6 +909,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 residual=residual,
                 shared_expert_output=shared_expert_output,
             )
+            # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables and 
+            # should be skipped here.
+            if self.config.overlap_moe_expert_parallel_comm:
+                probs, routing_map = self.mlp.route(hidden_states)
+                hidden_states, probs, residual = self.mlp.preprocess(hidden_states, probs, routing_map)
+                nvtx_range_pop(suffix="mlp")
+                return mlp_residual, hidden_states, probs, shared_expert_output
             mlp_output_with_bias = self.mlp(hidden_states)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
@@ -927,11 +925,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # If EP overlap is enabled, needs to return from `router_and_preprocess` for consistency.
             if self.config.overlap_moe_expert_parallel_comm:
                 assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
-                hidden_states = cuda_graph_output.pop()
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
-                return hidden_states, *(self.mlp.router_and_preprocess(
-                    pre_mlp_layernorm_output,
-                ))
+                mlp_residual = cuda_graph_output.pop()
+                hidden_states = self.pre_mlp_layernorm(mlp_residual)
+                shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
+                probs, routing_map = self.mlp.route(hidden_states)
+                hidden_states, probs, residual = self.mlp.preprocess(hidden_states, probs, routing_map)
+                return mlp_residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
             output = self._forward_mlp(*cuda_graph_output)
