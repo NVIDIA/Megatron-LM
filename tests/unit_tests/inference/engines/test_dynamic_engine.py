@@ -101,7 +101,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
-    cuda_graph_scope: str = "full_iteration"
+    cuda_graph_scope: List[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
@@ -123,6 +123,9 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
+
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = ["full_iteration"]
 
 
 @dataclass
@@ -506,7 +509,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], ["full_iteration"]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)

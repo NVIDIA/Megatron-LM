@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -32,6 +32,8 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -70,6 +72,11 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = []
+        self.valid_cudagraph_attrs = None
 
     @abstractmethod
     def dispatch_preprocess(
@@ -227,6 +234,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # each element is True if it's between the local_expert_indices. Only useful when cross
         # device token permutation is enabled and **AllGahter** is performed.
         self.global_local_map = None
+
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = ['routing_map']
 
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -420,11 +431,37 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish": 3,
             "no_sync": 4,
         }
-        self.cuda_dtoh_point = "before_permutation_1"
+        if (
+            config.cuda_graph_impl == "transformer_engine"
+            and 'moe_preprocess' in config.cuda_graph_scope
+        ):
+            self.cuda_dtoh_point = "before_ep_alltoall"
+        else:
+            self.cuda_dtoh_point = "before_permutation_1"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = [
+            'tokens_per_expert',
+            'input_splits',
+            'output_splits',
+            'output_splits_tp',
+            'num_out_tokens',
+            'num_global_tokens_per_local_expert',
+            'reversed_local_input_permutation_mapping',
+            'routing_map',
+        ]
+
         self.shared_experts = None
+
+    def set_shared_experts(self, shared_experts):
+        """Set shared expert to the dispatcher."""
+        super().set_shared_experts(shared_experts)
+        if shared_experts.use_shared_expert_gate:
+            self.cudagraph_attrs.append('shared_experts.gate_score')
+        self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -989,7 +1026,9 @@ class _DeepepManager(_DispatchManager):
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
-                print("DeepEP only supports float32 probs, please set --moe-router-dtype=fp32")
+                logger.info(
+                    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
             self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
@@ -1175,6 +1214,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             num_experts=self.tp_size * self.config.num_moe_experts,
             config=self.config,
         )
+        self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(

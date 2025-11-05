@@ -12,6 +12,8 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
+HAVE_HYBRIDEP = False
+
 import torch
 
 _buffer = None
