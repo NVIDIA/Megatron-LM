@@ -299,6 +299,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         prefix: str = "",
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """Non-default implementation for embeddings due to `allow_shape_mismatch` param"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
@@ -310,6 +311,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 key=weight_prefix,
                 allow_shape_mismatch=True,
                 prepend_offsets=sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=metadata["dp_cp_group"],
             )
         }
 
