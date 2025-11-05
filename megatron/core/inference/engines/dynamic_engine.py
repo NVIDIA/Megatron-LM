@@ -57,6 +57,14 @@ try:
 except:
     HAVE_MSGPACK = False
 
+try:
+    import wandb
+
+    HAVE_WANDB = True
+except ImportError:
+    HAVE_WANDB = False
+    wandb = None
+
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
@@ -89,6 +97,8 @@ class DynamicInferenceEngine(AbstractEngine):
         static_sampling (bool): If True, all requests are assumed to have the same
             sampling parameters. This avoids needing to loop through all requests and
             their sampling parameters every generation step, improving latency.
+        inference_logging_step_interval (int): The step interval at which to log
+        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
     def __init__(
@@ -101,6 +111,7 @@ class DynamicInferenceEngine(AbstractEngine):
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
         static_sampling: bool = False,
+        inference_logging_step_interval: int = 0,
     ):
 
         if enable_cuda_graph is not None:
@@ -136,6 +147,32 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.static_sampling = static_sampling
+
+        self.inference_logging_step_interval = inference_logging_step_interval
+        # Configure wandb to use separate step counter for inference metrics (only once)
+        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
+            logging.info(
+                f"\033[1;93m[INFERENCE]\033[0m "
+                f"\033[1;95mLogging inference metrics to wandb (rank {torch.distributed.get_rank()})\033[0m"
+            )
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                # Make all inference/* metrics use inference_step as their x-axis
+                # This allows inference and training to have independent step counters
+                context.metrics_writer.define_metric(
+                    "inference/*", step_metric="inference/inference_step"
+                )
+                # Initialize inference step offset by querying existing run history
+                self.inference_step_offset = 0
+                if wandb.run is not None:
+                    api_run = wandb.Api().run(
+                        f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
+                    )
+                    max_step = 0
+                    for row in api_run.scan_history(keys=["inference/inference_step"]):
+                        val = row.get("inference/inference_step")
+                        if isinstance(val, (int, float)) and int(val) > max_step:
+                            max_step = int(val)
+                    self.inference_step_offset = int(max_step)
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -779,6 +816,41 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_requests.append(failed_request)
             self.request_completion_futures[failed_request_id].set_result(failed_request)
         self.failed_request_ids.clear()
+
+        # Log KV cache utilization stats to W&B
+        if (
+            self.inference_logging_step_interval > 0
+            and self.step_count > 0
+            and self.step_count % self.inference_logging_step_interval == 0
+            and self.context.metrics_writer is not None
+        ):
+
+            # Get KV cache utilization stats from dynamic context
+            kv_stats = self.context.get_kvcache_utilization_stats()
+
+            # Prepare metrics dictionary with all stats
+            # Use 'inference/' prefix for all metrics to separate from training metrics
+            metrics = {
+                'inference/inference_step': int(self.inference_step_offset + int(self.step_count)),
+                'inference/step_time_s': float(step_time),
+                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
+                'inference/total_requests_dict_size': int(len(self.requests)),
+            }
+            # Add KV stats with inference/ prefix
+            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
+            for key, value in kv_stats.items():
+                if 'utilization' in key:
+                    # Convert to percentage (0-100) and group under kvcache_utilization
+                    metrics[f'inference/{key}'] = float(value * 100.0)
+                else:
+                    metrics[f'inference/{key}'] = value
+
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                self.context.metrics_writer.log(metrics, commit=True)
+            else:
+                raise ValueError(
+                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
+                )
 
         # Print context state.
         if verbose:
