@@ -191,14 +191,16 @@ def setup_model_and_optimizer(
 
     if 'muon' in optimizer:
         # Use layer-wise distributed optimizer with Muon
+        optimizer_type = optimizer
         optimizer = get_megatron_muon_optimizer(config, model)
     else:
+        optimizer_type = optimizer
         optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    if not 'muon' in optimizer:
+    if not 'muon' in optimizer_type:
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
                 if len(optimizer.optimizer.state[p]) == 0:
@@ -285,14 +287,16 @@ def setup_moe_model_and_optimizer(
     )
 
     if 'muon' in optimizer:
+        optimizer_type = optimizer
         optimizer = get_megatron_muon_optimizer(config, model)
     else:
+        optimizer_type = optimizer
         optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    if not 'muon' in optimizer:
+    if not 'muon' in optimizer_type:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:
                 for p in group['params']:
