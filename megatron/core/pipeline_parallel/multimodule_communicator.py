@@ -47,7 +47,7 @@ class RankModuleInfo:
     """Information about a rank in a module."""
 
     # the stage of the current rank in the current module's pipeline.
-    pp_stage: int  # the stage of the current rank in the current module's pipeline
+    pp_rank: int  # the stage of the current rank in the current module's pipeline
     pp_size: int  # the number of ranks in the current module's pipeline
     p2p_communicator: Optional[P2PCommunicator]
     # key is either the src or dst module name connected to the current module
@@ -134,12 +134,12 @@ class MultiModulePipelineCommunicator:
         """Return True if the current rank has the absolute first stage in the overall model.
 
         The absolute first stage is defined as:
-        1. The current rank must be in the first PP stage (pp_stage == 0) of some module
+        1. The current rank must be in the first PP stage (pp_rank == 0) of some module
         2. That module must be a source module (no incoming connections in topology)
         """
         for module_name, rank_module_info in self.rank_module_map.items():
             # Check if this rank is at the first PP stage of this module
-            if rank_module_info.pp_stage == 0:
+            if rank_module_info.pp_rank == 0:
                 # Check if this module is a source module (no incoming connections)
                 if self._is_source_module(module_name):
                     return True
@@ -155,7 +155,7 @@ class MultiModulePipelineCommunicator:
         """
         for module_name, rank_module_info in self.rank_module_map.items():
             # Check if this rank is at the last PP stage of this module
-            if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # Check if this module is a sink module (no outgoing connections)
                 if self._is_sink_module(module_name):
                     return True
@@ -230,13 +230,13 @@ class MultiModulePipelineCommunicator:
                 p2p_comm = P2PCommunicator(pp_group, self.config)
                 pp_size = dist.get_world_size(pp_group)
                 rank_in_pp_group = dist.get_group_rank(pp_group, self.current_rank)
-                pp_stage = rank_in_pp_group % pp_size
+                pp_rank = rank_in_pp_group % pp_size
 
                 bridge_comms_as_dest_module = []
                 bridge_comms_as_src_module = []
                 # If first stage, check if the module has any incoming modules
                 # If so, initialize bridge communicator
-                if pp_stage == 0:
+                if pp_rank == 0:
                     for bridge_comm in self.bridge_comms:
                         if (
                             bridge_comm.is_current_rank_in_grid(bridge_comm.dest_grid)
@@ -245,7 +245,7 @@ class MultiModulePipelineCommunicator:
                             bridge_comms_as_dest_module.append(bridge_comm)
                 # If last stage, check if the module has any outgoing modules
                 # If so, initialize bridge communicator
-                if pp_stage == pp_size - 1:
+                if pp_rank == pp_size - 1:
                     for bridge_comm in self.bridge_comms:
                         if (
                             bridge_comm.is_current_rank_in_grid(bridge_comm.src_grid)
@@ -254,7 +254,7 @@ class MultiModulePipelineCommunicator:
                             bridge_comms_as_src_module.append(bridge_comm)
                 # Build RankModuleInfo for the module
                 rank_module_info = RankModuleInfo(
-                    pp_stage=pp_stage,
+                    pp_rank=pp_rank,
                     pp_size=pp_size,
                     p2p_communicator=p2p_comm,
                     bridge_comms_as_dest_module=bridge_comms_as_dest_module,
@@ -280,7 +280,7 @@ class MultiModulePipelineCommunicator:
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
 
-            if rank_module_info.pp_stage == 0:
+            if rank_module_info.pp_rank == 0:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
@@ -303,7 +303,7 @@ class MultiModulePipelineCommunicator:
             f"[send_forward] output_dict keys: {output_dict.keys()}, is_last_stage: {is_last_stage}"
         )
         for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
@@ -331,7 +331,7 @@ class MultiModulePipelineCommunicator:
         """
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
@@ -370,7 +370,7 @@ class MultiModulePipelineCommunicator:
         )
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_stage == 0:
+            if rank_module_info.pp_rank == 0:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
@@ -406,7 +406,7 @@ class MultiModulePipelineCommunicator:
         )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
+            if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
@@ -431,7 +431,7 @@ class MultiModulePipelineCommunicator:
             f"[send_backward] grad_dict keys: {grad_dict.keys()}, is_first_stage: {is_first_stage}"
         )
         for module_name, rank_module_info in self.rank_module_map.items():
-            if rank_module_info.pp_stage == 0:
+            if rank_module_info.pp_rank == 0:
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:

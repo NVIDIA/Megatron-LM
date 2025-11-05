@@ -666,7 +666,7 @@ class TestMultiModulePipelineCommunicator:
         # If current rank is in the first grid, run first block and send output
         if grid_1 is not None and mllm_comm.is_current_rank_in_grid(grid_1):
             rank_module_info = mllm_comm.rank_module_map['image_encoder']
-            if rank_module_info.pp_stage == 0:
+            if rank_module_info.pp_rank == 0:
                 hidden_states = block_grid_1(hidden_states=hidden_states, attention_mask=None)
                 mllm_comm.send_forward({'image_encoder': hidden_states})
             else:
@@ -680,15 +680,15 @@ class TestMultiModulePipelineCommunicator:
         # If current rank is in second grid, receive and run the second block
         if grid_2 is not None and mllm_comm.is_current_rank_in_grid(grid_2):
             rank_module_info = mllm_comm.rank_module_map['llm']
-            if rank_module_info.pp_stage == 0:
+            if rank_module_info.pp_rank == 0:
                 input_dict = mllm_comm.recv_forward()
                 hidden_states = input_dict['image_encoder']
                 hidden_states = block_grid_2(hidden_states=hidden_states, attention_mask=None)
-                if rank_module_info.pp_stage == rank_module_info.pp_size - 1:
+                if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                     output_grid_2 = hidden_states
                 else:
                     mllm_comm.send_forward({'llm': hidden_states})
-            elif rank_module_info.pp_stage < rank_module_info.pp_size - 1:
+            elif rank_module_info.pp_rank < rank_module_info.pp_size - 1:
                 input_dict = mllm_comm.recv_forward(
                     tensor_shape=(
                         sequence_length,
@@ -751,7 +751,7 @@ class TestMultiModulePipelineCommunicator:
         if (
             grid_2 is not None
             and mllm_comm.is_current_rank_in_grid(grid_2)
-            and rank_module_info.pp_stage == rank_module_info.pp_size - 1
+            and rank_module_info.pp_rank == rank_module_info.pp_size - 1
         ):
             if grid1_dp == grid2_dp:
                 # DP size matches: all outputs directly compared
