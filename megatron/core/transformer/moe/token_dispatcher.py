@@ -1047,7 +1047,7 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        self.pad_multiple = get_align_size_for_quantization()
+        self.pad_multiple = self.get_align_size_for_quantization()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
