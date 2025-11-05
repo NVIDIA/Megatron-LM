@@ -567,10 +567,31 @@ class TextGenerationController:
         return logits
 
     def _dynamic_step_sample_bookkeeping(
-        self, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
-    ):
-        """Perform bookkeeping necessary to sample logits for dynamic batching."""
-        pass
+        self, active_request_metadata: Dict[str, List | Tensor]
+    ) -> List[Tuple[SamplingParams, List[int]]]:
+        """Perform bookkeeping necessary to sample logits for dynamic batching.
+
+        Returns:
+            active_sampling_map (List[Tuple[SamplingParams, List[int]]]): A list of tuples
+                matching each unique set of sampling params to the context array indices
+                of the corresponding active requests.
+        """
+        sampling_per_request: List[SamplingParams] = active_request_metadata["sampling_params"]
+
+        if getattr(self, "static_sampling", False):
+            return [(sampling_per_request[0], list(range(len(sampling_per_request))))]
+
+        # Divide all active requests into buckets based on their sampling params.
+        active_sampling_map: List[Tuple[SamplingParams, List[int]]] = []
+        for i, sampling_params in enumerate(sampling_per_request):
+            for sp, indices in active_sampling_map:
+                if sampling_params == sp:
+                    indices.append(i)
+                    break
+            else:
+                active_sampling_map.append((sampling_params, [i]))
+
+        return active_sampling_map
 
     def _dynamic_step_sample_logits(
         self, logits: Tensor, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
@@ -609,7 +630,9 @@ class TextGenerationController:
         )
         return new_sample, termination_id
 
-    def _dynamic_step_log_probs_bookkeeping(self):
+    def _dynamic_step_log_probs_bookkeeping(
+        self, active_request_metadata: Dict[str, List | Tensor]
+    ):
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
         pass
 
@@ -689,15 +712,14 @@ class TextGenerationController:
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
         self,
-        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+        active_request_metadata: Dict[str, List | Tensor],
         skip_bookkeeping: Optional[bool] = False,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
-            active_sampling_map (List[Tuple[SamplingParams, List[int]]]): A list of tuples
-                matching each unique set of sampling params to the context array indices
-                of the corresponding active requests.
+            active_request_metadata (Dict[str, List | Tensor]): A dictionary containing ordered
+                metadata associated with each request in the current active batch.
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
 
         Return:
@@ -737,12 +759,12 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         # This method will only perform computations using CPU tensors in the future.
-        self._dynamic_step_sample_bookkeeping(active_sampling_map)
+        active_sampling_map = self._dynamic_step_sample_bookkeeping(active_request_metadata)
         # This method will only perform computations using GPU tensors in the future.
         new_sample, termination_id = self._dynamic_step_sample_logits(logits, active_sampling_map)
 
         # This method will only perform computations using CPU tensors in the future.
-        self._dynamic_step_log_probs_bookkeeping()
+        self._dynamic_step_log_probs_bookkeeping(active_request_metadata)
         # This method will only perform computations using GPU tensors in the future.
         log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample, active_sampling_map)
 

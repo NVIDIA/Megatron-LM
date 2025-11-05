@@ -10,7 +10,7 @@ import warnings
 from collections import deque
 from datetime import datetime
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -129,26 +129,52 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        self.request_counter = Counter()
-        self.controller = controller
-        self.context = context
+        # Initialization options.
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
-        self.step_count = 0
-        self.finished_request_count = 0
-        self.waiting_request_ids = deque()
-        self.failed_request_ids = []  # deque()
-        self.request_counter = Counter()
-        self.requests: Dict[int, DynamicInferenceRequest] = {}
-        self.request_completion_futures: Dict[int, asyncio.Future] = {}
-        self.step_start_event = torch.cuda.Event(enable_timing=True)
-        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.inference_logging_step_interval = inference_logging_step_interval
+
+        if enable_cuda_graph is not None:
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
+        else:
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+
+        # Objects which sit on a lower level of the abstraction stack.
+        self.controller = controller
+        self.context = context
+
+        # Self runtime state.
         self.paused = False
         self.stopped = False
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.static_sampling = static_sampling
+        self._loop = get_asyncio_loop()
+        self._cond = asyncio.Condition()
 
-        self.inference_logging_step_interval = inference_logging_step_interval
+        # Request state tracking.
+        self.request_counter = Counter()
+        self.step_count = 0
+        self.finished_request_count = 0
+
+        self.requests: Dict[int, DynamicInferenceRequest] = {}
+        self.failed_request_ids = []  # deque()
+        self.waiting_request_ids = deque()
+        self.request_completion_futures: Dict[int, asyncio.Future] = {}
+
+        # Timing and logging variables.
+        self.step_start_event = torch.cuda.Event(enable_timing=True)
+        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.capture_stats = None
+
+        # Synchronize request metadata state with active batch state.
+        # Please read the docstring of `get_active_request_metadata` for more details.
+        self.sync_metadata_to_controller_sources: Dict[str, Callable] = {}
+        if static_sampling:
+            fn_to_add = self._sync_static_sampling_params_metadata
+            self.controller.static_sampling = True
+        else:
+            fn_to_add = self._sync_sampling_params_metadata
+        self.add_sync_metadata_to_controller_source("sampling_params", fn_to_add)
+
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
             logging.info(
@@ -173,19 +199,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
-
-        # Initialize the asyncio loop if it has not already been initialized.
-        # TODO: Start the engine loop here.
-        self._loop = get_asyncio_loop()
-        self._cond = asyncio.Condition()
-
-        # Capture cuda graph.
-        self.capture_stats = None
-
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
 
         if self.cuda_graph_impl == "local":
             self.create_cuda_graphs()
@@ -291,6 +304,41 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+
+    def add_sync_metadata_to_controller_source(self, tag: str, fn: Callable):
+        """Add a method that will be called before each controller step to sync request metadata.
+
+        Args:
+            tag (str): An identifier for the metadata to be synchronized.
+            fn (Callable): A method that only has two parameters:
+                - requests (Dict[int, DynamicInferenceRequest]): Mapped to self.requests.
+                - active_request_ids (Tensor): The tensor of active request IDs for the next step.
+
+            fn must return (List | Tensor) of metadata aligned with active_request_ids.
+            The shape of the return value must be the same as that of active_request_ids.
+        """
+        self.sync_metadata_to_controller_sources[tag] = fn
+
+    @staticmethod
+    def _sync_sampling_params_metadata(
+        *, requests: Dict[int, DynamicInferenceRequest], active_request_ids: Tensor
+    ) -> List:
+        """Sync sampling parameters metadata from all requests to active requests."""
+        active_request_ids = active_request_ids.tolist()
+        return [requests[req_id].sampling_params for req_id in active_request_ids]
+
+    @staticmethod
+    def _sync_static_sampling_params_metadata(
+        *, requests: Dict[int, DynamicInferenceRequest], active_request_ids: Tensor
+    ) -> List:
+        """Sync sampling parameters metadata from all requests to active requests.
+
+        This is used when `self.static_sampling==True`, meaning all requests have the same params.
+        """
+        active_request_ids = active_request_ids.tolist()
+        return [
+            next(iter(requests.values())).sampling_params for _ in range(len(active_request_ids))
+        ]
 
     async def start_listening_to_data_parallel_coordinator(
         self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
@@ -464,6 +512,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
+        else:
+            self.failed_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()
@@ -649,36 +699,35 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 break
 
-    def get_active_sampling_map(self) -> List[Tuple[SamplingParams, List[int]]]:
-        """Gets a map of sampling methods to active requests indices in the context."""
+    def get_active_request_metadata(self) -> Dict[str, List | Tensor]:
+        """Aligns request state with the context's currently active batch.
+
+        The controller requires two separate states to generate output tokens:
+         - The state of the active batch, which is maintained by the context.
+           - This involves information about the identity and shape of requests in the active batch.
+         - The state of all request metadata, which is maintained by the engine.
+           - This involves metadata such as termination criteria, sampling criteria, and
+               any extra processing required of the controller (logprobs, speculation, etc).
+
+        The state of the active batch is maintained entirely by the context.
+
+        The state of all request metadata does not belong in the context.
+        Since the controller is stateless by design, the engine must maintain this state.
+        """
         # Get all active request IDs.
         active_request_ids = self.context.request_ids[
             self.context.paused_request_count : self.context.total_request_count
-        ].tolist()
-        if self.static_sampling:
-            return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
+        ]
+        asserted_length = self.context.total_request_count - self.context.paused_request_count
 
-        # Get a map from request_id to context array index.
-        context_id_map = {r: i for i, r in enumerate(active_request_ids)}
-
-        # Create map of sampling methods to context array indices.
-        sampling_map: List[Tuple[SamplingParams, List[int]]] = []
-        for request_id, request in self.requests.items():
-            if request_id not in context_id_map:
-                continue
-            context_id = context_id_map[request_id]
-            sp = request.sampling_params
-
-            # Look for a pre-existing group with these sampling parameters.
-            for sampling, indices in sampling_map:
-                if sampling == sp:
-                    indices.append(context_id)
-                    break
-            # If no group exists, create a new one.
-            else:
-                sampling_map.append((sp, [context_id]))
-
-        return sampling_map
+        # Run all state synchronization methods.
+        ret = {}
+        for tag, method in self.sync_metadata_to_controller_sources.items():
+            state = method(requests=self.requests, active_request_ids=active_request_ids)
+            assert isinstance(state, (List, Tensor))
+            assert len(state) == asserted_length
+            ret[tag] = state
+        return ret
 
     def schedule_chunked_prefill(self):
         """
@@ -775,11 +824,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # save the is_decode_only AFTER scheduling, BEFORE update
         self.is_decode_only = is_decode_only
         self.step_start_event.record()
-        sampling_map = self.get_active_sampling_map()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
+            active_request_metadata=self.get_active_request_metadata()
+        )
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+
+        # Update engine's view of "active batch" state to allow for synchronization of state.
+        active_request_count = self.context.total_request_count - self.context.paused_request_count
 
         # Increment finished_request_count.
         cuda_graph_request_count = None
