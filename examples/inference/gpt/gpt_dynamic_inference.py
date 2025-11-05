@@ -128,6 +128,10 @@ def get_inference_context(
     else:
         max_sequence_length = args.inference_max_seq_length
 
+    metrics_writer = None
+    if args.inference_wandb_logging_step_interval > 0:
+        metrics_writer = get_wandb_writer()
+
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -156,6 +160,7 @@ def get_inference_context(
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        metrics_writer=metrics_writer,
     )
 
     return context
@@ -383,6 +388,7 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
+        inference_logging_step_interval=args.inference_wandb_logging_step_interval,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -504,7 +510,7 @@ def main():
     #     f"count [ p {p_count}, d {d_count} ]."
     # )
     capture_str = (
-        f"{engine.capture_stats["time"]:.2f} sec"
+        f"{engine.capture_stats['time']:.2f} sec"
         if engine.capture_stats else
         "--"
     )
