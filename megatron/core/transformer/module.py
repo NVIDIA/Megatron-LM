@@ -83,6 +83,7 @@ class MegatronModule(torch.nn.Module):
             # some model interface hasn't updated for m4, fallback needed
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         # Guard for cases metadata is not provided
+        tp_group = tp_group if self.tp_group is None else self.tp_group
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,

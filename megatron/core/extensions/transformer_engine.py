@@ -1070,6 +1070,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
+        te_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """Sharded state dict for the learnable softmax offset parameter"""
         if self.config.softmax_type == "learnable":
@@ -1077,7 +1078,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
+            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets, te_group=te_group, dp_cp_group=metadata["dp_cp_group"]
         )
 
 
