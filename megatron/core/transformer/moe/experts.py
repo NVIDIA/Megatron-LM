@@ -288,7 +288,7 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
         """
         Maps local expert to global experts.
         The sharded_state_dict for the weight parts are compatible with the SequentialMLP,
