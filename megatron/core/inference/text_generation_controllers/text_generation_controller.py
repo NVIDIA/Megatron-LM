@@ -590,9 +590,9 @@ class TextGenerationController:
         if backend == "torch":
             # Special-case for static sampling.
             if getattr(self, "static_sampling", False):
-                self.torch_sampling_groups = [torch.arange(
-                    active_request_count, device=request_metadata.device,
-                )]
+                self.torch_sampling_groups = [
+                    torch.arange(active_request_count, device=request_metadata.device)
+                ]
             else:
                 # Bucketize the core sampling parameters.
                 _, inv_indices, cnts = torch.unique(
