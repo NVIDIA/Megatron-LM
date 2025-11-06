@@ -14,8 +14,15 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 
 
-def serialize_tensor(tensor):
-    """Serialize tensor to bytes."""
+def serialize_tensor(tensor: torch.Tensor) -> bytes:
+    """Serialize tensor to bytes.
+
+    Args:
+        tensor (Tensor): Tensor.
+
+    Returns:
+        (bytes) Byte representation of tensor.
+    """
     buffer = io.BytesIO()
     torch.save(tensor, buffer)
     buffer.seek(0)
@@ -23,8 +30,15 @@ def serialize_tensor(tensor):
     return tensor_bytes
 
 
-def deserialize_tensor(tensor_bytes):
-    """Deserialize tensor from bytes."""
+def deserialize_tensor(tensor_bytes: bytes) -> torch.Tensor:
+    """Deserialize tensor from bytes.
+
+    Args:
+        tensor_bytes (bytes): Byte representation of tensor.
+
+    Returns:
+        (Tensor) Tensor.
+    """
     buffer = io.BytesIO(tensor_bytes)
     tensor = torch.load(buffer)
     return tensor
@@ -77,11 +91,12 @@ class InferenceRequest:
             )
             self.sampling_params = self.inference_parameters
 
-    def serializable(self):
-        """
-        Converts the instance into a serializable dictionary.
+    def serialize(self) -> dict:
+        """Converts the instance into a serializable dictionary.
+
         Returns:
-            dict: A dictionary representation of the instance suitable for serialization.
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
         """
 
         # Dataclass to dict.
@@ -170,11 +185,12 @@ class DynamicInferenceEvent:
         payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
-    def serialize(self):
-        """
-        Converts the instance into a serializable dictionary.
+    def serialize(self) -> dict:
+        """Converts the instance into a serializable dictionary.
+
         Returns:
-            dict: A dictionary representation of the instance suitable for serialization.
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
         """
 
         # Dataclass to dict.
@@ -254,13 +270,14 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serializable(self):
-        """
-        Converts the instance into a serializable dictionary.
+    def serialize(self):
+        """Converts the instance into a serializable dictionary.
+
         Returns:
-            dict: A dictionary representation of the instance suitable for serialization.
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
         """
-        obj = super().serializable()
+        obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         return obj
 
@@ -418,6 +435,31 @@ class DynamicInferenceRequestRecord:
             events=merge_lists("events"),
         )
 
+        return request
+
+    def serialize(self) -> dict:
+        """Converts the instance into a serializable dictionary.
+
+        Returns:
+            (dict) A dictionary representation of the instance suitable for
+                serialization.
+        """
+        obj = asdict(self)
+        obj["requests"] = [r.serialize() for r in obj["requests"]]
+        return obj
+
+    @classmethod
+    def deserialize(cls, obj: dict) -> "DynamicInferenceRequestRecord":
+        """Deserialize record.
+
+        Args:
+            obj (dict): Serialized record data.
+
+        Returns:
+            (DynamicInferenceRequestRecord) Deserialized record.
+        """
+        request = cls(**obj)
+        request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
         return request
 
 

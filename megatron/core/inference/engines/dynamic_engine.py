@@ -1252,12 +1252,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 if (
                     is_tp0_and_pp0
                     and engine_output is not None
-                    and engine_output["finished_requests"]
+                    and engine_output["finished_request_records"]
                 ):
                     payload = msgpack.packb(
                         [
                             Headers.ENGINE_REPLY.value,
-                            [r.serializable() for r in engine_output["finished_requests"]],
+                            [r.serialize() for r in engine_output["finished_request_records"]],
                         ],
                         use_bin_type=True,
                     )
