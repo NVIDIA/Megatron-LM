@@ -808,12 +808,6 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
-    # DEBUG ASSERT REMOVE LATER
-    assert (
-        tp_group == parallel_state.get_tensor_model_parallel_group()
-        or tp_group == parallel_state.get_expert_tensor_parallel_group()
-    )
-    assert dp_cp_group == parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     prepend_axis_num = len(prepend_offsets)
 
@@ -888,9 +882,6 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-    # DEBUG ASSERT REMOVE LATER
-    assert tp_group == parallel_state.get_tensor_model_parallel_group()
-    assert dp_cp_group == parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     # Use local get_pg_rank and get_pg_size functions
     dp_rank = get_pg_rank(dp_cp_group)
