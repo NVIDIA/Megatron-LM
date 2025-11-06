@@ -289,6 +289,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "unspecified launch failure" in concat_allranks_logs
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
+        or "Fatal glibc error" in concat_allranks_logs
     )
 
 
