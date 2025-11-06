@@ -801,13 +801,19 @@ def make_tp_sharded_tensor_for_checkpoint(
         replica_id: Replica ID for the tensor (default: None)
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         **kwargs: Additional arguments. May include:
-            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - tp_group: Tensor parallel group
             - dp_cp_group: Data parallel + context parallel group
-              (default: None, falls back to parallel_state)
     """
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    # If there are any additional kwargs left, surface them for visibility
+    # (these will be forwarded to ShardedTensor.from_rank_offsets).
+    if kwargs:
+        logger.warning(
+            "make_tp_sharded_tensor_for_checkpoint received extra kwargs: %s",
+            list(kwargs.keys()),
+        )
 
     prepend_axis_num = len(prepend_offsets)
 
@@ -866,13 +872,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         replica_id: Replica ID for the tensor (default: None)
         **kwargs: Additional arguments. May include:
-            - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
+            - tp_group: Tensor parallel group
             - dp_cp_group: Data parallel + context parallel group
-              (default: None, falls back to parallel_state)
     """
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    # If there are any additional kwargs left, surface them for visibility
+    # (these will be forwarded to ShardedTensor.from_rank_offsets).
+    if kwargs:
+        logger.warning(
+            "make_sharded_tensor_for_checkpoint received extra kwargs: %s",
+            list(kwargs.keys()),
+        )
 
     prepend_axis_num = len(prepend_offsets)
 
