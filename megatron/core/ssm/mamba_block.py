@@ -374,6 +374,7 @@ class MambaStack(MegatronModule):
         prefix: str = '',
         sharded_offsets: Optional[tuple] = None,
         metadata: Optional[dict] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """
         Returns a sharded state dictionary for the current object.
@@ -413,6 +414,7 @@ class MambaStack(MegatronModule):
             sharded_state_dict.update(layer_sharded_state_dict)
 
         # Add modules other than self.layers
+        tp_group = tp_group if self.tp_group is None else self.tp_group
         for name, module in self.named_children():
             if not module is self.layers:
                 sharded_state_dict.update(
@@ -421,7 +423,7 @@ class MambaStack(MegatronModule):
                         f'{prefix}{name}.',
                         sharded_offsets,
                         metadata,
-                        tp_group=self.tp_group,
+                        tp_group=tp_group,
                     )
                 )
 
