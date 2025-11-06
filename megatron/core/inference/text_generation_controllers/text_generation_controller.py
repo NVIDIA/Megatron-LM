@@ -570,7 +570,7 @@ class TextGenerationController:
                 retrieved from the context.
             request_metadata_labels (Optional[Dict]): An override for the map of metadata labels
                 to their index in the request_metadata tensor. By default, this metadata is
-                retrieved from the context.
+                retrieved from the request object.
         """
         assert backend in ["torch"]
         context = self.inference_wrapped_model.inference_context
@@ -581,7 +581,7 @@ class TextGenerationController:
                 context.paused_request_count : context.total_request_count, :
             ]
         if request_metadata_labels is None:
-            request_metadata_labels = context.request_metadata_labels
+            request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
 
         temp = request_metadata[:, request_metadata_labels["temperature"]]
         top_k = request_metadata[:, request_metadata_labels["top_k"]]

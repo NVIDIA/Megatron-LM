@@ -362,16 +362,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
 
         # Track request metadata.
-        # This is a list of all metadata stored. TODO @TDE: see if we can make this an argument.
-        self.request_metadata_labels = [
-            "temperature",
-            "top_k",
-            "top_p",
-            "termination_id",
-            "return_log_probs",
-            "skip_prompt_log_probs",
-        ]
-        self.request_metadata_labels = {k: v for k, v in enumerate(self.request_metadata_labels)}
         self.request_metadata = torch.empty(
             (self.max_requests, len(self.request_metadata_map),
             dtype=torch.long,
@@ -1216,14 +1206,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_ids[current_id] = req.request_id
         # Handle request metadata. TODO @TDE: see if we can build this using the metadata labels.
         sp = req.sampling_params
-        metadata = [
-            sp.temperature,
-            sp.top_k,
-            sp.top_p,
-            sp.termination_id,
-            sp.return_log_probs,
-            getattr(sp, "skip_prompt_log_probs_for_dynamic_inference", False),
-        ]
+        metadata = req.tracked_metadata
         self.request_metadata[current_id] = torch.tensor(
             metadata, dtype=torch.long, device=self.request_metadata.device
         )

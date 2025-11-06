@@ -250,14 +250,6 @@ class TestTextGenerationController:
             for idx in indices:
                 rev_sampling_dict[idx] = sampling_params
 
-        request_metadata_labels = [
-            "temperature",
-            "top_k",
-            "top_p",
-            "termination_id",
-            "return_log_probs",
-            "skip_prompt_log_probs",
-        ]
         request_metadata = torch.empty(
             (batch_size, len(request_metadata_labels)), dype=torch.long
         )
