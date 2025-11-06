@@ -111,19 +111,21 @@ def _resolve_callable_from_python_import_path(dotted_path: str):
     Raises ValueError with clear message on failure.
     """
     if not isinstance(dotted_path, str) or not dotted_path:
-        raise ValueError("fp8_quantizer_factory must be a non-empty string with format 'pkg.mod.func'.")
+        raise ValueError(
+            "fp8_quantizer_factory must be a non-empty string with format 'pkg.mod.func'."
+        )
 
     parts = dotted_path.rsplit(".", 1)
     if len(parts) == 1:
-        raise ValueError(
-            f"Invalid fp8_quantizer_factory '{dotted_path}'. Expected 'pkg.mod.func'."
-        )
+        raise ValueError(f"Invalid fp8_quantizer_factory '{dotted_path}'. Expected 'pkg.mod.func'.")
     module_path, attr = parts[0], parts[1]
 
     try:
         mod = importlib.import_module(module_path)
     except Exception as exc:
-        raise ValueError(f"Failed to import module '{module_path}' for fp8_quantizer_factory: {exc}") from exc
+        raise ValueError(
+            f"Failed to import module '{module_path}' for fp8_quantizer_factory: {exc}"
+        ) from exc
 
     fn = getattr(mod, attr, None)
     if fn is None:
@@ -140,9 +142,7 @@ def _resolve_callable_from_python_import_path(dotted_path: str):
 def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, Fp4Recipe]:
     quantizer_factory = _resolve_callable_from_python_import_path(quantizer_factory_python_path)
     try:
-        custom_recipe = transformer_engine.common.recipe.CustomRecipe(
-            qfactory=quantizer_factory
-        )
+        custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
         raise ValueError(
             """CustomRecipe recipe is not available in this version of 
@@ -517,8 +517,9 @@ if HAVE_TE:
             elif config.fp8_recipe == Fp8Recipe.custom:
                 if not config.fp8_quantizer_factory:
                     raise ValueError(
-                        "Python import path, e.g. package.module.quantizer_factory, must be provided "
-                        "via --fp8-quantizer-factory when --fp8-recipe custom is selected."
+                        "Python import path, e.g. package.module.quantizer_factory, "
+                        "must be provided via --fp8-quantizer-factory when "
+                        "--fp8-recipe custom is selected."
                     )
                 fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
             else:
