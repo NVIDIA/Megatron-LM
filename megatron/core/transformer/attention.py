@@ -172,6 +172,7 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        # TODO: This is built twice when using MLA, should be refactored.
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -188,6 +189,7 @@ class Attention(MegatronModule, ABC):
             and "core_attn" in self.config.recompute_modules
         )
 
+        # TODO: This is built twice when using MLA, should be refactored.
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,

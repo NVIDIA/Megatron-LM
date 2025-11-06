@@ -69,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_sparse_attention_args(parser)
     parser = _add_linear_attention_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
@@ -3264,6 +3265,20 @@ def _add_mla_args(parser):
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
 
+    return parser
+
+def _add_sparse_attention_args(parser):
+    group = parser.add_argument_group(title="sparse_attention")
+    group.add_argument('--sparse-attention-type', default=None, choices=['dsa'], type=str,
+                       help="Type of sparse attention to use. Currently support dsa (DeepSeek Sparse Attention).")
+    group.add_argument('--index-n-heads', default=None, type=int,
+                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
+    group.add_argument('--index-head-dim', default=None, type=int,
+                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
+    group.add_argument('--index-topk', default=256, type=int,
+                       help='Number of top-k tokens to select in sparse attention indexer.')
+    group.add_argument('--indexer-loss-coeff', default=0.0, type=float,
+                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
     return parser
 
 def _add_linear_attention_args(parser):

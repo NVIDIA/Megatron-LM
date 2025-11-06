@@ -148,6 +148,7 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
+        # TODO(kunlunl): Support sparse attention.
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,

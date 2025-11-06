@@ -220,6 +220,24 @@ class TransformerConfig(ModelParallelConfig):
     16 SMs can generally achieve good bandwidth."""
 
     ####################
+    # sparse attention
+    ####################
+    sparse_attention_type: Optional[str] = None
+    """Type of sparse attention to use. Currently only supports dsa (DeepSeek Sparse Attention)."""
+
+    index_n_heads: Optional[int] = None
+    """Number of indexer heads for sparse attention. If None, defaults to num_attention_heads."""
+
+    index_head_dim: Optional[int] = None
+    """Dimension per indexer head. If None, defaults to kv_channels."""
+
+    index_topk: int = 256
+    """Number of top-k tokens to select in sparse attention indexer."""
+
+    indexer_loss_coeff: float = 0.0
+    """Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    ####################
     # linear attention
     ####################
     linear_attention_type: Optional[str] = None
