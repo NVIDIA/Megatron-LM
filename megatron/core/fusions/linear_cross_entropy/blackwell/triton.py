@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+# NOTE: tl.pointer_type() is not available in Triton 3.3.0
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE_M": 1024}, num_stages=3, num_warps=32),
@@ -12,9 +14,9 @@ import triton.language as tl
 def get_num_valid_tokens(
     num_tokens: tl.int64,
     ignore_index: tl.int64,
-    labels_ptr: tl.pointer_type(tl.int64),
+    labels_ptr,#: tl.pointer_type(tl.int64),
     stride_labels: tl.int64,
-    num_valid_tokens_ptr: tl.pointer_type(tl.int64),
+    num_valid_tokens_ptr,#: tl.pointer_type(tl.int64),
     BLOCK_SIZE_M: tl.constexpr,
 ):
     """
@@ -48,22 +50,22 @@ def forward_dp_epilogue(
     num_tokens: tl.int64,
     num_splits: tl.int64, # TODO: maybe this could be a constexpr
     ignore_index: tl.int64,
-    labels_ptr: tl.pointer_type(tl.int64),
+    labels_ptr,#: tl.pointer_type(tl.int64),
     stride_labels: tl.int64,
-    num_valid_tokens_ptr: tl.pointer_type(tl.int64),
-    max_ptr: tl.pointer_type(tl.float32),
+    num_valid_tokens_ptr,#: tl.pointer_type(tl.int64),
+    max_ptr,#: tl.pointer_type(tl.float32),
     stride_max_m: tl.int64,
     stride_max_n: tl.int64,
-    accu_ptr: tl.pointer_type(tl.float32),
+    accu_ptr,#: tl.pointer_type(tl.float32),
     stride_accu_m: tl.int64,
     stride_accu_n: tl.int64,
-    global_max_ptr: tl.pointer_type(tl.float32),
+    global_max_ptr,#: tl.pointer_type(tl.float32),
     stride_global_max: tl.int64,
-    global_accu_ptr: tl.pointer_type(tl.float32),
+    global_accu_ptr,#: tl.pointer_type(tl.float32),
     stride_global_accu: tl.int64,
-    global_logprobs_ptr: tl.pointer_type(tl.float32),
+    global_logprobs_ptr,#: tl.pointer_type(tl.float32),
     stride_global_logprobs: tl.int64,
-    global_logprobs_scalar_ptr: tl.pointer_type(tl.float32),
+    global_logprobs_scalar_ptr,#: tl.pointer_type(tl.float32),
     REDUCTION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -161,18 +163,18 @@ def forward_dp_epilogue(
 def forward_tp_epilogue(
     num_tokens: tl.int64,
     num_splits: tl.int64,
-    reduced_max_ptr: tl.pointer_type(tl.float32),
+    reduced_max_ptr,#: tl.pointer_type(tl.float32),
     stride_reduced_max_m: tl.int64,
     stride_reduced_max_n: tl.int64,
-    original_max_ptr: tl.pointer_type(tl.float32),
+    original_max_ptr,#: tl.pointer_type(tl.float32),
     stride_original_max_m: tl.int64,
     stride_original_max_n: tl.int64,
-    accu_ptr: tl.pointer_type(tl.float32),
+    accu_ptr,#: tl.pointer_type(tl.float32),
     stride_accu_m: tl.int64,
     stride_accu_n: tl.int64,
-    global_max_ptr: tl.pointer_type(tl.float32),
+    global_max_ptr,#: tl.pointer_type(tl.float32),
     stride_global_max: tl.int64,
-    global_accu_ptr: tl.pointer_type(tl.float32),
+    global_accu_ptr,#: tl.pointer_type(tl.float32),
     stride_global_accu: tl.int64,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -239,16 +241,16 @@ def forward_tp_epilogue(
 def forward_tp_epilogue_update_logprobs(
     num_tokens: tl.int64,
     ignore_index: tl.int64,
-    num_valid_tokens_ptr: tl.pointer_type(tl.int64),
-    labels_ptr: tl.pointer_type(tl.int64),
+    num_valid_tokens_ptr,#: tl.pointer_type(tl.int64),
+    labels_ptr,#: tl.pointer_type(tl.int64),
     stride_labels: tl.int64,
-    logprobs_ptr: tl.pointer_type(tl.float32),
+    logprobs_ptr,#: tl.pointer_type(tl.float32),
     stride_logprobs: tl.int64,
-    maximum_ptr: tl.pointer_type(tl.float32),
+    maximum_ptr,#: tl.pointer_type(tl.float32),
     stride_maximum: tl.int64,
-    accumulate_ptr: tl.pointer_type(tl.float32),
+    accumulate_ptr,#: tl.pointer_type(tl.float32),
     stride_accumulate: tl.int64,
-    logprobs_scalar_ptr: tl.pointer_type(tl.float32),
+    logprobs_scalar_ptr,#: tl.pointer_type(tl.float32),
     REDUCTION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
