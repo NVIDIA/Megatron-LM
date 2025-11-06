@@ -21,6 +21,7 @@ DATA_PATH=$5 #<Specify path and file prefix>_text_document
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
     --nnodes $NUM_NODES 
+    --node_rank $NODE_RANK
     --master_addr $MASTER_ADDR 
     --master_port $MASTER_PORT
 )
