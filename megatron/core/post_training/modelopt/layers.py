@@ -148,7 +148,7 @@ class Linear(torch.nn.Linear):
                 setattr(param, "allreduce", True)
                 setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
 
@@ -156,11 +156,12 @@ class Linear(torch.nn.Linear):
             if "_amax" in k or "_scale" in k:
                 if v.ndim == 0:
                     state_dict[k] = v.view(1)
+        tp_group = tp_group if self.tp_group is None else self.tp_group
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
             sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
+            tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
         )
         return sharded_state_dict
