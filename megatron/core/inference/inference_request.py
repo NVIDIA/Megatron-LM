@@ -338,6 +338,7 @@ class DynamicInferenceRequestRecord:
     resumes."""
 
     requests: list[DynamicInferenceRequest] = field(default_factory=list)
+    latency: Optional[float] = None
 
     def __getitem__(self, idx: int) -> DynamicInferenceRequest:
         """Get request by index.
@@ -444,19 +445,9 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        # >>>
         obj = asdict(self)
-        print("+++++++++++++++++++ finished asdict.")
-        try:
-            obj["requests"] = [r.serialize() for r in self.requests]
-        except Exception as e:
-            print("+++++++ ....... %s." % e)
-            raise e
-        print("+++++++++++++++++++ finished requests.serialize().")
+        obj["requests"] = [r.serialize() for r in self.requests]
         return obj
-        # +++
-        # return asdict(self)
-        # <<<
 
     @classmethod
     def deserialize(cls, obj: dict) -> "DynamicInferenceRequestRecord":

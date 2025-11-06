@@ -1257,50 +1257,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     and engine_output is not None
                     and engine_output["finished_request_records"]
                 ):
-                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                    print("................. about to build payload.")
-                    records = engine_output["finished_request_records"]
-                    print("................. got records.")
-                    record = records[0]
-                    print("................. got record.")
-                    record = record.serialize()
-                    print("................. serialized record.")
-                    try:
-                        print("x")
-                        records = [ r.serialize() for r in records ]
-                        print("y")
-                    except Exception as e:
-                        print("z")
-                        print("             %s." % e)
-                        raise e
-
-                    try:
-                        print("i")
-                        [r.serialize() for r in engine_output["finished_request_records"]]
-                        print("j")
-                    except Exception as e:
-                        print("k")
-                        print("             %s." % e)
-                        raise e
-
-                    # import json
-                    # print("................. serialized records ... len: %d." % len(json.dumps(records)))
-                    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                    try:
-                        print("a")
-                        payload = msgpack.packb(
-                            [
-                                Headers.ENGINE_REPLY.value,
-                                [r.serialize() for r in engine_output["finished_request_records"]],
-                            ],
-                            use_bin_type=True,
-                        )
-                        print("b")
-                    except Exception as e:
-                        print("c")
-                        print("             %s." % e)
-                        raise e
+                    payload = msgpack.packb(
+                        [
+                            Headers.ENGINE_REPLY.value,
+                            [r.serialize() for r in engine_output["finished_request_records"]],
+                        ],
+                        use_bin_type=True,
+                    )
                     # >>>
                     print("................. built payload.")
                     # <<<
