@@ -27,7 +27,7 @@ from examples.inference.gpt.utils import (
 from megatron.core import parallel_state
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_args
@@ -112,14 +112,15 @@ async def main(
             # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 
             await asyncio.sleep(0)
         # While we wait for the requests to complete, the engine runs in the background.
-        results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
+        results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
 
-            for req in results:
+            for record in results:
+                req = record.merge(engine.controller.tokenizer)
                 result_dict = {
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
@@ -134,7 +135,8 @@ async def main(
         else:
             print("Results:")
             unique_prompt_map = defaultdict(list)
-            for req in results:
+            for record in results:
+                req = record.merge(engine.controller.tokenizer)
                 unique_prompt_map[req.prompt].append(req)
             for idx, (prompt_text, reqs) in enumerate(unique_prompt_map.items()):
                 print(f"%d/%d. prompt '%s' ... [%d] output '%s'." % (

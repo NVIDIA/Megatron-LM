@@ -213,23 +213,15 @@ class DataParallelInferenceCoordinator:
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
 
-                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                    try:
-                        print("a")
-                        self.router_socket.send_multipart(
-                            [
-                                client_identity,
-                                msgpack.packb(
-                                    [client_request_identity, finished_request_record],
-                                    use_bin_type=True,
-                                ),
-                            ]
-                        )
-                        print("b")
-                    except Exception as e:
-                        print("......... eeeee, '%s'." % e)
-                        raise e
-                    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                    self.router_socket.send_multipart(
+                        [
+                            client_identity,
+                            msgpack.packb(
+                                [client_request_identity, finished_request_record],
+                                use_bin_type=True,
+                            ),
+                        ]
+                    )
 
             else:
                 raise UnknownHeaderError(header)

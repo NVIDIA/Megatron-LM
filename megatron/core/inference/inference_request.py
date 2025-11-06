@@ -433,6 +433,7 @@ class DynamicInferenceRequestRecord:
             sampling_params=self.requests[0].sampling_params,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
+            latency=self.latency,
             events=merge_lists("events"),
         )
 

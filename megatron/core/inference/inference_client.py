@@ -125,19 +125,11 @@ class InferenceClient:
                 )
                 completion_future = self.completion_futures.pop(request_id)
                 completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
-                # >>>
-                print("...... client, 1.")
-                # <<<
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
             except KeyboardInterrupt:
                 break
-            # >>>
-            except Exception as e:
-                print("......... error, '%s'." % e)
-                raise e
-            # <<<
 
     def _connect_with_inference_coordinator(self):
         """
