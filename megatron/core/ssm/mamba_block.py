@@ -420,11 +420,7 @@ class MambaStack(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module,
-                        f'{prefix}{name}.',
-                        sharded_offsets,
-                        metadata,
-                        tp_group=tp_group,
+                        module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group
                     )
                 )
 
