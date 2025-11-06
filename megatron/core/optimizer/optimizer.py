@@ -49,6 +49,7 @@ from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+from ..fp4_utils import is_nvfp4tensor, dequantize_fp4_tensor
 
 logger = getLogger(__name__)
 
@@ -778,9 +779,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         assert state_dict is None, "Initialize main params from state dict is not supported"
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
-        _multi_tensor_copy_this_to_that(
-            this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf
-        )
+        # Dequantize NVFP4 tensors if present; otherwise do regular copy
+        if any(is_nvfp4tensor(t) for t in model_data):
+            for src, dst in zip(model_data, main_data):
+                if is_nvfp4tensor(src):
+                    dst.copy_(dequantize_fp4_tensor(src))
+                else:
+                    dst.copy_(src)
+        else:
+            _multi_tensor_copy_this_to_that(
+                this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf
+            )
 
     def state_dict(self, is_loading: bool = False):
         if is_loading:

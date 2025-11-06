@@ -55,6 +55,78 @@ def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("FP4 dequantization requires Transformer Engine >= 2.7.0.dev0")
 
 
+def get_nvfp4_rowwise_packed_shape(shape: torch.Size) -> torch.Size:
+    """Return packed byte shape for NVFP4 rowwise storage (last dim // 2)."""
+    if len(shape) == 0:
+        return shape
+    assert shape[-1] % 2 == 0, "NVFP4 requires inner dimension divisible by 2"
+    packed = list(shape)
+    packed[-1] = packed[-1] // 2
+    return torch.Size(packed)
+
+
+def modify_nvfp4_rowwise_storage(fp4_tensor: torch.Tensor, new_rowwise_data: torch.Tensor) -> None:
+    """Replace NVFP4 tensor's rowwise raw data with a new uint8 storage view.
+
+    Copies existing bytes into the new buffer, then swaps the underlying pointer.
+    """
+    if not is_nvfp4tensor(fp4_tensor):
+        raise ValueError("modify_nvfp4_rowwise_storage expects an NVFP4 tensor")
+    # Access TE's internal storage fields
+    old_rowwise = getattr(fp4_tensor, "_rowwise_data", None)
+    if old_rowwise is None:
+        raise RuntimeError("NVFP4 tensor is missing rowwise data to replace")
+    assert (
+        old_rowwise.dtype == new_rowwise_data.dtype == torch.uint8
+    ), "Rowwise NVFP4 storage must be uint8"
+    # Preserve existing values and then swap storage
+    new_rowwise_data.detach().copy_(old_rowwise)
+    setattr(fp4_tensor, "_rowwise_data", new_rowwise_data)
+
+
+def get_nvfp4_columnwise_packed_shape(shape: torch.Size) -> torch.Size:
+    """Return packed byte shape for NVFP4 columnwise storage.
+
+    Columnwise bytes are stored as a 2D tensor: (K, M/2), where M=prod(shape[:-1]), K=shape[-1].
+    """
+    if len(shape) == 0:
+        return shape
+    M = 1
+    for d in list(shape)[:-1]:
+        M *= int(d)
+    K = int(shape[-1])
+    assert M % 2 == 0, "NVFP4 requires flattened non-inner dimension divisible by 2"
+    return torch.Size([K, M // 2])
+
+
+def modify_nvfp4_columnwise_storage(fp4_tensor: torch.Tensor, new_columnwise_data: torch.Tensor) -> None:
+    """Replace NVFP4 tensor's columnwise raw data with a new uint8 storage view."""
+    if not is_nvfp4tensor(fp4_tensor):
+        raise ValueError("modify_nvfp4_columnwise_storage expects an NVFP4 tensor")
+    old_col = getattr(fp4_tensor, "_columnwise_data", None)
+    if old_col is None:
+        raise RuntimeError("NVFP4 tensor is missing columnwise data to replace")
+    assert (
+        old_col.dtype == new_columnwise_data.dtype == torch.uint8
+    ), "Columnwise NVFP4 storage must be uint8"
+    new_columnwise_data.detach().copy_(old_col)
+    setattr(fp4_tensor, "_columnwise_data", new_columnwise_data)
+
+
+def quantize_nvfp4_param_shard(
+    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+):
+    """Cast shard FP32 master weights to NVFP4 model params (rowwise/columnwise).
+
+    NOTE: This is a placeholder stub. Proper NVFP4 shard quantization requires
+    TE kernel support for nibble-accurate partial updates and coordinated tile updates.
+    """
+    raise NotImplementedError(
+        "NVFP4 shard quantization path is not implemented in MCore yet. "
+        "It requires TE NVFP4 shard casting support."
+    )
+
+
 if HAVE_TE:
     from megatron.core import parallel_state
 

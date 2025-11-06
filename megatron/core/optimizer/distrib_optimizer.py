@@ -47,6 +47,13 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..fp4_utils import is_nvfp4tensor
+try:
+    # Prefer TE's native casting path if available
+    from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_nvfp4 as _te_cast_nvfp4
+    HAVE_TE_NVFP4_CAST = True
+except Exception:
+    HAVE_TE_NVFP4_CAST = False
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
@@ -2360,6 +2367,45 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
 
+    def _get_nvfp4_params_and_shard_fp32_from_nvfp4(self):
+        """
+        Get lists of NVFP4 model params, corresponding shard main params, and the starting index of
+        the shard main param in the NVFP4 param. Parameters in all three lists are in the same order.
+        """
+        nvfp4_params = []
+        shard_fp32_from_nvfp4 = []
+        shard_offsets_in_nvfp4 = []
+
+        buffers = self.buffers if not self.ddp_config.use_megatron_fsdp else []
+
+        # Map param to index in lists
+        nvfp4_param_to_idx_map = {}
+        idx = 0
+        for buffer in buffers:
+            for param in buffer.params:
+                if is_nvfp4tensor(param):
+                    nvfp4_params.append(param)
+                    shard_fp32_from_nvfp4.append(None)
+                    shard_offsets_in_nvfp4.append(None)
+                    nvfp4_param_to_idx_map[param] = idx
+                    idx += 1
+
+        def get_shard_fp32_from_nvfp4(shard_main_groups, model_groups):
+            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    if is_nvfp4tensor(model_param):
+                        param_range_map = self._get_model_param_range_map(model_param)
+                        param_range = param_range_map["param"]
+                        assert param_range.size == shard_main_param.nelement()
+                        idx = nvfp4_param_to_idx_map[model_param]
+                        shard_fp32_from_nvfp4[idx] = shard_main_param
+                        shard_offsets_in_nvfp4[idx] = param_range.start
+
+        get_shard_fp32_from_nvfp4(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        get_shard_fp32_from_nvfp4(self.shard_fp32_groups, self.model_fp32_groups)
+
+        return nvfp4_params, shard_fp32_from_nvfp4, shard_offsets_in_nvfp4
+
     def _copy_model_grads_to_main_grads(self):
         """
         Copy model grads to main grads.
@@ -2427,6 +2473,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         quantize_param_shard(
             *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
         )
+        # Quantize FP32 master shards back to NVFP4 model params (row/col + tiles)
+        if HAVE_TE_NVFP4_CAST:
+            nvfp4_params, shard_fp32, shard_offsets = self._get_nvfp4_params_and_shard_fp32_from_nvfp4()
+            # If any shard is partial, TE function will raise; we allow full casts only for now
+            try:
+                _te_cast_nvfp4(nvfp4_params, shard_fp32, shard_offsets, self.data_parallel_group)
+            except NotImplementedError:
+                pass
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):

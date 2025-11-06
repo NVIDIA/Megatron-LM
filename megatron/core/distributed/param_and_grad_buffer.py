@@ -17,7 +17,7 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
+from ..fp4_utils import is_nvfp4tensor
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -78,9 +78,12 @@ class _ParamAndGradBucket:
         self,
         params: List[torch.nn.Parameter],
         param_data: Optional[torch.Tensor],
+        scale_data: Optional[torch.Tensor],
         grad_data: torch.Tensor,
         offset: int,
         numel_unpadded: int,
+        scale_offset: Optional[int],
+        scale_numel_unpadded: Optional[int],
         gradient_scaling_factor: float,
         bucket_id: int,
     ):
@@ -90,10 +93,13 @@ class _ParamAndGradBucket:
         assert len(self.params_list) == len(self.params)
         self.param_data = param_data
         self.grad_data = grad_data
+        self.scale_data = scale_data
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
         self.numel_unpadded = numel_unpadded
+        self.scale_offset = scale_offset
+        self.scale_numel_unpadded = scale_numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
         self.param_to_index = {}
@@ -251,6 +257,22 @@ class _ParamAndGradBucketGroup:
                     group=self.intra_distributed_optimizer_instance_group,
                     async_op=async_op,
                 )
+            # All-gather NVFP4 scaling factors per bucket
+            for idx, bucket in enumerate(self.buckets):
+                if bucket.scale_data is None:
+                    continue
+                # Create cached shard list for scale buffer
+                scale_shards = shard_buffer(
+                    bucket.scale_data, self.intra_distributed_optimizer_instance_size
+                )
+                local_scale_view = scale_shards[self.intra_distributed_optimizer_instance_rank]
+                dist_all_gather_func(
+                    bucket.scale_data,
+                    local_scale_view,
+                    group=self.intra_distributed_optimizer_instance_group,
+                    async_op=async_op,
+                )
+
         if async_op:
             self.param_gather_handle = cm
         else:
@@ -318,6 +340,8 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
+
+            # NVFP4: we only all-gather rowwise bytes and rowwise scale_inv (done in start_param_sync)
 
     def start_grad_sync(self):
         """
@@ -559,6 +583,7 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
+        self.scale_index_map = {}  # Param -> location in scale buffer mapping for NVFP4.
 
         def _pad(number_to_be_padded: int, divisor: int) -> int:
             return int(math.ceil(number_to_be_padded / divisor) * divisor)
@@ -636,6 +661,12 @@ class _ParamAndGradBuffer:
                 and self.ddp_config.use_distributed_optimizer
             )
 
+        # Parallel scale index bookkeeping for NVFP4
+        scale_start_index = 0
+        bucket_scale_start_index = 0
+        self.bucket_scale_indices = []
+        per_bucket_scale_numel_unpadded = []
+
         for param in params[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
@@ -650,6 +681,42 @@ class _ParamAndGradBuffer:
 
             param_end_index = param_start_index + this_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            # NVFP4 scale tiles (if present) use uint8 elements; compute and track separately
+            row_scale_numel = 0
+            col_scale_numel = 0
+            row_scale_shape = None
+            col_scale_shape = None
+            if is_nvfp4tensor(param):
+                if hasattr(param, "_rowwise_scale_inv") and (param._rowwise_scale_inv is not None):
+                    row_scale_shape = param._rowwise_scale_inv.shape
+                    row_scale_numel = int(param._rowwise_scale_inv.numel())
+                if hasattr(param, "_columnwise_scale_inv") and (param._columnwise_scale_inv is not None):
+                    col_scale_shape = param._columnwise_scale_inv.shape
+                    col_scale_numel = int(param._columnwise_scale_inv.numel())
+            row_scale_start = scale_start_index
+            row_scale_end = row_scale_start + row_scale_numel
+            col_scale_start = row_scale_end
+            col_scale_end = col_scale_start + col_scale_numel
+            scale_end_index = col_scale_end
+            self.scale_index_map[param] = {
+                "bucket_id": bucket_id,
+                "row_start": row_scale_start,
+                "row_end": row_scale_end,
+                "row_shape": row_scale_shape,
+                "col_start": col_scale_start,
+                "col_end": col_scale_end,
+                "col_shape": col_scale_shape,
+            }
+            # If we have enough elements already or the current param is part of the shared embedding layer and needs a separate bucket for scales, form a new scale bucket aligned with param buckets
+            if (
+                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                # close current scale bucket at current scale index (no padding for zeros-only params)
+                per_bucket_scale_numel_unpadded.append(scale_start_index - bucket_scale_start_index)
+                bucket_scale_end_index = _pad_end_of_bucket_if_needed(scale_start_index)
+                self.bucket_scale_indices.append((bucket_scale_start_index, bucket_scale_end_index))
+                bucket_scale_start_index = bucket_scale_end_index
+            scale_start_index = scale_end_index
             bucket_params.add(param)
 
             # If we have enough elements already or the current param is part of the shared
@@ -665,6 +732,10 @@ class _ParamAndGradBuffer:
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
             bucket_end_index = _update_bucket_metadata(param_end_index)
+            # finalize scale bucket too
+            per_bucket_scale_numel_unpadded.append(scale_start_index - bucket_scale_start_index)
+            bucket_scale_end_index = _pad_end_of_bucket_if_needed(scale_start_index)
+            self.bucket_scale_indices.append((bucket_scale_start_index, bucket_scale_end_index))
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
@@ -677,6 +748,7 @@ class _ParamAndGradBuffer:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
+        self.scale_data = None
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
@@ -725,6 +797,19 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
+            # Allocate scale buffer for NVFP4 if any
+            total_scale_numel = 0
+            if any(is_nvfp4tensor(p) for p in params):
+                # total scale buffer size is the end of last bucket_scale_indices
+                if len(self.bucket_scale_indices) > 0:
+                    total_scale_numel = self.bucket_scale_indices[-1][1]
+                if total_scale_numel > 0:
+                    self.scale_data = torch.zeros(
+                        total_scale_numel,
+                        dtype=torch.uint8,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
@@ -741,6 +826,39 @@ class _ParamAndGradBuffer:
                     )
                     if is_float8tensor(param):
                         modify_underlying_storage(param, new_param_data)
+                    elif is_nvfp4tensor(param):
+                        # For NVFP4, map rowwise byte storage to the param buffer and map scale tiles to scale buffer
+                        from ..fp4_utils import (
+                            get_nvfp4_rowwise_packed_shape,
+                            get_nvfp4_columnwise_packed_shape,
+                            modify_nvfp4_rowwise_storage,
+                            modify_nvfp4_columnwise_storage,
+                        )
+
+                        packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                        rowwise_bytes_view = self._get(
+                            packed_shape, param_start_index, buffer_type=BufferType.PARAM
+                        )
+                        modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                        # Columnwise bytes are placed in the second half of the element slice
+                        this_numel = param.data.nelement()
+                        col_packed_shape = get_nvfp4_columnwise_packed_shape(param.data.shape)
+                        col_offset_bytes = param_start_index + (this_numel // 2)
+                        col_bytes_view = self._get(
+                            torch.Size(col_packed_shape), col_offset_bytes, buffer_type=BufferType.PARAM
+                        )
+                        modify_nvfp4_columnwise_storage(param, col_bytes_view)
+                        # Map scale tiles
+                        if self.scale_data is not None:
+                            s_info = self.scale_index_map[param]
+                            # Rowwise tiles
+                            if s_info["row_end"] > s_info["row_start"] and s_info["row_shape"] is not None:
+                                row_scale_view = self.scale_data[s_info["row_start"]:s_info["row_end"]]
+                                param._rowwise_scale_inv = row_scale_view.view(s_info["row_shape"]) 
+                            # Columnwise tiles
+                            if s_info["col_end"] > s_info["col_start"] and s_info["col_shape"] is not None:
+                                col_scale_view = self.scale_data[s_info["col_start"]:s_info["col_end"]]
+                                param._columnwise_scale_inv = col_scale_view.view(s_info["col_shape"]) 
                     else:
                         old_param_data = param.data
                         param.data = new_param_data
@@ -760,6 +878,9 @@ class _ParamAndGradBuffer:
                         start_index=bucket_start_index,
                         end_index=bucket_end_index,
                         numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                        scale_start_index=self.bucket_scale_indices[cur_bucket_id][0] if len(self.bucket_scale_indices) > cur_bucket_id else None,
+                        scale_end_index=self.bucket_scale_indices[cur_bucket_id][1] if len(self.bucket_scale_indices) > cur_bucket_id else None,
+                        scale_numel_unpadded=per_bucket_scale_numel_unpadded[cur_bucket_id] if len(per_bucket_scale_numel_unpadded) > cur_bucket_id else None,
                         bucket_id=cur_bucket_id,
                     )
                 )
@@ -779,6 +900,9 @@ class _ParamAndGradBuffer:
                     start_index=bucket_start_index,
                     end_index=bucket_end_index,
                     numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
+                    scale_start_index=self.bucket_scale_indices[cur_bucket_id][0] if len(self.bucket_scale_indices) > cur_bucket_id else None,
+                    scale_end_index=self.bucket_scale_indices[cur_bucket_id][1] if len(self.bucket_scale_indices) > cur_bucket_id else None,
+                    scale_numel_unpadded=per_bucket_scale_numel_unpadded[cur_bucket_id] if len(per_bucket_scale_numel_unpadded) > cur_bucket_id else None,
                     bucket_id=cur_bucket_id,
                 )
             )
@@ -827,12 +951,26 @@ class _ParamAndGradBuffer:
         buffer_tensor = buffer_tensor.view(shape)
         return buffer_tensor
 
+    def _get_scale(self, shape: torch.Size, start_index: int) -> torch.Tensor:
+        """
+        Return a tensor view into the scale buffer starting at start_index.
+        """
+        assert self.scale_data is not None
+        end_index = start_index + shape.numel()
+        assert end_index <= self.scale_data.numel(), "Requested tensor is out of scale buffer range"
+        buffer_tensor = self.scale_data[start_index:end_index]
+        buffer_tensor = buffer_tensor.view(shape)
+        return buffer_tensor
+
     def _new_bucket(
         self,
         bucket_params: List[torch.nn.Parameter],
         start_index: int,
         end_index: int,
         numel_unpadded: int,
+        scale_start_index: Optional[int],
+        scale_end_index: Optional[int],
+        scale_numel_unpadded: Optional[int],
         bucket_id: int,
     ) -> _ParamAndGradBucket:
         """
@@ -852,15 +990,21 @@ class _ParamAndGradBuffer:
             bucketed_param_data = self._get(
                 torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
             )
+        bucketed_scale_data = None
+        if self.scale_data is not None and scale_start_index is not None and scale_end_index is not None:
+            bucketed_scale_data = self.scale_data[scale_start_index:scale_end_index]
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
         bucket = _ParamAndGradBucket(
             params=bucket_params,
             param_data=bucketed_param_data,
+            scale_data=bucketed_scale_data,
             grad_data=bucketed_grad_data,
             offset=start_index,
             numel_unpadded=numel_unpadded,
+            scale_offset=scale_start_index,
+            scale_numel_unpadded=scale_numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
         )
