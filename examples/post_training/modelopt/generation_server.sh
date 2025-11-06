@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_DIR="$(realpath $(dirname "$(readlink -f "$0")")/../../../tools)"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # Common arguments and base model specific arguments
 source "${SCRIPT_DIR}/conf/arguments.sh"
@@ -14,11 +14,9 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
     exit 1
 fi
 
-if [ -z ${DRAFT_LEN} ]; then
-    DRAFT_LEN=0
-fi
+TOOLS_DIR="$(realpath ${SCRIPT_DIR}/../../../tools)"
 
-${LAUNCH_SCRIPT} ${SCRIPT_DIR}/run_text_generation_server.py \
+${LAUNCH_SCRIPT} ${TOOLS_DIR}/run_text_generation_server.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
