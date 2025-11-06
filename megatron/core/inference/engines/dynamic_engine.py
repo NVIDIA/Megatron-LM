@@ -1264,9 +1264,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         ],
                         use_bin_type=True,
                     )
-                    # >>>
-                    print("................. built payload.")
-                    # <<<
                     self.socket_for_receiving_requests.send(payload)
 
         except asyncio.CancelledError:
