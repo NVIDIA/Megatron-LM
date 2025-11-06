@@ -242,7 +242,7 @@ def sharded_state_dict_default(
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
-            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata, tp_group=tp_group
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
         )
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)

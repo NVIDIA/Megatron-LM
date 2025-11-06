@@ -148,7 +148,7 @@ class Linear(torch.nn.Linear):
                 setattr(param, "allreduce", True)
                 setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
 
@@ -161,7 +161,7 @@ class Linear(torch.nn.Linear):
             state_dict,
             prefix,
             sharded_offsets=sharded_offsets,
-            tp_group=tp_group,
+            tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
         )
         return sharded_state_dict

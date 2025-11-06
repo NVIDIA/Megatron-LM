@@ -73,7 +73,7 @@ class ExtendedRMSNorm(RMSNormGated):
     RMSNormGated with sharded state dict.
     """
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
@@ -81,7 +81,7 @@ class ExtendedRMSNorm(RMSNormGated):
             prefix,
             {"weight": 0},
             sharded_offsets,
-            tp_group=tp_group,
+            tp_group=self.tp_group,
             dp_cp_group=metadata["dp_cp_group"],
         )
 
@@ -793,7 +793,7 @@ class MambaMixer(MegatronModule):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
@@ -812,7 +812,6 @@ class MambaMixer(MegatronModule):
             sharded_offsets=sharded_offsets,
         )
         # Submodules
-        tp_group = tp_group if self.tp_group is None else self.tp_group
         for name, module in self.named_children():
             if name == "conv1d":
                 # Add TP sharding for Conv1d
@@ -822,7 +821,7 @@ class MambaMixer(MegatronModule):
                     f"{prefix}{name}.",
                     {f"weight": 0, f"bias": 0},
                     sharded_offsets,
-                    tp_group=tp_group,
+                    tp_group=self.tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
 
