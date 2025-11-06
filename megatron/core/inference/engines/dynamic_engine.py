@@ -463,7 +463,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         "Defaulting to not using termination id."
                     )
                 eod = -1
-            request.sampling_params.termination_id = self.controller.tokenizer.eod
+            request.sampling_params.termination_id = eod
 
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate

@@ -246,10 +246,10 @@ class TestTextGenerationController:
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":
-            sampling_test_cases[3][0]["top_p"] = 0.8
+            sampling_test_cases[3][0].top_p = 0.8
 
         # Convert sampling params to non-readable format.
-        rev_sampling_dict: List[Dict] = [None] * batch_size
+        rev_sampling_dict: List[SamplingParams] = [None] * batch_size
         for sampling_params, indices in sampling_test_cases:
             for idx in indices:
                 rev_sampling_dict[idx] = sampling_params
@@ -257,23 +257,25 @@ class TestTextGenerationController:
         # Prepare metadata for sample bookkeeping.
         request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
         request_metadata = torch.empty(
-            (batch_size, len(request_metadata_labels)), dype=torch.float32
-        )
+            (batch_size, len(request_metadata_labels)), dtype=torch.float32
+        ).cuda()
         top_k_values = torch.Tensor(
             [s.top_k if s.top_k != 0 else self.vocab_size for s in rev_sampling_dict]
         ).cuda()
-        request_metadata[:, request_metadata_labels.index("top_k")] = top_k_values
+        request_metadata[:, request_metadata_labels["top_k"]] = top_k_values
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels.index("top_p")] = top_p_values
+        request_metadata[:, request_metadata_labels["top_p"]] = top_p_values
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda()
-        request_metadata[:, request_metadata_labels.index("temperature")] = temp_values
+        request_metadata[:, request_metadata_labels["temperature"]] = temp_values
 
         # Bookkeeping.
-        self.text_generation_controller._dynamic_step_sample_bookkeeping(request_metadata)
+        self.text_generation_controller._dynamic_step_sample_bookkeeping(
+            request_metadata=request_metadata
+        )
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        sampled_logits, _ = self.text_generation_controller._dynamic_step_sample_logits(
+        sampled_logits = self.text_generation_controller._dynamic_step_sample_logits(
             logits, backend=backend
         )
         vocab_indices = torch.arange(self.vocab_size).cuda()

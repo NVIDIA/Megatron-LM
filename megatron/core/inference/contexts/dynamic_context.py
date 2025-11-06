@@ -236,8 +236,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             allocate `memory_buffer` in unified memory. Eventually, additional
             levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
-        If None, defaults to using flash-infer if available.
+            If None, defaults to using flash-infer if available.
         metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
+        num_request_metadata (Optional[int]): Number of metadata fields to track per request.
+            These represent metadata that is needed by the text generation controller,
+            and that must be kept in sync with active requests through update_requests.
     """
 
     def __init__(
@@ -264,6 +267,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 0,
         metrics_writer: Optional['WandbModule'] = None,
+        num_request_metadata: Optional[int] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -378,8 +382,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
 
         # Track request metadata.
+        if num_request_metadata is None:
+            num_request_metadata = len(DynamicInferenceRequest.get_metadata_labels())
+        self.num_request_metadata = num_request_metadata
         self.request_metadata = torch.empty(
-            (self.max_requests, len(DynamicInferenceRequest.get_metadata_labels)),
+            (self.max_requests, self.num_request_metadata),
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
@@ -1165,8 +1172,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_ids[current_id] = req.request_id
         # Handle request metadata. TODO @TDE: see if we can build this using the metadata labels.
         metadata = req.tracked_metadata
+        assert len(metadata) == self.num_request_metadata
         self.request_metadata[current_id] = torch.tensor(
-            metadata, dtype=torch.long, device=self.request_metadata.device
+            metadata, dtype=torch.float32, device=self.request_metadata.device
         )
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length

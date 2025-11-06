@@ -590,9 +590,9 @@ class TextGenerationController:
         if backend == "torch":
             # Special-case for static sampling.
             if getattr(self, "static_sampling", False):
-                self.torch_sampling_groups = torch.arange(
-                    active_request_count, device=request_metadata.device
-                )
+                self.torch_sampling_groups = [torch.arange(
+                    active_request_count, device=request_metadata.device,
+                )]
             else:
                 # Bucketize the core sampling parameters.
                 _, inv_indices, cnts = torch.unique(
@@ -617,14 +617,14 @@ class TextGenerationController:
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
     def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
-        """Sample logits for dynamic batching.
+        """Sample tokens from logits for dynamic batching.
 
         Args:
             logits (Tensor): The logits to sample from.
             backend (str): The sampling backend to use.
 
         Returns:
-            sampled_logits (Tensor): The sampled logits. Return value only used for tests.
+            new_sample (Tensor): The sampled tokens.
         """
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
@@ -649,9 +649,9 @@ class TextGenerationController:
         group_reps = torch.stack([indices[0] for indices in self.torch_sampling_groups], dim=0)
         if backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
-            logit_list = []
+            token_list = []
             for i, indices in enumerate(self.torch_sampling_groups):
-                logit_list.append(
+                token_list.append(
                     self._torch_sampling_func(
                         self.cu_sampling_logits[indices, :],
                         self.cu_temperature[group_reps[i]],
@@ -660,12 +660,12 @@ class TextGenerationController:
                     )
                 )
             # Single write to the output tensor.
-            self.cu_sampled_tokens.index_copy_(
-                0, torch.cat(self.torch_sampling_groups, dim=0), torch.cat(logit_list, dim=0)
-            )
+            sampled_tokens = torch.cat(logits_list, dim=0).to(dtype=torch.int64, non_blocking=True)
+            sampled_indices = torch.cat(self.torch_sampling_groups, dim=0)
+            self.cu_sampled_tokens.index_copy_(0, sampled_indices, sampled_tokens)
         return self.cu_sampled_tokens[:active_request_count]
 
-    def _dynamic_step_log_probs_bookkeeping(self):
+    def _dynamic_step_log_probs_bookkeeping(self) -> bool:
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
@@ -694,11 +694,14 @@ class TextGenerationController:
             only_last_token_logits=materialize_only_last_token_logits,
         )
 
-    def _dynamic_step_context_bookkeeping(self) -> Tuple[Tensor, Tensor, Tensor]:
+    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Return:
-            Tuple[Tensor, Tensor, Tensor]: active / paused / finished request IDs.
+            Dict [str, Tensor]: A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -727,7 +730,7 @@ class TextGenerationController:
         new_sample_copy = torch.empty(
             active_request_count, dtype=torch.int32, device=self.cu_sampled_tokens.device
         )
-        new_sample.copy_(self.cu_sampled_tokens[:active_request_count])
+        new_sample_copy.copy_(self.cu_sampled_tokens[:active_request_count])
 
         # Update requests.
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
@@ -783,7 +786,7 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         self._dynamic_step_sample_bookkeeping()
-        self._dynamic_step_sample_logits(logits)
+        new_sample = self._dynamic_step_sample_logits(logits)
 
         return_log_probs = self._dynamic_step_log_probs_bookkeeping()
         if return_log_probs:
@@ -793,16 +796,16 @@ class TextGenerationController:
 
         # This method only performs computations using CPU tensors.
         if skip_bookkeeping:
-            request_bookeeping = {}
+            request_bookkeeping = {}
         else:
-            request_bookeeping = self._dynamic_step_context_bookkeeping()
+            request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
         ret = {
             "sample": new_sample,
             "log_probs": log_probs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
-        ret.update(request_bookeeping)
+        ret.update(request_bookkeeping)
         return ret
 
     @torch.inference_mode()
