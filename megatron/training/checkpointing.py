@@ -1540,7 +1540,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         if dp_cp_group is None:
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-        sharded_sd_metadata.update({"dp_cp_group": dp_cp_group})
+
+        # dist_checkpointing.load_content_metadata(...) may return None.
+        # Ensure we have a dict before updating to avoid NoneType AttributeError.
+        if sharded_sd_metadata is None:
+            sharded_sd_metadata = {}
+        sharded_sd_metadata["dp_cp_group"] = dp_cp_group
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
