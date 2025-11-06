@@ -80,9 +80,6 @@ class MegatronModule(torch.nn.Module):
         sharded_state_dict = {}
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
-        # Determine the tensor-parallel (TP) group to use:
-        # - If neither self.tp_group nor the tp_group argument is provided, fall back to the default.
-        # - Otherwise prefer self.tp_group; if it's None, use the passed-in tp_group.
         if getattr(self, 'tp_group', None) is None and tp_group is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
         tp_group = tp_group if getattr(self, 'tp_group', None) is None else self.tp_group
