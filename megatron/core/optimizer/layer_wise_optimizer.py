@@ -1,9 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -36,17 +39,36 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         optimizers: List[MegatronOptimizer],
         config: OptimizerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        init_state_fn_list: Optional[List[Callable]] = None,
     ) -> None:
+        """
+        Initialize LayerWiseDistributedOptimizer.
+
+        Args:
+            optimizers: List of MegatronOptimizers.
+            config: OptimizerConfig.
+            pg_collection: ProcessGroupCollection.
+            init_state_fn_list: List of init state functions.
+        """
+
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
         # wrap optimizer after sharding to avoid unnecessary master weight creation
         # TODO(deyuf): check if underlying optimizer.config need to fixed and if so can use
         # that instead of passing
+        if init_state_fn_list is None:
+            init_state_fn_list = [None] * len(optimizers)
+        else:
+            assert len(init_state_fn_list) == len(optimizers), (
+                "init_state_fn_list must be the " "same length as optimizers if provided"
+            )
+
         if config.bf16:
             if isinstance(optimizers[0], Float16OptimizerWithFloat16Params):
                 raise TypeError('LayerWiseDistributedOptimizer received Float16 optimizer already.')
             optimizers = [
-                Float16OptimizerWithFloat16Params(optim, config, None, None) for optim in optimizers
+                Float16OptimizerWithFloat16Params(optim, config, None, init_state_fn_list[idx])
+                for idx, optim in enumerate(optimizers)
             ]
         super().__init__(optimizers)
 
@@ -152,14 +174,23 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         return update_successful, grad_norm, num_zeros_in_grad
 
-    def save_state_dict_to_file(self, filename: str) -> None:
-        """Save the parameter state of the optimizer.
-
-        Args:
-            filename: The filename to save the parameter state.
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
+    ):
         """
-        torch.save(super().state_dict(), filename)
+        Sharded state dict for torch_dist format checkpointing.
+        For fixed DP usage only, set replica_id to 0 for all ShardedTensor.
+        """
+        sharded_state_dict = super().sharded_state_dict(
+            model_sharded_state_dict, is_loading, **kwargs
+        )
 
-    def load_state_dict_from_file(self, filename: str) -> None:
-        """Load the parameter state of the optimizer."""
-        super().load_state_dict(torch.load(filename))
+        # for fixed DP usage only
+        for sh_base in nested_values(sharded_state_dict):
+            if isinstance(sh_base, ShardedTensor):
+                assert (
+                    len(sh_base.replica_id) == 3
+                ), f'Expected replica_id format (PP, TP, DP), got: {sh_base}'
+                sh_base.replica_id = (*sh_base.replica_id[:2], 0)
+
+        return sharded_state_dict

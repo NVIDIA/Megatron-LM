@@ -1,5 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import os
-import tempfile
 
 import pytest
 import torch
@@ -224,29 +224,38 @@ class TestLayerWiseOptimizer:
         # TODO(deyuf): fix this. not going through get() will cause missing keys like wd_mult
         # optimizer.load_state_dict(state_dict)
 
-    def test_save_load_file(self):
-        """Test LayerWiseDistributedOptimizer save and load state dict to/from file."""
+    def test_sharded_state_dict(self):
+        """Test LayerWiseDistributedOptimizer sharded_state_dict method."""
         model, optimizer, pg_collection = self.create_model_and_optimizer()
 
         for param in model.parameters():
             param.grad = torch.randn_like(param)
         optimizer.step()
 
-        # Test save to file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp_file:
-            temp_filename = tmp_file.name
+        # Get model sharded state dict
+        model_sharded_state_dict = model.sharded_state_dict()
 
-        try:
-            optimizer.save_state_dict_to_file(temp_filename)
-            assert os.path.exists(temp_filename), "State dict file should be created"
+        # Test sharded_state_dict
+        sharded_state_dict = optimizer.sharded_state_dict(model_sharded_state_dict)
 
-            # Test load from file
-            # TODO(deyuf): fix this. not going through get() will cause missing keys like wd_mult
-            # optimizer.load_state_dict_from_file(temp_filename)
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
+        # Verify the sharded_state_dict is not None and has expected structure
+        assert sharded_state_dict is not None, "Sharded state dict should not be None"
+        assert (
+            'optimizer' in sharded_state_dict
+        ), "Sharded state dict should contain 'optimizer' key"
+
+        # Verify that replica_id is set correctly (should be 0 for DP dimension)
+        from megatron.core.dist_checkpointing import ShardedTensor
+        from megatron.core.dist_checkpointing.dict_utils import nested_values
+
+        for sh_base in nested_values(sharded_state_dict):
+            if isinstance(sh_base, ShardedTensor):
+                assert (
+                    len(sh_base.replica_id) == 3
+                ), f'Expected replica_id format (PP, TP, DP), got: {sh_base.replica_id}'
+                assert (
+                    sh_base.replica_id[2] == 0
+                ), f'Expected DP replica_id to be 0 for layer-wise optimizer, got: {sh_base.replica_id[2]}'
 
     def test_multiple_optimizers(self):
         """Test LayerWiseDistributedOptimizer with multiple chained optimizers.
