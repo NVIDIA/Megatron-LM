@@ -1,7 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-# FAILED: torchrun --nproc_per_node=8 -m pytest -s -vv -x tests/unit_tests/dist_checkpointing/models/test_mamba.py::TestMambaReconfiguration::test_parallel_reconfiguration_e2e[True-False-src_tp_pp_exp_cp5-dest_tp_pp_exp_cp5-False]
-
 import pytest
 import torch
 
