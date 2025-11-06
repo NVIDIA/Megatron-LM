@@ -172,9 +172,6 @@ class _CudagraphGlobalRecord:
             else:
                 runner.create_bwd_graph(global_tensor_pool)
 
-        # all references inside the cudagraph_runners are turned into weakrefs, so keep a reference
-        # to global_tensor_pool, which is all strong refs
-        cls.global_tensor_pool = global_tensor_pool
         for g in cls.cudagraph_record:
             runner = g[0]
             runner.cudagraph_created = True
@@ -273,7 +270,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
-        if runner.fp8_enabled:
+        if runner.fp8_enabled or runner.fp4_enabled:
             if isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
                 for m in runner.base_module.modules():
                     if isinstance(m, TransformerEngineBaseModule):
