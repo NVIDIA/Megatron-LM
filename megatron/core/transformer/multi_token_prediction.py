@@ -450,7 +450,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.layer_number = layer_number
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
-        self.tp_group = pg_collection.tp
 
         self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
@@ -766,7 +765,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction layer.
         """
-        tp_group = tp_group if self.tp_group is None else self.tp_group
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata, tp_group=tp_group)
         return sharded_state_dict
 
@@ -848,7 +846,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
-        self.tp_group = pg_collection.tp
 
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
@@ -959,7 +956,6 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        tp_group = tp_group if self.tp_group is None else self.tp_group
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata, tp_group=tp_group)
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
