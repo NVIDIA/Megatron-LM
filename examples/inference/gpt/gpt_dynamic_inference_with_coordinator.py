@@ -48,7 +48,9 @@ async def main(
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
     await engine.start_listening_to_data_parallel_coordinator( 
-        inference_coordinator_port=port, launch_inference_coordinator=True
+        inference_coordinator_port=port,
+        launch_inference_coordinator=True,
+        verbose=True,
     )
     # if you want to use your own inference coordinator - 
     # 1. set launch_inference_coordinator to False

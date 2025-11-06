@@ -444,9 +444,19 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
+        # >>>
         obj = asdict(self)
-        obj["requests"] = [r.serialize() for r in obj["requests"]]
+        print("+++++++++++++++++++ finished asdict.")
+        try:
+            obj["requests"] = [r.serialize() for r in self.requests]
+        except Exception as e:
+            print("+++++++ ....... %s." % e)
+            raise e
+        print("+++++++++++++++++++ finished requests.serialize().")
         return obj
+        # +++
+        # return asdict(self)
+        # <<<
 
     @classmethod
     def deserialize(cls, obj: dict) -> "DynamicInferenceRequestRecord":

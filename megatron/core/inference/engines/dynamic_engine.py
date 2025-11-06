@@ -292,7 +292,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
-        self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
+        self,
+        inference_coordinator_port: int,
+        launch_inference_coordinator: bool = True,
+        verbose: bool = False,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -411,7 +414,7 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
+        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator(verbose=verbose))
 
     @contextmanager
     @staticmethod
@@ -1254,13 +1257,53 @@ class DynamicInferenceEngine(AbstractEngine):
                     and engine_output is not None
                     and engine_output["finished_request_records"]
                 ):
-                    payload = msgpack.packb(
-                        [
-                            Headers.ENGINE_REPLY.value,
-                            [r.serialize() for r in engine_output["finished_request_records"]],
-                        ],
-                        use_bin_type=True,
-                    )
+                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                    print("................. about to build payload.")
+                    records = engine_output["finished_request_records"]
+                    print("................. got records.")
+                    record = records[0]
+                    print("................. got record.")
+                    record = record.serialize()
+                    print("................. serialized record.")
+                    try:
+                        print("x")
+                        records = [ r.serialize() for r in records ]
+                        print("y")
+                    except Exception as e:
+                        print("z")
+                        print("             %s." % e)
+                        raise e
+
+                    try:
+                        print("i")
+                        [r.serialize() for r in engine_output["finished_request_records"]]
+                        print("j")
+                    except Exception as e:
+                        print("k")
+                        print("             %s." % e)
+                        raise e
+
+                    # import json
+                    # print("................. serialized records ... len: %d." % len(json.dumps(records)))
+                    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+                    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                    try:
+                        print("a")
+                        payload = msgpack.packb(
+                            [
+                                Headers.ENGINE_REPLY.value,
+                                [r.serialize() for r in engine_output["finished_request_records"]],
+                            ],
+                            use_bin_type=True,
+                        )
+                        print("b")
+                    except Exception as e:
+                        print("c")
+                        print("             %s." % e)
+                        raise e
+                    # >>>
+                    print("................. built payload.")
+                    # <<<
                     self.socket_for_receiving_requests.send(payload)
 
         except asyncio.CancelledError:
