@@ -72,6 +72,7 @@ class DotProductAttention(MegatronModule):
                 pg_collection, 'tp'
             ), "DotProductAttention pg_collection must have tp process group"
         self.pg_collection = pg_collection
+        self.tp_group = self.pg_collection.tp
 
         world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
@@ -254,7 +255,6 @@ class DotProductAttention(MegatronModule):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """Sharded state dict for the learnable softmax offset parameter"""
         if self.config.softmax_type == "learnable":
@@ -266,6 +266,6 @@ class DotProductAttention(MegatronModule):
             prefix,
             {'softmax_offset': 0},
             sharded_offsets,
-            tp_group=tp_group,
+            tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
         )

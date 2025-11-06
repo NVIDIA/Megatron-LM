@@ -239,15 +239,13 @@ class MLP(MegatronModule):
         prefix: str = "",
         sharded_offsets: tuple = (),
         metadata: Optional[dict] = None,
-        tp_group=None,
     ) -> ShardedStateDict:
         """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
-        tp_group = tp_group if self.tp_group is None else self.tp_group
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(
-                f"{prefix}{name}.", sharded_offsets, metadata, tp_group
+                f"{prefix}{name}.", sharded_offsets, metadata
             )
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():

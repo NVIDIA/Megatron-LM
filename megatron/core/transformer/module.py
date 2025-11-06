@@ -59,7 +59,6 @@ class MegatronModule(torch.nn.Module):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
 
@@ -72,7 +71,6 @@ class MegatronModule(torch.nn.Module):
             sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
                 applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
             metadata (dict, optional): metadata passed recursively to sharded_state_dict methods
-            tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
 
         Returns:
             dict: dictionary of state dict keys mapped to ShardedTensors
@@ -80,22 +78,23 @@ class MegatronModule(torch.nn.Module):
         sharded_state_dict = {}
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
-        if getattr(self, 'tp_group', None) is None and tp_group is None:
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-        tp_group = tp_group if getattr(self, 'tp_group', None) is None else self.tp_group
+        if not hasattr(self, 'tp_group'):
+            # some model interface hasn't updated for m4, fallback needed
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
             sharded_offsets=sharded_offsets,
-            tp_group=tp_group,
+            tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
         )
         # Recurse into submodules
         for name, module in self.named_children():
             sharded_state_dict.update(
                 sharded_state_dict_default(
-                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group
+                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=self.tp_group
                 )
             )
         return sharded_state_dict
