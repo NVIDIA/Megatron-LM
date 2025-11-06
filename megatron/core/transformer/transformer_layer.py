@@ -648,7 +648,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None, tp_group = None
     ) -> ShardedStateDict:
         """
         Generate a sharded state dictionary for the transformer layer.
@@ -661,7 +661,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             ShardedStateDict: A dictionary containing the sharded state of the transformer layer.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata, tp_group=tp_group)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'
             for k, v in self.submodules_config.sharded_state_dict_keys_map.items()
