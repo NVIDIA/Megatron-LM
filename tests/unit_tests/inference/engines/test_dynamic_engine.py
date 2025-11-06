@@ -905,6 +905,7 @@ class TestDynamicInferenceEngine:
 
         assert result_event_types == expected_event_types
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -943,23 +944,25 @@ class TestDynamicInferenceEngine:
         # })
         # <<<
 
-        def assert_noisy_gte(value0, value1):
-            assert (
-                math.isclose(value0, value1, rel_tol=0.01)
-                or
-                value0 >= value1
-            ), f"{value0} < {value1}."
+        # >>>
+        # def assert_noisy_gte(value0, value1):
+        #     assert (
+        #         math.isclose(value0, value1, rel_tol=0.01)
+        #         or
+        #         value0 >= value1
+        #     ), f"{value0} < {value1}."
+        # <<<
 
         # Validate overall 'end' memory usage.
         golden_end_bytes = get_alloc(mem_usages[None]["end"])
         for interval, mem_usage in mem_usages.items():
             current_end_bytes = get_alloc(mem_usage["end"])
             # >>>
-            # assert math.isclose(
-            #     golden_end_bytes, current_end_bytes, rel_tol=0.01
-            # ), f"{current_end_bytes} != {golden_end_bytes}."
+            assert math.isclose(
+                golden_end_bytes, current_end_bytes, rel_tol=0.01
+            ), f"{current_end_bytes} != {golden_end_bytes}."
             # +++
-            assert_noisy_gte(golden_end_bytes, current_end_bytes)
+            # assert_noisy_gte(golden_end_bytes, current_end_bytes)
             # <<<
 
         # Validate 'suspend/resume' memory usage.
@@ -978,11 +981,77 @@ class TestDynamicInferenceEngine:
             assert math.isclose(
                 suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
             ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # @pytest.mark.internal
+    # @pytest.mark.skipif(
+    #     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    # )
+    # # >>>
+    # # @pytest.mark.parametrize("suspend_resume_interval", [ 8, 4, 2 ]) # interval 1 acts funny.
+    # @pytest.mark.parametrize("suspend_resume_interval", [ 2, 4, 8 ]) # interval 1 acts funny.
+    # # <<<
+    # def test_suspend_resume_memory(self, suspend_resume_interval):
+
+    #     # Run tests.
+    #     mem_usages = {}
+    #     # for _suspend_resume_interval in None, suspend_resume_interval:
+    #     for key, interval in [
+    #         ("gold", None),
+    #         ("test", suspend_resume_interval),
+    #     ]:
+
+    #         # Run test.
+    #         env = self._run_test(suspend_resume_interval=interval, num_gap_steps=1)
+
+    #         # Record memory usage.
+    #         mem_usages[key] = env.mem_usage
+
+    #         # Clear memory to make recorded memories consistent between tests.
+    #         # TODO(@lmcafee): why is memory not automatically cleared?
+    #         # env.engine.suspend() # TODO(@lmcafee): useful?
+    #         del env
+
+    #     # Utility methods.
+    #     get_alloc = lambda mem_stats: mem_stats["allocated_bytes.all.current"]
+
+    #     # Validate overall 'end' memory usage.
+    #     get_overall_end_bytes = lambda key : get_alloc(mem_usages[key]["end"])
+    #     gold_end_bytes = get_overall_end_bytes("gold")
+    #     test_end_bytes = get_overall_end_bytes("test")
+    #     assert math.isclose(
+    #         gold_end_bytes, test_end_bytes, rel_tol=0.01
+    #     ), f"{gold_end_bytes} != {test_end_bytes}."
+
+    #     # Validate 'suspend/resume' memory usage.
+    #     # get_suspend_resume_bytes = lambda key: list(
+    #     #     get_alloc(list(d["suspend_resume"].values())[-1][key])
+    #     #     for i, d in mem_usages.items()
+    #     #     if i is not None
+    #     # )
+    #     # get_suspend_resume_bytes = lambda key: (
+    #     #     get_alloc(mem_usages[key]["suspend_resume"]
+
+    #     from lutil import pax
+    #     pax(mem_usages["test"]["suspend_resume"])
+
+    #     gold_mid_bytes = get_suspend_resume_bytes("gold")
+    #     pax("gold_mid_bytes")
+    #     suspend_resume_mid_bytes = get_suspend_resume_bytes("mid")
+    #     suspend_resume_end_bytes = get_suspend_resume_bytes("end")
+    #     for mid_bytes in suspend_resume_mid_bytes:
+    #         assert math.isclose(
+    #             suspend_resume_mid_bytes[0], mid_bytes, rel_tol=0.01
+    #         ), f"{mid_bytes} != {suspend_resume_mid_bytes[0]}."
+    #     for end_bytes in suspend_resume_end_bytes:
+    #         assert math.isclose(
+    #             suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
+    #         ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 if __name__ == "__main__":
     test = TestDynamicInferenceEngine()
     # >>>
-    test.test_suspend_resume_memory()
+    test.test_suspend_resume_memory(2)
     print("~~~\nsuccess.")
     exit()
     # <<<
