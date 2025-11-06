@@ -1,0 +1,7 @@
+{
+  "mixtral_a2a_tp1ep8_bf16": {
+    "backward_ms": 6.481228876113891,
+    "forward_ms": 5.704969596862793,
+    "max_regression_ratio": 1.02
+  }
+}
