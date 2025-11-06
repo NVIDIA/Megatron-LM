@@ -982,7 +982,11 @@ class TEGroupedMLP(MegatronModule):
         return output, output_bias
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None, tp_group = None
+        self,
+        prefix: str = '',
+        sharded_offsets: tuple = (),
+        metadata: Optional[dict] = None,
+        tp_group=None,
     ) -> ShardedStateDict:
         """
         Maps local expert to global experts.
