@@ -417,6 +417,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.prompt_tokens
             )
         if request.sampling_params.termination_id is None:
+            try:
+                eod = self.controller.tokenizer.eod
+            except AttributeError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Termination ID not specified, and tokenizer does not define eod."
+                        "Defaulting to not using termination id."
+                    )
+                eod = -1
             request.sampling_params.termination_id = self.controller.tokenizer.eod
 
         if (

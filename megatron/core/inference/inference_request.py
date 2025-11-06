@@ -298,7 +298,7 @@ class DynamicInferenceRequest(InferenceRequest):
         ]
 
     @staticmethod
-    def get_metadata_labels() -> List[str]:
+    def get_metadata_labels() -> Dict[str, int]:
         """Provides human-readable labels for the tracked metadata fields."""
         ret = [
             "temperature",
@@ -308,7 +308,7 @@ class DynamicInferenceRequest(InferenceRequest):
             "return_log_probs",
             "skip_prompt_log_probs",
         ]
-        return {k: v for k,v in enumerate(ret)}
+        return {k: v for v, k in enumerate(ret)}
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""

@@ -363,8 +363,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Track request metadata.
         self.request_metadata = torch.empty(
-            (self.max_requests, len(self.request_metadata_map),
-            dtype=torch.long,
+            (self.max_requests, len(DynamicInferenceRequest.get_metadata_labels)),
+            dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
 
@@ -1205,7 +1205,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.request_ids[current_id] = req.request_id
         # Handle request metadata. TODO @TDE: see if we can build this using the metadata labels.
-        sp = req.sampling_params
         metadata = req.tracked_metadata
         self.request_metadata[current_id] = torch.tensor(
             metadata, dtype=torch.long, device=self.request_metadata.device
@@ -1263,7 +1262,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
-        self.request_metatadata[dst_idxs] = self.request_metadata[src_idxs]
+        self.request_metadata[dst_idxs] = self.request_metadata[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
         next_tokens[dst_idxs] = next_tokens[src_idxs]
 

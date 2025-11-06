@@ -234,8 +234,11 @@ class TestTextGenerationController:
         self.setup_model(torch.float32, batch_size=batch_size, static=False)
         self.mock_tokenizer.eod = self.vocab_size
 
-        # Prepare sampling params.
-        sampling_test_cases: List[Tuple[CoreParams, List[int]]] = [
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        context.materialize_only_last_token_logits = True
+
+        # Prepare sampling params in human-readable format, to aid with test maintenance.
+        sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
             (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
             (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
             (SamplingParams(top_p=0.8), [4, 1, 7]),
@@ -245,47 +248,44 @@ class TestTextGenerationController:
         if backend != "torch":
             sampling_test_cases[3][0]["top_p"] = 0.8
 
+        # Convert sampling params to non-readable format.
         rev_sampling_dict: List[Dict] = [None] * batch_size
         for sampling_params, indices in sampling_test_cases:
             for idx in indices:
                 rev_sampling_dict[idx] = sampling_params
 
+        # Prepare metadata for sample bookkeeping.
+        request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
         request_metadata = torch.empty(
-            (batch_size, len(request_metadata_labels)), dype=torch.long
+            (batch_size, len(request_metadata_labels)), dype=torch.float32
         )
-        return
-
-        # Prepare override data for sampling params.
-        active_sampling_hashes = [hash(rev_sampling_dict[i]) for i in range(batch_size)]
-        active_sampling_hashes = torch.Tensor(active_sampling_hashes).cuda()
-        sampling_hash_map = {hash(s): s for s, _ in sampling_test_cases}
-        context = self.text_generation_controller.inference_wrapped_model.inference_context
-        context.materialize_only_last_token_logits = True
+        top_k_values = torch.Tensor(
+            [s.top_k if s.top_k != 0 else self.vocab_size for s in rev_sampling_dict]
+        ).cuda()
+        request_metadata[:, request_metadata_labels.index("top_k")] = top_k_values
+        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda()
+        request_metadata[:, request_metadata_labels.index("top_p")] = top_p_values
+        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda()
+        request_metadata[:, request_metadata_labels.index("temperature")] = temp_values
 
         # Bookkeeping.
-        self.text_generation_controller._dynamic_step_sample_bookkeeping(
-            active_sampling_hashes=active_sampling_hashes, sampling_hash_map=sampling_hash_map
-        )
+        self.text_generation_controller._dynamic_step_sample_bookkeeping(request_metadata)
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
         sampled_logits, _ = self.text_generation_controller._dynamic_step_sample_logits(
             logits, backend=backend
         )
-        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).cuda().unsqueeze(1)
-        top_k_values[top_k_values == 0] = self.vocab_size
-        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda().unsqueeze(1)
-        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict]).cuda().unsqueeze(1)
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
         assert torch.all(
-            sampled_logits >= self.vocab_size - top_k_values.squeeze(1)
+            sampled_logits >= self.vocab_size - top_k_values
         ), f"The sampled logits should all be greater than {self.vocab_size - top_k_values} but its {sampled_logits}"
         l = logits.squeeze(0)
-        sampled_l = l.div(temp_values).softmax(dim=-1)
-        top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_values)
+        sampled_l = l.div(temp_values.unsqueeze(1)).softmax(dim=-1)
+        top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_values.unsqueeze(1))
         sampled_l.masked_fill_(top_k_mask, 0.0)
-        top_p_mask = sampled_l.cumsum(dim=-1) > top_p_values
+        top_p_mask = sampled_l.cumsum(dim=-1) > top_p_values.unsqueeze(1)
 
         first_excluded = torch.where(
             top_p_mask.any(dim=-1),
@@ -293,7 +293,7 @@ class TestTextGenerationController:
             torch.full((batch_size,), self.vocab_size, device=top_p_mask.device),
         )
         last_included = torch.clamp(first_excluded - 1, min=0)
-        start_idx = torch.clamp(self.vocab_size - top_k_values.squeeze(1), min=0).long()
+        start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         last_included = torch.max(last_included, start_idx)
         expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
         assert torch.all(
