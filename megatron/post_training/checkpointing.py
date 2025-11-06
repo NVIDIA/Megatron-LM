@@ -112,8 +112,8 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
             return
         if state_dict is None:
             print_rank_0("No checkpoint state_dict found. Skipping loading ModelOpt state.")
-        else:
-            modelopt_state = state_dict.get("modelopt_state", None)
+            return
+        modelopt_state = state_dict.get("modelopt_state", None)
         if modelopt_state is not None:
             mto.restore_from_modelopt_state(model, modelopt_state)
     else:
