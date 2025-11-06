@@ -23,11 +23,12 @@ from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
@@ -138,7 +139,7 @@ if __name__ == "__main__":
     check_arguments(args)
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
     unwrapped_model = unwrap_model(model)[0]
 
     report_current_memory_info()
