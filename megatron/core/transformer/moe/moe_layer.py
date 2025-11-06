@@ -166,7 +166,7 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-    def router_and_preprocess(self, hidden_states: torch.Tensor):
+    def router_and_preprocess(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Compute and preprocess token routing for dispatch.
 
         This method uses the router to determine which experts to send each token to,
@@ -175,7 +175,7 @@ class MoELayer(BaseMoELayer):
         hidden states are returned as a residual connection.
         """
         residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
+        probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -247,7 +247,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -258,7 +258,9 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor to the MoE layer.
-
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape in [seq_length, bsz]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -269,9 +271,9 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, padding_mask=None):
             shared_expert_output = self.shared_experts_compute(hidden_states)
-            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+            hidden_states, probs, residual = self.router_and_preprocess(hidden_states, padding_mask=padding_mask)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
@@ -285,12 +287,12 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    padding_mask,
                 )
             else:
-                output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states, padding_mask)
         else:
-            output, mlp_bias = custom_forward(hidden_states)
-
+            output, mlp_bias = custom_forward(hidden_states, padding_mask)
         return output, mlp_bias
 
     def backward_dw(self):

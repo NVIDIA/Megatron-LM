@@ -575,3 +575,145 @@ class TestRouterAuxLoss:
                 reduce_from_tensor_model_parallel_region(aux_loss, router.tp_cp_group)
             assert aux_loss.item() == 1, f"{aux_loss_type}: {aux_loss.item()}"
             clear_aux_losses_tracker()
+
+
+class TestPaddingMaskAuxLoss:
+    """Test padding mask support in various aux loss types."""
+    
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        # Default configuration
+        self.default_transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=8,
+            num_moe_experts=32,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=8,
+            moe_aux_loss_coeff=1.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+
+    def new_router(self, **kwargs):
+        """Create a new router with updated configuration."""
+        pg_collection = get_default_pg_collection()
+        new_transformer_config = dataclasses.replace(self.default_transformer_config, **kwargs)
+        router = TopKRouter(config=new_transformer_config, pg_collection=pg_collection)
+        router.set_layer_number(0)
+        return router
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("aux_loss_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
+    def test_padding_mask_removes_padding_tokens(self, aux_loss_type):
+        """Test that padding tokens are correctly excluded from aux loss calculation."""
+        clear_aux_losses_tracker()
+        
+        router = self.new_router(
+            moe_router_load_balancing_type=aux_loss_type,
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+        ).cuda()
+        
+        seq_len = 32
+        batch_size = 2
+        hidden_size = router.config.hidden_size
+        
+        # Create input with padding
+        hidden_states_full = torch.randn(
+            (seq_len, batch_size, hidden_size), dtype=torch.bfloat16, device='cuda'
+        )
+        
+        # Create padding mask: first half valid, second half padding
+        padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
+        padding_mask[seq_len // 2:, :] = False
+        
+        # Test with padding mask
+        router.weight.grad = None
+        scores_with_mask, routing_map_with_mask = router(hidden_states_full, padding_mask=padding_mask)
+        scores_with_mask.backward(torch.zeros_like(scores_with_mask))
+        
+        loss_name = {
+            "aux_loss": "load_balancing_loss",
+            "seq_aux_loss": "seq_load_balancing_loss",
+            "global_aux_loss": "global_load_balancing_loss",
+        }[aux_loss_type]
+        
+        tracker = get_moe_layer_wise_logging_tracker()
+        aux_loss_with_mask = tracker[loss_name]["values"][0].clone()
+        grad_with_mask = router.weight.grad.clone()
+        
+        # Test without padding (with only half of the tokens)
+        clear_aux_losses_tracker()
+        router.weight.grad = None
+        hidden_states_valid = hidden_states_full[:seq_len // 2, :, :]
+        scores_without_mask, routing_map_without_mask = router(hidden_states_valid)
+        scores_without_mask.backward(torch.zeros_like(scores_without_mask))
+        
+        aux_loss_without_mask = tracker[loss_name]["values"][0].clone()
+        grad_without_mask = router.weight.grad.clone()
+        
+        # The aux loss with mask should be close to the aux loss without mask
+        torch.testing.assert_close(aux_loss_with_mask, aux_loss_without_mask, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
+        
+        clear_aux_losses_tracker()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_mask_with_z_loss(self):
+        """Test that padding mask works correctly with z_loss."""
+        clear_aux_losses_tracker()
+        
+        router = self.new_router(
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_z_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+        ).cuda()
+        
+        seq_len = 32
+        batch_size = 2
+        hidden_size = router.config.hidden_size
+        
+        # Create input
+        hidden_states_full = torch.randn(
+            (seq_len, batch_size, hidden_size), dtype=torch.bfloat16, device='cuda'
+        )
+        
+        # Create padding mask: first half valid, second half padding
+        padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
+        padding_mask[seq_len // 2:, :] = False
+        
+        # Test with padding mask
+        router.weight.grad = None
+        scores_with_mask, _ = router(hidden_states_full, padding_mask=padding_mask)
+        scores_with_mask.sum().backward()
+        
+        tracker = get_moe_layer_wise_logging_tracker()
+        z_loss_with_mask = tracker["z_loss"]["values"][0].clone()
+        grad_with_mask = router.weight.grad.clone()
+        
+        # Test without padding (with only half of the tokens)
+        clear_aux_losses_tracker()
+        router.weight.grad = None
+        hidden_states_valid = hidden_states_full[:seq_len // 2, :, :]
+        scores_without_mask, _ = router(hidden_states_valid)
+        scores_without_mask.sum().backward()
+        
+        z_loss_without_mask = tracker["z_loss"]["values"][0].clone()
+        grad_without_mask = router.weight.grad.clone()
+        
+        # The z_loss with mask should be close to the z_loss without mask
+        torch.testing.assert_close(z_loss_with_mask, z_loss_without_mask, rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
+        
+        clear_aux_losses_tracker()
