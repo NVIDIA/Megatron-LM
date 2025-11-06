@@ -189,12 +189,12 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
         )
 
-        # Ring attention forward iterations
+        # Iterate over heads
         for i in range(0, nheads_k, heads_k_stride):
             # Wait for previous all-gather to complete
             comm.wait()
             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
-            # All-gather next chunk of KV buffers if not the last iteration
+            # All-gather the next portion of KV buffers if not the last iteration
             if i < nheads_k - heads_k_stride:
                 kvsl = i + heads_k_stride
                 kvsr = kvsl + heads_k_stride
@@ -273,7 +273,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             attention_mask, cp_size, nheads, nheads_k, heads_k_stride, q.device, q.dtype
         )
 
-        # Ring attention backward iterations
+        # Iterate over heads
         for i in range(0, nheads_k, heads_k_stride):
             # Slice query and output for this iteration
             q_slice = slice(i * nheads // nheads_k, (i + heads_k_stride) * nheads // nheads_k)
@@ -284,7 +284,7 @@ class AttentionFuncionWithContextParallel(torch.autograd.Function):
             comm.wait()
             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
-            # All-gather next chunk of KV buffers if not the last iteration
+            # All-gather the next portion of KV buffers if not the last iteration
             if i < nheads_k - heads_k_stride:
                 kvsl = i + heads_k_stride
                 kvsr = kvsl + heads_k_stride

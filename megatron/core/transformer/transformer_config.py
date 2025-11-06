@@ -1823,6 +1823,19 @@ class TransformerConfig(ModelParallelConfig):
                 f" but got {self.transformer_impl=}."
             )
 
+        if self.fallback_to_eager_attn or self.transformer_impl == "local":
+            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+                all_cp_comm_types_are_all_gather = (
+                    all(item == "all_gather" for item in self.cp_comm_type)
+                    if isinstance(self.cp_comm_type, list)
+                    else self.cp_comm_type == "all_gather"
+                )
+                if not all_cp_comm_types_are_all_gather:
+                    raise ValueError(
+                        f"fallback_to_eager_attn only supports all_gather communication type "
+                        f"for context parallelism, but got {self.cp_comm_type=} instead."
+                    )
+
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):

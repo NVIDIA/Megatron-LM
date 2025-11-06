@@ -10,6 +10,7 @@ from megatron.core.models.gpt.linear_attention_module_specs import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -117,15 +118,13 @@ def get_gpt_layer_with_transformer_engine_spec(
 
     if use_kitchen:
         assert HAVE_KITCHEN
-        backend: BackendSpecProvider = KitchenSpecProvider(
-            fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
-        )
+        backend: BackendSpecProvider = KitchenSpecProvider(fallback=TESpecProvider())
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
-        backend = TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
+        backend = TESpecProvider()
 
     sharded_state_dict_keys_map = {}
 
@@ -138,6 +137,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         multi_latent_attention=multi_latent_attention,
         mla_down_proj_use_column_parallel=False,
         normalization=normalization,
+        fallback_to_eager_attn=fallback_to_eager_attn,
     )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -217,6 +217,7 @@ def get_gpt_layer_local_spec(
         multi_latent_attention=multi_latent_attention,
         mla_down_proj_use_column_parallel=True,
         normalization=normalization,
+        fallback_to_eager_attn=False,
     )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -281,6 +282,7 @@ def get_attention_module_spec_for_backend(
     multi_latent_attention: Optional[bool] = False,
     mla_down_proj_use_column_parallel: Optional[bool] = False,
     normalization: Optional[str] = None,
+    fallback_to_eager_attn: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for Attention"""
 
@@ -295,6 +297,7 @@ def get_attention_module_spec_for_backend(
     rms_norm = normalization == "RMSNorm"
     qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True)
 
+    core_attention = backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_down_proj = (
@@ -331,7 +334,7 @@ def get_attention_module_spec_for_backend(
                 linear_q_up_proj=linear_q_up_proj,
                 linear_kv_down_proj=linear_kv_down_proj,
                 linear_kv_up_proj=linear_kv_up_proj,
-                core_attention=backend.core_attention(),
+                core_attention=core_attention,
                 linear_proj=backend.row_parallel_linear(),
                 q_layernorm=qk_norm,
                 kv_layernorm=qk_norm,
@@ -355,7 +358,7 @@ def get_attention_module_spec_for_backend(
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=linear_qkv,
-                core_attention=backend.core_attention(),
+                core_attention=core_attention,
                 linear_proj=backend.row_parallel_linear(),
                 q_layernorm=qk_norm,
                 k_layernorm=qk_norm,
@@ -656,11 +659,9 @@ def get_gpt_mtp_block_spec(
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
         backend: BackendSpecProvider = (
-            KitchenSpecProvider(
-                fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
-            )
+            KitchenSpecProvider(fallback=TESpecProvider())
             if config.use_kitchen
-            else TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
+            else TESpecProvider()
         )
     else:
         backend = (
