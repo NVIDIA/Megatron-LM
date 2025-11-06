@@ -29,6 +29,9 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer
+)
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
