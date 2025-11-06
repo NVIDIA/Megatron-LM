@@ -1304,8 +1304,7 @@ def core_transformer_config_from_args(args, config_class=None):
     elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
         kw_args['use_kitchen'] = True
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
-
-
+  
     # Return config.
     return config_class(**kw_args)
 
@@ -3307,6 +3306,7 @@ def _add_experimental_args(parser):
                        '--hidden-size * expand // --mamba-head-dim')
     group.add_argument('--is-hybrid-model', default=False, action="store_true",
                        help='Indicates whether the model is a hybrid model.')
+    group.add_argument('--parallel-hybrid-ratio', type=float, default=0.0, help='Ratio of parallel hybrid layers.')
     group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",
                        help='Disable Mamba efficient path.')
     group.add_argument('--yaml-cfg', type=str, default=None,

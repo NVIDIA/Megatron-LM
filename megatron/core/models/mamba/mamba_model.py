@@ -31,6 +31,8 @@ class MambaModel(LanguageModule):
             (used with pipeline parallelism). Defaults to True.
         hybrid_attention_ratio (float, optional): The target ratio of attention
             layers to total layers
+        parallel_hybrid_ratio (float, optional): The target ratio of parallel hybrid
+            layers to total layers
         hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
         hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
@@ -60,6 +62,7 @@ class MambaModel(LanguageModule):
         max_sequence_length: int,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
+        parallel_hybrid_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
         hybrid_override_pattern: str = None,
         post_process: bool = True,
@@ -84,6 +87,7 @@ class MambaModel(LanguageModule):
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
         self.hybrid_attention_ratio = hybrid_attention_ratio
+        self.parallel_hybrid_ratio = parallel_hybrid_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
         self.post_process = post_process
@@ -121,6 +125,7 @@ class MambaModel(LanguageModule):
             self.config,
             pre_process=self.pre_process,
             hybrid_attention_ratio=self.hybrid_attention_ratio,
+            parallel_hybrid_ratio=self.parallel_hybrid_ratio,
             hybrid_mlp_ratio=self.hybrid_mlp_ratio,
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,

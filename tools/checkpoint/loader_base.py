@@ -68,7 +68,7 @@ class MegatronCheckpointLoaderBase:
         # Expert parallelism requires sequence parallelism
         if margs.expert_model_parallel_size > 1:
             margs.sequence_parallel = True
-        
+
         margs = self._maybe_parse_additional_megatron_args(margs, checkpoint_args)
 
         # Validate final arguments
@@ -146,13 +146,71 @@ class MegatronCheckpointLoaderBase:
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
         mpu.set_expert_model_parallel_world_size(self.margs.expert_model_parallel_size)
-        
+
+
         # For backward compatibility during local parallel states refactoring
         fake_tp_group = _ConverterFakeProcessGroup(size=self.margs.tensor_model_parallel_size)
         fake_ep_group = _ConverterFakeProcessGroup(size=self.margs.expert_model_parallel_size)
+        # ADD: Create fake pp and cp groups
+        fake_pp_group = _ConverterFakeProcessGroup(size=self.margs.pipeline_model_parallel_size)
+        fake_cp_group = _ConverterFakeProcessGroup(size=1)  # Context parallel is always 1 for conversion
+
+        # Set all process groups
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
+        mpu._CONTEXT_PARALLEL_GROUP = fake_cp_group
+
+        # Also set combined groups that might be needed
+        mpu._MODEL_PARALLEL_GROUP = fake_tp_group  # Simplified: just use tp group
+        mpu._TENSOR_AND_CONTEXT_PARALLEL_GROUP = fake_tp_group  # Combined tp+cp
+
+        # ============================================
+        # Add RNG Tracker Init for checkpoint conversion
+        # ============================================
+        print("Initializing RNG tracker for checkpoint conversion...")
+        try:
+            from megatron.core.tensor_parallel.random import (
+                get_cuda_rng_tracker,
+                initialize_rng_tracker,
+                model_parallel_cuda_manual_seed,
+                _MODEL_PARALLEL_RNG_TRACKER_NAME,
+                _DATA_PARALLEL_RNG_TRACKER_NAME
+            )
+
+            # Initialize RNG tracker (equivalent to what _set_random_seed does)
+            initialize_rng_tracker(
+                use_te_rng_tracker=getattr(self.margs, 'te_rng_tracker', False),
+                inference_rng_tracker=getattr(self.margs, 'inference_rng_tracker', False),
+                use_cudagraphable_rng=getattr(self.margs, 'enable_cuda_graph', False)
+            )
+
+            # Add required RNG states (this is what model_parallel_cuda_manual_seed does)
+            seed = getattr(self.margs, 'seed', 1234)
+            rng_tracker = get_cuda_rng_tracker()
+
+            # Add model-parallel-rng state
+            if not hasattr(rng_tracker, '_states') or _MODEL_PARALLEL_RNG_TRACKER_NAME not in rng_tracker._states:
+                rng_tracker.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, seed)
+                print(f"Added {_MODEL_PARALLEL_RNG_TRACKER_NAME} RNG state with seed {seed}")
+
+            # Add data-parallel-rng state
+            if not hasattr(rng_tracker, '_states') or _DATA_PARALLEL_RNG_TRACKER_NAME not in rng_tracker._states:
+                rng_tracker.add(_DATA_PARALLEL_RNG_TRACKER_NAME, seed)
+                print(f"Added {_DATA_PARALLEL_RNG_TRACKER_NAME} RNG state with seed {seed}")
+
+            print("RNG tracker initialization completed successfully")
+
+            # Debug: Show available RNG states
+            if hasattr(rng_tracker, '_states'):
+                print(f"Available RNG states: {list(rng_tracker._states.keys())}")
+
+        except Exception as e:
+            print(f"Warning: Failed to initialize RNG tracker: {e}")
+            print("Model building may fail if RNG states are required")
+            # Don't exit - let it try without RNG tracker
         fused_kernels.load(self.margs)
+
 
     def compute_true_vocab_size(self):
         """Determine the 'true' (non-padded) vocab size."""
@@ -205,7 +263,14 @@ class MegatronCheckpointLoaderBase:
                     mpu.set_virtual_pipeline_model_parallel_rank(i)
                     pre_process = mpu.is_pipeline_first_stage()
                     post_process = mpu.is_pipeline_last_stage()
-                    this_model = model_provider(pre_process=pre_process,
+                    if self.args.model_type == 'Mamba':
+                        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+                        from mamba_builders import mamba_builder
+                        this_model = model_provider(mamba_builder,
+                                                pre_process=pre_process,
+                                                post_process=post_process).to(dtype)
+                    else:
+                        this_model = model_provider(pre_process=pre_process,
                                                 post_process=post_process).to(dtype)
                     model_list.append(this_model)
 
@@ -242,7 +307,7 @@ class MegatronCheckpointLoaderBase:
             all_models.append(get_models_for_pipeline_stage(tp_size, dtype))
 
         return all_models, consumed_train_samples, consumed_valid_samples
-    
+
     def send_metadata_over_queue(self):
         # Let the consumer know the overall metadata:
         self.md.consumed_train_samples = self.consumed_train_samples
@@ -401,7 +466,7 @@ class MegatronCheckpointLoaderBase:
         # 2) Ensure required arguments are present
         self.ensure_required_arguments()
 
-        # 3) Import the correct model provider (GPT or BERT)
+        # 3) Import the correct model provider (GPT or BERT or Mamba)
         model_provider = self.import_model_provider()
 
         # 4) Initialize the Megatron environment
@@ -422,7 +487,7 @@ class MegatronCheckpointLoaderBase:
             self.md.params_dtype
         )
 
-        # 8) Send model over the queue        
+        # 8) Send model over the queue
         self.send_model_over_queue()
 
     def build_checkpoint_metadata(self, true_vocab_size):
