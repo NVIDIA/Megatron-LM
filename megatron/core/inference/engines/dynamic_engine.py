@@ -416,6 +416,8 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
             )
+        if request.sampling_params.termination_id is None:
+            request.sampling_params.termination_id = self.controller.tokenizer.eod
 
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate

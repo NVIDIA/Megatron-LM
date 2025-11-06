@@ -16,7 +16,6 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.sampling_params import CoreParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -347,15 +346,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = None
         self.paused_tokens = None
 
-        # Keep a reverse hash map for sampling params that correspond to active & paused requests.
-        self.sampling_hash_map: Dict[int, CoreParams] = {}
-
         # Per-request state.
         self.request_ids = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        # Hashes of sampling params for each request.
-        self.request_sampling_hashes = torch.empty_like(self.request_ids, dtype=torch.int64)
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
@@ -366,6 +360,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id = torch.empty_like(self.request_ids)
         # request_last_kv_block_offset represents number of tokens in the last kv block
         self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
+
+        # Track request metadata.
+        # This is a list of all metadata stored. TODO @TDE: see if we can make this an argument.
+        self.request_metadata_labels = [
+            "temperature",
+            "top_k",
+            "top_p",
+            "termination_id",
+            "return_log_probs",
+            "skip_prompt_log_probs",
+        ]
+        self.request_metadata_labels = {k: v for k, v in enumerate(self.request_metadata_labels)}
+        self.request_metadata = torch.empty(
+            (self.max_requests, len(self.request_metadata_map),
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
+        )
 
         # Per-token state.
         self.token_to_input_ids = torch.full(
@@ -1203,18 +1214,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
-        # Get immutable core of sampling_params.
-        core_params = req.sampling_params.core_params
-        # Handle the sampling parameters hash.
-        old_sampling_hash = self.request_sampling_hashes[current_id].item()
-        new_sampling_hash = hash(core_params)
-        self.request_sampling_hashes[current_id] = new_sampling_hash
-        self.sampling_hash_map[new_sampling_hash] = core_params
-        # Update the reverse hash map if there are no more requests with this sampling hash.
-        # We do this to prevent unbounded growth of the hash map.
-        if (self.request_sampling_hashes != old_sampling_hash).all().item():
-            if old_sampling_hash in self.sampling_hash_map:
-                del self.sampling_hash_map[old_sampling_hash]
+        # Handle request metadata. TODO @TDE: see if we can build this using the metadata labels.
+        sp = req.sampling_params
+        metadata = [
+            sp.temperature,
+            sp.top_k,
+            sp.top_p,
+            sp.termination_id,
+            sp.return_log_probs,
+            getattr(sp, "skip_prompt_log_probs_for_dynamic_inference", False),
+        ]
+        self.request_metadata[current_id] = torch.tensor(
+            metadata, dtype=torch.long, device=self.request_metadata.device
+        )
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
@@ -1268,7 +1280,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
-        self.request_sampling_hashes[dst_idxs] = self.request_sampling_hashes[src_idxs]
+        self.request_metatadata[dst_idxs] = self.request_metadata[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
         next_tokens[dst_idxs] = next_tokens[src_idxs]
 
@@ -1284,6 +1296,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_metadata, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)

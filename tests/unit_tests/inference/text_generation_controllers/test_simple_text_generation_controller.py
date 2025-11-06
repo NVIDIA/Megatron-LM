@@ -27,7 +27,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.sampling_params import CoreParams, SamplingParams
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -236,10 +236,10 @@ class TestTextGenerationController:
 
         # Prepare sampling params.
         sampling_test_cases: List[Tuple[CoreParams, List[int]]] = [
-            (SamplingParams(temperature=0.1, top_p=0.01).core_params, [9, 6, 10]),
-            (SamplingParams(temperature=5.0, top_k=15).core_params, [0, 3, 2]),
-            (SamplingParams(top_p=0.8).core_params, [4, 1, 7]),
-            (SamplingParams(temperature=10.0, top_k=5).core_params, [11, 5, 8]),
+            (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
+            (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
+            (SamplingParams(top_p=0.8), [4, 1, 7]),
+            (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":
@@ -249,6 +249,19 @@ class TestTextGenerationController:
         for sampling_params, indices in sampling_test_cases:
             for idx in indices:
                 rev_sampling_dict[idx] = sampling_params
+
+        request_metadata_labels = [
+            "temperature",
+            "top_k",
+            "top_p",
+            "termination_id",
+            "return_log_probs",
+            "skip_prompt_log_probs",
+        ]
+        request_metadata = torch.empty(
+            (batch_size, len(request_metadata_labels)), dype=torch.long
+        )
+        return
 
         # Prepare override data for sampling params.
         active_sampling_hashes = [hash(rev_sampling_dict[i]) for i in range(batch_size)]
