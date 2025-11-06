@@ -13,6 +13,9 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
@@ -28,9 +31,6 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
-)
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_set_last_layer
 )
 
 if is_torch_min_version("1.13.0"):
