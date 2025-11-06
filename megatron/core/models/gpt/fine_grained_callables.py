@@ -334,16 +334,25 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     )
 
     class _BackwardDWWrapper:
-        def __init__(self, backward_dw_callable):
-            self.backward_dw_callable = backward_dw_callable
+        def __init__(self, ):
+            self.graphed_backward_dw_callable = None
+            self.attn_dw_callable = layer.self_attention.backward_dw
+            self.shared_expert_dw_callable = partial(layer.mlp.backward_dw, routed_experts=False, shared_experts=True)
+            self.cuda_graph_scope = layer.config.cuda_graph_scope
 
-        def set_backward_dw_callable(self, backward_dw_callable):
-            self.backward_dw_callable = backward_dw_callable
+        def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
+            self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
         def backward_dw(self):
-            self.backward_dw_callable()
+            is_replay = hasattr(layer, 'cuda_graphs') and layer.cuda_graphs
+            if not is_replay or "moe_router" not in self.cuda_graph_scope:
+                self.shared_expert_dw_callable()
+            if not is_replay or "attn" not in self.cuda_graph_scope:
+                self.attn_dw_callable()
+            if is_replay and self.graphed_backward_dw_callable is not None:
+                self.graphed_backward_dw_callable()
 
-    attn_backward_dw_wrapper = _BackwardDWWrapper(layer.self_attention.backward_dw)
+    attn_backward_dw_wrapper = _BackwardDWWrapper()
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -359,7 +368,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 layer.config.cuda_graph_scope
             )
             forward_func = layer._te_cuda_graph_replay
-            attn_backward_dw_wrapper.set_backward_dw_callable(
+            attn_backward_dw_wrapper.set_graphed_backward_dw_callable(
                 partial(layer.backward_dw_cudagraph, layer.current_microbatch)
             )
         else:
