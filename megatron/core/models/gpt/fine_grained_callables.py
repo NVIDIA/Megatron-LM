@@ -42,13 +42,13 @@ def weak_method(method):
     return wrapped_func
 
 
-def should_free_input(name, is_moe, is_deepep):
+def should_free_input(name, is_moe, config):
     """Determine if the node should free its input memory.
 
     Args:
         name: Node name
         is_moe: Whether it's a MoE model
-        is_deepep: Whether it's a DeepEP model
+        config: TransformerConfig object
 
     Returns:
         bool: Whether to free input memory
@@ -65,9 +65,10 @@ def should_free_input(name, is_moe, is_deepep):
         "mlp": True,
         "moe_combine": True,
         # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
-        # and it's not needed anymore after the forward pass
+        # and it's not needed anymore after the forward pass. If moe_preprocess is in cuda graph scope,
+        # tokens and probs are fixed size tensors, so they cannot be freed.
         # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "moe_dispatch": not is_deepep,
+        "moe_dispatch": config.moe_token_dispatcher_type=="alltoall" and ("moe_preprocess" not in config.cuda_graph_scope)
     }
 
     return free_input_nodes.get(name, False)
@@ -228,9 +229,10 @@ class TransformerLayerNode(ScheduleNode):
             extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
         """
         # determine whether to free input memory
+        config = extra_args.get("config", None)
+        assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
-        enable_deepep = extra_args.get("enable_deepep", False)
-        free_input = should_free_input(name, is_moe, enable_deepep)
+        free_input = should_free_input(name, is_moe, config)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
