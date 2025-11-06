@@ -61,7 +61,7 @@ MODEL_ARGS:
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
   --optimizer: dist_muon
-  --muon-momentum-beta: 0.9
+  --muon-momentum: 0.9
   --muon-extra-scale-factor: 0.2
   --muon-scale-mode: spectral
 TEST_TYPE: ckpt-resume

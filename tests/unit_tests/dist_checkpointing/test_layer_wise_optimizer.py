@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from copy import deepcopy
 from functools import partial
 from unittest import mock
 
@@ -24,6 +25,7 @@ from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
+    init_basic_mock_args,
     init_checkpointing_mock_args,
     initialize_gpt_model,
     setup_model_and_optimizer,
@@ -464,36 +466,19 @@ class TestLayerWiseOptimizer:
             assert num_zeros is None or num_zeros >= 0
 
     @pytest.mark.parametrize("fully_parallel", [False, True])
+    @pytest.mark.parametrize('optimizer_type', ['dist_muon', 'muon'])
     @pytest.mark.parametrize(
         ("tp_pp_ep", "is_moe", "is_mla", "kwargs"),
         [
+            ((1, 1, 1), False, False, {}),  # check DP
             ((2, 2, 1), False, False, {}),  # check TP
             ((1, 2, 1), False, True, {}),  # check param group order is right
-            (
-                (1, 8, 1),
-                False,
-                False,
-                {
-                    "account_for_embedding_in_pipeline_split": True,
-                    "account_for_loss_in_pipeline_split": True,
-                },
-            ),  # check embedding standalone
-            (
-                (1, 2, 2),
-                True,
-                False,
-                {"moe_layer_freq": [0, 0, 0, 1, 1, 1]},
-            ),  # check moe not on all ranks (case 1)
-            (
-                (1, 2, 2),
-                True,
-                False,
-                {"moe_layer_freq": [1, 1, 1, 0, 0, 0]},
-            ),  # check moe not on all ranks (case 2)
+            ((1, 2, 2), True, False, {}),  # check EP
+            ((1, 2, 2), True, True, {}),  # check EP with MLA
         ],
     )
     def test_optimizer_common_state_dict(
-        self, tmp_path_dist_ckpt, fully_parallel, tp_pp_ep, is_moe, is_mla, kwargs
+        self, tmp_path_dist_ckpt, fully_parallel, tp_pp_ep, is_moe, is_mla, kwargs, optimizer_type
     ):
         initialize_fn = partial(initialize_real_model, is_moe=is_moe, is_mla=is_mla, **kwargs)
 
@@ -508,16 +493,27 @@ class TestLayerWiseOptimizer:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
-            mock_args.use_distributed_optimizer = True
+            mock_args.use_distributed_optimizer = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
                 if is_moe:
                     model, optimizer_A = setup_moe_model_and_optimizer(
-                        seed=2, tp=tp, pp=pp, ep=ep, initialize_fn=initialize_fn
+                        seed=2,
+                        tp=tp,
+                        pp=pp,
+                        ep=ep,
+                        initialize_fn=initialize_fn,
+                        dist_opt=False,
+                        optimizer=optimizer_type,
                     )
                 else:
                     model, optimizer_A = setup_model_and_optimizer(
-                        seed=2, tp=tp, pp=pp, initialize_fn=initialize_fn
+                        seed=2,
+                        tp=tp,
+                        pp=pp,
+                        initialize_fn=initialize_fn,
+                        dist_opt=False,
+                        optimizer=optimizer_type,
                     )
 
                 # Save checkpoint
@@ -539,11 +535,22 @@ class TestLayerWiseOptimizer:
                 # Initialize model and optimizer B
                 if is_moe:
                     model, optimizer_B = setup_moe_model_and_optimizer(
-                        seed=3, tp=tp, pp=pp, ep=ep, initialize_fn=initialize_fn
+                        seed=3,
+                        tp=tp,
+                        pp=pp,
+                        ep=ep,
+                        initialize_fn=initialize_fn,
+                        dist_opt=False,
+                        optimizer=optimizer_type,
                     )
                 else:
                     model, optimizer_B = setup_model_and_optimizer(
-                        seed=3, tp=tp, pp=pp, initialize_fn=initialize_fn
+                        seed=3,
+                        tp=tp,
+                        pp=pp,
+                        initialize_fn=initialize_fn,
+                        dist_opt=False,
+                        optimizer=optimizer_type,
                     )
                 # Load optimizer B from checkpoint
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
@@ -556,3 +563,59 @@ class TestLayerWiseOptimizer:
                 assert not any(map(bool, diffs)), (rank, diffs)
 
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ('src_tp_pp', 'dest_tp_pp', 'use_glu'),
+        [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
+    )
+    @pytest.mark.parametrize('optimizer_type', ['dist_muon', 'muon'])
+    def test_finetune_doesnt_load_optimizer(
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu, optimizer_type
+    ):
+        """Test finetuning doesn't try to load the optimizer."""
+        Utils.initialize_model_parallel(*src_tp_pp)
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
+        ) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
+                init_checkpointing_mock_args(mock_args, ckpt_dir, False)
+
+                model, optimizer = setup_model_and_optimizer(
+                    seed=2,
+                    tp=src_tp_pp[0],
+                    pp=src_tp_pp[1],
+                    initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
+                    dist_opt=False,
+                    optimizer=optimizer_type,
+                )
+
+                save_checkpoint(10, model, optimizer, None, 0)
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(*dest_tp_pp)
+                mock_args.tensor_model_parallel_size = dest_tp_pp[0]
+                mock_args.pipeline_model_parallel_size = dest_tp_pp[1]
+                model, optimizer = setup_model_and_optimizer(
+                    seed=3,
+                    tp=dest_tp_pp[0],
+                    pp=dest_tp_pp[1],
+                    initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
+                    dist_opt=False,
+                    optimizer=optimizer_type,
+                )
+                model_unloaded_state_dict = deepcopy(model[0].state_dict())
+                optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
+
+                # Load with different TPxPP should raise DistributeOptimizer error
+                with pytest.raises(RuntimeError) as exc_info:
+                    load_checkpoint_no_arg_checks(model, optimizer, None)
+                # "(TP, PP) mismatch" check is for backwards compatibility tests
+                assert "(TP, PP) mismatch" in str(
+                    exc_info.value
+                ) or "(TP, PP, encoder TP, encoder PP) mismatch" in str(exc_info.value)
+
+                # Check that the state didn't change
+                assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
+                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
