@@ -263,7 +263,7 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
         """
         Maps local expert to global experts.
         The sharded_state_dict for the weight parts are compatible with the SequentialMLP,
@@ -921,7 +921,11 @@ class TEGroupedMLP(MegatronModule):
         return output, output_bias
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self,
+        prefix: str = '',
+        sharded_offsets: tuple = (),
+        metadata: Optional[dict] = None,
+        tp_group=None,
     ) -> ShardedStateDict:
         """
         Maps local expert to global experts.
@@ -931,9 +935,10 @@ class TEGroupedMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
+        tp_group = tp_group if self.tp_group is None else self.tp_group
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
-                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+                module, f'{name}.', sharded_offsets, metadata, tp_group=tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
@@ -1086,7 +1091,7 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             expert.backward_dw()
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
         """Maps local expert to global experts."""
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
@@ -1110,8 +1115,9 @@ class SequentialMLP(MegatronModule):
                     (len(sharded_offsets), expert_global_idx, num_global_experts),
                 )
 
+            tp_group = tp_group if self.tp_group is None else self.tp_group
             expert_state_dict = expert.sharded_state_dict(
-                expert_state_dict_prefix, expert_sharded_offsets, metadata, self.tp_group
+                expert_state_dict_prefix, expert_sharded_offsets, metadata, tp_group
             )
             # Remove expert layers indexing from sharded keys
             replace_prefix_for_sharding(
