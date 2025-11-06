@@ -295,7 +295,7 @@ class LanguageModule(MegatronModule):
 
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
-                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key
+                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata
             )
         elif self.post_process:
             # Make sure the output layer follows the embeddings padding logic
@@ -312,6 +312,7 @@ class LanguageModule(MegatronModule):
         sharded_state_dict: ShardedStateDict,
         output_layer_weight_key: str,
         first_stage_word_emb_key: str,
+        metadata: Optional[dict] = None,
     ) -> None:
         """Ties the embedding and output weights in a given sharded state dict.
 
@@ -321,9 +322,11 @@ class LanguageModule(MegatronModule):
                 This entry will be replaced with a tied version
             first_stage_word_emb_key (str): this must be the same as the
                 ShardedTensor.key of the first stage word embeddings.
+            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
 
         Returns: None, acts in-place
         """
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         if not self.post_process:
             # No output layer
             assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
