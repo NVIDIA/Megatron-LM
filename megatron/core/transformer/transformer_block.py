@@ -764,6 +764,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         elif isinstance(self.config.moe_layer_freq, list):
             non_homogeneous_layers = True
 
+        if isinstance(self.config.linear_attention_freq, int):
+            if self.config.linear_attention_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.linear_attention_freq, list):
+            non_homogeneous_layers = True
+
         if self.config.heterogeneous_block_specs:
             non_homogeneous_layers = True
 
