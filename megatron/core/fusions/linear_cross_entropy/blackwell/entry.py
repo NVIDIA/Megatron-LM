@@ -1,0 +1,385 @@
+import torch
+import torch.distributed as dist
+import typing
+import triton
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
+import cuda.bindings.driver as cuda
+
+import megatron.core.fusions.linear_cross_entropy.utils as utils
+import megatron.core.fusions.linear_cross_entropy.blackwell.fwd_mainloop as fwd_mainloop
+import megatron.core.fusions.linear_cross_entropy.blackwell.bwd_partial_dlogits as bwd_partial_dlogits
+import megatron.core.fusions.linear_cross_entropy.blackwell.triton as triton_kernels
+
+# import linear_cross_entropy.utils as utils
+# import linear_cross_entropy.blackwell.fwd_mainloop as fwd_mainloop
+# import linear_cross_entropy.blackwell.bwd_partial_dlogits as bwd_partial_dlogits
+# import linear_cross_entropy.blackwell.triton as triton_kernels
+
+def forward(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
+    reduction: typing.Optional[str] = "mean",
+    ignore_index: typing.Optional[int] = -100,
+) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    forward host function
+    """
+    assert hidden.is_cuda and weight.is_cuda and labels.is_cuda
+    assert weight.device == hidden.device and labels.device == hidden.device
+
+    # hidden could be [batch, seqlen, dim] or [seqlen, batch, dim] or [tokens, dim]
+    assert hidden.dim() == 2 or hidden.dim() == 3
+    # weight must be [vocab_size, dim]
+    assert weight.dim() == 2
+    # labels could be [batch, seqlen] or [seqlen, batch] or [tokens]
+    assert ((hidden.dim() == 2 and labels.dim() == 1) 
+            or (hidden.dim() == 3 and labels.dim() == 2))
+    assert hidden.is_contiguous() and weight.is_contiguous() and labels.is_contiguous()
+
+    hidden_view = hidden.view(-1, hidden.shape[-1])
+    labels_view = labels.view(-1)
+
+    assert hidden_view.shape[0] == labels_view.shape[0]
+    assert hidden_view.shape[1] == weight.shape[1]
+    num_tokens, dim = hidden_view.shape
+    vocab_size, _ = weight.shape
+
+    tp_rank = 0 if tp_group is None else torch.distributed.get_rank(tp_group)
+    tp_world_size = 1 if tp_group is None else torch.distributed.get_world_size(tp_group)
+
+    if not hasattr(forward, "_initialized"):
+        global _dedicated_stream, _dedicated_events
+        _dedicated_stream = torch.cuda.Stream(hidden.device)
+        _dedicated_events = [torch.cuda.Event() for _ in range(2)]
+        forward._initialized = True
+
+    REDUCTION = utils.str_to_reduction_enum(reduction)
+    # declare logprobs
+    if REDUCTION == utils.EntropyReductionEnum.kNone:
+        logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
+        if tp_group is not None:
+            logprobs.zero_()
+    else:
+        logprobs = torch.zeros((), device=hidden.device, dtype=torch.float32)
+    # declare auxiliary tensors
+    maximum = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
+    accumulate = torch.empty_like(maximum, dtype=torch.float32)
+    num_valid_tokens = torch.empty((), device=hidden.device, dtype=torch.int64)
+    assert maximum.is_contiguous() and accumulate.is_contiguous() and num_valid_tokens.is_contiguous()
+    # declare intermediate tensors
+    # NOTE: this is a parameter for tuning
+    vocab_per_split = 512 * 6
+    num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
+    _max = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
+    _accu = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
+    if REDUCTION == utils.EntropyReductionEnum.kNone:
+        _logprobs = logprobs
+    else:
+        _logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
+        if tp_group is not None:
+            _logprobs.zero_()
+    assert _max.is_contiguous() and _accu.is_contiguous() and _logprobs.is_contiguous()
+
+    triton_kernels.get_num_valid_tokens[(1,)](
+        num_tokens,
+        ignore_index,
+        labels_view,
+        labels_view.stride(0),
+        num_valid_tokens,
+    )
+    
+    if not hasattr(forward, "_fwd_mainloop_kernels"):
+        forward._fwd_mainloop_kernels = dict()
+
+    # need to compile the kernel for the first time
+    hidden_packed = from_dlpack(
+        hidden_view.detach(), assumed_align=16
+    ).mark_compact_shape_dynamic(mode=0)
+    weight_packed = from_dlpack(
+        weight.detach(), assumed_align=16
+    )
+    labels_packed = from_dlpack(
+        labels_view.detach(), assumed_align=8
+    ).mark_compact_shape_dynamic(mode=0)
+    logprobs_packed = from_dlpack(
+        _logprobs, assumed_align=16
+    ).mark_compact_shape_dynamic(mode=0)
+    _max_packed = from_dlpack(
+        _max, assumed_align=8
+    ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+    _accu_packed = from_dlpack(
+        _accu, assumed_align=8
+    ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+    cuda_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    # VocabSize and Dim are fixed for a given model,
+    # only the number of tokens can vary
+    key = f"vocab_size:{vocab_size}+dim:{dim}+dtype:{hidden.dtype}"
+    if forward._fwd_mainloop_kernels.get(key) is None:
+        fwd_mainloop_kernel = fwd_mainloop.FwdMainLoop(
+            vocab_per_split=vocab_per_split,
+        )
+        fwd_mainloop_compiled_kernel = cute.compile(
+            fwd_mainloop_kernel,
+            hidden_packed,
+            weight_packed,
+            labels_packed,
+            logprobs_packed,
+            _max_packed,
+            _accu_packed,
+            ignore_index,
+            tp_rank,
+            cuda_stream
+        )
+        forward._fwd_mainloop_kernels[key] = fwd_mainloop_compiled_kernel
+    else:
+        fwd_mainloop_compiled_kernel = forward._fwd_mainloop_kernels[key]
+    fwd_mainloop_compiled_kernel(
+        hidden_packed,
+        weight_packed,
+        labels_packed,
+        logprobs_packed,
+        _max_packed,
+        _accu_packed,
+        ignore_index,
+        tp_rank,
+        cuda_stream
+    )
+    
+    if tp_group is None:
+        def grid(meta):
+            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]),)
+
+        triton_kernels.forward_dp_epilogue[grid](
+            num_tokens,
+            num_splits,
+            ignore_index,
+            labels_view,
+            labels_view.stride(0),
+            num_valid_tokens,
+            _max,
+            _max.stride(0),
+            _max.stride(1),
+            _accu,
+            _accu.stride(0),
+            _accu.stride(1),
+            maximum,
+            maximum.stride(0),
+            accumulate,
+            maximum.stride(0),
+            _logprobs,
+            _logprobs.stride(0),
+            logprobs,
+            triton.language.constexpr(REDUCTION),
+        )
+    else:
+        _max_backup = _max.clone()
+        dist.all_reduce(_max, op=dist.ReduceOp.MAX, group=tp_group)
+
+        torch.cuda.current_stream().record_event(_dedicated_events[0])
+        with torch.cuda.stream(_dedicated_stream):
+            _dedicated_stream.wait_event(_dedicated_events[0])
+            dist.all_reduce(_logprobs, op=dist.ReduceOp.SUM, group=tp_group)
+            _dedicated_stream.record_event(_dedicated_events[1])
+
+        def grid(meta):
+            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]),)
+
+        triton_kernels.forward_tp_epilogue[grid](
+            num_tokens,
+            num_splits,
+            _max,
+            _max.stride(0),
+            _max.stride(1),
+            _max_backup,
+            _max_backup.stride(0),
+            _max_backup.stride(1),
+            _accu,
+            _accu.stride(0),
+            _accu.stride(1),
+            maximum,
+            maximum.stride(0),
+            accumulate,
+            maximum.stride(0),
+        )
+        # reduce accumulate
+        dist.all_reduce(accumulate, op=dist.ReduceOp.SUM, group=tp_group)
+
+        # update logprobs
+        torch.cuda.current_stream().wait_event(_dedicated_events[1])
+        triton_kernels.forward_tp_epilogue_update_logprobs[grid](
+            num_tokens,
+            ignore_index,
+            num_valid_tokens,
+            labels_view,
+            labels_view.stride(0),
+            _logprobs,
+            _logprobs.stride(0),
+            maximum,
+            maximum.stride(0),
+            accumulate,
+            accumulate.stride(0),
+            logprobs,
+            REDUCTION,
+        )
+
+    return logprobs, maximum, accumulate, num_valid_tokens, tp_rank, tp_world_size
+
+def backward(
+    dlogprobs: torch.Tensor,
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    maximum: torch.Tensor,
+    accu: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    reduction: typing.Optional[str] = "mean",
+    ignore_index: typing.Optional[int] = -100,
+    tp_group: typing.Optional[dist.ProcessGroup] = None,
+    tp_rank: typing.Optional[int] = 0,
+    tp_world_size: typing.Optional[int] = 1,
+) -> typing.List[torch.Tensor]:
+    """
+    backward host function
+    """
+    hidden_view = hidden.view(-1, hidden.shape[-1])
+    labels_view = labels.view(-1)
+
+    num_tokens, dim = hidden_view.shape
+    vocab_size, _ = weight.shape
+
+    REDUCTION = utils.str_to_reduction_enum(reduction)
+    dlogprobs_view = dlogprobs.view(-1)
+    assert (
+        (REDUCTION == utils.EntropyReductionEnum.kNone and dlogprobs.shape == (num_tokens,))
+        or (REDUCTION != utils.EntropyReductionEnum.kNone and dlogprobs.dim() == 0)
+    )
+    assert dlogprobs.is_contiguous() and dlogprobs.is_cuda
+
+    assert num_valid_tokens.dim() == 0 and num_valid_tokens.is_cuda and num_valid_tokens.dtype == torch.int64
+
+    d_hidden = torch.empty_like(hidden)
+    d_weight = torch.empty_like(weight)
+    assert d_hidden.is_contiguous() and d_weight.is_contiguous()
+
+    # FIXME: implement different backward methods
+    _backward = utils.BackwardMethodEnum.kDlogitsSplitN
+    if _backward == utils.BackwardMethodEnum.kDlogitsSplitN:
+        vocab_per_split = 512 * 6
+        num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
+
+        _d_logits = torch.empty(
+            (num_tokens, vocab_per_split),
+            device=hidden.device,
+            dtype=hidden.dtype
+        )
+
+        hidden_packed = from_dlpack(
+            hidden_view.detach(),
+            assumed_align=16
+        ).mark_compact_shape_dynamic(mode=0)
+        weight_packed = from_dlpack(
+            weight.detach(),
+            assumed_align=16
+        )
+        labels_packed = from_dlpack(
+            labels_view.detach(),
+            assumed_align=8
+        ).mark_compact_shape_dynamic(mode=0)
+        dlogprobs_packed = from_dlpack(
+            dlogprobs_view.detach(),
+            assumed_align=8
+        ).mark_compact_shape_dynamic(mode=0)
+        maximum_packed = from_dlpack(
+            maximum.detach(),
+            assumed_align=8
+        ).mark_compact_shape_dynamic(mode=0)
+        accu_packed = from_dlpack(
+            accu.detach(),
+            assumed_align=8
+        ).mark_compact_shape_dynamic(mode=0)
+        dlogits_packed = from_dlpack(
+            _d_logits,
+            assumed_align=32
+        ).mark_compact_shape_dynamic(mode=0)
+        scalarNumValidTokens_packed = cute.runtime.make_ptr(
+            cutlass.Int64,
+            num_valid_tokens.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8
+        )
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        if not hasattr(backward, "_bwd_kernel"):
+            backward._bwd_kernel = dict()
+
+        key = f"vocab_size:{vocab_size}+dim:{dim}+reduction:{REDUCTION}+dtype:{hidden.dtype}"
+        if backward._bwd_kernel.get(key) is None:
+            bwd_kernel = bwd_partial_dlogits.BwdPartialDlogits(
+                reduction=REDUCTION,
+                vocab_per_split=vocab_per_split,
+            )
+            bwd_kernel_compiled = cute.compile(
+                bwd_kernel,
+                0, # split_idx
+                hidden_packed,
+                weight_packed,
+                labels_packed,
+                dlogprobs_packed,
+                maximum_packed,
+                accu_packed,
+                dlogits_packed,
+                scalarNumValidTokens_packed,
+                ignore_index,
+                stream
+            )
+            backward._bwd_kernel[key] = bwd_kernel_compiled
+        else:
+            bwd_kernel_compiled = backward._bwd_kernel.get(key)
+
+        for split_idx in range(num_splits):
+            bwd_kernel_compiled(
+                split_idx,
+                hidden_packed,
+                weight_packed,
+                labels_packed,
+                dlogprobs_packed,
+                maximum_packed,
+                accu_packed,
+                dlogits_packed,
+                scalarNumValidTokens_packed,
+                ignore_index,
+                stream
+            )
+            vocab_right_bound = (
+                min((split_idx + 1) * vocab_per_split, vocab_size) - split_idx * vocab_per_split
+            )
+            # remove padding areas
+            _d_logits = _d_logits[:, :vocab_right_bound].contiguous()
+
+            if split_idx == 0:
+                torch.matmul(
+                    _d_logits,
+                    weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
+                    out=d_hidden.view(num_tokens, dim)
+                )
+            else:
+                d_hidden += torch.matmul(
+                    _d_logits,
+                    weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
+                ).view(d_hidden.shape)
+            torch.matmul(
+                _d_logits.T,
+                hidden_view,
+                out=d_weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :]
+            )
+    else:
+        raise NotImplementedError(f"Unsupported backward method: {_backward}")
+    
+    return d_hidden, d_weight
