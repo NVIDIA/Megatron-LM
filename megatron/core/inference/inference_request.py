@@ -333,6 +333,10 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[idx]
 
+    @property
+    def request_id(self):
+        return self.requests[0].request_id
+
     def suspend(self, tokenizer: MegatronTokenizer):
         """Suspend request by storing references to previous prompt, generations,
         and sampling params.

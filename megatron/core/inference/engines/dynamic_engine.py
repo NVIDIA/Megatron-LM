@@ -1067,15 +1067,15 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id = int(next(self.request_counter))
             _ = self.add_request(request_id, prompt, sampling_params)
 
-        finished_requests_list = []
+        finished_request_records_list = []
         while self.has_unfinished_requests():
             result = self.step_modern()
-            finished_requests_list.extend(result["finished_requests"])
+            finished_request_records_list.extend(result["finished_request_records"])
 
         # Ensure requests are returned in the same order they were passed in.
-        finished_requests_list.sort(key=lambda x: x.request_id)
+        finished_request_records_list.sort(key=lambda r: r.request_id)
 
-        return finished_requests_list
+        return finished_request_records_list
 
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.

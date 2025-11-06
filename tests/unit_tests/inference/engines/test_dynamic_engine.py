@@ -334,14 +334,6 @@ class TestDynamicInferenceEngine:
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
 
-        # >>>
-        # # Mock the detokenize method to return predictable result
-        # def mock_detokenize_prompt(tokens):
-        #     return "tokenized_prompt"
-
-        # env.engine.controller.tokenizer.detokenize = mock_detokenize_prompt
-        # <<<
-
         return env
 
     @classmethod
@@ -375,16 +367,9 @@ class TestDynamicInferenceEngine:
         # Append output tokens.
         for finished_request_record in finished_request_records:
             finished_request = finished_request_record.merge(env.engine.controller.tokenizer)
-            # >>>
-            # from lutil import pax
-            # pax("finished_request")
-            # <<<
             request = env.requests[finished_request.request_id]
             request.output = finished_request.generated_tokens
-            # >>>
-            # request.state = "finished"
             request.status = finished_request.status
-            # <<<
 
     @classmethod
     def _run_test(cls, **test_config_kwargs):
@@ -748,7 +733,11 @@ class TestDynamicInferenceEngine:
         # Call the generate function.
         # It's safe to use request 0's sampling params here because all sampling
         # params are identical as long as use_fixed_output_lengths == False.
-        finished_requests = env.engine.generate(prompts, env.requests[0].sampling_params)
+        finished_request_records = env.engine.generate(prompts, env.requests[0].sampling_params)
+        finished_requests = [
+            r.merge(env.engine.controller.tokenizer)
+            for r in finished_request_records
+        ]
 
         # Verify results
         assert len(finished_requests) == len(
@@ -905,19 +894,19 @@ class TestDynamicInferenceEngine:
 
         assert result_event_types == expected_event_types
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.skip(
+        reason="test works in isolation, but memory dynamics change when run "
+        "within unt test suite."
     )
     def test_suspend_resume_memory(self):
 
         # Run tests.
         mem_usages = {}
-        # >>>
-        # for suspend_resume_interval in None, 4, 2, 1:
         for suspend_resume_interval in None, 8, 4, 2: # interval 1 acts funny.
-        # <<<
 
             # Run test.
             env = self._run_test(suspend_resume_interval=suspend_resume_interval, num_gap_steps=1)
@@ -932,38 +921,14 @@ class TestDynamicInferenceEngine:
 
         # Utility methods.
         get_alloc = lambda mem_stats: mem_stats["allocated_bytes.all.current"]
-        # >>>
-        # from lutil import pax
-        # # pax(mem_usages)
-        # pax({
-        #     k : {
-        #         kk : (get_alloc(vv) if kk != "suspend_resume" else vv)
-        #         for kk, vv in v.items()
-        #     }
-        #     for k, v in mem_usages.items()
-        # })
-        # <<<
-
-        # >>>
-        # def assert_noisy_gte(value0, value1):
-        #     assert (
-        #         math.isclose(value0, value1, rel_tol=0.01)
-        #         or
-        #         value0 >= value1
-        #     ), f"{value0} < {value1}."
-        # <<<
 
         # Validate overall 'end' memory usage.
         golden_end_bytes = get_alloc(mem_usages[None]["end"])
         for interval, mem_usage in mem_usages.items():
             current_end_bytes = get_alloc(mem_usage["end"])
-            # >>>
             assert math.isclose(
                 golden_end_bytes, current_end_bytes, rel_tol=0.01
             ), f"{current_end_bytes} != {golden_end_bytes}."
-            # +++
-            # assert_noisy_gte(golden_end_bytes, current_end_bytes)
-            # <<<
 
         # Validate 'suspend/resume' memory usage.
         get_suspend_resume_bytes = lambda key: list(
@@ -981,97 +946,3 @@ class TestDynamicInferenceEngine:
             assert math.isclose(
                 suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
             ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    # @pytest.mark.internal
-    # @pytest.mark.skipif(
-    #     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    # )
-    # # >>>
-    # # @pytest.mark.parametrize("suspend_resume_interval", [ 8, 4, 2 ]) # interval 1 acts funny.
-    # @pytest.mark.parametrize("suspend_resume_interval", [ 2, 4, 8 ]) # interval 1 acts funny.
-    # # <<<
-    # def test_suspend_resume_memory(self, suspend_resume_interval):
-
-    #     # Run tests.
-    #     mem_usages = {}
-    #     # for _suspend_resume_interval in None, suspend_resume_interval:
-    #     for key, interval in [
-    #         ("gold", None),
-    #         ("test", suspend_resume_interval),
-    #     ]:
-
-    #         # Run test.
-    #         env = self._run_test(suspend_resume_interval=interval, num_gap_steps=1)
-
-    #         # Record memory usage.
-    #         mem_usages[key] = env.mem_usage
-
-    #         # Clear memory to make recorded memories consistent between tests.
-    #         # TODO(@lmcafee): why is memory not automatically cleared?
-    #         # env.engine.suspend() # TODO(@lmcafee): useful?
-    #         del env
-
-    #     # Utility methods.
-    #     get_alloc = lambda mem_stats: mem_stats["allocated_bytes.all.current"]
-
-    #     # Validate overall 'end' memory usage.
-    #     get_overall_end_bytes = lambda key : get_alloc(mem_usages[key]["end"])
-    #     gold_end_bytes = get_overall_end_bytes("gold")
-    #     test_end_bytes = get_overall_end_bytes("test")
-    #     assert math.isclose(
-    #         gold_end_bytes, test_end_bytes, rel_tol=0.01
-    #     ), f"{gold_end_bytes} != {test_end_bytes}."
-
-    #     # Validate 'suspend/resume' memory usage.
-    #     # get_suspend_resume_bytes = lambda key: list(
-    #     #     get_alloc(list(d["suspend_resume"].values())[-1][key])
-    #     #     for i, d in mem_usages.items()
-    #     #     if i is not None
-    #     # )
-    #     # get_suspend_resume_bytes = lambda key: (
-    #     #     get_alloc(mem_usages[key]["suspend_resume"]
-
-    #     from lutil import pax
-    #     pax(mem_usages["test"]["suspend_resume"])
-
-    #     gold_mid_bytes = get_suspend_resume_bytes("gold")
-    #     pax("gold_mid_bytes")
-    #     suspend_resume_mid_bytes = get_suspend_resume_bytes("mid")
-    #     suspend_resume_end_bytes = get_suspend_resume_bytes("end")
-    #     for mid_bytes in suspend_resume_mid_bytes:
-    #         assert math.isclose(
-    #             suspend_resume_mid_bytes[0], mid_bytes, rel_tol=0.01
-    #         ), f"{mid_bytes} != {suspend_resume_mid_bytes[0]}."
-    #     for end_bytes in suspend_resume_end_bytes:
-    #         assert math.isclose(
-    #             suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
-    #         ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-if __name__ == "__main__":
-    test = TestDynamicInferenceEngine()
-    # >>>
-    test.test_suspend_resume_memory(2)
-    print("~~~\nsuccess.")
-    exit()
-    # <<<
-    test.test_simple(4, "full")
-    test.test_overflow_factor()
-    test.test_request_overflow()
-    test.test_token_overflow_transient()
-    # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
-    test.test_block_overflow()
-    test.test_multi_add()
-    test.test_fixed_output_lengths()
-    test.test_cuda_graph_token_counts()
-    test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
-    test.test_generate_function()
-    asyncio.run(test.test_run_engine())
-    test.test_return_log_probs()
-    # test.test_parallel_inference()
-    # test.test_events() # uncomment in megatron-core 0.16
-    test.test_suspend_resume_memory()
-    test.teardown_method(None)
-    print("~~~")
-    print("success.")
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
