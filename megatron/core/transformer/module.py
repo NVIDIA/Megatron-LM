@@ -80,14 +80,16 @@ class MegatronModule(torch.nn.Module):
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
         if not hasattr(self, 'tp_group'):
             # some model interface hasn't updated for m4, fallback needed
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            tp_group = self.tp_group
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
             sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
+            tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
         )
         # Recurse into submodules
