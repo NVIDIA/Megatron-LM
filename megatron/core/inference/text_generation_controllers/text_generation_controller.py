@@ -586,34 +586,10 @@ class TextGenerationController:
             request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
         active_request_count = request_metadata.size(0)
 
+        # Shorthand these, because the torch backend needs them.
         temp = request_metadata[:, request_metadata_labels["temperature"]]
         top_k = request_metadata[:, request_metadata_labels["top_k"]]
         top_p = request_metadata[:, request_metadata_labels["top_p"]]
-
-        if backend == "torch":
-            # Special-case for static sampling.
-            if getattr(self, "static_sampling", False):
-                bucket = torch.arange(active_request_count, device=request_metadata.device)
-                reps = temp[0].item(), top_k[0].item(), top_p[0].item()
-                self.torch_sampling_buckets = ((bucket, *reps),)
-            else:
-                # Bucketize the core sampling parameters.
-                core_params = torch.stack((temp, top_k, top_p), dim=1)
-                _, inv_indices, cnts = torch.unique(
-                    core_params, dim=0, return_inverse=True, return_counts=True
-                )
-                order = torch.argsort(inv_indices)
-                sampling_buckets = torch.split(order, cnts.tolist())
-                # Perform the D2H sync needed by `_torch_sampling_func` here.
-                group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
-                temp_reps = temp[group_reps].tolist()
-                top_k_reps = top_k[group_reps].tolist()
-                top_p_reps = top_p[group_reps].tolist()
-                # Store the buckets and their equivalence class representatives.
-                self.torch_sampling_buckets = (
-                    (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
-                    for idx in range(len(sampling_buckets))
-                )
 
         # Copy data into relevant tensors.
         self.cu_temperature[:active_request_count].copy_(temp, non_blocking=True)
@@ -630,6 +606,32 @@ class TextGenerationController:
         self.cu_skip_prompt_log_probs[:active_request_count] = request_metadata[
             :, request_metadata_labels["skip_prompt_log_probs"]
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
+
+        if backend == "torch":
+            # Special-case for static sampling.
+            if getattr(self, "static_sampling", False):
+                bucket = torch.arange(active_request_count, device=request_metadata.device)
+                reps = temp[0].item(), int(top_k[0].item()), top_p[0].item()
+                self.torch_sampling_buckets = ((bucket, *reps),)
+            else:
+                # Bucketize the core sampling parameters.
+                core_params = torch.stack((temp, top_k, top_p), dim=1)
+                _, inv_indices, cnts = torch.unique(
+                    core_params, dim=0, return_inverse=True, return_counts=True
+                )
+                order = torch.argsort(inv_indices, stable=True)
+                sampling_buckets = torch.split(order, cnts.tolist())
+                # Perform the D2H sync needed by `_torch_sampling_func` here.
+                group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
+                core_params_reps = core_params[group_reps].detach().cpu()
+                temp_reps = core_params_reps[:, 0].tolist()
+                top_k_reps = core_params_reps[:, 1].to(torch.int32).tolist()
+                top_p_reps = core_params_reps[:, 2].tolist()
+                # Store the buckets and their equivalence class representatives.
+                self.torch_sampling_buckets = (
+                    (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
+                    for idx in range(len(sampling_buckets))
+                )
 
     def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
         """Sample tokens from logits for dynamic batching.
@@ -662,6 +664,7 @@ class TextGenerationController:
         if backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
             token_list = []
+            indices_list = []
 
             for indices, temp, top_k, top_p in self.torch_sampling_buckets:
                 token_list.append(
@@ -669,10 +672,11 @@ class TextGenerationController:
                         self.cu_sampling_logits[indices, :], temp, top_k, top_p
                     )
                 )
+                indices_list.append(indices)
 
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
-            sampled_indices = torch.cat(self.torch_sampling_buckets, dim=0)
+            sampled_indices = torch.cat(indices_list, dim=0)
             self.cu_sampled_tokens.index_copy_(0, sampled_indices, sampled_tokens)
         return self.cu_sampled_tokens[:active_request_count].clone()
 
@@ -697,16 +701,14 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
-        if materialize_only_last_token_logits:
-            active_request_count = context.total_request_count - context.paused_request_count
-        else:
-            active_request_count = logits.size(0)
+        active_request_count = context.total_request_count - context.paused_request_count
 
-        return context.calculate_log_probs(
+        ret = context.calculate_log_probs(
             logits,
             self.cu_sampled_tokens[:active_request_count],
             only_last_token_logits=materialize_only_last_token_logits,
         )
+        return ret
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -734,7 +736,7 @@ class TextGenerationController:
         active_request_mask = (
             self.cu_sampled_tokens[:active_request_count]
             != self.cu_termination_id[:active_request_count]
-        ) & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -779,13 +781,13 @@ class TextGenerationController:
         if context.active_token_count == 0:
             return None
 
-        input_ids, position_ids = self._dynamic_step_context_init()  # CPU ops
+        input_ids, position_ids = self._dynamic_step_context_init()
 
         cuda_graph_request_count = (
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
-        logits = self._dynamic_step_forward_logits(input_ids, position_ids)  # GPU ops
+        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -805,7 +807,6 @@ class TextGenerationController:
         else:
             log_probs = None
 
-        # This method only performs computations using CPU tensors.
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
