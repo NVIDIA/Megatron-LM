@@ -313,8 +313,7 @@ class TestDynamicInferenceEngine:
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
             tokenizer=types.SimpleNamespace(
-                vocab_size=test_config.vocab_size,
-                detokenize=lambda tokens: "tokenized_prompt",
+                vocab_size=test_config.vocab_size, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
 
@@ -735,8 +734,7 @@ class TestDynamicInferenceEngine:
         # params are identical as long as use_fixed_output_lengths == False.
         finished_request_records = env.engine.generate(prompts, env.requests[0].sampling_params)
         finished_requests = [
-            r.merge(env.engine.controller.tokenizer)
-            for r in finished_request_records
+            r.merge(env.engine.controller.tokenizer) for r in finished_request_records
         ]
 
         # Verify results
@@ -906,7 +904,7 @@ class TestDynamicInferenceEngine:
 
         # Run tests.
         mem_usages = {}
-        for suspend_resume_interval in None, 8, 4, 2: # interval 1 acts funny.
+        for suspend_resume_interval in None, 8, 4, 2:  # interval 1 acts funny.
 
             # Run test.
             env = self._run_test(suspend_resume_interval=suspend_resume_interval, num_gap_steps=1)

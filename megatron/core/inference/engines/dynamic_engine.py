@@ -9,7 +9,6 @@ import time
 import warnings
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import asdict
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -458,7 +457,9 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator(verbose=verbose))
+        self.engine_loop_task = asyncio.create_task(
+            self.run_engine_with_coordinator(verbose=verbose)
+        )
 
     @contextmanager
     @staticmethod

@@ -352,7 +352,12 @@ class DynamicInferenceRequestRecord:
         return self.requests[idx]
 
     @property
-    def request_id(self):
+    def request_id(self) -> int:
+        """Get request id.
+
+        Returns:
+            (int) Request id.
+        """
         return self.requests[0].request_id
 
     def suspend(self, tokenizer: MegatronTokenizer):
