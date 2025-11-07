@@ -1,7 +1,26 @@
 {
+  "deepseek_a2a_tp1ep8_bf16": {
+    "backward_ms": 10.71298246383667,
+    "forward_ms": 8.74237117767334,
+    "max_allocated_bytes": 3591346688,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_deepep_tp1ep8_bf16": {
+    "backward_ms": 9.470105600357055,
+    "forward_ms": 8.774849677085877,
+    "max_allocated_bytes": 2825890841.6,
+    "max_regression_ratio": 1.02
+  },
   "mixtral_a2a_tp1ep8_bf16": {
-    "backward_ms": 6.481228876113891,
-    "forward_ms": 5.704969596862793,
+    "backward_ms": 7.507815980911255,
+    "forward_ms": 5.430964756011963,
+    "max_allocated_bytes": 2672594483.2,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_deepep_tp1ep8_bf16": {
+    "backward_ms": 7.813905572891235,
+    "forward_ms": 7.6475934982299805,
+    "max_allocated_bytes": 2665632000,
     "max_regression_ratio": 1.02
   }
 }
