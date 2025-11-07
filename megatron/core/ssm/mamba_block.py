@@ -154,22 +154,22 @@ class MambaStack(MegatronModule):
             self.hybrid_override_pattern,
         )
 
-        pp_layer_offset = 0
+        self.pp_layer_offset = 0
         if self.pp_group.size() > 1:
-            pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
+            self.pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
                 self.layer_type_list
             )
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
-            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+            fp8_init_context = get_fp8_context(self.config, i + self.pp_layer_offset, is_init=True)
             with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
-                        layer_number=i + 1 + pp_layer_offset,
+                        layer_number=i + 1 + self.pp_layer_offset,
                         pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:

@@ -331,10 +331,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
+        self.pp_layer_offset = get_transformer_layer_offset(
+            self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
+        )  # 1-based index
+
         def build_layer(layer_spec, layer_number):
-            global_layer_number = layer_number + get_transformer_layer_offset(
-                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
-            )  # 1-based index
+            global_layer_number = layer_number + self.pp_layer_offset
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:

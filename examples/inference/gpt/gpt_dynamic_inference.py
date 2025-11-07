@@ -125,6 +125,7 @@ def get_inference_context(
     requests: List[Request],
     sampling_params: Optional[SamplingParams] = None,
     calculate_max_sequence_length_from_requests: bool = True,
+    pp_layer_offset: int = 0,
     layer_type_list: Optional[List[str]] = None,
     mamba_conv_states_shape: Optional[Tuple[int]] = None,
     mamba_ssm_states_shape: Optional[Tuple[int]] = None,
@@ -165,6 +166,7 @@ def get_inference_context(
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_args=args.pipeline_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         layer_type_list=layer_type_list,
         mamba_conv_states_shape=mamba_conv_states_shape,
@@ -383,6 +385,7 @@ def main():
 
     # Layer type list for hybrid models
     decoder = get_attr_wrapped_model(model, "decoder")
+    pp_layer_offset = getattr(decoder, "pp_layer_offset")
     layer_type_list = getattr(decoder, "layer_type_list", None)
     if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
         (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
@@ -395,6 +398,7 @@ def main():
     context = get_inference_context(
         requests,
         sampling_params,
+        pp_layer_offset=pp_layer_offset,
         layer_type_list=layer_type_list,
         mamba_conv_states_shape=mamba_conv_states_shape,
         mamba_ssm_states_shape=mamba_ssm_states_shape,
