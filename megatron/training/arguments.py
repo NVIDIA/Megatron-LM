@@ -1181,7 +1181,7 @@ def validate_args(args, defaults={}):
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format == "torch", "Muon optimizer only supports torch checkpoint format for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2349,6 +2349,8 @@ def _add_training_args(parser):
                        help='The submodules to offload its input. Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
     group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
                        help='The minimum size of the tensor to be offloaded.')
+    group.add_argument('--disable-jit-fuser', action='store_true',
+                       help='Disable the JIT fuser.')
     return parser
 
 
