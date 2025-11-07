@@ -277,8 +277,8 @@ class TestDynamicContext:
         dynamic_context.memory_buffer.fill_(1)
         dynamic_context.request_to_kv_block_ids.fill_(1)
         if is_hybrid_model:
-            dynamic_context.mamba_metadata.mamba_conv_states.fill_(1)
-            dynamic_context.mamba_metadata.mamba_ssm_states.fill_(1)
+            dynamic_context.mamba_conv_states.fill_(1)
+            dynamic_context.mamba_ssm_states.fill_(1)
 
         # Call reset
         dynamic_context.reset()
@@ -309,8 +309,8 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
-            assert torch.all(dynamic_context.mamba_metadata.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_metadata.mamba_ssm_states == 0)
+            assert torch.all(dynamic_context.mamba_conv_states == 0)
+            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -469,16 +469,16 @@ class TestDynamicContext:
 
         if is_hybrid_model:
             # Also initialize Mamba states for the dummy requests
-            dynamic_context.mamba_metadata.mamba_conv_states[:, 0:3, :, :].fill_(1.0)
-            dynamic_context.mamba_metadata.mamba_ssm_states[:, 0:3, :, :, :].fill_(1.0)
+            dynamic_context.mamba_conv_states[:, 0:3, :, :].fill_(1.0)
+            dynamic_context.mamba_ssm_states[:, 0:3, :, :, :].fill_(1.0)
 
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
         assert dynamic_context.total_request_count == 0
         if is_hybrid_model:
-            assert torch.all(dynamic_context.mamba_metadata.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_metadata.mamba_ssm_states == 0)
+            assert torch.all(dynamic_context.mamba_conv_states == 0)
+            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
         # This case would cover all cases
         # 1. Already there will be 2 paused requests
@@ -559,10 +559,8 @@ class TestDynamicContext:
             for i in range(total_request_count):
                 dynamic_context.mamba_metadata.request_to_mamba_state_idx[i] = i
             dynamic_context.mamba_metadata.mamba_state_free_slot_count -= total_request_count
-            dynamic_context.mamba_metadata.mamba_conv_states[:, 0:total_request_count, :, :] = 1.0
-            dynamic_context.mamba_metadata.mamba_ssm_states[
-                :, 0:total_request_count, :, :, :
-            ] = 1.0
+            dynamic_context.mamba_conv_states[:, 0:total_request_count, :, :] = 1.0
+            dynamic_context.mamba_ssm_states[:, 0:total_request_count, :, :, :] = 1.0
 
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask, new_tokens=next_tokens
@@ -687,10 +685,10 @@ class TestDynamicContext:
             dynamic_context.request_query_lengths[i] = 1
             dynamic_context.request_ids[i] = i
             if is_hybrid_model:
-                dynamic_context.mamba_metadata.mamba_conv_states[:, i, :, :].fill_(
+                dynamic_context.mamba_conv_states[:, i, :, :].fill_(
                     float(i + 1)
                 )  # Fill with distinct values
-                dynamic_context.mamba_metadata.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
+                dynamic_context.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
                 dynamic_context.mamba_metadata.request_to_mamba_state_idx[i] = i
                 dynamic_context.mamba_metadata.mamba_state_free_slot_count -= 1
 
@@ -716,21 +714,12 @@ class TestDynamicContext:
             # Request at position 3 now moves into finished request position 0
             # Request at position 1 remains active
             mamba_idx = {
-                i: dynamic_context.mamba_metadata.request_to_mamba_state_idx[i]
-                for i in range(5)
+                i: dynamic_context.mamba_metadata.request_to_mamba_state_idx[i] for i in range(5)
             }
-            assert torch.all(
-                dynamic_context.mamba_metadata.mamba_conv_states[:, mamba_idx[0], :, :] == 4.0
-            )
-            assert torch.all(
-                dynamic_context.mamba_metadata.mamba_ssm_states[:, mamba_idx[0], :, :, :] == 4.0
-            )
-            assert torch.all(
-                dynamic_context.mamba_metadata.mamba_conv_states[:, mamba_idx[1], :, :] == 2.0
-            )
-            assert torch.all(
-                dynamic_context.mamba_metadata.mamba_ssm_states[:, mamba_idx[1], :, :, :] == 2.0
-            )
+            assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx[0], :, :] == 4.0)
+            assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx[0], :, :, :] == 4.0)
+            assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx[1], :, :] == 2.0)
+            assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx[1], :, :, :] == 2.0)
             assert mamba_idx[2] == -1
             assert mamba_idx[3] == -1
             assert mamba_idx[4] == -1
@@ -786,8 +775,8 @@ class TestDynamicContext:
             dynamic_context.request_query_lengths[i] = 1
             dynamic_context.request_ids[i] = i
             if is_hybrid_model:
-                dynamic_context.mamba_metadata.mamba_conv_states[:, i, :, :].fill_(float(i + 1))
-                dynamic_context.mamba_metadata.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
+                dynamic_context.mamba_conv_states[:, i, :, :].fill_(float(i + 1))
+                dynamic_context.mamba_ssm_states[:, i, :, :, :].fill_(float(i + 1))
 
         # Create an active_requests_mask where all requests are finished
         active_requests_mask = torch.tensor([0, 0, 0], device=torch.cuda.current_device())
@@ -807,8 +796,8 @@ class TestDynamicContext:
 
         if is_hybrid_model:
             # All mamba states should be zeroed out
-            assert torch.all(dynamic_context.mamba_metadata.mamba_conv_states == 0)
-            assert torch.all(dynamic_context.mamba_metadata.mamba_ssm_states == 0)
+            assert torch.all(dynamic_context.mamba_conv_states == 0)
+            assert torch.all(dynamic_context.mamba_ssm_states == 0)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -873,13 +862,13 @@ class TestDynamicContext:
 
         # Test for the first Mamba layer (global layer 1, local mamba layer 0)
         global_layer_1_mamba_local_idx = 0
-        dynamic_context.mamba_metadata.mamba_conv_states[global_layer_1_mamba_local_idx] = 10.0
-        dynamic_context.mamba_metadata.mamba_ssm_states[global_layer_1_mamba_local_idx] = 20.0
+        dynamic_context.mamba_conv_states[global_layer_1_mamba_local_idx] = 10.0
+        dynamic_context.mamba_ssm_states[global_layer_1_mamba_local_idx] = 20.0
 
         # Test for the second Mamba layer (global layer 3, local mamba layer 1)
         global_layer_3_mamba_local_idx = 1
-        dynamic_context.mamba_metadata.mamba_conv_states[global_layer_3_mamba_local_idx] = 30.0
-        dynamic_context.mamba_metadata.mamba_ssm_states[global_layer_3_mamba_local_idx] = 40.0
+        dynamic_context.mamba_conv_states[global_layer_3_mamba_local_idx] = 30.0
+        dynamic_context.mamba_ssm_states[global_layer_3_mamba_local_idx] = 40.0
 
         # Retrieve states using mamba_states_cache for global layer 1
         conv_state_layer1, ssm_state_layer1 = dynamic_context.mamba_states_cache(layer_number=1)

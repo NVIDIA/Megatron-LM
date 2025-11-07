@@ -890,7 +890,9 @@ class TestDynamicInferenceEngine:
 
             # Verify that all request outputs were set.
             for request_id, fut in request_completion_futures.items():
-                num_tokens_to_generate = env.requests[request_id].sampling_params.num_tokens_to_generate
+                num_tokens_to_generate = env.requests[
+                    request_id
+                ].sampling_params.num_tokens_to_generate
                 result = fut.result()
                 assert result.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "

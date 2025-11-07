@@ -590,18 +590,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Optional state tensors for hybrid models
-        # TODO(ksanthanam): Allocate an additional buffer request in the event of padding
-        # for non-decode CUDA graphs
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
-                num_mamba_layers=self.num_mamba_layers,
-                max_requests=self.max_requests,
-                mamba_conv_states_shape=mamba_conv_states_shape,
-                mamba_ssm_states_shape=mamba_ssm_states_shape,
-                params_dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-                ctx_manager=ctx_manager,
-            )
+            self.mamba_metadata = MambaMetadata(max_requests=self.max_requests)
+
+            with ctx_manager:
+                self.mamba_conv_states = torch.zeros(
+                    (self.num_mamba_layers, self.max_requests) + mamba_conv_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.zeros(
+                    (self.num_mamba_layers, self.max_requests) + mamba_ssm_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
         else:
             self.mamba_metadata = None
 
@@ -835,8 +838,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
 
         mamba_layer_number = self.layer_map[layer_number - 1]
-        conv_state = self.mamba_metadata.mamba_conv_states[mamba_layer_number]
-        ssm_state = self.mamba_metadata.mamba_ssm_states[mamba_layer_number]
+        conv_state = self.mamba_conv_states[mamba_layer_number]
+        ssm_state = self.mamba_ssm_states[mamba_layer_number]
 
         return (conv_state, ssm_state)
 
@@ -960,6 +963,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
+            self.mamba_conv_states.fill_(0)
+            self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
     def using_cuda_graph_this_step(self) -> bool:
@@ -1093,8 +1098,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.is_decode_only() or self.using_cuda_graph_this_step():
                 self.mamba_metadata.update_cudagraph_mapping(
-                    active_mamba_indices,
-                    self.total_request_count - self.paused_request_count,
+                    active_mamba_indices, self.total_request_count - self.paused_request_count
                 )
 
     def reset(self) -> None:
@@ -1322,6 +1326,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
+
+            # Initialize the allocated Mamba state
+            self.mamba_conv_states[:, mamba_idx] = 0.0
+            self.mamba_ssm_states[:, mamba_idx] = 0.0
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
         self.active_token_count += chunk_length
@@ -1343,9 +1351,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
 
         if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[
-                dst_idxs
-            ] = self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+            self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+            )
 
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
