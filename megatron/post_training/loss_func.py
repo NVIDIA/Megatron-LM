@@ -2,14 +2,12 @@
 
 """Pretrain GPT loss function(s)."""
 
-import os
-
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.training import get_args
-from megatron.training.utils import average_losses_across_data_parallel_group, unwrap_model
+from megatron.training.utils import unwrap_model
 
 
 def _mask_loss(output_tensor, loss_mask):
@@ -36,24 +34,6 @@ def _mask_loss(output_tensor, loss_mask):
         torch.distributed.all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group())
 
     return loss
-
-
-def _allreduce_losses(losses):
-    """Reduce losses across all GPUs."""
-    args = get_args()
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        for loss in losses:
-            assert not loss.isnan(), (
-                f'Rank {global_rank}: found NaN in local forward loss calculation. '
-                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-            )
-
-    # Reduce loss for logging.
-    # TODO(aanoosheh): This should ideally be done with num_tokens separately reduced and averaged.
-    return average_losses_across_data_parallel_group(losses)
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTModel):

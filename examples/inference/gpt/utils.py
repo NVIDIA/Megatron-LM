@@ -373,6 +373,9 @@ def build_dynamic_engine_setup_prefix(
     else:
         cg_str = "--"
 
+    # Unified memory (UVM).
+    uvm_str = f"uvm {int(context.unified_memory_level)}"
+
     # Prompt description
     prompt_src_str = (
         "cli" if args.prompts else
@@ -401,6 +404,7 @@ def build_dynamic_engine_setup_prefix(
         get_model_size_str(model),
         "dynamic",
         cg_str,
+        uvm_str,
         request_str,
         buffer_limits_str,
     ]
