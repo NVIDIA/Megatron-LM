@@ -156,7 +156,6 @@ class Linear(torch.nn.Linear):
             if "_amax" in k or "_scale" in k:
                 if v.ndim == 0:
                     state_dict[k] = v.view(1)
-        tp_group = tp_group if self.tp_group is None else self.tp_group
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
