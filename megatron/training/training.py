@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
+import json
 import logging
 import math
 import os
@@ -47,7 +48,7 @@ except ImportError:
     CallWrapper = type(None)
 
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, parallel_state
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_model_config,
@@ -1238,6 +1239,53 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def maybe_log_global_grad_norm(grad_norm):
+    """Append the global gradient norm for the requested iteration."""
+    args = get_args()
+    output_path = getattr(args, 'log_global_grad_norms', None)
+    if not output_path:
+        return
+
+    if grad_norm is None:
+        return
+
+    target_iteration = getattr(args, 'log_grad_norm_iteration', 0)
+    if args.curr_iteration != target_iteration:
+        return
+
+    if getattr(args, '_grad_norm_logged_iteration', None) == args.curr_iteration:
+        return
+
+    if torch.distributed.get_rank() != 0:
+        return
+
+    record = {
+        'iteration': args.curr_iteration,
+        'grad_norm': float(grad_norm),
+        'consumed_train_samples': getattr(args, 'consumed_train_samples', None),
+        'micro_batch_size': args.micro_batch_size,
+        'global_batch_size': getattr(args, 'global_batch_size', None),
+        'world_size': torch.distributed.get_world_size(),
+        'data_parallel_size': parallel_state.get_data_parallel_world_size(
+            with_context_parallel=True
+        ),
+        'tensor_model_parallel_size': parallel_state.get_tensor_model_parallel_world_size(),
+        'pipeline_model_parallel_size': parallel_state.get_pipeline_model_parallel_world_size(),
+        'context_parallel_size': parallel_state.get_context_parallel_world_size(),
+    }
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(output_path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(record) + '\n')
+
+    print_rank_0(f"Appended global grad norm to {output_path}")
+
+    args._grad_norm_logged_iteration = args.curr_iteration
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
@@ -1305,6 +1353,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
+
+    maybe_log_global_grad_norm(grad_norm)
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
