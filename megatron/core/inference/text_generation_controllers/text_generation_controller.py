@@ -589,7 +589,6 @@ class TextGenerationController:
         temp = request_metadata[:, request_metadata_labels["temperature"]]
         top_k = request_metadata[:, request_metadata_labels["top_k"]]
         top_p = request_metadata[:, request_metadata_labels["top_p"]]
-        core_params = torch.stack((temp, top_k, top_p), dim=1)
 
         if backend == "torch":
             # Special-case for static sampling.
@@ -598,6 +597,7 @@ class TextGenerationController:
                     torch.arange(active_request_count, device=request_metadata.device)
                 ]
             else:
+                core_params = torch.stack((temp, top_k, top_p), dim=1)
                 # Bucketize the core sampling parameters.
                 _, inv_indices, cnts = torch.unique(
                     core_params, dim=0, return_inverse=True, return_counts=True
@@ -605,6 +605,7 @@ class TextGenerationController:
                 order = torch.argsort(inv_indices)
                 self.torch_sampling_groups = torch.split(order, cnts.tolist())
 
+        # Copy data into relevant tensors.
         self.cu_temperature[:active_request_count].copy_(temp, non_blocking=True)
         self.cu_top_k[:active_request_count] = top_k.to(
             dtype=torch.int32, copy=True, non_blocking=True
@@ -732,7 +733,7 @@ class TextGenerationController:
         finished_request_ids = context.request_ids[finished_idxs]
 
         # New sample gets updated in update_requests, so we pass in a clone
-        new_sample_copy = new_sample
+        new_sample_copy = new_sample.clone()
 
         # Update requests.
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
