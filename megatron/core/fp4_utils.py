@@ -56,9 +56,17 @@ def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     a 16-byte aligned address for efficient memory access. Since FP4 uses 4 bits per value,
     16 bytes (128 bits) corresponds to 32 FP4 values. Therefore, the alignment size for FP4
     is 32. With this alignment, NVFP4 GEMM can be performed efficiently.
+
+    Note that since we are also random hadamard transform for NVFP4 training, we want 
+    fused group nvfp4 quantize plus hadamard transform. Hadamard transform will leverage 
+    tensor core instructions for better performance, while group quantize kernels also 
+    prefer a more aligned size in token dimension M. Therefore, we apply align size 64
+    here for better performance in MOE.
+
+    Paper link: https://arxiv.org/pdf/2509.25149
     """
     # pylint: disable=unused-argument
-    return 32
+    return 64
 
 
 def dequantize_fp4_tensor(fp4_tensor: torch.Tensor) -> torch.Tensor:
