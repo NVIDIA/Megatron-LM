@@ -11,7 +11,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple, Optional
 
 import torch
 from tqdm import tqdm
@@ -28,18 +28,21 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_attr_wrapped_model
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-
-from megatron.core.utils import configure_nvtx_profiling
 from model_provider import model_provider
 from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
+
+from megatron.core.utils import configure_nvtx_profiling
 
 import json
 
@@ -54,7 +57,6 @@ from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider
 
 import torch
 import io
@@ -86,9 +88,16 @@ def get_model() -> MegatronModule:
 
     args = get_args()
 
+    if args.model_provider == "gpt":
+        model_builder = gpt_builder
+    elif args.model_provider == "mamba":
+        model_builder = mamba_builder
+    else:
+        raise ValueError(f"Invalid model provider {args.model_provider}")
+
     # Build model.
     model = _get_model(
-        partial(model_provider, gpt_builder),
+        partial(model_provider, model_builder),
         wrap_with_ddp=False
     )
 
@@ -115,7 +124,10 @@ def get_model() -> MegatronModule:
 def get_inference_context(
     requests: List[Request],
     sampling_params: Optional[SamplingParams] = None,
-    calculate_max_sequence_length_from_requests: bool = True
+    calculate_max_sequence_length_from_requests: bool = True,
+    layer_type_list: Optional[List[str]] = None,
+    mamba_conv_states_shape: Optional[Tuple[int]] = None,
+    mamba_ssm_states_shape: Optional[Tuple[int]] = None,
 ):
     """The inference context manages the KV cache and other inference state."""
 
@@ -154,6 +166,9 @@ def get_inference_context(
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
+        layer_type_list=layer_type_list,
+        mamba_conv_states_shape=mamba_conv_states_shape,
+        mamba_ssm_states_shape=mamba_ssm_states_shape,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
@@ -364,21 +379,38 @@ def main():
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
     )
 
-    # Requests, context, conroller.
     model = get_model()
+
+    # Layer type list for hybrid models
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+    else:
+        mamba_conv_states_shape = None
+        mamba_ssm_states_shape = None
+
+    # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    context = get_inference_context(requests, sampling_params)
+    context = get_inference_context(
+        requests,
+        sampling_params,
+        layer_type_list=layer_type_list,
+        mamba_conv_states_shape=mamba_conv_states_shape,
+        mamba_ssm_states_shape=mamba_ssm_states_shape,
+    )
     controller = get_inference_controller(model, context)
 
     # Validate all context_length's <= max_tokens.
-    invalid_prompt_length_map = {}
-    for request_idx, request in enumerate(requests):
-        if len(request.prompt_tokens) > context.max_tokens:
-            invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-    assert not invalid_prompt_length_map, (
-        "request idxs with prompts longer than context.max_tokens: "
-        ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
-    )
+    if args.disable_chunked_prefill:
+        invalid_prompt_length_map = {}
+        for request_idx, request in enumerate(requests):
+            if len(request.prompt_tokens) > context.max_tokens:
+                invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
+        assert not invalid_prompt_length_map, (
+            "request idxs with prompts longer than context.max_tokens: "
+            ", ".join(f"{k}({v})" for k, v in invalid_prompt_length_map.items())
+        )
 
     # Inference engine.
     engine = DynamicInferenceEngine(
@@ -418,8 +450,8 @@ def main():
         )
 
     # Print unique prompts + outputs.
-    if torch.distributed.get_rank() == 0:
 
+    if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
 
