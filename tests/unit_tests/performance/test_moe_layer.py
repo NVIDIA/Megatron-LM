@@ -224,7 +224,9 @@ def _build_transformer_config(case: MoEPerformanceCase) -> TransformerConfig:
 
 # NOTE: Only TE backend is covered in this test.
 def _resolve_moe_submodules(case: MoEPerformanceCase):
-    layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=case.model.num_experts, moe_grouped_gemm=True)
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=case.model.num_experts, moe_grouped_gemm=True
+    )
     return layer_spec.submodules.mlp.submodules
 
 
