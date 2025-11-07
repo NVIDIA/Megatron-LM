@@ -444,7 +444,7 @@ class MambaMixer(MegatronModule):
 
         # Fast path: decode-only
         if context.is_decode_only():
-            batch_indices = context.request_to_mamba_state_idx_cudagraph_only[
+            batch_indices = context.mamba_metadata.request_to_mamba_state_idx_cudagraph_only[
                 : context.padded_active_token_count
             ]
             out, out_bias = self.decode(
@@ -461,7 +461,7 @@ class MambaMixer(MegatronModule):
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
         ]
-        batch_indices = context.request_to_mamba_state_idx
+        batch_indices = context.mamba_metadata.request_to_mamba_state_idx
 
         # First request with query len > 1 is prefill-start.
         first_prefill_token_idx = torch.nonzero(active_query_lengths > 1)[0].int()
