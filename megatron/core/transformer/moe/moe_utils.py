@@ -44,7 +44,7 @@ def compute_tokens_per_expert_with_padding(
 ):
     """Compute tokens_per_expert and total_num_tokens with optional padding mask.
     This function provides a unified way to compute token counts across different aux loss types.
-    
+
     Args:
         routing_map (torch.Tensor): Token to expert routing map.
             - For aux_loss/global_aux_loss: shape [num_tokens, num_experts]
@@ -55,25 +55,28 @@ def compute_tokens_per_expert_with_padding(
         seq_length (int, optional): Sequence length, required when reshape_for_seq_aux=True.
         bsz (int, optional): Batch size, required when reshape_for_seq_aux=True.
         num_experts (int, optional): Number of experts, required when reshape_for_seq_aux=True.
-    
+
     Returns:
         tuple: (tokens_per_expert, num_valid_tokens)
-            - tokens_per_expert (torch.Tensor): Number of tokens per expert, shape [num_experts] 
+            - tokens_per_expert (torch.Tensor): Number of tokens per expert, shape [num_experts]
                 or [bsz * num_experts] for seq_aux_loss
             - num_valid_tokens (torch.Tensor or int): Number of valid (non-padding) tokens
     """
     if reshape_for_seq_aux:
         # seq aux loss
-        assert seq_length is not None and bsz is not None and num_experts is not None, \
-            "seq_length, bsz, and num_experts must be provided when reshape_for_seq_aux=True"
-        
+        assert (
+            seq_length is not None and bsz is not None and num_experts is not None
+        ), "seq_length, bsz, and num_experts must be provided when reshape_for_seq_aux=True"
+
         if padding_mask is not None:
             # Reshape padding_mask to [seq_length, bsz]
             padding_mask_reshaped = padding_mask.reshape(seq_length, bsz)
             # Expand to match routing_map after reshape [seq_length, bsz * num_experts]
-            mask_expanded = padding_mask_reshaped.unsqueeze(-1).expand(
-                -1, -1, num_experts
-            ).reshape(seq_length, -1)
+            mask_expanded = (
+                padding_mask_reshaped.unsqueeze(-1)
+                .expand(-1, -1, num_experts)
+                .reshape(seq_length, -1)
+            )
             routing_map_masked = routing_map.reshape(seq_length, -1) & mask_expanded
             tokens_per_expert = routing_map_masked.sum(dim=0)
             # Count valid tokens only
@@ -93,7 +96,7 @@ def compute_tokens_per_expert_with_padding(
         else:
             tokens_per_expert = routing_map.sum(dim=0)
             num_valid_tokens = routing_map.shape[0]
-    
+
     return tokens_per_expert, num_valid_tokens
 
 
@@ -167,7 +170,7 @@ def switch_load_balancing_loss_func(
         # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
-    
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
@@ -203,7 +206,7 @@ def z_loss_func(logits, z_loss_coeff, padding_mask: Optional[torch.Tensor] = Non
     """
     logsum = torch.logsumexp(logits, dim=-1)
     z_loss_values = torch.square(logsum)
-    
+
     if padding_mask is not None:
         # Only compute z_loss for non-padding tokens
         z_loss_values = z_loss_values * padding_mask
@@ -710,8 +713,11 @@ def topk_routing_with_score_function(
 
 
 def compute_routing_scores_for_aux_loss(
-    logits: torch.Tensor, topk: int, score_function: str, fused: bool = False, 
-    padding_mask: Optional[torch.Tensor] = None
+    logits: torch.Tensor,
+    topk: int,
+    score_function: str,
+    fused: bool = False,
+    padding_mask: Optional[torch.Tensor] = None,
 ):
     """Compute routing scores based on the score function.
 
@@ -730,7 +736,9 @@ def compute_routing_scores_for_aux_loss(
             )
         # Note: fused implementation does not support padding_mask yet
         if padding_mask is not None:
-            raise ValueError("Fused compute_routing_scores does not support padding_mask. Set fused=False.")
+            raise ValueError(
+                "Fused compute_routing_scores does not support padding_mask. Set fused=False."
+            )
         return fused_compute_score_for_moe_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
@@ -745,7 +753,7 @@ def compute_routing_scores_for_aux_loss(
 
     _, top_indices = torch.topk(scores, k=topk, dim=1)
     routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-    
+
     # Apply padding mask to scores if provided
     if padding_mask is not None:
         mask_expanded = padding_mask.unsqueeze(-1).to(scores.dtype)

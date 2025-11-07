@@ -453,7 +453,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        
+
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -613,7 +613,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
-        
+
         padding_mask_for_moe = None
         if self.is_moe_layer and padding_mask is not None:
             # padding_mask from GPTModel: [bsz, seq_length]
@@ -652,7 +652,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             assert (
                 not self.recompute_pre_mlp_layernorm
             ), "Recomputation is not supported for CUDA graph."
-            cudagraph_outputs = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask_for_moe)
+            cudagraph_outputs = self.mlp(
+                pre_mlp_layernorm_output, padding_mask=padding_mask_for_moe
+            )
             return cudagraph_outputs + [residual]
         elif self.recompute_mlp:
             if self.config.fp8:
@@ -663,7 +665,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     # For MoE with checkpointing, we need a wrapper to pass padding_mask
                     def mlp_forward_with_padding(hidden_states):
                         return self.mlp(hidden_states, padding_mask=padding_mask_for_moe)
-                    
+
                     mlp_output_with_bias = te_checkpoint(
                         mlp_forward_with_padding,
                         False,
@@ -684,7 +686,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     # For MoE with checkpointing, we need a wrapper to pass padding_mask
                     def mlp_forward_with_padding(hidden_states):
                         return self.mlp(hidden_states, padding_mask=padding_mask_for_moe)
-                    
+
                     mlp_output_with_bias = tensor_parallel.checkpoint(
                         mlp_forward_with_padding, False, pre_mlp_layernorm_output
                     )
@@ -707,7 +709,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
             if self.is_moe_layer:
-                mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask_for_moe)
+                mlp_output_with_bias = self.mlp(
+                    pre_mlp_layernorm_output, padding_mask=padding_mask_for_moe
+                )
             else:
                 mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 

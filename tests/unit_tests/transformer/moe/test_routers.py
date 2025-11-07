@@ -133,31 +133,41 @@ class TestTop2Router:
         seq_len = 32
         batch_size = 2
         hidden_size = self.router.config.hidden_size
-        
+
         # Create input with shape [seq_len, batch_size, hidden_size]
         hidden_states = torch.randn((seq_len, batch_size, hidden_size)).cuda().bfloat16()
-        
+
         # Create padding mask: first half valid, second half padding
         # padding_mask shape: [seq_len, batch_size]
         padding_mask = torch.ones((seq_len, batch_size), dtype=torch.bool, device='cuda')
-        padding_mask[seq_len // 2:, :] = False  # Second half is padding
-        
+        padding_mask[seq_len // 2 :, :] = False  # Second half is padding
+
         # Test forward pass with padding mask
         with torch.no_grad():
-            probs_with_mask, routing_map_with_mask = self.router(hidden_states, padding_mask=padding_mask)
-            
+            probs_with_mask, routing_map_with_mask = self.router(
+                hidden_states, padding_mask=padding_mask
+            )
+
             # Test forward pass without padding mask (only valid tokens)
-            hidden_states_valid = hidden_states[:seq_len // 2, :, :]
+            hidden_states_valid = hidden_states[: seq_len // 2, :, :]
             probs_without_mask, routing_map_without_mask = self.router(hidden_states_valid)
-            
+
             # The valid part of routing with mask should match routing without mask
-            probs_valid_part = probs_with_mask.reshape(seq_len, batch_size, -1)[:seq_len // 2, :, :]
+            probs_valid_part = probs_with_mask.reshape(seq_len, batch_size, -1)[
+                : seq_len // 2, :, :
+            ]
             probs_valid_part = probs_valid_part.reshape(-1, probs_valid_part.shape[-1])
-            
+
             # Check that shapes are as expected
-            assert probs_with_mask.shape == (seq_len * batch_size, self.router.config.num_moe_experts)
-            assert routing_map_with_mask.shape == (seq_len * batch_size, self.router.config.num_moe_experts)
-            
+            assert probs_with_mask.shape == (
+                seq_len * batch_size,
+                self.router.config.num_moe_experts,
+            )
+            assert routing_map_with_mask.shape == (
+                seq_len * batch_size,
+                self.router.config.num_moe_experts,
+            )
+
             # Verify that probs for valid tokens are similar
             torch.testing.assert_close(probs_valid_part, probs_without_mask, rtol=1e-3, atol=1e-3)
 
