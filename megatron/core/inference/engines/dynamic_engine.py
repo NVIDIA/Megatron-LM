@@ -702,7 +702,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -939,7 +939,7 @@ class DynamicInferenceEngine(AbstractEngine):
             result = self.step_modern()
             finished_requests_list.extend(result["finished_requests"])
 
-        # Ensure requests are returned in the same order they were passed in.
+        # Ensure requests are returned in the same order they were passed in
         finished_requests_list.sort(key=lambda x: x.request_id)
 
         return finished_requests_list
