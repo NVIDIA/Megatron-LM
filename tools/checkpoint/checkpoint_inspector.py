@@ -744,8 +744,15 @@ def convert_torch_dist_to_fsdp_dtensor(
 
     ckpt_path = Path(input_dir)
     output_dir = Path(output_dir)
-    with open(param_to_param_group_map_json, "r") as f:
-        param_to_param_group_map = json.load(f)
+    param_to_param_group_map_json = param_to_param_group_map_json.strip()
+    try:
+        param_to_param_group_map = json.loads(param_to_param_group_map_json)
+    except ValueError:
+        try:
+            with open(param_to_param_group_map_json, "r") as f:
+                param_to_param_group_map = json.load(f)
+        except (ValueError, OSError):
+            raise ValueError(f"Not valid JSON string or JSON file, {param_to_param_group_map_json}")
     convert_checkpoint(
         ckpt_path, output_dir, swiglu, process_group=dist.group.WORLD,
         optimizer_state_prefix=output_optimizer_state_prefix,
