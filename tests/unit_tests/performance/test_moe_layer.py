@@ -23,10 +23,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.config import set_experimental_flag
+from megatron.core.transformer.moe.moe_utils import RandomSTE
 
 
 # NOTE: Performance regression threshold
 DEFAULT_MAX_REGRESSION_RATIO = 1.02
+DEFAULT_MAX_VARIANCE_RATIO = 0.02 # The std/mean should be less than 2%
 WARMUP_ITERS = 5
 MEASURE_ITERS = 20
 
@@ -128,13 +131,13 @@ DEEPSEEK_PROXY = MoEModelConfig(
 
 
 PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
-    # MoEPerformanceCase(
-    #     name="mixtral_a2a_tp1ep8_bf16",
-    #     token_dispatcher="alltoall",
-    #     model=MIXTRAL_PROXY,
-    #     tensor_model_parallel_size=1,
-    #     expert_model_parallel_size=8,
-    # ),
+    MoEPerformanceCase(
+        name="mixtral_a2a_tp1ep8_bf16",
+        token_dispatcher="alltoall",
+        model=MIXTRAL_PROXY,
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=8,
+    ),
     MoEPerformanceCase(
         name="mixtral_deepep_tp1ep8_bf16",
         token_dispatcher="flex",
@@ -151,21 +154,21 @@ PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
     #     tensor_model_parallel_size=1,
     #     expert_model_parallel_size=8,
     # ),
-    # MoEPerformanceCase(
-    #     name="deepseek_a2a_tp1ep8_bf16",
-    #     token_dispatcher="alltoall",
-    #     model=DEEPSEEK_PROXY,
-    #     tensor_model_parallel_size=1,
-    #     expert_model_parallel_size=8,
-    # ),
-    # MoEPerformanceCase(
-    #     name="deepseek_deepep_tp1ep8_bf16",
-    #     token_dispatcher="flex",
-    #     moe_flex_dispatcher_backend="deepep",
-    #     model=DEEPSEEK_PROXY,
-    #     tensor_model_parallel_size=1,
-    #     expert_model_parallel_size=8,
-    # ),
+    MoEPerformanceCase(
+        name="deepseek_a2a_tp1ep8_bf16",
+        token_dispatcher="alltoall",
+        model=DEEPSEEK_PROXY,
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=8,
+    ),
+    MoEPerformanceCase(
+        name="deepseek_deepep_tp1ep8_bf16",
+        token_dispatcher="flex",
+        moe_flex_dispatcher_backend="deepep",
+        model=DEEPSEEK_PROXY,
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=8,
+    ),
     # MoEPerformanceCase(
     #     name="deepseek_hybridep_tp1ep8_bf16",
     #     token_dispatcher="flex",
@@ -280,11 +283,25 @@ def _assert_within_baseline(case_name: str, metrics: Dict[str, float], baselines
     backward_ms = metrics["backward_ms"]
     max_allocated_bytes = metrics.get("max_allocated_bytes")
 
+    forward_std_ms = metrics.get("forward_std_ms")
+    backward_std_ms = metrics.get("backward_std_ms")
+    forward_timings = metrics.get("forward_timings")
+    backward_timings = metrics.get("backward_timings")
+
     assert forward_ms <= fwd_limit, (
         f"Forward pass for {case_name} regressed: {forward_ms:.3f} ms (limit {fwd_limit:.3f} ms)."
     )
     assert backward_ms <= bwd_limit, (
         f"Backward pass for {case_name} regressed: {backward_ms:.3f} ms (limit {bwd_limit:.3f} ms)."
+    )
+
+    assert forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
+        f"Forward pass for {case_name} has high variance: {forward_std_ms:.3f} ms (limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {forward_ms:.3f} ms). \
+        The full timings are {forward_timings}."
+    )
+    assert backward_std_ms / backward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
+        f"Backward pass for {case_name} has high variance: {backward_std_ms:.3f} ms (limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {backward_ms:.3f} ms). \
+        The full timings are {backward_timings}."
     )
     assert max_allocated_bytes is not None and max_allocated_bytes <= mem_limit, (
         "Max allocated memory for "
@@ -293,8 +310,9 @@ def _assert_within_baseline(case_name: str, metrics: Dict[str, float], baselines
     )
 
 
-def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase) -> Dict[str, float]:
+def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
     torch.cuda.synchronize()
+    set_experimental_flag(True)
 
     forward_timings = []
     backward_timings = []
@@ -308,8 +326,8 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase) -> Dict[str,
         gc.disable()
         gc.collect()
 
-    # Note: Using the same input tensor for all iterations to prevent different routing results,
-    # which may leads to different kernel and library load/compile overhead.
+    # NOTE: Using the same input tensor for all iterations to prevent different routing results,
+    # which may lead to different kernels and library load/compile overhead.
     input_tensor = torch.randn(
         model.seq_length,
         model.micro_batch_size,
@@ -320,6 +338,8 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase) -> Dict[str,
     )
     input_tensor.requires_grad_(True)
     for iteration in range(WARMUP_ITERS + MEASURE_ITERS):
+        if RandomSTE.generator is not None:
+            RandomSTE.generator.manual_seed(RandomSTE.generator.initial_seed())
         torch.distributed.barrier()
         torch.cuda.nvtx.range_push(f"({case.name}) iteration {iteration}")
         # Use a long CUDA kernel to hide the router launch overhead
@@ -346,6 +366,7 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase) -> Dict[str,
         bwd_end.record()
 
         torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
 
         if iteration >= WARMUP_ITERS:
             forward_timings.append(fwd_start.elapsed_time(fwd_end))
@@ -367,6 +388,8 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase) -> Dict[str,
         "forward_std_ms": statistics.pstdev(forward_timings) if len(forward_timings) > 1 else 0.0,
         "backward_std_ms": statistics.pstdev(backward_timings) if len(backward_timings) > 1 else 0.0,
         "max_allocated_bytes": max_allocated_bytes,
+        "forward_timings": forward_timings,
+        "backward_timings": backward_timings,
     }
 
 
@@ -387,7 +410,7 @@ def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking")
 @pytest.mark.parametrize("perf_case", PERFORMANCE_CASES, ids=lambda c: c.name)
-def test_moe_layer_performance(perf_case: MoEPerformanceCase, profile: bool = False):
+def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool = False):
     if not perf_case.is_current_platform():
         pytest.skip(
             "GPU platform mismatch: "
@@ -425,7 +448,7 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, profile: bool = Fa
         baseline_failure_message = ""
 
         # Only rank 0 checks the baseline
-        if Utils.rank == 0 and not profile:
+        if Utils.rank == 0 and not debug_mode:
             baselines = _load_baselines()
             if os.getenv(UPDATE_BASELINES_ENV) == "1":
                 _maybe_update_baseline(perf_case, metrics, baselines)
@@ -446,15 +469,12 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, profile: bool = Fa
         )
         baseline_failed = bool(failure_tensor.item())
 
-        if baseline_failed and Utils.rank != 0:
-            baseline_failure_message = "Baseline regression detected on rank 0."
-
         if baseline_failed:
-            pytest.fail(
-                baseline_failure_message
-                if baseline_failure_message
-                else "Baseline regression detected."
-            )
+            if Utils.rank != 0:
+                baseline_failure_message = "Baseline regression detected on rank 0."
+                pytest.fail(baseline_failure_message, pytrace=False)
+            else:
+                pytest.fail(baseline_failure_message, pytrace=True)
 
     finally:
         Utils.destroy_model_parallel()
@@ -474,6 +494,6 @@ if __name__ == "__main__":
     torch.cuda.cudart().cudaProfilerStart()
     torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
     for case in PERFORMANCE_CASES:
-        test_moe_layer_performance(case, profile=True)
+        test_moe_layer_performance(case, debug_mode=True)
     torch.cuda.cudart().cudaProfilerStop()
     torch.distributed.destroy_process_group()
