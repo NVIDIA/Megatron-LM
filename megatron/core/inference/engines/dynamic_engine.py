@@ -396,11 +396,11 @@ class DynamicInferenceEngine(AbstractEngine):
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
             self.model_parallel_publisher_socket = self.zmq_context.socket(zmq.PUB)
-            self.model_parallel_publisher_socket.bind(f"tpc://*:{req_port}")
+            self.model_parallel_publisher_socket.bind(f"tcp://*:{req_port}")
 
             # 3. Create another publisher socket to broadcast the number of messages to receive.
             self.model_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.PUB)
-            self.model_parallel_num_msgs_publisher_socket.bind(f"tpc://*:{req_port}")
+            self.model_parallel_num_msgs_publisher_socket.bind(f"tcp://*:{req_port}")
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
                 self.model_parallel_num_msgs_publisher_socket,
