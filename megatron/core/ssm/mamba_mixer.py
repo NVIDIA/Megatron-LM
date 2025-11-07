@@ -329,6 +329,7 @@ class MambaMixer(MegatronModule):
             self.A_log = nn.Parameter(A_log)
             self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
+
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
