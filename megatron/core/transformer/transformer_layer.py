@@ -931,6 +931,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if self.config.overlap_moe_expert_parallel_comm:
                 assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
                 mlp_residual = cuda_graph_output.pop()
+                if not self.is_moe_layer:
+                    return mlp_residual, None, None, None
                 hidden_states = self.pre_mlp_layernorm(mlp_residual)
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
