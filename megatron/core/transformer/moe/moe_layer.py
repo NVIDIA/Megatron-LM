@@ -183,11 +183,11 @@ class MoELayer(BaseMoELayer):
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
-        
+
         Args:
             hidden_states (torch.Tensor): Input tensor.
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [seq_length, bsz]. True for valid tokens,
+                                                   Shape = [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
         """
         probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
@@ -286,9 +286,9 @@ class MoELayer(BaseMoELayer):
         4. Combine: The outputs from the experts are combined and returned.
 
         Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer. 
+            hidden_states (torch.Tensor): The input tensor to the MoE layer.
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [seq_length, bsz]. True for valid tokens,
+                                                   Shape = [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
 
         Returns:
@@ -330,7 +330,9 @@ class MoELayer(BaseMoELayer):
                     padding_mask,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, padding_mask)
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward, False, hidden_states, padding_mask
+                )
         else:
             outputs = custom_forward(hidden_states, padding_mask)
 
