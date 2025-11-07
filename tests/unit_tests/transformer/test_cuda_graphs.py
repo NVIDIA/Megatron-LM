@@ -1,11 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 import os
 import random
 import sys
 import time
 import types
-import gc
 
 import pytest
 import torch

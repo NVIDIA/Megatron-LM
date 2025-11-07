@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import gc
 import os
 import sys
-import gc
 
 import pytest
 import torch
