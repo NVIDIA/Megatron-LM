@@ -194,8 +194,7 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 prompts = ["sample" * (i + 1) for i in range(batch_size)]
             results: List[Union[InferenceRequest, DynamicInferenceRequestRecord]] = (
                 self.static_engine.generate(
-                    prompts,
-                    sampling_params=SamplingParams(num_tokens_to_generate=10),
+                    prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
                 )
             )
 
