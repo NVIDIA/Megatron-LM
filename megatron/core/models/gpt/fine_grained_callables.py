@@ -336,9 +336,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         def __init__(self):
             self.graphed_backward_dw_callable = None
             self.attn_dw_callable = layer.self_attention.backward_dw
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
+            if isinstance(layer.mlp, MoELayer):
+                self.shared_expert_dw_callable = partial(
+                    layer.mlp.backward_dw, routed_experts=False, shared_experts=True
+                )
+            else:
+                self.shared_expert_dw_callable = None
             self.cuda_graph_scope = layer.config.cuda_graph_scope
 
         def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
@@ -348,7 +351,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         def backward_dw(self):
             """Execute weight gradients, skipping CUDA graphed components during replay."""
             is_replay = hasattr(layer, 'cuda_graphs') and layer.cuda_graphs
-            if not is_replay or "moe_router" not in self.cuda_graph_scope:
+            if self.shared_expert_dw_callable is not None and \
+                (not is_replay or "moe_router" not in self.cuda_graph_scope):
                 self.shared_expert_dw_callable()
             if not is_replay or "attn" not in self.cuda_graph_scope:
                 self.attn_dw_callable()
@@ -398,6 +402,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                 )
+                if not isinstance(layer.mlp, MoELayer):
+                    return hidden_states, None, None, None
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
                     pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
@@ -422,6 +428,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
+        if not isinstance(layer.mlp, MoELayer):
+            return hidden_states
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
