@@ -43,36 +43,101 @@ class LinearCrossEntropy(torch.autograd.Function):
         tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
         reduction: typing.Optional[str] = "mean",
         ignore_index: typing.Optional[int] = -100,
+        sequence_parallel: typing.Optional[bool] = False,
     ) -> torch.Tensor:
         """
         The forward pass of the Linear Cross Entropy.
-        If tp_group is not None, the weight tensor to each TP rank should be (vocab_size // world_size, dim).
+        If tp_group is not None, the weight tensor to each TP rank should be (global_vocab_size // world_size, dim).
         Note that each of the ranks should get equal shards along the vocab_size dimension.
 
         Args:
             @param hidden: the input tensor with shape (num_tokens, dim)
-            @param weight: the lm_head weight tensor with shape (vocab_size, dim)
+            @param weight: the lm_head weight tensor with shape (local_vocab_size, dim)
             @param labels: the labels tensor with shape (num_tokens,)
             @param tp_group: the distributed process group for TP.
             @param reduction: Default to "mean", and can be one of "none", "sum", "mean".
             @param ignore_index: The index to ignore. Default to -100.
+            @param sequence_parallel: Whether to use sequence parallel. Default to False.
         Returns:
             @return: logprobs with shape
                 - either (num_tokens,) when reduction is "none"
                 - or (1,) when reduction is "mean" or "sum"
 
+        tp_group is None ----------------------------------> DP
+                B
+            A   C
+        tp_group is not None & sequence_parallel is False -> TP
+                B0  B1
+            A   C0  C1
+        tp_group is not None & sequence_parallel is True --> SP
+                B0  B1
+            A0  C0  XX
+            A1  XX  C1
+
+        When tp_group is not None, the weight tensor will be split along the vocab_size dimension, 
+        which means each rank will get equal shards along the global_vocab_size dimension.
+        Specifically, the weight tensor to each rank will be (local_vocab_size, dim). 
+        And there is an assumption that each rank will get the same local_vocab_size.
+
+        When sequence_parallel is True, the hidden tensor will be split along the sequence length dimension,
+        which means each rank will get equal shards along the sequence length dimension.
+        Specifically, the hidden tensor to each rank will be (local_num_tokens, dim).
+        And there is an assumption that each rank will get the same local_num_tokens.
+
+        In TP forward pass, the hidden tensor and label tensor shall be identical among all TP ranks,
+        and it's user's responsibility to ensure the hidden tensor is identical among all TP ranks.
+        Then this operation will produce identical logprobs among all TP ranks.
+
+        In TP backward pass, the gradient of the logprobs shall be identical among all TP ranks,
+        and it's user's responsibility to ensure the gradient of the logprobs is identical among all TP ranks.
+        Then this operation will produce distinct gradients for the local weight tensor,
+        and identical gradients for the hidden tensor. 
+
+        ```python
+        # ------------ forward pass ------------ #
+        hidden = tp_group.broadcast(hidden, src=0) # handled by framework
+        labels = tp_group.broadcast(labels, src=0) # handled by framework
+        logprobs = linear_cross_entropy(...)
+        # each rank will get the same logprobs
+
+        # ------------ backward pass ------------ #
+        g_logprobs = tp_group.broadcast(g_logprobs, src=0) # handled by framework
+        d_hidden, d_weight = torch.autograd.grad(...)
+        # each rank will get the same d_hidden, 
+        # and distinct d_weight for local weight shard
+        ```
+
+        In SP forward pass, the hidden tensor shall be split along the sequence length dimension, 
+        and the label tensor shall be identical among all TP ranks.
+        Then this operation will produce identical logprobs among all TP ranks.
+
+        In SP backward pass, the gradient of the logprobs shall be identical among all TP ranks,
+        Then this operation will produce distinct gradients for the local hidden tensor and weight tensor.
+        ```python
+        # ------------ forward pass ------------ #
+        hidden = global_hidden[tp_rank] # handled by framework
+        labels = tp_group.broadcast(labels, src=0) # handled by framework
+        logprobs = linear_cross_entropy(...)
+        # each rank will get the same logprobs
+
+        # ------------ backward pass ------------ #
+        g_logprobs = tp_group.broadcast(g_logprobs, src=0) # handled by framework
+        d_hidden, d_weight = torch.autograd.grad(...)
+        # each rank will get distinct local d_hidden and d_weight
+        ```
         """
         with torch.cuda.nvtx.range("LinearCrossEntropy-forward"):
-            logprobs, _maximum, _acc, _num_valid_tokens, tp_rank, tp_world_size = (
+            logprobs, _maximum, _acc, _num_valid_tokens, tp_rank, tp_world_size, global_hidden = (
                 forward_func(
                     hidden, weight, labels,
                     tp_group, 
                     reduction,
                     ignore_index,
+                    sequence_parallel,
                 )
             )
             ctx.save_for_backward(
-                hidden, weight, labels,
+                global_hidden, weight, labels,
                 _maximum, _acc, _num_valid_tokens,
             )
             ctx.tp_group = tp_group
@@ -80,6 +145,7 @@ class LinearCrossEntropy(torch.autograd.Function):
             ctx.reduction = reduction
             ctx.tp_rank = tp_rank
             ctx.tp_world_size = tp_world_size
+            ctx.sequence_parallel = sequence_parallel
 
         return logprobs
             
@@ -100,17 +166,18 @@ class LinearCrossEntropy(torch.autograd.Function):
             dweight (torch.Tensor): The gradient of the weight.
         """
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
-            (hidden, weight, labels, _maximum, _accu, _num_valid_tokens) = ctx.saved_tensors
+            (global_hidden, weight, labels, _maximum, _accu, _num_valid_tokens) = ctx.saved_tensors
 
             tp_group = ctx.tp_group
             ignore_index = ctx.ignore_index
             reduction = ctx.reduction
             tp_rank = ctx.tp_rank
             tp_world_size = ctx.tp_world_size
+            sequence_parallel = ctx.sequence_parallel
 
             d_hidden, d_weight = backward_func(
                 dlogprobs,
-                hidden,
+                global_hidden,
                 weight,
                 labels,
                 _maximum,
@@ -120,10 +187,11 @@ class LinearCrossEntropy(torch.autograd.Function):
                 ignore_index,
                 tp_group,
                 tp_rank,
-                tp_world_size
+                tp_world_size,
+                sequence_parallel,
             )
 
-        return d_hidden, d_weight, None, None, None, None
+        return d_hidden, d_weight, None, None, None, None, None
 
 
 def linear_cross_entropy(
@@ -133,12 +201,13 @@ def linear_cross_entropy(
     tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
     reduction: typing.Optional[str] = "mean",
     ignore_index: typing.Optional[int] = -100,
+    sequence_parallel: typing.Optional[bool] = False,
 ) -> torch.Tensor:
     """
     helper function for linear cross entropy.
     """
     _impl = LinearCrossEntropy.apply
-    return _impl(hidden, weight, labels, tp_group, reduction, ignore_index)
+    return _impl(hidden, weight, labels, tp_group, reduction, ignore_index, sequence_parallel)
 
 __all__ = [
     "linear_cross_entropy",
