@@ -215,6 +215,7 @@ def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_groupe
         multi_latent_attention=True,
         num_moe_experts=num_moe_experts,
         moe_grouped_gemm=moe_grouped_gemm,
+        cuda_graph_scope=[],
         **extra_kwargs,
     )
     return config
