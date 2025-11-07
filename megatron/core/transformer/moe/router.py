@@ -342,11 +342,12 @@ class TopKRouter(Router):
             num_experts=self.config.num_moe_experts,
         )
 
-        total_num_tokens = num_tokens * self.tp_cp_group.size()
-
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_cp_group
         )
+        # For seq_aux_loss, total_num_tokens should be seq_length (per sequence),
+        # not seq_length * batch_size
+        total_num_tokens = seq_length * self.tp_cp_group.size()
 
         aux_loss = (
             switch_load_balancing_loss_func(
