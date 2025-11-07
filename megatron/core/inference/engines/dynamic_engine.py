@@ -480,8 +480,18 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.sampling_params is None:
                 self.sampling_params = request.sampling_params
             else:
+                self_core_params = (
+                    self.sampling_params.temperature,
+                    self.sampling_params.top_k,
+                    self.sampling_params.top_p,
+                )
+                new_core_params = (
+                    request.sampling_params.temperature,
+                    request.sampling_params.top_k,
+                    request.sampling_params.top_p,
+                )
                 assert (
-                    self.sampling_params.core_params == request.sampling_params.core_params
+                    self_core_params == new_core_params
                 ), "All requests must have the same core sampling parameters for static_sampling."
 
         if request.status != Status.FAILED:

@@ -1170,7 +1170,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
-        # Handle request metadata. TODO @TDE: see if we can build this using the metadata labels.
+        # Handle request metadata.
         metadata = req.tracked_metadata
         assert len(metadata) == self.num_request_metadata
         self.request_metadata[current_id] = torch.tensor(

@@ -288,6 +288,13 @@ class DynamicInferenceRequest(InferenceRequest):
         inherently assumed to remain immutable once the request becomes active.
         """
         sp = self.sampling_params
+        if sp.termination_id is None:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    f"DynamicInferenceRequest {self.request_id} has no termination_id set "
+                    "in its sampling_params. Defaulting to -1."
+                )
+            sp.termination_id = -1
         return [
             sp.temperature,
             sp.top_k,

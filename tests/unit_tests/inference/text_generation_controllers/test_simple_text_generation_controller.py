@@ -259,9 +259,7 @@ class TestTextGenerationController:
         request_metadata = torch.empty(
             (batch_size, len(request_metadata_labels)), dtype=torch.float32
         ).cuda()
-        top_k_values = torch.Tensor(
-            [s.top_k if s.top_k != 0 else self.vocab_size for s in rev_sampling_dict]
-        ).cuda()
+        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).cuda()
         request_metadata[:, request_metadata_labels["top_k"]] = top_k_values
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict]).cuda()
         request_metadata[:, request_metadata_labels["top_p"]] = top_p_values
@@ -280,6 +278,7 @@ class TestTextGenerationController:
         )
         vocab_indices = torch.arange(self.vocab_size).cuda()
 
+        top_k_values[top_k_values == 0] = self.vocab_size
         assert torch.all(
             sampled_logits >= self.vocab_size - top_k_values
         ), f"The sampled logits should all be greater than {self.vocab_size - top_k_values} but its {sampled_logits}"

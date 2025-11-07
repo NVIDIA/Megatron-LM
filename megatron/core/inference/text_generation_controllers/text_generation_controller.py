@@ -23,7 +23,11 @@ from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
     WarmupEngineMode,
 )
-from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    InferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
@@ -574,13 +578,13 @@ class TextGenerationController:
         assert backend in ["torch"]
         context = self.inference_wrapped_model.inference_context
 
-        active_request_count = context.total_request_count - context.paused_request_count
         if request_metadata is None:
             request_metadata = context.request_metadata[
                 context.paused_request_count : context.total_request_count, :
             ]
         if request_metadata_labels is None:
             request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
+        active_request_count = request_metadata.size(0)
 
         temp = request_metadata[:, request_metadata_labels["temperature"]]
         top_k = request_metadata[:, request_metadata_labels["top_k"]]
@@ -633,8 +637,6 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
-        active_request_count = context.total_request_count - context.paused_request_count
-
         # Last token logits.
         if materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
@@ -642,9 +644,9 @@ class TextGenerationController:
             last_token_logits = logits.squeeze(0)
         else:
             last_token_logits = context.last_token_logits(logits)
-        assert active_request_count == last_token_logits.size(0)
+        active_request_count = last_token_logits.size(0)
 
-        self.cu_sampling_logits[:active_request_count].copy_(last_token_logits)
+        self.cu_sampling_logits[:active_request_count].copy_(last_token_logits, non_blocking=True)
         # Get sampling parameters via vectorized operation instead of loop.
         group_reps = torch.stack([indices[0] for indices in self.torch_sampling_groups], dim=0)
         if backend == "torch":
@@ -654,16 +656,16 @@ class TextGenerationController:
                 token_list.append(
                     self._torch_sampling_func(
                         self.cu_sampling_logits[indices, :],
-                        self.cu_temperature[group_reps[i]],
-                        self.cu_top_k[group_reps[i]],
-                        self.cu_top_p[group_reps[i]],
+                        self.cu_temperature[group_reps[i]].item(),
+                        self.cu_top_k[group_reps[i]].item(),
+                        self.cu_top_p[group_reps[i]].item(),
                     )
                 )
             # Single write to the output tensor.
-            sampled_tokens = torch.cat(logits_list, dim=0).to(dtype=torch.int64, non_blocking=True)
+            sampled_tokens = torch.cat(token_list, dim=0)
             sampled_indices = torch.cat(self.torch_sampling_groups, dim=0)
             self.cu_sampled_tokens.index_copy_(0, sampled_indices, sampled_tokens)
-        return self.cu_sampled_tokens[:active_request_count]
+        return self.cu_sampled_tokens[:active_request_count].clone()
 
     def _dynamic_step_log_probs_bookkeeping(self) -> bool:
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
@@ -675,8 +677,8 @@ class TextGenerationController:
         to_check = self.cu_return_log_probs[:active_request_count]
         to_check &= ~self.cu_skip_prompt_log_probs[:active_request_count]
 
-        assert (
-            not to_check.all() or materialize_only_last_token_logits
+        assert not (
+            to_check.any() and materialize_only_last_token_logits
         ), "Prompt log probs cannot be calculated if only last token logits are materialized."
 
         return self.cu_return_log_probs[:active_request_count].any()
@@ -686,7 +688,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
-        active_request_count = context.total_request_count - context.paused_request_count
+        if materialize_only_last_token_logits:
+            active_request_count = context.total_request_count - context.paused_request_count
+        else:
+            active_request_count = logits.size(0)
 
         return context.calculate_log_probs(
             logits,
@@ -694,7 +699,7 @@ class TextGenerationController:
             only_last_token_logits=materialize_only_last_token_logits,
         )
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Return:
@@ -727,10 +732,7 @@ class TextGenerationController:
         finished_request_ids = context.request_ids[finished_idxs]
 
         # New sample gets updated in update_requests, so we pass in a clone
-        new_sample_copy = torch.empty(
-            active_request_count, dtype=torch.int32, device=self.cu_sampled_tokens.device
-        )
-        new_sample_copy.copy_(self.cu_sampled_tokens[:active_request_count])
+        new_sample_copy = new_sample
 
         # Update requests.
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
@@ -798,7 +800,7 @@ class TextGenerationController:
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
-            request_bookkeeping = self._dynamic_step_context_bookkeeping()
+            request_bookkeeping = self._dynamic_step_context_bookkeeping(new_sample)
 
         ret = {
             "sample": new_sample,
