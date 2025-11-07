@@ -628,6 +628,12 @@ def pretrain(
     print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
     print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
 
+    # Log rank to physical node assignment.
+    if torch.distributed.get_rank() % torch.cuda.device_count() == 0:
+        min_rank = torch.distributed.get_rank()
+        max_rank = min_rank + (torch.cuda.device_count() - 1)
+        print(f"Ranks {list(range(min_rank, max_rank+1))} -> {os.uname()[1]}")
+
     args = get_args()
     timers = get_timers()
 
