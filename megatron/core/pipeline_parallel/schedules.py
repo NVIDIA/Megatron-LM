@@ -673,7 +673,7 @@ def forward_backward_no_pipelining(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and "full_iteration" not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 
@@ -1940,7 +1940,7 @@ def forward_backward_pipelining_with_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and "full_iteration" not in config.cuda_graph_scope
     ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
@@ -2327,7 +2327,7 @@ def forward_backward_pipelining_without_interleaving(
     if (
         hasattr(config, 'cuda_graph_impl')
         and config.cuda_graph_impl == "local"
-        and config.cuda_graph_scope != "full_iteration"
+        and "full_iteration" not in config.cuda_graph_scope
     ):
         create_cudagraphs()
 

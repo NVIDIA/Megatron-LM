@@ -48,7 +48,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_$CLUSTER.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -106,14 +106,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  # TODO: The migration of custom fsdp causes EP + FSDP to be temporarily unavailable, which will be fixed in a subsequent MR.
-  # - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #       platforms: [dgx_h100]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective]
     products:
       - environment: [dev]
@@ -130,6 +127,11 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_fine_grained_offloading]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
     products:
       - environment: [dev]
         scope: [mr]
