@@ -70,7 +70,6 @@ def _pad_routing_map_kernel(
     tl.store(output_row_ptr + token_indices, output_row, mask=token_mask)
 
 
-@experimental_fn(introduced_with_version="0.13.0")
 @jit_fuser
 def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
     """Fused version of pad_routing_map.

@@ -324,7 +324,6 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
         return grad, None, None, None, None, None, None, None, None
 
 
-@experimental_fn(introduced_with_version="0.13.0")
 def fused_apply_mla_rope_for_q(
     t: torch.Tensor,
     cos: torch.Tensor,
@@ -733,7 +732,6 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         return d_kv, d_emb, None, None, None, None, None, None, None, None, None
 
 
-@experimental_fn(introduced_with_version="0.13.0")
 def fused_apply_mla_rope_for_kv(
     kv: torch.Tensor,
     k_pos_emb: torch.Tensor,
