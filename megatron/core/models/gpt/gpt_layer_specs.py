@@ -571,3 +571,4 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_block_spec = None
 
     return mtp_block_spec
+
