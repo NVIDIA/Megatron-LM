@@ -858,8 +858,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()
 
-        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
-            self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
+        if (
+            not self.config.cuda_graph_scope
+            or (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope)
+            or (self.is_moe_layer and 'moe' in self.config.cuda_graph_scope)
         ):
             # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
