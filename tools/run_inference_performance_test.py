@@ -1,81 +1,59 @@
-import os
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
+import os
 import random
-import torch
 import sys
 import time
-import tqdm
-import warnings
-from model_provider import model_provider
+
+import torch
+
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
-from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
+from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_attr_wrapped_model
+from model_provider import model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from megatron.training import get_args
-from megatron.training import get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
-from megatron.core import mpu
-from megatron.training.initialize import initialize_megatron
-from megatron.training import get_model, get_tokenizer
 import asyncio
 from functools import partial
-from typing import AsyncIterator, List, Union
+from typing import List, Union
+
+from examples.inference.gpt.utils import add_common_inference_args
+from megatron.core import mpu
+from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
 
 
-def add_text_generate_args(parser):
-    """Text generation arguments."""
-    group = parser.add_argument_group(title='text generation')
+def add_inference_benchmarking_args(parser):
+    """Inference benchmarking arguments."""
+    parser = add_common_inference_args(parser)
 
-    group.add_argument("--temperature", type=float, default=1.0, help='Sampling temperature.')
-    group.add_argument("--top_k", type=int, default=1, help='Top k sampling.')
-    group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
+    group = parser.add_argument_group(title='inference_benchmarking')
+
     group.add_argument(
-        "--return-log-probs",
-        action='store_true',
-        default=False,
-        help='Return the log probabilities of the final output tokens',
-    )
-    group.add_argument("--top-n-logprobs", type=int, default=0, help="Top-N logprobs")
-    group.add_argument(
-        "--num-tokens-to-generate",
-        type=int,
-        default=30,
-        help='Number of tokens to generate for each prompt',
-    )
-    group.add_argument(
-        "--prompts",
-        metavar='N',
-        type=str,
-        default=None,
-        nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
-    )
-    group.add_argument(
-        "--num-input-tokens", type=int, default=None, help='Number of input tokens per prompt'
-    )
-    group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
-    group.add_argument(
-        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+        "--num-input-tokens", type=int, default=128, help="Number of input tokens per request"
     )
     group.add_argument(
         "--engine-type", choices=["static", "dynamic"], default="static", help="Engine type"
@@ -83,13 +61,12 @@ def add_text_generate_args(parser):
     group.add_argument(
         "--benchmark-profile", action="store_true", default=False, help="If set, profile"
     )
+    group.add_argument('--stream', action="store_true", default=False, help="If set, stream tokens")
     return parser
 
 
 def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> AbstractEngine:
     """Utility to get the relevant backend for running inference
-
-    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -109,8 +86,17 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
+        moe_pad_experts_for_cuda_graph_inference=args.moe_pad_experts_for_cuda_graph_inference,
     )
+
+    # Layer type list for hybrid models
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+    else:
+        mamba_conv_states_shape = None
+        mamba_ssm_states_shape = None
 
     if args.engine_type == "static":
         inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
@@ -130,12 +116,28 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
                 args.num_query_groups if args.group_query_attention else args.num_attention_heads
             ),
             max_sequence_length=args.inference_max_seq_length,
+            num_cuda_graphs=(
+                args.inference_dynamic_batching_num_cuda_graphs
+                if args.cuda_graph_impl == "local"
+                else None
+            ),
             buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
             buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
             buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
             max_requests_override=args.inference_dynamic_batching_max_requests_override,
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
             block_size_tokens=args.inference_dynamic_batching_block_size,
+            tensor_model_parallel_size=args.tensor_model_parallel_size,
+            materialize_only_last_token_logits=not args.return_log_probs,
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
+            kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
+            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+            use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
+            use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
+            unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             model, inference_wrapper_config, inference_context=context
@@ -233,7 +235,6 @@ def generate_dynamic(
     args: argparse.Namespace,
     inference_requests: List[InferenceRequest],
     inference_engine: DynamicInferenceEngine,
-    sampling_params: SamplingParams,
 ):
     global REQUEST_ID
     for request in inference_requests:
@@ -241,13 +242,13 @@ def generate_dynamic(
         REQUEST_ID += 1
         prompt_tokens = request.prompt_tokens
         inference_engine.add_request(
-            request_id, prompt_tokens, num_tokens_to_generate=args.num_tokens_to_generate
+            request_id, prompt_tokens, request.inference_parameters,
         )
 
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step(sampling_params, verbose=False)
+        result = inference_engine.step(verbose=False)
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -268,7 +269,7 @@ def main():
     # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
     initialize_megatron(
-        extra_args_provider=add_text_generate_args,
+        extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
             'no_load_rng': True,
             'no_load_optim': True,
@@ -284,6 +285,8 @@ def main():
         model_builder = gpt_builder
     elif args.model_provider == "mamba":
         model_builder = mamba_builder
+    else:
+        raise ValueError(f"Invalid model provider {args.model_provider}")
 
     model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
     tokenizer = get_tokenizer()
@@ -337,10 +340,7 @@ def main():
         print(f"Running warmup for CUDA graphs...")
         warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
         warmup_sampling_params.add_attributes({"no_early_termination": True})
-        if args.engine_type == "static":
-            inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
-        elif args.engine_type == "dynamic":
-            generate_dynamic(args, requests, inference_engine, sampling_params)
+        inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
 
     if args.benchmark_profile:
         torch.cuda.cudart().cudaProfilerStart()
@@ -361,7 +361,7 @@ def main():
             )
         elif args.engine_type == "dynamic":
             results: List[InferenceRequest] = generate_dynamic(
-                args, requests, inference_engine, sampling_params
+                args, requests, inference_engine,
             )
     end_time = time.perf_counter()
     latency = end_time - start_time

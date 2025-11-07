@@ -15,12 +15,13 @@ from examples.inference.gpt.gpt_dynamic_inference import (
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.text_generation_server import run_text_generation_server
+from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
 
-
 def add_text_generation_server_args(parser: argparse.ArgumentParser):
     """Adds the required command line arguments for running the text generation server."""
+    parser = add_modelopt_args(parser)
     parser = add_dynamic_inference_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     return parser

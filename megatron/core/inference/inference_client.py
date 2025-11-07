@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import logging
@@ -124,7 +124,7 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
-                completed_request = DynamicInferenceRequest(**reply)
+                completed_request = DynamicInferenceRequest.deserialize(reply)
                 completion_future.get_loop().call_soon_threadsafe(
                     completion_future.set_result, completed_request
                 )
