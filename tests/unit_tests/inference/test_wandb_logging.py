@@ -48,9 +48,8 @@ class TestInferenceWandbLogging:
         kv_channels=8,
         num_attention_heads=2,
         max_sequence_length=512,
-        buffer_size_gb=0.03,
+        active_buffer_size_gb=0.03,
         block_size_tokens=128,
-        buffer_guaranteed_fraction=0.1,
         metrics_writer=None,
     ):
         """Helper to create a DynamicInferenceContext."""
@@ -61,8 +60,7 @@ class TestInferenceWandbLogging:
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
-            buffer_size_gb=buffer_size_gb,
-            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            active_buffer_size_gb=active_buffer_size_gb,
             block_size_tokens=block_size_tokens,
             metrics_writer=metrics_writer,
         )
@@ -83,12 +81,11 @@ class TestInferenceWandbLogging:
         assert 'active_utilization' in stats
         assert 'active_request_count' in stats
         assert 'paused_request_count' in stats
-        assert 'gtd_block_count' in stats
         assert 'block_count_avail' in stats
-        assert 'num_non_gtd_blocks' in stats
         assert 'active_token_count' in stats
         assert 'total_request_count' in stats
-        assert 'max_requests' in stats
+        assert 'max_total_requests' in stats
+        assert 'max_active_requests' in stats
 
         # Verify values for empty context
         assert stats['allocated_blocks'] == 0
@@ -134,12 +131,11 @@ class TestInferenceWandbLogging:
         assert stats_after['total_blocks'] == stats['total_blocks']
         assert stats_after['total_blocks'] > 0
 
-        # Verify that gtd_block_count remains constant
-        assert stats_after['gtd_block_count'] == stats['gtd_block_count']
-
         # Verify that max_requests remains constant
-        assert stats_after['max_requests'] == stats['max_requests']
-        assert stats_after['max_requests'] > 0
+        assert stats_after['max_total_requests'] == stats['max_total_requests']
+        assert stats_after['max_total_requests'] > 0
+        assert stats_after['max_active_requests'] == stats['max_active_requests']
+        assert stats_after['max_active_requests'] > 0
 
         # Verify block availability decreased after allocation
         assert stats_after['block_count_avail'] < stats['block_count_avail']
@@ -147,7 +143,7 @@ class TestInferenceWandbLogging:
         # Verify relationship: allocated_blocks + block_count_avail + 1 (dummy) = total
         assert (
             stats_after['allocated_blocks'] + stats_after['block_count_avail'] + 1
-            == dynamic_context.block_allocator.block_count_total
+            == dynamic_context.block_allocator.total_count
         )
 
         # Verify utilization bounds [0, 1]
@@ -180,12 +176,11 @@ class TestInferenceWandbLogging:
             'active_unique_blocks',
             'active_request_count',
             'paused_request_count',
-            'gtd_block_count',
             'block_count_avail',
-            'num_non_gtd_blocks',
             'active_token_count',
             'total_request_count',
-            'max_requests',
+            'max_total_requests',
+            'max_active_requests',
         ]
 
         for field in int_fields:
@@ -239,8 +234,7 @@ class TestInferenceWandbLogging:
             num_attention_heads=8,
             max_sequence_length=128,
             num_cuda_graphs=None,
-            buffer_size_gb=0.01,  # Small buffer to force pausing
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=0.01,  # Small buffer to force pausing
             block_size_tokens=32,
         )
 

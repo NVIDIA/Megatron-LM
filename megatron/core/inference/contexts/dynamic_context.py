@@ -1581,11 +1581,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             }
         """
         # Total usable blocks exclude the reserved dummy block.
-        total_blocks = max(self.block_allocator.block_count_total - 1, 1)
-        block_count_avail = int(self.block_allocator.block_count_avail)
+        total_blocks = max(self.block_allocator.total_count - 1, 1)
+        block_count_avail = int(self.block_allocator.total_avail)
 
         # Overall allocated blocks in the buffer right now.
-        allocated_blocks = (self.block_allocator.block_count_total - 1) - block_count_avail
+        allocated_blocks = (self.block_allocator.total_count - 1) - block_count_avail
         allocated_blocks = int(max(0, allocated_blocks))
 
         # Active unique blocks referenced by current active requests only.
@@ -1607,7 +1607,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_utilization = float(active_unique_blocks) / float(total_blocks)
 
         # Diagnostic helpers
-        num_non_gtd_blocks = max(0, block_count_avail - int(self.gtd_block_count))
         total_request_count = int(self.total_request_count)
         return {
             'total_blocks': int(total_blocks),
@@ -1617,10 +1616,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             'active_utilization': active_utilization,
             'active_request_count': int(self.get_active_request_count()),
             'paused_request_count': int(self.paused_request_count),
-            'gtd_block_count': int(self.gtd_block_count),
             'block_count_avail': int(block_count_avail),
-            'num_non_gtd_blocks': int(num_non_gtd_blocks),
             'active_token_count': int(self.active_token_count),
             'total_request_count': int(total_request_count),
-            'max_requests': int(self.max_requests),
+            'max_total_requests': int(self.max_total_requests),
+            'max_active_requests': int(self.max_active_requests),
         }
