@@ -30,13 +30,11 @@ class BwdPartialDlogits:
                  acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
                  use_2cta_instrs: bool = False,
                  mma_tiler_mn: Tuple[int, int] = (128, 256),
-                 rank: int = 0,
                  vocab_per_split: int = 512):
         self.REDUCTION: cutlass.Constexpr[cutlass.Int32] = cutlass.const_expr(reduction)
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.rank = rank
         self.vocab_per_split = vocab_per_split
 
         self.cta_group = (
@@ -150,6 +148,7 @@ class BwdPartialDlogits:
         b_smem_layout_staged: cute.ComposedLayout,
         cluster_layout_vmnk: cute.Layout,
         problem_mnk: Tuple[int, int, int],
+        rank: cutlass.Int32,
     ) -> None:
         warp_idx = cute.arch.make_warp_uniform(
             cute.arch.warp_idx()
@@ -623,7 +622,7 @@ class BwdPartialDlogits:
                     tTMEM_load_rAcc[idx] = cute.exp(tTMEM_load_rAcc[idx] - tMrMaximum[0])
 
                     position: cutlass.Int64 = (
-                        self.rank * problem_mnk[1]
+                        rank * problem_mnk[1]
                         + split_idx * self.vocab_per_split
                         + pidn * self.epi_tile[1]
                         + n_subtile * cute.size(tTMEM_load_rAcc, mode=[0])
@@ -675,6 +674,7 @@ class BwdPartialDlogits:
         dlogits_partial: cute.Tensor,
         scalarNumValidTokens: cute.Pointer,
         ignore_index: cutlass.Int64,
+        rank: cutlass.Int32,
         stream: cuda.CUstream,
     ) -> None:
         a_dtype: Type[cutlass.Numeric] = hidden.element_type
@@ -801,6 +801,7 @@ class BwdPartialDlogits:
             b_smem_layout_staged,
             self.cluster_layout_vmnk,
             problem_mnk,
+            rank,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -884,6 +885,8 @@ if __name__ == "__main__":
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    rank = 0
+
     compiled = cute.compile(
         bwd_kernel,
         split_idx,
@@ -896,6 +899,7 @@ if __name__ == "__main__":
         dlogits_partial_packed,
         scalarNumValidTokens_packed,
         ignore_index,
+        rank,
         stream,
     )
 
@@ -913,6 +917,7 @@ if __name__ == "__main__":
             dlogits_partial_packed,
             scalarNumValidTokens_packed,
             ignore_index,
+            rank,
             stream
         )
     stop.record(stream=torch.cuda.current_stream())

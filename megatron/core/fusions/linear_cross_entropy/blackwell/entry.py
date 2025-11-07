@@ -25,10 +25,15 @@ def forward(
     tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
     reduction: typing.Optional[str] = "mean",
     ignore_index: typing.Optional[int] = -100,
+    sequence_parallel: typing.Optional[bool] = False,
 ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     forward host function
     """
+    tp_rank = 0 if tp_group is None else torch.distributed.get_rank(tp_group)
+    tp_world_size = 1 if tp_group is None else torch.distributed.get_world_size(tp_group)
+    in_tp_mode = (tp_group is not None) and (tp_world_size > 1)
+
     assert hidden.is_cuda and weight.is_cuda and labels.is_cuda
     assert weight.device == hidden.device and labels.device == hidden.device
 
@@ -44,13 +49,32 @@ def forward(
     hidden_view = hidden.view(-1, hidden.shape[-1])
     labels_view = labels.view(-1)
 
-    assert hidden_view.shape[0] == labels_view.shape[0]
+    assert ((sequence_parallel and hidden_view.shape[0] * tp_world_size == labels_view.shape[0])
+            or (not sequence_parallel and hidden_view.shape[0] == labels_view.shape[0]))
     assert hidden_view.shape[1] == weight.shape[1]
+
+    global_hidden = hidden
+    if in_tp_mode and sequence_parallel:
+        partial_hidden_shape = hidden.shape
+        global_hidden_shape = (
+            partial_hidden_shape[0] * tp_world_size,
+            *partial_hidden_shape[1:]
+        )
+        global_hidden = torch.empty(
+            global_hidden_shape,
+            dtype=hidden.dtype,
+            device=hidden.device
+        )
+        dist.all_gather_into_tensor(
+            global_hidden,
+            hidden,
+            group=tp_group
+        )
+        assert global_hidden.is_contiguous()
+        hidden_view = global_hidden.view(-1, global_hidden.shape[-1])
+
     num_tokens, dim = hidden_view.shape
     vocab_size, _ = weight.shape
-
-    tp_rank = 0 if tp_group is None else torch.distributed.get_rank(tp_group)
-    tp_world_size = 1 if tp_group is None else torch.distributed.get_world_size(tp_group)
 
     if not hasattr(forward, "_initialized"):
         global _dedicated_stream, _dedicated_events
@@ -62,7 +86,7 @@ def forward(
     # declare logprobs
     if REDUCTION == utils.EntropyReductionEnum.kNone:
         logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
-        if tp_group is not None:
+        if in_tp_mode:
             logprobs.zero_()
     else:
         logprobs = torch.zeros((), device=hidden.device, dtype=torch.float32)
@@ -81,7 +105,7 @@ def forward(
         _logprobs = logprobs
     else:
         _logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
-        if tp_group is not None:
+        if in_tp_mode:
             _logprobs.zero_()
     assert _max.is_contiguous() and _accu.is_contiguous() and _logprobs.is_contiguous()
 
@@ -119,7 +143,7 @@ def forward(
 
     # VocabSize and Dim are fixed for a given model,
     # only the number of tokens can vary
-    key = f"vocab_size:{vocab_size}+dim:{dim}+dtype:{hidden.dtype}"
+    key = f"vocab_size:{vocab_size}+dim:{dim}+dtype:{hidden_view.dtype}"
     if forward._fwd_mainloop_kernels.get(key) is None:
         fwd_mainloop_kernel = fwd_mainloop.FwdMainLoop(
             vocab_per_split=vocab_per_split,
@@ -151,7 +175,7 @@ def forward(
         cuda_stream
     )
     
-    if tp_group is None:
+    if not in_tp_mode:
         def grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]),)
 
@@ -228,11 +252,11 @@ def forward(
             REDUCTION,
         )
 
-    return logprobs, maximum, accumulate, num_valid_tokens, tp_rank, tp_world_size
+    return logprobs, maximum, accumulate, num_valid_tokens, tp_rank, tp_world_size, global_hidden
 
 def backward(
     dlogprobs: torch.Tensor,
-    hidden: torch.Tensor,
+    global_hidden: torch.Tensor,
     weight: torch.Tensor,
     labels: torch.Tensor,
     maximum: torch.Tensor,
@@ -243,11 +267,14 @@ def backward(
     tp_group: typing.Optional[dist.ProcessGroup] = None,
     tp_rank: typing.Optional[int] = 0,
     tp_world_size: typing.Optional[int] = 1,
+    sequence_parallel: typing.Optional[bool] = False,
 ) -> typing.List[torch.Tensor]:
     """
     backward host function
     """
-    hidden_view = hidden.view(-1, hidden.shape[-1])
+    in_tp_mode = (tp_group is not None) and (tp_world_size > 1)
+
+    hidden_view = global_hidden.view(-1, global_hidden.shape[-1])
     labels_view = labels.view(-1)
 
     num_tokens, dim = hidden_view.shape
@@ -263,7 +290,7 @@ def backward(
 
     assert num_valid_tokens.dim() == 0 and num_valid_tokens.is_cuda and num_valid_tokens.dtype == torch.int64
 
-    d_hidden = torch.empty_like(hidden)
+    d_hidden = torch.empty_like(global_hidden)
     d_weight = torch.empty_like(weight)
     assert d_hidden.is_contiguous() and d_weight.is_contiguous()
 
@@ -275,8 +302,8 @@ def backward(
 
         _d_logits = torch.empty(
             (num_tokens, vocab_per_split),
-            device=hidden.device,
-            dtype=hidden.dtype
+            device=global_hidden.device,
+            dtype=global_hidden.dtype
         )
 
         hidden_packed = from_dlpack(
@@ -319,7 +346,7 @@ def backward(
         if not hasattr(backward, "_bwd_kernel"):
             backward._bwd_kernel = dict()
 
-        key = f"vocab_size:{vocab_size}+dim:{dim}+reduction:{REDUCTION}+dtype:{hidden.dtype}"
+        key = f"vocab_size:{vocab_size}+dim:{dim}+reduction:{REDUCTION}+dtype:{hidden_view.dtype}"
         if backward._bwd_kernel.get(key) is None:
             bwd_kernel = bwd_partial_dlogits.BwdPartialDlogits(
                 reduction=REDUCTION,
@@ -337,6 +364,7 @@ def backward(
                 dlogits_packed,
                 scalarNumValidTokens_packed,
                 ignore_index,
+                tp_rank,
                 stream
             )
             backward._bwd_kernel[key] = bwd_kernel_compiled
@@ -355,6 +383,7 @@ def backward(
                 dlogits_packed,
                 scalarNumValidTokens_packed,
                 ignore_index,
+                tp_rank,
                 stream
             )
             vocab_right_bound = (
@@ -381,5 +410,16 @@ def backward(
             )
     else:
         raise NotImplementedError(f"Unsupported backward method: {_backward}")
+
+    if in_tp_mode:
+        dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
+        if sequence_parallel:
+            partial_hidden_shape = (
+                global_hidden.shape[0] // tp_world_size,
+                *global_hidden.shape[1:]
+            )
+            partial_num_tokens = num_tokens // tp_world_size
+            d_hidden = d_hidden.view(-1, d_hidden.shape[-1])[tp_rank * partial_num_tokens : (tp_rank + 1) * partial_num_tokens, :]
+            d_hidden = d_hidden.view(partial_hidden_shape).clone()
     
     return d_hidden, d_weight

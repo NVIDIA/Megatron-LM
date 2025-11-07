@@ -193,7 +193,7 @@ def forward_tp_epilogue(
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
         _reduced_max = tl.load(
-            reduce_max_ptr + offs_m[:, None] * stride_reduce_max_m + offs_n[None, :] * stride_reduce_max_n,
+            reduced_max_ptr + offs_m[:, None] * stride_reduced_max_m + offs_n[None, :] * stride_reduced_max_n,
             mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < num_splits),
             other=0.0,
         )
