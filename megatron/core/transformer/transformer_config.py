@@ -1753,9 +1753,9 @@ class TransformerConfig(ModelParallelConfig):
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
 
             if self.cuda_graph_impl != "none":
-                assert self.cuda_graph_impl == "transformer_engine" and self.cuda_graph_scope == [
-                    "attn"
-                ], 'Only attention CUDA graph is supported when enabling overlap_moe_expert_parallel_comm'
+                assert (self.cuda_graph_impl == "transformer_engine" and "moe" not in self.cuda_graph_scope \
+                    and "mlp" not in self.cuda_graph_scope
+                ), 'moe and mlp CUDA graph scope is not supported when enabling overlap_moe_expert_parallel_comm'
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
