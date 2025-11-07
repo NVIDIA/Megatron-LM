@@ -1619,7 +1619,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     data_iterator=None, ckpt_format=ckpt_format, force=True,
                 )
             if not args.no_load_rng:
-                gen_sd_rng_state = get_rng_state(args.ckpt_format)
+                gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)
             if not args.no_load_optim:
                 gen_sd_optim = optimizer
                 gen_sd_opt_param_scheduler = opt_param_scheduler
