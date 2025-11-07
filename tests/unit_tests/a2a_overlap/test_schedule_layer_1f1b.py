@@ -66,7 +66,7 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     """
     transformer_layer = model.decoder.layers[0]
     for i in range(len(input_tensors)):
-        input_tensors[i] = input_tensors[i].clone()     
+        input_tensors[i] = input_tensors[i].clone()
 
     event = torch.cuda.Event()
     comp_stream = torch.cuda.current_stream()
