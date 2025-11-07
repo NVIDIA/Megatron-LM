@@ -9,34 +9,31 @@ import os
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, cast
 
 import pytest  # type: ignore[import]
 import torch
 
+from megatron.core.config import set_experimental_flag
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
-from megatron.core.config import set_experimental_flag
-from megatron.core.transformer.moe.moe_utils import RandomSTE
-
 
 # NOTE: Performance regression threshold
 DEFAULT_MAX_REGRESSION_RATIO = 1.02
-DEFAULT_MAX_VARIANCE_RATIO = 0.02 # The std/mean should be less than 2%
+DEFAULT_MAX_VARIANCE_RATIO = 0.02  # The std/mean should be less than 2%
 WARMUP_ITERS = 5
 MEASURE_ITERS = 20
 
 
-BASELINES_PATH = (
-    Path(__file__).resolve().parent / "baselines" / "moe_layer.json"
-)
+BASELINES_PATH = Path(__file__).resolve().parent / "baselines" / "moe_layer.json"
 UPDATE_BASELINES_ENV = "MEGATRON_UPDATE_PERF_BASELINES"
 
 
@@ -49,12 +46,12 @@ class MoEModelConfig:
     num_experts: int
     router_topk: int
     num_attention_heads: int = 8
-    moe_shared_expert_intermediate_size: int = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
 
     # Router related
     moe_router_load_balancing_type: str = "aux_loss"
-    moe_router_num_groups: int = None
-    moe_router_group_topk: int = None
+    moe_router_num_groups: Optional[int] = None
+    moe_router_group_topk: Optional[int] = None
     moe_router_score_function: str = "softmax"
     moe_router_dtype: str = "fp32"
     moe_router_enable_expert_bias: bool = False
@@ -89,7 +86,7 @@ class MoEPerformanceCase:
     moe_router_fusion: bool = True
 
     # Performance stability related
-    moe_router_force_load_balancing: bool = True 
+    moe_router_force_load_balancing: bool = True
     manual_gc: bool = True
 
     @property
@@ -219,12 +216,7 @@ def _build_transformer_config(case: MoEPerformanceCase) -> TransformerConfig:
 
     if case.fp8:
         config_kwargs.update(
-            dict(
-                fp8="hybrid",
-                fp8_margin=0,
-                fp8_interval=1,
-                fp8_recipe="blockwise",
-            )
+            dict(fp8="hybrid", fp8_margin=0, fp8_interval=1, fp8_recipe="blockwise")
         )
 
     return TransformerConfig(**config_kwargs)
@@ -261,10 +253,16 @@ def _serialize_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
     }
 
 
-def _assert_within_baseline(case_name: str, metrics: Dict[str, float], baselines: Dict[str, Dict[str, float]]):
+def _assert_within_baseline(
+    case_name: str,
+    metrics: Mapping[str, Any],
+    baselines: Dict[str, Dict[str, float]],
+):
     baseline = baselines.get(case_name)
     if baseline is None:
-        pytest.error(f"Missing baseline data for {case_name}. Set {UPDATE_BASELINES_ENV}=1 to record.")
+        pytest.fail(
+            f"Missing baseline data for {case_name}. Set {UPDATE_BASELINES_ENV}=1 to record."
+        )
 
     max_ratio = baseline.get("max_regression_ratio", DEFAULT_MAX_REGRESSION_RATIO)
 
@@ -279,31 +277,41 @@ def _assert_within_baseline(case_name: str, metrics: Dict[str, float], baselines
     bwd_limit = _limit("backward_ms")
     mem_limit = _limit("max_allocated_bytes")
 
-    forward_ms = metrics["forward_ms"]
-    backward_ms = metrics["backward_ms"]
-    max_allocated_bytes = metrics.get("max_allocated_bytes")
+    forward_ms = cast(float, metrics["forward_ms"])
+    backward_ms = cast(float, metrics["backward_ms"])
+    max_allocated_bytes = cast(float, metrics["max_allocated_bytes"])
 
-    forward_std_ms = metrics.get("forward_std_ms")
-    backward_std_ms = metrics.get("backward_std_ms")
-    forward_timings = metrics.get("forward_timings")
-    backward_timings = metrics.get("backward_timings")
+    forward_std_ms = cast(float, metrics.get("forward_std_ms", 0.0))
+    backward_std_ms = cast(float, metrics.get("backward_std_ms", 0.0))
+    forward_timings = cast(Sequence[float], metrics.get("forward_timings", ()))
+    backward_timings = cast(Sequence[float], metrics.get("backward_timings", ()))
 
-    assert forward_ms <= fwd_limit, (
-        f"Forward pass for {case_name} regressed: {forward_ms:.3f} ms (limit {fwd_limit:.3f} ms)."
-    )
-    assert backward_ms <= bwd_limit, (
-        f"Backward pass for {case_name} regressed: {backward_ms:.3f} ms (limit {bwd_limit:.3f} ms)."
-    )
+    assert (
+        forward_ms <= fwd_limit
+    ), f"Forward pass for {case_name} regressed: {forward_ms:.3f} ms (limit {fwd_limit:.3f} ms)."
+    assert (
+        backward_ms <= bwd_limit
+    ), f"Backward pass for {case_name} regressed: {backward_ms:.3f} ms (limit {bwd_limit:.3f} ms)."
 
-    assert forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
-        f"Forward pass for {case_name} has high variance: {forward_std_ms:.3f} ms (limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {forward_ms:.3f} ms). \
-        The full timings are {forward_timings}."
-    )
-    assert backward_std_ms / backward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
-        f"Backward pass for {case_name} has high variance: {backward_std_ms:.3f} ms (limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {backward_ms:.3f} ms). \
-        The full timings are {backward_timings}."
-    )
-    assert max_allocated_bytes is not None and max_allocated_bytes <= mem_limit, (
+    if forward_ms > 0.0:
+        assert (
+            forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO
+        ), (
+            "Forward pass for "
+            f"{case_name} has high variance: {forward_std_ms:.3f} ms "
+            f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {forward_ms:.3f} ms). "
+            f"The full timings are {list(forward_timings)}."
+        )
+    if backward_ms > 0.0:
+        assert (
+            backward_std_ms / backward_ms <= DEFAULT_MAX_VARIANCE_RATIO
+        ), (
+            "Backward pass for "
+            f"{case_name} has high variance: {backward_std_ms:.3f} ms "
+            f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {backward_ms:.3f} ms). "
+            f"The full timings are {list(backward_timings)}."
+        )
+    assert max_allocated_bytes <= mem_limit, (
         "Max allocated memory for "
         f"{case_name} regressed: {max_allocated_bytes / (1024 ** 2):.3f} MiB "
         f"(limit {mem_limit / (1024 ** 2):.3f} MiB)."
@@ -320,7 +328,7 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
 
     generator = torch.Generator(device="cuda").manual_seed(1234)
     model = case.model
-    
+
     if case.manual_gc:
         torch.cuda.empty_cache()
         gc.disable()
@@ -340,7 +348,8 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
     for iteration in range(WARMUP_ITERS + MEASURE_ITERS):
         if RandomSTE.generator is not None:
             RandomSTE.generator.manual_seed(RandomSTE.generator.initial_seed())
-        torch.distributed.barrier()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         torch.cuda.nvtx.range_push(f"({case.name}) iteration {iteration}")
         # Use a long CUDA kernel to hide the router launch overhead
         with torch.cuda.nvtx.range("(dummy GEMM)"):
@@ -381,19 +390,24 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
         gc.collect()
         gc.enable()
 
-    print(f"({case.name}) forward times {forward_timings}")
+    if Utils.rank == 0:
+        print(f"({case.name}) forward times {forward_timings}")
     return {
         "forward_ms": forward_ms,
         "backward_ms": backward_ms,
         "forward_std_ms": statistics.pstdev(forward_timings) if len(forward_timings) > 1 else 0.0,
-        "backward_std_ms": statistics.pstdev(backward_timings) if len(backward_timings) > 1 else 0.0,
+        "backward_std_ms": (
+            statistics.pstdev(backward_timings) if len(backward_timings) > 1 else 0.0
+        ),
         "max_allocated_bytes": max_allocated_bytes,
         "forward_timings": forward_timings,
         "backward_timings": backward_timings,
     }
 
 
-def _maybe_update_baseline(case: MoEPerformanceCase, metrics: Dict[str, float], baselines: Dict[str, Dict[str, float]]):
+def _maybe_update_baseline(
+    case: MoEPerformanceCase, metrics: Dict[str, float], baselines: Dict[str, Dict[str, float]]
+):
     baselines[case.name] = _serialize_metrics(metrics)
     _persist_baselines(baselines)
 
@@ -408,7 +422,9 @@ def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking"
+)
 @pytest.mark.parametrize("perf_case", PERFORMANCE_CASES, ids=lambda c: c.name)
 def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool = False):
     if not perf_case.is_current_platform():
@@ -438,7 +454,8 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
             f"(σ={metrics['forward_std_ms']:.3f}), backward {metrics['backward_ms']:.3f} ms "
             f"(σ={metrics['backward_std_ms']:.3f}), max mem {metrics['max_allocated_bytes'] / (1024 ** 2):.3f} MiB"
         )
-        print(summary)
+        if Utils.rank == 0:
+            print(summary)
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -464,9 +481,7 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
             device=torch.device("cuda", torch.cuda.current_device()),
             dtype=torch.int32,
         )
-        torch.distributed.all_reduce(
-            failure_tensor, op=torch.distributed.ReduceOp.MAX
-        )
+        torch.distributed.all_reduce(failure_tensor, op=torch.distributed.ReduceOp.MAX)
         baseline_failed = bool(failure_tensor.item())
 
         if baseline_failed:
