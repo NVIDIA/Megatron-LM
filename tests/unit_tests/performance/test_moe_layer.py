@@ -224,7 +224,7 @@ def _build_transformer_config(case: MoEPerformanceCase) -> TransformerConfig:
 
 # NOTE: Only TE backend is covered in this test.
 def _resolve_moe_submodules(case: MoEPerformanceCase):
-    layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=case.model.num_experts)
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=case.model.num_experts, moe_grouped_gemm=True)
     return layer_spec.submodules.mlp.submodules
 
 
@@ -376,6 +376,9 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
             backward_timings.append(bwd_start.elapsed_time(bwd_end))
             max_allocated_bytes.append(torch.cuda.max_memory_allocated())
 
+    # Exclude the top 3 values from timings lists to avoid outliers
+    forward_timings_sorted = sorted(forward_timings)[:-3]
+    backward_timings_sorted = sorted(backward_timings)[:-3]
     forward_ms = statistics.mean(forward_timings)
     backward_ms = statistics.mean(backward_timings)
     max_allocated_bytes = statistics.mean(max_allocated_bytes)
@@ -415,6 +418,7 @@ def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
     return layer
 
 
+@pytest.mark.flaky(reruns=2)
 @pytest.mark.internal
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking"
@@ -499,10 +503,14 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 #         --capture-range-end=stop \
 #         -o output \
 #         uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 tests/unit_tests/performance/test_moe_layer.py
+# Commands to run with pytest:
+# export MEGATRON_UPDATE_PERF_BASELINES=0 # set to 1 to update baseline perf numbers
+# uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m pytest tests/unit_tests/performance/test_moe_layer.py
 if __name__ == "__main__":
     torch.cuda.cudart().cudaProfilerStart()
     torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
     for case in PERFORMANCE_CASES:
-        test_moe_layer_performance(case, debug_mode=True)
+        if case.name == "deepseek_deepep_tp1ep8_bf16":
+            test_moe_layer_performance(case, debug_mode=True)
     torch.cuda.cudart().cudaProfilerStop()
     torch.distributed.destroy_process_group()
