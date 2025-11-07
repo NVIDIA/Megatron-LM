@@ -226,7 +226,12 @@ def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, in
             else:
                 x1[k] = merge(x1[k], v2, key=key + (k,))
     elif isinstance(x1, list) and isinstance(x2, list):
-        if len(x1) != len(x2):
+        # For LayerWiseDistributedOptimizer, we may have empty lists in the state dict.
+        if len(x1) == 0:
+            return x2
+        elif len(x2) == 0:
+            return x1
+        elif len(x1) != len(x2):
             raise ValueError(
                 f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "
                 f"encountered at level {key})"
