@@ -104,8 +104,8 @@ class TransformerLayerSchedulePlan:
             if is_mtp
             else isinstance(self.layer.mlp, MoELayer)
         )
-        enable_deepep = self.layer.config.moe_enable_deepep
-        extra_args["enable_deepep"] = enable_deepep
+
+        extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
