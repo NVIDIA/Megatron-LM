@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import torch
 from packaging import version
 
-from megatron.core.utils import experimental_fn, null_decorator
+from megatron.core.utils import null_decorator
 
 try:
     import triton
