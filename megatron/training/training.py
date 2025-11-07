@@ -855,6 +855,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
 
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import has_modelopt_state
+        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
+        # set a flag to use our model provider if so.
+        if args.load is not None and has_modelopt_state(args.load):
+            print_rank_0(f'ModelOpt checkpoint detected')
+            args.modelopt_enabled = True
+        elif getattr(args, "export_kd_teacher_load", None):
+            # For distillation ckpts without ModelOpt state
+            args.modelopt_enabled = True
+
+
     # Build model.
     def build_model():
         if (
@@ -1080,17 +1092,6 @@ def setup_model_and_optimizer(
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
-
-    if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
