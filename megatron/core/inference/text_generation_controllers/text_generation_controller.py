@@ -608,30 +608,24 @@ class TextGenerationController:
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
         if backend == "torch":
-            # Special-case for static sampling.
-            if getattr(self, "static_sampling", False):
-                bucket = torch.arange(active_request_count, device=request_metadata.device)
-                reps = temp[0].item(), int(top_k[0].item()), top_p[0].item()
-                self.torch_sampling_buckets = ((bucket, *reps),)
-            else:
-                # Bucketize the core sampling parameters.
-                core_params = torch.stack((temp, top_k, top_p), dim=1)
-                _, inv_indices, cnts = torch.unique(
-                    core_params, dim=0, return_inverse=True, return_counts=True
-                )
-                order = torch.argsort(inv_indices, stable=True)
-                sampling_buckets = torch.split(order, cnts.tolist())
-                # Perform the D2H sync needed by `_torch_sampling_func` here.
-                group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
-                core_params_reps = core_params[group_reps].detach().cpu()
-                temp_reps = core_params_reps[:, 0].tolist()
-                top_k_reps = core_params_reps[:, 1].to(torch.int32).tolist()
-                top_p_reps = core_params_reps[:, 2].tolist()
-                # Store the buckets and their equivalence class representatives.
-                self.torch_sampling_buckets = (
-                    (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
-                    for idx in range(len(sampling_buckets))
-                )
+            # Bucketize the core sampling parameters.
+            core_params = torch.stack((temp, top_k, top_p), dim=1)
+            _, inv_indices, cnts = torch.unique(
+                core_params, dim=0, return_inverse=True, return_counts=True
+            )
+            order = torch.argsort(inv_indices, stable=True)
+            sampling_buckets = torch.split(order, cnts.tolist())
+            # Perform the D2H sync needed by `_torch_sampling_func` here.
+            group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
+            core_params_reps = core_params[group_reps].detach().cpu()
+            temp_reps = core_params_reps[:, 0].tolist()
+            top_k_reps = core_params_reps[:, 1].to(torch.int32).tolist()
+            top_p_reps = core_params_reps[:, 2].tolist()
+            # Store the buckets and their equivalence class representatives.
+            self.torch_sampling_buckets = (
+                (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
+                for idx in range(len(sampling_buckets))
+            )
 
     def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
         """Sample tokens from logits for dynamic batching.

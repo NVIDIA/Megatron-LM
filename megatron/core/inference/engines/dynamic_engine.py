@@ -94,9 +94,6 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
-        static_sampling (bool): If True, all requests are assumed to have the same
-            sampling parameters. This avoids needing to loop through all requests and
-            their sampling parameters every generation step, improving latency.
         inference_logging_step_interval (int): The step interval at which to log
         inference metrics to wandb. Defaults to 0, which means no logging.
     """
@@ -110,7 +107,6 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
-        static_sampling: bool = False,
         inference_logging_step_interval: int = 0,
     ):
 
@@ -146,10 +142,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.paused = False
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
-        self.static_sampling = static_sampling
-        if self.static_sampling:
-            self.sampling_params: Optional[SamplingParams] = None
-            self.controller.static_sampling = True
 
         self.inference_logging_step_interval = inference_logging_step_interval
         # Configure wandb to use separate step counter for inference metrics (only once)
@@ -475,24 +467,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
-
-        if self.static_sampling:
-            if self.sampling_params is None:
-                self.sampling_params = request.sampling_params
-            else:
-                self_core_params = (
-                    self.sampling_params.temperature,
-                    self.sampling_params.top_k,
-                    self.sampling_params.top_p,
-                )
-                new_core_params = (
-                    request.sampling_params.temperature,
-                    request.sampling_params.top_k,
-                    request.sampling_params.top_p,
-                )
-                assert (
-                    self_core_params == new_core_params
-                ), "All requests must have the same core sampling parameters for static_sampling."
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)

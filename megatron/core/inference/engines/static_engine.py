@@ -110,7 +110,6 @@ class StaticInferenceEngine(AbstractEngine):
                     random_seed=self.random_seed,
                     context=dynamic_context,
                     enable_cuda_graph=True,
-                    static_sampling=True,
                 )
         except Exception as e:
             # Get exception details for better debugging
