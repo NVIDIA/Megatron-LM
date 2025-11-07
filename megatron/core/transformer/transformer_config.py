@@ -7,7 +7,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.enums import Fp8Recipe
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -800,6 +800,14 @@ class TransformerConfig(ModelParallelConfig):
                         f"({max_bf16_layers_per_pipeline_stage})."
                     )
 
+            if self.fp8_recipe == Fp8Recipe.custom:
+                if not self.fp8_quantizer_factory:
+                    raise ValueError(
+                        "fp8_quantizer_factory must be provided when fp8_recipe is 'custom'. "
+                        "Specify a Python import path (e.g., package.module.quantizer_factory) "
+                        "via --fp8-quantizer-factory."
+                    )
+
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
@@ -809,6 +817,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp4 and self.fp8:
             raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
+
+        if self.fp4 and self.fp4_recipe == Fp4Recipe.custom:
+            if not self.fp4_quantizer_factory:
+                raise ValueError(
+                    "fp4_quantizer_factory must be provided when fp4_recipe is 'custom'. "
+                    "Specify a Python import path (e.g., package.module.quantizer_factory) "
+                    "via --fp4-quantizer-factory."
+                )
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True

@@ -515,12 +515,6 @@ if HAVE_TE:
                     fp8_format=fp8_format
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
-                if not config.fp8_quantizer_factory:
-                    raise ValueError(
-                        "Python import path, e.g. package.module.quantizer_factory, "
-                        "must be provided via --fp8-quantizer-factory when "
-                        "--fp8-recipe custom is selected."
-                    )
                 fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
             else:
                 raise ValueError(

@@ -72,12 +72,6 @@ if HAVE_TE:
                         >= 2.7.0.dev0."""
                     )
             elif config.fp4_recipe == Fp4Recipe.custom:
-                if not config.fp4_quantizer_factory:
-                    raise ValueError(
-                        "Python import path, e.g. package.module.quantizer_factory, "
-                        "must be provided via --fp4-quantizer-factory when "
-                        "--fp4-recipe custom is selected."
-                    )
                 fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
             else:
                 raise ValueError(
