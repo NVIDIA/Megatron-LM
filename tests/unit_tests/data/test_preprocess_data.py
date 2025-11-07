@@ -2,18 +2,21 @@
 
 import json
 import os
+import random
+import string
 import sys
 import tempfile
 
-import nltk
-import pytest
 import requests
+
+import torch
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.training.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
 )
+from tests.unit_tests.test_utilities import Utils
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_data import Encoder
 from tools.preprocess_data import get_args as build_args
@@ -23,11 +26,11 @@ __HUGGINGFACE_BERT_BASE_UNCASED_VOCAB = (
     "https://huggingface.co/bert-base-uncased/raw/main/vocab.txt"
 )
 
-__LOCAL_BERT_VOCAB = "/home/gitlab-runner/data/bert_data/vocab.txt"
+__LOCAL_BERT_VOCAB = "/opt/data/tokenizers/megatron/bert-vocab.txt"
 
-__LOCAL_GPT2_MERGE = "/home/gitlab-runner/data/gpt3_data/gpt2-merges.txt"
+__LOCAL_GPT2_MERGE = "/opt/data/tokenizers/megatron/gpt2-merges.txt"
 
-__LOCAL_GPT2_VOCAB = "/home/gitlab-runner/data/gpt3_data/gpt2-vocab.json"
+__LOCAL_GPT2_VOCAB = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
 
 
 def dummy_jsonl(odir):
@@ -42,37 +45,33 @@ def dummy_jsonl(odir):
     ]
     with open(os.path.join(odir, "numbers_ascending.jsonl"), "w") as writer:
         writer.writelines(list_numbers_ascending)
-    # test
-    list_test = []
-    with open(__file__) as reader:
-        for line in reader:
-            list_test.append(json.dumps({"text": line}) + "\n")
-    with open(os.path.join(odir, "test.jsonl"), "w") as writer:
-        writer.writelines(list_test)
+    # string
+    choices = string.ascii_letters + string.digits + string.punctuation + string.whitespace
+    list_string = [
+        json.dumps({"text": "".join(random.choices(choices, k=random.randint(3, 100)))}) + "\n"
+        for i in range(100)
+    ]
+    with open(os.path.join(odir, "string.jsonl"), "w") as writer:
+        writer.writelines(list_string)
 
 
 def build_datasets(idir, odir, extra_args=[]):
     for name in os.listdir(idir):
-        sys.argv = [
-            sys.argv[0],
+        args_list = [
             "--input",
             os.path.join(idir, name),
             "--output-prefix",
             os.path.join(odir, os.path.splitext(name)[0]),
         ] + extra_args
-        build_main()
+        build_main(args_list)
 
 
 def merge_datasets(idir):
-    sys.argv = [sys.argv[0], "--input", idir, "--output-prefix", os.path.join(idir, "merge")]
-    merge_main()
+    args_list = ["--input", idir, "--output-prefix", os.path.join(idir, "merge")]
+    merge_main(args_list)
 
 
 def do_test_preprocess_data(temp_dir, extra_args=[]):
-    # set the default nltk data path
-    os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
-    nltk.data.path.append(os.environ["NLTK_DATA"])
-
     path_to_raws = os.path.join(temp_dir, "sample_raws")
     path_to_data = os.path.join(temp_dir, "sample_data")
     os.mkdir(path_to_raws)
@@ -87,8 +86,8 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None] + extra_args
-    encoder = Encoder(build_args())
+    args_list = ["--input", None, "--output-prefix", None] + extra_args
+    encoder = Encoder(build_args(args_list))
     encoder.initializer()
 
     def tokens_to_string(toks):
@@ -168,7 +167,7 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
 def gpt2_vocab(odir):
     if os.path.exists(__LOCAL_GPT2_VOCAB):
         return __LOCAL_GPT2_VOCAB
-    path = os.path.join(odir, "vocab.json")
+    path = os.path.join(odir, "gpt2-vocab.json")
     with open(path, "wb") as writer:
         writer.write(requests.get(PRETRAINED_VOCAB_ARCHIVE_MAP['gpt2']).content)
     return path
@@ -177,13 +176,18 @@ def gpt2_vocab(odir):
 def gpt2_merge(odir):
     if os.path.exists(__LOCAL_GPT2_MERGE):
         return __LOCAL_GPT2_MERGE
-    path = os.path.join(odir, "merge.txt")
+    path = os.path.join(odir, "gpt2-merges.txt")
     with open(path, "wb") as writer:
         writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
     return path
 
 
 def test_preprocess_data_gpt():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() != 0:
+            return
+
     with tempfile.TemporaryDirectory() as temp_dir:
 
         # gpt specific args
@@ -191,9 +195,9 @@ def test_preprocess_data_gpt():
             "--tokenizer-type",
             "GPT2BPETokenizer",
             "--vocab-file",
-            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
+            gpt2_vocab(temp_dir),
             "--merge-file",
-            "/opt/data/tokenizers/megatron/gpt2-merges.txt",
+            gpt2_merge(temp_dir),
             "--append-eod",
             "--workers",
             "10",
@@ -207,15 +211,18 @@ def test_preprocess_data_gpt():
 def bert_vocab(odir):
     if os.path.exists(__LOCAL_BERT_VOCAB):
         return __LOCAL_BERT_VOCAB
-    path = os.path.join(odir, "vocab.txt")
+    path = os.path.join(odir, "bert-vocab.txt")
     with open(path, "wb") as writer:
         writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
     return path
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() != 0:
+            return
+
     with tempfile.TemporaryDirectory() as temp_dir:
 
         # bert specific args
@@ -223,7 +230,7 @@ def test_preprocess_data_bert():
             "--tokenizer-type",
             "BertWordPieceLowerCase",
             "--vocab-file",
-            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
+            bert_vocab(temp_dir),
             "--split-sentences",
             "--workers",
             "10",

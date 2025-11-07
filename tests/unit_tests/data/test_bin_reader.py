@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 import random
 import sys
@@ -6,16 +8,18 @@ from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict
 
-import nltk
-import pytest
-
 try:
     import boto3
     import botocore.exceptions as exceptions
 except ModuleNotFoundError:
+    # Create mock msc module
     boto3 = ModuleType("boto3")
-    sys.modules[boto3.__name__] = boto3
+
+    # Create mock types submodule
     exceptions = ModuleType("botocore.exceptions")
+
+    # Register the mock module in sys.modules
+    sys.modules[boto3.__name__] = boto3
     sys.modules[exceptions.__name__] = exceptions
 
 try:
@@ -43,6 +47,8 @@ except ModuleNotFoundError:
     sys.modules[msc.__name__] = msc
     sys.modules[types_module.__name__] = types_module
 
+import torch
+
 from megatron.core.datasets.indexed_dataset import (
     IndexedDataset,
     ObjectStorageConfig,
@@ -58,9 +64,11 @@ from tests.unit_tests.data.test_preprocess_data import (
     gpt2_merge,
     gpt2_vocab,
 )
+from tests.unit_tests.test_utilities import Utils
+
 
 ##
-# Overload client from boto3
+# Mock boto3
 ##
 
 
@@ -72,7 +80,8 @@ class _LocalClient(S3Client):
 
     def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
         os.makedirs(os.path.dirname(Filename), exist_ok=True)
-        os.system(f"cp {os.path.join('/', Bucket, Key)} {Filename}")
+        remote_path = os.path.join("/", Bucket, Key)
+        os.system(f"cp {remote_path} {Filename}")
         assert os.path.exists(Filename)
 
     def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
@@ -104,12 +113,12 @@ setattr(boto3, "client", _LocalClient)
 
 
 ##
-# Overload ClientError from botocore.exceptions
+# Mock botocore.exceptions
 ##
 
 
 class _LocalClientError(Exception):
-    """ "Local test client error"""
+    """Local test client error"""
 
     pass
 
@@ -117,14 +126,15 @@ class _LocalClientError(Exception):
 setattr(exceptions, "ClientError", _LocalClientError)
 
 ##
-# Mock multistorageclient module
+# Mock msc.open, msc.download_file, msc.resolve_storage_client
 ##
 
 
 def _msc_download_file(remote_path, local_path):
-    remote_path = remote_path.removeprefix(MSC_PREFIX + "default")
+    remote_path = os.path.join("/", remote_path.removeprefix(MSC_PREFIX))
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     os.system(f"cp {remote_path} {local_path}")
+    assert os.path.exists(local_path)
 
 
 def _msc_resolve_storage_client(path):
@@ -134,7 +144,7 @@ def _msc_resolve_storage_client(path):
                 f.seek(byte_range.offset)
                 return f.read(byte_range.size)
 
-    return StorageClient(), path.removeprefix(MSC_PREFIX + "default")
+    return StorageClient(), os.path.join("/", path.removeprefix(MSC_PREFIX))
 
 
 setattr(msc, "open", open)
@@ -142,20 +152,21 @@ setattr(msc, "download_file", _msc_download_file)
 setattr(msc, "resolve_storage_client", _msc_resolve_storage_client)
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_bin_reader():
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # set the default nltk data path
-        os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
-        nltk.data.path.append(os.environ["NLTK_DATA"])
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() != 0:
+            return
 
+    with tempfile.TemporaryDirectory() as temp_dir:
         path_to_raws = os.path.join(temp_dir, "sample_raws")
         path_to_data = os.path.join(temp_dir, "sample_data")
-        path_to_object_storage_cache = os.path.join(temp_dir, "object_storage_cache")
+        path_to_object_storage_cache_msc = os.path.join(temp_dir, "object_storage_cache_msc")
+        path_to_object_storage_cache_s3 = os.path.join(temp_dir, "object_storage_cache_s3")
         os.mkdir(path_to_raws)
         os.mkdir(path_to_data)
-        os.mkdir(path_to_object_storage_cache)
+        os.mkdir(path_to_object_storage_cache_msc)
+        os.mkdir(path_to_object_storage_cache_s3)
 
         # create the dummy resources
         dummy_jsonl(path_to_raws)
@@ -195,11 +206,11 @@ def test_bin_reader():
             assert isinstance(indexed_dataset_mmap.bin_reader, _MMapBinReader)
 
             indexed_dataset_msc = IndexedDataset(
-                MSC_PREFIX + "default" + prefix,  # use the default profile to access the filesystem
+                MSC_PREFIX + prefix.lstrip("/"),
                 multimodal=False,
                 mmap=False,
                 object_storage_config=ObjectStorageConfig(
-                    path_to_idx_cache=path_to_object_storage_cache
+                    path_to_idx_cache=path_to_object_storage_cache_msc
                 ),
             )
             assert isinstance(indexed_dataset_msc.bin_reader, _MultiStorageClientBinReader)
@@ -207,15 +218,14 @@ def test_bin_reader():
             assert len(indexed_dataset_msc) == len(indexed_dataset_mmap)
 
             indexed_dataset_s3 = IndexedDataset(
-                S3_PREFIX + prefix,
+                S3_PREFIX + prefix.lstrip("/"),
                 multimodal=False,
                 mmap=False,
                 object_storage_config=ObjectStorageConfig(
-                    path_to_idx_cache=path_to_object_storage_cache
+                    path_to_idx_cache=path_to_object_storage_cache_s3
                 ),
             )
             assert isinstance(indexed_dataset_s3.bin_reader, _S3BinReader)
-
             assert len(indexed_dataset_s3) == len(indexed_dataset_file)
             assert len(indexed_dataset_s3) == len(indexed_dataset_mmap)
 
@@ -226,6 +236,7 @@ def test_bin_reader():
             for idx in indices:
                 assert (indexed_dataset_s3[idx] == indexed_dataset_file[idx]).all()
                 assert (indexed_dataset_s3[idx] == indexed_dataset_mmap[idx]).all()
+                assert (indexed_dataset_s3[idx] == indexed_dataset_msc[idx]).all()
 
 
 if __name__ == "__main__":
