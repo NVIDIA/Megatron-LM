@@ -532,7 +532,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         inference_config: InferenceWrapperConfig,
         model,
         max_batch_size: int,
-        buffer_size_gb: float = 40,
+        active_buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
     ):
         """
@@ -540,7 +540,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # TODO: Add other necessary configs from inference_config
 
-        buffer_guaranteed_fraction = 0.1
         model_config = model.config
         max_sequence_length = (
             inference_config.inference_max_seq_length or model_config.max_sequence_length
@@ -552,10 +551,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=inference_config.inference_max_seq_length,
-            buffer_size_gb=buffer_size_gb,
-            buffer_guaranteed_fraction=buffer_guaranteed_fraction,
+            active_buffer_size_gb=active_buffer_size_gb,
             materialize_only_last_token_logits=False,
-            max_requests_override=max_batch_size,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
         )
