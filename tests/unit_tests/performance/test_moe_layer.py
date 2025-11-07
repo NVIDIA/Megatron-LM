@@ -254,9 +254,7 @@ def _serialize_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
 
 
 def _assert_within_baseline(
-    case_name: str,
-    metrics: Mapping[str, Any],
-    baselines: Dict[str, Dict[str, float]],
+    case_name: str, metrics: Mapping[str, Any], baselines: Dict[str, Dict[str, float]]
 ):
     baseline = baselines.get(case_name)
     if baseline is None:
@@ -294,18 +292,14 @@ def _assert_within_baseline(
     ), f"Backward pass for {case_name} regressed: {backward_ms:.3f} ms (limit {bwd_limit:.3f} ms)."
 
     if forward_ms > 0.0:
-        assert (
-            forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO
-        ), (
+        assert forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
             "Forward pass for "
             f"{case_name} has high variance: {forward_std_ms:.3f} ms "
             f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {forward_ms:.3f} ms). "
             f"The full timings are {list(forward_timings)}."
         )
     if backward_ms > 0.0:
-        assert (
-            backward_std_ms / backward_ms <= DEFAULT_MAX_VARIANCE_RATIO
-        ), (
+        assert backward_std_ms / backward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
             "Backward pass for "
             f"{case_name} has high variance: {backward_std_ms:.3f} ms "
             f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {backward_ms:.3f} ms). "
