@@ -45,6 +45,7 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import unwrap_model
 
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
@@ -63,19 +64,6 @@ def get_ep_layer_offset(num_experts: int | None = None) -> int:
     local_expert_offset = ep_rank * num_local_experts
 
     return local_expert_offset
-
-
-def get_total_num_experts(num_experts: int | None = None) -> int:
-    """
-    Get the total number of experts for the current model.
-
-    Args:
-        num_experts: Total number of experts in the model. If None, returns 0.
-
-    Returns:
-        The total number of experts.
-    """
-    return num_experts if num_experts else 0
 
 
 def get_expert_index_from_key(key):
@@ -114,7 +102,7 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
         The processed state dictionary with rewritten expert keys.
     """
     local_expert_start = get_ep_layer_offset(num_experts)
-    local_expert_end = get_total_num_experts(num_experts)
+    local_expert_end = num_experts if num_experts else 0
 
     def should_keep_expert_key(expert_index):
         """Determine if this rank should keep this expert key based on expert index"""
@@ -195,7 +183,8 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
 
-    num_experts = model.config.num_moe_experts if hasattr(model, "config") else None
+    unwrapped_model = unwrap_model(model)
+    num_experts = unwrapped_model.config.num_moe_experts
 
     def intersection(s1, s2):
         # Only works for step=1
@@ -475,7 +464,8 @@ def get_global_unique_param_name(model_chunks, param):
             param_name = re.sub(r"layers\.(\d+)", f"layers.{tf_layer_number - 1}", param_name)
 
     # Get EP unique parameter name
-    num_experts = model_chunks[0].config.num_moe_experts if model_chunks else None
+    unwrapped_model = unwrap_model(model_chunks[0])
+    num_experts = unwrapped_model.config.num_moe_experts
     param_name = next(iter(handle_experts_in_state_dict({param_name: None}, num_experts).keys()))
 
     return param_name
