@@ -751,10 +751,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states, input_ids, position_ids
 
     def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """
         Generate a sharded state dictionary for the multi token prediction layer.
@@ -768,9 +765,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction layer.
         """
-        sharded_state_dict = super().sharded_state_dict(
-            prefix, sharded_offsets, metadata
-        )
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         return sharded_state_dict
 
 
@@ -947,10 +942,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         return hidden_states
 
     def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """
         Generate a sharded state dictionary for the multi token prediction module.
@@ -964,9 +956,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        sharded_state_dict = super().sharded_state_dict(
-            prefix, sharded_offsets, metadata
-        )
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config)

@@ -128,10 +128,7 @@ class SharedExpertMLP(MLP):
         return output
 
     def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         """Gets sharded state dict."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
