@@ -66,6 +66,8 @@ class Router(ABC, MegatronModule):
         """Reset the router parameters."""
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
+            if self.bias is not None:
+                self.config.init_method(self.bias)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
         if self.bias is not None:
