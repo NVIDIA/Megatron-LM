@@ -315,7 +315,7 @@ class TestDynamicInferenceEngine:
                 num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 mamba_num_heads=16,
-                num_attention_heads=4,
+                num_attention_heads=16,
                 use_cpu_initialization=True,
                 cuda_graph_impl=(
                     "local"
@@ -871,30 +871,13 @@ class TestDynamicInferenceEngine:
         Test asynchronously adding and waiting for requests while the engine is
         running continuously.
         """
+        # Have to wrap inference mode in-line because async functions are not supported
         with torch.inference_mode():
             # Test environment.
-            test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
+            test_config = DynamicEngineTestConfig(num_requests=8, use_fixed_output_lengths=True)
             env = self._build_test_env(test_config)
 
-        engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
-
-        request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
-
-        # Add requests to engine.
-        for request in tqdm(env.requests, "add requests"):
-            request_completion_futures[request.request_id] = env.engine._add_request(request)
-
-        # Wait for all requests to complete.
-        await asyncio.gather(*request_completion_futures.values())
-
-        # Verify that all request outputs were set.
-        for request_id, fut in request_completion_futures.items():
-            num_tokens_to_generate = env.requests[request_id].sampling_params.num_tokens_to_generate
-            result = fut.result()
-            assert result.generated_length == num_tokens_to_generate, (
-                f"Request {request_id} expected to generate {num_tokens_to_generate} "
-                f"tokens but generated {result.generated_length}"
-            )
+            engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
@@ -907,9 +890,7 @@ class TestDynamicInferenceEngine:
 
             # Verify that all request outputs were set.
             for request_id, fut in request_completion_futures.items():
-                num_tokens_to_generate = env.requests[
-                    request_id
-                ].sampling_params.num_tokens_to_generate
+                num_tokens_to_generate = env.requests[request_id].sampling_params.num_tokens_to_generate
                 result = fut.result()
                 assert result.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "
