@@ -1117,6 +1117,13 @@ def setup_model_and_optimizer(
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
+    # Convert heterogeneity of checkpoint
+    if args.ckpt_convert_heterogeneity is not None:
+        if args.ckpt_convert_heterogeneity == 'homogeneity-to-heterogeneity':
+            args.ckpt_current_heterogeneity = False
+        elif args.ckpt_convert_heterogeneity == 'heterogeneity-to-homogeneity':
+            args.ckpt_current_heterogeneity = True
+
     if args.moe_use_upcycling:
         torch.distributed.barrier()
         assert not checkpoint_exists(args.save), (
@@ -1221,6 +1228,26 @@ def setup_model_and_optimizer(
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
+        torch.distributed.barrier()
+        exit()
+
+    # Convert heterogeneity of checkpoint
+    if args.ckpt_convert_heterogeneity is not None:
+        if args.ckpt_convert_heterogeneity == 'homogeneity-to-heterogeneity':
+            args.ckpt_current_heterogeneity = True
+        elif args.ckpt_convert_heterogeneity == 'heterogeneity-to-homogeneity':
+            args.ckpt_current_heterogeneity = False
+
+        save_checkpoint(
+            args.iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            args.num_floating_point_operations_so_far,
+            preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        )
+
+        print_rank_0("> converted checkpoint: %s." % args.ckpt_convert_heterogeneity)
         torch.distributed.barrier()
         exit()
 

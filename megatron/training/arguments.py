@@ -2486,6 +2486,10 @@ def _add_checkpointing_args(parser):
                        'for the distributed optimizer, which previously used a '
                        'merged param/grad buffer and a different bucket mapping. '
                        'The legacy format was deprecated on Feb 13, 2024.')
+    group.add_argument('--ckpt-convert-heterogeneity', default=None,
+                       choices=['homogeneity-to-heterogeneity', 'heterogeneity-to-homogeneity'],
+                       help='Convert heterogeneity of checkpoints. You can convert checkpoints'
+                            ' from homogeneity to heterogeneity, and vice versa.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
