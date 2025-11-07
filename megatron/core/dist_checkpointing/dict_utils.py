@@ -137,22 +137,22 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
 
 def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
     """Helper to print types of (nested) dict values."""
-    print_indent = lambda: print(" " * indent * len(prefix), end="")
+    print_indent = lambda: print(" " * indent * len(prefix), end="")  # pylint: disable=bad-builtin
     if isinstance(x, dict):
-        print()
+        print()  # pylint: disable=bad-builtin
         for k, v in x.items():
-            print_indent()
-            print(f"> {k}: ", end="")
+            print_indent()  # pylint: disable=bad-builtin
+            print(f"> {k}: ", end="")  # pylint: disable=bad-builtin
             inspect_types(v, prefix + (k,), indent)
     elif isinstance(x, list):
-        print()
+        print()  # pylint: disable=bad-builtin
         for i, v in enumerate(x):
-            print_indent()
-            print(f"- {i}: ", end="")
+            print_indent()  # pylint: disable=bad-builtin
+            print(f"- {i}: ", end="")  # pylint: disable=bad-builtin
             inspect_types(v, prefix + (i,), indent)
     else:
         if isinstance(x, torch.Tensor):
-            print(f"Tensor of shape {x.shape}")
+            print(f"Tensor of shape {x.shape}")  # pylint: disable=bad-builtin
         else:
             try:
                 x_str = str(x)
@@ -160,7 +160,7 @@ def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
                 x_str = "<no string repr>"
             if len(x_str) > 30:
                 x_str = x_str[:30] + "... (truncated)"
-            print(f"[{type(x)}]: {x_str}")
+            print(f"[{type(x)}]: {x_str}")  # pylint: disable=bad-builtin
 
 
 def nested_values(x: Union[dict, list]):
