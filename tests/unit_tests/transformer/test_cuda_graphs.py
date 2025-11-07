@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
@@ -556,13 +557,18 @@ class TestPartialCudaGraph:
         self,
         pre_process=True,
         post_process=True,
-        layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
+        layer_spec_fn=get_gpt_decoder_block_spec,
         **config_kwargs,
     ):
         model_parallel_cuda_manual_seed(123)
         args = get_args()
         config = core_transformer_config_from_args(args)
-        transformer_layer_spec = layer_spec_fn()
+        transformer_layer_spec = layer_spec_fn(
+            config,
+            use_transformer_engine=True,
+            normalization=args.normalization,
+            qk_l2_norm=args.qk_l2_norm,
+        )
         if args.mtp_num_layers:
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config, transformer_layer_spec, use_transformer_engine=True
@@ -622,10 +628,11 @@ class TestPartialCudaGraph:
         args.num_experts = 4
         args.expert_model_parallel_size = ep_size
         args.moe_shared_expert_intermediate_size = 1024
-        args.moe_layer_freq = "[0,0,1,1]"
+        args.moe_layer_freq = [0,0,1,1]
         args.moe_permute_fusion = True
         args.moe_router_fusion = True
         args.moe_router_topk = 2
+        args.moe_router_dtype = "fp32"
 
         # CUDA graph settings
         args.cuda_graph_impl = cuda_graph_impl

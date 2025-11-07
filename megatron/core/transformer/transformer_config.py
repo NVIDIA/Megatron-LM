@@ -646,7 +646,7 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_scope: Optional[List[str]] = None
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
-    "moe_router", "moe_preprocess", "mamba". None means ["attn", "mlp"].
+    "moe_router", "moe_preprocess", "mamba". None means the full layer.
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
@@ -1386,22 +1386,24 @@ class TransformerConfig(ModelParallelConfig):
                     'use cuda_graph_impl=transformer_engine instead.'
                 )
                 self.cuda_graph_impl = "transformer_engine"
+
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = []
+        elif not isinstance(self.cuda_graph_scope, list):
+            assert isinstance(self.cuda_graph_scope, str), (
+                "cuda_graph_scope must be a string or a list of strings, "
+                f"got {self.cuda_graph_scope}."
+            )
+            self.cuda_graph_scope = [self.cuda_graph_scope]
+
         if self.cuda_graph_impl != "none":
             assert self.cuda_graph_impl in [
                 "transformer_engine",
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
-
-            if self.cuda_graph_scope is None:
-                self.cuda_graph_scope = []
-            elif not isinstance(self.cuda_graph_scope, list):
-                assert isinstance(self.cuda_graph_scope, str), (
-                    "cuda_graph_scope must be a string or a list of strings, "
-                    f"got {self.cuda_graph_scope}."
-                )
-                self.cuda_graph_scope = [self.cuda_graph_scope]
 
             if self.cuda_graph_impl == "local":
                 assert not self.cuda_graph_scope or self.cuda_graph_scope == ["full_iteration"], (
