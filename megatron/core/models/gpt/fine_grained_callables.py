@@ -9,15 +9,13 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
@@ -65,10 +63,11 @@ def should_free_input(name, is_moe, config):
         "mlp": True,
         "moe_combine": True,
         # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
-        # and it's not needed anymore after the forward pass. If moe_preprocess is in cuda graph scope,
-        # tokens and probs are fixed size tensors, so they cannot be freed.
+        # and it's not needed anymore after the forward pass. If moe_preprocess is in cuda graph
+        # scope, tokens and probs are fixed size tensors, so they cannot be freed.
         # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "moe_dispatch": config.moe_token_dispatcher_type=="alltoall" and ("moe_preprocess" not in config.cuda_graph_scope)
+        "moe_dispatch": config.moe_token_dispatcher_type == "alltoall"
+        and ("moe_preprocess" not in config.cuda_graph_scope),
     }
 
     return free_input_nodes.get(name, False)
@@ -334,16 +333,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     )
 
     class _BackwardDWWrapper:
-        def __init__(self, ):
+        def __init__(self):
             self.graphed_backward_dw_callable = None
             self.attn_dw_callable = layer.self_attention.backward_dw
-            self.shared_expert_dw_callable = partial(layer.mlp.backward_dw, routed_experts=False, shared_experts=True)
+            self.shared_expert_dw_callable = partial(
+                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
+            )
             self.cuda_graph_scope = layer.config.cuda_graph_scope
 
         def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
+            """Store the CUDA graphed backward weight gradient callable."""
             self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
         def backward_dw(self):
+            """Execute weight gradients, skipping CUDA graphed components during replay."""
             is_replay = hasattr(layer, 'cuda_graphs') and layer.cuda_graphs
             if not is_replay or "moe_router" not in self.cuda_graph_scope:
                 self.shared_expert_dw_callable()
@@ -356,16 +359,20 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
-        Performs same attnention forward logic as GPT Model and forward pass for 
+        Performs same attnention forward logic as GPT Model and forward pass for
         computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
 
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             assert (
-                "mlp" not in layer.config.cuda_graph_scope and "moe" not in layer.config.cuda_graph_scope
-            ), "Supported CUDA graph scope with EP overlap: attn, moe_router, moe_preprocess, got {}".format(
-                layer.config.cuda_graph_scope
+                "mlp" not in layer.config.cuda_graph_scope
+                and "moe" not in layer.config.cuda_graph_scope
+            ), (
+                "Supported CUDA graph scope with EP overlap: "
+                "attn, moe_router, moe_preprocess, mlp, got {}".format(
+                    layer.config.cuda_graph_scope
+                )
             )
             forward_func = layer._te_cuda_graph_replay
             attn_backward_dw_wrapper.set_graphed_backward_dw_callable(
@@ -401,7 +408,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-                local_tokens, probs, _ = layer.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+                local_tokens, probs, _ = layer.mlp.preprocess(
+                    pre_mlp_layernorm_output, probs, routing_map
+                )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
         hidden_states, local_tokens, probs, shared_expert_output = forward_func(
@@ -461,13 +470,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # release tensor reference after use
         node.layer_state.dispatched_probs = None
         node.layer_state.pre_mlp_layernorm_output = None
-        
+
         return expert_output
 
-    def submodule_combine_forward(
-        node: ScheduleNode,
-        output: torch.Tensor,
-    ):
+    def submodule_combine_forward(node: ScheduleNode, output: torch.Tensor):
         """
         # Triggers token combine and the remaining computation in the transformer layer.
         # The `mlp_bda` computation is placed after `mlp.combine` due to data dependency.
@@ -477,8 +483,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # with another microbatch's computation and expose the communication.
         """
         residual = node.layer_state.residual
-
-        output = layer.mlp.combine(output, node.layer_state.shared_expert_output)
+        shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
+        output = layer.mlp.combine(output, shared_expert_output)
         mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
@@ -534,9 +540,7 @@ def build_mtp_layer_callables(layer):
     """
 
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
-    attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = (
-        forward_funcs
-    )
+    attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
     is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
@@ -602,13 +606,7 @@ def build_mtp_layer_callables(layer):
     combine_func = partial(rng_context_wrapper, combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
-    forward_funcs = [
-        attn_func,
-        dispatch_func,
-        mlp_func,
-        combine_func,
-        mtp_post_process_func,
-    ]
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
     if isinstance(backward_dw["attn"], list):
         backward_dw["attn"].append(layer.eh_proj)
     else:

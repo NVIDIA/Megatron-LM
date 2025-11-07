@@ -864,36 +864,43 @@ class TestPartialCudaGraph:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _run_1f1b_helper(self, cuda_graph_helper, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps):
-        from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+    def _run_1f1b_helper(
+        self, cuda_graph_helper, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
+    ):
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            TransformerModelChunkSchedulePlan,
+        )
+
         schedule_plans = []
         losses = []
 
         gpt_model[0].zero_grad_buffer()
         optimizer.zero_grad()
         assert cuda_graph_warmup_steps > 0, "cuda_graph_warmup_steps must be greater than 0"
-        for fwd_mb_idx in range(num_iters+1):
+        for fwd_mb_idx in range(num_iters + 1):
 
             # Capture CUDA graphs after warmup if helper is provided
             if cuda_graph_helper is not None and fwd_mb_idx == cuda_graph_warmup_steps:
                 cuda_graph_helper.create_cudagraphs()
-            
+
             if fwd_mb_idx < cuda_graph_warmup_steps:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
                 output = gpt_model[0].forward(**data)
                 schedule_plans.append(None)
             else:
-                f_schedule_plan = gpt_model[0].build_schedule_plan(**data) if fwd_mb_idx < num_iters else None
+                f_schedule_plan = (
+                    gpt_model[0].build_schedule_plan(**data) if fwd_mb_idx < num_iters else None
+                )
                 schedule_plans.append(f_schedule_plan)
-                b_schedule_plan = schedule_plans[fwd_mb_idx-1]
+                b_schedule_plan = schedule_plans[fwd_mb_idx - 1]
                 if b_schedule_plan is not None:
                     gpt_model[0].zero_grad_buffer()
                     optimizer.zero_grad()
                 output = TransformerModelChunkSchedulePlan.run(
                     f_schedule_plan,
                     b_schedule_plan,
-                    b_grad=losses[fwd_mb_idx-1] if fwd_mb_idx > 0 else None,
+                    b_grad=losses[fwd_mb_idx - 1] if fwd_mb_idx > 0 else None,
                 )
             # Check output shapes
             assert output.shape[0] == self.micro_batch_size
@@ -913,7 +920,13 @@ class TestPartialCudaGraph:
         return losses
 
     def _run_test_helper(
-        self, ep_size, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_overlap=False, **kwargs
+        self,
+        ep_size,
+        cuda_graph_impl,
+        cuda_graph_scope,
+        cuda_graph_warmup_steps,
+        ep_overlap=False,
+        **kwargs,
     ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
@@ -948,7 +961,7 @@ class TestPartialCudaGraph:
                 micro_batch_size=self.micro_batch_size,
                 optimizers=[optimizer],
             )
-        
+
         num_iters = 10
         if not ep_overlap:
             for i in range(num_iters):
@@ -991,12 +1004,7 @@ class TestPartialCudaGraph:
                 "loss_mask": loss_mask,
             }
             loss_list = self._run_1f1b_helper(
-                cuda_graph_helper,
-                gpt_model, 
-                optimizer,
-                data,
-                num_iters,
-                cuda_graph_warmup_steps,
+                cuda_graph_helper, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
             )
             loss_list = [loss.item() for loss in loss_list]
 

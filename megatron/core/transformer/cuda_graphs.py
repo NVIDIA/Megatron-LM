@@ -1573,7 +1573,8 @@ class TECudaGraphHelper:
                 tp_group=None,
                 dp_cp_group=None,
                 level=logging.DEBUG,
-                msg=f'Rank {torch.distributed.get_rank()}: ORDER after overlap_moe_expert_parallel_comm {order}',
+                msg=f'Rank {torch.distributed.get_rank()}: '
+                f'ORDER after overlap_moe_expert_parallel_comm {order}',
             )
 
         def get_make_graphed_callables_kwargs():
