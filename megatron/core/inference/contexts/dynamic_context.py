@@ -471,7 +471,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_attn_metadata = None
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=block_count_total,
+            block_count_total=self.block_allocator.total_count,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_total_requests,
             block_size_tokens=self.block_size_tokens,
@@ -479,7 +479,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=block_count_total,
+            block_count_total=self.block_allocator.total_count,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_total_requests,
             block_size_tokens=self.block_size_tokens,
