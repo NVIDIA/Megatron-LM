@@ -329,11 +329,35 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         and layer.config.moe_flex_dispatcher_backend == "deepep"
     )
 
+    class _BackwardDWWrapper:
+        def __init__(self, backward_dw_callable):
+            self.backward_dw_callable = backward_dw_callable
+
+        def set_backward_dw_callable(self, backward_dw_callable):
+            self.backward_dw_callable = backward_dw_callable
+
+        def backward_dw(self):
+            self.backward_dw_callable()
+
+    attn_backward_dw_wrapper = _BackwardDWWrapper(layer.self_attention.backward_dw)
+
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
         Performs same attnention forward logic as GPT Model.
         """
-        hidden_states, _ = layer._forward_attention(
+        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
+            assert (
+                layer.config.cuda_graph_scope == ["attn"]
+            ), "CUDA graph scope must be attn for fine grained callables, got {}".format(
+                layer.config.cuda_graph_scope
+            )
+            forward_fun = layer._te_cuda_graph_replay
+            attn_backward_dw_wrapper.set_backward_dw_callable(
+                partial(layer.backward_dw_cudagraph, layer.current_microbatch)
+            )
+        else:
+            forward_fun = layer._forward_attention
+        hidden_states, _ = forward_fun(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -478,7 +502,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
 
     forward_funcs = [attn_func, post_attn_func, dispatch_func, mlp_func, combine_func, None]
-    backward_dw = {"attn": layer.self_attention, "mlp": layer.mlp}
+    backward_dw = {"attn": attn_backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
 
@@ -567,10 +591,11 @@ def build_mtp_layer_callables(layer):
         combine_func,
         mtp_post_process_func,
     ]
-    backward_dw = {
-        "attn": [layer.transformer_layer.self_attention, layer.eh_proj],
-        "mlp": layer.transformer_layer.mlp,
-    }
+    if isinstance(backward_dw["attn"], list):
+        backward_dw["attn"].append(layer.eh_proj)
+    else:
+        backward_dw["attn"] = [backward_dw["attn"], layer.eh_proj]
+
     return forward_funcs, backward_dw
 
 
