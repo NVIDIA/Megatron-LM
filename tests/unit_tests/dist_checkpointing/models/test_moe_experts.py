@@ -190,7 +190,7 @@ class TestExpertLayerReconfiguration:
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
-            if "dp_cp_group" in list(metadata.keys()):
+            if "dp_cp_group" in metadata.keys():
                 del metadata["dp_cp_group"]
 
             # Load checkpoint A with different TP/PP/EP and save as checkpoint B
@@ -279,7 +279,7 @@ class TestExpertLayerReconfiguration:
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
-            if "dp_cp_group" in list(metadata.keys()):
+            if "dp_cp_group" in metadata.keys():
                 del metadata["dp_cp_group"]
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
@@ -357,7 +357,7 @@ class TestExpertLayerReconfiguration:
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
-            if "dp_cp_group" in list(metadata.keys()):
+            if "dp_cp_group" in metadata.keys():
                 del metadata["dp_cp_group"]
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
