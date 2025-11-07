@@ -626,11 +626,8 @@ class TextGenerationController:
         return_log_probs = False
         for sampling_params, mask in active_sampling_map:
             if sampling_params.return_log_probs:
-                skip_prompt_log_probs_for_dynamic_inference = getattr(
-                    sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
-                )
                 assert (
-                    skip_prompt_log_probs_for_dynamic_inference
+                    sampling_params.skip_prompt_log_probs
                     or materialize_only_last_token_logits is False
                 ), "Materialize only last token logits must be false for returning log probs"
                 return_log_probs = True
