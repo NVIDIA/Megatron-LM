@@ -105,7 +105,7 @@ class TextGenerationController:
         self.cu_skip_prompt_log_probs = torch.empty(max_requests, dtype=torch.bool, device=device)
 
         # Used for inefficient torch sampling.
-        self.torch_sampling_groups: List[Tensor] = []
+        self.torch_sampling_buckets: List[Tensor] = []
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -593,17 +593,27 @@ class TextGenerationController:
         if backend == "torch":
             # Special-case for static sampling.
             if getattr(self, "static_sampling", False):
-                self.torch_sampling_groups = [
-                    torch.arange(active_request_count, device=request_metadata.device)
-                ]
+                bucket = torch.arange(active_request_count, device=request_metadata.device)
+                reps = temp[0].item(), top_k[0].item(), top_p[0].item()
+                self.torch_sampling_buckets = ((bucket, *reps),)
             else:
-                core_params = torch.stack((temp, top_k, top_p), dim=1)
                 # Bucketize the core sampling parameters.
+                core_params = torch.stack((temp, top_k, top_p), dim=1)
                 _, inv_indices, cnts = torch.unique(
                     core_params, dim=0, return_inverse=True, return_counts=True
                 )
                 order = torch.argsort(inv_indices)
-                self.torch_sampling_groups = torch.split(order, cnts.tolist())
+                sampling_buckets = torch.split(order, cnts.tolist())
+                # Perform the D2H sync needed by `_torch_sampling_func` here.
+                group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
+                temp_reps = temp[group_reps].tolist()
+                top_k_reps = top_k[group_reps].tolist()
+                top_p_reps = top_p[group_reps].tolist()
+                # Store the buckets and their equivalence class representatives.
+                self.torch_sampling_buckets = (
+                    (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
+                    for idx in range(len(sampling_buckets))
+                )
 
         # Copy data into relevant tensors.
         self.cu_temperature[:active_request_count].copy_(temp, non_blocking=True)
@@ -646,25 +656,23 @@ class TextGenerationController:
         else:
             last_token_logits = context.last_token_logits(logits)
         active_request_count = last_token_logits.size(0)
-
+        # Copy last_token_logits to contiguous buffer.
         self.cu_sampling_logits[:active_request_count].copy_(last_token_logits, non_blocking=True)
-        # Get sampling parameters via vectorized operation instead of loop.
-        group_reps = torch.stack([indices[0] for indices in self.torch_sampling_groups], dim=0)
+
         if backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
             token_list = []
-            for i, indices in enumerate(self.torch_sampling_groups):
+
+            for indices, temp, top_k, top_p in self.torch_sampling_buckets:
                 token_list.append(
                     self._torch_sampling_func(
-                        self.cu_sampling_logits[indices, :],
-                        self.cu_temperature[group_reps[i]].item(),
-                        self.cu_top_k[group_reps[i]].item(),
-                        self.cu_top_p[group_reps[i]].item(),
+                        self.cu_sampling_logits[indices, :], temp, top_k, top_p
                     )
                 )
+
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
-            sampled_indices = torch.cat(self.torch_sampling_groups, dim=0)
+            sampled_indices = torch.cat(self.torch_sampling_buckets, dim=0)
             self.cu_sampled_tokens.index_copy_(0, sampled_indices, sampled_tokens)
         return self.cu_sampled_tokens[:active_request_count].clone()
 
