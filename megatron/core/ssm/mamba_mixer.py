@@ -268,24 +268,23 @@ class MambaMixer(MegatronModule):
             )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
+        # weight shape: [conv_dim, 1, d_conv]
+        # bias shape: [conv_dim]
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=conv_dim,
+            padding=d_conv - 1,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
+        setattr(self.conv1d.weight, "tensor_model_parallel", True)
+        setattr(self.conv1d.bias, "tensor_model_parallel", True)
 
-        with get_cuda_rng_tracker().fork():
-            # weight shape: [conv_dim, 1, d_conv]
-            # bias shape: [conv_dim]
-            self.conv1d = nn.Conv1d(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                bias=conv_bias,
-                kernel_size=d_conv,
-                groups=conv_dim,
-                padding=d_conv - 1,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
-            setattr(self.conv1d.weight, "tensor_model_parallel", True)
-            setattr(self.conv1d.bias, "tensor_model_parallel", True)
-
-            if self.config.perform_initialization and self.conv_init is not None:
+        if self.config.perform_initialization and self.conv_init is not None:
+            with get_cuda_rng_tracker().fork():
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
         self.activation = "silu"
