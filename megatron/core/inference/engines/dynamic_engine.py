@@ -747,55 +747,41 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
-    async def async_step(
-        self, *, verbose: Optional[bool] = False
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
-        """
-        Wrapper for controller.generate_output_tokens_dynamic_batch(), to
-        match vLLM API. Uses `asyncio` for continuous generation which allows this
-        method to sleep and wake up when new requests are available.
+    async def async_bookkeep(
+        self,
+        step_result: Optional[Dict],
+        step_state: Tuple[bool, int, int, int],
+        step_time: float,
+        step_count: int,
+        *,
+        verbose: bool = False,
+    ):
+        """Uses `asyncio` for continuous bookkeeping.
 
         Args:
-            sampling_params (SamplingParams): The sampling parameters.
+            step_result (Optional[Dict]): The result of the step.
+            step_state (Tuple): is_decode_only, total/paused request count, active token count.
+            step_time (float): How long this step took.
+            step_count (int): The count of the step.
             verbose (bool): Whether to run in verbose mode.
 
         Returns:
-            A tuple comprised of:
-                1. Requests that ran in the last step and are still active.
-                2. Requests that ran in the last step and have now finished.
-                3. The step time in seconds.
+            A dictionary containing:
+                active_requests (List): Requests that ran in the last step and are still active.
+                finished_requests (List): Requests that ran in the last step and have now finished.
+                step_time (float): The step time in seconds.
+                cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        # schedule requests
-        self.schedule_waiting_requests()
-
-        # Previous context state, for printing output below.
-        prev_is_decode_only = self.context.is_decode_only()
-        prev_total_request_count = self.context.total_request_count
-        prev_paused_request_count = self.context.paused_request_count
-        prev_active_token_count = self.context.active_token_count
-
-        range_push("Prefill" if not prev_is_decode_only else "Decode")
-
-        # Generate tokens.
-        is_decode_only = self.context.is_decode_only()
-        # save the is_decode_only AFTER scheduling, BEFORE update
-        self.is_decode_only = is_decode_only
-        self.step_start_event.record()
-        sampling_map = self.get_active_sampling_map()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
-        self.step_end_event.record()
-        self.step_end_event.synchronize()
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-
+        is_decode_only, total_request_count, paused_request_count, active_token_count = step_state
         # Increment finished_request_count.
         cuda_graph_request_count = None
-        if result is not None:
-            active_request_ids = result["active_request_ids"]
-            newly_paused_request_ids = result["newly_paused_request_ids"]
-            finished_request_ids = result["finished_request_ids"]
-            sample = result["sample"]
-            log_probs = result["log_probs"]
-            cuda_graph_request_count = result["cuda_graph_request_count"]
+        if step_result is not None:
+            active_request_ids = step_result["active_request_ids"]
+            newly_paused_request_ids = step_result["newly_paused_request_ids"]
+            finished_request_ids = step_result["finished_request_ids"]
+            sample = step_result["sample"]
+            log_probs = step_result["log_probs"]
+            cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
@@ -826,8 +812,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Log KV cache utilization stats to W&B
         if (
             self.inference_logging_step_interval > 0
-            and self.step_count > 0
-            and self.step_count % self.inference_logging_step_interval == 0
+            and step_count > 0
+            and step_count % self.inference_logging_step_interval == 0
             and self.context.metrics_writer is not None
         ):
 
@@ -837,7 +823,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.inference_step_offset + int(self.step_count)),
+                'inference/inference_step': int(self.inference_step_offset + int(step_count)),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
@@ -868,7 +854,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
-                    self.step_count,
+                    step_count,
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
@@ -877,35 +863,91 @@ class DynamicInferenceEngine(AbstractEngine):
                             step_type,
                             (
                                 "DIM %d:%d"
-                                % (context.padded_active_token_count, prev_active_token_count)
+                                % (context.padded_active_token_count, active_token_count)
                                 if self.context.using_cuda_graph_this_step()
                                 else "OFF"
                             ),
                         )
                     ),
-                    prev_total_request_count,
+                    total_request_count,
                     context.gtd_request_count,
-                    prev_total_request_count - prev_paused_request_count,
-                    prev_paused_request_count,
+                    total_request_count - paused_request_count,
+                    paused_request_count,
                     self.finished_request_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
-            if prev_is_decode_only:
+            if is_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 
-        self.step_count += 1
-
-        range_pop()
         return {
             "active_requests": active_requests,
             "finished_requests": finished_requests,
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+
+    async def async_forward(self) -> Tuple[Dict, Tuple, float]:
+        """Uses `asyncio` for continuous generation.
+        Sleeps when no requests are available, until new requests have been added.
+
+        Returns:
+            A tuple comprised of:
+                step_result (Optional[Dict]): The result of the step.
+                step_state (Tuple): is_decode_only, total/paused request count, active token count.
+                step_time (float): How long this step took.
+        """
+        # schedule requests
+        self.schedule_waiting_requests()
+
+        # Saving pre-step state, for printing output below.
+        is_decode_only = self.context.is_decode_only()
+        step_state = (
+            is_decode_only,
+            self.context.total_request_count,
+            self.context.paused_request_count,
+            self.context.active_token_count,
+        )
+
+        # Generate tokens.
+        range_push("Prefill" if not is_decode_only else "Decode")
+
+        self.step_start_event.record()
+        sampling_map = self.get_active_sampling_map()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        self.step_count += 1
+
+        range_pop()
+        return result, step_state, step_time, self.step_count
+
+    async def async_step(
+        self, *, verbose: Optional[bool] = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """
+        Wrapper for controller.generate_output_tokens_dynamic_batch(), to
+        match vLLM API. Uses `asyncio` for continuous generation which allows this
+        method to sleep and wake up when new requests are available.
+
+        Args:
+            sampling_params (SamplingParams): The sampling parameters.
+            verbose (bool): Whether to run in verbose mode.
+
+        Returns:
+            A tuple comprised of:
+                1. Requests that ran in the last step and are still active.
+                2. Requests that ran in the last step and have now finished.
+                3. The step time in seconds.
+        """
+        step_data = await self.async_forward()
+        ret = await self.async_bookkeep(*step_data, verbose=verbose)
+
+        return ret
 
     def step_modern(
         self, *, verbose: Optional[bool] = False
