@@ -864,8 +864,56 @@ class TestPartialCudaGraph:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
+    def _run_1f1b_helper(self, cuda_graph_helper, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps):
+        from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+        schedule_plans = []
+        losses = []
+
+        gpt_model[0].zero_grad_buffer()
+        optimizer.zero_grad()
+        assert cuda_graph_warmup_steps > 0, "cuda_graph_warmup_steps must be greater than 0"
+        for fwd_mb_idx in range(num_iters+1):
+
+            # Capture CUDA graphs after warmup if helper is provided
+            if cuda_graph_helper is not None and fwd_mb_idx == cuda_graph_warmup_steps:
+                cuda_graph_helper.create_cudagraphs()
+            
+            if fwd_mb_idx < cuda_graph_warmup_steps:
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
+                output = gpt_model[0].forward(**data)
+                schedule_plans.append(None)
+            else:
+                f_schedule_plan = gpt_model[0].build_schedule_plan(**data) if fwd_mb_idx < num_iters else None
+                schedule_plans.append(f_schedule_plan)
+                b_schedule_plan = schedule_plans[fwd_mb_idx-1]
+                if b_schedule_plan is not None:
+                    gpt_model[0].zero_grad_buffer()
+                    optimizer.zero_grad()
+                output = TransformerModelChunkSchedulePlan.run(
+                    f_schedule_plan,
+                    b_schedule_plan,
+                    b_grad=losses[fwd_mb_idx-1] if fwd_mb_idx > 0 else None,
+                )
+            # Check output shapes
+            assert output.shape[0] == self.micro_batch_size
+            assert output.shape[1] == self.seq_length
+
+            # Verify gradients
+            losses.append(output.mean())
+            if fwd_mb_idx < cuda_graph_warmup_steps:
+                losses[-1].backward()
+
+            for param in gpt_model[0].parameters():
+                assert param.main_grad is not None
+
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+        return losses
+
     def _run_test_helper(
-        self, ep_size, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, **kwargs
+        self, ep_size, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_overlap=False, **kwargs
     ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
@@ -900,40 +948,96 @@ class TestPartialCudaGraph:
                 micro_batch_size=self.micro_batch_size,
                 optimizers=[optimizer],
             )
+        
+        num_iters = 10
+        if not ep_overlap:
+            for i in range(num_iters):
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
 
-        for i in range(100):
-            gpt_model[0].zero_grad_buffer()
-            optimizer.zero_grad()
+                # Capture CUDA graphs after warmup if helper is provided
+                if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                    cuda_graph_helper.create_cudagraphs()
 
-            # Capture CUDA graphs after warmup if helper is provided
-            if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
-                cuda_graph_helper.create_cudagraphs()
+                output = gpt_model[0].forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                )
 
-            output = gpt_model[0].forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                loss_mask=loss_mask,
+                # Check output shapes
+                assert output.shape[0] == self.micro_batch_size
+                assert output.shape[1] == self.seq_length
+
+                # Verify gradients
+                loss = output.mean()
+                loss.backward()
+
+                for param in gpt_model[0].parameters():
+                    assert param.main_grad is not None
+
+                update_successful, _, _ = optimizer.step()
+                assert update_successful
+
+                loss_list.append(loss.item())
+        else:
+            data = {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "loss_mask": loss_mask,
+            }
+            loss_list = self._run_1f1b_helper(
+                cuda_graph_helper,
+                gpt_model, 
+                optimizer,
+                data,
+                num_iters,
+                cuda_graph_warmup_steps,
             )
-
-            # Check output shapes
-            assert output.shape[0] == self.micro_batch_size
-            assert output.shape[1] == self.seq_length
-
-            # Verify gradients
-            loss = output.mean()
-            loss.backward()
-
-            for param in gpt_model[0].parameters():
-                assert param.main_grad is not None
-
-            update_successful, _, _ = optimizer.step()
-            assert update_successful
-
-            loss_list.append(loss.item())
+            loss_list = [loss.item() for loss in loss_list]
 
         return torch.tensor(loss_list)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.14.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 1.14.0",
+    )
+    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    def test_moe_partial_cudagraph_with_ep_overlap(self, moe_dispatcher_type):
+        extra_kwargs = {}
+        if moe_dispatcher_type == "deepep":
+            if not is_deep_ep_available():
+                pytest.skip("Deep EP is not available")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+        elif moe_dispatcher_type == "hybridep":
+            if not is_hybrid_ep_available():
+                pytest.skip("Hybrid EP is not available")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
+        else:
+            extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+
+        loss_list_ref = self._run_test_helper(4, "none", None, 0, **extra_kwargs)
+        for cuda_graph_scope in [
+            ["attn"],
+            ["attn", "moe_router"],
+            ["attn", "moe_router", "moe_preprocess"],
+        ]:
+            cuda_graph_warmup_steps = 3
+            loss_list = self._run_test_helper(
+                4,
+                "transformer_engine",
+                cuda_graph_scope,
+                cuda_graph_warmup_steps,
+                ep_overlap=True,
+                **extra_kwargs,
+            )
+            assert torch.equal(loss_list, loss_list_ref)
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.14.0")),
