@@ -41,16 +41,6 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
-
 stimer = StragglerDetector()
 
 
