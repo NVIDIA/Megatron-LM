@@ -64,6 +64,7 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.qk_clip import clip_qk
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -1300,16 +1301,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
     if args.qk_clip:
-        for model_chunk in model:
-            for transformer_layer in model_chunk.module.module.decoder.layers:
-                if hasattr(transformer_layer.self_attention, 'clip_qk'):
-                    log_max_attention_logit = max(
-                        log_max_attention_logit, 
-                        torch.max(
-                            transformer_layer.self_attention.core_attention.current_max_attn_logits
-                        ).item()
-                    )
-                    transformer_layer.self_attention.clip_qk()
+        log_max_attention_logit = clip_qk(model)
             
     timers('optimizer').stop()
 
