@@ -12,12 +12,14 @@ from examples.inference.gpt.gpt_dynamic_inference import (
     get_inference_controller,
     get_model,
 )
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server import run_text_generation_server
+from megatron.core.utils import get_mamba_inference_metadata_from_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
+
 
 def add_text_generation_server_args(parser: argparse.ArgumentParser):
     """Adds the required command line arguments for running the text generation server."""
@@ -36,7 +38,20 @@ if __name__ == "__main__":
 
         args = get_args()
         model = get_model()
-        context = get_inference_context(None, None, calculate_max_sequence_length_from_requests=False)
+
+        (layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            get_mamba_inference_metadata_from_model(model)
+        )
+
+        context = get_inference_context(
+            None,
+            None,
+            calculate_max_sequence_length_from_requests=False,
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+        )
+
         controller = get_inference_controller(model, context)
 
         engine = DynamicInferenceEngine(
@@ -64,7 +79,7 @@ if __name__ == "__main__":
                     engine,
                     args.inference_coordinator_port,
                     args.port,
-                    default_sampling_params=default_sampling_params
+                    default_sampling_params=default_sampling_params,
                 )
             )
         except KeyboardInterrupt:

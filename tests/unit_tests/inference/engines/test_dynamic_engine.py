@@ -45,6 +45,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     check_mamba_sequence_packing_support,
     get_attr_wrapped_model,
+    get_mamba_inference_metadata_from_model,
     is_fa_min_version,
     is_te_min_version,
 )
@@ -369,22 +370,9 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        # Layer type list for hybrid models
-        decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if test_config.model_provider == "mamba":
-            mamba_states_shapes = decoder.mamba_state_shapes_per_request()
-            if mamba_states_shapes is not None:
-                (mamba_conv_states_shape, mamba_ssm_states_shape) = mamba_states_shapes
-            else:
-                # A `MambaBlock` can only not have a `MambaLayer` if using pipeline parallelism
-                # and a particular pipeline stage was not assigned a `MambaLayer`.
-                assert test_config.pipeline_model_parallel_size > 1
-                mamba_conv_states_shape = None
-                mamba_ssm_states_shape = None
-        else:
-            mamba_conv_states_shape = None
-            mamba_ssm_states_shape = None
+        (layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            get_mamba_inference_metadata_from_model(model)
+        )
 
         # Inference config.
         inference_config = InferenceWrapperConfig(

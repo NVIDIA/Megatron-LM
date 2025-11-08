@@ -28,10 +28,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_mamba_inference_metadata_from_model
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -381,14 +380,11 @@ def main():
 
     model = get_model()
 
-    # Layer type list for hybrid models
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-    else:
-        mamba_conv_states_shape = None
-        mamba_ssm_states_shape = None
+    (
+        layer_type_list,
+        mamba_conv_states_shape,
+        mamba_ssm_states
+    ) = get_mamba_inference_metadata_from_model(model)
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
