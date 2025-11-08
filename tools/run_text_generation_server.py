@@ -70,20 +70,11 @@ if __name__ == "__main__":
             num_tokens_to_generate=args.num_tokens_to_generate,
         )
 
-        if os.environ.get("NSIGHT_PREFIX"):
-            torch.cuda.cudart().cudaProfilerStart()
-
-        try:
-            asyncio.run(
-                run_text_generation_server(
-                    engine,
-                    args.inference_coordinator_port,
-                    args.port,
-                    default_sampling_params=default_sampling_params,
-                )
+        asyncio.run(
+            run_text_generation_server(
+                engine,
+                args.inference_coordinator_port,
+                args.port,
+                default_sampling_params=default_sampling_params,
             )
-        except KeyboardInterrupt:
-            pass
-        finally:
-            if os.environ.get("NSIGHT_PREFIX"):
-                torch.cuda.cudart().cudaProfilerStop()
+        )
