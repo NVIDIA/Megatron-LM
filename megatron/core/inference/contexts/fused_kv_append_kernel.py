@@ -119,8 +119,8 @@ def triton_append_key_value_cache(
 
     _, num_heads, h_dim = key.shape
 
-    key_cache = memory_buffer[0, layer_number - 1]
-    value_cache = memory_buffer[1, layer_number - 1]
+    key_cache = memory_buffer[0, layer_number]
+    value_cache = memory_buffer[1, layer_number]
 
     key_to_cache = key[:n_tokens]
     value_to_cache = value[:n_tokens]
