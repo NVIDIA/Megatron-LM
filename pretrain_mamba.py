@@ -54,18 +54,23 @@ stimer = StragglerDetector()
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage):
-        return None, None, None, None, None, None, None
+    empty_batch = {
+        'tokens': None,
+        'labels': None,
+        'loss_mask': None,
+        'attention_mask': None,
+        'position_ids': None,
+        'cu_seqlens': None,
+        'max_seqlen': None,
+    }
 
-    # get batches based on the TP rank you are on
+    if data_iterator is None:
+        return empty_batch.values()
+
     batch = get_batch_on_this_tp_rank(data_iterator)
 
     cu_seqlens = batch['cu_seqlens']
-    if cu_seqlens is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-    else:  # Packed THD format
+    if cu_seqlens is not None:
         assert (
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
         ), "micro-batch-size must be 1 for packing"
@@ -77,6 +82,19 @@ def get_batch(data_iterator, vp_stage=None):
         # TODO(duncan): can this be kept as a 0-D tensor?
         batch['max_seqlen'] = int(max_seqlen[0].item())
 
+    if mpu.is_pipeline_first_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
+        total_tokens = batch['tokens'].size(1)
+    elif mpu.is_pipeline_last_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
+        total_tokens = batch['labels'].size(1)
+    else:  # packed sequence
+        empty_batch['cu_seqlens'] = cu_seqlens
+        empty_batch['max_seqlen'] = max_seqlen
+        return empty_batch.value()
+
+    if cu_seqlens is None:
+        # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+    else:  # Packed THD format
         cp_size = get_context_parallel_world_size()
         if cp_size > 1:  # slice batch along sequence dimension for context parallelism
             assert tex is not None and is_te_min_version("1.10.0"), (
@@ -86,28 +104,15 @@ def get_batch(data_iterator, vp_stage=None):
             cp_rank = get_context_parallel_rank()
             index = tex.thd_get_partitioned_indices(
                 cu_seqlens,
-                batch['tokens'].size(1),
+                total_tokens,
                 cp_size,
                 cp_rank,
             )
             for key, data in batch.items():
                 if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
                     continue
-                if data is None:  # On PP rank 0, labels and loss_mask will be None
-                    batch[key] = None
-                else:
+                if data is not None:  # on PP rank 0, labels and loss_mask will be None
                     batch[key] = data.index_select(1, index)
-
-        # Reshape from [B,S] to [T,1]
-        # I don't think this is needed
-        # for key, data in batch.items():
-        #     if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
-        #         continue
-        #     batch[key] = (
-        #         batch[key].contiguous()
-        #         .view(batch[key].shape[0] * batch[key].shape[1])
-        #         .unsqueeze(0)
-        #     )
 
     return batch.values()
 
@@ -228,8 +233,13 @@ def forward_step(data_iterator, model: MambaModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None):
-    return is_first_or_last_pipeline_stage(vp_stage) and mpu.get_tensor_model_parallel_rank() == 0
+def is_dataset_built_on_rank(vp_stage=None, sft=False):
+    if mpu.get_tensor_model_parallel_rank() != 0:
+        return False
+    elif sft:
+        return True
+    else:
+        return is_first_or_last_pipeline_stage(vp_stage)
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -294,7 +304,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage),
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage, sft=args.sft),
         config
     ).build()
 

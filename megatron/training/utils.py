@@ -549,6 +549,29 @@ def get_batch_on_this_tp_rank(data_iterator):
             ),
         }
 
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(batch['tokens'])
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['attention_mask'])
+            _broadcast(batch['position_ids'])
+
+        elif mpu.is_pipeline_first_stage():
+            _broadcast(batch['tokens'])
+            _broadcast(batch['attention_mask'])
+            _broadcast(batch['position_ids'])
+
+        elif mpu.is_pipeline_last_stage():
+            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
+            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
+            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+            if args.mtp_num_layers is not None:
+                _broadcast(batch['tokens'])
+                _broadcast(batch['position_ids'])
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['attention_mask'])
+
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
 
@@ -565,34 +588,8 @@ def get_batch_on_this_tp_rank(data_iterator):
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
-        if args.pipeline_model_parallel_size == 1:
-            _broadcast(batch['tokens'])
-            _broadcast(batch['labels'])
-            _broadcast(batch['loss_mask'])
-            _broadcast(batch['attention_mask'])
-            _broadcast(batch['position_ids'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
-
-        elif mpu.is_pipeline_first_stage():
-            _broadcast(batch['tokens'])
-            _broadcast(batch['attention_mask'])
-            _broadcast(batch['position_ids'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
-
-        elif mpu.is_pipeline_last_stage():
-            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
-            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
-            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
-                _broadcast(batch['tokens'])
-                _broadcast(batch['position_ids'])
-                _broadcast_cu_seqlens(batch['cu_seqlens'])
-                _broadcast(batch['max_seqlen'])
-            _broadcast(batch['labels'])
-            _broadcast(batch['loss_mask'])
-            _broadcast(batch['attention_mask'])
+        _broadcast_cu_seqlens(batch['cu_seqlens'])
+        _broadcast(batch['max_seqlen'])
 
     else:
 
@@ -634,6 +631,36 @@ def get_batch_on_this_tp_rank(data_iterator):
         else:
             max_seqlen = None
 
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(tokens)
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            _broadcast(attention_mask)
+            _broadcast(position_ids)
+
+        elif mpu.is_pipeline_first_stage():
+            labels = None
+            loss_mask = None
+
+            _broadcast(tokens)
+            _broadcast(attention_mask)
+            _broadcast(position_ids)
+
+        elif mpu.is_pipeline_last_stage():
+            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
+            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
+            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+            if args.mtp_num_layers is not None:
+                _broadcast(tokens)
+                _broadcast(position_ids)
+            else:
+                tokens = None
+                position_ids = None
+
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            _broadcast(attention_mask)
+
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
 
@@ -649,43 +676,8 @@ def get_batch_on_this_tp_rank(data_iterator):
 
             return cu_seqlens if n > 0 else None
 
-        if args.pipeline_model_parallel_size == 1:
-            _broadcast(tokens)
-            _broadcast(labels)
-            _broadcast(loss_mask)
-            _broadcast(attention_mask)
-            _broadcast(position_ids)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
-
-        elif mpu.is_pipeline_first_stage():
-            labels = None
-            loss_mask = None
-
-            _broadcast(tokens)
-            _broadcast(attention_mask)
-            _broadcast(position_ids)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
-
-        elif mpu.is_pipeline_last_stage():
-            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
-            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
-            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
-                _broadcast(tokens)
-                _broadcast(position_ids)
-                cu_seqlens = _broadcast_cu_seqlens()
-                _broadcast(max_seqlen)
-            else:
-                tokens = None
-                position_ids = None
-                cu_seqlens = None
-                max_seqlen = None
-
-            _broadcast(labels)
-            _broadcast(loss_mask)
-            _broadcast(attention_mask)
+        cu_seqlens = _broadcast_cu_seqlens()
+        _broadcast(max_seqlen)
 
         batch = {
             'tokens': tokens,
