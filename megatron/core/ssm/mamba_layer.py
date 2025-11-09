@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -82,6 +82,10 @@ class MambaLayer(GraphableMegatronModule):
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+        """Returns the Mamba conv and ssm states shapes per request."""
+        return self.mixer.mamba_state_shapes_per_request()
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -127,10 +131,6 @@ class MambaLayer(GraphableMegatronModule):
 
         return hidden_states
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """Allocate the inference cache."""
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
-
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -163,7 +163,7 @@ class MambaLayer(GraphableMegatronModule):
         """
         assert kwargs.get('inference_context') is None, (
             "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
-            "For inference cuda graph, please use enable_cuda_graph instead."
+            "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
         return super()._te_cuda_graph_replay(*args, **kwargs)
 
