@@ -145,7 +145,6 @@ class InferenceClient:
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
         assert Headers(reply) == Headers.ACK
 
-    @trace_async_exceptions
     async def start(self):
         """
         Connects to the coordinator and starts the background listener task.
