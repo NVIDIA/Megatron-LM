@@ -17,14 +17,16 @@ import threading
 import time
 import traceback
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
 
+import numpy
 import torch
 
 from megatron.core import config
@@ -2095,3 +2097,58 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
     return loop
+
+
+_ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
+
+
+def trace_async_exceptions(
+    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
+) -> Callable[..., Coroutine]:
+    """Decorator to be applied to every coroutine that runs in a separate task.
+
+    This is needed because asyncio tasks do not propagate exceptions.
+    Coroutines running inside separate tasks will fail silently if not decorated.
+
+    Passing in `verbose=True` will print additional lifetime logging information about the task.
+    Such functionality is relied on by some users, and can be enabled as shown below:
+    ```
+        @trace_async_exceptions(verbose=True)
+        async def my_coroutine(...):
+            ...
+    ```
+    """
+
+    def _decorate(fn):
+        if not asyncio.iscoroutinefunction(fn):
+            raise TypeError("trace_async_exceptions can only be used with async functions")
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if verbose:
+                start = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"Exception in async function {fn.__name__}: {e}")
+                traceback.print_exc()
+                sys.exit(1)
+            finally:
+                if verbose:
+                    elapsed = (time.perf_counter() - start) * 1000.0
+                    name = fn.__qualname__
+                    cnt, tot = _ASYNC_TASK_STATS[name]
+                    _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+                    avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+
+                    log10 = numpy.log10(max(cnt, 1))
+                    if numpy.isclose(log10, round(log10)):
+                        logger.info(
+                            f"{name} completed in {elapsed:.3f} ms, "
+                            f"lifetime avg: {avg:.3f} ms, "
+                            f"lifetime cnt: {cnt + 1}"
+                        )
+
+        return wrapper
+
+    return _decorate if func is None else _decorate(func)
