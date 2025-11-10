@@ -455,7 +455,10 @@ def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
     if not args.export_offline_model:
-        report_draft_acceptance_length(model)
+        try:
+            report_draft_acceptance_length(model)
+        except Exception as e:
+            print(e)
 
 
 
