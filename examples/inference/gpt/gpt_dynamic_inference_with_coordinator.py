@@ -61,15 +61,25 @@ async def main(
         #tbar = tqdm(total=num_requests_total)
         while True:
             current_time = time.time_ns() / 10**9
-            # Only add requests that have arrived at the current time.
-            while num_requests_added < num_requests_total and requests[num_requests_added].time_arrival <= current_time:
-                request = requests[num_requests_added]
-                # These add-request calls will queue up the request on a zmq socket and return
-                # instantaneously. They will return an asyncio future which can be awaited for
-                # request completion.
-                futures.append(client.add_request(request.prompt_text, request.sampling_params))
-                num_requests_added += 1
-                #tbar.update(1)
+            if args.incoming_requests_per_step is None:
+                # Only add requests that have arrived at the current time.
+                while num_requests_added < num_requests_total and requests[num_requests_added].time_arrival <= current_time:
+                    request = requests[num_requests_added]
+                    # These add-request calls will queue up the request on a zmq socket and return
+                    # instantaneously. They will return an asyncio future which can be awaited for
+                    # request completion.
+                    futures.append(client.add_request(request.prompt_text, request.sampling_params))
+                    num_requests_added += 1
+                    #tbar.update(1)
+            else:
+                # Add deterministic number of requests (generally used for debugging).
+                for _ in range(min(
+                    args.incoming_requests_per_step,
+                    num_requests_total - num_requests_added
+                )):
+                    request = requests[num_requests_added]
+                    futures.append(client.add_request(request.prompt_text, request.sampling_params))
+                    num_requests_added += 1
             if num_requests_added == num_requests_total:
                 break
             # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 
