@@ -267,7 +267,7 @@ def checkpoint_exists(checkpoints_path):
 def read_metadata(tracker_filename):
     # Read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
-    iteration = 0
+    iteration = -1
     release = False
 
     with open_file(tracker_filename, 'r') as f:
@@ -280,7 +280,7 @@ def read_metadata(tracker_filename):
                 print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
                     tracker_filename))
                 sys.exit()
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+    assert iteration > -1 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
     # Get the max iteration retrieved across the ranks.
