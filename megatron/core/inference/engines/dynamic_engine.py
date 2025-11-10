@@ -33,8 +33,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 try:
     from tqdm import tqdm
@@ -56,6 +56,14 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+try:
+    import wandb
+
+    HAVE_WANDB = True
+except ImportError:
+    HAVE_WANDB = False
+    wandb = None
 
 
 def format_mem_bytes(mem_bytes):
@@ -89,6 +97,8 @@ class DynamicInferenceEngine(AbstractEngine):
         static_sampling (bool): If True, all requests are assumed to have the same
             sampling parameters. This avoids needing to loop through all requests and
             their sampling parameters every generation step, improving latency.
+        inference_logging_step_interval (int): The step interval at which to log
+        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
     def __init__(
@@ -101,6 +111,7 @@ class DynamicInferenceEngine(AbstractEngine):
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
         static_sampling: bool = False,
+        inference_logging_step_interval: int = 0,
     ):
 
         if enable_cuda_graph is not None:
@@ -136,6 +147,32 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.static_sampling = static_sampling
+
+        self.inference_logging_step_interval = inference_logging_step_interval
+        # Configure wandb to use separate step counter for inference metrics (only once)
+        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
+            logging.info(
+                f"\033[1;93m[INFERENCE]\033[0m "
+                f"\033[1;95mLogging inference metrics to wandb (rank {torch.distributed.get_rank()})\033[0m"
+            )
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                # Make all inference/* metrics use inference_step as their x-axis
+                # This allows inference and training to have independent step counters
+                context.metrics_writer.define_metric(
+                    "inference/*", step_metric="inference/inference_step"
+                )
+                # Initialize inference step offset by querying existing run history
+                self.inference_step_offset = 0
+                if wandb.run is not None:
+                    api_run = wandb.Api().run(
+                        f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
+                    )
+                    max_step = 0
+                    for row in api_run.scan_history(keys=["inference/inference_step"]):
+                        val = row.get("inference/inference_step")
+                        if isinstance(val, (int, float)) and int(val) > max_step:
+                            max_step = int(val)
+                    self.inference_step_offset = int(max_step)
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -256,7 +293,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
-        self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
+        self,
+        inference_coordinator_port: int,
+        launch_inference_coordinator: bool = True,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -370,12 +411,14 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.barrier(parallel_state.get_tensor_model_parallel_group())
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
-            coordinator_ready_event.wait()
+            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
+        loop = get_asyncio_loop(loop)
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
+    @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
         async with self._cond:
@@ -429,7 +472,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
+        self.request_completion_futures[request_id] = self._loop.create_future()
         return self.request_completion_futures[request_id]
 
     def add_request(
@@ -599,12 +642,12 @@ class DynamicInferenceEngine(AbstractEngine):
         while self.waiting_request_ids:
             req = self.requests[self.waiting_request_ids[0]]
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req, safe=True)
+                self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
-                    asyncio.create_task, self._notify_cond_for_new_request()
+                    self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add()
@@ -665,7 +708,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -673,9 +716,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.active_token_count + remaining_len <= self.context.max_tokens
             )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(
-                req, safe=not is_continuing_chunked_prefill
-            )
+            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
             if request_can_be_added and kv_cache_available:
@@ -683,7 +724,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add()
@@ -695,7 +736,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
@@ -780,6 +821,41 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures[failed_request_id].set_result(failed_request)
         self.failed_request_ids.clear()
 
+        # Log KV cache utilization stats to W&B
+        if (
+            self.inference_logging_step_interval > 0
+            and self.step_count > 0
+            and self.step_count % self.inference_logging_step_interval == 0
+            and self.context.metrics_writer is not None
+        ):
+
+            # Get KV cache utilization stats from dynamic context
+            kv_stats = self.context.get_kvcache_utilization_stats()
+
+            # Prepare metrics dictionary with all stats
+            # Use 'inference/' prefix for all metrics to separate from training metrics
+            metrics = {
+                'inference/inference_step': int(self.inference_step_offset + int(self.step_count)),
+                'inference/step_time_s': float(step_time),
+                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
+                'inference/total_requests_dict_size': int(len(self.requests)),
+            }
+            # Add KV stats with inference/ prefix
+            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
+            for key, value in kv_stats.items():
+                if 'utilization' in key:
+                    # Convert to percentage (0-100) and group under kvcache_utilization
+                    metrics[f'inference/{key}'] = float(value * 100.0)
+                else:
+                    metrics[f'inference/{key}'] = value
+
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                self.context.metrics_writer.log(metrics, commit=True)
+            else:
+                raise ValueError(
+                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
+                )
+
         # Print context state.
         if verbose:
             context = self.context
@@ -787,7 +863,8 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
+                "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
+                "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.step_count,
@@ -805,11 +882,16 @@ class DynamicInferenceEngine(AbstractEngine):
                             ),
                         )
                     ),
-                    prev_total_request_count,
-                    context.gtd_request_count,
                     prev_total_request_count - prev_paused_request_count,
+                    context.block_allocator.active_count,
                     prev_paused_request_count,
+                    context.block_allocator.paused_count,
+                    len(self.waiting_request_ids),
                     self.finished_request_count,
+                    context.block_allocator.get_active_used(),
+                    context.block_allocator.active_count,
+                    context.block_allocator.get_paused_used(),
+                    context.block_allocator.paused_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
@@ -867,7 +949,7 @@ class DynamicInferenceEngine(AbstractEngine):
             result = self.step_modern()
             finished_requests_list.extend(result["finished_requests"])
 
-        # Ensure requests are returned in the same order they were passed in.
+        # Ensure requests are returned in the same order they were passed in
         finished_requests_list.sort(key=lambda x: x.request_id)
 
         return finished_requests_list
@@ -967,8 +1049,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
         parallel_state.destroy_model_parallel()
 
-    async def run_engine(self, *, verbose: Optional[bool] = False):
+    @trace_async_exceptions
+    async def run_engine(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -982,8 +1068,12 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def run_engine_with_coordinator(self, *, verbose: Optional[bool] = False):
+    @trace_async_exceptions
+    async def run_engine_with_coordinator(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 self.schedule_requests()

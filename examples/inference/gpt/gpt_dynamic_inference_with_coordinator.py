@@ -20,6 +20,10 @@ import json
 from megatron.training.arguments import parse_args
 from megatron.core import parallel_state
 
+import logging
+
+logging.basicConfig(level=logging.INFO, force=True)
+
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],

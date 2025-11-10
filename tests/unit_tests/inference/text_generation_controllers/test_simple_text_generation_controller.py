@@ -66,7 +66,7 @@ class TestTextGenerationController:
         else:
             model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
         self.batch_size = batch_size
-        self.hidden_size = 12
+        self.hidden_size = 32
         self.vocab_size = 100
         self.sequence_length = 60 if fp8 else 64  # Test padding for fp8
         transformer_config = TransformerConfig(
@@ -116,8 +116,7 @@ class TestTextGenerationController:
                 kv_channels=transformer_config.kv_channels,
                 num_attention_heads=transformer_config.num_attention_heads,
                 max_sequence_length=2048,
-                buffer_size_gb=1,
-                buffer_guaranteed_fraction=0.1,
+                active_buffer_size_gb=0.2,
                 materialize_only_last_token_logits=False,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
