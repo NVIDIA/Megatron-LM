@@ -55,6 +55,15 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Number of tokens to generate for each prompt',
     )
     group.add_argument(
+        "--num-tokens-to-generate-random",
+        type=int,
+        nargs="+",
+        default=None,
+        help='Number of tokens to generate for each prompt. This can be a '
+        'space-separated pair of integers, and the generated output lengths will '
+        'be uniformly sampled within this range.',
+    )
+    group.add_argument(
         "--top-n-logprobs",
         type=int,
         default=0,
@@ -263,6 +272,9 @@ def get_synthetic_requests(
         args.incoming_requests_per_sec,
         int(args.incoming_requests_per_sec * args.incoming_requests_duration),
     )
+
+    if args.num_tokens_to_generate_random is not None:
+        sampling_params.num_tokens_to_generate = random.randint(*args.num_tokens_to_generate_random)
 
     # Init requests.
     requests = [

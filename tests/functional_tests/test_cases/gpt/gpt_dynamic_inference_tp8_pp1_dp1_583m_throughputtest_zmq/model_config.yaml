@@ -35,11 +35,12 @@ MODEL_ARGS:
   --hidden-size: 1152
   --num-attention-heads: 16
   --max-position-embeddings: 1024
-  --seq-length: 512
-  --temperature: 1.0
+  --seq-length: 1024
+  --top_p: 1
   --top_k: 1
   --return-log-probs: true
-  --num-tokens-to-generate: 128
+  --num-tokens-to-prompt: 32 512
+  --num-tokens-to-generate-random: 32 512
   --inference-dynamic-batching-max-requests-override: 512
   --inference-dynamic-batching-buffer-guaranteed-fraction: 0
   --inference-dynamic-batching-buffer-overflow-factor: 0.2
