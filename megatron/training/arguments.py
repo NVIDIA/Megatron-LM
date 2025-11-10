@@ -1004,9 +1004,8 @@ def validate_args(args, defaults={}):
         args.add_qkv_bias = True
 
     if args.qk_clip:
-        # TODO: add is_te_min_version("2.9.0") before merge
-        # assert is_te_min_version("2.9.0"), \
-        #     '--qk-clip is only supported with TE >= 2.9.0.'
+        assert is_te_min_version("2.9.0"), \
+            '--qk-clip is only supported with TE >= 2.9.0.'
         assert 0.0 < args.qk_clip_alpha < 1.0, \
             '--qk-clip-balancing-alpha must be between 0.0 and 1.0 when using --qk-clip.'
         assert args.qk_clip_threshold > 0, \
