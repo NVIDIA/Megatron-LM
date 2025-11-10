@@ -3275,7 +3275,7 @@ def _add_sparse_attention_args(parser):
                        help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
     group.add_argument('--index-head-dim', default=None, type=int,
                        help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
-    group.add_argument('--index-topk', default=256, type=int,
+    group.add_argument('--index-topk', default=None, type=int,
                        help='Number of top-k tokens to select in sparse attention indexer.')
     group.add_argument('--indexer-loss-coeff', default=0.0, type=float,
                        help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')

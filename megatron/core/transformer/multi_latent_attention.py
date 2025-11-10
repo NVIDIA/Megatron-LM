@@ -148,7 +148,6 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
-        # TODO(kunlunl): Support sparse attention.
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -292,9 +291,9 @@ class MultiLatentAttention(Attention):
                         query,
                         key,
                         value,
-                        hidden_states,
-                        q_compressed,
-                        attention_mask,
+                        x=hidden_states,
+                        qr=q_compressed,
+                        attention_mask=attention_mask,
                         attn_mask_type=attn_mask_type,
                         attention_bias=None,
                         packed_seq_params=packed_seq_params,
@@ -829,7 +828,7 @@ class MLASelfAttention(MultiLatentAttention):
         return query, key, value, q_compressed, kv_compressed
 
     def get_query_key_value_tensors(self, *args, **kwargs):
-        # Only return q, k, v
+        # Only return query, key and value.
         return get_query_key_value_and_compressed_tensors(self, *args, **kwargs)[:3]
 
     def uncompress_kv_from_cache(self, kv_cached):

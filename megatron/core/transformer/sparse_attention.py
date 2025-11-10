@@ -598,21 +598,30 @@ class SparseAttention(MegatronModule):
         # Apply sparse mask from indexer
         # ===================================
         # topk_indices: [b, sq, topk]
-        # Create sparse mask
-        index_mask = torch.full(
-            (b, sq, sk), float("-inf"), device=query.device, dtype=attention_scores.dtype
+
+        # Step 1: Create sparse selection mask (only allow top-k)
+        # Start with all positions masked (True = masked)
+        sparse_mask = torch.ones(
+            (b, sq, sk), dtype=torch.bool, device=query.device
         )
-        # Fill top-k positions with 0 (allow attention)
-        index_mask.scatter_(-1, topk_indices, 0)
+        # Allow top-k positions (False = not masked)
+        sparse_mask.scatter_(-1, topk_indices, False)
 
-        # Expand index_mask to [b, np, sq, sk]
-        index_mask = index_mask.unsqueeze(1).expand(-1, np, -1, -1)
+        # Expand to [b, np, sq, sk]
+        sparse_mask = sparse_mask.unsqueeze(1).expand(-1, np, -1, -1)
 
-        # Combine with regular attention mask
+        # Step 2: Combine with regular attention mask if provided
         if attention_mask is not None:
-            index_mask = index_mask + attention_mask
+            # attention_mask is boolean: True = masked, False = allowed
+            # Combine with OR: position is masked if EITHER mask says so
+            if attention_mask.dtype == torch.bool:
+                sparse_mask = sparse_mask | attention_mask
+            else:
+                # If attention_mask is float (-inf for masked), convert to boolean
+                sparse_mask = sparse_mask | (attention_mask < -1000.0)
 
-        attention_scores = attention_scores + index_mask
+        # Step 3: Apply combined mask to attention scores
+        attention_scores = attention_scores.masked_fill(sparse_mask, float("-inf"))
 
         # ===================================
         # Attention probabilities [b, np, sq, sk]
@@ -645,16 +654,15 @@ class SparseAttention(MegatronModule):
             # Get indexer loss coefficient from config
             indexer_loss_coeff = getattr(self.config, 'indexer_loss_coeff', 0.0)
 
-            if indexer_loss_coeff > 0:
-                # Compute KL divergence loss between indexer scores and true attention scores
-                indexer_loss = compute_indexer_loss(
-                    index_scores,
-                    attention_scores.detach(),  # Don't backprop through attention scores
-                    indexer_loss_coeff
-                )
+            # Compute KL divergence loss between indexer scores and true attention scores
+            indexer_loss = compute_indexer_loss(
+                index_scores,
+                attention_scores.detach(),  # Don't backprop through attention scores
+                indexer_loss_coeff
+            )
 
-                # Attach loss to context output (will trigger backward through indexer)
-                context = IndexerLossAutoScaler.apply(context, indexer_loss)
+            # Attach loss to context output (will trigger backward through indexer)
+            context = IndexerLossAutoScaler.apply(context, indexer_loss)
 
         return context
 
