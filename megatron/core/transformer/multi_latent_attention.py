@@ -234,13 +234,22 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
-        )
+        if self.config.sparse_attention_type is None:
+            query, key, value = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
+        else:
+            query, key, value, q_compressed, _ = self.get_query_key_value_and_compressed_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
 
         # ===================================================
         # Adjust key, value for inference
@@ -268,14 +277,28 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    packed_seq_params=packed_seq_params,
-                    attn_mask_type=attn_mask_type,
-                )
+                if self.config.sparse_attention_type is None:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        packed_seq_params=packed_seq_params,
+                        attn_mask_type=attn_mask_type,
+                    )
+                else:
+                    # For sparse attention, use a specialized forward.
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        hidden_states,
+                        q_compressed,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=None,
+                        packed_seq_params=packed_seq_params,
+                    )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -461,7 +484,7 @@ class MLASelfAttention(MultiLatentAttention):
             eps=self.config.layernorm_epsilon,
         )
 
-    def get_query_key_value_tensors(
+    def get_query_key_value_and_compressed_tensors(
         self,
         hidden_states,
         key_value_states=None,
@@ -580,6 +603,16 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = k_pos_emb.squeeze(1)
 
         # =========================================
+        # Apply norm
+        # =========================================
+
+        if self.config.q_lora_rank is not None:
+            # q_compressed: [num_tokens, q_lora_rank]
+            q_compressed = self.q_layernorm(q_compressed)
+
+        kv_compressed = self.kv_layernorm(kv_compressed)
+
+        # =========================================
         # QKV up projection and RoPE apply
         # =========================================
 
@@ -589,7 +622,6 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q_compressed = self.q_layernorm(q_compressed)
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
@@ -598,8 +630,6 @@ class MLASelfAttention(MultiLatentAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            kv_compressed = self.kv_layernorm(kv_compressed)
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
@@ -664,7 +694,6 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q_compressed = self.q_layernorm(q_compressed)
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
@@ -673,8 +702,6 @@ class MLASelfAttention(MultiLatentAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            kv_compressed = self.kv_layernorm(kv_compressed)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
@@ -799,7 +826,11 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        return query, key, value
+        return query, key, value, q_compressed, kv_compressed
+
+    def get_query_key_value_tensors(self, *args, **kwargs):
+        # Only return q, k, v
+        return get_query_key_value_and_compressed_tensors(self, *args, **kwargs)[:3]
 
     def uncompress_kv_from_cache(self, kv_cached):
         """

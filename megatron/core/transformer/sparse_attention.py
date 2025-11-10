@@ -296,6 +296,9 @@ class Indexer(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
         )
 
         self.wk = build_module(
@@ -305,6 +308,9 @@ class Indexer(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
         )
 
         self.k_norm = build_module(
@@ -322,6 +328,9 @@ class Indexer(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
         )
 
         self.softmax_scale: float = self.head_dim ** -0.5
@@ -337,8 +346,8 @@ class Indexer(MegatronModule):
         Forward pass for Indexer.
 
         Args:
-            x: Input tensor [batch, seq_len, hidden_dim] or [seq, batch, hidden_dim]
-            qr: Query representation tensor [batch, seq_len, q_lora_rank]
+            x: Input tensor [seq, batch, hidden_dim]
+            qr: Query representation tensor [seq, batch, q_lora_rank]
             mask: Attention mask
             packed_seq_params: Packed sequence parameters for variable length sequences
 
@@ -362,8 +371,8 @@ class Indexer(MegatronModule):
         This is used when KL loss is enabled to compare indexer scores with true attention scores.
 
         Args:
-            x: Input tensor [batch, seq_len, hidden_dim]
-            qr: Query representation tensor [batch, seq_len, q_lora_rank]
+            x: Input tensor [seq, batch, hidden_dim]
+            qr: Query representation tensor [seq, batch, q_lora_rank]
             mask: Attention mask
             packed_seq_params: Packed sequence parameters
 
@@ -371,7 +380,8 @@ class Indexer(MegatronModule):
             index_scores: Index scores [batch, seq_len, seq_len]
             topk_indices: Top-k indices [batch, seq_len, index_topk]
         """
-        bsz, seqlen, _ = x.size()
+        # Input format: [seq, batch, hidden]
+        seqlen, bsz, _ = x.size()
 
         # Compute rotary position embeddings internally
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
@@ -381,13 +391,12 @@ class Indexer(MegatronModule):
         else:  # yarn
             rotary_pos_emb, mscale = self.rotary_pos_emb(seqlen, packed_seq=packed_seq)
 
-        q = self.wq_b(qr)
-        q = q.reshape(bsz, seqlen, -1, self.head_dim)
+        q, _ = self.wq_b(qr)  # [seq, batch, heads*head_dim]
+        q = q.reshape(seqlen, bsz, -1, self.head_dim)  # [seq, batch, heads, head_dim]
         q_pe, q_nope = torch.split(
             q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        # Apply RoPE to query position embedding part
         q_pe = apply_rotary_pos_emb(
             q_pe,
             rotary_pos_emb,
@@ -395,16 +404,15 @@ class Indexer(MegatronModule):
             cp_group=self.pg_collection.cp,
             mscale=mscale,
         )
-        q = torch.cat([q_pe, q_nope], dim=-1)
+        q = torch.cat([q_pe, q_nope], dim=-1)  # [seq, batch, heads, head_dim]
 
-        k = self.wk(x)
-        k = self.k_norm(k)
+        k, _ = self.wk(x)  # [seq, batch, head_dim]
+        k = self.k_norm(k)  # [seq, batch, head_dim]
         k_pe, k_nope = torch.split(
             k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        # Apply RoPE to key position embedding part
-        k_pe = k_pe.unsqueeze(2)  # [batch, seq_len, 1, rope_head_dim]
+        k_pe = k_pe.unsqueeze(2)  # [seq, batch, 1, rope_head_dim]
         k_pe = apply_rotary_pos_emb(
             k_pe,
             rotary_pos_emb,
@@ -412,16 +420,25 @@ class Indexer(MegatronModule):
             cp_group=self.pg_collection.cp,
             mscale=mscale,
         )
-        k_pe = k_pe.squeeze(2)  # [batch, seq_len, rope_head_dim]
-        k = torch.cat([k_pe, k_nope], dim=-1)
+        k_pe = k_pe.squeeze(2)  # [seq, batch, rope_head_dim]
+        k = torch.cat([k_pe, k_nope], dim=-1)  # [seq, batch, head_dim]
 
+        # For compute_index_score, we need batch-first format
+        # Transpose to [batch, seq, heads, head_dim]
+        q = q.transpose(0, 1)  # [seq, batch, heads, head_dim] -> [batch, seq, heads, head_dim]
+        k = k.transpose(0, 1)  # [seq, batch, head_dim] -> [batch, seq, head_dim]
+        
         q = rotate_activation(q)
         k = rotate_activation(k)
 
-        weights = self.weights_proj(x) * self.n_heads ** -0.5
+        # weights_proj expects seq-first, so use original x
+        weights, _ = self.weights_proj(x)  # [seq, batch, n_heads]
+        weights = weights.transpose(0, 1)  # -> [batch, seq, n_heads]
+        weights = weights * self.n_heads ** -0.5
         weights = weights.unsqueeze(-1) * self.softmax_scale
 
         # Compute index scores (BF16 version of the FP8 kernel)
+        # All inputs are now batch-first
         index_scores = compute_index_score(q.contiguous(), weights, k.contiguous())
 
         if mask is not None:
@@ -516,12 +533,12 @@ class SparseAttention(MegatronModule):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        x: torch.Tensor,
+        qr: torch.Tensor,
         attention_mask: torch.Tensor,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
-        x: Optional[torch.Tensor] = None,
-        qr: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -543,14 +560,19 @@ class SparseAttention(MegatronModule):
         # Input shape: [sq, b, np, hn]
         sq, b, np, hn = query.size()
         sk = key.size(0)
+        v_hn = value.size(3)  # Value head dimension may differ from query/key
 
-        # Prepare inputs for indexer (expects batch-first [b, s, h] format)
-        if x is None:
-            # Convert query from [sq, b, np, hn] to [b, sq, np*hn]
-            x = query.transpose(0, 1).reshape(b, sq, np * hn)
-        if qr is None:
-            # For non-MLA, use x as qr
-            qr = x
+        # ===================================
+        # Use Indexer for sparse selection (do this first to compute loss before using query)
+        # ===================================
+        # Get index scores and top-k indices
+        # Note: We need to get index_scores before topk for KL loss computation
+        # Detach x and qr to prevent gradients from flowing back to the main model
+        # Indexer is trained solely through the indexer_loss (KL divergence)
+        # TODO(kunlunl): Should x and qr be detached?
+        index_scores, topk_indices = self.indexer.forward_with_scores(
+            x.detach(), qr.detach(), mask=None, packed_seq_params=packed_seq_params
+        )
 
         # ===================================
         # Raw attention scores [b, np, sq, sk]
@@ -571,34 +593,6 @@ class SparseAttention(MegatronModule):
 
         # Reshape to [b, np, sq, sk]
         attention_scores = attention_scores.view(*output_size)
-
-        # ===================================
-        # Use Indexer for sparse selection
-        # ===================================
-        # Get index scores and top-k indices
-        # Note: We need to get index_scores before topk for KL loss computation
-        index_scores, topk_indices = self.indexer.forward_with_scores(
-            x, qr, mask=None, packed_seq_params=packed_seq_params
-        )
-
-        # ===================================
-        # Compute and attach indexer loss
-        # ===================================
-        if self.training and torch.is_grad_enabled():
-            # Get indexer loss coefficient from config
-            indexer_loss_coeff = getattr(self.config, 'indexer_loss_coeff', 0.0)
-
-            if indexer_loss_coeff > 0:
-                # Compute KL divergence loss between indexer scores and true attention scores
-                indexer_loss = compute_indexer_loss(
-                    index_scores,
-                    attention_scores.detach(),  # Don't backprop through attention scores
-                    indexer_loss_coeff
-                )
-
-                # Attach loss to query activation (will be backpropagated)
-                # This doesn't change the forward pass but triggers gradient flow in backward
-                query = IndexerLossAutoScaler.apply(query, indexer_loss)
 
         # ===================================
         # Apply sparse mask from indexer
@@ -629,20 +623,38 @@ class SparseAttention(MegatronModule):
         # ===================================
         # Context layer [sq, b, hp]
         # ===================================
-        # Reshape value: [sk, b, np, hn] -> [b * np, sk, hn]
-        value_reshaped = value.transpose(0, 1).reshape(b * np, sk, hn)
+        # Reshape value: [sk, b, np, v_hn] -> [b * np, sk, v_hn]
+        value_reshaped = value.transpose(0, 1).reshape(b * np, sk, v_hn)
 
         # Reshape attention_probs: [b, np, sq, sk] -> [b * np, sq, sk]
         attention_probs_reshaped = attention_probs.view(b * np, sq, sk)
 
-        # Compute context: [b * np, sq, hn]
+        # Compute context: [b * np, sq, v_hn]
         context = torch.bmm(attention_probs_reshaped, value_reshaped)
 
-        # Reshape context: [b * np, sq, hn] -> [b, np, sq, hn] -> [sq, b, np, hn]
-        context = context.view(b, np, sq, hn).permute(2, 0, 1, 3).contiguous()
+        # Reshape context: [b * np, sq, v_hn] -> [b, np, sq, v_hn] -> [sq, b, np, v_hn]
+        context = context.view(b, np, sq, v_hn).permute(2, 0, 1, 3).contiguous()
 
-        # Flatten: [sq, b, np, hn] -> [sq, b, np*hn]
-        context = context.view(sq, b, np * hn)
+        # Flatten: [sq, b, np, v_hn] -> [sq, b, np*v_hn]
+        context = context.view(sq, b, np * v_hn)
+
+        # ===================================
+        # Attach indexer loss (training only)
+        # ===================================
+        if self.training and torch.is_grad_enabled():
+            # Get indexer loss coefficient from config
+            indexer_loss_coeff = getattr(self.config, 'indexer_loss_coeff', 0.0)
+
+            if indexer_loss_coeff > 0:
+                # Compute KL divergence loss between indexer scores and true attention scores
+                indexer_loss = compute_indexer_loss(
+                    index_scores,
+                    attention_scores.detach(),  # Don't backprop through attention scores
+                    indexer_loss_coeff
+                )
+
+                # Attach loss to context output (will trigger backward through indexer)
+                context = IndexerLossAutoScaler.apply(context, indexer_loss)
 
         return context
 
