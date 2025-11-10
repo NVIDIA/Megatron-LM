@@ -33,7 +33,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter
+from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 try:
@@ -407,7 +407,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.barrier(parallel_state.get_tensor_model_parallel_group())
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
-            coordinator_ready_event.wait()
+            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
