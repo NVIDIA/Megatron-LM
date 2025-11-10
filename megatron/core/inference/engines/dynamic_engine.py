@@ -293,7 +293,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
-        self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
+        self,
+        inference_coordinator_port: int,
+        launch_inference_coordinator: bool = True,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -411,7 +415,8 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
+        loop = get_asyncio_loop(loop)
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop = loop))
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -642,7 +647,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
-                    asyncio.create_task, self._notify_cond_for_new_request()
+                    self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add()
@@ -721,7 +726,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add()
@@ -733,7 +738,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
