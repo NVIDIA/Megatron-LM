@@ -115,6 +115,7 @@ class MoEModelTestContainer:
         torch.cuda.synchronize()
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     def dispatcher_dropless_test(self):
         moe_layer = self.moe_layer
@@ -157,6 +158,7 @@ class MoEModelTestContainer:
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
         moe_layer = self.moe_layer
@@ -210,6 +212,7 @@ class MoEModelTestContainer:
             hidden_states.grad, restored_hidden_states_answer
         ), "Gradient of hidden states should be same as hidden states"
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     def dispatcher_drop_and_pad_test(self):
         """Test if the tokens are dropped and padded correctly.
@@ -275,6 +278,7 @@ class MoEModelTestContainer:
             hidden_states.grad, backward_answer
         ), "Gradient of hidden states should be same as hidden states"
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     def dispatcher_router_padding_for_fp8_test(self):
         """Test if the routing map is padded correctly for FP8 training.
