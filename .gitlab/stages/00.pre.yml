@@ -8,6 +8,7 @@ include:
       when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
       when: always
+
     - when: never
   stage: .pre
 
@@ -19,29 +20,6 @@ include:
     - docker system prune -a --filter "until=36h" -f || true
     - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
-
-pre:mirror_to_github:
-  rules:
-    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
-      allow_failure: true
-    - when: never
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  stage: .pre
-  image: python:3.10
-  variables:
-    GIT_STRATEGY: "clone"
-  script:
-    - git checkout $CI_COMMIT_BRANCH
-    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
-    - git push -u github $CI_COMMIT_BRANCH
-  retry:
-    max: 2
 
 pre:create_ci_branches:
   rules:
@@ -60,6 +38,7 @@ pre:create_ci_branches:
       - branch: ci-upgrade-dependencies
       - branch: ci-approve-main
       - branch: ci-approve-dev
+      - branch: ci-sync-branches
   tags:
     - arch/amd64
     - env/prod
@@ -346,55 +325,5 @@ pre:check_status_of_main:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       when: never
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
-      when: always
-    - when: never
-
-pre:approve_merge_gate:
-  extends: [.pre_rules]
-  image: maniator/gh
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  script:
-    - |
-      set -eoux pipefail
-      EXIT_CODE=0
-      python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_COMMIT_BRANCH" --once || EXIT_CODE=$?
-
-      export GH_TOKEN=$GH_TOKEN
-      export REPO=NVIDIA/Megatron-LM
-      export TARGET_BRANCH="$CI_COMMIT_BRANCH"
-
-      if [[ $EXIT_CODE -eq 0 ]]; then
-        STATUS="approved"
-        COMMENT="Main is healthy. Submitting PR."
-      else
-        STATUS="rejected"
-        COMMENT="Main is not healthy. An automation engineer is investigating. No need to take any action."
-      fi
-
-      gh api "repos/$REPO/actions/runs?status=waiting" --jq '.workflow_runs[].id' \
-        | while read run_id; do
-            HEAD_BRANCH=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.head_branch')
-            PR_NUMBER="${HEAD_BRANCH##*/}"
-            if [ -n "$PR_NUMBER" ]; then
-                PR_BASE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref')
-                if [ "$PR_BASE" = "$TARGET_BRANCH" ]; then
-                    gh api \
-                      --method POST "repos/$REPO/actions/runs/$run_id/pending_deployments" \
-                      -F "environment_ids[]=$(gh api "repos/$REPO/environments" --jq '.environments[] | select(.name=="merge-gate") | .id')" \
-                      -f state="$STATUS" \
-                      -f comment="$COMMENT";
-                fi
-            fi
-        done
-  retry:
-    max: 2
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
       when: always
     - when: never

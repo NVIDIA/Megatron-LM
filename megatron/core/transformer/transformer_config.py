@@ -611,7 +611,8 @@ class TransformerConfig(ModelParallelConfig):
     # Cuda Graphs
     ##################
     enable_cuda_graph: bool = False
-    """When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
+    """DEPRECATED and replaced by cuda_graph_impl.
+    When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
     CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
     determines the scope of graph capture."""
 
@@ -631,13 +632,23 @@ class TransformerConfig(ModelParallelConfig):
     """Number of warmup steps for CUDA graphs"""
 
     external_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+    """DEPRECATED and replaced by cuda_graph_impl.
+    When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
+    cuda_graph_impl: str = "none"
+    """Determines the CUDA graph capture implementation.
+    "none": no CUDA graph.
+    "local": capture the CUDA graph using MCore local implementation. Either partial CUDA graph
+    (1/many CUDA graph per layer) or full iteration CUDA graph (1 CUDA graph for whole iteration
+    excluding optimizer) is enabled.
+    "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
     cuda_graph_scope: str = "full"
-    """Determines the CUDA graphs capturing scope. When external_cuda_graph is set to true,
-    valid values are "full" and "attn". "Full" scope captures a whole Transformer
-    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention().
-    When enable_cuda_graph is set to true, "full_iteration" can be specified as cuda_graph_scope
+    """Determines the CUDA graphs capturing scope.
+    When cuda_graph_impl is set to "transformer_engine", valid values are "full" and "attn".
+    "Full" scope captures a whole Transformer layer. "Attn" scope only captures operations in
+    TransformerLayer._forward_attention().
+    When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
@@ -1359,11 +1370,48 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
 
-        if self.enable_cuda_graph:
+        if self.enable_cuda_graph or self.external_cuda_graph:
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Do not use enable_cuda_graph or external_cuda_graph with cuda_graph_impl."
+            assert (
+                not self.enable_cuda_graph or not self.external_cuda_graph
+            ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+
+            if self.enable_cuda_graph:
+                warnings.warn('enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.')
+                self.cuda_graph_impl = "local"
+            if self.external_cuda_graph:
+                warnings.warn(
+                    'external_cuda_graph is deprecated, '
+                    'use cuda_graph_impl=transformer_engine instead.'
+                )
+                self.cuda_graph_impl = "transformer_engine"
+        if self.cuda_graph_impl != "none":
+            assert self.cuda_graph_impl in [
+                "transformer_engine",
+                "local",
+            ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
             if self.recompute_granularity:
-                raise ValueError("CUDA graphs not supported with activation recomputation.")
+                if (
+                    self.recompute_granularity != "selective"
+                    or self.cuda_graph_impl != "transformer_engine"
+                    or self.cuda_graph_scope != "attn"
+                ):
+                    raise ValueError("CUDA graphs not supported with activation recomputation.")
+                else:
+                    for module in self.recompute_modules:
+                        if module in ['core_attn', 'mla_up_proj']:
+                            raise ValueError(
+                                f'attn cuda graph is not supported with {module} recompute.'
+                            )
+                    if "layernorm" in self.recompute_modules:
+                        warnings.warn(
+                            "input_layernorm recompute is not supported with attention "
+                            "cudagraph. Will only recompute the pre_mlp_layernorm."
+                        )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:

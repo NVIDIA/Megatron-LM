@@ -47,6 +47,7 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..fp4_utils import is_nvfp4tensor
 try:
     # Prefer TE's native casting path if available
@@ -54,6 +55,7 @@ try:
     HAVE_TE_NVFP4_CAST = True
 except Exception:
     HAVE_TE_NVFP4_CAST = False
+
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
@@ -1159,6 +1161,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         "Ensure that each model chunk has unique parameter names."
                     )
                 name_to_param.update(_name_to_param)
+            name_to_param = handle_experts_in_state_dict(name_to_param)
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
             param in self.param_to_name

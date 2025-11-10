@@ -13,6 +13,8 @@ import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
+logger = logging.getLogger(__name__)
+
 try:
     import einops
 
@@ -1892,23 +1894,25 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
         return 0
 
 
-def get_intra_distributed_optimizer_instance_group():
+def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group of all GPUs in a distributed optimizer instance."""
-    assert (
-        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
-    ), "Intra distributed optimizer instance group is not initialized"
+    if check_initialized:
+        assert (
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
+        ), "Intra distributed optimizer instance group is not initialized"
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
-def get_inter_distributed_optimizer_instance_group():
+def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
     inter_partial_expert_data_parallel_group, and return it at here.
     """
-    assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-        "Attention and MLP/Expert share same inter distributed optimize instance group, "
-        "which has not been initialized"
-    )
+    if check_initialized:
+        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
+            "Attention and MLP/Expert share same inter distributed optimize instance group, "
+            "which has not been initialized"
+        )
     return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
 
