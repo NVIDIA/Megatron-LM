@@ -10,7 +10,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
-    _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -21,7 +20,122 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+try:
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_apply_mla_rope_for_kv,
+        fused_apply_mla_rope_for_q,
+    )
+except:
+    fused_apply_mla_rope_for_kv = None
+    fused_apply_mla_rope_for_q = None
+
 # TODO(kunlunl): Add third-party fused kernels.
+try:
+    from fast_hadamard_transform import hadamard_transform
+except ImportError:
+    hadamard_transform = None
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    """Apply Hadamard rotation activation.
+    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L424-L428
+
+    Args:
+        x: Input tensor (must be bfloat16)
+
+    Returns:
+        Rotated tensor
+    """
+    assert x.dtype == torch.bfloat16
+    assert hadamard_transform is not None, (
+        "fast_hadamard_transform is not installed."
+    )
+    hidden_size = x.size(-1)
+    return hadamard_transform(x, scale=hidden_size ** -0.5)
+
+
+def compute_index_score(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """
+    Perform index score using BF16 precision.
+
+    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
+    This is a BF16 implementation of the `fp8_index` logic:
+        1. Compute attention scores: q @ k^T;
+        2. Apply ReLU activation;
+        3. Weight by attention weights;
+        4. Sum across attention heads.
+
+    Args:
+        q          : BF16 [seqlen_q, bsz, n_heads, head_dim], the query tensor.
+        weights    : FP32 [seqlen_q, bsz, n_heads], the attention weights.
+        k          : BF16 [seqlen_k, bsz, head_dim], the key tensor.
+
+    Returns:
+        index_score: FP32 [bsz, seqlen_q, seqlen_k], the index scores.
+    """
+    # Compute attention scores: q @ k^T
+    # [seqlen_q, bsz, n_heads, head_dim] @ [seqlen_k, bsz, head_dim]^T -> [seqlen_q, bsz, n_heads, seqlen_k]
+    index_score = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+
+    # Apply ReLU activation.
+    index_score = torch.relu(index_score)
+
+    # Weight each head by attention weights.
+    # [seqlen_q, bsz, n_heads, seqlen_k] * [seqlen_q, bsz, n_heads, 1] -> [seqlen_q, bsz, n_heads, seqlen_k]
+    index_score = index_score * weights.unsqueeze(-1)
+
+    # Sum across attention heads.
+    # [seqlen_q, bsz, n_heads, seqlen_k] -> [seqlen_q, bsz, seqlen_k]
+    index_score = index_score.sum(dim=2)
+
+    # Transpose to [bsz, seqlen_q, seqlen_k].
+    index_score = index_score.transpose(0, 1)
+
+    return index_score
+
+
+def compute_indexer_loss(
+    index_scores: torch.Tensor,
+    attention_scores: torch.Tensor,
+    indexer_loss_coeff: float,
+) -> torch.Tensor:
+    """
+    Compute KL divergence loss between index_scores and true attention_scores.
+
+    This loss trains the indexer to predict which tokens are important by matching the distribution
+    of true attention scores.
+
+    Reference: Section 2.1 of https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
+
+    Args:
+        index_scores: Scores predicted by indexer [bsz, seqlen_q, seqlen_k].
+        attention_scores: True attention scores from q @ k^T [bsz, heads, seqlen_q, seqlen_k].
+        indexer_loss_coeff: Coefficient for the indexer KL divergence loss.
+
+    Returns:
+        index_loss: KL divergence loss (scalar).
+    """
+    # Sum attention scores across heads.
+    # [bsz, heads, seqlen_q, seqlen_k] -> [bsz, seqlen_q, seqlen_k]
+    target_scores = attention_scores.sum(dim=1)
+
+    # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
+    # obtained from softmax so they are already non-negative.
+    target_probs = target_scores / target_scores.sum(dim=-1, keepdim=True)
+
+    # Convert index_scores to probabilities with softmax.
+    index_probs = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+
+    # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
+    kl_per_element = (
+        target_probs * (torch.log(target_probs + 1e-10) - torch.log(index_probs + 1e-10))
+    )
+    kl_div = kl_per_element.sum(dim=-1).mean()
+
+    # Scale by coefficient.
+    indexer_loss = kl_div * indexer_loss_coeff
+
+    return indexer_loss
 
 
 class IndexerLossAutoScaler(torch.autograd.Function):
@@ -71,117 +185,12 @@ class IndexerLossAutoScaler(torch.autograd.Function):
         """Set the scale of the indexer loss.
 
         Args:
-            scale: The scale value to set. Please ensure that the scale passed in
-                   matches the scale of the main_loss.
+            scale: The scale value to set.
         """
         if IndexerLossAutoScaler.main_loss_backward_scale is None:
             IndexerLossAutoScaler.main_loss_backward_scale = scale
         else:
             IndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
-
-
-def compute_indexer_loss(
-    index_scores: torch.Tensor,
-    attention_scores: torch.Tensor,
-    indexer_loss_coeff: float,
-) -> torch.Tensor:
-    """
-    Compute KL divergence loss between indexer scores and true attention scores.
-
-    This loss trains the indexer to predict which tokens are important
-    by matching the distribution of true attention scores.
-
-    Args:
-        index_scores: Scores predicted by indexer [batch, seq, seq]
-        attention_scores: True attention scores from q@k [batch, heads, seq, seq]
-        indexer_loss_coeff: Coefficient for the indexer KL divergence loss
-
-    Returns:
-        indexer_loss: KL divergence loss (scalar)
-    """
-    # Average attention scores across heads to get target distribution
-    # [batch, heads, seq, seq] -> [batch, seq, seq]
-    target_scores = attention_scores.mean(dim=1)
-
-    # Convert to probabilities with softmax
-    # Apply softmax over the last dimension (keys)
-    index_probs = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
-    target_probs = torch.nn.functional.softmax(target_scores, dim=-1, dtype=torch.float32)
-
-    # Compute KL divergence: KL(target || index)
-    # KL(P || Q) = Σ P(x) * log(P(x) / Q(x))
-    kl_div = torch.nn.functional.kl_div(
-        index_probs.log(),
-        target_probs,
-        reduction='batchmean',
-        log_target=False,
-    )
-
-    # Scale by coefficient
-    indexer_loss = kl_div * indexer_loss_coeff
-
-    return indexer_loss
-
-
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Apply Hadamard rotation activation.
-
-    Args:
-        x: Input tensor (must be bfloat16)
-
-    Returns:
-        Rotated tensor
-    """
-    assert x.dtype == torch.bfloat16
-    from fast_hadamard_transform import hadamard_transform
-    hidden_size = x.size(-1)
-    return hadamard_transform(x, scale=hidden_size ** -0.5)
-
-
-def compute_index_score(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """
-    Compute index scores for sparse attention (BF16 version).
-
-    This is a BF16 implementation of the FP8 index kernel logic:
-    1. Compute attention scores: q @ k^T
-    2. Apply ReLU activation
-    3. Weight by attention weights
-    4. Sum across attention heads
-
-    Args:
-        q: Query tensor [batch, seq_len, n_heads, head_dim] (bf16)
-        weights: Attention weights [batch, seq_len, n_heads, 1] (bf16)
-        k: Key tensor [batch, seq_len, head_dim] (bf16)
-
-    Returns:
-        index_score: Index scores [batch, seq_len, seq_len] (bf16)
-
-    Note: Original FP8 kernel signature was:
-        fp8_index(q, q_s, k, k_s) where q_s and k_s are scaling factors
-        Here we use BF16 directly without separate scaling factors.
-    """
-    # q: [bsz, seqlen, n_heads, head_dim]
-    # k: [bsz, seqlen, head_dim]
-    # weights: [bsz, seqlen, n_heads, 1]
-
-    # Compute attention scores: q @ k^T
-    # [bsz, seqlen, n_heads, head_dim] @ [bsz, seqlen, head_dim]^T
-    # -> [bsz, seqlen, n_heads, seqlen]
-    index_score = torch.einsum('bshd,btd->bsht', q, k)
-
-    # Apply ReLU activation (for throughput efficiency)
-    index_score = torch.relu(index_score)
-
-    # Weight each head by attention weights
-    # [bsz, seqlen, n_heads, seqlen] * [bsz, seqlen, n_heads, 1]
-    index_score = index_score * weights
-
-    # Sum across attention heads
-    # [bsz, seqlen, n_heads, seqlen] -> [bsz, seqlen, seqlen]
-    index_score = index_score.sum(dim=2)
-
-    return index_score
-
 
 
 @dataclass
@@ -219,7 +228,7 @@ class Indexer(MegatronModule):
     Computes index scores to identify the top-k most relevant key-value pairs
     for each query position in sparse attention.
 
-    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py
+    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
 
     Args:
         config: Transformer configuration.
@@ -254,16 +263,15 @@ class Indexer(MegatronModule):
         self.rope_head_dim = rope_head_dim
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
+        self.softmax_scale: float = self.head_dim ** -0.5
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-
         self.pg_collection = pg_collection
         world_size = pg_collection.tp.size()
         self.n_local_heads = n_heads // world_size
 
-        # Initialize Rotary Position Embedding.
-        # Use rope_type from config if available, default to "rope".
+        # Initialize Position Embedding.
         if self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.rope_head_dim,
@@ -285,10 +293,10 @@ class Indexer(MegatronModule):
             )
         else:
             raise ValueError(
-                f"Unsupported RoPE type: {self.config.rope_type}, supported types are 'rope' and 'yarn'"
+                f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
+                "'rope' and 'yarn'"
             )
 
-        # Build linear layers using build_module
         self.wq_b = build_module(
             submodules.linear_wq_b,
             self.q_lora_rank,
@@ -333,28 +341,25 @@ class Indexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-        self.softmax_scale: float = self.head_dim ** -0.5
-
     def forward(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
         Forward pass for Indexer.
 
         Args:
-            x: Input tensor [seq, batch, hidden_dim]
-            qr: Query representation tensor [seq, batch, q_lora_rank]
-            mask: Attention mask
-            packed_seq_params: Packed sequence parameters for variable length sequences
+            x: hidden states [seqlen, batch, hidden_dim].
+            qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
+            mask: Attention mask [batch, seqlen, seqlen].
+            packed_seq_params: Packed sequence parameters for variable length sequences.
 
         Returns:
-            topk_indices: Top-k indices for sparse attention [batch, seq_len, index_topk]
+            topk_indices: Top-k indices for sparse attention [batch, seqlen, index_topk].
         """
-        # Call forward_with_scores and only return indices
         _, topk_indices = self.forward_with_scores(x, qr, mask, packed_seq_params)
         return topk_indices
 
@@ -363,7 +368,7 @@ class Indexer(MegatronModule):
         x: torch.Tensor,
         qr: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for Indexer that returns both index scores and top-k indices.
@@ -371,81 +376,100 @@ class Indexer(MegatronModule):
         This is used when KL loss is enabled to compare indexer scores with true attention scores.
 
         Args:
-            x: Input tensor [seq, batch, hidden_dim]
-            qr: Query representation tensor [seq, batch, q_lora_rank]
-            mask: Attention mask
-            packed_seq_params: Packed sequence parameters
+            x: hidden states [seqlen, batch, hidden_dim].
+            qr: Low-rank query tensor [seqlen, batch, q_lora_rank].
+            mask: Attention mask [batch, seqlen, seqlen].
+            packed_seq_params: Packed sequence parameters for variable length sequences.
 
         Returns:
-            index_scores: Index scores [batch, seq_len, seq_len]
-            topk_indices: Top-k indices [batch, seq_len, index_topk]
+            index_scores: Index scores [batch, seqlen, seqlen]
+            topk_indices: Top-k indices [batch, seqlen, index_topk]
         """
-        # Input format: [seq, batch, hidden]
+        assert packed_seq_params is None, "Packed sequence is not supported for SparseAttention"
+        assert not self.config.apply_rope_fusion, "RoPE fusion is not supported for SparseAttention"
+
         seqlen, bsz, _ = x.size()
 
-        # Compute rotary position embeddings internally
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(seqlen, packed_seq=packed_seq)
-            mscale = 1.0
-        else:  # yarn
-            rotary_pos_emb, mscale = self.rotary_pos_emb(seqlen, packed_seq=packed_seq)
-
-        q, _ = self.wq_b(qr)  # [seq, batch, heads*head_dim]
-        q = q.reshape(seqlen, bsz, -1, self.head_dim)  # [seq, batch, heads, head_dim]
-        q_pe, q_nope = torch.split(
-            q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        # =========================================
+        # Prepare RoPE params
+        # =========================================
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            None, None, x, self.config, packed_seq_params
         )
+        if self.config.rope_type == "rope":
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+            mscale = 1.0
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
 
+        # =========================================
+        # Apply RoPE to q
+        # =========================================
+        # [seqlen, batch, q_lora_rank] -> [seqlen, batch, n_heads * head_dim]
+        q, _ = self.wq_b(qr)
+        # [seqlen, batch, n_heads * head_dim] -> [seqlen, batch, n_heads, head_dim]
+        q = q.reshape(seqlen, bsz, self.n_heads, self.head_dim)
+        q_nope, q_pe = torch.split(
+            q, [self.head_dim - self.rope_head_dim, self.rope_head_dim], dim=-1
+        )
         q_pe = apply_rotary_pos_emb(
             q_pe,
             rotary_pos_emb,
             config=self.config,
-            cp_group=self.pg_collection.cp,
+            cu_seqlens=None,
             mscale=mscale,
+            cp_group=self.pg_collection.cp,
         )
-        q = torch.cat([q_pe, q_nope], dim=-1)  # [seq, batch, heads, head_dim]
+        # [seqlen, batch, n_heads, head_dim]
+        q = torch.cat([q_nope, q_pe], dim=-1)
 
-        k, _ = self.wk(x)  # [seq, batch, head_dim]
-        k = self.k_norm(k)  # [seq, batch, head_dim]
-        k_pe, k_nope = torch.split(
-            k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        # =========================================
+        # Apply RoPE to k
+        # =========================================
+        # [seqlen, batch, hidden_dim] -> [seqlen, batch, head_dim]
+        k, _ = self.wk(x)
+        k = self.k_norm(k)
+        # [seqlen, batch, head_dim] -> [seqlen, batch, 1, head_dim]
+        k = k.reshape(seqlen, bsz, 1, self.head_dim)
+        k_nope, k_pe = torch.split(
+            k, [self.head_dim - self.rope_head_dim, self.rope_head_dim], dim=-1
         )
-
-        k_pe = k_pe.unsqueeze(2)  # [seq, batch, 1, rope_head_dim]
         k_pe = apply_rotary_pos_emb(
             k_pe,
             rotary_pos_emb,
             config=self.config,
-            cp_group=self.pg_collection.cp,
+            cu_seqlens=None,
             mscale=mscale,
+            cp_group=self.pg_collection.cp,
         )
-        k_pe = k_pe.squeeze(2)  # [seq, batch, rope_head_dim]
-        k = torch.cat([k_pe, k_nope], dim=-1)  # [seq, batch, head_dim]
+        # [seqlen, batch, 1, head_dim]
+        k = torch.cat([k_nope, k_pe], dim=-1)
+        # [seqlen, batch, head_dim]
+        k = k.reshape(seqlen, bsz, self.head_dim)
 
-        # For compute_index_score, we need batch-first format
-        # Transpose to [batch, seq, heads, head_dim]
-        q = q.transpose(0, 1)  # [seq, batch, heads, head_dim] -> [batch, seq, heads, head_dim]
-        k = k.transpose(0, 1)  # [seq, batch, head_dim] -> [batch, seq, head_dim]
-        
+        # =========================================
+        # Rotate activation
+        # =========================================
         q = rotate_activation(q)
         k = rotate_activation(k)
 
-        # weights_proj expects seq-first, so use original x
-        weights, _ = self.weights_proj(x)  # [seq, batch, n_heads]
-        weights = weights.transpose(0, 1)  # -> [batch, seq, n_heads]
-        weights = weights * self.n_heads ** -0.5
-        weights = weights.unsqueeze(-1) * self.softmax_scale
-
-        # Compute index scores (BF16 version of the FP8 kernel)
-        # All inputs are now batch-first
-        index_scores = compute_index_score(q.contiguous(), weights, k.contiguous())
-
+        # =========================================
+        # Compute index scores
+        # =========================================
+        # [seqlen, batch, hidden_dim] -> [seqlen, batch, n_heads]
+        weights, _ = self.weights_proj(x)
+        weights = weights * (self.n_heads ** -0.5) * self.softmax_scale
+        # [batcch, seqlen, seqlen]
+        index_scores = compute_index_score(q, weights, k)
         if mask is not None:
+            assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
             index_scores = index_scores + mask
 
+        # =========================================
         # Select top-k indices
+        # =========================================
         topk_k = min(self.index_topk, seqlen)
+        # [batch, seqlen, index_topk]
         topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
         return index_scores, topk_indices
@@ -456,7 +480,7 @@ class SparseAttention(MegatronModule):
     This module implements sparse attention mechanism using an Indexer to compute top-k attention
     indices for reducing computational complexity.
 
-    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py
+    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
 
     Args:
         config: Transformer configuration.
@@ -514,7 +538,6 @@ class SparseAttention(MegatronModule):
             )
         self.softmax_scale = softmax_scale
 
-        # Build indexer - required for sparse attention
         assert submodules.indexer is not None, "Indexer is required for SparseAttention"
         self.indexer = build_module(
             submodules.indexer,
@@ -544,127 +567,107 @@ class SparseAttention(MegatronModule):
         Forward pass for Sparse Attention.
 
         Args:
-            query: Query tensor [sq, b, np, hn]
-            key: Key tensor [sk, b, np, hn]
-            value: Value tensor [sk, b, np, hn]
-            attention_mask: Attention mask tensor
-            attn_mask_type: Type of attention mask
-            attention_bias: Optional attention bias
-            packed_seq_params: Packed sequence parameters
-            x: Original input hidden states [b, s, h] (needed for indexer, will be inferred if not provided)
-            qr: Low-rank query representation [b, s, q_lora_rank] (for MLA, will be inferred if not provided)
+            query: Query tensor [seqlen_q, bsz, n_heads, head_dim].
+            key: Key tensor [seqlen_k, bsz, n_heads, head_dim].
+            value: Value tensor [seqlen_k, bsz, n_heads, head_dim_v].
+            x: Original hidden states [seqlen_q, bsz, hidden_dim].
+            qr: Low-rank query representation [seqlen_q, bsz, q_lora_rank].
+            attention_mask: Attention mask tensor.
+            attn_mask_type: Type of attention mask.
+            attention_bias: Optional attention bias.
+            packed_seq_params: Packed sequence parameters.
 
         Returns:
             context: Output tensor [sq, b, hp]
         """
-        # Input shape: [sq, b, np, hn]
         sq, b, np, hn = query.size()
         sk = key.size(0)
-        v_hn = value.size(3)  # Value head dimension may differ from query/key
+        # Value head dimension may differ from query/key.
+        v_hn = value.size(3)
+
+        # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
+        # TODO(kunlunl): Should x and qr be detached?
+        x = x.detach()
+        qr = qr.detach()
+
+        # Get a FP32 mask with -inf for masked positions.
+        if attention_mask is not None:
+            mask = attention_mask.squeeze()
+            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(
+                mask, float('-inf')
+            )
+        else:
+            float_mask = None
 
         # ===================================
-        # Use Indexer for sparse selection (do this first to compute loss before using query)
-        # ===================================
         # Get index scores and top-k indices
-        # Note: We need to get index_scores before topk for KL loss computation
-        # Detach x and qr to prevent gradients from flowing back to the main model
-        # Indexer is trained solely through the indexer_loss (KL divergence)
-        # TODO(kunlunl): Should x and qr be detached?
+        # ===================================
         index_scores, topk_indices = self.indexer.forward_with_scores(
-            x.detach(), qr.detach(), mask=None, packed_seq_params=packed_seq_params
+            x, qr, mask=float_mask, packed_seq_params=packed_seq_params
         )
 
         # ===================================
         # Raw attention scores [b, np, sq, sk]
         # ===================================
-        output_size = (b, np, sq, sk)
-
-        # Reshape for batch matrix multiplication
-        # [sq, b, np, hn] -> [b * np, sq, hn]
-        query_reshaped = query.transpose(0, 1).reshape(b * np, sq, hn)
-        # [sk, b, np, hn] -> [b * np, sk, hn]
-        key_reshaped = key.transpose(0, 1).reshape(b * np, sk, hn)
-
+        # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
+        query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+        # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
+        key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
         # Compute attention scores: [b * np, sq, sk]
         attention_scores = torch.bmm(
-            query_reshaped,
-            key_reshaped.transpose(1, 2)
+            query_reshaped.float(), key_reshaped.float()
         ) * self.softmax_scale
-
         # Reshape to [b, np, sq, sk]
-        attention_scores = attention_scores.view(*output_size)
+        attention_scores = attention_scores.view(b, np, sq, sk)
 
         # ===================================
         # Apply sparse mask from indexer
         # ===================================
-        # topk_indices: [b, sq, topk]
-
-        # Step 1: Create sparse selection mask (only allow top-k)
-        # Start with all positions masked (True = masked)
-        sparse_mask = torch.ones(
-            (b, sq, sk), dtype=torch.bool, device=query.device
-        )
-        # Allow top-k positions (False = not masked)
-        sparse_mask.scatter_(-1, topk_indices, False)
-
-        # Expand to [b, np, sq, sk]
-        sparse_mask = sparse_mask.unsqueeze(1).expand(-1, np, -1, -1)
-
-        # Step 2: Combine with regular attention mask if provided
-        if attention_mask is not None:
-            # attention_mask is boolean: True = masked, False = allowed
-            # Combine with OR: position is masked if EITHER mask says so
-            if attention_mask.dtype == torch.bool:
-                sparse_mask = sparse_mask | attention_mask
-            else:
-                # If attention_mask is float (-inf for masked), convert to boolean
-                sparse_mask = sparse_mask | (attention_mask < -1000.0)
-
-        # Step 3: Apply combined mask to attention scores
-        attention_scores = attention_scores.masked_fill(sparse_mask, float("-inf"))
+        # index_mask [b, sq, sk]
+        index_mask = torch.full((b, sq, sk), float("-inf"), device=x.device)
+        index_mask.scatter_(-1, topk_indices, 0)
+        if float_mask is not None:
+            index_mask += float_mask
+        attention_scores += index_mask.unsqueeze(1)
 
         # ===================================
         # Attention probabilities [b, np, sq, sk]
         # ===================================
-        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
-        attention_probs = attention_probs.to(query.dtype)
+        attention_probs_fp32 = torch.nn.functional.softmax(
+            attention_scores, dim=-1, dtype=torch.float32
+        )
+        attention_probs = attention_probs_fp32.to(query.dtype)
 
         # ===================================
-        # Context layer [sq, b, hp]
+        # Output
         # ===================================
-        # Reshape value: [sk, b, np, v_hn] -> [b * np, sk, v_hn]
-        value_reshaped = value.transpose(0, 1).reshape(b * np, sk, v_hn)
-
+        # [sk, b, np, v_hn] -> [b, np, sk, v_hn] -> [b * np, sk, v_hn]
+        value_reshaped = value.permute(1, 2, 0, 3).reshape(b * np, sk, v_hn)
         # Reshape attention_probs: [b, np, sq, sk] -> [b * np, sq, sk]
         attention_probs_reshaped = attention_probs.view(b * np, sq, sk)
-
-        # Compute context: [b * np, sq, v_hn]
-        context = torch.bmm(attention_probs_reshaped, value_reshaped)
-
-        # Reshape context: [b * np, sq, v_hn] -> [b, np, sq, v_hn] -> [sq, b, np, v_hn]
-        context = context.view(b, np, sq, v_hn).permute(2, 0, 1, 3).contiguous()
-
-        # Flatten: [sq, b, np, v_hn] -> [sq, b, np*v_hn]
-        context = context.view(sq, b, np * v_hn)
+        # Compute output: [b * np, sq, v_hn]
+        output = torch.bmm(attention_probs_reshaped, value_reshaped)
+        # Reshape output: [b * np, sq, v_hn] -> [b, np, sq, v_hn] -> [sq, b, np, v_hn]
+        output = output.view(b, np, sq, v_hn).permute(2, 0, 1, 3).contiguous()
+        # Flatten: [sq, b, np, v_hn] -> [sq, b, np * v_hn]
+        output = output.view(sq, b, np * v_hn)
 
         # ===================================
-        # Attach indexer loss (training only)
+        # Attach indexer loss
         # ===================================
         if self.training and torch.is_grad_enabled():
             # Get indexer loss coefficient from config
             indexer_loss_coeff = getattr(self.config, 'indexer_loss_coeff', 0.0)
-
             # Compute KL divergence loss between indexer scores and true attention scores
             indexer_loss = compute_indexer_loss(
                 index_scores,
-                attention_scores.detach(),  # Don't backprop through attention scores
-                indexer_loss_coeff
+                attention_probs_fp32.detach(),
+                indexer_loss_coeff,
             )
+            # Attach loss to output output (will trigger backward through indexer)
+            output = IndexerLossAutoScaler.apply(output, indexer_loss)
 
-            # Attach loss to context output (will trigger backward through indexer)
-            context = IndexerLossAutoScaler.apply(context, indexer_loss)
-
-        return context
+        return output
 
     def sharded_state_dict(
         self,
@@ -673,6 +676,7 @@ class SparseAttention(MegatronModule):
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Sharded state dict for the learnable softmax offset parameter"""
+        # TODO(kunlunl): Add checkpointing for indexer.
         if self.config.softmax_type == "learnable":
             state_dict = self.state_dict(prefix="", keep_vars=True)
         else:
