@@ -26,6 +26,9 @@ def cleanup():
 
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
+    # Reduce memory usage by NCCL
+    os.environ['NCCL_MAX_NCHANNELS'] = '1'
+    os.environ['NCCL_NVLS_ENABLE'] = '0'
     if is_te_min_version("1.3"):
         os.environ['NVTE_FLASH_ATTN'] = '0'
         os.environ['NVTE_FUSED_ATTN'] = '0'

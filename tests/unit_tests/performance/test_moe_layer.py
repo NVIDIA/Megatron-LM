@@ -419,6 +419,10 @@ def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
     layer.train()
     return layer
 
+def _check_env():
+    NCCL_MAX_NCHANNELS = os.environ.get("NCCL_MAX_NCHANNELS")
+    if NCCL_MAX_NCHANNELS is not None:
+        pytest.fail(f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression")
 
 @pytest.mark.flaky(reruns=2)
 @pytest.mark.internal
@@ -427,6 +431,7 @@ def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
 )
 @pytest.mark.parametrize("perf_case", PERFORMANCE_CASES, ids=lambda c: c.name)
 def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool = False):
+    _check_env()
     if not perf_case.is_current_platform():
         pytest.skip(
             "GPU platform mismatch: "

@@ -48,11 +48,22 @@ def cleanup():
 
 
 @pytest.fixture(scope="function", autouse=True)
-def set_env():
+def set_env(request):
+    fspath = getattr(request.node, "fspath", None)
+    is_performance_test = False
+    if fspath is not None:
+        is_performance_test = "tests/unit_tests/performance" in str(fspath)
+
     if is_te_min_version("1.3"):
         os.environ['NVTE_FLASH_ATTN'] = '0'
         os.environ['NVTE_FUSED_ATTN'] = '0'
 
+    if is_performance_test:
+        os.environ.pop('NCCL_MAX_NCHANNELS', None)
+        os.environ.pop('NCCL_NVLS_ENABLE', None)
+    else:
+        os.environ['NCCL_MAX_NCHANNELS'] = '1'
+        os.environ['NCCL_NVLS_ENABLE'] = '0'
 
 @pytest.fixture(scope="session")
 def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
