@@ -251,8 +251,6 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                 return t
             sharded_tensor: ShardedTensor = t
             x = loaded_ten
-            if sharded_tensor.flattened_range is not None:
-                x = flatten_range(sharded_tensor, x)
 
             # Reuse existing buffer
             sharded_tensor.data.data.copy_(x)
