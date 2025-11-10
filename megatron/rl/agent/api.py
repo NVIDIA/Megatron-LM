@@ -8,7 +8,7 @@ from typing import Generic, TypeVar
 import numpy as np
 from pydantic import BaseModel
 
-from ..__init__ import Request, TypeLookupable, trace_async_exceptions
+from ..__init__ import Request, TypeLookupable
 from ..inference import (
     ChatInferenceInterface,
     ChatInferenceRequest,
@@ -17,6 +17,8 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+
+from megatron.core.utils import trace_async_exceptions
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -192,7 +194,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        @trace_async_exceptions
+        @trace_async_exceptions(verbose=True)
         async def group_task():
             nonlocal submitted_groups
             while request.num_groups == -1 or submitted_groups < request.num_groups:
