@@ -32,12 +32,20 @@ class TestFusedKVAppend:
         dtype = cache_params['dtype']
 
         key = torch.randn(
-            batch_size, 1, cache_params['num_kv_heads'], cache_params['head_dim'],
-            dtype=dtype, device=device
+            batch_size,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=dtype,
+            device=device,
         )
         value = torch.randn(
-            batch_size, 1, cache_params['num_kv_heads'], cache_params['head_dim'],
-            dtype=dtype, device=device
+            batch_size,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=dtype,
+            device=device,
         )
 
         token_to_block_idx = torch.tensor([0, 1, 2, 3, 4], device=device)
@@ -130,9 +138,11 @@ class TestFusedKVAppend:
 
         batch_size = 5
         kv_concat = torch.randn(
-            batch_size, 1, kv_reduced_dim,
+            batch_size,
+            1,
+            kv_reduced_dim,
             dtype=cache_params['dtype'],
-            device=cache_params['device']
+            device=cache_params['device'],
         )
         block_idx = torch.tensor([0, 1, 2, 3, 4], device=cache_params['device'])
         local_pos = torch.tensor([0, 5, 10, 15, 20], device=cache_params['device'])
@@ -228,9 +238,11 @@ class TestFusedKVAppend:
 
         batch_size = 5
         kv_concat = torch.randn(
-            batch_size, 1, kv_reduced_dim,
+            batch_size,
+            1,
+            kv_reduced_dim,
             dtype=cache_params['dtype'],
-            device=cache_params['device']
+            device=cache_params['device'],
         )
         block_idx = torch.tensor([0, 1, 2, 3, 4], device=cache_params['device'])
         local_pos = torch.tensor([0, 5, 10, 15, 20], device=cache_params['device'])
@@ -265,10 +277,22 @@ class TestFusedKVAppend:
         cache = create_mhagqa_cache(layout=KVCacheLayout.M_2NCHD, **cache_params)
 
         # Empty tensors
-        key = torch.empty(0, 1, cache_params['num_kv_heads'], cache_params['head_dim'],
-                         dtype=cache_params['dtype'], device=cache_params['device'])
-        value = torch.empty(0, 1, cache_params['num_kv_heads'], cache_params['head_dim'],
-                           dtype=cache_params['dtype'], device=cache_params['device'])
+        key = torch.empty(
+            0,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=cache_params['dtype'],
+            device=cache_params['device'],
+        )
+        value = torch.empty(
+            0,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=cache_params['dtype'],
+            device=cache_params['device'],
+        )
         block_idx = torch.empty(0, dtype=torch.long, device=cache_params['device'])
         local_pos = torch.empty(0, dtype=torch.long, device=cache_params['device'])
 
@@ -287,10 +311,22 @@ class TestFusedKVAppend:
         """Test appending a single token."""
         cache = create_mhagqa_cache(layout=KVCacheLayout.S_NCHD, **cache_params)
 
-        key = torch.randn(1, 1, cache_params['num_kv_heads'], cache_params['head_dim'],
-                         dtype=cache_params['dtype'], device=cache_params['device'])
-        value = torch.randn(1, 1, cache_params['num_kv_heads'], cache_params['head_dim'],
-                           dtype=cache_params['dtype'], device=cache_params['device'])
+        key = torch.randn(
+            1,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=cache_params['dtype'],
+            device=cache_params['device'],
+        )
+        value = torch.randn(
+            1,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=cache_params['dtype'],
+            device=cache_params['device'],
+        )
         block_idx = torch.tensor([3], device=cache_params['device'])
         local_pos = torch.tensor([42], device=cache_params['device'])
 
@@ -314,12 +350,22 @@ class TestFusedKVAppend:
         cache = create_mhagqa_cache(layout=KVCacheLayout.M_N2HCD, **cache_params)
 
         chunk_size = cache_params['chunk_size']
-        key = torch.randn(chunk_size, 1, cache_params['num_kv_heads'],
-                         cache_params['head_dim'],
-                         dtype=cache_params['dtype'], device=cache_params['device'])
-        value = torch.randn(chunk_size, 1, cache_params['num_kv_heads'],
-                           cache_params['head_dim'],
-                           dtype=cache_params['dtype'], device=cache_params['device'])
+        key = torch.randn(
+            chunk_size,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=cache_params['dtype'],
+            device=cache_params['device'],
+        )
+        value = torch.randn(
+            chunk_size,
+            1,
+            cache_params['num_kv_heads'],
+            cache_params['head_dim'],
+            dtype=cache_params['dtype'],
+            device=cache_params['device'],
+        )
 
         # Fill block 0 completely
         block_idx = torch.zeros(chunk_size, dtype=torch.long, device=cache_params['device'])

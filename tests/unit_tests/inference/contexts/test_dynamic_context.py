@@ -38,7 +38,8 @@ class TestDynamicContext:
         params_dtype,
         num_layers,
         kv_channels,
-        num_attention_heads,
+        num_attention_kv_heads,
+        num_attention_qo_heads,
         max_sequence_length,
         buffer_size_gb,
         block_size_tokens,
@@ -52,7 +53,8 @@ class TestDynamicContext:
             params_dtype=params_dtype,
             num_layers=num_layers,
             kv_channels=kv_channels,
-            num_attention_heads=num_attention_heads,
+            num_attention_kv_heads=num_attention_kv_heads,
+            num_attention_qo_heads=num_attention_qo_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
             buffer_size_gb=buffer_size_gb,
@@ -78,7 +80,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -104,7 +107,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=64,
-            num_attention_heads=8,
+            num_attention_kv_heads=8,
+            num_attention_qo_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
             buffer_size_gb=1.0,
@@ -120,7 +124,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=64,
-            num_attention_heads=8,
+            num_attention_kv_heads=8,
+            num_attention_qo_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
             buffer_size_gb=1.0,
@@ -148,7 +153,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=64,
-            num_attention_heads=8,
+            num_attention_kv_heads=8,
+            num_attention_qo_heads=8,
             max_sequence_length=128,
             num_cuda_graphs=None,
             buffer_size_gb=0.01,
@@ -175,7 +181,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=64,
-            num_attention_heads=8,
+            num_attention_kv_heads=8,
+            num_attention_qo_heads=8,
             max_sequence_length=512,
             num_cuda_graphs=None,
             buffer_size_gb=0.1,
@@ -204,7 +211,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=2,
             kv_channels=64,
-            num_attention_heads=8,
+            num_attention_kv_heads=8,
+            num_attention_qo_heads=8,
             max_sequence_length=128,
             num_cuda_graphs=None,
             buffer_size_gb=1.0,
@@ -232,7 +240,7 @@ class TestDynamicContext:
         dynamic_context.token_to_block_idx.fill_(1)
         dynamic_context.token_to_local_position_within_kv_block.fill_(1)
         dynamic_context.block_allocator.block_count_avail = 5
-        dynamic_context.memory_buffer.fill_(1)
+        [cache.reset() for cache in dynamic_context.memory_buffer]
         dynamic_context.request_to_kv_block_ids.fill_(1)
 
         # Call reset
@@ -270,7 +278,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -305,7 +314,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -377,7 +387,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -414,7 +425,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -548,7 +560,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -599,7 +612,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -662,7 +676,8 @@ class TestDynamicContext:
             params_dtype=torch.float32,
             num_layers=4,
             kv_channels=8,
-            num_attention_heads=2,
+            num_attention_kv_heads=2,
+            num_attention_qo_heads=2,
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
@@ -875,11 +890,19 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     def test_unified_memory(self):
-        from megatron.core.inference.unified_memory import has_unified_memory
 
-        if not has_unified_memory:
+        from megatron.core.inference.unified_memory import (
+            UnifiedMemoryUnsupportedError,
+            create_unified_mempool,
+        )
+
+        # Check UVM support.
+        try:
+            create_unified_mempool()
+        except UnifiedMemoryUnsupportedError:
             pytest.skip("Unified memory not available due to bad environment.")
 
+        # Setup.
         self._setup_model_parallel_group(1, 1)
 
         # Compute number of contexts needed to fill GPU memory.
@@ -898,7 +921,8 @@ class TestDynamicContext:
                         params_dtype=torch.float32,
                         num_layers=4,
                         kv_channels=8,
-                        num_attention_heads=2,
+                        num_attention_kv_heads=2,
+                        num_attention_qo_heads=2,
                         max_sequence_length=512,
                         buffer_size_gb=buffer_size_gb,
                         buffer_overflow_factor=1,

@@ -26,7 +26,7 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
         max_requests,
         block_size_tokens,
         max_seqlen,
-        backend: AttnBackend = AttnBackend.flashinfer_fa2
+        backend: AttnBackend = AttnBackend.flashinfer_fa2,
     ):
         super().__init__(
             block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
@@ -139,7 +139,9 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
                     block_tables=self.state_data["decode_block_table"],
                 )
 
-    def set_model_params(self, num_qo_heads: int, num_kv_heads: int, head_dim: int, params_dtype: torch.dtype):
+    def set_model_params(
+        self, num_qo_heads: int, num_kv_heads: int, head_dim: int, params_dtype: torch.dtype
+    ):
         """
         Set model parameters needed for FlashInfer planning.
 
@@ -177,7 +179,7 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
         if self.padded_config.prefill_req_count > 0 and self.padded_config.decode_req_count == 0:
             o_fi = prefill_wrapper.run(q_fi, kv_cache)
             return o_fi.unsqueeze(1)
-        
+
         if self.padded_config.decode_req_count > 0 and self.padded_config.prefill_req_count == 0:
             o_fi = decode_wrapper.run(q_fi, kv_cache)
             return o_fi.unsqueeze(1)
@@ -185,10 +187,7 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
         # Prepare prefill input buffer using triton copy
         q_pf_input = torch.empty_like(q_fi)
         attn_partial_copy_triton(
-            q_fi,
-            q_pf_input,
-            self.state_data["device_decode_prefill"],
-            check_bounds=False
+            q_fi, q_pf_input, self.state_data["device_decode_prefill"], check_bounds=False
         )
 
         # Run prefill if there are prefill requests
@@ -202,10 +201,7 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
         # Run decode if there are decode requests
         nvtx_range_push("decode_wrapper.run")
         if self.padded_config.decode_req_count > 0:
-            o_fi_dc = decode_wrapper.run(
-                q_fi[:self.padded_config.decode_req_count],
-                kv_cache
-            )
+            o_fi_dc = decode_wrapper.run(q_fi[: self.padded_config.decode_req_count], kv_cache)
         else:
             o_fi_dc = torch.empty_like(q_fi)
         nvtx_range_pop("decode_wrapper.run")
@@ -217,9 +213,9 @@ class MHAFlashInferMetadata(MHASplitPDMetadata):
             prefill_tensor=o_fi_pf,
             output_tensor=o_fi,
             device_dc=self.state_data["device_decode_prefill"],
-            pf_useful_from_beginning=True
+            pf_useful_from_beginning=True,
         )
-        
+
         # Unsqueeze back: (batch, heads, dim) -> (batch, 1, heads, dim)
         return o_fi.unsqueeze(1)
 
@@ -239,10 +235,15 @@ class GraphMHAFlashInferMetadata(MHAFlashInferMetadata):
         max_seqlen,
         backend: AttnBackend = AttnBackend.flashinfer_fa2,
         prefill_workspace_size: int = 128 * 1024 * 1024,  # 128MB default
-        decode_workspace_size: int = 128 * 1024 * 1024,   # 128MB default
+        decode_workspace_size: int = 128 * 1024 * 1024,  # 128MB default
     ):
         super().__init__(
-            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen, backend
+            block_count_total,
+            max_kv_block_count,
+            max_requests,
+            block_size_tokens,
+            max_seqlen,
+            backend,
         )
 
         device = torch.cuda.current_device()
@@ -282,8 +283,8 @@ class GraphMHAFlashInferMetadata(MHAFlashInferMetadata):
                 self.prefill_workspace_buffer,
                 "HND",
                 use_cuda_graph=True,
-                qo_indptr_buf=self._prefill_qo_indptr_buf[:batch_size + 1],
-                paged_kv_indptr_buf=self._prefill_paged_kv_indptr_buf[:batch_size + 1],
+                qo_indptr_buf=self._prefill_qo_indptr_buf[: batch_size + 1],
+                paged_kv_indptr_buf=self._prefill_paged_kv_indptr_buf[: batch_size + 1],
                 paged_kv_indices_buf=self._prefill_paged_kv_indices_buf,
                 paged_kv_last_page_len_buf=self._prefill_paged_kv_last_page_len_buf[:batch_size],
                 backend=self.flashinfer_backend_map[self.backend],
@@ -312,7 +313,7 @@ class GraphMHAFlashInferMetadata(MHAFlashInferMetadata):
                 "HND",
                 use_tensor_cores=True,
                 use_cuda_graph=True,
-                paged_kv_indptr_buffer=self._decode_paged_kv_indptr_buf[:batch_size + 1],
+                paged_kv_indptr_buffer=self._decode_paged_kv_indptr_buf[: batch_size + 1],
                 paged_kv_indices_buffer=self._prefill_paged_kv_indices_buf,  # Reuse prefill indices
                 paged_kv_last_page_len_buffer=self._decode_paged_kv_last_page_len_buf[:batch_size],
                 backend=self.flashinfer_backend_map[self.backend],
@@ -362,10 +363,15 @@ class NonGraphMHAFlashInferMetadata(MHAFlashInferMetadata):
         max_seqlen,
         backend: AttnBackend = AttnBackend.flashinfer_fa2,
         prefill_workspace_size: int = 128 * 1024 * 1024,  # 128MB default
-        decode_workspace_size: int = 128 * 1024 * 1024,   # 128MB default
+        decode_workspace_size: int = 128 * 1024 * 1024,  # 128MB default
     ):
         super().__init__(
-            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen, backend
+            block_count_total,
+            max_kv_block_count,
+            max_requests,
+            block_size_tokens,
+            max_seqlen,
+            backend,
         )
 
         device = torch.cuda.current_device()

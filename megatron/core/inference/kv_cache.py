@@ -98,6 +98,11 @@ class KVCacheBase(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def reset(self):
+        """Resets the cache."""
+        raise NotImplementedError
+
     def supports_triton(self) -> bool:
         """
         Returns True if this cache layout is compatible with Triton kernels.
@@ -132,10 +137,7 @@ class MLACache(KVCacheBase):
         )
         self.kv_reduced_dim = kv_reduced_dim
         self.cache: Tensor = torch.full(
-            (num_chunks, chunk_size, kv_reduced_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, chunk_size, kv_reduced_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -161,6 +163,10 @@ class MLACache(KVCacheBase):
         kv_concat = key.squeeze(1)
         self.cache[block_idx, local_kv_seq_idx] = kv_concat[:padded_active_token_count]
 
+    def reset(self):
+        """Resets the MLA cache."""
+        self.cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """MLA is Triton-compatible."""
         return True
@@ -184,10 +190,7 @@ class KVCacheM2NCHD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.cache: Tensor = torch.full(
-            (2, num_chunks, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (2, num_chunks, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -213,6 +216,10 @@ class KVCacheM2NCHD(KVCacheBase):
         self.cache[0, block_idx, local_kv_seq_idx] = key[:padded_active_token_count]
         self.cache[1, block_idx, local_kv_seq_idx] = value[:padded_active_token_count]
 
+    def reset(self):
+        """Resets the merged cache."""
+        self.cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """M_2NCHD is Triton-compatible."""
         return True
@@ -235,10 +242,7 @@ class KVCacheMN2CHD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.cache: Tensor = torch.full(
-            (num_chunks, 2, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, 2, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -264,6 +268,10 @@ class KVCacheMN2CHD(KVCacheBase):
         self.cache[block_idx, 0, local_kv_seq_idx] = key[:padded_active_token_count]
         self.cache[block_idx, 1, local_kv_seq_idx] = value[:padded_active_token_count]
 
+    def reset(self):
+        """Resets the merged cache."""
+        self.cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """M_N2CHD is Triton-compatible."""
         return True
@@ -287,10 +295,7 @@ class KVCacheMN2HCD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.cache: Tensor = torch.full(
-            (num_chunks, 2, num_kv_heads, chunk_size, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, 2, num_kv_heads, chunk_size, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tensor:
@@ -316,6 +321,10 @@ class KVCacheMN2HCD(KVCacheBase):
         self.cache[block_idx, 0, :, local_kv_seq_idx, :] = key[:padded_active_token_count]
         self.cache[block_idx, 1, :, local_kv_seq_idx, :] = value[:padded_active_token_count]
 
+    def reset(self):
+        """Resets the merged cache."""
+        self.cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """M_N2HCD is Triton-compatible."""
         return True
@@ -339,16 +348,10 @@ class KVCacheSNCHD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.k_cache: Tensor = torch.full(
-            (num_chunks, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
         self.v_cache: Tensor = torch.full(
-            (num_chunks, chunk_size, num_kv_heads, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, chunk_size, num_kv_heads, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tuple[Tensor, Tensor]:
@@ -374,6 +377,11 @@ class KVCacheSNCHD(KVCacheBase):
         self.k_cache[block_idx, local_kv_seq_idx] = key[:padded_active_token_count]
         self.v_cache[block_idx, local_kv_seq_idx] = value[:padded_active_token_count]
 
+    def reset(self):
+        """Resets all caches."""
+        self.k_cache.fill_(-1)
+        self.v_cache.fill_(-1)
+
     def supports_triton(self) -> bool:
         """S_NCHD is Triton-compatible."""
         return True
@@ -396,21 +404,20 @@ class KVCacheSNHCD(KVCacheBase):
     ):
         super().__init__(num_chunks, chunk_size, num_kv_heads, head_dim, device, dtype)
         self.k_cache: Tensor = torch.full(
-            (num_chunks, num_kv_heads, chunk_size, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, num_kv_heads, chunk_size, head_dim), -1, dtype=dtype, device=device
         )
         self.v_cache: Tensor = torch.full(
-            (num_chunks, num_kv_heads, chunk_size, head_dim),
-            -1,
-            dtype=dtype,
-            device=device,
+            (num_chunks, num_kv_heads, chunk_size, head_dim), -1, dtype=dtype, device=device
         )
 
     def get_content(self) -> Tuple[Tensor, Tensor]:
         """Returns (k_cache, v_cache) tuple."""
         return (self.k_cache, self.v_cache)
+
+    def reset(self):
+        """Resets all caches."""
+        self.k_cache.fill_(-1)
+        self.v_cache.fill_(-1)
 
     def append(
         self,

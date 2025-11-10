@@ -1,0 +1,34 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Auto Reminder Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * *"
+
+jobs:
+  run-script:
+    environment: main
+    name: Run Auto Reminder Bot
+    runs-on: ubuntu-latest
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir PyGithub slack-sdk
+
+      - name: Run Auto Reminder Bot
+        run: |
+          export SLACK_TOKEN=${{ secrets.SLACK_TOKEN }}
+          export SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+          export GH_TOKEN=${{ secrets.PAT }}
+          python tests/test_utils/python_scripts/auto_reminder_github.py

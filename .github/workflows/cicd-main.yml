@@ -11,17 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 name: CICD Megatron-LM
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: 0 0 * * *
   push:
     branches:
+      - dev
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -31,19 +34,135 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+
 jobs:
+  is-not-external-contributor:
+    runs-on: ubuntu-latest
+    environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    outputs:
+      is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.PAT }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ env.GITHUB_TOKEN }}
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Check membership
+        id: check-membership
+        env:
+          IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
+        run: |
+          PR_AUTHOR=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').user.login }}
+
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
+            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Checking if $PR_AUTHOR is a repo collaborator..."
+          API_URL="https://api.github.com/repos/$REPO/collaborators/$PR_AUTHOR"
+          REPO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            $API_URL)
+
+          echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA-NeMo..."
+          API_URL="https://api.github.com/orgs/NVIDIA-NeMo/members/$PR_AUTHOR"
+          ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            $API_URL)
+
+          echo "Checking if $PR_AUTHOR is an org collaborator to NVIDIA..."
+          API_URL="https://api.github.com/orgs/NVIDIA/members/$PR_AUTHOR"
+          ORG_NVIDIA_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            $API_URL)
+
+          if [ "$REPO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE" -eq 204 ] || [ "$ORG_NVIDIA_MEMBERSHIP_RESPONSE" -eq 204 ]; then
+            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
+          else
+            echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Find Comment
+        uses: peter-evans/find-comment@v4
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        id: fc
+        with:
+          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          repository: ${{ github.repository }}
+          body-includes: "<!--external-contributor-comment-->"
+
+      - name: Delete comment
+        uses: actions/github-script@v7
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.fc.outputs.comment-id != ''
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.deleteComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ steps.fc.outputs.comment-id }}
+            })
+
+      - name: Write pull request comment
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          repository: ${{ github.repository }}
+          body: |
+            <!--external-contributor-comment-->
+
+            Thank you for your contribution!
+
+            NVIDIA Megatron-LM is currently transitioning to development on Github. We will aim to review your PR after we complete our transition and stabilize our Github development process.
+
+            Thank you for your understanding.
+
+      - name: exit
+        run: |
+          if [ "${{ steps.check-membership.outputs.is_maintainer }}" == "true" ]; then
+            exit 0
+          else
+            exit 1
+          fi
+
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.0
+    needs: [is-not-external-contributor]
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
 
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
     if: |
       (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'true'
       ) || (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'false'
           && needs.pre-flight.outputs.docs_only == 'false'
       )
@@ -68,11 +187,14 @@ jobs:
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Run linting
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
         run: |
           export PATH=".venv/bin:$PATH"
-          export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}" 
-          export CHECK_ONLY=true 
-          export SKIP_DOCS=false 
+          export GITLAB_ENDPOINT=github.com
+          export CI_PROJECT_NAMESPACE=NVIDIA
+          export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
+          export CHECK_ONLY=true
+          export SKIP_DOCS=false
           bash tools/autoformat.sh
 
   cicd-wait-in-queue:
@@ -87,69 +209,260 @@ jobs:
       - name: Running CI tests
         run: |
           echo "Running CI tests"
+          echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
+
+  cicd-container-build:
+    needs: [pre-flight, cicd-wait-in-queue]
+    runs-on: nvidia-ci-aws-gpu-x8
+    environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Download test data
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "::group::Download test data"
+          pip install --no-cache-dir pygithub click
+          python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+          echo "::endgroup::"
+
+      - name: Install GH CLI
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y gh
+
+      - name: Get last merged PR
+        id: cache_from
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST_PRS=$(gh api graphql -f query='
+            query {
+              repository(owner: "NVIDIA", name: "Megatron-LM") {
+                pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number
+                  }
+                }
+              }
+            }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
+              echo "type=registry,ref=${{ env.container-registry }}/megatron-lm:$number-buildcache,mode=max"
+            done)
+
+          echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
+          echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
+          echo "EOF" | tee -a $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          file: ./docker/Dockerfile.ci.dev
+          push: true
+          context: .
+          target: main
+          build-args: |
+            FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
+          cache-from: |
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
+            ${{ steps.cache_from.outputs.LAST_PRS }}
+          cache-to: |
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          no-cache: false
+          tags: |
+            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+            ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          secrets: |
+            GH_TOKEN=${{ secrets.PAT }}
+
+  cicd-parse-unit-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - bucket: "unit_tests"
-          - bucket: "unit_tests/data/"
-          - bucket: "unit_tests/dist_checkpointing/*.py"
-          - bucket: "unit_tests/dist_checkpointing/models/"
-          - bucket: "unit_tests/transformer/*.py"
-          - bucket: "unit_tests/transformer/moe"
-    needs: [pre-flight, cicd-wait-in-queue]
+        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
-      && !needs.pre-flight.outputs.is_merge_group == 'true'
+      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: main
         uses: ./.github/actions
         with:
-          test_case: tests/${{ matrix.bucket }}
+          test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
-  cicd-functional-tests-latest:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - model: "gpt"
-            test_case: "gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G"
-          - model: "gpt"
-            test_case: "gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G"
-          - model: "moe"
-            test_case: "gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer"
-          - model: "moe"
-            test_case: "gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed"
+  cicd-parse-integration-tests:
+    runs-on: ubuntu-latest
     needs:
       - pre-flight
       - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-unit-tests-latest
+    environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    outputs:
+      integration-tests: ${{ steps.main.outputs.integration-tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Has Run tests label
+        id: has-run-tests-label
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
+          echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
+      - name: Parse functional tests
+        id: main
+        env:
+          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
+        run: |
+          export PYTHONPATH=$(pwd)
+
+          if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
+            ARGS=(
+              --scope mr-github
+              --enable-lightweight-mode
+            )
+          else
+            ARGS=(
+              --scope mr-slim
+              --enable-lightweight-mode
+            )
+          fi
+
+          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+            --n-repeat 5 \
+            --time-limit 2700 \
+            --test-cases all \
+            --container-image mcore_ci_dev \
+            --container-tag latest \
+            --dependent-job functional:configure \
+            --record-checkpoints false \
+            --slurm-account gh \
+            --no-enable-warmup \
+            --environment dev \
+            --platform dgx_h100 \
+            --cluster ghci \
+            ${ARGS[@]} \
+            --output-path integration-tests.yaml
+
+          cat integration-tests.yaml | \
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests.json
+
+          echo "integration-tests=$(cat integration-tests.json)" | tee -a "$GITHUB_OUTPUT"
+
+  cicd-integration-tests-latest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-integration-tests.outputs.integration-tests) }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-parse-integration-tests
       - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
-      && !needs.pre-flight.outputs.is_merge_group == 'true'
+      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
       - name: Checkout
@@ -163,12 +476,13 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:
       - pre-flight
       - cicd-unit-tests-latest
-      - cicd-functional-tests-latest
+      - cicd-integration-tests-latest
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
@@ -178,6 +492,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -189,8 +504,8 @@ jobs:
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
           SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped")] | length') || echo 0
@@ -216,6 +531,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -225,7 +541,7 @@ jobs:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
-              repo: context.repo.repo, 
+              repo: context.repo.repo,
               sha: context.sha,
               state: 'success',
               description: 'No code changes - coverage check skipped',
@@ -241,9 +557,10 @@ jobs:
         || success()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
-        flag: [unit-test, e2e]
+        flag: [unit-test]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

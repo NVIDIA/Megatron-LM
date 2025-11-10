@@ -971,6 +971,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             else:
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
@@ -1111,6 +1112,7 @@ def setup_model_and_optimizer(
         # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
         #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
         default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+        dump_param_to_param_group_map=args.dump_param_to_param_group_map,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1781,6 +1783,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -1823,7 +1826,9 @@ def post_training_step_callbacks(
             assert prof is not None
             prof.stop()
         else:
-            torch.cuda.cudart().cudaProfilerStop()
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            if nsys_nvtx_context is not None:
+                nsys_nvtx_context.__exit__(None, None, None)
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2147,6 +2152,7 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
         and torch.distributed.get_rank() in args.profile_ranks
@@ -2201,8 +2207,9 @@ def train(
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -2445,6 +2452,7 @@ def train(
             iteration,
             prof,
             num_floating_point_operations_since_last_log_event,
+            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.

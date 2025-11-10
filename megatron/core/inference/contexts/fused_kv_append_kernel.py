@@ -68,9 +68,7 @@ def _append_kv_merged_kernel(
     # --- Calculate destination pointers in the merged cache ---
     # The stride_cache_kv allows us to select between K (0) and V (1)
     base_offset = (
-        block_idx * stride_cache_block
-        + local_pos * stride_cache_pos
-        + head_idx * stride_cache_head
+        block_idx * stride_cache_block + local_pos * stride_cache_pos + head_idx * stride_cache_head
     )
 
     key_dest_ptr = cache_ptr + 0 * stride_cache_kv + base_offset
