@@ -295,7 +295,7 @@ def apply_swiglu_sharded_factory(
             )
             w_key = key
             v_key = key
-        
+
         tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
         return [
             ShardedTensor.from_rank_offsets(
@@ -315,7 +315,6 @@ def apply_swiglu_sharded_factory(
                 prepend_axis_num=prepend_axis_num,
             ),
         ]
-
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():

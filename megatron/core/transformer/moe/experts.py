@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import copy
-import itertools
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil

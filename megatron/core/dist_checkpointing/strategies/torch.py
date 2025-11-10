@@ -5,9 +5,8 @@ import io
 import os
 import pickle
 import warnings
-from collections import ChainMap, defaultdict
+from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from pathlib import Path
@@ -185,9 +184,7 @@ def sharded_tensor_to_torch_sharded_tensor(
     offsets_shape = some_sh_ten.data.shape  # includes prepended axes
 
     local_shards = [
-        Shard.from_tensor_and_offsets(
-            sh_ten.data, list(sh_ten.global_offset), rank  # simple case
-        )
+        Shard.from_tensor_and_offsets(sh_ten.data, list(sh_ten.global_offset), rank)  # simple case
         for sh_ten in sh_tens
     ]
 
@@ -445,10 +442,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
             # For MCore, these should be already non-duplicates.
             write_items += _create_write_items(fqn, obj)
 
-        self.plan = SavePlan(
-            items=write_items,
-            planner_data=self.mappings,
-        )
+        self.plan = SavePlan(items=write_items, planner_data=self.mappings)
         return self.plan
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
@@ -789,9 +783,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         (sharded_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
         )
-        pyt_state_dict = mcore_to_pyt_state_dict(
-            sharded_state_dict, True
-        )
+        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
         checkpoint.load_state_dict(

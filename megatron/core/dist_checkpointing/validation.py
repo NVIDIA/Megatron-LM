@@ -10,12 +10,7 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
-from megatron.core.dist_checkpointing.dict_utils import (
-    diff,
-    extract_matching_values,
-    map_reduce,
-    nested_values,
-)
+from megatron.core.dist_checkpointing.dict_utils import diff, extract_matching_values, nested_values
 from megatron.core.dist_checkpointing.mapping import (
     CommonStateDict,
     ShardedBase,

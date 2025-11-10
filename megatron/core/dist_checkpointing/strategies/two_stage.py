@@ -17,7 +17,7 @@ from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy
 from .tensorstore import _load_from_array, open_ts_array
-from .zarr import flatten_range, load_zarr_based_sharded_metadata
+from .zarr import load_zarr_based_sharded_metadata
 
 _import_trigger = None
 
