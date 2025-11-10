@@ -157,6 +157,7 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 class TestClipQK:
 
     def setup_method(self, method):
@@ -206,9 +207,6 @@ class TestClipQK:
 
     def test_clip_qk_below_threshold_no_update(self):
         """Test that weights are not updated when max logits are below threshold."""
-        if not is_te_min_version("2.9.0"):
-            pytest.skip("QK clipping requires TransformerEngine >= 2.9.0")
-
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -243,9 +241,6 @@ class TestClipQK:
 
     def test_clip_qk_above_threshold_updates_weights(self):
         """Test that weights are updated when max logits exceed threshold."""
-        if not is_te_min_version("2.9.0"):
-            pytest.skip("QK clipping requires TransformerEngine >= 2.9.0")
-
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -280,9 +275,6 @@ class TestClipQK:
 
     def test_clip_qk_gqa_configuration(self):
         """Test clip_qk with GQA (Grouped Query Attention) configuration."""
-        if not is_te_min_version("2.9.0"):
-            pytest.skip("QK clipping requires TransformerEngine >= 2.9.0")
-
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -318,9 +310,6 @@ class TestClipQK:
 
     def test_clip_qk_mixed_logits(self):
         """Test clip_qk with mixed logits (some above, some below threshold)."""
-        if not is_te_min_version("2.9.0"):
-            pytest.skip("QK clipping requires TransformerEngine >= 2.9.0")
-
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,

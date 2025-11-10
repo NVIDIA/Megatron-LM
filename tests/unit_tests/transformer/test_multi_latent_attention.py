@@ -1034,6 +1034,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             os.environ.update(_environ)
 
 
+@pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestMLAClipQK:
 
