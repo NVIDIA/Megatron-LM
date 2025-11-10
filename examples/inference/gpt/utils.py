@@ -222,6 +222,9 @@ def get_time_offsets(
     if len(time_offsets) == 0:
         time_offsets = [0.0]
 
+    # Ensure first time is 0.
+    time_offsets = [to - time_offsets[0] for to in time_offsets]
+    
     # Truncate to num_requests.
     assert len(time_offsets) >= num_requests
     time_offsets = time_offsets[:num_requests]
@@ -355,6 +358,9 @@ def build_dynamic_engine_setup_prefix(
     else:
         cg_str = "--"
 
+    # Unified memory (UVM).
+    uvm_str = f"uvm {int(context.unified_memory_level)}"
+
     # Prompt description
     prompt_src_str = (
         "cli" if args.prompts else
@@ -390,6 +396,7 @@ def build_dynamic_engine_setup_prefix(
         get_model_size_str(model),
         "dynamic",
         cg_str,
+        uvm_str,
         request_str,
         buffer_limits_str,
         guaranteed_fraction_str,
