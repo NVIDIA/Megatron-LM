@@ -419,10 +419,14 @@ def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
     layer.train()
     return layer
 
+
 def _check_env():
     NCCL_MAX_NCHANNELS = os.environ.get("NCCL_MAX_NCHANNELS")
     if NCCL_MAX_NCHANNELS is not None:
-        pytest.fail(f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression")
+        pytest.fail(
+            f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression"
+        )
+
 
 @pytest.mark.flaky(reruns=2)
 @pytest.mark.internal

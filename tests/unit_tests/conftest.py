@@ -65,6 +65,7 @@ def set_env(request):
         os.environ['NCCL_MAX_NCHANNELS'] = '1'
         os.environ['NCCL_NVLS_ENABLE'] = '0'
 
+
 @pytest.fixture(scope="session")
 def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     """Common directory for saving the checkpoint.
