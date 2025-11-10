@@ -2,6 +2,7 @@
 
 import asyncio
 import multiprocessing
+
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -138,9 +139,7 @@ def tensor_swap(x, src_idxs, dst_idxs):
 
 
 async def await_process_event(
-    event: multiprocessing.Event,
-    process: multiprocessing.Process,
-    timeout: float = 1.0,
+    event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
 ) -> None:
     """Repeatedly wait for a multiprocessing event to be set, aborting upon process failure.
 

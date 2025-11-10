@@ -417,7 +417,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop = loop))
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
