@@ -11,6 +11,7 @@ from typing import Any, List, Optional
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
 from megatron.core.transformer.module import MegatronModule
 
 from megatron.core.inference.sampling_params import SamplingParams
@@ -65,7 +66,7 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Add a deterministic number of requests per step. This arg is "
         "prioritized over `--incoming-requests-per-sec` below (which is non-"
         "deterministic). Note that the number of requests added per step is "
-        "additionally limited by the inference context's `max_requests`, "
+        "additionally limited by the inference context's `max_active_requests`, "
         "`max_tokens`, and KV buffer size.",
     )
     group.add_argument(
@@ -262,10 +263,27 @@ def get_synthetic_requests(
         int(args.incoming_requests_per_sec * args.incoming_requests_duration),
     )
 
+    # Build prompts with expected lengths.
+    assert (
+        len(args.num_tokens_to_prompt) == 2
+        and
+        args.num_tokens_to_prompt[1] >= args.num_tokens_to_prompt[0]
+    )
+    max_prompt_length = args.num_tokens_to_prompt[1]
+    max_prompt_text = "hi " * max_prompt_length
+    max_prompt_tokens = tokenizer.tokenize(max_prompt_text)
+    prompt_lengths = [
+        random.randint(*args.num_tokens_to_prompt)
+        for _ in time_offsets
+    ]
+    prompt_tokens_list = [ max_prompt_tokens[:l] for l in prompt_lengths ]
+    prompt_texts = [ tokenizer.detokenize(tt) for tt in prompt_tokens_list ]
+
     # Init requests.
+    assert len(prompt_texts) == len(time_offsets)
     requests = [
-        Request("hi " * random.randint(*args.num_tokens_to_prompt), t, tokenizer, sampling_params)
-        for t in time_offsets
+        Request(t, o, tokenizer, sampling_params=sampling_params)
+        for t, o in zip(prompt_texts, time_offsets)
     ]
 
     return requests
@@ -342,7 +360,7 @@ def build_dynamic_engine_setup_prefix(
 
     Args:
         args (Namespace): Command-line arguments for this run.
-        context (DynamicInferenceContext): Stores limits such as `max_requests`,
+        context (DynamicInferenceContext): Stores limits such as `max_active_requests`,
             `max_tokens`, and `gtd_request_count`.
         requests (List[DynamicInferenceRequest]): List of inference requests.
 
@@ -379,17 +397,10 @@ def build_dynamic_engine_setup_prefix(
     )
 
     # Buffer limits config
-    flw = args.inference_dynamic_batching_buffer_overflow_factor
-    flw_str = "no overflow" if flw is None else f"{flw:.1f}"
     buffer_limits_str = (
-        f"bf {args.inference_dynamic_batching_buffer_size_gb:.0f}, {flw_str} "
-        f"[r {context.max_requests}, t {context.max_tokens}]"
-    )
-
-    # Guaranteed request config
-    guaranteed_fraction_str = (
-        f"gtd {args.inference_dynamic_batching_buffer_guaranteed_fraction:.2f} "
-        f"[r {context.gtd_request_count}]"
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_active_buffer_size_gb*1024**3)}, "
+        f"{context.block_allocator.active_count} chunks "
+        f"[r {context.max_active_requests}, t {context.max_tokens}]"
     )
 
     parts = [
@@ -399,7 +410,6 @@ def build_dynamic_engine_setup_prefix(
         uvm_str,
         request_str,
         buffer_limits_str,
-        guaranteed_fraction_str,
     ]
 
     return " | ".join(parts)
