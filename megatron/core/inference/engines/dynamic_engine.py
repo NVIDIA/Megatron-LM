@@ -39,9 +39,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter
+from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 try:
     from tqdm import tqdm
@@ -339,6 +339,8 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int,
         launch_inference_coordinator: bool = True,
         verbose: bool = False,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -453,10 +455,15 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.barrier(parallel_state.get_tensor_model_parallel_group())
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
-            coordinator_ready_event.wait()
+            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
+        loop = get_asyncio_loop(loop)
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(
+            loop=loop,
+            verbose=verbose
+        ))
         self.engine_loop_task = asyncio.create_task(
             self.run_engine_with_coordinator(verbose=verbose)
         )
@@ -604,6 +611,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Notify event loop.
         self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
 
+    @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
         async with self._cond:
@@ -670,7 +678,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # completed. If the engine has previously been suspended, then the future
         # may already exist.
         if request_id not in self.request_completion_futures:
-            self.request_completion_futures[request_id] = asyncio.Future()
+            self.request_completion_futures[request_id] = self._loop.create_future()
 
         return self.request_completion_futures[request_id]
 
@@ -847,7 +855,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
-                    asyncio.create_task, self._notify_cond_for_new_request()
+                    self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add()
@@ -910,7 +918,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -928,7 +936,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add()
@@ -940,7 +948,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
@@ -1262,8 +1270,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
         parallel_state.destroy_model_parallel()
 
-    async def run_engine(self, *, verbose: Optional[bool] = False):
+    @trace_async_exceptions
+    async def run_engine(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -1282,8 +1294,12 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def run_engine_with_coordinator(self, *, verbose: Optional[bool] = False):
+    @trace_async_exceptions
+    async def run_engine_with_coordinator(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 self.schedule_requests()

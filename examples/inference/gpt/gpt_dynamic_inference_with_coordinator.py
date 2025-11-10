@@ -32,6 +32,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_args
 
+import logging
+
+logging.basicConfig(level=logging.INFO, force=True)
+
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],

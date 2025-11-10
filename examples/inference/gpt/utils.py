@@ -222,6 +222,9 @@ def get_time_offsets(
     if len(time_offsets) == 0:
         time_offsets = [0.0]
 
+    # Ensure first time is 0.
+    time_offsets = [to - time_offsets[0] for to in time_offsets]
+    
     # Truncate to num_requests.
     assert len(time_offsets) >= num_requests
     time_offsets = time_offsets[:num_requests]
