@@ -292,6 +292,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    @trace_async_exceptions
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,
@@ -747,6 +748,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
+    @trace_async_exceptions
     async def async_step(
         self, *, verbose: Optional[bool] = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
