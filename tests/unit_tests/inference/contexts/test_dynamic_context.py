@@ -43,10 +43,7 @@ class TestDynamicContext:
         max_sequence_length,
         active_buffer_size_gb,
         block_size_tokens,
-        buffer_guaranteed_fraction,
-        buffer_overflow_factor,
-        max_requests_override,
-        max_tokens_override,
+        max_tokens,
         is_hybrid_model=False,
         layer_type_list=None,
         rounder=64,
@@ -66,7 +63,7 @@ class TestDynamicContext:
             use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
             active_buffer_size_gb=active_buffer_size_gb,
             block_size_tokens=block_size_tokens,
-            max_tokens=max_tokens_override,
+            max_tokens=max_tokens,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=(544, 4),
             mamba_ssm_states_shape=(8, 64, 16),
@@ -91,24 +88,24 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_tokens_override=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
         if not is_hybrid_model:
-            assert dynamic_context.gtd_block_count == 48
-            assert dynamic_context.gtd_request_count == 12
-            assert dynamic_context.block_allocator.block_count_total == 491
-            assert dynamic_context.max_requests == 128
-            assert dynamic_context.max_tokens == 62848
+            assert dynamic_context.block_allocator.total_count == 981
+            assert dynamic_context.block_allocator.active_count == 490
+            assert dynamic_context.max_total_requests == 980
+            assert dynamic_context.max_active_requests == 490
+            assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.gtd_block_count == 112
-            assert dynamic_context.gtd_request_count == 28
-            assert dynamic_context.block_allocator.block_count_total == 1156
-            assert dynamic_context.max_requests == 320
-            assert dynamic_context.max_tokens == 154176
+            assert dynamic_context.block_allocator.total_count == 1111
+            assert dynamic_context.block_allocator.active_count == 555
+            assert dynamic_context.max_total_requests == 1110
+            assert dynamic_context.max_active_requests == 555
+            assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
 
@@ -126,9 +123,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=1.0,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
         )
         assert not dynamic_context.is_static_batching()
 
@@ -144,9 +139,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=1.0,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
         dynamic_context.block_allocator.active_count = 10
@@ -170,9 +163,7 @@ class TestDynamicContext:
             max_sequence_length=128,
             active_buffer_size_gb=0.01,
             block_size_tokens=32,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
@@ -202,7 +193,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.1,
             block_size_tokens=128,
-            max_tokens=20,  # Setting a very low token limit
+            max_tokens=200,  # setting low, but >= context.max_active_requests.
             rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
@@ -211,7 +202,7 @@ class TestDynamicContext:
             dynamic_context.add_request(
                 DynamicInferenceRequest(
                     request_id=1,
-                    prompt_tokens=torch.arange(0, 25, device='cuda'),
+                    prompt_tokens=torch.arange(0, 225, device='cuda'),
                     sampling_params=SamplingParams(
                         num_tokens_to_generate=dynamic_context.max_tokens - 25
                     ),
@@ -231,9 +222,7 @@ class TestDynamicContext:
             max_sequence_length=128,
             active_buffer_size_gb=1.0,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
@@ -256,7 +245,6 @@ class TestDynamicContext:
         dynamic_context.token_to_position_in_request.fill_(1)
         dynamic_context.token_to_block_idx.fill_(1)
         dynamic_context.token_to_local_position_within_kv_block.fill_(1)
-        dynamic_context.block_allocator.active_count = 1023
         dynamic_context.memory_buffer.fill_(1)
         dynamic_context.request_to_kv_block_ids.fill_(1)
         if is_hybrid_model:
@@ -307,16 +295,14 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
         if is_hybrid_model:
-            expected_memory_blocks = [1151, 1152, 1153, 1154]
+            expected_memory_blocks = [1106, 1107, 1108, 1109]
         else:
-            expected_memory_blocks = [486, 487, 488, 489]
+            expected_memory_blocks = [976, 977, 978, 979]
         expected_block_count_avail = expected_memory_blocks[0]
 
         assert (
@@ -327,16 +313,16 @@ class TestDynamicContext:
             .tolist()
             == expected_memory_blocks
         )
-        assert dynamic_context.block_allocator.block_count_avail == expected_block_count_avail
+        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail
         dynamic_context.block_allocator.release_memory_blocks(
             torch.tensor(expected_memory_blocks[-2:], device='cuda')
         )
-        assert dynamic_context.block_allocator.block_count_avail == expected_block_count_avail + 2
+        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail + 2
         assert (
             dynamic_context.block_allocator.allocate_memory_blocks(1).item()
             == expected_memory_blocks[-1]
         )
-        assert dynamic_context.block_allocator.block_count_avail == expected_block_count_avail + 1
+        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail + 1
         # Should return None since we allocate more blocks than what we have.
         assert (
             dynamic_context.block_allocator.allocate_memory_blocks(
@@ -358,9 +344,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
         assert dynamic_context.block_size_tokens == 128
@@ -382,7 +366,7 @@ class TestDynamicContext:
         assert dynamic_context.request_kv_length_offsets[0] == 0
         assert dynamic_context.request_kv_block_counts[0] == 2
         assert dynamic_context.request_last_kv_block_id[0].item() == (
-            1154 if is_hybrid_model else 489
+            1109 if is_hybrid_model else 979
         )
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
@@ -433,9 +417,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
@@ -479,9 +461,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
@@ -594,16 +574,16 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [1144, 1147, -1, -1],
-                        [1145, 1144, -1, -1],
-                        [1149, 1151, -1, -1],
-                        [1150, 1152, -1, -1],
-                        [1148, -1, -1, -1],
-                        [1146, -1, -1, -1],
-                        [1153, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
+                        [1099, 1102,   -1,   -1],
+                        [1100, 1099,   -1,   -1],
+                        [1104, 1106,   -1,   -1],
+                        [1105, 1107,   -1,   -1],
+                        [1103,   -1,   -1,   -1],
+                        [1101,   -1,   -1,   -1],
+                        [1108,   -1,   -1,   -1],
+                        [  -1,   -1,   -1,   -1],
+                        [  -1,   -1,   -1,   -1],
+                        [  -1,   -1,   -1,   -1]
                     ]
                 )
             )
@@ -612,16 +592,16 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [479, 482, -1, -1],
-                        [480, 479, -1, -1],
-                        [484, 486, -1, -1],
-                        [485, 487, -1, -1],
-                        [483, -1, -1, -1],
-                        [481, -1, -1, -1],
-                        [488, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
+                        [969, 972,  -1,  -1],
+                        [970, 969,  -1,  -1],
+                        [974, 976,  -1,  -1],
+                        [975, 977,  -1,  -1],
+                        [973,  -1,  -1,  -1],
+                        [971,  -1,  -1,  -1],
+                        [978,  -1,  -1,  -1],
+                        [ -1,  -1,  -1,  -1],
+                        [ -1,  -1,  -1,  -1],
+                        [ -1,  -1,  -1,  -1]
                     ]
                 )
             )
@@ -640,9 +620,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
@@ -714,9 +692,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
 
@@ -787,12 +763,9 @@ class TestDynamicContext:
                 kv_channels=8,
                 num_attention_heads=2,
                 max_sequence_length=512,
-                buffer_size_gb=0.03,
-                buffer_guaranteed_fraction=0.1,
+                active_buffer_size_gb=0.03,
                 block_size_tokens=128,
-                max_requests_override=None,
-                max_tokens_override=None,
-                buffer_overflow_factor=None,
+                max_tokens=None,
                 is_hybrid_model=False,
             )
             with pytest.raises(AssertionError) as error:
@@ -805,12 +778,9 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            buffer_size_gb=0.03,
-            buffer_guaranteed_fraction=0.1,
+            active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
             is_hybrid_model=is_hybrid_model,
             layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MAMBA, Symbols.ATTENTION],
         )
@@ -866,9 +836,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             active_buffer_size_gb=0.03,
             block_size_tokens=128,
-            max_requests_override=None,
-            max_tokens_override=None,
-            buffer_overflow_factor=None,
+            max_tokens=None,
         )
 
         # Add a few requests to the context

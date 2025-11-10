@@ -114,7 +114,7 @@ class BlockOverflowError(ContextOverflowError):
 
 class ActiveRequestCountOverflowError(ContextOverflowError):
     '''Used when `initialize_attention_state()` is called with
-    `num_warmup_requests > max_requests.'''
+    `num_warmup_requests > max_active_requests.'''
 
     def __init__(self, max_request_count, active_request_count):
         assert active_request_count > max_request_count
@@ -232,9 +232,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_size_tokens (int): Size of KV cache block size.
         tensor_model_parallel_size (Optional[int]): Tensor model parallel size.
         num_cuda_graphs (Optional[int]): Maximum number of cuda graphs to capture,
-            where the cuda graph batch sizes range from 1 to `max_requests` (as
-            computed below). Due to rounding, the actual number of cuda graphs may
-            not equal this argument.
+            where the cuda graph batch sizes range from 1 to `max_active_requests`
+            (as computed below). Due to rounding, the actual number of cuda graphs
+            may not equal this argument.
         materialize_only_last_token_logits (Optional[bool]): Whether to only
             materialize logits for the last token. This should be set to False
             if returning log probs.
@@ -549,16 +549,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Optional state tensors for hybrid models
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(max_requests=self.max_requests)
+            self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
 
             with ctx_manager:
                 self.mamba_conv_states = torch.zeros(
-                    (self.num_mamba_layers, self.max_requests) + mamba_conv_states_shape,
+                    (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
                 self.mamba_ssm_states = torch.zeros(
-                    (self.num_mamba_layers, self.max_requests) + mamba_ssm_states_shape,
+                    (self.num_mamba_layers, self.max_total_requests) + mamba_ssm_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
