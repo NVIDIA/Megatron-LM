@@ -195,9 +195,9 @@ class DynamicInferenceContext(BaseInferenceContext):
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
     that the context is defined to support. For the block-level KV cache, a memory
-    buffer is allocated up front (size `buffer_size_gb`), that is divided into
-    blocks and dynamically assigned to requests. At any given step, any unassigned
-    blocks equate to unused space.
+    buffer is allocated up front (size `2 * active_buffer_size_gb`), that is
+    divided into blocks and dynamically assigned to requests. At any given step,
+    any unassigned blocks equate to unused space.
 
     Additionally, a fraction of the memory buffer (`gtd_request_fraction`, i.e.,
     the 'guaranteed' request fraction) is reserved for guaranteeing that a
@@ -360,26 +360,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         assert self.block_size_bytes > 0
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # # Initialize block allocator.
-        # active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
-        # active_block_count_total = active_buffer_size_bytes // self.block_size_bytes
-        # self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
-        # del active_block_count_total  # use self.block_allocator.active_count
-        # active_buffer_size_bytes = self.block_allocator.active_count * self.block_size_bytes
-
-        # # Set max_total_requests, max_active_requests, max_tokens.
-        # self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
-        # self.max_active_requests = self.block_allocator.active_count
-        # self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
             mamba_states_memory_per_request += math.prod(mamba_conv_states_shape)
             mamba_states_memory_per_request += math.prod(mamba_ssm_states_shape)
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
+
+        # Initialize block allocator.
+        active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
+        active_block_count_total = active_buffer_size_bytes // (
+            self.block_size_bytes + mamba_states_memory_per_request
+        )
+        self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
+        del active_block_count_total  # use self.block_allocator.active_count
+        active_buffer_size_bytes = self.block_allocator.active_count * self.block_size_bytes
+
+        # Set max_total_requests, max_active_requests, max_tokens.
+        self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
+        self.max_active_requests = self.block_allocator.active_count
+        self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
 
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
@@ -438,12 +438,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
-
-        # Calculate the total number of chunks available in the buffer
-        total_mamba_states_memory = mamba_states_memory_per_request * self.max_requests
-        block_count_total = (
-            max(0, buffer_size_bytes - total_mamba_states_memory) // self.block_size_bytes
-        )
 
         # Memory buffer.
         ctx_manager = (
