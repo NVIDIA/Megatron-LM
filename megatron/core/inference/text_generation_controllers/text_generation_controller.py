@@ -349,6 +349,7 @@ class TextGenerationController:
             generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
                             indicates the prompt at that index has started generating tokens.
             top_n_logprobs_dict (top_n_logprobs_dict): The dict to be updated
+            logits (torch.Tensor): Full logits tensor for prompt top n logprobs calculation
 
         Returns:
             sampled_logits (torch.Tensor): 1D tensor with [batch_size] elements
@@ -360,15 +361,43 @@ class TextGenerationController:
         new_sample = torch.zeros(batch_size, dtype=torch.int64, device=last_token_logits.device)
         termination_id = torch.zeros_like(new_sample, dtype=torch.int64)
 
+        # Create generation_started tensor if not provided
+        # For dynamic batching, we assume all active requests have started generation
+        # unless we're in the first prefill step
+        if generation_started is None:
+            context = self.inference_wrapped_model.inference_context
+            generation_started = torch.ones(batch_size, dtype=torch.bool, device=last_token_logits.device)
+
         for sampling_params, mask in active_sampling_map:
             # Filter out indices that are out of bounds for the current batch
             valid_mask = [i for i in mask if i < batch_size]
             if valid_mask:
+                # Create a sub-dict for this batch if top_n_logprobs is enabled
+                # We need to remap the keys from context indices to sub-batch indices
+                sub_top_n_logprobs_dict = None
+                if sampling_params.top_n_logprobs > 0 and top_n_logprobs_dict is not None:
+                    # Map context indices to sub-batch indices (0, 1, 2, ...)
+                    sub_top_n_logprobs_dict = {
+                        sub_idx: top_n_logprobs_dict.get(context_idx, [])
+                        for sub_idx, context_idx in enumerate(valid_mask)
+                    }
+
                 new_sample[valid_mask] = self.sample_from_logits(
                     last_token_logits[valid_mask],
                     sampling_params=sampling_params,
                     vocab_size=vocab_size,
+                    generation_started=generation_started[valid_mask] if generation_started is not None else None,
+                    top_n_logprobs_dict=sub_top_n_logprobs_dict,
+                    logits=None,  # We don't support prompt top_n_logprobs in dynamic inference yet
                 )
+
+                # Update the main top_n_logprobs_dict with results from sub_dict
+                # Map back from sub-batch indices to context indices
+                if sub_top_n_logprobs_dict is not None:
+                    for sub_idx, context_idx in enumerate(valid_mask):
+                        if sub_idx in sub_top_n_logprobs_dict:
+                            top_n_logprobs_dict[context_idx] = sub_top_n_logprobs_dict[sub_idx]
+
                 if sampling_params.termination_id is not None:
                     termination_id[valid_mask] = sampling_params.termination_id
                 else:
@@ -573,8 +602,9 @@ class TextGenerationController:
         pass
 
     def _dynamic_step_sample_logits(
-        self, logits: Tensor, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
-    ) -> Tensor:
+        self, logits: Tensor, active_sampling_map: List[Tuple[SamplingParams, List[int]]],
+        top_n_logprobs_dict: Optional[Dict[int, List[Dict[str, float]]]] = None
+    ) -> Tuple[Tensor, Tensor]:
         """Sample logits for dynamic batching.
 
         Args:
@@ -582,6 +612,8 @@ class TextGenerationController:
             active_sampling_map (List[Tuple[SamplingParams, List[int]]]): A list of tuples
                 matching each unique set of sampling params to the context array indices
                 of the corresponding active requests.
+            top_n_logprobs_dict (Optional[Dict[int, List[Dict[str, float]]]]): Dictionary to store
+                top n logprobs for each request.
 
         Returns:
             new_sample (Tensor): The sampled tokens for each active request.
@@ -605,7 +637,8 @@ class TextGenerationController:
         # to nearest power of 2.
         vocab_size = inference_wrapper_config.padded_vocab_size
         new_sample, termination_id = self.sample_from_dynamic_logits(
-            last_token_logits, active_sampling_map, vocab_size=vocab_size
+            last_token_logits, active_sampling_map, vocab_size=vocab_size,
+            top_n_logprobs_dict=top_n_logprobs_dict, logits=logits
         )
         return new_sample, termination_id
 
@@ -707,6 +740,7 @@ class TextGenerationController:
                 finished_request_ids (Tensor): Finished request IDs.
                 sample (Tensor): New sample.
                 log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                top_n_logprobs_dict (Optional[Dict]): Top n log probabilities for each request, if requested.
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
@@ -717,6 +751,10 @@ class TextGenerationController:
         # No tokens?
         if context.active_token_count == 0:
             return None
+
+        # Check if any request needs top_n_logprobs
+        need_top_n_logprobs = any(sp.top_n_logprobs > 0 for sp, _ in active_sampling_map)
+        top_n_logprobs_dict = defaultdict(list) if need_top_n_logprobs else None
 
         # This method only performs computations using CPU tensors.
         input_ids, position_ids = self._dynamic_step_context_init()
@@ -739,7 +777,9 @@ class TextGenerationController:
         # This method will only perform computations using CPU tensors in the future.
         self._dynamic_step_sample_bookkeeping(active_sampling_map)
         # This method will only perform computations using GPU tensors in the future.
-        new_sample, termination_id = self._dynamic_step_sample_logits(logits, active_sampling_map)
+        new_sample, termination_id = self._dynamic_step_sample_logits(
+            logits, active_sampling_map, top_n_logprobs_dict=top_n_logprobs_dict
+        )
 
         # This method will only perform computations using CPU tensors in the future.
         self._dynamic_step_log_probs_bookkeeping()
@@ -755,6 +795,7 @@ class TextGenerationController:
         ret = {
             "sample": new_sample,
             "log_probs": log_probs,
+            "top_n_logprobs_dict": top_n_logprobs_dict,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookeeping)

@@ -530,6 +530,7 @@ class DynamicInferenceEngine(AbstractEngine):
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
+        top_n_logprobs_dict: Optional[Dict[int, List[Dict[str, float]]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -540,6 +541,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
+            top_n_logprobs_dict (Optional[Dict]): Top n log probs for each request
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -551,9 +553,17 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
-        for request_id, token, request_log_probs in zip(
+        # Create a mapping from context indices to request_ids for top_n_logprobs
+        context_idx_to_request_id = {}
+        if top_n_logprobs_dict is not None:
+            active_request_ids = self.context.request_ids[
+                self.context.paused_request_count : self.context.total_request_count
+            ].tolist()
+            context_idx_to_request_id = {i: rid for i, rid in enumerate(active_request_ids)}
+
+        for request_idx, (request_id, token, request_log_probs) in enumerate(zip(
             request_ids.tolist(), sample.tolist(), log_probs_iter
-        ):
+        )):
             request: DynamicInferenceRequest = self.requests[request_id]
             if request_id != self.context.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
@@ -584,6 +594,15 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_log_probs.extend(request_log_probs)
                         else:
                             request.generated_log_probs.extend(request_log_probs)
+
+                # Handle top_n_logprobs
+                if top_n_logprobs_dict is not None and request_idx in context_idx_to_request_id:
+                    context_idx = request_idx
+                    if context_idx in top_n_logprobs_dict and top_n_logprobs_dict[context_idx]:
+                        if not hasattr(request, 'generated_top_n_logprobs') or request.generated_top_n_logprobs is None:
+                            request.generated_top_n_logprobs = []
+                        # Append the top_n_logprobs for this step
+                        request.generated_top_n_logprobs.extend(top_n_logprobs_dict[context_idx])
 
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
@@ -789,6 +808,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids = result["finished_request_ids"]
             sample = result["sample"]
             log_probs = result["log_probs"]
+            top_n_logprobs_dict = result.get("top_n_logprobs_dict", None)
             cuda_graph_request_count = result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -801,7 +821,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Add finished events.
             (active_requests, finished_requests) = self.post_process_requests(
-                active_request_ids, finished_request_ids, step_time, sample, log_probs
+                active_request_ids, finished_request_ids, step_time, sample, log_probs,
+                top_n_logprobs_dict=top_n_logprobs_dict
             )
 
         else:
