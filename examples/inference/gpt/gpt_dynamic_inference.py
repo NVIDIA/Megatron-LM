@@ -161,6 +161,7 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         active_buffer_size_gb=args.inference_dynamic_batching_active_buffer_size_gb,
+        max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         layer_type_list=layer_type_list,
