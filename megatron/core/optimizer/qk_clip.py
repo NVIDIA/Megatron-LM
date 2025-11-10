@@ -1,9 +1,12 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 import torch
+
 
 def clip_qk(model) -> float:
     """
     Clip the QK attention logits to the threshold, recommended for Muon optimizer.
-    
+
     Args:
         model: The model to clip the QK attention logits, a list of model chunks.
 
@@ -16,10 +19,10 @@ def clip_qk(model) -> float:
         for transformer_layer in model_chunk.module.module.decoder.layers:
             if hasattr(transformer_layer.self_attention, 'clip_qk'):
                 log_max_attention_logit = max(
-                    log_max_attention_logit, 
+                    log_max_attention_logit,
                     torch.max(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits
-                    ).item()
+                    ).item(),
                 )
                 transformer_layer.self_attention.clip_qk()
 
