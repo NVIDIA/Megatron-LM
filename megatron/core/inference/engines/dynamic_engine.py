@@ -472,7 +472,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
+        self.request_completion_futures[request_id] = self._loop.create_future()
         return self.request_completion_futures[request_id]
 
     def add_request(
