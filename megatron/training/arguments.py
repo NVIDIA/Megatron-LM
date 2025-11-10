@@ -2176,8 +2176,8 @@ def _add_training_args(parser):
                        dest='bias_swiglu_fusion')
     group.add_argument('--use-fused-weighted-squared-relu', action='store_true',
                        help='Use fused weighted squared relu when using MoE.')
-    group.add_argument('--no-linear-cross-entropy-fusion', action='store_false',
-                       help='Disable fusion of linear layer and cross entropy '
+    group.add_argument('--linear-cross-entropy-fusion', action='store_true',
+                       help='Enable fusion of linear layer and cross entropy '
                        'loss calculation.',
                        dest='linear_cross_entropy_fusion')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',

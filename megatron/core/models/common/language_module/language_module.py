@@ -123,9 +123,10 @@ class LanguageModule(MegatronModule):
         hidden: Tensor,
         labels: Optional[Tensor],
         weight: Tensor = None,
+        sequence_parallel_enabled: bool = False,
         column_parallel_linear: torch.nn.Module = None,
         col_linear_kwargs: Dict[str, Any] = {},
-        reduction: Optional[str] = "mean",
+        reduction: Optional[str] = "none",
         ignore_index: Optional[int] = -100,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Computes the language model logits and loss (Cross entropy across vocabulary)
@@ -138,7 +139,7 @@ class LanguageModule(MegatronModule):
             column_parallel_linear (torch.nn.Module): The column parallel linear
                 layer to use for computing logits when not using fused linear cross entropy.
             col_linear_kwargs (Dict[str, Any]): Additional kwargs for column parallel linear layer
-            reduction (Optional[str]): The reduction method. Defaults to "mean", and can be
+            reduction (Optional[str]): The reduction method. Defaults to "none", and can be
                 one of "none", "sum", "mean".
             ignore_index (Optional[int]): The index to ignore in the loss calculation.
                 Defaults to -100.
@@ -147,7 +148,6 @@ class LanguageModule(MegatronModule):
             Tensor: Loss tensor of dimensions [batch size, sequence_length].
         """
         if self.config.linear_cross_entropy_fusion:
-
             assert (
                 weight is not None
             ), "weight cannot be None when using fused linear cross entropy."
@@ -157,13 +157,14 @@ class LanguageModule(MegatronModule):
                 hidden,
                 weight,
                 labels,
-                dist_process_group=self.pg_collection.tp,
+                tp_group=self.pg_collection.tp,
+                sequence_parallel=sequence_parallel_enabled,
                 reduction=reduction,
                 ignore_index=ignore_index,
             )
 
             # [s b] => [b, s]
-            loss = loss.transpose(0, 1).contiguous()
+            loss = loss.view_as(labels).transpose(0, 1).contiguous()
             return loss
         else:
             assert (
