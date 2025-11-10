@@ -4,7 +4,8 @@ from unittest.mock import MagicMock
 import torch
 from packaging import version
 
-from megatron.core.utils import experimental_fn, null_decorator
+from megatron.core.jit import jit_fuser
+from megatron.core.utils import null_decorator
 
 try:
     import triton
@@ -68,7 +69,6 @@ def _pad_routing_map_kernel(
     tl.store(output_row_ptr + token_indices, output_row, mask=token_mask)
 
 
-@experimental_fn(introduced_with_version="0.13.0")
 def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
     """Fused version of pad_routing_map.
     Args:
