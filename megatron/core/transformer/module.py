@@ -438,7 +438,8 @@ class Float16Module(MegatronModule):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
         if (
-            is_vp_last_stage(self.vp_stage, self.vp_size) and is_pp_last_stage(pp_group)
+            is_vp_last_stage(self.vp_stage, self.vp_size)
+            and is_pp_last_stage(pp_group)
             and fp32_output is True
         ):
             outputs = float16_to_fp32(outputs)
