@@ -1040,3 +1040,9 @@ class TestDynamicInferenceEngine:
             context_block_size_tokens=256,
             context_max_tokens_override=300,
         )
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+if __name__ == "__main__":
+    test = TestDynamicInferenceEngine()
+    test.test_simple("mamba", None, "full")
+    print("~~~\nsuccess.")
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

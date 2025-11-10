@@ -472,6 +472,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        with ctx_manager:
+            # self.mamba_conv_states = torch.zeros(
+            #     (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
+            #     dtype=self.params_dtype,
+            #     device=torch.cuda.current_device(),
+            # )
+            # myt = torch.zeros(
+            #     (10,),
+            #     dtype=self.params_dtype,
+            #     device=torch.cuda.current_device(),
+            # )
+            print("hello, world.")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
@@ -548,6 +562,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Optional state tensors for hybrid models
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        with ctx_manager:
+            self.mamba_conv_states = torch.zeros(
+                (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
 
