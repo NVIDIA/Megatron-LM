@@ -834,7 +834,7 @@ class TestPartialCudaGraph:
         args.num_experts = 4
         args.expert_model_parallel_size = ep_size
         args.moe_shared_expert_intermediate_size = 1024
-        args.moe_layer_freq = "[0,0,1,1]"
+        args.moe_layer_freq = [0, 0, 1, 1]
         args.moe_permute_fusion = True
         args.moe_router_fusion = True
         args.moe_router_topk = 2

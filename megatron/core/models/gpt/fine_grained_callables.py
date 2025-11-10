@@ -351,8 +351,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         def backward_dw(self):
             """Execute weight gradients, skipping CUDA graphed components during replay."""
             is_replay = hasattr(layer, 'cuda_graphs') and layer.cuda_graphs
-            if self.shared_expert_dw_callable is not None and \
-                (not is_replay or "moe_router" not in self.cuda_graph_scope):
+            if self.shared_expert_dw_callable is not None and (
+                not is_replay or "moe_router" not in self.cuda_graph_scope
+            ):
                 self.shared_expert_dw_callable()
             if not is_replay or "attn" not in self.cuda_graph_scope:
                 self.attn_dw_callable()
