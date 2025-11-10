@@ -106,33 +106,43 @@ def attn_merge_triton(
     """
 
     # Validate inputs
-    assert decode_tensor.device == prefill_tensor.device == output_tensor.device, \
-        "All tensors must be on the same device"
-    assert decode_tensor.dtype == prefill_tensor.dtype == output_tensor.dtype, \
-        "All tensors must have the same dtype"
-    assert decode_tensor.is_contiguous() and prefill_tensor.is_contiguous() and output_tensor.is_contiguous(), \
-        "All tensors must be contiguous"
+    assert (
+        decode_tensor.device == prefill_tensor.device == output_tensor.device
+    ), "All tensors must be on the same device"
+    assert (
+        decode_tensor.dtype == prefill_tensor.dtype == output_tensor.dtype
+    ), "All tensors must have the same dtype"
+    assert (
+        decode_tensor.is_contiguous()
+        and prefill_tensor.is_contiguous()
+        and output_tensor.is_contiguous()
+    ), "All tensors must be contiguous"
 
     if check_bounds:
         # Check tensor shapes are compatible
-        assert decode_tensor.ndim == prefill_tensor.ndim == output_tensor.ndim, \
-            "All tensors must have the same number of dimensions"
+        assert (
+            decode_tensor.ndim == prefill_tensor.ndim == output_tensor.ndim
+        ), "All tensors must have the same number of dimensions"
 
         for i in range(1, decode_tensor.ndim):
-            assert decode_tensor.shape[i] == prefill_tensor.shape[i] == output_tensor.shape[i], \
-                f"Dimension {i} must match across all tensors"
+            assert (
+                decode_tensor.shape[i] == prefill_tensor.shape[i] == output_tensor.shape[i]
+            ), f"Dimension {i} must match across all tensors"
 
-        assert output_tensor.shape[0] >= decode_tensor.shape[0], \
-            f"Output tensor batch size must be >= decode_tensor.shape[0]"
+        assert (
+            output_tensor.shape[0] >= decode_tensor.shape[0]
+        ), f"Output tensor batch size must be >= decode_tensor.shape[0]"
 
         # Check device_dc is valid
         device_dc_val = device_dc[0].item()
-        assert 0 <= device_dc_val <= decode_tensor.shape[0], \
-            f"device_dc must be between 0 and decode_tensor.shape[0]"
+        assert (
+            0 <= device_dc_val <= decode_tensor.shape[0]
+        ), f"device_dc must be between 0 and decode_tensor.shape[0]"
 
         if not pf_useful_from_beginning:
-            assert prefill_tensor.shape[0] >= device_dc_val, \
-                f"prefill_tensor.shape[0] must be >= device_dc when pf_useful_from_beginning=False"
+            assert (
+                prefill_tensor.shape[0] >= device_dc_val
+            ), f"prefill_tensor.shape[0] must be >= device_dc when pf_useful_from_beginning=False"
 
     # Get tensor dimensions
     prefill_batch_size = prefill_tensor.shape[0]

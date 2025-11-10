@@ -174,7 +174,7 @@ class CUDAGraphConfig:
         Valid graphs are those that have enough tokens and
         requests budget to handle the real configurations.
 
-        Note that if strict is False, prefill slots can be used 
+        Note that if strict is False, prefill slots can be used
         for prefill or decode requests. Otherwise, prefill slots
         can only be used for prefill requests.
         """
@@ -184,7 +184,7 @@ class CUDAGraphConfig:
             return (
                 self.token_count >= real_config.token_count
                 and self.decode_req_count >= real_config.decode_req_count
-                and self.prefill_req_count == 0 # keep decode only property
+                and self.prefill_req_count == 0  # keep decode only property
             )
         if strict:
             return (
@@ -225,7 +225,7 @@ class CUDAGraphConfig:
             other.decode_req_count,
             other.copy_id,
         )
-    
+
     @property
     def req_count(self) -> int:
         """

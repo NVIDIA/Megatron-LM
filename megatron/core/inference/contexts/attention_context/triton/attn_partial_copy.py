@@ -54,10 +54,7 @@ def _attn_partial_copy_kernel(
 
 
 def attn_partial_copy_triton(
-    input_tensor,
-    output_tensor,
-    device_dc,
-    check_bounds: bool = False,
+    input_tensor, output_tensor, device_dc, check_bounds: bool = False
 ) -> None:
     """
     Partial copy from input tensor to output tensor using Triton.
@@ -76,31 +73,38 @@ def attn_partial_copy_triton(
     """
 
     # Validate inputs
-    assert input_tensor.device == output_tensor.device, \
-        "Input and output tensors must be on the same device"
-    assert input_tensor.dtype == output_tensor.dtype, \
-        "Input and output tensors must have the same dtype"
-    assert input_tensor.is_contiguous() and output_tensor.is_contiguous(), \
-        "Input and output tensors must be contiguous"
+    assert (
+        input_tensor.device == output_tensor.device
+    ), "Input and output tensors must be on the same device"
+    assert (
+        input_tensor.dtype == output_tensor.dtype
+    ), "Input and output tensors must have the same dtype"
+    assert (
+        input_tensor.is_contiguous() and output_tensor.is_contiguous()
+    ), "Input and output tensors must be contiguous"
 
     if check_bounds:
         # Check tensor shapes are compatible
-        assert input_tensor.ndim == output_tensor.ndim, \
-            "Input and output tensors must have the same number of dimensions"
+        assert (
+            input_tensor.ndim == output_tensor.ndim
+        ), "Input and output tensors must have the same number of dimensions"
 
         for i in range(1, input_tensor.ndim):
-            assert input_tensor.shape[i] == output_tensor.shape[i], \
-                f"Dimension {i} must match between input and output tensors"
+            assert (
+                input_tensor.shape[i] == output_tensor.shape[i]
+            ), f"Dimension {i} must match between input and output tensors"
 
         # Check device_dc is valid
         device_dc_val = device_dc[0].item()
-        assert 0 <= device_dc_val <= input_tensor.shape[0], \
-            f"device_dc must be between 0 and input_tensor.shape[0]"
+        assert (
+            0 <= device_dc_val <= input_tensor.shape[0]
+        ), f"device_dc must be between 0 and input_tensor.shape[0]"
 
         # Check that we have enough space in output tensor
         copy_size = input_tensor.shape[0] - device_dc_val
-        assert copy_size <= output_tensor.shape[0], \
-            f"Copy size ({copy_size}) exceeds output_tensor.shape[0] ({output_tensor.shape[0]})"
+        assert (
+            copy_size <= output_tensor.shape[0]
+        ), f"Copy size ({copy_size}) exceeds output_tensor.shape[0] ({output_tensor.shape[0]})"
 
     # Get tensor dimensions
     input_batch_size = input_tensor.shape[0]

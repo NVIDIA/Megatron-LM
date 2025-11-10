@@ -1,36 +1,44 @@
 import torch
 import pytest
 import time
-from megatron.core.inference.contexts.attention_context.triton.attn_partial_copy import attn_partial_copy_triton
+from megatron.core.inference.contexts.attention_context.triton.attn_partial_copy import (
+    attn_partial_copy_triton,
+)
 
 
-def _assert_tensor_shapes_compatible(input_tensor: torch.Tensor, output_tensor: torch.Tensor, name: str):
+def _assert_tensor_shapes_compatible(
+    input_tensor: torch.Tensor, output_tensor: torch.Tensor, name: str
+):
     """Assert that tensors have compatible shapes for partial copying."""
-    assert input_tensor.ndim == output_tensor.ndim, \
-        f"{name}: Input and output tensors must have the same number of dimensions"
+    assert (
+        input_tensor.ndim == output_tensor.ndim
+    ), f"{name}: Input and output tensors must have the same number of dimensions"
 
     # Check that all dimensions except the first (batch) are the same
     for i in range(1, input_tensor.ndim):
-        assert input_tensor.shape[i] == output_tensor.shape[i], \
-            f"{name}: Dimension {i} must match between input and output tensors"
+        assert (
+            input_tensor.shape[i] == output_tensor.shape[i]
+        ), f"{name}: Dimension {i} must match between input and output tensors"
 
 
-def _assert_device_dc_valid(device_dc_tensor: torch.Tensor, input_tensor: torch.Tensor, output_tensor: torch.Tensor):
+def _assert_device_dc_valid(
+    device_dc_tensor: torch.Tensor, input_tensor: torch.Tensor, output_tensor: torch.Tensor
+):
     """Assert that device_dc is within valid bounds."""
     device_dc = device_dc_tensor[0].item()
-    assert 0 <= device_dc <= input_tensor.shape[0], \
-        f"device_dc ({device_dc}) must be between 0 and input_tensor.shape[0] ({input_tensor.shape[0]})"
+    assert (
+        0 <= device_dc <= input_tensor.shape[0]
+    ), f"device_dc ({device_dc}) must be between 0 and input_tensor.shape[0] ({input_tensor.shape[0]})"
 
     # Check that we have enough space in output tensor
     copy_size = input_tensor.shape[0] - device_dc
-    assert copy_size <= output_tensor.shape[0], \
-        f"Copy size ({copy_size}) exceeds output_tensor.shape[0] ({output_tensor.shape[0]})"
+    assert (
+        copy_size <= output_tensor.shape[0]
+    ), f"Copy size ({copy_size}) exceeds output_tensor.shape[0] ({output_tensor.shape[0]})"
 
 
 def attn_partial_copy_pytorch(
-    input_tensor: torch.Tensor,
-    output_tensor: torch.Tensor,
-    device_dc: torch.Tensor,
+    input_tensor: torch.Tensor, output_tensor: torch.Tensor, device_dc: torch.Tensor
 ) -> None:
     """
     PyTorch reference implementation for attn_partial_copy_triton.
@@ -54,7 +62,7 @@ def attn_partial_copy_pytorch(
 
     # Copy from input[device_dc:device_dc+copy_size] to output[0:copy_size]
     if copy_size > 0:
-        output_tensor[:copy_size].copy_(input_tensor[device_dc_val:device_dc_val + copy_size])
+        output_tensor[:copy_size].copy_(input_tensor[device_dc_val : device_dc_val + copy_size])
 
 
 @pytest.fixture
@@ -68,11 +76,7 @@ def device():
 @pytest.fixture
 def test_params():
     """Common test parameters."""
-    return {
-        'input_batch': 16,
-        'output_batch': 20,
-        'feature_dim': 256,
-    }
+    return {'input_batch': 16, 'output_batch': 20, 'feature_dim': 256}
 
 
 def test_basic_functionality(device, test_params):
@@ -102,18 +106,18 @@ def test_basic_functionality(device, test_params):
     copy_size = input_batch - device_dc_val
 
     # Check copied region
-    assert torch.equal(output_pt[:copy_size], output_tr[:copy_size]), \
-        "Copied region mismatch between PyTorch and Triton"
-    assert torch.equal(output_pt[:copy_size], input_tensor[device_dc_val:device_dc_val + copy_size]), \
-        "Copied region incorrect in output"
+    assert torch.equal(
+        output_pt[:copy_size], output_tr[:copy_size]
+    ), "Copied region mismatch between PyTorch and Triton"
+    assert torch.equal(
+        output_pt[:copy_size], input_tensor[device_dc_val : device_dc_val + copy_size]
+    ), "Copied region incorrect in output"
 
     # Check unchanged region
-    assert torch.equal(output_pt[15:], output_tr[15:]), \
-        "Unchanged region mismatch"
+    assert torch.equal(output_pt[15:], output_tr[15:]), "Unchanged region mismatch"
 
     # Check full output
-    assert torch.equal(output_pt, output_tr), \
-        "Full output mismatch between PyTorch and Triton"
+    assert torch.equal(output_pt, output_tr), "Full output mismatch between PyTorch and Triton"
 
 
 def test_edge_case_device_dc_zero(device, test_params):
@@ -128,8 +132,9 @@ def test_edge_case_device_dc_zero(device, test_params):
     attn_partial_copy_triton(input_tensor, output_tensor, torch.tensor([0, 0], device=device))
 
     copy_size = min(input_batch, output_batch)
-    assert torch.equal(output_tensor[:copy_size], input_tensor[:copy_size]), \
-        "device_dc=0 test failed"
+    assert torch.equal(
+        output_tensor[:copy_size], input_tensor[:copy_size]
+    ), "device_dc=0 test failed"
 
 
 def test_edge_case_device_dc_full(device, test_params):
@@ -142,10 +147,13 @@ def test_edge_case_device_dc_full(device, test_params):
     output_tensor = torch.ones(output_batch, feature_dim, dtype=torch.float32, device=device)
     original_output = output_tensor.clone()
 
-    attn_partial_copy_triton(input_tensor, output_tensor, torch.tensor([input_batch, 0], device=device))
+    attn_partial_copy_triton(
+        input_tensor, output_tensor, torch.tensor([input_batch, 0], device=device)
+    )
 
-    assert torch.equal(output_tensor, original_output), \
-        "device_dc=input_batch test failed - output should remain unchanged"
+    assert torch.equal(
+        output_tensor, original_output
+    ), "device_dc=input_batch test failed - output should remain unchanged"
 
 
 def test_exact_size_match(device):
@@ -158,8 +166,7 @@ def test_exact_size_match(device):
     attn_partial_copy_triton(small_input, small_output, torch.tensor([3, 0], device=device))
 
     # Copy size is 8 - 3 = 5, which exactly matches output size
-    assert torch.equal(small_output, small_input[3:8]), \
-        "Exact size match test failed"
+    assert torch.equal(small_output, small_input[3:8]), "Exact size match test failed"
 
 
 def test_1d_tensors(device):
@@ -169,8 +176,7 @@ def test_1d_tensors(device):
 
     attn_partial_copy_triton(input_1d, output_1d, torch.tensor([2, 0], device=device))
 
-    assert torch.equal(output_1d, input_1d[2:10]), \
-        "1D tensor test failed"
+    assert torch.equal(output_1d, input_1d[2:10]), "1D tensor test failed"
 
 
 def test_3d_tensors(device):
@@ -181,8 +187,7 @@ def test_3d_tensors(device):
     attn_partial_copy_triton(input_3d, output_3d, torch.tensor([1, 0], device=device))
 
     copy_size = min(6 - 1, 10)  # Should be 5
-    assert torch.equal(output_3d[:copy_size], input_3d[1:6]), \
-        "3D tensor test failed"
+    assert torch.equal(output_3d[:copy_size], input_3d[1:6]), "3D tensor test failed"
 
 
 def test_bounds_checking(device, test_params):
@@ -200,7 +205,7 @@ def test_bounds_checking(device, test_params):
             input_tensor,
             output_tensor,
             torch.tensor([input_batch + 1, 0], device=device),
-            check_bounds=True
+            check_bounds=True,
         )
 
 
@@ -215,8 +220,9 @@ def test_pytorch_triton_consistency(device):
     attn_partial_copy_pytorch(input_tensor, output_pt, device_dc)
     attn_partial_copy_triton(input_tensor, output_tr, device_dc)
 
-    assert torch.equal(output_pt, output_tr), \
-        "PyTorch and Triton implementations produce different results"
+    assert torch.equal(
+        output_pt, output_tr
+    ), "PyTorch and Triton implementations produce different results"
 
 
 if __name__ == '__main__':
@@ -272,8 +278,7 @@ if __name__ == '__main__':
 
     # Verify against expected behavior
     expected_copied_match = torch.equal(
-        output_pt[:copy_size],
-        input_tensor[device_dc_val:device_dc_val + copy_size]
+        output_pt[:copy_size], input_tensor[device_dc_val : device_dc_val + copy_size]
     )
     print(f"Copied region correct: {expected_copied_match}")
 
@@ -292,7 +297,9 @@ if __name__ == '__main__':
     print(f"\n--- Edge Case: device_dc=input_batch ---")
     output_edge2 = torch.ones(output_batch, feature_dim, dtype=torch.float32, device=device)
     original_output = output_edge2.clone()
-    attn_partial_copy_triton(input_tensor, output_edge2, torch.tensor([input_batch, 0], device=device))
+    attn_partial_copy_triton(
+        input_tensor, output_edge2, torch.tensor([input_batch, 0], device=device)
+    )
     expected_edge2 = torch.equal(output_edge2, original_output)  # Should remain unchanged
     print(f"device_dc=input_batch test: {expected_edge2}")
 
@@ -327,9 +334,10 @@ if __name__ == '__main__':
     try:
         # This should fail - device_dc too large
         attn_partial_copy_triton(
-            input_tensor, output_pt,
+            input_tensor,
+            output_pt,
             torch.tensor([input_batch + 1, 0], device=device),
-            check_bounds=True
+            check_bounds=True,
         )
         print("Bounds check failed - should have raised assertion")
     except AssertionError as e:

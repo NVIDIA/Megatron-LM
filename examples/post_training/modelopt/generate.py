@@ -150,9 +150,10 @@ if __name__ == "__main__":
                 input_ids = tokenizer.apply_chat_template(
                     new_conversations, return_tensors="pt", add_generation_prompt=True
                 )
-                output_ids = simple_generate(
-                    unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
-                )
+                with torch.no_grad():
+                    output_ids = simple_generate(
+                        unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
+                    )
                 output_texts = tokenizer.batch_decode(output_ids)[0]
                 print_rank_0("{}".format(output_texts))
                 new_conversations.append({"role": "assistant", "content": output_texts})

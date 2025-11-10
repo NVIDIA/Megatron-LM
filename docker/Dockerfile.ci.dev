@@ -61,8 +61,9 @@ RUN bash -ex <<"EOF"
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
-    git clone --branch v1.2.1 https://github.com/deepseek-ai/DeepEP.git
+    git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
+        git checkout ef73fd9a4c098e09929e48dfd696505ddc8e2043
         patch -p1 < /workspace/deepep.patch
     popd
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
@@ -89,6 +90,6 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
     uv pip install --no-cache-dir --upgrade "setuptools<80.0.0"
-    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=2.0" 
+    uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=3.0" 
 EOF
 ###

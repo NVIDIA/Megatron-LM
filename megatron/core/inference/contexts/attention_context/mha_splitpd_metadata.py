@@ -6,6 +6,7 @@ from .metadata_base import MetadataBase
 from .triton import compute_layout_triton
 from .triton import attn_partial_copy_triton
 from .triton import attn_merge_triton
+
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 except:
@@ -35,7 +36,9 @@ class MHASplitPDMetadata(MetadataBase):
         self._max_seqlen_k = 0
 
         # Prefill buffers (sized to max batch size)
-        self._prefill_qo_indptr_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
+        self._prefill_qo_indptr_buf = torch.zeros(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
         self._prefill_paged_kv_indptr_buf = torch.zeros(
             max_requests + 1, dtype=torch.int32, device=device
         )
@@ -48,11 +51,15 @@ class MHASplitPDMetadata(MetadataBase):
         self._prefill_block_table_buf = torch.zeros(
             (max_requests, max_kv_block_count), dtype=torch.int32, device=device
         )
-        self._prefill_cum_kv_seq_len_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
+        self._prefill_cum_kv_seq_len_buf = torch.zeros(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
 
         # Decode buffers (sized to max batch size)
         self._decode_qo_indptr_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
-        self._decode_paged_kv_indptr_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
+        self._decode_paged_kv_indptr_buf = torch.zeros(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
         self._decode_paged_kv_indices_buf = torch.zeros(
             block_count_total, dtype=torch.int32, device=device
         )
@@ -67,7 +74,9 @@ class MHASplitPDMetadata(MetadataBase):
         self._full_qo_indptr_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
         self._full_indptr_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
         self._full_last_page_len_buf = torch.zeros(max_requests, dtype=torch.int32, device=device)
-        self._full_cum_kv_seq_len_buf = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
+        self._full_cum_kv_seq_len_buf = torch.zeros(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
         self._full_max_metadata_buf = torch.zeros(2, dtype=torch.int32, device=device)
         self._full_block_table_buf = torch.zeros(
             (max_requests, max_kv_block_count), dtype=torch.int32, device=device
@@ -165,29 +174,32 @@ class MHASplitPDMetadata(MetadataBase):
         # Build state_data with properly sliced tensors
         self.state_data = {
             # Full batch metadata
-            "cu_query_seq_lengths": self._full_qo_indptr_buf[:padded_active_request_count + 1],
-            "cu_kv_seq_lengths": self._full_cum_kv_seq_len_buf[:padded_active_request_count + 1],
+            "cu_query_seq_lengths": self._full_qo_indptr_buf[: padded_active_request_count + 1],
+            "cu_kv_seq_lengths": self._full_cum_kv_seq_len_buf[: padded_active_request_count + 1],
             "kv_seq_lengths": self._kv_seq_lengths_buf[:padded_active_request_count],
             "block_table": self._full_block_table_buf[:padded_active_request_count, :],
             "max_seqlen_q": self._max_seqlen_q,
             "max_seqlen_k": self._max_seqlen_k,
             # Prefill-specific metadata
-            "prefill_qo_indptr": self._prefill_qo_indptr_buf[:pf_target_size + 1],
-            "prefill_paged_kv_indptr": self._prefill_paged_kv_indptr_buf[:pf_target_size + 1],
-            "prefill_paged_kv_last_page_len": self._prefill_paged_kv_last_page_len_buf[:pf_target_size],
+            "prefill_qo_indptr": self._prefill_qo_indptr_buf[: pf_target_size + 1],
+            "prefill_paged_kv_indptr": self._prefill_paged_kv_indptr_buf[: pf_target_size + 1],
+            "prefill_paged_kv_last_page_len": self._prefill_paged_kv_last_page_len_buf[
+                :pf_target_size
+            ],
             "prefill_block_table": self._prefill_block_table_buf[:pf_target_size, :],
-            "prefill_cum_kv_seq_len": self._prefill_cum_kv_seq_len_buf[:pf_target_size + 1],
+            "prefill_cum_kv_seq_len": self._prefill_cum_kv_seq_len_buf[: pf_target_size + 1],
             # Decode-specific metadata
-            "decode_qo_indptr": self._decode_qo_indptr_buf[:dc_target_size + 1],
-            "decode_paged_kv_indptr": self._decode_paged_kv_indptr_buf[:dc_target_size + 1],
-            "decode_paged_kv_last_page_len": self._decode_paged_kv_last_page_len_buf[:dc_target_size],
+            "decode_qo_indptr": self._decode_qo_indptr_buf[: dc_target_size + 1],
+            "decode_paged_kv_indptr": self._decode_paged_kv_indptr_buf[: dc_target_size + 1],
+            "decode_paged_kv_last_page_len": self._decode_paged_kv_last_page_len_buf[
+                :dc_target_size
+            ],
             "decode_block_table": self._decode_block_table_buf[:dc_target_size, :],
             # Counts
             "decode_count": dc_count,
             "prefill_count": pf_count,
             "device_decode_prefill": self._device_decode_prefill_buf,
         }
-
 
     def reset(self):
         """
@@ -226,7 +238,6 @@ class MHASplitPDMetadata(MetadataBase):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         q = q.squeeze(1)
-        
 
         # prefill only:
         if self.padded_config.prefill_req_count > 0 and self.padded_config.decode_req_count == 0:
@@ -243,26 +254,30 @@ class MHASplitPDMetadata(MetadataBase):
                 block_table=self.state_data["prefill_block_table"],
             )
             return o_pf.unsqueeze(1)
-        
+
         # decode only:
         if self.padded_config.decode_req_count > 0 and self.padded_config.prefill_req_count == 0:
             flash_attn_args = {
-                "q": q[:self.padded_config.decode_req_count].unsqueeze(1),
+                "q": q[: self.padded_config.decode_req_count].unsqueeze(1),
                 "k_cache": k,
                 "v_cache": v,
-                "cache_seqlens": self.state_data["kv_seq_lengths"][:self.padded_config.decode_req_count],
+                "cache_seqlens": self.state_data["kv_seq_lengths"][
+                    : self.padded_config.decode_req_count
+                ],
                 "causal": True,
                 "block_table": self.state_data["decode_block_table"],
             }
             o_dc = flash_attn_with_kvcache(**flash_attn_args).squeeze(1)
             return o_dc.unsqueeze(1)
-        
+
         # prefill and decode:
         q_pf = torch.empty_like(q)
-        attn_partial_copy_triton(q, q_pf, self.state_data["device_decode_prefill"], check_bounds=False)
+        attn_partial_copy_triton(
+            q, q_pf, self.state_data["device_decode_prefill"], check_bounds=False
+        )
         if self.padded_config.prefill_req_count > 0:
             o_pf = flash_attn_varlen_func(
-                q_pf[:self.padded_config.token_count - self.padded_config.decode_req_count],
+                q_pf[: self.padded_config.token_count - self.padded_config.decode_req_count],
                 k,
                 v,
                 self.state_data["prefill_qo_indptr"],
@@ -278,10 +293,12 @@ class MHASplitPDMetadata(MetadataBase):
 
         if self.padded_config.decode_req_count > 0:
             flash_attn_args = {
-                "q": q[:self.padded_config.decode_req_count].unsqueeze(1),
+                "q": q[: self.padded_config.decode_req_count].unsqueeze(1),
                 "k_cache": k,
                 "v_cache": v,
-                "cache_seqlens": self.state_data["kv_seq_lengths"][:self.padded_config.decode_req_count],
+                "cache_seqlens": self.state_data["kv_seq_lengths"][
+                    : self.padded_config.decode_req_count
+                ],
                 "causal": True,
                 "block_table": self.state_data["decode_block_table"],
             }
@@ -290,12 +307,11 @@ class MHASplitPDMetadata(MetadataBase):
             o_dc = torch.empty_like(q)
         o_final = torch.empty_like(q)
 
-
         attn_merge_triton(
-            decode_tensor = o_dc, 
-            prefill_tensor = o_pf,
-            output_tensor = o_final,
-            device_dc = self.state_data["device_decode_prefill"],
-            pf_useful_from_beginning = True
+            decode_tensor=o_dc,
+            prefill_tensor=o_pf,
+            output_tensor=o_final,
+            device_dc=self.state_data["device_decode_prefill"],
+            pf_useful_from_beginning=True,
         )
         return o_final.unsqueeze(1)
