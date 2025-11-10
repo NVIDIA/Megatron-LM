@@ -130,6 +130,8 @@ class TestMambaReconfiguration:
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
+            if metadata is not None:
+                metadata.pop("dp_cp_group")
 
             # Load checkpoint A with different TP/PP/expert/CP and save as checkpoint B
             # No FPS this time, only FPL
