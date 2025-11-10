@@ -73,11 +73,14 @@ async def main(
                     #tbar.update(1)
             else:
                 # Add deterministic number of requests (generally used for debugging).
-                for _ in range(min(
+                for i in range(min(
                     args.incoming_requests_per_step,
                     num_requests_total - num_requests_added
                 )):
+                    # Change sampling parameters to force different generation lengths.
                     request = requests[num_requests_added]
+                    n = request.sampling_params.num_tokens_to_generate
+                    request.sampling_params.num_tokens_to_generate = n + i
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
             if num_requests_added == num_requests_total:

@@ -35,7 +35,7 @@ MODEL_ARGS:
   --hidden-size: 1152
   --num-attention-heads: 16
   --max-position-embeddings: 1024
-  --seq-length: 1024
+  --seq-length: 512
   --temperature: 1.0
   --top_k: 1
   --return-log-probs: true

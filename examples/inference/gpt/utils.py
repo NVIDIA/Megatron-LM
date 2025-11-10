@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import json
 import itertools
 import random
@@ -176,6 +177,7 @@ class Request:
         self.time_end = None
         self.state = "not-started"
         self.sampling_params: SamplingParams = sampling_params if sampling_params is not None else get_default_sampling_params(tokenizer.eod)
+        self.sampling_params = copy.deepcopy(self.sampling_params)
 
     def __str__(self) -> str:
         return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
