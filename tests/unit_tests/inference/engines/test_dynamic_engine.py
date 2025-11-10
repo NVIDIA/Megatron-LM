@@ -1038,11 +1038,5 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=False,
             model_provider=model_provider,
             context_block_size_tokens=256,
-            context_max_tokens_override=300,
+            context_max_tokens=1000,
         )
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-if __name__ == "__main__":
-    test = TestDynamicInferenceEngine()
-    test.test_simple("mamba", None, "full")
-    print("~~~\nsuccess.")
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<

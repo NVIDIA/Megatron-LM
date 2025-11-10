@@ -440,12 +440,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
         # Memory buffer.
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
-        with ctx_manager:
+        def allocate_memory_buffer():
+            """Allocate the memory buffer. This function is called below within
+            `with ctx_manager:`."""
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
                     (
@@ -472,20 +469,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        with ctx_manager:
-            # self.mamba_conv_states = torch.zeros(
-            #     (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
-            #     dtype=self.params_dtype,
-            #     device=torch.cuda.current_device(),
-            # )
-            # myt = torch.zeros(
-            #     (10,),
-            #     dtype=self.params_dtype,
-            #     device=torch.cuda.current_device(),
-            # )
-            print("hello, world.")
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
@@ -562,18 +545,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Optional state tensors for hybrid models
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        with ctx_manager:
-            self.mamba_conv_states = torch.zeros(
-                (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
-
-            with ctx_manager:
+        def allocate_mamba_states():
+            """Allocate Mamba states. This function is called below within
+            `with ctx_manager:`."""
+            if self.is_hybrid_model:
+                self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
                 self.mamba_conv_states = torch.zeros(
                     (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
                     dtype=self.params_dtype,
@@ -585,8 +561,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
 
-        else:
-            self.mamba_metadata = None
+            else:
+                self.mamba_metadata = None
+
+        # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
+        # `ctx_manager` can only be used once.)
+        ctx_manager = (
+            torch.cuda.use_mem_pool(self.unified_memory_mempool)
+            if self.unified_memory_level > 0
+            else nullcontext()
+        )
+        with ctx_manager:
+            allocate_memory_buffer()
+            allocate_mamba_states()
 
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
