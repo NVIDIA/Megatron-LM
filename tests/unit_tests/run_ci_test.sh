@@ -136,9 +136,6 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
-# Reduce memory usage by NCCL
-export NCCL_MAX_NCHANNELS=1
-export NCCL_NVLS_ENABLE=0
 export ONE_LOGGER_JOB_CATEGORY=test
 
 for i in $(seq $UNIT_TEST_REPEAT); do
