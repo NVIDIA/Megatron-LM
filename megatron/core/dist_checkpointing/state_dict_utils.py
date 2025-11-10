@@ -104,8 +104,6 @@ def filter_out_empty_flatten_tensor(sharded_state_dict: Union[dict, list]):
         sharded_state_dict,
         lambda v: not (
             isinstance(v, ShardedTensor)
-            and v.flattened_range
-            and v.flattened_range.start == v.flattened_range.stop
         ),
     )
 
