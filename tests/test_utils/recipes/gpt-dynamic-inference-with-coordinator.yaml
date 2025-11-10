@@ -64,3 +64,8 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp8_pp1_dp1_583m_latencytest_zmq]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
