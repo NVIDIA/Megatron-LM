@@ -55,7 +55,6 @@ def set_env():
         os.environ['NVTE_FUSED_ATTN'] = '0'
 
 
-
 @pytest.fixture(scope="session")
 def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     """Common directory for saving the checkpoint.
