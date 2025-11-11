@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1.3-labs
 
 ARG FROM_IMAGE_NAME
-ARG WHEEL_DIR=/workspace/wheels
-
 FROM ${FROM_IMAGE_NAME} as main
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,16 +23,16 @@ RUN bash -ex <<"EOF"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
-ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
+ARG IMAGE_TYPE=dev
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra dev --extra mlm --link-mode copy --locked \
+    uv sync --extra ${IMAGE_TYPE} --extra mlm --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
