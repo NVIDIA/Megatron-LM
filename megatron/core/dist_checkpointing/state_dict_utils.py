@@ -101,7 +101,12 @@ def filter_out_empty_flatten_tensor(sharded_state_dict: Union[dict, list]):
     # `TorchShardedTensor._init_from_local_shards_and_global_metadata` to fail.
     # This situation may occur in custom Fully Sharded Data Parallel (FSDP) cases.
     sharded_state_dict, _ = extract_matching_values(
-        sharded_state_dict, lambda v: not (isinstance(v, ShardedTensor))
+        sharded_state_dict,
+        lambda v: not (
+            isinstance(v, ShardedTensor)
+            and v.flattened_range
+            and v.flattened_range.start == v.flattened_range.stop
+        ),
     )
 
     return sharded_state_dict
