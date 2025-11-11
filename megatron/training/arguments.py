@@ -1195,6 +1195,8 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+        assert args.linear_attention_type is None, "Muon optimizer does not support linear attention type for now."
+        assert not args.attention_output_gate, "Muon optimizer does not support attention output gate for now."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -1972,11 +1974,11 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
-    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['qwen3_next'],
+    group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
                        'None (default): param no weight decay if and only if it is 1D; or it is bias; '
                        'or it is embedding and embedding_init_method_std is not None. '
-                       '"qwen3_next": In addition to the default rules, '
+                       '"apply_wd_to_qk_layernorm": In addition to the default rules, '
                        'apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
@@ -3342,8 +3344,8 @@ def _add_mla_args(parser):
 
 def _add_linear_attention_args(parser):
     group = parser.add_argument_group(title="la")
-    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net', 'mamba'], type=str,
-                       help='Type of linear attention to use. Currently support gated_delta_net and mamba.')
+    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
+                       help='Type of linear attention to use. Currently support gated_delta_net.')
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
                             ' SDPA (scaled dot-product attention) layers. Accepts either: '
