@@ -143,6 +143,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.use_coordinator = False
         self.paused = False
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
@@ -809,6 +810,17 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures[failed_request_id].set_result(failed_request)
         self.failed_request_ids.clear()
 
+        # Handle necessary ZMQ DP coordinator communication.
+        if self.use_coordinator and self.is_tp0_and_pp0 and finished_requests:
+            payload = msgpack.packb(
+                [
+                    Headers.ENGINE_REPLY.value,
+                    [r.serializable() for r in engine_output["finished_requests"]],
+                ],
+                use_bin_type=True,
+            )
+            self.socket_for_receiving_requests.send(payload)
+
         # Log KV cache utilization stats to W&B
         if (
             self.inference_logging_step_interval > 0
@@ -901,6 +913,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): How long this step took.
         """
         # schedule requests
+        if self.use_coordinator:
+            self.schedule_requests()
         self.schedule_waiting_requests()
 
         # Saving pre-step state, for printing output below.
@@ -927,7 +941,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, step_state, step_time, self.step_count
 
     async def async_step(
-        self, *, verbose: Optional[bool] = False
+        self, *, verbose: bool = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -935,7 +949,6 @@ class DynamicInferenceEngine(AbstractEngine):
         method to sleep and wake up when new requests are available.
 
         Args:
-            sampling_params (SamplingParams): The sampling parameters.
             verbose (bool): Whether to run in verbose mode.
 
         Returns:
@@ -950,13 +963,13 @@ class DynamicInferenceEngine(AbstractEngine):
         return ret
 
     def step_modern(
-        self, *, verbose: Optional[bool] = False
+        self, *, verbose: bool = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         return self._loop.run_until_complete(self.async_step(verbose=verbose))
 
     def step_legacy(
-        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+        self, sampling_params: SamplingParams, *, verbose: bool = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         warnings.warn(
@@ -964,9 +977,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(
-            self.async_step(sampling_params=sampling_params, verbose=verbose)
-        )
+        result = self._loop.run_until_complete(self.async_step(verbose=verbose))
         return (result["active_requests"], result["finished_requests"], result["step_time"])
 
     # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
@@ -1089,78 +1100,50 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @trace_async_exceptions
     async def run_engine(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+        self,
+        *,
+        use_coordinator=False,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        verbose: bool = False,
     ):
-        """Continually steps the engine asynchronously."""
+        """Continually steps the engine asynchronously.
+
+        Args:
+            use_coordinator (bool): Whether to use the ZMQ-based DP coordinator.
+            loop (Optional[asyncio.AbstractEventLoop]): The event loop to use.
+            verbose (bool): Whether to run in verbose mode.
+        """
         self._loop = get_asyncio_loop(loop)
+        self.use_coordinator = use_coordinator
+
+        if self.use_coordinator:
+            self.is_tp0_and_pp0 = (
+                parallel_state.get_tensor_model_parallel_rank() == 0
+                and parallel_state.get_pipeline_model_parallel_rank() == 0
+            )
         try:
-            while True:
+            while not self.stopped:
                 # Wait until there are active requests before proceeding.
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: self.context.get_active_request_count() > 0
                         or self.waiting_request_ids
+                        or self.paused
                     )
-
                 await self.async_step(verbose=verbose)
         except asyncio.CancelledError:
             pass
+        finally:
+            if self.use_coordinator:
+                self.stop()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: bool = False
     ):
         """Continually steps the engine asynchronously."""
-        self._loop = get_asyncio_loop(loop)
-        try:
-            while True:
-                self.schedule_requests()
-                if self.stopped:
-                    self.stop()
-                    return
-
-                # for the cases below (engine is paused or no active requests),
-                # do not use asyncio.sleep(0)
-                # as tp-rank=0 will flood the num_messages publisher
-                # with "0" repeatedly. This causes some packets to drop.
-                # Instead be nice, and sleep
-                # for a short time.
-                # The minimum sleep time needed is ~100us i.e. the time
-                # needed to send one message on an IPC socket. However
-                # just to be safe, we use 20ms here.
-
-                # todo [Siddharth]: Can this hardcoded sleep be avoided
-                # with asyncio zmq sockets?
-                if self.paused:
-                    await asyncio.sleep(0.02)
-                    continue
-
-                if (
-                    self.context.get_active_request_count() == 0
-                    and len(self.waiting_request_ids) == 0
-                ):
-                    await asyncio.sleep(0.02)
-                    continue
-
-                engine_output = await self.async_step(verbose=verbose)
-
-                is_tp0_and_pp0 = (
-                    parallel_state.get_tensor_model_parallel_rank() == 0
-                    and parallel_state.get_pipeline_model_parallel_rank() == 0
-                )
-                if (
-                    is_tp0_and_pp0
-                    and engine_output is not None
-                    and engine_output["finished_requests"]
-                ):
-                    payload = msgpack.packb(
-                        [
-                            Headers.ENGINE_REPLY.value,
-                            [r.serializable() for r in engine_output["finished_requests"]],
-                        ],
-                        use_bin_type=True,
-                    )
-                    self.socket_for_receiving_requests.send(payload)
-
-        except asyncio.CancelledError:
-            pass
+        warnings.warn(
+            "`run_engine_with_coordinator()` is deprecated and will be removed in `megatron-core` "
+            "0.16. Please use `run_engine(use_coordinator=True)` going forward"
+        )
+        await self.run_engine(use_coordinator=True, loop=loop, verbose=verbose)
