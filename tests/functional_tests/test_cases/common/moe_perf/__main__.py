@@ -19,10 +19,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -99,7 +99,6 @@ class MoEPerformanceCase:
             return True
         device_name = torch.cuda.get_device_name(torch.cuda.current_device())
         return self.gpu_platform.lower() in device_name.lower()
-
 
 
 MIXTRAL_PROXY = MoEModelConfig(
@@ -409,6 +408,20 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
 def _maybe_update_baseline(
     case: MoEPerformanceCase, metrics: Dict[str, float], baselines: Dict[str, Dict[str, float]]
 ):
+    forward_ms = metrics["forward_ms"]
+    backward_ms = metrics["backward_ms"]
+    forward_std_ms = metrics["forward_std_ms"]
+    backward_std_ms = metrics["backward_std_ms"]
+    assert forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
+        "Forward pass for "
+        f"{case.name} has high variance: {forward_std_ms:.3f} ms "
+        f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {forward_ms:.3f} ms)."
+    )
+    assert backward_std_ms / backward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
+        "Backward pass for "
+        f"{case.name} has high variance: {backward_std_ms:.3f} ms "
+        f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {backward_ms:.3f} ms)."
+    )
     baselines[case.name] = _serialize_metrics(metrics)
     _persist_baselines(baselines)
 
@@ -429,6 +442,7 @@ def _check_env():
             f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression"
         )
 
+
 def _check_dependencies(case: MoEPerformanceCase):
     if case.token_dispatcher == "flex":
         if case.moe_flex_dispatcher_backend == "deepep":
@@ -437,6 +451,7 @@ def _check_dependencies(case: MoEPerformanceCase):
         elif case.moe_flex_dispatcher_backend == "hybridep":
             if not HAVE_HYBRIDEP:
                 pytest.skip("HybridEP is not available")
+
 
 @pytest.mark.flaky(reruns=5)
 @pytest.mark.internal
@@ -529,7 +544,7 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 # export MEGATRON_UPDATE_PERF_BASELINES=0 # set to 1 to update baseline perf numbers
 # uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m pytest tests/unit_tests/performance/test_moe_layer.py
 if __name__ == "__main__":
-    pytest.main(["-x", "-v", "-s", __file__]) # -xvs
+    pytest.main(["-x", "-v", "-s", __file__])  # -xvs
     # torch.cuda.cudart().cudaProfilerStart()
     # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
     # for case in PERFORMANCE_CASES:
