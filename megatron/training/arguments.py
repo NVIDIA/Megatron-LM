@@ -1319,9 +1319,13 @@ def _add_transformer_engine_args(parser):
                        dest='fp8')
     # per tensor current scaling recipe selection
     group.add_argument('--fp8-recipe', default='delayed',
-                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise', 'custom'],
                        help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
                        dest='fp8_recipe')
+    group.add_argument('--fp8-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp8_quantizer_factory')
     # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
@@ -1358,9 +1362,13 @@ def _add_transformer_engine_args(parser):
                        help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
                        dest='fp4')
     group.add_argument('--fp4-recipe', default='nvfp4',
-                       choices=['nvfp4'],
+                       choices=['nvfp4', 'custom'],
                        help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
                        dest='fp4_recipe')
+    group.add_argument('--fp4-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
@@ -1497,7 +1505,11 @@ def _add_inference_args(parser):
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
+                       help='Step interval for logging inference metrics to wandb. '
+                            'Default to 0 to disable inference wandb logging.')
+
     return parser
 
 
