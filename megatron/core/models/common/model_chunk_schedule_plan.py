@@ -87,6 +87,36 @@ class TransformerLayerSchedulePlan:
         # get callable nodes for transformer/mtp layer
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
+    def __del__(self):
+        try:
+            if hasattr(self, 'attn') and self.attn is not None:
+                del self.attn
+                self.attn = None
+            if hasattr(self, 'post_attn') and self.post_attn is not None:
+                del self.post_attn
+                self.post_attn = None
+            if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
+                del self.moe_dispatch
+                self.moe_dispatch = None
+            if hasattr(self, 'mlp') and self.mlp is not None:
+                del self.mlp
+                self.mlp = None
+            if hasattr(self, 'moe_combine') and self.moe_combine is not None:
+                del self.moe_combine
+                self.moe_combine = None
+            if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
+                del self.mtp_post_process
+                self.mtp_post_process = None
+            if hasattr(self, 'layer_state') and self.layer_state is not None:
+                del self.layer_state
+                self.layer_state = None
+
+            if hasattr(self, 'layer'):
+                del self.layer
+
+        except Exception:
+            pass
+
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
@@ -369,6 +399,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         assert i < self.num_layers()
         return self._transformer_layers[i]
 
+    def pop_layer(self):
+        """Pops the transformer layer in FILO order."""
+        return self._transformer_layers.pop()
+
     def num_layers(self):
         """Gets the number of transformer layers."""
         return len(self._transformer_layers)
@@ -378,7 +412,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the model chunk state."""
         return self._model_chunk_state
 
-    def release_state(self):
+    # def release_state(self):
+    def __del__(self):
         """Release reference, this helps avoid memory leak."""
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
@@ -447,13 +482,14 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlapped_layers = min(f_num_layers, b_num_layers)
 
+        f_layer = b_layer = None
         # combined forward and backward pass for overlapped layers
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
-            b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
-            torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
             if f_layer.layer.config.fine_grained_activation_offloading:
                 fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
+            b_layer = b_schedule_plan.pop_layer()
+            torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -465,8 +501,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
-            b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
-            torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
+            b_layer = b_schedule_plan.pop_layer()
+            torch.cuda.nvtx.range_push(f"layer_{b_schedule_plan.num_layers()}b")
             _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
@@ -497,7 +533,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm
         if b_num_layers > 0:
-            b_schedule_plan.get_layer(0).attn.backward_dw()
+            assert b_layer is not None
+            b_layer.attn.backward_dw()
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
@@ -510,9 +547,5 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.wait_current_stream()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
-
-        # Release reference as early as possible, this helps avoid memory leak.
-        if b_schedule_plan is not None:
-            b_schedule_plan.release_state()
 
         return f_input
