@@ -294,11 +294,12 @@ fi
 
 if [ "$TE_FP8" -eq 1 ]; then
     EXTRA_ARGS="$EXTRA_ARGS --transformer-impl=transformer_engine \
-        --fp8-format=hybrid \
 "
 
     if [ "$TE_FP8_RECIPE" == "delayed" ]; then
-        EXTRA_ARGS="$EXTRA_ARGS --fp8-margin=0 \
+        EXTRA_ARGS="$EXTRA_ARGS --fp8-recipe=delayed \
+            --fp8-format=hybrid \
+            --fp8-margin=0 \
             --fp8-interval=1 \
             --fp8-amax-history-len=1024 \
             --fp8-amax-compute-algo=max \
@@ -306,6 +307,7 @@ if [ "$TE_FP8" -eq 1 ]; then
         "
     elif [ "$TE_FP8_RECIPE" == "mxfp8" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --fp8-recipe=mxfp8 \
+            --fp8-format=e4m3 \
             --keep_fp8_weight_transpose_cache \
         "
         # Currently we have to keep fp8 weight tranpose cache due to an issue
@@ -313,6 +315,7 @@ if [ "$TE_FP8" -eq 1 ]; then
         export NVTE_ROCM_ENABLE_MXFP8=1
     elif [ "$TE_FP8_RECIPE" == "tensorwise" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --fp8-recipe=tensorwise \
+            --fp8-format=hybrid \
         "
     else
         echo "$TE_FP8_RECIPE is not supported"
