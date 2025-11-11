@@ -8,6 +8,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyNode,
+    DummyState,
     build_data,
     compare_captures,
     deterministic_mode,
@@ -30,9 +31,6 @@ def run_model_ref_with_capture(model, input_tensors, iterations):
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
     """
-    for module in model.modules():
-        if hasattr(module, 'fuse_wgrad_accumulation'):
-            module.fuse_wgrad_accumulation = False
 
     output_tensors = []
     for i in range(iterations):
@@ -62,18 +60,20 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
 
     for i in range(len(input_tensors)):
         input_tensors[i] = input_tensors[i].clone()
-    for module in model.modules():
-        if hasattr(module, 'fuse_wgrad_accumulation'):
-            module.fuse_wgrad_accumulation = False
 
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
     attn, post_attn, dispatch, moe, combine, post_process = callables
     assert post_process is None
+    dummy_model = DummyState()
+    dummy_model.decoder = DummyState()
+    dummy_model.decoder.final_layernorm = None
     for i in range(microbatches):
         # build mock func/state
         node = DummyNode()
+        node.is_mtp = False
+        node.chunk_state.model = dummy_model
 
         # attn fwd
         hidden_states = attn(node, input_tensors[i])
@@ -82,10 +82,10 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         local_tokens, probs = post_attn(node, hidden_states)
 
         # dispatch fwd
-        dispatched_tokens, probs = dispatch(node, local_tokens, probs)
+        dispatched_tokens = dispatch(node, local_tokens, probs)
 
         # moe fwd
-        expert_outputs = moe(node, dispatched_tokens, probs)
+        expert_outputs = moe(node, dispatched_tokens)
         if model.mlp.use_shared_expert:
             expert_output, shared_expert_output = expert_outputs
         else:

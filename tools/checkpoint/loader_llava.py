@@ -76,7 +76,6 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         margs.allow_missing_vision_projection_checkpoint = getattr(checkpoint_args, "allow_missing_vision_projection_checkpoint", False)
         margs.freeze_LM = getattr(checkpoint_args, "freeze_LM", False)
         margs.freeze_ViT = getattr(checkpoint_args, "freeze_ViT", False)
-        margs.encoder_tensor_model_parallel_size = getattr(checkpoint_args, "encoder_tensor_model_parallel_size", 0)
         margs.force_system_message = getattr(checkpoint_args, "force_system_message", False)
         margs.image_tag_type = getattr(checkpoint_args, "image_tag_type", "")
         margs.num_frames = getattr(checkpoint_args, "num_frames", 8)
@@ -136,7 +135,8 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         # Swiglu is used to chunk linear layer weight in a specific way, and this is guarded by the
         # gated_linear_unit config in the MLP code.
         md.swiglu = self.margs.swiglu and language_config.gated_linear_unit
-        md.previous_encoder_tensor_parallel_size = self.margs.tensor_model_parallel_size if self.margs.encoder_tensor_model_parallel_size == 0 else self.margs.encoder_tensor_model_parallel_size
+        # With deprecated encoder_tensor_model_parallel_size removed, always use tensor_model_parallel_size
+        md.previous_encoder_tensor_parallel_size = self.margs.tensor_model_parallel_size
         md.vision_model_type = self.margs.vision_model_type
         md.language_model_type = self.margs.language_model_type
         md.vision_projection_linear_bias = vision_projection_config.add_bias_linear

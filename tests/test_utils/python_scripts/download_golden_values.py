@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import os
 import pathlib
@@ -24,9 +26,15 @@ def main(pipeline_id: int, only_failing: bool):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
 
-    gl = gitlab.Gitlab(
-        f"https://{os.getenv('GITLAB_ENDPOINT')}", private_token=os.getenv("RO_API_TOKEN")
-    )
+    gitlab_endpoint = os.getenv('GITLAB_ENDPOINT')
+    ro_api_token = os.getenv('RO_API_TOKEN')
+
+    if not gitlab_endpoint or not ro_api_token:
+        raise Exception(
+            "Environment variables {GITLAB_ENDPOINT} and {RO_API_TOKEN} have not been set. ie. GITLAB_ENDPOINT=<gitlab-endpoint>, RO_API_TOKEN=<gitlab-token>"
+        )
+
+    gl = gitlab.Gitlab(f"https://{gitlab_endpoint}", private_token=ro_api_token)
     logger.info("Setting only_failing to %s", only_failing)
 
     project = gl.projects.get(PROJECT_ID)
@@ -49,8 +57,8 @@ def main(pipeline_id: int, only_failing: bool):
         for functional_pipeline_job in functional_pipeline_jobs:
             job = project.jobs.get(functional_pipeline_job.id)
             logger.info("Starting with job %s", job.name)
-            if only_failing and job.status != "failed":
-                logger.info("Job %s is not failing. Skipping.", job.name)
+            if only_failing and job.status == "success":
+                logger.info("Job %s is successful. Skipping.", job.name)
                 continue
 
             try:
@@ -60,26 +68,42 @@ def main(pipeline_id: int, only_failing: bool):
                 zip = zipfile.ZipFile(file_name)
                 zip.extractall("tmp")
                 logger.info("Downloaded artifacts of job %s", job.name)
-            except Exception:
+            except Exception as e:
+                logger.error("Failed to download artifacts of job %s due to %s", job.name, e)
                 continue
 
             os.unlink(file_name)
             restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[-1]
-            golden_values_source = (
-                pathlib.Path(ASSETS_DIR)
-                / f"{restart_dir}"
-                / "assets"
-                / "basic"
-                / f"{job.name.replace('_', '-').lower()}-{environment.replace('_', '-')}"
-                / f"golden_values_{environment}.json"
+            golden_values_sources = list(
+                (
+                    pathlib.Path(ASSETS_DIR)
+                    / f"{restart_dir}"
+                    / "assets"
+                    / "basic"
+                    / f"{job.name.replace('_', '-').lower()}-{environment.replace('_', '-')}"
+                ).glob("g*.json")
             )
+
+            if len(golden_values_sources) == 1:
+                golden_values_source = golden_values_sources[0]
+            else:
+                logger.info(
+                    "Golden values for %s does not exist. Skip.", str(golden_values_sources)
+                )
+                continue
+
+            golden_values_source_name = golden_values_source.name
+            golden_values_source_name = golden_values_source_name.replace(
+                "generations", "golden_values"
+            )
+
             golden_values_target = (
                 pathlib.Path("tests")
                 / "functional_tests"
                 / 'test_cases'
                 / job.stage
                 / job.name
-                / f"golden_values_{environment}.json"
+                / golden_values_source_name
             )
 
             if golden_values_source.exists():

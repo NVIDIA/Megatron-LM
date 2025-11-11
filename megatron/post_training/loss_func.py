@@ -2,14 +2,12 @@
 
 """Pretrain GPT loss function(s)."""
 
-import os
-
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.training import get_args
-from megatron.training.utils import average_losses_across_data_parallel_group, unwrap_model
+from megatron.training.utils import unwrap_model
 
 
 def _mask_loss(output_tensor, loss_mask):
@@ -22,7 +20,6 @@ def _mask_loss(output_tensor, loss_mask):
     else:
         tp_reduce, is_sequence_parallel = False, False
 
-    num_tokens = loss_mask.sum().float()
     if is_sequence_parallel:
         # Sequence-parallel tensor derived from intermediate activation - need to split loss mask.
         idx = parallel_state.get_tensor_model_parallel_rank()
@@ -30,35 +27,13 @@ def _mask_loss(output_tensor, loss_mask):
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.reshape(-1).float()
-
-    loss = torch.cat([torch.sum(losses * loss_mask).view(1), num_tokens.view(1)])
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=parallel_state.get_context_parallel_group())
-    loss = loss[0] / loss[1]
+    loss = torch.sum(losses * loss_mask)
 
     if tp_reduce or is_sequence_parallel:
         # Losses on parallel tensors require extra all-reduce to sync across MP ranks.
         torch.distributed.all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group())
 
     return loss
-
-
-def _allreduce_losses(losses):
-    """Reduce losses across all GPUs."""
-    args = get_args()
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        for loss in losses:
-            assert not loss.isnan(), (
-                f'Rank {global_rank}: found NaN in local forward loss calculation. '
-                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-            )
-
-    # Reduce loss for logging.
-    # TODO(aanoosheh): This should ideally be done with num_tokens separately reduced and averaged.
-    return average_losses_across_data_parallel_group(losses)
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTModel):
@@ -76,9 +51,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
 
     # Standard lm loss
     loss_lm = _mask_loss(output_tensor, loss_mask)
-    loss_lm_avg = _allreduce_losses([loss_lm])[0]
-
-    loss, report = loss_lm, {'lm loss': loss_lm_avg}
+    loss = loss_lm
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
 
     if model.training and args.export_kd_teacher_load:
         # [ModelOpt]: Handle knowledge distillation
@@ -88,9 +63,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
         )
         loss = losses["kd_loss"]
 
-        losses_avg = _allreduce_losses([losses["kd_loss"], losses["logits_loss"], losses["intermediate_loss"]])
-        report["kd loss"] = losses_avg[0]
-        report["logits distillation loss"] = losses_avg[1]
-        report["intermediate distillation loss"] = losses_avg[2]
+        report["total loss"] = torch.cat([losses["kd_loss"].clone().detach().view(1), num_tokens.view(1)])
+        report["logits distillation loss"] = torch.cat([losses["logits_loss"].clone().detach().view(1), num_tokens.view(1)])
+        report["intermediate distillation loss"] = torch.cat([losses["intermediate_loss"].clone().detach().view(1), num_tokens.view(1)])
 
-    return loss, report
+    return loss, num_tokens, report

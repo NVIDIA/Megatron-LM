@@ -10,8 +10,9 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -49,7 +50,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
-        model_comm_pgs (ModelCommProcessGroups, optional): Model communication process groups.
+        pg_collection (ProcessGroupCollection, optional): Model communication process groups.
     """
 
     def __init__(
@@ -72,9 +73,9 @@ class MambaModel(LanguageModule):
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
-        super().__init__(config=config)
+        super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -92,11 +93,6 @@ class MambaModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
-                required_pgs=['tp', 'pp', 'cp', 'tp_cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
-            )
-
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
@@ -108,7 +104,7 @@ class MambaModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=model_comm_pgs.tp,
+                tp_group=self.pg_collection.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -118,7 +114,7 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=model_comm_pgs.cp,
+                cp_group=self.pg_collection.cp,
             )
 
         self.decoder = build_module(
@@ -130,7 +126,7 @@ class MambaModel(LanguageModule):
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=self.pg_collection,
         )
 
         # Output
@@ -145,7 +141,7 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
-                tp_group=model_comm_pgs.tp,
+                tp_group=self.pg_collection.tp,
             )
 
         if self.pre_process or self.post_process:
@@ -195,6 +191,11 @@ class MambaModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        in_inference_mode = inference_context is not None and not self.training
+
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -215,7 +216,7 @@ class MambaModel(LanguageModule):
         # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
         # reference held by this caller function, enabling early garbage collection
         # for inference.
-        if inference_context is not None and not self.training:
+        if in_inference_mode:
             decoder_input = WrappedTensor(decoder_input)
 
         # The following assert will currently fail when running inference.
@@ -244,16 +245,40 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if (
-            not self.training
-            and inference_context is not None
-            and inference_context.materialize_only_last_token_logits
-        ):
-            hidden_states = hidden_states[-1, :, :].unsqueeze(0)
+        sequence_parallel_override = False
+        if in_inference_mode and inference_context.materialize_only_last_token_logits:
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                if self.output_layer.sequence_parallel:
+                    # Perform the sequence parallel gather here instead of after the output layer
+                    # because we need to slice the last token logits from the full view of the
+                    # packed logits across all requests.
+                    hidden_states = gather_from_sequence_parallel_region(
+                        hidden_states, group=self.pg_collection.tp
+                    )
+                    self.output_layer.sequence_parallel = False
+                    sequence_parallel_override = True
+
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # state ([B, H]) → unsqueeze back to [B, 1, H]
+                # (so that the output layer, which expects S×B×H, receives only the final token)
+                hidden_states = inference_context.last_token_logits(
+                    hidden_states.squeeze(1).unsqueeze(0)
+                ).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # Restore sequence parallel execution to the output layer if necessary.
+        if sequence_parallel_override:
+            assert (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.materialize_only_last_token_logits
+            )
+            self.output_layer.sequence_parallel = True
 
         if labels is None:
             # [s b h] => [b s h]

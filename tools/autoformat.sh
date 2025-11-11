@@ -15,14 +15,20 @@ CHECK_ONLY=${CHECK_ONLY:-false}
 SKIP_DOCS=${SKIP_DOCS:-false}
 
 BASE_REF=${BASE_REF:-main}
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
+git remote add autoformatter-remote "https://github.com/NVIDIA/Megatron-LM.git" || true
+git fetch autoformatter-remote ${BASE_REF}
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base autoformatter-remote/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
 ADDITIONAL_PYLINT_ARGS=""
+ADDITIONAL_RUFF_ARGS=""
 
 if [[ $CHECK_ONLY == true ]]; then
     ADDITIONAL_ARGS="--check"
     ADDITIONAL_BLACK_ARGS="--diff"
+    ADDITIONAL_RUFF_ARGS="--no-fix"
+else
+    ADDITIONAL_RUFF_ARGS="--fix"
 fi
 
 if [[ $SKIP_DOCS == true ]]; then
@@ -33,6 +39,7 @@ if [[ -n "$CHANGED_FILES" ]]; then
     black --skip-magic-trailing-comma --skip-string-normalization $ADDITIONAL_ARGS $ADDITIONAL_BLACK_ARGS --verbose $CHANGED_FILES
     isort $ADDITIONAL_ARGS $CHANGED_FILES
     pylint $ADDITIONAL_PYLINT_ARGS $CHANGED_FILES
+    ruff check $ADDITIONAL_RUFF_ARGS $CHANGED_FILES
     mypy --explicit-package-bases --follow-imports=skip $CHANGED_FILES || true
 else
     echo Changeset is empty, all good.

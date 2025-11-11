@@ -12,16 +12,15 @@ from typing import Dict, List, Optional
 import torch
 from torch.distributed import _coalescing_manager
 
+import megatron.core.nccl_allocator as nccl_allocator
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-
-try:
-    import apex.contrib.nccl_allocator as nccl_allocator
-except ImportError:
-    nccl_allocator = None
+from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +34,8 @@ try:
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+
+import megatron.core.nccl_allocator as nccl_allocator
 
 
 class BufferType(Enum):
@@ -151,11 +152,26 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
+            assert (
+                not self.ddp_config.reduce_scatter_with_fp32_accumulation
+            ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
+
+        global dist_reduce_scatter_func
+        if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
 
         self.reset()
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+
+        # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
+        # introduces some CPU overheads. We use these two lists to cache the created local
+        # shards to avoid unnecessary CPU operations. This does not increase GPU memory usage
+        # because it only saves a slice view, which shares the same memory with bucket.param_data
+        # or bucket.grad_data.
+        self.cached_param_buffer_shard_list = [None] * len(self.buckets)
+        self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
     def reset(self):
         """
@@ -229,10 +245,14 @@ class _ParamAndGradBucketGroup:
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
         ) as cm:
-            for bucket in self.buckets:
-                local_data_view = shard_buffer(
-                    bucket.param_data, self.intra_distributed_optimizer_instance_size
-                )[self.intra_distributed_optimizer_instance_rank]
+            for idx, bucket in enumerate(self.buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]
                 dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
@@ -287,6 +307,25 @@ class _ParamAndGradBucketGroup:
                     )
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
+
+            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
+            # we need to copy the param_data from the shared_param/grad_buffer to param.data
+            # after the param all-gather.
+            if (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and self.ddp_config.overlap_param_gather
+            ):
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        param_start, param_end = bucket.param_to_index[param]
+                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                        param.data.copy_(param_slice.view(param.data.shape))
+                    # All-gathered params are not needed after being copied to param.data.
+                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                    # We cannot zero out the entire grad buffer because one grad buffer may
+                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                    # it would clear the data of those param buffers that have not yet completed AG.
+                    bucket.param_data.zero_()
 
     def start_grad_sync(self):
         """
@@ -351,13 +390,18 @@ class _ParamAndGradBucketGroup:
             communication_group = self.data_parallel_group
 
         # Coalesce communication kernels across buckets in the bucket group.
+        grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-            for bucket in self.buckets:
+            for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
-                    dist_reduce_scatter_func(
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    grad_reduce_handle = dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
@@ -382,10 +426,14 @@ class _ParamAndGradBucketGroup:
                     self.inter_distributed_optimizer_instance_group, async_ops=async_op
                 ) as cm,
             ):
-                for bucket in self.buckets:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
 
                     torch.distributed.all_reduce(
                         local_data_view,
@@ -395,7 +443,16 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            self.grad_reduce_handle = cm
+            if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+                assert (
+                    len(self.buckets) == 1
+                ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
+                # torch.distributed._coalescing_manager does not correctly handle calling our custom
+                # collective handle's .wait() method, so we take matters into our own hands here.
+                assert grad_reduce_handle is not None
+                self.grad_reduce_handle = grad_reduce_handle
+            else:
+                self.grad_reduce_handle = cm
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
@@ -484,7 +541,19 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+
+        if pg_collection is None:
+            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
+                with_context_parallel=True
+            )
+            self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')
+            self.dp_cp_group = pg_collection.dp_cp
+            self.tp_group = pg_collection.tp
+
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices
@@ -629,11 +698,15 @@ class _ParamAndGradBuffer:
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
-            if not nccl_allocator:
-                raise RuntimeError("NCCL allocator importing failed but nccl ub is still requested")
-            pool = nccl_allocator.create_nccl_mem_pool()
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(
+                symmetric=not self.ddp_config.disable_symmetric_registration
+            )
             mem_alloc_context = functools.partial(
-                nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
+                nccl_allocator.nccl_mem,
+                pool,
+                group=self.data_parallel_group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
             )
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
@@ -746,7 +819,13 @@ class _ParamAndGradBuffer:
             )
             for param in bucket.params:
                 log_strs.append(f"\t{param_to_name[param]}")
-        log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            "\n".join(log_strs),
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""

@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import gc
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -14,7 +15,11 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
-from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
+from megatron.core.fusions.fused_bias_geglu import (
+    bias_geglu_impl,
+    quick_gelu,
+    weighted_bias_quick_geglu_impl,
+)
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
@@ -34,10 +39,19 @@ except ImportError:
     HAVE_TE = False
 
 
+logger = logging.getLogger(__name__)
+
+
 # pylint: disable=missing-class-docstring
 @dataclass
 class MLPSubmodules:
+    """
+    The dataclass for ModuleSpecs of MLP submodules
+    including  linear fc1, activation function, linear fc2.
+    """
+
     linear_fc1: Union[ModuleSpec, type] = None
+    activation_func: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
 
 
@@ -104,7 +118,10 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.use_te_activation_func and not (submodules.activation_func is None):
+            self.activation_func = build_module(submodules.activation_func, config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -128,7 +145,15 @@ class MLP(MegatronModule):
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
-        if self.config.bias_activation_fusion:
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        elif self.config.bias_activation_fusion:
             if per_token_scale is not None:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
@@ -138,8 +163,19 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                     )
+                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                    intermediate_parallel = weighted_bias_quick_geglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                        self.config.glu_linear_offset,
+                        self.config.activation_func_clamp_value,
+                    )
                 else:
-                    raise ValueError("Only support fusion of swiglu with per_token_scale in MLP.")
+                    raise ValueError(
+                        "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
+                    )
             else:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
@@ -166,8 +202,13 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit:
 
                 def glu(x):
-                    x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * x[1]
+                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                    if (val := self.config.activation_func_clamp_value) is not None:
+                        x_glu = x_glu.clamp(min=None, max=val)
+                        x_linear = x_linear.clamp(min=-val, max=val)
+                    return self.config.activation_func(x_glu) * (
+                        x_linear + self.config.glu_linear_offset
+                    )
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
@@ -184,8 +225,11 @@ class MLP(MegatronModule):
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
 
-        if per_token_scale is not None:
-            assert output_bias is None, "Bias is not supported with per_token_scale"
+        if per_token_scale is not None and output_bias is not None:
+            # if this MLP is an expert, and bias is required, we add the bias to output directly
+            # without doing bda later.
+            output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
+            output_bias = None
 
         return output, output_bias
 
@@ -193,19 +237,29 @@ class MLP(MegatronModule):
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
+        """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
+                        sub_sd[k] = apply_swiglu_sharded_factory(
+                            v, sharded_offsets, singleton_local_shards
+                        )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
+    def backward_dw(self):
+        self.linear_fc2.backward_dw()
+        self.linear_fc1.backward_dw()
+
 
 # pylint: disable=missing-function-docstring
-def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
+def apply_swiglu_sharded_factory(
+    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
+):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading
@@ -227,13 +281,25 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
-        offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset + axis_frag, axis_frag * 2)
+        if singleton_local_shards:
+            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+            offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+            w_key = f'{key}_w'
+            v_key = f'{key}_v'
+        else:
+            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
+            offset_v = (
+                swiglu_shard_axis + prepend_axis_num,
+                rank_offset + axis_frag,
+                axis_frag * 2,
+            )
+            w_key = key
+            v_key = key
         if flattened_range is None:
             tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
             return [
                 ShardedTensor.from_rank_offsets(
-                    key,
+                    w_key,
                     tensor_w,
                     *sharded_offsets,
                     offset_w,
@@ -241,7 +307,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                     prepend_axis_num=prepend_axis_num,
                 ),
                 ShardedTensor.from_rank_offsets(
-                    key,
+                    v_key,
                     tensor_v,
                     *sharded_offsets,
                     offset_v,
@@ -250,6 +316,10 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 ),
             ]
         else:
+            if singleton_local_shards:
+                raise NotImplementedError(
+                    'singleton_local_shards not implemented for SwiGLU MLP flattened tensors'
+                )
             # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
             # of the *original* flattened tensor into slices `w` and `v` of chunked
             # and flattened tensor.
@@ -311,7 +381,17 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
-            return torch.cat(sub_state_dict)
+            try:
+                return torch.cat(sub_state_dict)
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                logger.warning(
+                    f"CUDA OutOfMemoryError encountered during tensors merging."
+                    f" Switching to CPU merge. (Error: {e})"
+                )
+                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+                gc.collect()
+                torch.cuda.empty_cache()
+                return merged_sub_state_dict
 
     return ShardedTensorFactory(
         original_sh_ten.key,

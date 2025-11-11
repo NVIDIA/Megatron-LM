@@ -1,5 +1,7 @@
 .build_rules:
   rules:
+    - if: $BUILD == "no"
+      when: never
     - when: on_success
   stage: test
 
@@ -23,15 +25,15 @@
     DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
     TAG: purpose/builder-large
     STAGE: jet
-    MCORE_BACKWARDS_REF: core_r0.13.0
+    MCORE_BACKWARDS_REF: core_r0.14.0
     KUBERNETES_SERVICE_MEMORY_REQUEST: 90Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
-    # KUBERNETES_SERVICE_CPU_REQUEST: 60
-    # KUBERNETES_SERVICE_CPU_LIMIT: 60
+    SHARED_PATH: /builds/$CI_PROJECT_PATH/shared
   script:
     - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
     - apk add bash curl git
     - export TE_GIT_REF=$TE_GIT_REF
+    - export GH_TOKEN=$GH_TOKEN
     - bash .gitlab/scripts/build.sh
 
     - git fetch origin $MCORE_BACKWARDS_REF
@@ -51,11 +53,13 @@ test:build_image:
   parallel:
     matrix:
       - IMAGE: CI_MCORE_LTS_IMAGE
-        FILE: Dockerfile.ci.lts
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+        FILE: Dockerfile.ci.dev
+        IMAGE_TYPE: lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.05-py3
+        IMAGE_TYPE: dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.09-py3
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10

@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
+from megatron.core.tokenizers import MegatronTokenizerBase
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,12 @@ class BlendedMegatronDatasetConfig:
     """A set of blends, as defined above, one for each split distribution. Not to be used with
        'blend'. Defauls to None.
     """
+
+    multiple_validation_sets: Optional[bool] = None
+    """Whether the validation split should be treated as multiple seperate datasets."""
+
+    full_validation: Optional[bool] = None
+    """Whether to run a full epoch of validation each time validation occurs."""
 
     split: Optional[str] = None
     """The split string, a comma separated weighting for the dataset splits when drawing samples
@@ -60,8 +66,8 @@ class BlendedMegatronDatasetConfig:
        constructor.
     """
 
-    tokenizer: Optional[MegatronTokenizer] = None
-    """The MegatronTokenizer instance. Required for datasets that do online tokenization."""
+    tokenizer: Optional[MegatronTokenizerBase] = None
+    """The MegatronTokenizerBase instance. Required for datasets that do online tokenization."""
 
     mid_level_dataset_surplus: float = 0.005
     """The sample surplus to build for the mid-level datasets(s). Defaults arbitrarily to 0.005.
@@ -69,6 +75,17 @@ class BlendedMegatronDatasetConfig:
        if the top level dataset oversamples the mid level dataset(s). This value may be set to 0.0
        in future if the top level dataset is constrained to not oversample the mid level
        datasets(s).
+    """
+
+    allow_ambiguous_pad_tokens: Optional[bool] = False
+    """Whether to prevent pad tokens already present in the dataset from being masked out
+       when the pad token incorrectly shares the same id with other special tokens.
+       Treating such tokens as pad tokens results in training instability and divergence.
+       Such a scenario is best resolved by fixing the tokenizer, but leaving this option as False
+       provides a workaround.
+       This argument will have no effect if the tokenizer is correct. However, should the user
+       desire to train on a dataset that intentionally contains pad tokens - while also using an
+       incorrect tokenizer - this option may be set to True. This is typically not recommended.
     """
 
     def __post_init__(self) -> None:

@@ -41,6 +41,9 @@ MODEL_ARGS=" \
     --use-mcore-models \
     --rotary-percent 1.0 \
     --rotary-base 1000000 \
+    --rotary-seq-len-interpolation-factor 1 \
     --no-bias-swiglu-fusion \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
     --sequence-parallel \
 "

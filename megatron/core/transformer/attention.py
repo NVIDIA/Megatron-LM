@@ -22,17 +22,23 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    get_pg_size,
     is_fa_min_version,
+    is_te_min_version,
     nvtx_range_pop,
     nvtx_range_push,
 )
 
+from ..models.common.embeddings.yarn_rotary_pos_embedding import (
+    _yarn_get_concentration_factor_from_config,
+)
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
@@ -42,14 +48,36 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
-    from flashattn_hopper.flash_attn_interface import (
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
 
     HAVE_FA3 = True
-except:
+except ImportError as e:
     HAVE_FA3 = False
+
+if not HAVE_FA3:
+    try:
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+
+        HAVE_FA3 = True
+    except ImportError as e:
+        pass
+
+try:
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+    HAVE_FMLA = True
+except ImportError:
+    flash_mla_with_kvcache = None
+    get_mla_metadata = None
+    HAVE_FMLA = False
+
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -61,10 +89,21 @@ try:
     import transformer_engine  # pylint: disable=unused-import
 
     HAVE_TE = True
-    from megatron.core.extensions.transformer_engine import SplitAlongDim
+    from megatron.core.extensions.transformer_engine import (
+        SplitAlongDim,
+        TELinear,
+        set_save_original_input,
+    )
 except ImportError:
     HAVE_TE = False
-    SplitAlongDim = None
+    SplitAlongDim, TELinear, set_save_original_input = None, None, None
+
+try:
+    from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
+
+    HAVE_FUSED_QKV_ROPE = True
+except ImportError:
+    HAVE_FUSED_QKV_ROPE = False
 
 
 @dataclass
@@ -107,7 +146,7 @@ class Attention(MegatronModule, ABC):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: str = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
 
@@ -121,21 +160,19 @@ class Attention(MegatronModule, ABC):
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
-                required_pgs=['tp', 'cp']
-            )
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         else:
             assert hasattr(
-                model_comm_pgs, 'tp'
-            ), "Attention model_comm_pgs must have tp process group"
+                pg_collection, 'tp'
+            ), "Attention pg_collection must have tp process group"
             assert hasattr(
-                model_comm_pgs, 'cp'
-            ), "Attention model_comm_pgs must have cp process group"
-        self.model_comm_pgs = model_comm_pgs
+                pg_collection, 'cp'
+            ), "Attention pg_collection must have cp process group"
+        self.pg_collection = pg_collection
 
         # Per attention head and per partition values
-        world_size = self.model_comm_pgs.tp.size()
+        world_size = get_pg_size(self.pg_collection.tp)
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
@@ -154,7 +191,7 @@ class Attention(MegatronModule, ABC):
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
-            model_comm_pgs=self.model_comm_pgs,
+            pg_collection=self.pg_collection,
         )
 
         self.checkpoint_core_attention = (
@@ -174,8 +211,21 @@ class Attention(MegatronModule, ABC):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
-            tp_group=self.model_comm_pgs.tp,
+            tp_group=self.pg_collection.tp,
         )
+
+        if (
+            HAVE_TE
+            and self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
+            and isinstance(self.linear_proj, TELinear)
+        ):
+            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # linear_proj also saves the quantized tensor of this output. Here we set the
+            # linear_proj to save the original input tensors to avoid the extra memory usage of
+            # the quantized tensor.
+            set_save_original_input(self.linear_proj)
 
     def _checkpointed_attention_forward(
         self,
@@ -238,6 +288,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Tensor,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -255,6 +306,8 @@ class Attention(MegatronModule, ABC):
                 embedding tensor(s).
             rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
 
@@ -365,23 +418,34 @@ class Attention(MegatronModule, ABC):
             value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
         else:
             # Apply rotary embeddings before appending KV cache.
-            if rotary_pos_emb is not None:
+            if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
+                query, key = inference_context.apply_fused_qk_rotary_emb(
+                    query, key, rotary_pos_cos_sin, self.config
+                )
+            elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key, k_pos_emb, self.config, self.model_comm_pgs.cp
+                    key, k_pos_emb, self.config, self.pg_collection.cp
                 )
+
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
             inference_context.append_key_value_cache(self.layer_number, key, value)
 
-            # Read key/value *pointer* tensors from cache.
-            key, value, block_table = inference_context.key_value_cache(self.layer_number)
-
+            _, max_seqlen_q = inference_context.cu_query_lengths()
+            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+                kv_cache, _, block_table = inference_context.key_value_cache(self.layer_number)
+                # Uncompress the KV cache for prefill/mixed mode
+                key, value = self.uncompress_kv_from_cache(kv_cache)
+            else:
+                # Read key/value *pointer* tensors from cache.
+                key, value, block_table = inference_context.key_value_cache(self.layer_number)
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
-    def get_query_key_value_tensors(self, hidden_states, key_value_states):
+    def get_query_key_value_tensors(self, hidden_states, key_value_states, split_qkv=True):
         """
         This method needs to be implemented based on whether the derived class
         is "self-attn" or "cross-attn".
@@ -443,7 +507,6 @@ class Attention(MegatronModule, ABC):
         cu_seqlens_q,
         cu_seqlens_k,
         seqlens_k,
-        seqlens_k_decode_only,
         block_table,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
@@ -457,21 +520,24 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            seqlens_k_decode_only (Tensor): key sequence lengths (decode_only).
-            block_table (Tensor): KV cache chunk ids for all samples.
+            block_table (Tensor): KV cache block ids for all samples.
         Return:
             (Tensor) Attention output.
         """
 
         assert not self.training
+        assert block_table is not None
 
         # Flash attn kernel.
         if max_seqlen_q > 1:
             q = q.squeeze(1)
+            if getattr(self, "softmax_scale", None) is not None:
+                softmax_scale = self.softmax_scale
+            else:
+                softmax_scale = q.shape[-1] ** -0.5
             if HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
-                softmax_scale = q.shape[-1] ** -0.5
                 output_total, *unused = _flash_attn_forward(
                     q=q,
                     k=k,
@@ -516,23 +582,53 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_k,
                     max_seqlen_q,
                     max_seqlen_k,
+                    softmax_scale=softmax_scale,
                     causal=True,
                     block_table=block_table,
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
-            flash_attn_args = {
-                "q": q,
-                "k_cache": k,
-                "v_cache": v,
-                "cache_seqlens": seqlens_k_decode_only,
-                "causal": True,
-                "page_table" if HAVE_FA3 else "block_table": block_table,
-            }
-            if HAVE_FA3:
-                output_total = flash_attn3_with_kvcache(**flash_attn_args)
+            # If using MLA we use the FlashMLA kernel
+            if isinstance(self.config, MLATransformerConfig):
+                softmax_scale = self.softmax_scale
+
+                num_heads_k = 1  # Only a single head for MLA Flash
+                seq_len_q = 1  # Sequence length is 1 for decode
+                num_heads_q = self.num_attention_heads_per_partition
+                num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
+
+                cache_seqlens = seqlens_k
+                tile_scheduler_metadata, num_splits = get_mla_metadata(
+                    cache_seqlens,  # cumulative key-lengths
+                    num_heads_per_head_k,  # decode-only lengths
+                    num_heads_k,  # per-head dim of V
+                )
+                head_dim_v = self.config.kv_lora_rank
+                kv_cache = k.unsqueeze(-2)
+                output_total, softmax_lse = flash_mla_with_kvcache(
+                    q,
+                    kv_cache,
+                    block_table,
+                    cache_seqlens,
+                    head_dim_v,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
             else:
-                output_total = flash_attn_with_kvcache(**flash_attn_args)
+                flash_attn_args = {
+                    "q": q,
+                    "k_cache": k,
+                    "v_cache": v,
+                    "cache_seqlens": seqlens_k,
+                    "causal": True,
+                    "page_table" if HAVE_FA3 else "block_table": block_table,
+                }
+                if HAVE_FA3:
+                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                else:
+                    output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
     def forward(
@@ -544,6 +640,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
@@ -563,6 +660,8 @@ class Attention(MegatronModule, ABC):
                 embedding tensor(s).
             rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Optional[Tensor]): Attention bias.
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
@@ -588,7 +687,17 @@ class Attention(MegatronModule, ABC):
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode and not self.training and inference_context is not None:
+        is_inference_mode = inference_context is not None and not self.training
+        # is_using_flash_decode - True is we are using the static inference engine with flash decode
+        is_using_flash_decode = is_inference_mode and self.config.flash_decode
+        # is_using_flashinfer_rope - True if we are using the dynamic inference engine
+        # with flashinfer fused rope
+        is_using_flashinfer_rope = is_inference_mode and (
+            not inference_context.is_static_batching()
+            and inference_context.use_flashinfer_fused_rope
+        )
+        if is_using_flash_decode or is_using_flashinfer_rope:
+            # flash decode and flash-infer fused rope use rotary_pos_cos and rotary_pos_sin
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -603,7 +712,39 @@ class Attention(MegatronModule, ABC):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
-        query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        split_qkv = (self.attention_type == "cross") or not all(
+            [
+                not self.config.test_mode,
+                self.config.fused_single_qkv_rope,
+                inference_context is None,
+                packed_seq_params is None,
+                (
+                    rotary_pos_emb is not None
+                    and rotary_pos_emb[0] is not None
+                    and rotary_pos_emb[1] is not None
+                ),
+                not self.config.flash_decode,
+                HAVE_FUSED_QKV_ROPE,
+                self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
+                self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
+            ]
+        )
+        # Check if fused_single_qkv_rope is requested but either unavailable or not
+        # supported for the current use case.
+        if self.attention_type != "cross":
+            assert not (
+                self.config.fused_single_qkv_rope and split_qkv
+            ), "fused_single_qkv_rope requested but not available/supported for the config."
+
+        qkv_output = self.get_query_key_value_tensors(
+            hidden_states, key_value_states, split_qkv=split_qkv
+        )
+        attn_mask_type = self.attn_mask_type
+        block_table = None
+        if split_qkv:
+            query, key, value = qkv_output
+        else:
+            mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
         # ===================================================
@@ -643,23 +784,26 @@ class Attention(MegatronModule, ABC):
 
         if (
             in_decode_mode
-            and self.config.enable_cuda_graph
+            and self.config.cuda_graph_impl == "local"
+            and self.config.cuda_graph_scope != "full_iteration"
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
 
-        query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
-            self._adjust_key_value_for_inference(
-                inference_context,
-                query,
-                key,
-                value,
-                rotary_pos_emb,
-                rotary_pos_cos,
-                rotary_pos_sin,
-                sequence_len_offset,
+        if split_qkv:
+            query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
+                self._adjust_key_value_for_inference(
+                    inference_context,
+                    query,
+                    key,
+                    value,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    rotary_pos_cos_sin,
+                    sequence_len_offset,
+                )
             )
-        )
 
         if packed_seq_params is not None:
             query = query.squeeze(1)
@@ -671,7 +815,9 @@ class Attention(MegatronModule, ABC):
         # relative positional embedding (rotary embedding)
         # ================================================
         nvtx_range_push(suffix="rotary_pos_emb")
-        if rotary_pos_emb is not None and not self.config.flash_decode:
+        if rotary_pos_emb is not None and (
+            not self.config.flash_decode or inference_context is None
+        ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None:
@@ -686,27 +832,34 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
-            if q_pos_emb is not None:
-                # TODO VIJAY: simplify
-                if inference_context is None or inference_context.is_static_batching():
-                    query = apply_rotary_pos_emb(
-                        query,
-                        q_pos_emb,
+            if split_qkv:
+                if q_pos_emb is not None:
+                    # TODO VIJAY: simplify
+                    if inference_context is None or inference_context.is_static_batching():
+                        query = apply_rotary_pos_emb(
+                            query,
+                            q_pos_emb,
+                            config=self.config,
+                            cu_seqlens=cu_seqlens_q,
+                            mscale=_yarn_get_concentration_factor_from_config(self.config),
+                            cp_group=self.pg_collection.cp,
+                        )
+                    else:
+                        query = inference_context.apply_rotary_emb_query(
+                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                        )
+                if k_pos_emb is not None:
+                    key = apply_rotary_pos_emb(
+                        key,
+                        k_pos_emb,
                         config=self.config,
-                        cu_seqlens=cu_seqlens_q,
-                        cp_group=self.model_comm_pgs.cp,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=_yarn_get_concentration_factor_from_config(self.config),
+                        cp_group=self.pg_collection.cp,
                     )
-                else:
-                    query = inference_context.apply_rotary_emb_query(
-                        query, q_pos_emb, self.config, cu_seqlens_q, self.model_comm_pgs.cp
-                    )
-            if k_pos_emb is not None:
-                key = apply_rotary_pos_emb(
-                    key,
-                    k_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    cp_group=self.model_comm_pgs.cp,
+            else:
+                query, key, value = apply_fused_qkv_rotary_pos_emb(
+                    mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
                 )
 
             # TODO, can apply positional embedding to value_layer so it has
@@ -747,9 +900,7 @@ class Attention(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, kv_lengths_decode_only, max_seqlen_k = (
-                    inference_context.cu_kv_lengths()
-                )
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
                 core_attn_out = self.flash_decode_and_prefill(
                     q,
@@ -760,7 +911,6 @@ class Attention(MegatronModule, ABC):
                     cu_query_lengths,
                     cu_kv_lengths,
                     kv_lengths,
-                    kv_lengths_decode_only,
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
@@ -783,6 +933,10 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
+
 
 class SelfAttention(Attention):
     """Self-attention layer class
@@ -798,7 +952,7 @@ class SelfAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
             config=config,
@@ -807,7 +961,7 @@ class SelfAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="self",
             cp_comm_type=cp_comm_type,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         self.linear_qkv = build_module(
@@ -821,7 +975,7 @@ class SelfAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',
-            tp_group=self.model_comm_pgs.tp,
+            tp_group=self.pg_collection.tp,
         )
 
         if submodules.q_layernorm is not None:
@@ -915,9 +1069,10 @@ class SelfAttention(Attention):
                 "TP",
             )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
+    def get_query_key_value_tensors(self, hidden_states, key_value_states=None, split_qkv=True):
         """
-        Derives `query`, `key` and `value` tensors from `hidden_states`.
+        Derives `query`, `key` and `value` tensors from `hidden_states`. If `split_qkv=False`, then
+        the unsplit mixed_qkv tensor is returned.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
@@ -941,6 +1096,10 @@ class SelfAttention(Attention):
             self.hidden_size_per_attention_head,
             self.hidden_size_per_attention_head,
         ]
+
+        # Return unsplit mixed_qkv and split_arg_list
+        if not split_qkv:
+            return mixed_qkv, split_arg_list
 
         if SplitAlongDim is not None:
 
@@ -980,6 +1139,12 @@ class SelfAttention(Attention):
         """Update weights for output projection layer"""
         self.linear_proj.backward_dw()
 
+    def set_for_recompute_input_layernorm(self):
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        set_save_original_input(self.linear_qkv)
+
 
 class CrossAttention(Attention):
     """Cross-attention layer class
@@ -995,7 +1160,7 @@ class CrossAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(
             config=config,
@@ -1004,7 +1169,7 @@ class CrossAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="cross",
             cp_comm_type=cp_comm_type,
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
@@ -1035,11 +1200,12 @@ class CrossAttention(Attention):
             is_expert=False,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, key_value_states):
+    def get_query_key_value_tensors(self, hidden_states, key_value_states, split_qkv=True):
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
         """
+        assert split_qkv, "split_qkv must be True for CrossAttention"
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
         mixed_kv, _ = self.linear_kv(key_value_states)
 

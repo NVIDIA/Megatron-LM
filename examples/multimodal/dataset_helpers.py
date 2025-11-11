@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from energon_util import OfflineTargetAspectRatioSample, SampleListSample
+from megatron.core.models.multimodal.context_parallel import get_padding
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN, VIDEO_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.energon import (
@@ -404,7 +405,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             for turn in conversation:
                 if turn["role"] == "user":
                     turn["content"] = turn["content"].replace(IMAGE_TOKEN, "")
-            number_image_tags = 0   
+            number_image_tags = 0
 
         # We currently only support one video per sample.
         number_of_images = 1 if has_video else len(sample.images)
@@ -502,6 +503,20 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         # We need to ensure that there are at least some trainable tokens in the sample.
         assert self.target_has_trainable_tokens(input_ids, num_tiles, target), "Sample has no trainable tokens."
+
+        # Context parallel requires padding.
+        total_len = self._get_total_seq_length(input_ids, num_tiles)
+        has_cp = self.args.context_parallel_size > 1
+
+        if has_cp:
+            # Note: FP8 requires padding only the total sequence length.
+            # We pad for FP8 when we have the final, possibly packed sample.
+            padding_needed = get_padding(total_len, self.args.context_parallel_size, self.args.tensor_model_parallel_size, self.args.sequence_parallel, fp8_enabled=False)
+            padding_input = np.ones(padding_needed) * self.tokenizer.pad
+            padding_labels = np.ones(padding_needed) * IGNORE_INDEX
+            input_ids = np.concatenate([input_ids, padding_input])
+            target = np.concatenate([target, padding_labels])
+            total_len = total_len + padding_needed
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -786,9 +801,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if not max_seq_len:
            max_seq_len = max(len(s.tokens) for s in samples)
 
-        tokens = np.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=np.int64)
+        tokens = torch.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=torch.int64)
         # +1 to accommodate shift to left by one later.
-        labels = np.full((len(samples), max_seq_len + 1), self.tokenizer.pad, dtype=np.int64)
+        labels = torch.full((len(samples), max_seq_len + 1), self.tokenizer.pad, dtype=torch.int64)
 
         for i, s in enumerate(samples):
             # If the sample/target length exceeds the target sequence length, then truncate.
@@ -806,9 +821,32 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         cu_lengths = torch.tensor([[0]], dtype=torch.int32)
         max_lengths = torch.tensor([[0]], dtype=torch.int32)
 
-        if isinstance(samples[0], ImageTaskSamplePacked):
+        is_packed = isinstance(samples[0], ImageTaskSamplePacked)
+
+        if is_packed:
             cu_lengths = torch.stack([s.cu_lengths for s in samples])
             max_lengths = torch.tensor([s.max_length for s in samples], dtype=torch.int32)
+
+        # Pad entire sequence to be a multiple of 32 or 16 if using fp8.
+        has_fp8 = self.args.fp8
+        if has_fp8:
+            total_seq_len = self._get_total_seq_length(tokens[0], num_tiles)
+            padding_needed = get_padding(
+                total_seq_len,
+                self.args.context_parallel_size,
+                self.args.tensor_model_parallel_size,
+                self.args.sequence_parallel,
+                fp8_enabled=has_fp8,
+                fp8_recipe=self.args.fp8_recipe,
+            )
+            if padding_needed > 0:
+                tokens = torch.cat([tokens, torch.full((tokens.shape[0], padding_needed), self.tokenizer.pad, dtype=torch.int64)], dim=1)
+                labels = torch.cat([labels, torch.full((labels.shape[0], padding_needed), IGNORE_INDEX, dtype=torch.int64)], dim=1)
+                if is_packed:
+                    cu_lengths[0][-1] += padding_needed
+                    new_max_length = cu_lengths[0][-1] - cu_lengths[0][-2]
+                    max_lengths = torch.max(max_lengths, new_max_length)
+
 
         return ImageTaskBatchPacked(
             __key__=[s.__key__ for s in samples],

@@ -13,7 +13,14 @@ class ModelType(enum.Enum):
     """
 
     encoder_or_decoder = 1
-    encoder_and_decoder = 2
+
+    @property
+    def encoder_and_decoder(self):
+        """Deprecated property - use encoder_or_decoder instead."""
+        raise ValueError(
+            "ModelType.encoder_and_decoder is deprecated. Please use ModelType.encoder_or_decoder "
+            "instead."
+        )
 
 
 class LayerType(enum.Enum):
@@ -47,6 +54,7 @@ class AttnMaskType(enum.Enum):
     no_mask = 3  # only used for TE
     padding_causal = 4  # only used for thd attention
     arbitrary = 5
+    causal_bottom_right = 6  # only used for TE
 
 
 class AttnBackend(enum.Enum):

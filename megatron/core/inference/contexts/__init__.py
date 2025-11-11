@@ -3,7 +3,7 @@
 import warnings
 
 from .base_context import BaseInferenceContext
-from .dynamic_chunk_allocator import ChunkAllocator
+from .dynamic_block_allocator import BlockAllocator
 from .static_context import StaticInferenceContext
 
 warnings.warn(
@@ -14,7 +14,8 @@ warnings.warn(
     DeprecationWarning,
 )
 from .dynamic_context import (
-    ChunkOverflowError,
+    ActiveRequestCountOverflowError,
+    BlockOverflowError,
     ContextOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,

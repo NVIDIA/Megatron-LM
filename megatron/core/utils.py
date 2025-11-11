@@ -3,6 +3,7 @@
 """Utility functions used throughout Megatron core"""
 
 import array
+import asyncio
 import functools
 import hashlib
 import inspect
@@ -16,14 +17,16 @@ import threading
 import time
 import traceback
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
 
+import numpy
 import torch
 
 from megatron.core import config
@@ -64,6 +67,8 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+_mamba_ssm_version = None
+_causal_conv1d_version = None
 
 
 @contextmanager
@@ -101,6 +106,7 @@ def experimental_fn(introduced_with_version: str):
         ExperimentalNotEnabledError: Error raised when experimental function
             was called without enabling the experimental flag.
     """
+    logged_functions = set()
 
     def validator(func: Callable, max_lifetime: int = 3) -> Callable:
         """Validates the request to the experimental function.
@@ -134,8 +140,12 @@ def experimental_fn(introduced_with_version: str):
         def wrapped_func(*args, **kwargs):
             if config.is_experimental_enabled() is not True:
                 raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
-
-            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+            # log once on one rank
+            if func.__name__ not in logged_functions:
+                logged_functions.add(func.__name__)
+                log_single_rank(
+                    logger, logging.INFO, "ENABLE_EXPERIMENTAL is True, running experimental code."
+                )
 
             return func(*args, **kwargs)
 
@@ -160,6 +170,7 @@ def experimental_cls(introduced_with_version: str):
         ExperimentalNotEnabledError: Error raised when experimental class
             was called without enabling the experimental flag.
     """
+    logged_classes = set()
 
     def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
         """Validates the request to the experimental function.
@@ -211,8 +222,14 @@ def experimental_cls(introduced_with_version: str):
                     raise ExperimentalNotEnabledError(
                         f"Flag config.ENABLE_EXPERIMENTAL not enabled."
                     )
-
-                logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+                # log once on one rank
+                if cls.__name__ not in logged_classes:
+                    logged_classes.add(cls.__name__)
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "ENABLE_EXPERIMENTAL is True, running experimental code.",
+                    )
                 return super.__getattribute__(attr)
 
             class ClassInterceptor(type):
@@ -375,6 +392,79 @@ def is_fa_min_version(version, check_equality=True):
     return get_fa_version() > PkgVersion(version)
 
 
+def get_mamba_version():
+    """Get mamba version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_mamba_version_str():
+        import mamba_ssm
+
+        if hasattr(mamba_ssm, "__version__"):
+            return str(mamba_ssm.__version__)
+        else:
+            return version("mamba_ssm")
+
+    global _mamba_ssm_version
+    if _mamba_ssm_version is None:
+        _mamba_ssm_version = PkgVersion(get_mamba_version_str())
+    return _mamba_ssm_version
+
+
+def is_mamba_min_version(version, check_equality=True):
+    """Check if minimum version of `mamba_ssm` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_mamba_version() >= PkgVersion(version)
+    return get_mamba_version() > PkgVersion(version)
+
+
+def get_causal_conv1d_version():
+    """Get causal_conv1d version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_causal_conv1d_version_str():
+        import causal_conv1d
+
+        if hasattr(causal_conv1d, "__version__"):
+            return str(causal_conv1d.__version__)
+        else:
+            return version("causal_conv1d")
+
+    global _causal_conv1d_version
+    if _causal_conv1d_version is None:
+        _causal_conv1d_version = PkgVersion(get_causal_conv1d_version_str())
+    return _causal_conv1d_version
+
+
+def is_causal_conv1d_min_version(version, check_equality=True):
+    """Check if minimum version of `causal_conv1d` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_causal_conv1d_version() >= PkgVersion(version)
+    return get_causal_conv1d_version() > PkgVersion(version)
+
+
+def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
+    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
+    if not is_causal_conv1d_min_version("1.5.3.post1"):
+        return False, "causal_conv1d >= 1.5.3.post1 is required"
+    elif not is_mamba_min_version("2.2.6.post3"):
+        return False, "mamba_ssm >= 2.2.6.post3 is required"
+    return True, None
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -401,6 +491,9 @@ def deprecate_inference_params(inference_context, inference_params):
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
+    if not torch.distributed.is_initialized():
+        return None
+
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             warnings.warn(
@@ -660,7 +753,13 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
         logger.log(*args, **kwargs)
 
 
-def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any):
+def log_on_each_pipeline_stage(
+    logger: logging.Logger,
+    *args: Any,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    **kwargs: Any,
+):
     """Log on first rank in each pipeline stage
 
     Args:
@@ -672,10 +771,16 @@ def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any
     """
     assert torch.distributed.is_initialized()
 
-    if (
-        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-        and parallel_state.get_tensor_model_parallel_rank() == 0
-    ):
+    if tp_group is None and dp_cp_group is None:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    elif tp_group is not None and dp_cp_group is not None:
+        tp_rank = tp_group.rank()
+        dp_cp_rank = dp_cp_group.rank()
+    else:
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(*args, **kwargs)
 
 
@@ -794,28 +899,6 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    if hasattr(tensor, "fully_shard_param_local_shard"):
-        assert len(replica_id) == 3, f"Expected replica_id format (PP, TP, DP), got: {replica_id}"
-        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
-
-        sh_ten = ShardedTensor.from_rank_offsets_flat(
-            key,
-            tensor.fully_shard_param_local_shard,
-            tensor.shape,
-            *prepend_offsets,
-            (
-                tp_axis + prepend_axis_num,
-                parallel_state.get_tensor_model_parallel_rank(),
-                parallel_state.get_tensor_model_parallel_world_size(),
-            ),
-            flattened_range=slice(*tensor.fully_shard_param_local_index),
-            replica_id=replica_id,
-            prepend_axis_num=prepend_axis_num,
-            **kwargs,
-        )
-        setattr(sh_ten, "is_data_parallel_fully_shard", True)
-        return sh_ten
-
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -848,23 +931,6 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if replica_id is None:
         replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
-
-    if hasattr(tensor, "fully_shard_param_local_shard"):
-        assert len(replica_id) == 3, f"Expected replica_id format (PP, TP, DP), got: {replica_id}"
-        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
-
-        sh_ten = ShardedTensor.from_rank_offsets_flat(
-            key,
-            tensor.fully_shard_param_local_shard,
-            tensor.shape,
-            *prepend_offsets,
-            flattened_range=slice(*tensor.fully_shard_param_local_index),
-            replica_id=replica_id,
-            prepend_axis_num=prepend_axis_num,
-            **kwargs,
-        )
-        setattr(sh_ten, "is_data_parallel_fully_shard", True)
-        return sh_ten
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -939,7 +1005,9 @@ except Exception:
     dist_all_gather_func = torch.distributed._all_gather_base
 
 
-def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
+def drain_embedding_wgrad_compute(
+    config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
+):
     """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
     AllGather and GEMM's.
 
@@ -953,23 +1021,17 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
     import fused_weight_gradient_mlp_cuda
 
-    from megatron.core.parallel_state import (
-        get_global_memory_buffer,
-        get_tensor_model_parallel_group,
-        get_tensor_model_parallel_world_size,
-    )
+    from megatron.core.parallel_state import get_global_memory_buffer
 
     input = embedding_activation_buffer.pop(0)
-    world_size = get_tensor_model_parallel_world_size()
+    world_size = tp_group.size()
     dim_size = list(input.size())
     dim_size[0] = dim_size[0] * world_size
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
         all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = dist_all_gather_func(
-            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
-        )
+        handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=False)
 
         all_gathered_input[0] = all_gather_buffer
         all_gather_buffer = None
@@ -982,6 +1044,9 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
             grad_output, all_gathered_input
         )
+
+        if hasattr(weight, "__fsdp_param__"):
+            weight.main_grad = weight.get_main_grad()
 
         if config.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
@@ -1004,9 +1069,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = dist_all_gather_func(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-            )
+            handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=True)
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer
             all_gather_buffer = None
@@ -1850,9 +1913,9 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                     val.shape[seq_dim] // (2 * cp_size),
                     *val.shape[(seq_dim + 1) :],
                 )
-                index = torch.tensor(
-                    [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-                ).cuda(non_blocking=True)
+                index = torch.zeros(2, dtype=torch.int64, device=val.device)
+                index[0].fill_(cp_rank)
+                index[1].fill_(2 * cp_size - cp_rank - 1)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
                 batch[key] = val
@@ -1987,3 +2050,105 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         return func
 
     return decorator
+
+
+def unwrap_model(model, module_instances=None):
+    """Unwrap_model to return the final model instance"""
+    if module_instances is None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            FullyShardedDataParallel as megatron_FSDP,
+        )
+        from megatron.core.transformer.module import Float16Module
+
+        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
+
+
+def maybe_cat(a, b, dim=0, *, required=False):
+    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
+    xs = [t for t in (a, b) if t is not None]
+    if not xs:
+        if required:
+            raise ValueError("both tensors are None")
+        return None
+    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
+
+
+def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
+    """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    return loop
+
+
+_ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
+
+
+def trace_async_exceptions(
+    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
+) -> Callable[..., Coroutine]:
+    """Decorator to be applied to every coroutine that runs in a separate task.
+
+    This is needed because asyncio tasks do not propagate exceptions.
+    Coroutines running inside separate tasks will fail silently if not decorated.
+
+    Passing in `verbose=True` will print additional lifetime logging information about the task.
+    Such functionality is relied on by some users, and can be enabled as shown below:
+    ```
+        @trace_async_exceptions(verbose=True)
+        async def my_coroutine(...):
+            ...
+    ```
+    """
+
+    def _decorate(fn):
+        if not asyncio.iscoroutinefunction(fn):
+            raise TypeError("trace_async_exceptions can only be used with async functions")
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if verbose:
+                start = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"Exception in async function {fn.__name__}: {e}")
+                traceback.print_exc()
+                sys.exit(1)
+            finally:
+                if verbose:
+                    elapsed = (time.perf_counter() - start) * 1000.0
+                    name = fn.__qualname__
+                    cnt, tot = _ASYNC_TASK_STATS[name]
+                    _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+                    avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+
+                    log10 = numpy.log10(max(cnt, 1))
+                    if numpy.isclose(log10, round(log10)):
+                        logger.info(
+                            f"{name} completed in {elapsed:.3f} ms, "
+                            f"lifetime avg: {avg:.3f} ms, "
+                            f"lifetime cnt: {cnt + 1}"
+                        )
+
+        return wrapper
+
+    return _decorate if func is None else _decorate(func)
