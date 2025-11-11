@@ -550,6 +550,7 @@ def get_start_time_from_progress_log():
 
 def preprocess_common_state_dict(common_state_dict):
     import copy
+    from megatron.training.checkpointing import _clean_metadata_for_serialization
 
     # Convert args key of type namespace to dictionary
     preprocessed_common_state_dict = copy.deepcopy(common_state_dict)
@@ -590,6 +591,7 @@ def preprocess_common_state_dict(common_state_dict):
                 if i in optimizer_state_dict.keys():
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
+    preprocessed_common_state_dict = _clean_metadata_for_serialization(preprocessed_common_state_dict)
     return preprocessed_common_state_dict
 
 
