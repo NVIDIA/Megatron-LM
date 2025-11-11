@@ -36,7 +36,7 @@ MODEL_ARGS:
   --num-attention-heads: 16
   --max-position-embeddings: 1024
   --seq-length: 1024
-  --top_p: 1
+  --temperature: 1.0
   --top_k: 1
   --seed: 42
   --return-log-probs: true
