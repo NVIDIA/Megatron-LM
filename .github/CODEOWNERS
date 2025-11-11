@@ -24,7 +24,7 @@ megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
 
 megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-devtech
+megatron/core/transformer/moe/ @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
 
 megatron/core/inference/ @NVIDIA/inference
 
