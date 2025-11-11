@@ -61,7 +61,7 @@ class MambaModel(LanguageModule):
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
-        hybrid_override_pattern: str = None,
+        hybrid_override_pattern: Optional[str] = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,

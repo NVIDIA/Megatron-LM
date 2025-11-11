@@ -1,26 +1,28 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 """
 Implementations of the fusion lm_head(Linear) + Cross-Entropy kernel
 """
 
-from typing import Optional, Type, Tuple, Union
-import cuda.bindings.driver as cuda
+from typing import Tuple, Type
 
-import torch
-
+import cuda.bindings.driver as cuda  # type: ignore
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
-import cutlass.pipeline as pipeline
+import cutlass.pipeline as pipeline  # type: ignore
+import cutlass.utils as utils  # type: ignore
+import cutlass.utils.blackwell_helpers as sm100_utils  # type: ignore
 from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.torch as cutlass_torch
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack
-
 
 SM100_TMEM_CAPACITY_COLUMNS: int = 512
 
+
 def make_thread_cooperative_group(size: int):
+    """
+    Create a thread cooperative group.
+    """
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size, alignment=size)
+
 
 class FwdMainLoop:
     """
@@ -28,14 +30,16 @@ class FwdMainLoop:
 
     Traits stored as attributes.
 
-    :param acc_dtype: 
+    :param acc_dtype:
     """
 
-    def __init__(self,
-                 acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-                 use_2cta_instrs: bool = False,
-                 mma_tiler_mn: Tuple[int, int] = (128, 256),
-                 vocab_per_split: int = 512):
+    def __init__(
+        self,
+        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        use_2cta_instrs: bool = False,
+        mma_tiler_mn: Tuple[int, int] = (128, 256),
+        vocab_per_split: int = 512,
+    ):
         """
         Configuration including:
             - MMA instruction settings
@@ -45,16 +49,10 @@ class FwdMainLoop:
         self.use_2cta_instrs = use_2cta_instrs
         # This is the shape covered by tiledMMA, not just single MMA instruction
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.cta_tiler = (
-            self.mma_tiler[0],
-            vocab_per_split,
-            self.mma_tiler[2]
-        )
+        self.cta_tiler = (self.mma_tiler[0], vocab_per_split, self.mma_tiler[2])
         self.vocab_per_split = vocab_per_split
-        
-        self.cta_group = (
-            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        )
+
+        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
 
         self.occupancy = 1
@@ -73,19 +71,14 @@ class FwdMainLoop:
         self.empty_warp_ids = (6, 7)
 
         self.threads_per_cta: int = self.threads_per_warp * len(
-            (*self.epi_warp_ids,
-             self.load_warp_ids,
-             self.mma_warp_ids,
-             *self.empty_warp_ids)
+            (*self.epi_warp_ids, self.load_warp_ids, self.mma_warp_ids, *self.empty_warp_ids)
         )
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
-            barrier_id = 1,
-            num_threads = self.threads_per_cta
+            barrier_id=1, num_threads=self.threads_per_cta
         )
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id = 2,
-            num_threads = self.threads_per_cta
+            barrier_id=2, num_threads=self.threads_per_cta
         )
 
         self.buffer_align_bytes: int = 1024
@@ -97,26 +90,14 @@ class FwdMainLoop:
         tiled_mma: cute.TiledMma,
         mma_tiler: Tuple[int, int, int],
         a_dtype: Type[cutlass.Numeric],
-        b_dtype: Type[cutlass.Numeric]
+        b_dtype: Type[cutlass.Numeric],
     ):
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            mma_tiler,
-            a_dtype,
-            1, # only single stage
+            tiled_mma, mma_tiler, a_dtype, 1  # only single stage
         )
-        b_smem_layout_stage_one = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            mma_tiler,
-            b_dtype,
-            1,
-        )
-        a_bytes_per_stage = cute.size_in_bytes(
-            a_dtype, a_smem_layout_stage_one
-        )
-        b_bytes_per_stage = cute.size_in_bytes(
-            b_dtype, b_smem_layout_stage_one
-        )
+        b_smem_layout_stage_one = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler, b_dtype, 1)
+        a_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+        b_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
         num_acc_stage = 2
         num_a_stage = 4
         num_b_stage = 4
@@ -132,30 +113,26 @@ class FwdMainLoop:
     ):
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
-            (tiled_mma.thr_id.shape,),
+            cute.make_layout(self.cluster_shape_mnk), (tiled_mma.thr_id.shape,)
         )
 
         # this is fixed for dense MMA, k=16
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         # 16*4 = 64; 64 * sizeof(FP16) = 128Bytes
         mma_inst_tile_k: int = 4
-        self.mma_tiler = (
-            self.mma_tiler[0],
-            self.mma_tiler[1],
-            mma_inst_shape_k * mma_inst_tile_k
-        )
+        self.mma_tiler = (self.mma_tiler[0], self.mma_tiler[1], mma_inst_shape_k * mma_inst_tile_k)
 
-        self.num_acc_stage, self.num_a_stage, self.num_b_stage, self.num_epi_stage_per_tile =\
+        self.num_acc_stage, self.num_a_stage, self.num_b_stage, self.num_epi_stage_per_tile = (
             self._compute_stages(tiled_mma, self.mma_tiler, a_dtype, b_dtype)
+        )
         self.tmem_alloc_cols = self.num_acc_stage * self.mma_tiler[1]
         assert self.tmem_alloc_cols <= SM100_TMEM_CAPACITY_COLUMNS
 
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler[1],
-            self.mma_tiler[2]
-        )    
+            self.mma_tiler[2],
+        )
 
     @cute.kernel
     def kernel(
@@ -174,8 +151,11 @@ class FwdMainLoop:
         cluster_layout_vmnk: cute.Layout,
         problem_mnk: Tuple[int, int, int],
         ignore_index: cutlass.Int64,
-        rank: cutlass.Int32
+        rank: cutlass.Int32,
     ):
+        """
+        The forward kernel for the mainloop.
+        """
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
@@ -196,7 +176,7 @@ class FwdMainLoop:
             producer_group=make_thread_cooperative_group(len([self.load_warp_ids])),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_ids])),
             tx_count=self.tma_copy_a_bytes + self.tma_copy_b_bytes,
-            barrier_storage=storage.load_ab_mbar_ptr.data_ptr()
+            barrier_storage=storage.load_ab_mbar_ptr.data_ptr(),
         )
         ab_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_a_stage
@@ -211,7 +191,7 @@ class FwdMainLoop:
             consumer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.epi_warp_ids)
             ),
-            barrier_storage=storage.mma_mbar_ptr.data_ptr()
+            barrier_storage=storage.mma_mbar_ptr.data_ptr(),
         )
         mma_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_acc_stage
@@ -224,23 +204,16 @@ class FwdMainLoop:
         if warp_idx == self.empty_warp_ids[0]:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_init(
-                    tmem_dealloc_mbar_ptr,
-                    self.threads_per_warp * len(self.epi_warp_ids)
+                    tmem_dealloc_mbar_ptr, self.threads_per_warp * len(self.epi_warp_ids)
                 )
                 cute.arch.mbarrier_init_fence()
 
         # -------- SMEM partition ------------ #
         # swizzle o [(tileM, tileK), loopM, loopK, Stage]
-        sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer,
-            swizzle=a_smem_layout_staged.inner
-        )
+        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         # swizzle o [(tileN, tileK), loopN, loopK, stage]
-        sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer,
-            swizzle=b_smem_layout_staged.inner
-        )
-        
+        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+
         # FIXME: if 2 CTAs, modify here
         thr_mma = tiled_mma.get_slice(0)
         # [MMA, loopM, loopK, stage]
@@ -250,72 +223,50 @@ class FwdMainLoop:
 
         # ---------- GMEM partition ----------- #
         # [tileM, tileK, loopK]
-        gA = cute.local_tile(
-            mA,
-            (self.mma_tiler[0], self.mma_tiler[2]),
-            (pidm, None)
-        )
+        gA = cute.local_tile(mA, (self.mma_tiler[0], self.mma_tiler[2]), (pidm, None))
 
         # [vocab_size_per_split, dim]
         mB_n = cute.local_tile(
-            mB,
-            (self.vocab_per_split, cute.size(mB.layout.shape, mode=[1])),
-            (pidn, 0)
+            mB, (self.vocab_per_split, cute.size(mB.layout.shape, mode=[1])), (pidn, 0)
         )
 
         # [tileN, tileK, loopN, loopK]
-        gB = cute.local_tile(
-            mB_n,
-            (self.mma_tiler[1], self.mma_tiler[2]),
-            (None, None)
-        )
-        
+        gB = cute.local_tile(mB_n, (self.mma_tiler[1], self.mma_tiler[2]), (None, None))
+
         # [MMA, tileCntM, tileCntK, loopK]
         tCgA = thr_mma.partition_A(gA)
         # [MMA, tileCntN, tileCntK, loopN, loopK]
         tCgB = thr_mma.partition_B(gB)
 
-        a_cta_layout = cute.make_layout(
-            cute.slice_(
-                cluster_layout_vmnk, 
-                (0, 0, None, 0)).shape
-        )
+        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
         # FIXME: if 2 CTAs, modify here
         cta_rank_in_cluster = 0
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
-            cta_rank_in_cluster
-        )
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tTMAsA, tTMAgA = cpasync.tma_partition(
             tma_atom_a,
-            block_in_cluster_coord_vmnk[2], # cta_coord,
+            block_in_cluster_coord_vmnk[2],  # cta_coord,
             a_cta_layout,
-            cute.group_modes(sA, 0, 3), # SMEM tensor
-            cute.group_modes(tCgA, 0, 3) # GMEM tensor
+            cute.group_modes(sA, 0, 3),  # SMEM tensor
+            cute.group_modes(tCgA, 0, 3),  # GMEM tensor
         )
-        b_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-        )
+        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
         tTMAsB, tTMAgB = cpasync.tma_partition(
             tma_atom_b,
-            block_in_cluster_coord_vmnk[1], # cta_coord
+            block_in_cluster_coord_vmnk[1],  # cta_coord
             b_cta_layout,
             cute.group_modes(sB, 0, 3),
-            cute.group_modes(tCgB, 0, 3)
+            cute.group_modes(tCgB, 0, 3),
         )
 
         # Allocate TMEM
         tmem_holding_buf = storage.tmem_holding_buf
         if warp_idx == self.empty_warp_ids[0]:
             cute.arch.alloc_tmem(
-                self.tmem_alloc_cols, 
-                tmem_holding_buf,
-                is_two_cta=self.use_2cta_instrs
+                self.tmem_alloc_cols, tmem_holding_buf, is_two_cta=self.use_2cta_instrs
             )
         self.cta_sync_barrier.arrive_and_wait()
         tmem_ptr = cute.arch.retrieve_tmem_ptr(
-            self.acc_dtype,
-            alignment=16,
-            ptr_to_buffer_holding_addr=tmem_holding_buf
+            self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
         )
 
         # [(tileM, tileN), loopM, loopN]
@@ -323,16 +274,14 @@ class FwdMainLoop:
         acc_shape = thr_mma.partition_shape_C(tmem_shape)
         tCtC_fake = thr_mma.make_fragment_C(acc_shape)
         tCtC = cute.make_tensor(tmem_ptr, tCtC_fake.layout)
-        
-        block_vocab_left_idx: cutlass.Int64 = (
-            pidn * self.vocab_per_split
-        )
-        block_vocab_right_idx: cutlass.Int64 = (
-            min((pidn + 1) * self.vocab_per_split, problem_mnk[1])
+
+        block_vocab_left_idx: cutlass.Int64 = pidn * self.vocab_per_split
+        block_vocab_right_idx: cutlass.Int64 = min(
+            (pidn + 1) * self.vocab_per_split, problem_mnk[1]
         )
         num_n_tiles: cutlass.Int64 = cute.ceil_div(
-            (block_vocab_right_idx - block_vocab_left_idx), 
-            self.mma_tiler[1])
+            (block_vocab_right_idx - block_vocab_left_idx), self.mma_tiler[1]
+        )
 
         # ///////
         # empty
@@ -353,13 +302,13 @@ class FwdMainLoop:
                         tma_atom_a,
                         tTMAgA[(None, k)],
                         tTMAsA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state)
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                     )
                     cute.copy(
                         tma_atom_b,
                         tTMAgB[(None, n, k)],
                         tTMAsB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state)
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                     )
                     ab_pipeline.producer_commit(ab_producer_state)
                     ab_producer_state.advance()
@@ -384,7 +333,7 @@ class FwdMainLoop:
                             cute.append_ones(tCtC[(None, None, mma_producer_state.index)]),
                             tCsA[(None, None, kblock_idx, ab_consumer_state.index)],
                             tCsB[(None, None, kblock_idx, ab_consumer_state.index)],
-                            cute.append_ones(tCtC[(None, None, mma_producer_state.index)])
+                            cute.append_ones(tCtC[(None, None, mma_producer_state.index)]),
                         )
                         # enable accumulate for the next tile
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -404,21 +353,18 @@ class FwdMainLoop:
             # epilog TMEM copy and partition
             copy_atom_t2r = sm100_utils.get_tmem_load_op(
                 self.cta_tile_shape_mnk,
-                utils.LayoutEnum.ROW_MAJOR, # This is hard-coded
+                utils.LayoutEnum.ROW_MAJOR,  # This is hard-coded
                 self.acc_dtype,
                 self.acc_dtype,
                 (self.epi_tile[0], self.epi_tile[1] // self.num_epi_stage_per_tile),
-                self.use_2cta_instrs
+                self.use_2cta_instrs,
             )
             # [tileM, subTileN, loopM, CntSubTileN, loopN]
             tAcc_epi = cute.flat_divide(
                 tCtC[((None, None), 0, None)],
-                (self.epi_tile[0],
-                 self.epi_tile[1] // self.num_epi_stage_per_tile)
+                (self.epi_tile[0], self.epi_tile[1] // self.num_epi_stage_per_tile),
             )
-            tiled_copy_t2r = tcgen05.make_tmem_copy(
-                copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
-            )
+            tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
             tTMEM_load_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
             # [(pattern), loopM, loopN, CntTileM, CntTileN]
@@ -429,131 +375,84 @@ class FwdMainLoop:
             # [tileM, subTileN, loopM, CntSubTileN, CntTileN]
             tCcAcc_epi = cute.flat_divide(
                 tCcAcc[((None, None), 0, None)],
-                (self.epi_tile[0],
-                 self.epi_tile[1] // self.num_epi_stage_per_tile)
+                (self.epi_tile[0], self.epi_tile[1] // self.num_epi_stage_per_tile),
             )
             tTMEM_load_cAcc = thr_copy_t2r.partition_D(tCcAcc_epi)
-            tTMEM_load_cAcc_shape = cute.select(
-                tTMEM_load_cAcc.shape,
-                mode=[0, 1, 2]
-            )
+            tTMEM_load_cAcc_shape = cute.select(tTMEM_load_cAcc.shape, mode=[0, 1, 2])
 
             # epilogue layouts
             epilogue_thread_layout = cute.make_layout((128, 1))
-            copy_atom_g2r = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mLabels.element_type
-            )
-            tiled_copy_g2r = cute.make_tiled_copy(
-                copy_atom_g2r,
-                epilogue_thread_layout,
-                (128, 1)
-            )
+            copy_atom_g2r = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mLabels.element_type)
+            tiled_copy_g2r = cute.make_tiled_copy(copy_atom_g2r, epilogue_thread_layout, (128, 1))
             thr_copy_g2r = tiled_copy_g2r.get_slice(tidx)
 
-            copy_atom_r2g = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                cutlass.Float32
-            )
-            tiled_copy_r2g = cute.make_tiled_copy(
-                copy_atom_r2g,
-                epilogue_thread_layout,
-                (128, 1)
-            )
+            copy_atom_r2g = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32)
+            tiled_copy_r2g = cute.make_tiled_copy(copy_atom_r2g, epilogue_thread_layout, (128, 1))
             thr_copy_r2g = tiled_copy_r2g.get_slice(tidx)
-            
 
             # auxiliary tensors
             # [tileM]
-            gLabels = cute.local_tile(
-                mLabels,
-                (self.epi_tile[0],),
-                (pidm,)
-            )
+            gLabels = cute.local_tile(mLabels, (self.epi_tile[0],), (pidm,))
 
             tLabelsCAcc = thr_copy_g2r.partition_S(cAcc)[(None, None, 0)]
             tLabelsCAcc_mask = cute.make_fragment(tLabelsCAcc.shape, cutlass.Boolean)
             # [(1, 1), 1]
-            tLabelsCAcc_mask[0] = cute.elem_less(
-                pidm * self.epi_tile[0] + tidx,
-                problem_mnk[0]
-            )
+            tLabelsCAcc_mask[0] = cute.elem_less(pidm * self.epi_tile[0] + tidx, problem_mnk[0])
             # to align shape with gMax and gAccu
             tLabelsCAcc_mask = cute.append_ones(tLabelsCAcc_mask)
 
             # [(1, 1), 1, 1]
             tLabelsgLabels = thr_copy_g2r.partition_S(cute.append_ones(gLabels))
             tLabelsrLabels = cute.make_fragment(tLabelsgLabels.shape, tLabelsgLabels.element_type)
-            cute.copy(
-                tiled_copy_g2r,
-                tLabelsgLabels,
-                tLabelsrLabels,
-                pred=tLabelsCAcc_mask
-            )
-            valid_mask: cutlass.Boolean =\
-                (tLabelsrLabels[0] != ignore_index) and tLabelsCAcc_mask[0]
+            cute.copy(tiled_copy_g2r, tLabelsgLabels, tLabelsrLabels, pred=tLabelsCAcc_mask)
+            valid_mask: cutlass.Boolean = (tLabelsrLabels[0] != ignore_index) and tLabelsCAcc_mask[
+                0
+            ]
 
             # [tileM, 1]
-            gMax = cute.local_tile(
-                mMax,
-                (self.epi_tile[0], 1),
-                (pidm, pidn)
-            )
+            gMax = cute.local_tile(mMax, (self.epi_tile[0], 1), (pidm, pidn))
             # [(CPYM, CPYN), loopM, loopN]
             tR2GgMax = thr_copy_r2g.partition_D(gMax)
             tR2GrMax = cute.make_fragment(tR2GgMax.shape, tR2GgMax.element_type)
             tR2GrMax.fill(-1e30)
 
             # [tileM, 1]
-            gAccu = cute.local_tile(
-                mAccu,
-                (self.epi_tile[0], 1),
-                (pidm, pidn)
-            )
+            gAccu = cute.local_tile(mAccu, (self.epi_tile[0], 1), (pidm, pidn))
             # [(CPYM, CPYN), loopM, loopN]
             tR2GgAccu = thr_copy_r2g.partition_D(gAccu)
             tR2GrAccu = cute.make_fragment(tR2GgAccu.shape, tR2GgAccu.element_type)
             tR2GrAccu.fill(0.0)
-            
+
             # [tileM, 1]
-            gLogprobs = cute.append_ones(cute.local_tile(
-                mLogprobs,
-                (self.epi_tile[0],),
-                (pidm,)
-            ))
+            gLogprobs = cute.append_ones(cute.local_tile(mLogprobs, (self.epi_tile[0],), (pidm,)))
             # [(CPYM, CPYN), loopM, loopN]
             tR2GgLogprobs = thr_copy_r2g.partition_D(gLogprobs)
             tR2GrLogprobs = cute.make_fragment(tR2GgLogprobs.shape, tR2GgLogprobs.element_type)
             tR2GrLogprobs.fill(0.0)
 
             # [(tileN // num_epi_stage_per_tile, 1), 1, 1]
-            tTMEM_load_rAcc = cute.make_fragment(
-                tTMEM_load_cAcc_shape,
-                self.acc_dtype
-            )
+            tTMEM_load_rAcc = cute.make_fragment(tTMEM_load_cAcc_shape, self.acc_dtype)
 
             for n in cutlass.range(num_n_tiles):
                 mma_pipeline.consumer_wait(mma_consumer_state)
 
-                left: cutlass.Int64 = (
-                    block_vocab_left_idx + n * self.epi_tile[1]
-                )
-                right: cutlass.Int64 = (
-                    min((n + 1) * self.epi_tile[1] + block_vocab_left_idx, 
-                        block_vocab_right_idx)
+                left: cutlass.Int64 = block_vocab_left_idx + n * self.epi_tile[1]
+                right: cutlass.Int64 = min(
+                    (n + 1) * self.epi_tile[1] + block_vocab_left_idx, block_vocab_right_idx
                 )
                 num_n_subtiles: cutlass.Int64 = cute.ceil_div(
-                    (right - left),
-                    cute.size(tTMEM_load_rAcc, mode=[0])
+                    (right - left), cute.size(tTMEM_load_rAcc, mode=[0])
                 )
                 for n_subtile in cutlass.range(num_n_subtiles):
                     cute.copy(
                         tiled_copy_t2r,
                         tTMEM_load_tAcc[(None, None, None, n_subtile, mma_consumer_state.index)],
-                        tTMEM_load_rAcc
+                        tTMEM_load_rAcc,
                     )
 
-                    for idx in cutlass.range(cute.size(tTMEM_load_rAcc, mode=[0]), unroll_full=True):
+                    for idx in cutlass.range(
+                        cute.size(tTMEM_load_rAcc, mode=[0]), unroll_full=True
+                    ):
                         local_position: cutlass.Int64 = (
                             n * self.epi_tile[1]
                             + n_subtile * cute.size(tTMEM_load_rAcc, mode=[0])
@@ -567,77 +466,46 @@ class FwdMainLoop:
                             tR2GrAccu[0] = coeff * tR2GrAccu[0] + exp_logits
 
                             position: cutlass.Int64 = (
-                                rank * problem_mnk[1]
-                                + pidn * self.vocab_per_split
-                                + local_position
+                                rank * problem_mnk[1] + pidn * self.vocab_per_split + local_position
                             )
                             mask: cutlass.Boolean = valid_mask and (position == tLabelsrLabels[0])
-                            tR2GrLogprobs[0] += (mask * tTMEM_load_rAcc[idx])
+                            tR2GrLogprobs[0] += mask * tTMEM_load_rAcc[idx]
 
                 mma_pipeline.consumer_release(mma_consumer_state)
                 mma_consumer_state.advance()
 
-            cute.copy(
-                tiled_copy_r2g,
-                tR2GrMax,
-                tR2GgMax,
-                pred=tLabelsCAcc_mask
-            )
-            cute.copy(
-                tiled_copy_r2g,
-                tR2GrAccu,
-                tR2GgAccu,
-                pred=tLabelsCAcc_mask
-            )
+            cute.copy(tiled_copy_r2g, tR2GrMax, tR2GgMax, pred=tLabelsCAcc_mask)
+            cute.copy(tiled_copy_r2g, tR2GrAccu, tR2GgAccu, pred=tLabelsCAcc_mask)
 
-            vocab_left_idx: cutlass.Int64 = (
-                rank * problem_mnk[1]
-                + pidn * self.vocab_per_split
-            )
-            vocab_right_idx: cutlass.Int64 = (
-                rank * problem_mnk[1]
-                + min((pidn + 1) * self.vocab_per_split, problem_mnk[1])
+            vocab_left_idx: cutlass.Int64 = rank * problem_mnk[1] + pidn * self.vocab_per_split
+            vocab_right_idx: cutlass.Int64 = rank * problem_mnk[1] + min(
+                (pidn + 1) * self.vocab_per_split, problem_mnk[1]
             )
             valid: cutlass.Boolean = (
-                tLabelsrLabels[0] >= vocab_left_idx
-                and tLabelsrLabels[0] < vocab_right_idx
+                tLabelsrLabels[0] >= vocab_left_idx and tLabelsrLabels[0] < vocab_right_idx
             )
             tLabelsCAcc_mask[0] &= valid
 
-            cute.copy(
-                tiled_copy_r2g,
-                tR2GrLogprobs,
-                tR2GgLogprobs,
-                pred=tLabelsCAcc_mask
-            )
+            cute.copy(tiled_copy_r2g, tR2GrLogprobs, tR2GgLogprobs, pred=tLabelsCAcc_mask)
 
         # Dealloc TMEM
         self.cta_sync_barrier.arrive_and_wait()
         if warp_idx == self.empty_warp_ids[0]:
             cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.dealloc_tmem(
-                tmem_ptr, 
-                self.tmem_alloc_cols,
-                is_two_cta=self.use_2cta_instrs
-            )
+            cute.arch.dealloc_tmem(tmem_ptr, self.tmem_alloc_cols, is_two_cta=self.use_2cta_instrs)
 
     @staticmethod
     def _compute_grid(
         problem_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         cta_tiler: Tuple[int, int, int],
-        num_splits: int
+        num_splits: int,
     ) -> Tuple[int, int, int]:
 
         cluster_shape = (*cluster_shape_mn, 1)
 
         grid = cute.round_up(
-            (
-                cute.ceil_div(problem_mnk[0], cta_tiler[0]),
-                num_splits,
-                1,
-            ),
-            cluster_shape
+            (cute.ceil_div(problem_mnk[0], cta_tiler[0]), num_splits, 1), cluster_shape
         )
         return grid
 
@@ -658,42 +526,31 @@ class FwdMainLoop:
         b_dtype: Type[cutlass.Numeric] = weight.element_type
 
         if cutlass.const_expr(hidden.element_type != weight.element_type):
-            raise RuntimeError(f"data type don't match: {hidden.element_type} v.s. {weight.element_type}")
+            raise RuntimeError(
+                f"data type don't match: {hidden.element_type} v.s. {weight.element_type}"
+            )
         if cutlass.const_expr(hidden.element_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise RuntimeError("hidden can only be FP16 or BF16")
         if cutlass.const_expr(hidden.layout.shape[1] != weight.layout.shape[1]):
             raise RuntimeError("K dimension doesn't match")
-        
-        problem_mnk = (
-            hidden.layout.shape[0],
-            weight.layout.shape[0],
-            hidden.layout.shape[1],
-        )
+
+        problem_mnk = (hidden.layout.shape[0], weight.layout.shape[0], hidden.layout.shape[1])
         if cutlass.const_expr((problem_mnk[2] * a_dtype.width // 8) % 16 != 0):
             raise RuntimeError(f"K dimension is not 16B aligned: {problem_mnk[2]}")
 
         num_splits = cute.ceil_div(problem_mnk[1], self.vocab_per_split)
-        # if cutlass.const_expr(_max.layout.shape != (hidden.layout.shape[0], num_splits)):
-        #     raise RuntimeError(f"max shape mismatch: {_max.layout.shape} != ({hidden.layout.shape[0]}, {num_splits})")
-        # if cutlass.const_expr(_accu.layout.shape != (hidden.layout.shape[0], num_splits)):
-        #     raise RuntimeError(f"accu shape mismatch: {_accu.layout.shape} != ({hidden.layout.shape[0]}, {num_splits})")
 
         grid = self._compute_grid(
-            problem_mnk = problem_mnk,
-            cluster_shape_mn = self.cluster_shape_mn,
-            cta_tiler = self.cta_tiler,
-            num_splits = num_splits
+            problem_mnk=problem_mnk,
+            cluster_shape_mn=self.cluster_shape_mn,
+            cta_tiler=self.cta_tiler,
+            num_splits=num_splits,
         )
         a_major_mode = utils.LayoutEnum.from_tensor(hidden).mma_major_mode()
         b_major_mode = utils.LayoutEnum.from_tensor(weight).mma_major_mode()
-        
+
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            a_dtype,
-            a_major_mode,
-            b_major_mode,
-            self.acc_dtype,
-            self.cta_group,
-            self.mma_tiler[:2]
+            a_dtype, a_major_mode, b_major_mode, self.acc_dtype, self.cta_group, self.mma_tiler[:2]
         )
 
         self._setup_attributes(tiled_mma, a_dtype, b_dtype)
@@ -701,20 +558,14 @@ class FwdMainLoop:
             raise RuntimeError(f"K dimension is not 128B aligned: {problem_mnk[2]}")
 
         self.epi_tile = self.mma_tiler[:2]
-        
+
         # Swizzle o [(tileM, tileK), loopM, loopK, stage]
         a_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            self.mma_tiler,
-            a_dtype,
-            self.num_a_stage
+            tiled_mma, self.mma_tiler, a_dtype, self.num_a_stage
         )
         # Swizzle o [(tileN, tileK), loopN, loopK, stage]
         b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            self.mma_tiler,
-            b_dtype,
-            self.num_b_stage
+            tiled_mma, self.mma_tiler, b_dtype, self.num_b_stage
         )
 
         # TMA loading
@@ -722,32 +573,26 @@ class FwdMainLoop:
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
         # Swizzle o [(tileM, tileK), loopM, loopK]
-        a_smem_layout = cute.select(
-            a_smem_layout_staged,
-            mode=[0, 1, 2]
-        )
+        a_smem_layout = cute.select(a_smem_layout_staged, mode=[0, 1, 2])
         # create tma copy atom for hidden,
         # and the cooresponding tma descriptor tensor
         tma_atom_a, tma_desc_a = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            hidden, # gmem_tensor
-            a_smem_layout, # SMEM layout
-            self.mma_tiler, # MMA tiler
-            tiled_mma, # TiledMMA
-            self.cluster_layout_vmnk.shape # cluster_shape_vmnk
+            hidden,  # gmem_tensor
+            a_smem_layout,  # SMEM layout
+            self.mma_tiler,  # MMA tiler
+            tiled_mma,  # TiledMMA
+            self.cluster_layout_vmnk.shape,  # cluster_shape_vmnk
         )
         # Swizzle o [(tileN, tileK), loopN, loopK]
-        b_smem_layout = cute.select(
-            b_smem_layout_staged,
-            mode=[0, 1, 2]
-        )
+        b_smem_layout = cute.select(b_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_b, tma_desc_b = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op,
-            weight, # gmem_tensor
-            b_smem_layout, # SMEM layout
-            self.mma_tiler, # MMA tiler
-            tiled_mma, # TiledMMA
-            self.cluster_layout_vmnk.shape # cluster_shape_vmnk
+            weight,  # gmem_tensor
+            b_smem_layout,  # SMEM layout
+            self.mma_tiler,  # MMA tiler
+            tiled_mma,  # TiledMMA
+            self.cluster_layout_vmnk.shape,  # cluster_shape_vmnk
         )
         a_copy_size = cute.size_in_bytes(a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
@@ -755,8 +600,13 @@ class FwdMainLoop:
         self.tma_copy_b_bytes = b_copy_size
 
         assert self.num_a_stage == self.num_b_stage
+
         @cute.struct
         class SharedStorage:
+            """
+            The shared storage for the forward kernel.
+            """
+
             # pipeline barriers, 2 = producer + consumer
             load_ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_a_stage * 2]
             mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
@@ -772,6 +622,7 @@ class FwdMainLoop:
                 cute.struct.MemRange[b_dtype, cute.cosize(b_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+
         self.shared_storage = SharedStorage
 
         # launch kernel
@@ -798,95 +649,3 @@ class FwdMainLoop:
             stream=stream,
         )
         return None
-
-
-if __name__ == "__main__":
-    rank = 0
-
-    vocab_per_split = 512 * 6
-    fwd_mainloop = FwdMainLoop(
-        vocab_per_split=vocab_per_split
-    ) # use default arguments
-
-    torch.manual_seed(1111)
-
-    num_tokens = 13092
-    hidden_size = 4096
-    vocab_size = 152064
-    # num_tokens = 4
-    # hidden_size = 64
-    # vocab_size = 512
-    dtype = torch.bfloat16
-    ignore_index = -100
-
-    hidden = (
-        torch.empty((num_tokens, hidden_size), dtype=dtype, device="cuda")
-        .uniform_(-0.5, 0.5)
-    )
-    weight = (
-        torch.empty((vocab_size, hidden_size), dtype=dtype, device="cuda")
-        .uniform_(-0.5, 0.5)
-    )
-    # hidden = torch.ones((num_tokens, hidden_size), dtype=dtype, device="cuda")
-    # weight = torch.ones((vocab_size, hidden_size), dtype=dtype, device="cuda")
-    labels = torch.randint(0, vocab_size, (num_tokens,), device="cuda")
-
-    # pad 1 ignore_index to the right
-    padded_labels = torch.nn.functional.pad(
-        labels, (0, 1), value=ignore_index
-    )
-    # remove first element
-    labels = padded_labels[..., 1:].contiguous()
-
-    # allocate output tensor
-    logprobs = torch.empty((num_tokens), dtype=torch.float32, device="cuda")
-    
-    # allocate intermediate tensors
-    num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
-    _max = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
-    _accu = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
-
-
-    # compile kernel
-    _hidden = from_dlpack(hidden, assumed_align=16).mark_compact_shape_dynamic(mode=0, divisibility=1)
-    _weight = from_dlpack(weight, assumed_align=16)
-    _labels = from_dlpack(labels, assumed_align=8).mark_compact_shape_dynamic(mode=0)
-    _logprobs = from_dlpack(logprobs, assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    _max_ = from_dlpack(_max, assumed_align=8).mark_compact_shape_dynamic(mode=0)
-    _accu_ = from_dlpack(_accu, assumed_align=8).mark_compact_shape_dynamic(mode=0)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = cute.compile(fwd_mainloop, 
-        _hidden, _weight, _labels, _logprobs, 
-        _max_, _accu_, 
-        ignore_index,
-        rank,
-        stream)
-    
-    # launch kernel
-    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-
-    with torch.cuda.nvtx.range("FwdMainLoop"):
-        start.record(stream=torch.cuda.current_stream())
-        compiled(_hidden, _weight, _labels, _logprobs, _max_, _accu_, ignore_index, rank, stream)
-        stop.record(stream=torch.cuda.current_stream())
-
-    torch.cuda.synchronize()
-
-    elapsed_time = start.elapsed_time(stop)
-
-    gemm = torch.matmul(hidden.to(torch.float32), weight.T.to(torch.float32))
-    # print(gemm)
-
-    # print(_max)
-    # print(_accu)
-    # print(logprobs)
-
-    cut_max, _ = torch.max(_max, dim=1)
-    print(cut_max)
-    # for i in range(cut_max.shape[0]):
-    #     print(i, cut_max[i])
-
-    torch_max, _ = torch.max(gemm, dim=1)
-    print(torch_max)
-
-    print(f"Success, Elapsed time: {elapsed_time:.4f} ms")

@@ -222,8 +222,8 @@ def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_groupe
 
 def get_valid_token_dispatcher_types():
     try:
-        from deep_ep import Buffer
-        from deep_ep.utils import EventHandle, EventOverlap
+        from deep_ep import Buffer  # type: ignore
+        from deep_ep.utils import EventHandle, EventOverlap  # type: ignore
 
         return ["alltoall", "flex"]
     except ImportError:
