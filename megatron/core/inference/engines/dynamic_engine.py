@@ -501,7 +501,6 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
-
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -824,7 +823,7 @@ class DynamicInferenceEngine(AbstractEngine):
             payload = msgpack.packb(
                 [
                     Headers.ENGINE_REPLY.value,
-                    [r.serializable() for r in engine_output["finished_requests"]],
+                    [r.serializable() for r in finished_requests],
                 ],
                 use_bin_type=True,
             )
@@ -922,8 +921,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): How long this step took.
         """
         # schedule requests
-        if self.use_coordinator:
-            self.schedule_requests()
         self.schedule_waiting_requests()
 
         # Saving pre-step state, for printing output below.
@@ -967,6 +964,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 3. The step time in seconds.
         """
         step_data = await self.async_forward()
+
+        # Keep for compatibility with current test suite.
+        _, step_state, _, _ = step_data
+        self.is_decode_only, _, _, _ = step_state
+
         ret = await self.async_bookkeep(*step_data, verbose=verbose)
 
         return ret
@@ -1012,7 +1014,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_requests_list
 
-    def schedule_requests(self) -> int:
+    async def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
         This method is a collective and synchronous operation that must be called
@@ -1089,7 +1091,22 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.UNPAUSE:
                 self.paused = False
 
+        await self._notify_cond_for_new_request()
+
         return len(all_messages)
+
+    async def run_schedule_requests_task(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Runs schedule_requests in a loop as a background task.
+
+        NOTE: This method will be deprecated as soon as ZMQ is made async.
+        """
+        loop = get_asyncio_loop(loop)
+        try:
+            while not self.stopped:
+                await self.schedule_requests()
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            pass
 
     def stop(self):
         """
@@ -1130,6 +1147,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 parallel_state.get_tensor_model_parallel_rank() == 0
                 and parallel_state.get_pipeline_model_parallel_rank() == 0
             )
+            self.schedule_requests_task = self._loop.create_task(
+                self.run_schedule_requests_task(loop=self._loop)
+            )
         try:
             while not self.stopped:
                 # Wait until there are active requests before proceeding.
@@ -1139,7 +1159,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         or self.waiting_request_ids
                         or self.paused
                     )
-                await self.async_step(verbose=verbose)
+                if not self.stopped and not self.paused:
+                    await self.async_step(verbose=verbose)
         except asyncio.CancelledError:
             pass
         finally:
