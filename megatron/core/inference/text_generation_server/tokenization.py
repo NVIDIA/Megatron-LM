@@ -12,7 +12,7 @@ from megatron.core.inference.communication_utils import broadcast_int_list, broa
 def tokenize_prompts(
     tokenizer, prompts=None, tokens_to_generate=None, add_BOS=None, rank=0, data_parallel=False
 ):
-    """Tokenize prompts and make them avaiable on all ranks.
+    """Tokenize prompts and make them available on all ranks.
 
     Args:
         data_parallel (bool): Broadcast tokens across a single data parallel model replica.
@@ -35,18 +35,18 @@ def tokenize_prompts(
         prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor = (
             _tokenize_prompts_and_batch(tokenizer, prompts, tokens_to_generate, add_BOS)
         )
-        # We need the sizes of these tensors for the boradcast
+        # We need the sizes of these tensors for the broadcast
         sizes_list = [
             prompts_tokens_cuda_long_tensor.size(0),  # Batch size
             prompts_tokens_cuda_long_tensor.size(1),
-        ]  # Sequence lenght
+        ]  # Sequence length
 
     # First, broadcast the sizes.
     sizes_tensor = broadcast_int_list(
         2, int_list=sizes_list, rank=rank, data_parallel=data_parallel
     )
 
-    # Now that we have the sizes, we can boradcast the tokens
+    # Now that we have the sizes, we can broadcast the tokens
     # and length tensors.
     sizes = sizes_tensor.tolist()
     prompts_tokens_cuda_long_tensor = broadcast_tensor(

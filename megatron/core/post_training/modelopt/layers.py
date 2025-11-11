@@ -74,7 +74,7 @@ class Norm:
                 **_get_extra_te_kwargs(config),
             )
         else:
-            raise Exception("Only LayerNorm and RMSNorm are curently supported")
+            raise Exception("Only LayerNorm and RMSNorm are currently supported")
 
         def _state_dict_hook(self, state_dict, prefix, local_metadata):
             if "_extra_state" in state_dict:
@@ -169,7 +169,7 @@ class Linear(torch.nn.Linear):
 class RealQuantTransformerLayer(TransformerLayer):
     """Real quantization transformer layer base class.
 
-    This base class iniitialize the default TransformerLayer and immediately
+    This base class initialize the default TransformerLayer and immediately
     perform weight-only real quantization via TensorRT Model Optimizer.
     All linear weights (Linear, ColumnParallelLinear, RowParallelLinear) picked
     up will be replaced with low-bit data type (default torch.uint8). If sub-byte

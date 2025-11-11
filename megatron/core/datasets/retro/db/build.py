@@ -645,5 +645,5 @@ def build_db(config: RetroPreprocessingConfig) -> None:
         save_indexed_dataset_infos(project_dir, indexed_dataset_infos)
     indexed_dataset_infos = get_indexed_dataset_infos(project_dir)
 
-    # Builded merged dbs.
+    # Built merged dbs.
     build_merged_dbs(project_dir, indexed_dataset_infos)

@@ -352,7 +352,7 @@ def save(
             configures common data saving behavior and backend
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process.
-            It also makes sure the common state dict is consistant across all ranks
+            It also makes sure the common state dict is consistent across all ranks
         async_sharded_save (bool, optional): if True, for the sharded state dict part
             an async save implementation will be called, with the AsyncRequest
             being returned to the caller. Note that it is the caller responsibility to

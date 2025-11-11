@@ -234,7 +234,7 @@ class TENorm:
                 **_get_extra_te_kwargs(config),
             )
         else:
-            raise Exception("Only LayerNorm and RMSNorm are curently supported")
+            raise Exception("Only LayerNorm and RMSNorm are currently supported")
 
         return instance
 
@@ -1344,7 +1344,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None
         ):
             """
-            prefix should be module_name to make keys identical to sequetial ones.
+            prefix should be module_name to make keys identical to sequential ones.
             """
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}

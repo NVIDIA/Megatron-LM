@@ -34,7 +34,7 @@ Megatron-FSDP can provide up to 25% speed up and 23% memory savings compared to 
 
 - **Advanced Bucketing**: Data-type aware bucketing system to minimize the overhead of collective operations
 - **Buffer Management**: Zero copy communication is achieved by reorganizing the storage of parameters and main grad with `ParamAndGradBuffer` class
-- **Communication Overlapping**: Improved communication overlap of paramter all-gather and gradient reduce-scatter
+- **Communication Overlapping**: Improved communication overlap of parameter all-gather and gradient reduce-scatter
 - **FP8 Mixed Precision with Transformer Engine**: Compatibility with Transformer Engine enables efficient FP8 mixed precision training
 - **Gradient accumulate fusion support with Transformer Engine**: Remove the explicit gradient copy to the communication buffer in backwards pass
 
@@ -222,9 +222,9 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
 - `nccl_ub` will allocate and register the NCCL userbuffer for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with SHARP if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`.
-    - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registraion.
-- `disable_symmetric_registration` will disable NCCL window (i.e. symmetric) registraion when using `nccl_ub`. 
-    - Dafaults to `False`.
+    - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registration.
+- `disable_symmetric_registration` will disable NCCL window (i.e. symmetric) registration when using `nccl_ub`. 
+    - Defaults to `False`.
 - `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.

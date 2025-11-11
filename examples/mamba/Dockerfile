@@ -10,7 +10,7 @@ RUN pip uninstall -y triton && \
 # are using (in the NGC base container). Generally, if the package is not
 # compatible with the PyTorch version, then it will generate a Python import
 # error. The package authors tend to only release wheels for new versions of
-# these pacakges which are compatible with the versions of regular PyTorch and
+# these packages which are compatible with the versions of regular PyTorch and
 # NGC-variant PyTorch that are newer at the time of release. So, to use newer
 # versions of these packages with relatively older versions of the NGC PyTorch
 # container, we tend to have to build the packages from scratch.

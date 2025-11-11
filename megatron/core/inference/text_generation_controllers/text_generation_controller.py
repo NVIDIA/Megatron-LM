@@ -958,7 +958,7 @@ class TextGenerationController:
                 )
             elif model_config.sequence_parallel and (ep_size == 1 or tp_size == 1):
                 raise NotImplementedError(
-                    f"Sequence parallellism is only supported for static batching with MoE models"
+                    f"Sequence parallelism is only supported for static batching with MoE models"
                 )
 
             # If using symmetric kernels and we are using using nccl
@@ -992,7 +992,7 @@ class TextGenerationController:
             # have maximum total sequence length < the current generated sequence length.
             while True:
                 # Add a timing event at the start of each iteration. The token generation
-                # time will be the elapsed time between consective timing events.
+                # time will be the elapsed time between consecutive timing events.
                 timing_events.append(torch.cuda.Event(enable_timing=True))
                 timing_events[-1].record()
 

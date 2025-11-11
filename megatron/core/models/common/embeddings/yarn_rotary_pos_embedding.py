@@ -153,7 +153,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
+            # and select the partition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb, _mscale
 

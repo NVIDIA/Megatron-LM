@@ -93,7 +93,7 @@ class ExperimentalNotEnabledError(Exception):
 def experimental_fn(introduced_with_version: str):
     """A decorator that marks a function as experimental.
     Experimental functions may change quickly and do not guarantee backwards
-    compatiblity.
+    compatibility.
 
     Experimental functions have a limited lifetime and should
     either be productionized or deprecated.
@@ -157,7 +157,7 @@ def experimental_fn(introduced_with_version: str):
 def experimental_cls(introduced_with_version: str):
     """A decorator that marks a Class as experimental.
     Experimental Classes may change quickly and do not guarantee backwards
-    compatiblity.
+    compatibility.
 
     Experimental classes have a limited lifetime and should
     either be productionized or deprecated.
@@ -890,7 +890,7 @@ def make_tp_sharded_tensor_for_checkpoint(
         if tp_axis == 0:
             # both FSDP2 and TP shards axis 0
             # default MCore uses tp-cp-ep-dp-pp
-            # FSDP2 is compatibile with TP, CP
+            # FSDP2 is compatible with TP, CP
             new_offsets[0] = (prepend_axis_num, tp_rank * dp_size + dp_rank, tp_size * dp_size)
         else:
             # FSDP2 shards axis 0 and TP shards some other axis
@@ -1277,7 +1277,7 @@ class StragglerDetector:
     def __init__(self) -> None:
         """Initializer
 
-        The inital state of the StragglerDetector instance is disabled.
+        The initial state of the StragglerDetector instance is disabled.
         The enabled state is indicated using self._off member variable
         and the proerty enabled.
         """
@@ -1682,7 +1682,7 @@ class StragglerDetector:
             Union[_StragglerData, None]: It contains the min/max of few metrics and the
                                          corresponding rank it also has sorted list of
                                          all (flops, rank) sorted by flops (aflops)
-                                         or returns None if collecton is disabled
+                                         or returns None if collection is disabled
         """
         if self._off:
             return None

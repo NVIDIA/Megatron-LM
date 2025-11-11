@@ -126,7 +126,7 @@ _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 # combined parallel group of TP, DP, and CP used for fp8
 _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
-# Paralel group of all GPUs in a distributed optimizer instance
+# Parallel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
@@ -223,7 +223,7 @@ def create_group(
         kwargs.pop("group_desc")
         if timeout is None:
             # Old version (e.g. v2.1.2) sets default_pg_timeout as default value to timeout
-            # in function signature, then check tiemout value type.
+            # in function signature, then check timeout value type.
             # New version sets None as default value to timeout in function signature. If value
             # is None, torch will give value according to the backend, then check type.
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
@@ -988,7 +988,7 @@ def initialize_model_parallel(
         #    - It may provide better performance due to zero SM resource usage.
         if "CUDA_DEVICE_MAX_CONNECTIONS" in os.environ:
             # UCC backend requires CUDA_DEVICE_MAX_CONNECTIONS variable to be larger than 1,
-            # to gurantee the overlapped UCC communications. If this environment variable is set to 1,
+            # to guarantee the overlapped UCC communications. If this environment variable is set to 1,
             # all the UCC communication will be serialized.
             assert (
                 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] != "1"
@@ -1005,7 +1005,7 @@ def initialize_model_parallel(
         # eager and rendezvous (RNDV) communication protocols.
         # "UCX_NET_DEVICES" select which network interfaces UCX should use.
         # "UCC_CL_BASIC_TLS" controls which Transport Layers are used by
-        # the Basic Collective libraray
+        # the Basic Collective library
 
         os.environ["TORCH_UCC_BLOCKING_WAIT"] = (
             os.environ["TORCH_UCC_BLOCKING_WAIT"]
@@ -1768,7 +1768,7 @@ def get_expert_tensor_parallel_world_size():
     global _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE
     if _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE
-    # Use tensor parallel group world size for backward compability otherwise
+    # Use tensor parallel group world size for backward compatibility otherwise
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     else:
@@ -1786,7 +1786,7 @@ def get_expert_tensor_parallel_rank():
     global _MPU_EXPERT_TENSOR_PARALLEL_RANK
     if _MPU_EXPERT_TENSOR_PARALLEL_RANK is not None:
         return _MPU_EXPERT_TENSOR_PARALLEL_RANK
-    # Use tensor parallel group rank for backward compability otherwise
+    # Use tensor parallel group rank for backward compatibility otherwise
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     else:

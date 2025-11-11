@@ -69,7 +69,7 @@ TOKENIZER_ARGS=(
 
 # Model args
 # TODO: ykarnati - these are not used. model provider sets the config and spec for LLM.
-# We can have overrrides based on CLI - TBD
+# We can have overrides based on CLI - TBD
 GPT_MODEL_ARGS=(
     --num-layers 1
     --hidden-size 128

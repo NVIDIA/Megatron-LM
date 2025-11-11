@@ -204,7 +204,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Runs a very simple forward pass for model. Used  in the case of models without any parallelism or only tensor parallelism.
 
         Args:
-            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
@@ -220,7 +220,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
     ) -> torch.Tensor:
         """Utility to carry out forward pass for PP models with very small inputs
 
-        If a model is pipeline parallel, yet, the input global batch is very small, we compute a foward pass on the entire global batch, rather than splitting it up into micro batches and doing something more complex as in the forward_pass_with_pipeline_parallel_large_input_batch method
+        If a model is pipeline parallel, yet, the input global batch is very small, we compute a forward pass on the entire global batch, rather than splitting it up into micro batches and doing something more complex as in the forward_pass_with_pipeline_parallel_large_input_batch method
 
         Args:
             inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
@@ -268,7 +268,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         this splits the global batch into small micro batches and runs them through the model.
 
         Args:
-            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
             recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel recv buffer.
 
         Returns:

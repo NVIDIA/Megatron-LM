@@ -36,7 +36,7 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--num-tokens-to-prompt",
@@ -201,7 +201,7 @@ def get_time_offsets(
 
     # if num_requests is not None:
     incoming_requests_duration = num_requests / incoming_requests_per_sec
-    incoming_requests_duration *= 2 # extra margin, to accomodate time sampling
+    incoming_requests_duration *= 2 # extra margin, to accommodate time sampling
 
     random.seed(seed)
     

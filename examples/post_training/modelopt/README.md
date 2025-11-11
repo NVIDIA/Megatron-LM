@@ -51,12 +51,12 @@ to try our latest features.
 
 Provide the pretrained checkpoint path through variable `${HF_MODEL_CKPT}` and provide variable
 `${MLM_MODEL_SAVE}` which stores a resumeable Megatron-LM distributed checkpoint. To export
-Hugging Face-Like quantized checkpoint for TensorRT-LLM, vLLM, or SGLang deployement,
+Hugging Face-Like quantized checkpoint for TensorRT-LLM, vLLM, or SGLang deployment,
 provide `${EXPORT_DIR}` to `export.sh`.
 
 > **📙 NOTE:** ModelOpt supports different quantization formats. By default, we simulate the
 > low-precision numerical behavior (fake-quant) which can be run on GPUs with compute > 80.
-> Real low-precision paramters (e.g. `E4M3` or `E2M1`)
+> Real low-precision parameters (e.g. `E4M3` or `E2M1`)
 > and low-precision compute (e.g. `FP8Linear`) are also supported depending on GPU compute capability.
 > **See [Adanvanced Topics](advanced.md) for details**.
 
@@ -75,7 +75,7 @@ provide `${EXPORT_DIR}` to `export.sh`.
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
-> **❗ IMPORTANT:** The first positional arugment (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
+> **❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
 > is the config name used to match the supported model config in `conf/`. The pretrained checkpoint should
 > be downloaded and provided through `${HF_MODEL_CKPT}`.
 

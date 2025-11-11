@@ -110,7 +110,7 @@ def log_config_to_disk(config, dict_data, prefix='', rank_str=''):
             prefix = type(dict_data['self']).__name__
         del dict_data['self']
 
-    # the caller of the funcion can decide the most informative string
+    # the caller of the function can decide the most informative string
     # rank_str defaults to '0_0_0_0_0' format (tp_dp_cp_pp_ep ranks)
     if rank_str == '':
         rank_str = parallel_state.get_all_ranks()

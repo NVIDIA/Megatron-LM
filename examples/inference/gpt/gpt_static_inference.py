@@ -70,7 +70,7 @@ def add_static_inference_args(parser):
 def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInferenceEngine:
     """Utility to get the relevant backend for running inference
 
-    This function will automatically choose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implemented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line

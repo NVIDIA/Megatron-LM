@@ -339,7 +339,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         Args:
             model_state_dict (dict): The full model state dict (all on CPU)
             trtllm_conversion_dict (dict): The conversion dictionary used to convert model layer names to trtllm layer names
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use representation 2 set this to True. Defaults to True
         """
 
         # First step is to convert input model layer names to equivalent trtllm layer names

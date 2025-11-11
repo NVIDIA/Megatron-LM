@@ -24,7 +24,7 @@ class OptimizerConfig:
     """
 
     min_lr: Optional[float] = None
-    """Minumum value for learning rate. The scheduler clip values below this threshold."""
+    """Minimum value for learning rate. The scheduler clip values below this threshold."""
 
     decoupled_lr: Optional[float] = None
     """Separate learning rate for the input and output layer."""
@@ -54,7 +54,7 @@ class OptimizerConfig:
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
     params_dtype: torch.dtype = torch.float32
-    """dtype used when intializing the weights. Defaults to torch.float32."""
+    """dtype used when initializing the weights. Defaults to torch.float32."""
 
     use_precision_aware_optimizer: bool = False
     """If true, allows optimizer-related tensors (master_param, gradients and optimizer states)

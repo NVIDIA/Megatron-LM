@@ -253,7 +253,7 @@ class TemporalAsyncCaller(AsyncCaller):
         return is_done
 
     def close(self, abort=False):
-        """For TemporalAsyncCaller, this method is called explictly in `is_current_async_calls_done`
+        """For TemporalAsyncCaller, this method is called explicitly in `is_current_async_calls_done`
 
         This method make sure the TemporalAsyncCaller terminated
         with all its assigned async request completed
@@ -447,7 +447,7 @@ class PersistentAsyncCaller(AsyncCaller):
         """Main function for the persistent checkpoint worker
 
         The persisent worker is created once and terminated at exit or
-        when application calls `close()` explictily
+        when application calls `close()` explicitly
 
         This routine receives `AsyncRequest` and does `preload_fn` first and
         put the integer value in `preload_q` to inform the trainer to proceed.

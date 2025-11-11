@@ -37,7 +37,7 @@ class InferenceWrapperConfig:
 
     nccl_all_reduce_for_prefill: bool = False
     """When using symmetric all reduce kernels we keep the default all reduces for nccl. 
-    This can be more effecient for large prefill sizes"""
+    This can be more efficient for large prefill sizes"""
 
     fp8: Optional[str] = None
     """If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined

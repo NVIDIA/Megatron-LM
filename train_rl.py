@@ -370,7 +370,7 @@ if __name__ == "__main__":
             return _gpt_builder(args, pre_process, post_process, vp_stage)
 
     pretrain(
-        train_valid_test_datasets_provider,  # This is currently a mock dataset that will be overriden inside of the train_step call for rl.
+        train_valid_test_datasets_provider,  # This is currently a mock dataset that will be overridden inside of the train_step call for rl.
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,

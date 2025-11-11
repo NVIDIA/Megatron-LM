@@ -57,7 +57,7 @@ def add_text_generate_args(parser):
         metavar='N',
         type=str,
         nargs='+',
-        help='Encoder input prompts with each prompt within quotes and seperated by space',
+        help='Encoder input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--max-batch-size", type=int, default=1, help='Max number of prompts to process at once'
@@ -68,7 +68,7 @@ def add_text_generate_args(parser):
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Utility to get the relevant backend for running inference
 
-    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
+    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implemented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line

@@ -184,7 +184,7 @@ def get_inference_context(
 def get_inference_controller(
     model: MegatronModule, context: DynamicInferenceContext
 ) -> TextGenerationController:
-    """Buid text generation controller, which manages the model inference context.
+    """Build text generation controller, which manages the model inference context.
 
     Args:
         model (MegatronModule): Megatron GPT model.

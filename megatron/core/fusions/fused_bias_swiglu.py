@@ -91,7 +91,7 @@ def weighted_swiglu_back(g, y, weights):
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
-    # precison of w may be higher than y and g, so we need to cast g to w_dtype
+    # precision of w may be higher than y and g, so we need to cast g to w_dtype
     weights_grad = swiglu(y) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)

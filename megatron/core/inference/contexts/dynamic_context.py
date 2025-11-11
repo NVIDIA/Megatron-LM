@@ -517,7 +517,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_step_size = (
                 math.ceil(self.cuda_graph_step_size / cuda_graph_rounder) * cuda_graph_rounder
             )
-            # Make sure divisble by TP size
+            # Make sure divisible by TP size
             self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size
 
             # Cuda graph token counts.
@@ -1107,7 +1107,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         This method does:
         - Reset active/paused request/token counts to zero.
         - Reset available blocks to entire memory.
-        - Reset other tensors to zeros (unncessary, just or sanity checking).
+        - Reset other tensors to zeros (unnecessary, just or sanity checking).
 
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
@@ -1337,7 +1337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
-        Move all the relevent booking tensors with src idxs to dst idxs
+        Move all the relevant booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
@@ -1357,7 +1357,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
-        Swaps all the relevent booking tensors with src idxs to dst idxs
+        Swaps all the relevant booking tensors with src idxs to dst idxs
         """
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
@@ -1511,7 +1511,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily
-        #       b) Move the paused requests to the left, and active requets to the right
+        #       b) Move the paused requests to the left, and active requests to the right
         #       c) Update the paused request count and active_request_count appropriately
         newly_paused_request_ids = None
         if active_request_count > 0:

@@ -103,7 +103,7 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
         # make sure attribute exists even if class didn't define it
         setattr(dispatcher, "moe_expert_capacity_factor", capacity_factor)
 
-        # Check fliping the modules config
+        # Check flipping the modules config
         if hasattr(dispatcher, "config"):
             dispatcher.config.moe_pad_expert_input_to_capacity = bool(set_to)
             dispatcher.config.moe_expert_capacity_factor = capacity_factor
@@ -145,7 +145,7 @@ async def await_process_event(
 
     Note that the timeout in this function is only for checking process liveness.
     Its value should be set to a relatively high number. The only problem a high timeout
-    introduces is that an error is raised slighly later.
+    introduces is that an error is raised slightly later.
     The timeout does not have any effect on the event-waiting, only on process failure detection.
 
     Args:

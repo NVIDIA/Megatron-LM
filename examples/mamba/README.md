@@ -79,7 +79,7 @@ layers. For example, 24 MLP layers out of 48 total layers is specified by
 * (1.0 - `ATT` - `MLP`) is the hybrid mamba ratio, the ratio of mamba layers to
 total layers.
 * `ATT` = `MLP` = 0 is a pure Mamba model.
-* `ATT` = `MLP` = 0.5 is a transfomer model.
+* `ATT` = `MLP` = 0.5 is a transformer model.
 
 If either `ATT` or `MLP` is greater than 0.0 or if `--hybrid-override-pattern`
 is specified, the logfile will include information about the hybrid layer

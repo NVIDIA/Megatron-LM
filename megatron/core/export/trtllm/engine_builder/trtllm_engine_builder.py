@@ -71,7 +71,7 @@ class TRTLLMEngineBuilder:
             max_seq_len (int, optional): Max seq length. Defaults to None.
             opt_num_tokens (int, optional): Opt number of tokens. Defaults to None.
             max_beam_width (int, optional): Max beam width. Defaults to 1.
-            tokens_per_block (int, optional): Nmber of tokens per block. Defaults to 128.
+            tokens_per_block (int, optional): Number of tokens per block. Defaults to 128.
             multiple_profiles (bool, optional): Use multiple profiles. Defaults to False.
             gpt_attention_plugin (str, optional): Gpt attention plugin to use. Defaults to "auto".
             gemm_plugin (str, optional): Gemma plugin to use. Defaults to "auto".

@@ -196,7 +196,7 @@ def validate_integrity_and_strict_load(
     if validate_access_integrity:
         if global_metadata is None:
             raise CheckpointingException(
-                "Cannot check sharding intergrity without global_metadata (None)."
+                "Cannot check sharding integrity without global_metadata (None)."
             )
         validate_sharding_integrity(global_metadata)
 
@@ -373,7 +373,7 @@ def maybe_report_missing_and_unexpected_keys(
 
 
 def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
-    """Validate consistancy across ranks for the common state dict
+    """Validate consistency across ranks for the common state dict
 
     We save the common state dict only on rank 0. We validate to make sure that the common dict is consistent across ranks before saving.
 

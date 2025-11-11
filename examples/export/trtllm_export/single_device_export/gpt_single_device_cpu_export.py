@@ -32,7 +32,7 @@ def model_provider():
 
     transformer_config = TransformerConfig(
         num_layers=2, 
-        hidden_size=64, # Needs to be atleast 32 times num_attn_heads
+        hidden_size=64, # Needs to be at least 32 times num_attn_heads
         num_attention_heads=2, 
         use_cpu_initialization=True, 
         pipeline_dtype=torch.float32,
