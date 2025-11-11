@@ -1,5 +1,6 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, ContextManager, Optional
 
@@ -314,6 +315,10 @@ class ModelParallelConfig:
        rank 0 | 0 1 2 0 1 2 3 4 3 4 
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
+
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
     # CPU Offloading

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -1068,6 +1068,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             else:
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             if args.use_megatron_fsdp and args.use_precision_aware_optimizer:
                 kwargs["preserve_fp32_weights"] = False
@@ -1210,6 +1211,7 @@ def setup_model_and_optimizer(
             # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
             #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
             default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
     else:
         optimizer = get_megatron_muon_optimizer(
@@ -1894,6 +1896,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -1936,7 +1939,9 @@ def post_training_step_callbacks(
             assert prof is not None
             prof.stop()
         else:
-            torch.cuda.cudart().cudaProfilerStop()
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            if nsys_nvtx_context is not None:
+                nsys_nvtx_context.__exit__(None, None, None)
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2234,7 +2239,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
@@ -2260,6 +2265,7 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
         and torch.distributed.get_rank() in args.profile_ranks
@@ -2314,8 +2320,9 @@ def train(
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
-                torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
@@ -2365,12 +2372,13 @@ def train(
         # Capture CUDA Graphs.
         if (
             args.cuda_graph_impl == "transformer_engine"
-            and iteration == args.cuda_graph_warmup_steps
+            and not cuda_graph_helper.graphs_created()
+            and iteration - start_iteration == args.cuda_graph_warmup_steps
         ):
-            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
             cuda_graph_helper.create_cudagraphs()
-            if iteration > start_iteration and should_disable_forward_pre_hook(args):
+            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
@@ -2445,8 +2453,11 @@ def train(
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
                         args.cuda_graph_impl == "transformer_engine"
-                        and iteration == args.cuda_graph_warmup_steps
+                        and args.cuda_graph_warmup_steps == 0
                     ):
+                        assert (
+                            cuda_graph_helper.graphs_created()
+                        ), "CUDA Graphs should have been created."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
@@ -2558,6 +2569,7 @@ def train(
             iteration,
             prof,
             num_floating_point_operations_since_last_log_event,
+            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.
@@ -2646,7 +2658,7 @@ def evaluate(
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and args.cuda_graph_scope=="full_iteration":
+    if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     if eval_iters is None:
@@ -2885,18 +2897,20 @@ def get_train_valid_test_num_samples():
     return (train_samples, eval_samples, test_iters * args.global_batch_size)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, vp_stage=None):
     """Build pretraining datasets."""
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
-    print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
-    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+    if vp_stage is not None:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples, vp_stage=vp_stage)
+    else:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -2925,7 +2939,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
+            build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None,
+            vp_stage=vp_stage,
         )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
 
@@ -2967,14 +2982,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider,
+        vp_stage=vp_stage
     )
 
     # Build iterators.

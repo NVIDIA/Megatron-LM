@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import random
@@ -80,7 +80,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs_for_dynamic_inference: bool = False
-    cuda_graph_scope: str = "full_iteration"
+    cuda_graph_scope: List[str] = None
     force_build_cuda_graphs: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
@@ -110,6 +110,9 @@ class DynamicEngineTestConfig:
             # Enough room for all tokens.
             if self.context_max_tokens_override is None:
                 self.context_max_tokens_override = self.num_requests * self.max_sequence_length
+
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = ["full_iteration"]
 
 
 @dataclass
@@ -154,6 +157,9 @@ class TestDynamicInferenceEngine:
             # Sampling params.
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
+                termination_id=(
+                    -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
+                ),
                 return_log_probs=test_config.return_log_probs,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
@@ -161,10 +167,10 @@ class TestDynamicInferenceEngine:
                 sampling_params.add_attributes({"num_tokens_total": num_tokens_total})
             else:
                 sampling_params.num_tokens_total = num_tokens_total
+
+            config_entry = test_config.skip_prompt_log_probs_for_dynamic_inference
             sampling_params.add_attributes(
-                {
-                    "skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs_for_dynamic_inference
-                }
+                {"skip_prompt_log_probs_for_dynamic_inference": config_entry}
             )
 
             # Request.
@@ -316,9 +322,6 @@ class TestDynamicInferenceEngine:
         engine = DynamicInferenceEngine(
             text_generation_controller,
             inference_context,
-            termination_id=(
-                -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
-            ),
             random_seed=test_config.random_seed,
             enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
         )
@@ -342,7 +345,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(env.requests[0].sampling_params, verbose=False)
+        result = env.engine.step_modern(verbose=False)
         finished_requests = result["finished_requests"]
 
     @classmethod
@@ -403,7 +406,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], ["full_iteration"]])
     def test_simple(self, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
 
@@ -724,11 +727,7 @@ class TestDynamicInferenceEngine:
         test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
         env = self._build_test_env(test_config)
 
-        # It's safe to use request 0's sampling params here because all sampling
-        # params are identical as long as use_fixed_output_lengths == False.
-        engine_task = asyncio.create_task(
-            env.engine.run_engine(sampling_params=env.requests[0].sampling_params, verbose=False)
-        )
+        engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
 
         request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 

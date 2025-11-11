@@ -104,7 +104,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
-    return StaticInferenceEngine(text_generation_controller=text_generation_controller)
+    return StaticInferenceEngine(text_generation_controller=text_generation_controller, legacy=args.use_legacy_static_engine)
 
 
 async def generate(

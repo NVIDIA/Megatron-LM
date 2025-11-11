@@ -35,32 +35,17 @@ permissions:
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
-  build-test-publish-wheel:
+  build-test-publish-wheels:
     needs: [pre-flight]
-    if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
-      || needs.pre-flight.outputs.is_merge_group == 'true'
-      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.63.1
-    with:
-      dry-run: true
-      python-package: megatron.core
-      python-version: "3.10"
-      packaging: uv
-      no-publish: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
-      custom-container: nvcr.io/nvidia/pytorch:25.05-py3
-      no-build-isolation: true
-      runner: linux-amd64-cpu16
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      GH_TOKEN: ${{ secrets.PAT }}
 
   build-test-publish-wheel-summary:
-    needs: [pre-flight, build-test-publish-wheel]
+    needs: [pre-flight, build-test-publish-wheels]
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
@@ -68,10 +53,18 @@ jobs:
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
         || always()
       )
+      && github.repository == 'NVIDIA/Megatron-LM'
       && !cancelled()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 

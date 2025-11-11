@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import Optional, Union
@@ -10,6 +10,7 @@ from megatron.core.models.gpt.linear_attention_module_specs import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -138,6 +139,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         multi_latent_attention=multi_latent_attention,
         mla_down_proj_use_column_parallel=False,
         normalization=normalization,
+        fallback_to_eager_attn=fallback_to_eager_attn,
     )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -217,6 +219,7 @@ def get_gpt_layer_local_spec(
         multi_latent_attention=multi_latent_attention,
         mla_down_proj_use_column_parallel=True,
         normalization=normalization,
+        fallback_to_eager_attn=False,
     )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -281,6 +284,7 @@ def get_attention_module_spec_for_backend(
     multi_latent_attention: Optional[bool] = False,
     mla_down_proj_use_column_parallel: Optional[bool] = False,
     normalization: Optional[str] = None,
+    fallback_to_eager_attn: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for Attention"""
 
@@ -295,6 +299,7 @@ def get_attention_module_spec_for_backend(
     rms_norm = normalization == "RMSNorm"
     qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True)
 
+    core_attention = backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_down_proj = (
@@ -331,7 +336,7 @@ def get_attention_module_spec_for_backend(
                 linear_q_up_proj=linear_q_up_proj,
                 linear_kv_down_proj=linear_kv_down_proj,
                 linear_kv_up_proj=linear_kv_up_proj,
-                core_attention=backend.core_attention(),
+                core_attention=core_attention,
                 linear_proj=backend.row_parallel_linear(),
                 q_layernorm=qk_norm,
                 kv_layernorm=qk_norm,
@@ -355,7 +360,7 @@ def get_attention_module_spec_for_backend(
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=linear_qkv,
-                core_attention=backend.core_attention(),
+                core_attention=core_attention,
                 linear_proj=backend.row_parallel_linear(),
                 q_layernorm=qk_norm,
                 k_layernorm=qk_norm,
@@ -480,7 +485,7 @@ def get_mlp_module_spec_for_backend(
         )
 
 
-def get_gpt_decoder_block_spec(
+def get_gpt_decoder_layer_specs(
     config: TransformerConfig,
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
@@ -604,6 +609,21 @@ def get_gpt_decoder_block_spec(
             raise ValueError(f"Invalid layer spec key: {layer_spec_key}")
         layer_specs.append(layer_spec_dict[layer_spec_key])
 
+    return layer_specs
+
+
+def get_gpt_decoder_block_spec(
+    config: TransformerConfig,
+    use_transformer_engine: bool,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> TransformerBlockSubmodules:
+    """GPT block spec."""
+    layer_specs = get_gpt_decoder_layer_specs(
+        config, use_transformer_engine, normalization, qk_l2_norm
+    )
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
@@ -619,6 +639,10 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
+    if use_transformer_engine:
+        layer_norm_impl = TENorm
+    else:
+        layer_norm_impl = LNImpl
     # Block spec.
     block_spec = TransformerBlockSubmodules(
         layer_specs=local_layer_specs, layer_norm=layer_norm_impl
@@ -680,13 +704,10 @@ def get_gpt_mtp_block_spec_for_backend(
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
-    offset = get_mtp_layer_offset(config)
+    offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
     # split the mtp layer specs to only include the layers that are built in this pipeline stage.
     mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
     if len(mtp_layer_specs) > 0:
-        assert (
-            len(mtp_layer_specs) == config.mtp_num_layers
-        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None

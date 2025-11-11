@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import logging
@@ -15,8 +15,11 @@ logger = logging.getLogger(__name__)
 class PipelineParallelLayerLayout:
     """Configuration of custom pipeline parallel layer partitioning."""
 
-    def __repr__(self):
-        return self.input_data
+    def __repr__(self) -> str:
+        if isinstance(self.input_data, str):
+            return self.input_data
+        else:
+            return str(self.input_data)
 
     def __init__(self, layout: str | list, pipeline_model_parallel_size: int):
         """Initialize PipelineParallelLayerLayout from a list or a str.
@@ -124,14 +127,27 @@ class PipelineParallelLayerLayout:
             if LayerType.mtp in self.layout[pp_rank][-1]:
                 assert (
                     self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
-                ), "All of the MTP layers must be in the same stage"
-                assert (
-                    pp_rank == self.pipeline_model_parallel_size - 1
-                    and LayerType.loss in self.layout[pp_rank][-1]
-                ), "MTP layers must be in the last stage together with Loss stage."
+                ), "All of the MTP layers must be in the same one virtual pipeline stage"
+        for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
+            assert LayerType.mtp not in self.layout[0][vpp_rank], (
+                f"Corrently we restrict that the MTP should not be in the first pp rank."
+                f"But got {self.layout[0]} for the first pp rank."
+            )
+        ## Detect MTP standalone usage.
+        mtp_standalone = False
+        for pp_rank in range(self.pipeline_model_parallel_size):
+            if (
+                LayerType.mtp in self.layout[pp_rank][-1]
+                and pp_rank != self.pipeline_model_parallel_size - 1
+            ):
+                mtp_standalone = True
+                break
+
         # TODO: remove them in the future once they are supported
         if self.flatten_layout.count(LayerType.encoder) > 0:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")
+
+        return mtp_standalone
 
     def get_num_layers_to_build(
         self,

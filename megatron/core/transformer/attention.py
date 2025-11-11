@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -21,6 +22,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_group_commit,
+    fine_grained_offloading_group_start,
+    get_fine_grained_offloading_context,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
@@ -48,14 +54,25 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
-    from flashattn_hopper.flash_attn_interface import (
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
 
     HAVE_FA3 = True
-except:
+except ImportError as e:
     HAVE_FA3 = False
+
+if not HAVE_FA3:
+    try:
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+
+        HAVE_FA3 = True
+    except ImportError as e:
+        pass
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -186,6 +203,21 @@ class Attention(MegatronModule, ABC):
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
+        )
+
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -730,9 +762,17 @@ class Attention(MegatronModule, ABC):
         if output_gate:
             assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
 
-        qkv_output = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
-        )
+        if self.offload_qkv_linear:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
+        with get_fine_grained_offloading_context(self.offload_qkv_linear):
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
+            )
+        if self.offload_qkv_linear:
+            (qkv_output,) = fine_grained_offloading_group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[]
+            )
+
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -782,7 +822,7 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and self.config.cuda_graph_scope != "full_iteration"
+            and "full_iteration" not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -881,17 +921,20 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         else:
+            if self.offload_core_attention and self.training:
+                query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                with get_fine_grained_offloading_context(self.offload_core_attention):
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
@@ -911,6 +954,10 @@ class Attention(MegatronModule, ABC):
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            if self.offload_core_attention and self.training:
+                (core_attn_out,) = fine_grained_offloading_group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -923,7 +970,7 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._torch_compiled_output_gate(core_attn_out, gate)
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -931,13 +978,20 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
+        with get_fine_grained_offloading_context(self.offload_attn_proj):
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output, bias = fine_grained_offloading_group_commit(
+                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
 
-    @torch.compile
-    def _torch_compiled_output_gate(self, x, gate):
+    @jit_fuser
+    def _apply_output_gate(self, x, gate):
         x_dtype = x.dtype
         gate = gate.contiguous()
         gate = gate.view(*x.shape)
