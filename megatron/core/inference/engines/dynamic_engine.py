@@ -821,10 +821,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_tp0_and_pp0 and finished_requests:
             payload = msgpack.packb(
-                [
-                    Headers.ENGINE_REPLY.value,
-                    [r.serializable() for r in finished_requests],
-                ],
+                [Headers.ENGINE_REPLY.value, [r.serializable() for r in finished_requests]],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
