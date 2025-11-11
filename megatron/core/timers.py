@@ -302,16 +302,17 @@ class Timers:
         """Report only min and max times across all ranks."""
 
         rank_name_to_time = self._get_elapsed_time_all_ranks(names, reset, barrier)
+        # Using Python built-in methods to avoid the overhead of PyTorch operations.
+        rank_name_to_time = rank_name_to_time.permute(1, 0).tolist()
         name_to_min_max_time = {}
         for i, name in enumerate(names):
-            rank_to_time = rank_name_to_time[:, i]
             # filter out the ones we did not have any timings for
-            rank_to_time = rank_to_time[rank_to_time > 0.0]
+            rank_to_time = list(filter(lambda x: x > 0.0, rank_name_to_time[i]))
             # If the timer exists:
-            if rank_to_time.numel() > 0:
+            if len(rank_to_time) > 0:
                 name_to_min_max_time[name] = (
-                    rank_to_time.min().item() / normalizer,
-                    rank_to_time.max().item() / normalizer,
+                    min(rank_to_time) / normalizer,
+                    max(rank_to_time) / normalizer,
                 )
         return name_to_min_max_time
 
