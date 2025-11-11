@@ -5,7 +5,7 @@ import modelopt.torch.quantization as mtq
 from megatron.core import parallel_state
 from megatron.training.utils import unwrap_model
 from modelopt.torch.quantization.utils import is_quantized
-from megatron.training import print_rank_0
+from modelopt.torch.utils import atomic_print
 
 def get_current_memory_info():
     """Get current memory usage."""
@@ -62,24 +62,37 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
         lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
     )
 
-def print_distributed_quant_summary(model):
+def print_distributed_quant_summary(model, msg=""):
+    from megatron.core import parallel_state
+    from megatron.training import print_rank_0
+    from megatron.training.utils import unwrap_model
+
     unwrapped_model = unwrap_model(model)
     if isinstance(unwrapped_model, list):
         unwrapped_model = unwrapped_model[0]
+
     if not is_quantized(unwrapped_model):
         return
+
+    print_rank_0(f"{msg}\nQuantization summary of unwrapped model: {unwrapped_model}\n{'_'*80}")
 
     if not torch.distributed.is_initialized():
         mtq.print_quant_summary(unwrapped_model)
         return
 
-    if parallel_state.get_expert_data_parallel_rank() == 0:
-        for i in range(parallel_state.get_expert_model_parallel_world_size()):
-            if i == parallel_state.get_expert_model_parallel_rank():
-                print(f"\nExpert model parallel rank {i}")
-                print(f"TP rank [{parallel_state.get_tensor_model_parallel_rank()}], DP rank [{parallel_state.get_data_parallel_rank()}]")
-                print("Quantization summary:")
-                print("_"*80)
-                mtq.print_quant_summary(unwrapped_model)
-            torch.distributed.barrier(group=parallel_state.get_expert_model_parallel_group())
-    torch.distributed.barrier()
+    @atomic_print
+    def _print_rank_summary():
+        TP_rank = parallel_state.get_tensor_model_parallel_rank()
+        EP_rank = parallel_state.get_expert_model_parallel_rank()
+        PP_rank = parallel_state.get_pipeline_model_parallel_rank()
+        print(f"\nTP rank {TP_rank}, EP rank {EP_rank}, PP rank {PP_rank}")
+        print("_" * 80)
+        mtq.print_quant_summary(unwrapped_model)
+
+    # Only print from unique TP ranks of [0, 1]
+    should_print = (
+        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+        and parallel_state.get_tensor_model_parallel_rank() in [0, 1]
+    )
+    if should_print:
+        _print_rank_summary()

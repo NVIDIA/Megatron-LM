@@ -42,13 +42,14 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_provider import model_provider
-from megatron.post_training.utils import report_current_memory_info
+from megatron.post_training.utils import report_current_memory_info, print_distributed_quant_summary
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 
 warnings.filterwarnings("ignore")
 
+# TODO deprecate these aliases in the next release
 QUANT_CFG_CHOICES = {
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
@@ -56,6 +57,17 @@ QUANT_CFG_CHOICES = {
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
     "nvfp4": mtq.NVFP4_DEFAULT_CFG,
+}
+for k in mtq.config.choices:
+    QUANT_CFG_CHOICES[k] = getattr(mtq, k)
+
+KV_QUANT_CFG_CHOICES = {
+    "none": "none",
+    "fp8": "FP8_KV_CFG",
+    "fp8_affine": "FP8_AFFINE_KV_CFG",
+    "nvfp4": "NVFP4_KV_CFG",
+    "nvfp4_affine": "NVFP4_AFFINE_KV_CFG",
+    "nvfp4_rotate": "NVFP4_KV_ROTATE_CFG"
 }
 
 if mtq_psx is not None:
@@ -99,6 +111,11 @@ def add_text_generate_ptq_args(parser):
         "--weight-only",
         action="store_true",
         help="Disable input quantization.",
+    )
+    group.add_argument(
+        "--force-all-expert-routing",
+        action="store_true",
+        help="Forcing all experts to be routed during the calibration.",
     )
     group.add_argument(
         "--num-first-layers-to-skip-quant",
@@ -195,8 +212,6 @@ def get_modelopt_torch_quantization_config():
         "axis": None,
         "enable": True,
     }
-    # Disable mamba-mixer quantization for now.
-    mtq_config["quant_cfg"]["*mixer.conv1d.*"] = {"enable": False}
     if args.export_quant_cfg == "fp8":
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
@@ -212,8 +227,16 @@ def get_modelopt_torch_quantization_config():
     # Customization
     if args.disable_qkv_quant:
         mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
-    if args.export_kv_cache_quant and not args.compress:
-        mtq_config["quant_cfg"]["*linear_qkv.output_quantizer"] = fp8_config
+
+    # KV Cache Quantization
+    enable_quant_kv_cache = args.export_kv_cache_quant != "none"
+    if enable_quant_kv_cache and not args.compress:
+        kv_cache_quant_cfg = getattr(mtq, KV_QUANT_CFG_CHOICES[args.export_kv_cache_quant])["quant_cfg"]
+        mtq_config = mtq.utils.update_quant_cfg_with_kv_cache_quant(
+                mtq_config, kv_cache_quant_cfg
+    )
+
+    # Weight Only Quantization
     if args.weight_only:
         mtq_config["quant_cfg"]["*input_quantizer"] = {"enable": False}
     if args.num_first_layers_to_skip_quant is not None:
@@ -295,11 +318,25 @@ if __name__ == "__main__":
     def _hf_dataset_forword_loop_func(model):
         dataloader = get_calib_dataloader(args.calib_size)
 
+        if args.force_all_expert_routing:
+            for name, module in model.named_modules():
+                if isinstance(module, TopKRouter):
+                    module.topk = module.num_experts
+
+
         for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
             generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=1)
 
+            if args.force_all_expert_routing:
+                for name, module in model.named_modules():
+                    if isinstance(module, TopKRouter):
+                        module.topk = module.config.moe_router_topk
+
     unwrapped_model = unwrap_model(model)[0]
+
+    if args.force_all_expert_routing:
+        warnings.warn("--force-all-expert-routing will be deprecated in the next release and is no longer needed.")
 
     if args.export_quant_cfg is not None:
         if args.export_quant_cfg not in QUANT_CFG_CHOICES:
@@ -321,27 +358,7 @@ if __name__ == "__main__":
             mtq.compress(unwrapped_model)
             print_rank_0("Weights are now compressed to low-bit!")
 
-        if torch.distributed.get_rank() == 0:
-            for k, v in unwrapped_model.state_dict().items():
-                if "amax" not in k and "_scale" not in k:
-                    continue
-                if isinstance(v, torch.Tensor):
-                    v_amax = torch.max(torch.abs(v.clone().detach().to(torch.bfloat16)))
-                    print("{:80} {:32} {:32} max {:.4e}".format(k, str(v.dtype), str(v.shape), v_amax))
-                else:
-                    print("{:80}".format(k))
-        if parallel_state.get_expert_data_parallel_rank() == 0:
-            for i in range(parallel_state.get_expert_model_parallel_world_size()):
-                if i == parallel_state.get_expert_model_parallel_rank():
-                    print(f"\nExpert model parallel rank {i}")
-                    print(f"TP rank [{parallel_state.get_tensor_model_parallel_rank()}], DP rank [{parallel_state.get_data_parallel_rank()}]")
-                    print("Quantization summary:")
-                    print("_"*80)
-                    mtq.print_quant_summary(unwrapped_model)
-                torch.distributed.barrier(group=parallel_state.get_expert_model_parallel_group())
-        torch.distributed.barrier()
-
-        print_rank_0(f"Fake Quantized Model:\n {unwrapped_model}")
+        print_distributed_quant_summary(model, "Quantized Model:")
 
     _custom_prompt_forward_loop_func(unwrapped_model)
 

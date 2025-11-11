@@ -130,7 +130,6 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
 
-    mtq.disable_quantizer(unwrapped_model, "*mixer.conv1d.*")
     mtq.fold_weight(unwrapped_model)
 
     for idx, example in enumerate(dataset):

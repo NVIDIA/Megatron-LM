@@ -22,11 +22,6 @@ from megatron.training import get_args, get_model, get_tokenizer, initialize_meg
 from megatron.training.utils import print_rank_0, unwrap_model
 import modelopt.torch.quantization as mtq
 warnings.filterwarnings('ignore')
-warnings.filterwarnings("ignore", module="datasets")
-warnings.filterwarnings("ignore", module="huggingface_hub")
-datasets.utils.logging.set_verbosity_error()
-logging.getLogger("datasets").setLevel(logging.ERROR)
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 def add_mmlu_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
@@ -167,8 +162,7 @@ if __name__ == "__main__":
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
-    mtq.disable_quantizer(unwrapped_model, "*mixer.conv1d.*")
-    mtq.fold_weight(unwrapped_model)
+    mtq.fold_weight(unwrapped_model) # speed up quantization
 
     all_subjects = get_all_subjects()
 
