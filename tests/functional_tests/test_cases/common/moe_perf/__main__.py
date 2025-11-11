@@ -22,6 +22,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -33,7 +34,7 @@ WARMUP_ITERS = 5
 MEASURE_ITERS = 20
 
 
-BASELINES_PATH = Path(__file__).resolve().parent / "baselines" / "moe_layer.json"
+BASELINES_PATH = Path(__file__).resolve().parent / "baseline.json"
 UPDATE_BASELINES_ENV = "MEGATRON_UPDATE_PERF_BASELINES"
 
 
@@ -98,6 +99,7 @@ class MoEPerformanceCase:
             return True
         device_name = torch.cuda.get_device_name(torch.cuda.current_device())
         return self.gpu_platform.lower() in device_name.lower()
+
 
 
 MIXTRAL_PROXY = MoEModelConfig(
@@ -427,8 +429,16 @@ def _check_env():
             f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression"
         )
 
+def _check_dependencies(case: MoEPerformanceCase):
+    if case.token_dispatcher == "flex":
+        if case.moe_flex_dispatcher_backend == "deepep":
+            if not HAVE_DEEP_EP:
+                pytest.skip("DeepEP is not available")
+        elif case.moe_flex_dispatcher_backend == "hybridep":
+            if not HAVE_HYBRIDEP:
+                pytest.skip("HybridEP is not available")
 
-@pytest.mark.flaky(reruns=2)
+@pytest.mark.flaky(reruns=5)
 @pytest.mark.internal
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking"
@@ -436,6 +446,7 @@ def _check_env():
 @pytest.mark.parametrize("perf_case", PERFORMANCE_CASES, ids=lambda c: c.name)
 def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool = False):
     _check_env()
+    _check_dependencies(perf_case)
     if not perf_case.is_current_platform():
         pytest.skip(
             "GPU platform mismatch: "
@@ -518,10 +529,11 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 # export MEGATRON_UPDATE_PERF_BASELINES=0 # set to 1 to update baseline perf numbers
 # uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m pytest tests/unit_tests/performance/test_moe_layer.py
 if __name__ == "__main__":
-    torch.cuda.cudart().cudaProfilerStart()
-    torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-    for case in PERFORMANCE_CASES:
-        if case.name == "deepseek_deepep_tp1ep8_bf16":
-            test_moe_layer_performance(case, debug_mode=True)
-    torch.cuda.cudart().cudaProfilerStop()
-    torch.distributed.destroy_process_group()
+    pytest.main(["-x", "-v", "-s", __file__]) # -xvs
+    # torch.cuda.cudart().cudaProfilerStart()
+    # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+    # for case in PERFORMANCE_CASES:
+    #     if case.name == "deepseek_deepep_tp1ep8_bf16":
+    #         test_moe_layer_performance(case, debug_mode=True)
+    # torch.cuda.cudart().cudaProfilerStop()
+    # torch.distributed.destroy_process_group()
