@@ -686,14 +686,240 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [64]),
-            (1, [64]),
-            (2, [64, 32]),
-            (4, [64, 48, 32, 16]),
-            (8, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (16, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (64, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
+            # num_cuda_graphs, updated_expected_values
+            (0, [1280]),
+            (1, [1280]),
+            (2, [1280, 640]),
+            (4, [1280, 960, 640, 320]),
+            (8, [1280, 1120, 960, 800, 640, 480, 320, 160]),
+            (
+                16,
+                [1280, 1200, 1120, 1040, 960, 880, 800, 720, 640, 560, 480, 400, 320, 240, 160, 80],
+            ),
+            (
+                64,
+                [
+                    1280,
+                    1272,
+                    1248,
+                    1224,
+                    1200,
+                    1176,
+                    1152,
+                    1128,
+                    1104,
+                    1080,
+                    1056,
+                    1032,
+                    1008,
+                    984,
+                    960,
+                    936,
+                    912,
+                    888,
+                    864,
+                    840,
+                    816,
+                    792,
+                    768,
+                    744,
+                    720,
+                    696,
+                    672,
+                    648,
+                    624,
+                    600,
+                    576,
+                    552,
+                    528,
+                    504,
+                    480,
+                    456,
+                    432,
+                    408,
+                    384,
+                    360,
+                    336,
+                    312,
+                    288,
+                    264,
+                    240,
+                    216,
+                    192,
+                    168,
+                    144,
+                    120,
+                    96,
+                    72,
+                    48,
+                    24,
+                ],
+            ),
+            (
+                1024,
+                [
+                    1280,
+                    1272,
+                    1264,
+                    1256,
+                    1248,
+                    1240,
+                    1232,
+                    1224,
+                    1216,
+                    1208,
+                    1200,
+                    1192,
+                    1184,
+                    1176,
+                    1168,
+                    1160,
+                    1152,
+                    1144,
+                    1136,
+                    1128,
+                    1120,
+                    1112,
+                    1104,
+                    1096,
+                    1088,
+                    1080,
+                    1072,
+                    1064,
+                    1056,
+                    1048,
+                    1040,
+                    1032,
+                    1024,
+                    1016,
+                    1008,
+                    1000,
+                    992,
+                    984,
+                    976,
+                    968,
+                    960,
+                    952,
+                    944,
+                    936,
+                    928,
+                    920,
+                    912,
+                    904,
+                    896,
+                    888,
+                    880,
+                    872,
+                    864,
+                    856,
+                    848,
+                    840,
+                    832,
+                    824,
+                    816,
+                    808,
+                    800,
+                    792,
+                    784,
+                    776,
+                    768,
+                    760,
+                    752,
+                    744,
+                    736,
+                    728,
+                    720,
+                    712,
+                    704,
+                    696,
+                    688,
+                    680,
+                    672,
+                    664,
+                    656,
+                    648,
+                    640,
+                    632,
+                    624,
+                    616,
+                    608,
+                    600,
+                    592,
+                    584,
+                    576,
+                    568,
+                    560,
+                    552,
+                    544,
+                    536,
+                    528,
+                    520,
+                    512,
+                    504,
+                    496,
+                    488,
+                    480,
+                    472,
+                    464,
+                    456,
+                    448,
+                    440,
+                    432,
+                    424,
+                    416,
+                    408,
+                    400,
+                    392,
+                    384,
+                    376,
+                    368,
+                    360,
+                    352,
+                    344,
+                    336,
+                    328,
+                    320,
+                    312,
+                    304,
+                    296,
+                    288,
+                    280,
+                    272,
+                    264,
+                    256,
+                    248,
+                    240,
+                    232,
+                    224,
+                    216,
+                    208,
+                    200,
+                    192,
+                    184,
+                    176,
+                    168,
+                    160,
+                    152,
+                    144,
+                    136,
+                    128,
+                    120,
+                    112,
+                    104,
+                    96,
+                    88,
+                    80,
+                    72,
+                    64,
+                    56,
+                    48,
+                    40,
+                    32,
+                    24,
+                    16,
+                    8,
+                ],
+            ),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
@@ -708,112 +934,6 @@ class TestDynamicInferenceEngine:
                 expected_cuda_graph_token_counts,
                 actual_cuda_graph_token_counts,
             )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize(
-        "warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]
-    )
-    @pytest.mark.parametrize(
-        "num_warmup_tokens, expected_cuda_graph_token_count",
-        [
-            (1, 8),
-            (2, 8),
-            (4, 8),
-            (8, 8),
-            (10, 16),
-            (12, 16),
-            (16, 16),
-            (20, 24),
-            (24, 24),
-            (28, 32),
-            (32, 32),
-        ],
-    )
-    @torch.inference_mode()
-    def test_cuda_graph_warmup(
-        self,
-        warmup_engine_mode: WarmupEngineMode,
-        num_warmup_tokens: int,
-        expected_cuda_graph_token_count: int,
-    ) -> None:
-        """Test initialization during cuda graph warmup."""
-        if num_warmup_tokens == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
-            pytest.skip("WarmupEngineMode.NON_DECODE with num_warmup_tokens=1 is not supported.")
-
-        # Initialize context.
-        env = self._build_test_env(
-            DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8, num_tokens_to_generate=1)
-        )
-
-        context = env.engine.context
-        assert context.is_decode_only()
-        assert context.cuda_graph_token_counts == [
-            32,
-            24,
-            16,
-            8,
-        ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_token_counts)
-
-        context.initialize_attention_state(
-            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
-        )
-
-        # Validate request & token counts.
-
-        assert (
-            expected_cuda_graph_token_count
-            == context.padded_active_request_count
-            == context.padded_active_token_count
-        ), (
-            "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
-            % (
-                num_warmup_tokens,
-                expected_cuda_graph_token_count,
-                context.padded_active_request_count,
-                context.padded_active_token_count,
-            )
-        )
-
-        # Validate input/position dimensions.
-        input_ids, pos_ids = context.current_input_and_position_ids()
-        assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
-        assert context.using_cuda_graph_this_step, (
-            "expected `using_cuda_graph_this_step` to be True for decode step with "
-            "num_warmup_tokens <= max_requests."
-        )
-        context.reset()
-
-        # Test active request count overflow
-        for num_warmup_tokens in (64, 128, 1024):
-            try:
-                context.initialize_attention_state(
-                    num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
-                )
-            except ActiveRequestCountOverflowError as e:
-                continue
-            raise Exception("`ActiveRequestCountOverflowError should have been raised.")
-
-        context.reset()
-
-        # test the case where the active token count exceeds max requests.
-        # expectation: we should be in non-decode mode and not using cuda graphs
-
-        # add all requests to the context.
-        for request in tqdm(env.requests, "add requests"):
-            env.engine._add_request(request)
-        env.engine.schedule_waiting_requests()
-
-        # we should now have more active tokens than max requests.
-        context.initialize_attention_state()
-        assert not context.is_decode_only()
-        assert not context.using_cuda_graph_this_step(), (
-            "expected `using_cuda_graph_this_step` to be False for non-decode step where "
-            "the active token count exceeds max requests"
-        )
-        context.reset()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1099,8 +1219,8 @@ if __name__ == "__main__":
     test.test_block_overflow()
     test.test_multi_add()
     test.test_fixed_output_lengths()
-    test.test_cuda_graph_request_counts()
-    test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
+    test.test_cuda_graph_token_counts()
+    # test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
     test.test_generate_function()
     asyncio.run(test.test_run_engine())
     test.test_return_log_probs()

@@ -175,6 +175,8 @@ def get_inference_context(
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
+        cuda_graph_max_prefill_requests=args.inference_dynamic_batching_cuda_graph_max_prefill_requests,
         metrics_writer=metrics_writer,
     )
 
@@ -257,7 +259,7 @@ def run_inference(
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
     if args.cuda_graph_impl == "local":
-        cuda_graph_request_count_map = {r:0 for r in engine.context.cuda_graph_request_counts}
+        cuda_graph_request_count_map = {}
     else:
         cuda_graph_request_count_map = None
 
@@ -306,7 +308,7 @@ def run_inference(
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
         if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
-            cuda_graph_request_count_map[cuda_graph_request_count] += 1
+            cuda_graph_request_count_map[cuda_graph_request_count] = cuda_graph_request_count_map.get(cuda_graph_request_count, 0) + 1
 
         # Update requests.
         active_requests = result["active_requests"]

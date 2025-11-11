@@ -41,6 +41,8 @@ try:
 except ImportError:
     HAVE_TE = False
 
+from megatron.core.inference.utils import CUDAGraphConfig
+
 
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
@@ -469,19 +471,12 @@ class TextGenerationController:
         """
         return padded_batch_prompt_tokens[:original_batch_size]
 
-    def _dynamic_step_context_init(
-        self,
-        num_warmup_tokens: Optional[int] = None,
-        warmup_engine_mode: Optional[WarmupEngineMode] = None,
-    ):
+    def _dynamic_step_context_init(self, construct_graph_config: Optional[CUDAGraphConfig] = None):
         """Initializes the inference context for dynamic batching.
 
         Args:
-            num_warmup_tokens (Optional[int]): Number of tokens to use for
-                warming up cuda graphs. Must be less than or equal to
-                `max_requests`.
-            warmup_engine_mode (WarmupEngineMode): Denote whether to setup
-                for a decode or a non-decode cuda-graph warmup.
+            construct_graph_config (Optional[CUDAGraphConfig]): The graph config to use
+                for constructing the cuda graphs.
 
         Return:
             input_ids (Tensor): The active input IDs.
@@ -495,9 +490,7 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
-            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
-        )
+        context.initialize_attention_state(construct_graph_config=construct_graph_config)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -524,7 +517,12 @@ class TextGenerationController:
                 unwrapped_model.set_symmetric_ar(None)
 
         # Get flat tokens, position ids.
-        return context.current_input_and_position_ids(num_warmup_tokens=num_warmup_tokens)
+        if construct_graph_config is not None:
+            return context.current_input_and_position_ids(
+                num_warmup_tokens=construct_graph_config.token_count
+            )
+        else:
+            return context.current_input_and_position_ids()
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
         """Forward step the model to get logits for dynamic batching.

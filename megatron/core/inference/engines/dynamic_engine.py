@@ -21,7 +21,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
-    WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -216,57 +215,33 @@ class DynamicInferenceEngine(AbstractEngine):
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
-        logging.info(
-            "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
-            len(context.cuda_graph_token_counts),
-            context.cuda_graph_token_counts,
-        )
-        for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
-            # Check whether to skip non-decode graphs.
-            if (
-                warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                and not context.non_decode_cuda_graphs
-            ):
-                continue
+        logging.info("> dynamic_engine.py: building cuda graphs for ")
+        for graph in context.cudagraph_config_list:
+            logging.info(graph)
 
-            tbar = enumerate(context.cuda_graph_token_counts)
+        tbar = enumerate(context.cudagraph_config_list)
+        if HAVE_TQDM:
+            tbar = tqdm(tbar, total=len(context.cudagraph_config_list))
+        for tbar_idx, cudagraph_config in tbar:
+            input_ids, position_ids = self.controller._dynamic_step_context_init(
+                construct_graph_config=cudagraph_config
+            )
+            # Progress.
+            tbar_str = f"cuda graph warmup - {cudagraph_config}"
             if HAVE_TQDM:
-                tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+                tbar.set_description(tbar_str)
+            else:
+                logging.info(f"{tbar_idx}/{len(context.cudagraph_config_list)}. {tbar_str}")
 
-            # Iterate cuda graph dims.
-            for tbar_idx, cuda_graph_token_count in tbar:
-                if (
-                    cuda_graph_token_count == 1
-                    and warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                ):
-                    # This case is not supported`` as we require atleast two
-                    # tokens for a non-decode engine step.
-                    continue
+            # Get flat tokens, position ids.
+            input_ids, position_ids = context.current_input_and_position_ids(
+                num_warmup_tokens=cudagraph_config.token_count
+            )
 
-                # Initialize context.
-                input_ids, position_ids = self.controller._dynamic_step_context_init(
-                    num_warmup_tokens=cuda_graph_token_count, warmup_engine_mode=warmup_engine_mode
-                )
+            # Forward pass -> logits.
+            controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                # Initialize attention state.
-                assert (
-                    cuda_graph_token_count == context.padded_active_token_count
-                ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
-
-                # Progress.
-                mode_str = warmup_engine_mode.name.lower()
-                tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
-                if HAVE_TQDM:
-                    tbar.set_description(tbar_str)
-                else:
-                    logging.info(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
-
-                # Forward pass -> logits.
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
-
-                if reset_context:
-                    with torch.inference_mode():
-                        context.reset()  # todo: @lmcafee, remove if unnecessary.
+            context.reset()
 
         # Memory usage.
         time_end = time.time()
@@ -872,14 +847,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
-                        " [%s + cuda graph %s]"
+                        " [%s + real config %s + cuda graph %s]"
                         % (
                             step_type,
+                            context.real_config,
                             (
-                                "DIM %d:%d"
-                                % (context.padded_active_token_count, prev_active_token_count)
-                                if self.context.using_cuda_graph_this_step()
-                                else "OFF"
+                                "OFF"
+                                if not context.using_cuda_graph_this_step()
+                                else context.padded_config
                             ),
                         )
                     ),
