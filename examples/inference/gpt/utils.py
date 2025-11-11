@@ -6,7 +6,7 @@ import itertools
 import random
 import time
 import torch
-from argparse import ArgumentParser, Namespace
+from argparse import Action, ArgumentError, ArgumentParser, Namespace
 from tqdm import tqdm
 from typing import Any, List, Optional
 
@@ -17,7 +17,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.inference.sampling_params import SamplingParams
 
 
-class SplitArgs(argparse.Action):
+class SplitArgs(Action):
     def __call__(self, parser, namespace, values, option_string=None):
         parts = []
         for v in values:
@@ -25,7 +25,7 @@ class SplitArgs(argparse.Action):
         try:
             nums = [int(p) for p in parts]
         except ValueError:
-            raise argparse.ArgumentError(self, f"Could not parse {parts} as integers")
+            raise ArgumentError(self, f"Could not parse {parts} as integers")
         setattr(namespace, self.dest, nums)
 
 
