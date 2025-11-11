@@ -129,27 +129,44 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        self.request_counter = Counter()
-        self.controller = controller
-        self.context = context
+        # Initialization options.
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
-        self.step_count = 0
-        self.finished_request_count = 0
-        self.waiting_request_ids = deque()
-        self.failed_request_ids = []  # deque()
-        self.request_counter = Counter()
-        self.requests: Dict[int, DynamicInferenceRequest] = {}
-        self.request_completion_futures: Dict[int, asyncio.Future] = {}
-        self.step_start_event = torch.cuda.Event(enable_timing=True)
-        self.step_end_event = torch.cuda.Event(enable_timing=True)
-        self.use_coordinator = False
-        self.paused = False
-        self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.static_sampling = static_sampling
-
         self.inference_logging_step_interval = inference_logging_step_interval
+
+        if enable_cuda_graph is not None:
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
+        else:
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+
+        # Objects which sit on a lower level of the abstraction stack.
+        self.controller = controller
+        self.context = context
+
+        # Runtime state.
+        self.paused = False
+        self.stopped = False
+        self.use_coordinator = False
+        self._loop = get_asyncio_loop()
+        self._cond = asyncio.Condition()
+
+        # Request state tracking.
+        self.request_counter = Counter()
+        self.step_count = 0
+        self.finished_request_count = 0
+
+        self.requests: Dict[int, DynamicInferenceRequest] = {}
+        self.waiting_request_ids = deque()
+        self.failed_request_ids = []  # deque()
+        self.request_completion_futures: Dict[int, asyncio.Future] = {}
+
+        # Timing and logging variables.
+        self.step_start_event = torch.cuda.Event(enable_timing=True)
+        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.capture_stats = None
+
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
             logging.info(
@@ -175,21 +192,11 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Initialize the asyncio loop if it has not already been initialized.
-        # TODO: Start the engine loop here.
-        self._loop = get_asyncio_loop()
-        self._cond = asyncio.Condition()
-
         # Capture cuda graph.
-        self.capture_stats = None
-
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
-
         if self.cuda_graph_impl == "local":
             self.create_cuda_graphs()
+
+        # TODO: Start the engine loop here.
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -471,6 +478,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
+        else:
+            self.failed_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = self._loop.create_future()
