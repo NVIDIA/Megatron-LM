@@ -52,7 +52,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     )
     group.add_argument(
         "--num-tokens-to-prompt",
-        type=int,
         nargs="+",
         action=SplitArgs,
         default=[64, 1024],
@@ -62,7 +61,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     )
     group.add_argument(
         "--num-tokens-to-generate-random",
-        type=int,
         nargs="+",
         action=SplitArgs,
         default=None,
