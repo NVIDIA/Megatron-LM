@@ -38,6 +38,7 @@ MODEL_ARGS:
   --seq-length: 1024
   --top_p: 1
   --top_k: 1
+  --seed: 42
   --return-log-probs: true
   --num-tokens-to-prompt: 32 512
   --num-tokens-to-generate-random: 32 512

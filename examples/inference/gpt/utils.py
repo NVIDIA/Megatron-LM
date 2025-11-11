@@ -17,6 +17,17 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.inference.sampling_params import SamplingParams
 
 
+class SplitArgs(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        parts = []
+        for v in values:
+            parts.extend(v.split(" "))
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            raise argparse.ArgumentError(self, f"Could not parse {parts} as integers")
+        setattr(namespace, self.dest, nums)
+
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Common inference arguments."""
@@ -43,9 +54,20 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--num-tokens-to-prompt",
         type=int,
         nargs="+",
+        action=SplitArgs,
         default=[64, 1024],
         help='Number of tokens to use for simulated prompts. This should be a '
         'space-separated pair of integers, and the generated prompt lengths will '
+        'be uniformly sampled within this range.',
+    )
+    group.add_argument(
+        "--num-tokens-to-generate-random",
+        type=int,
+        nargs="+",
+        action=SplitArgs,
+        default=None,
+        help='Number of tokens to generate for each prompt. This can be a '
+        'space-separated pair of integers, and the generated output lengths will '
         'be uniformly sampled within this range.',
     )
     group.add_argument(
@@ -53,15 +75,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=30,
         help='Number of tokens to generate for each prompt',
-    )
-    group.add_argument(
-        "--num-tokens-to-generate-random",
-        type=int,
-        nargs="+",
-        default=None,
-        help='Number of tokens to generate for each prompt. This can be a '
-        'space-separated pair of integers, and the generated output lengths will '
-        'be uniformly sampled within this range.',
     )
     group.add_argument(
         "--top-n-logprobs",
