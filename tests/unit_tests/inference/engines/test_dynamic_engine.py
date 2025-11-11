@@ -102,7 +102,7 @@ class DynamicEngineTestConfig:
     model_provider: str = "gpt"
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
-    skip_prompt_log_probs_for_dynamic_inference: bool = False
+    skip_prompt_log_probs: bool = False
     cuda_graph_scope: str = "full_iteration"
     force_build_cuda_graphs: bool = False
     # If False, do not build cuda graphs in the tests, even if
@@ -183,17 +183,13 @@ class TestDynamicInferenceEngine:
                     -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
                 ),
                 return_log_probs=test_config.return_log_probs,
+                skip_prompt_log_probs=test_config.skip_prompt_log_probs,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
                 sampling_params.add_attributes({"num_tokens_total": num_tokens_total})
             else:
                 sampling_params.num_tokens_total = num_tokens_total
-
-            config_entry = test_config.skip_prompt_log_probs_for_dynamic_inference
-            sampling_params.add_attributes(
-                {"skip_prompt_log_probs_for_dynamic_inference": config_entry}
-            )
 
             # Request.
             prompt_tokens = torch.randint(
@@ -939,7 +935,7 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             return_log_probs=True,
             materialize_only_last_token_logits=True,
-            skip_prompt_log_probs_for_dynamic_inference=True,
+            skip_prompt_log_probs=True,
         )
 
     @pytest.mark.internal
