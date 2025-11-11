@@ -242,6 +242,7 @@ class MultiLatentAttention(Attention):
                 inference_context=inference_context,
             )
         else:
+            # TODO(kunlunl): Is this a universal usage of sparse attention?
             query, key, value, q_compressed, _ = self.get_query_key_value_and_compressed_tensors(
                 hidden_states,
                 key_value_states,
@@ -287,6 +288,7 @@ class MultiLatentAttention(Attention):
                     )
                 else:
                     # For sparse attention, use a specialized forward.
+                    # TODO(kunlunl): Is there a unified interface for sparse attention?
                     core_attn_out = self.core_attention(
                         query,
                         key,
@@ -828,8 +830,11 @@ class MLASelfAttention(MultiLatentAttention):
         return query, key, value, q_compressed, kv_compressed
 
     def get_query_key_value_tensors(self, *args, **kwargs):
+        query, key, value, q_compressed, kv_compressed = (
+            self.get_query_key_value_and_compressed_tensors(self, *args, **kwargs)
+        )
         # Only return query, key and value.
-        return get_query_key_value_and_compressed_tensors(self, *args, **kwargs)[:3]
+        return query, key, value
 
     def uncompress_kv_from_cache(self, kv_cached):
         """

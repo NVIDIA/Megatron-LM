@@ -20,15 +20,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_apply_mla_rope_for_kv,
-        fused_apply_mla_rope_for_q,
-    )
-except:
-    fused_apply_mla_rope_for_kv = None
-    fused_apply_mla_rope_for_q = None
-
 # TODO(kunlunl): Add third-party fused kernels.
 try:
     from fast_hadamard_transform import hadamard_transform
