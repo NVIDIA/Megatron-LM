@@ -400,7 +400,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # 3. Create another publisher socket to broadcast the number of messages to receive.
             self.model_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.PUB)
-            self.model_parallel_num_msgs_publisher_socket.bind(f"tcp://*:{req_port}")
+            self.model_parallel_num_msgs_publisher_socket.bind(f"tcp://*:{len_port}")
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
                 self.model_parallel_num_msgs_publisher_socket,
@@ -412,7 +412,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_num_msgs_subscriber_socket.connect(f"tcp://{bcast_hostname}:{req_port}")
+        self.model_parallel_num_msgs_subscriber_socket.connect(f"tcp://{bcast_hostname}:{len_port}")
         self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.zmq_sockets += [
@@ -420,7 +420,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.model_parallel_num_msgs_subscriber_socket,
         ]
 
-        torch.distributed.barrier(parallel_state.get_model_model_parallel_group())
+        torch.distributed.barrier(parallel_state.get_model_parallel_group())
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
             coordinator_ready_event.wait()
