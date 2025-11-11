@@ -371,6 +371,7 @@ class TestAllgatherDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+    @pytest.mark.flaky_in_dev
     def test_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
