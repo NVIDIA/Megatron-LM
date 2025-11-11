@@ -220,6 +220,8 @@ class CUDAGraphConfig:
         Returns the total number of requests.
         """
         return self.prefill_req_count + self.decode_req_count
+
+
 async def await_process_event(
     event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
 ) -> None:
