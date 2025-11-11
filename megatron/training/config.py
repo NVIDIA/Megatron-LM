@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import signal
 from typing import Optional, Literal
 
@@ -18,7 +18,7 @@ class TrainingConfig:
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: Optional[list[int]] = None
+    rampup_batch_size: Optional[list[int]] = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
     """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
     <ramp-up samples>
     For example:
