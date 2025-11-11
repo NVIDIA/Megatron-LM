@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -116,7 +116,7 @@ class GPTModel(LanguageModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.vp_stage = vp_stage
+        self.vp_stage: Optional[int] = vp_stage
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -196,7 +196,7 @@ class GPTModel(LanguageModule):
             ), "mrope require mrope_section setting, but we got None from TransformerConfig"
 
         # Cache for RoPE tensors which do not change between iterations.
-        self.rotary_pos_emb_cache = {}
+        self.rotary_pos_emb_cache: Dict[int, Tuple[Tensor, Tensor]] = {}
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -216,6 +216,8 @@ class GPTModel(LanguageModule):
         # Output
         if self.post_process:
 
+            self.embedding_activation_buffer: Optional[List[Tensor]] = None
+            self.grad_output_buffer: Optional[List[Tensor]] = None
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
@@ -393,7 +395,7 @@ class GPTModel(LanguageModule):
         if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
 
-        preproc_output = (
+        preproc_output: Tuple[Any, ...] = (
             decoder_input,
             rotary_pos_emb,
             rotary_pos_cos,
@@ -419,7 +421,7 @@ class GPTModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
+        extra_block_kwargs: Optional[Dict[str, Any]] = None,
         runtime_gather_output: Optional[bool] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
@@ -687,7 +689,7 @@ class GPTModel(LanguageModule):
         labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
+        extra_block_kwargs: Optional[Dict[str, Any]] = None,
         runtime_gather_output: Optional[bool] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
