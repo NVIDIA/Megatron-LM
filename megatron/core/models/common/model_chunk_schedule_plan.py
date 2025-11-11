@@ -412,7 +412,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the model chunk state."""
         return self._model_chunk_state
 
-    # def release_state(self):
     def __del__(self):
         """Release reference, this helps avoid memory leak."""
         self._model_chunk_state.model = None
