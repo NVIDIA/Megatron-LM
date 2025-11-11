@@ -479,6 +479,7 @@ class GroupedMLP(MegatronModule):
                         ),
                         dim=-2,
                     )
+                else:
                     assert isinstance(sub_state_dict['data'], list)
                     sub_state_dict = torch.stack(sub_state_dict['data'])
             else:
