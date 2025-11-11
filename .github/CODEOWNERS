@@ -5,6 +5,7 @@ megatron/core/models/gpt/ @NVIDIA/gpt
 megatron/core/models/multimodal/ @NVIDIA/multi-modal
 
 megatron/core/models/mamba/ @NVIDIA/hybrid-mamba
+megatron/core/ssm/ @NVIDIA/hybrid-mamba
 
 megatron/core/datasets/ @NVIDIA/datasets
 
