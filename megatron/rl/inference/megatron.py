@@ -183,7 +183,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             top_p=request.generation_args.top_p or 0.0,
             termination_id=self._coordinator.engine.controller.tokenizer.eod,
             return_log_probs=True,
-            skip_prompt_log_probs_for_dynamic_inference=True,
+            skip_prompt_log_probs=True,
             add_BOS=tokenizer.bos is not None,
         )
         request_ids = [
