@@ -9,7 +9,6 @@ import builtins
 import ast
 from dataclasses import Field, fields
 
-# TODO: support include/exclude keys
 # TODO: support arg renames, bool name invert
 # TODO: if metadata handles types, ignore exceptions from _extract_type()
 
@@ -20,12 +19,20 @@ class ArgumentGroupFactory:
         that require some customized or additional handling.
 
     Args:
-        src_cfg_class: The target dataclass to build arguments from.
+        src_cfg_class: The source dataclass type (not instance) whose fields will be 
+            converted into command-line arguments. Each field's type annotation determines 
+            the argument type, default values become argument defaults, and field-level 
+            docstrings are extracted to populate argument help text.
+        exclude: Optional list of attribute names from `src_cfg_class` to exclude from 
+            argument generation. Useful for omitting internal fields, computed properties,
+            or attributes that should be configured through other means. If None, all 
+            dataclass fields will be converted to command-line arguments. Default: None.
     """
 
-    def __init__(self, src_cfg_class: type) -> None:
+    def __init__(self, src_cfg_class: type, exclude: Optional[list[str]] = None) -> None:
         self.src_cfg_class = src_cfg_class
         self.field_docstrings = self._get_field_docstrings(src_cfg_class)
+        self.exclude = set(exclude) if exclude is not None else set()
 
     def _format_arg_name(self, config_attr_name: str) -> str:
         """Convert dataclass name into appropriate argparse flag name.
@@ -107,6 +114,9 @@ class ArgumentGroupFactory:
         """
         arg_group = parser.add_argument_group(title=title, description=self.src_cfg_class.__doc__)
         for attr in fields(self.src_cfg_class):
+            if attr.name in self.exclude:
+                continue
+
             add_arg_kwargs = self._build_argparse_kwargs_from_field(attr)
 
             arg_name = add_arg_kwargs.pop("arg_name")
