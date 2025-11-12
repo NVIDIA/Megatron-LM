@@ -1275,7 +1275,6 @@ class SelfAttention(Attention):
             # Handle different weight access patterns (main_param vs direct access)
             if hasattr(self.linear_qkv.weight, 'main_param'):
                 weight = self.linear_qkv.weight.main_param.data
-                weight_shape = weight.shape
             else:
                 weight = self.linear_qkv.weight.data
 
