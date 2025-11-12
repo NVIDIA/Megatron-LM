@@ -9,7 +9,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, save
-from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
@@ -32,6 +32,24 @@ from tests.unit_tests.dist_checkpointing import (
     setup_moe_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def check_equal(input_1, input_2):
+    """Check if two inputs are equal, used for checking checkpointing."""
+    if isinstance(input_1, dict) and isinstance(input_2, dict):
+        assert input_1.keys() == input_2.keys()
+        for key in input_1.keys():
+            check_equal(input_1[key], input_2[key])
+    elif isinstance(input_1, list) and isinstance(input_2, list):
+        assert len(input_1) == len(input_2)
+        for i in range(len(input_1)):
+            check_equal(input_1[i], input_2[i])
+    elif isinstance(input_1, torch.Tensor) and isinstance(input_2, torch.Tensor):
+        assert torch.all(input_1 == input_2), f"Input 1: {input_1} != Input 2: {input_2}"
+    elif type(input_1) != type(input_2):
+        assert False, f"Input 1 type: {type(input_1)} != Input 2 type: {type(input_2)}"
+    else:
+        assert input_1 == input_2, f"Input 1: {input_1} != Input 2: {input_2}"
 
 
 def initialize_real_model(
@@ -222,8 +240,7 @@ class TestLayerWiseOptimizer:
                 plain_sd_A = load_plain_tensors(ckpt_dir_A)
                 plain_sd_B = load_plain_tensors(ckpt_dir_B)
 
-                diffs = diff(plain_sd_A, plain_sd_B)
-                assert not any(map(bool, diffs)), f"Checkpoints differ: {diffs}"
+                check_equal(plain_sd_A, plain_sd_B)
 
     @pytest.mark.parametrize('tp_pp', [(2, 2), (4, 1)])
     def test_layer_wise_optimizer_grad_norm(self, tp_pp):
@@ -320,18 +337,8 @@ class TestLayerWiseOptimizer:
             model_sharded_sd = model_B[0].sharded_state_dict()
             load_sharded_sd = optimizer_B.sharded_state_dict(model_sharded_sd, is_loading=True)
 
-            # Load should work for same TP/PP or handle differences gracefully
-            if src_tp_pp == dest_tp_pp:
-                state_dict = load(load_sharded_sd, ckpt_dir)
-                optimizer_B.load_state_dict(state_dict)
-            else:
-                # For different TP/PP, load may succeed or fail depending on compatibility
-                try:
-                    state_dict = load(load_sharded_sd, ckpt_dir)
-                    optimizer_B.load_state_dict(state_dict)
-                except Exception:
-                    # Different TP/PP may not be compatible
-                    pass
+            state_dict = load(load_sharded_sd, ckpt_dir)
+            optimizer_B.load_state_dict(state_dict)
 
     @pytest.mark.parametrize('tp_pp_ep', [(2, 2, 2), (4, 1, 2)])
     def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp_pp_ep):
@@ -559,8 +566,7 @@ class TestLayerWiseOptimizer:
                 optim_param_state_B = optimizer_B.state_dict()
 
                 # Test both param state dicts are equal
-                diffs = diff(optim_param_state_A, optim_param_state_B)
-                assert not any(map(bool, diffs)), (rank, diffs)
+                check_equal(optim_param_state_A, optim_param_state_B)
 
         Utils.destroy_model_parallel()
 
@@ -617,5 +623,5 @@ class TestLayerWiseOptimizer:
                 ) or "(TP, PP, encoder TP, encoder PP) mismatch" in str(exc_info.value)
 
                 # Check that the state didn't change
-                assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
-                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+                check_equal(model[0].state_dict(), model_unloaded_state_dict)
+                check_equal(optimizer.state_dict(), optim_unloaded_state_dict)
