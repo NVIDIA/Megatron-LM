@@ -74,7 +74,8 @@ mamba_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            module=TransformerLayer,  # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
