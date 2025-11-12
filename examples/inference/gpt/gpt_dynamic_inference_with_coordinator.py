@@ -27,6 +27,10 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 # pylint: disable=line-too-long
 
 
+import logging
+
+logging.basicConfig(level=logging.INFO, force=True)
+
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
