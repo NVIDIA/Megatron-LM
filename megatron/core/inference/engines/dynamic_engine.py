@@ -204,13 +204,17 @@ class DynamicInferenceEngine(AbstractEngine):
         config = controller.inference_wrapped_model.inference_wrapper_config
         moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
 
-        if moe_pad_experts and context.non_decode_cuda_graphs:
-            context.non_decode_cuda_graphs = False
-            if torch.distributed.get_rank() == 0:
+        if moe_pad_experts:
+            filtered_cudagraph_config_list = []
+            for config in context.cudagraph_config_list:
+                if config.prefill_req_count == 0:
+                    filtered_cudagraph_config_list.append(config)
+            if len(filtered_cudagraph_config_list) != len(context.cudagraph_config_list):
                 warnings.warn(
                     "MoE models do not support non-decode cuda graphs. "
                     "Forcing non_decode_cuda_graphs to False."
                 )
+            context.cudagraph_config_list = filtered_cudagraph_config_list
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()

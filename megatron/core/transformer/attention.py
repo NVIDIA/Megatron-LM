@@ -524,6 +524,7 @@ class Attention(MegatronModule, ABC):
         Return:
             (Tensor) Attention output.
         """
+
         assert not self.training
         assert block_table is not None
 

@@ -364,7 +364,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_size_bytes_rem = buffer_size_bytes % self.block_size_bytes
         buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
 
-        block_count_total = buffer_size_bytes // self.block_size_bytes
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
             mamba_states_memory_per_request += math.prod(mamba_conv_states_shape)
@@ -396,7 +395,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         if max_requests_override is not None:
-
             self.max_requests = (
                 max_requests_override
                 if max_requests_override < self.REQUEST_ROUNDER
@@ -609,6 +607,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
+    CUDA_GRAPH_ROUNDER = 8
 
     def populate_cudagraph_config_list(
         self,
@@ -657,10 +656,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
 
             # Cuda graph step size.
-            cuda_graph_rounder = 8
             self.cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-            self.cuda_graph_step_size = cuda_graph_rounder * int(
-                math.ceil(int(self.cuda_graph_step_size) / cuda_graph_rounder)
+            self.cuda_graph_step_size = self.CUDA_GRAPH_ROUNDER * int(
+                math.ceil(int(self.cuda_graph_step_size) / self.CUDA_GRAPH_ROUNDER)
             )
             # Make sure divisble by TP size
             self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size
@@ -687,15 +685,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             or not use_cuda_graphs_for_non_decode_steps
         ):  # decode only
             for size in self.cuda_graph_token_counts:
-                self.cudagraph_config_list.append(CUDAGraphConfig(size, 0, size))
+                self.cudagraph_config_list.append(
+                    CUDAGraphConfig(min(size, self.max_requests), 0, min(size, self.max_requests))
+                )
         else:
             for size in self.cuda_graph_token_counts:
-                self.cudagraph_config_list.append(CUDAGraphConfig(size, 0, size))
+                self.cudagraph_config_list.append(
+                    CUDAGraphConfig(min(size, self.max_requests), 0, min(size, self.max_requests))
+                )
                 self.cudagraph_config_list.append(
                     CUDAGraphConfig(
-                        size,
-                        cuda_graph_max_prefill_requests,
-                        size - cuda_graph_max_prefill_requests,
+                        min(size, self.max_requests),
+                        min(cuda_graph_max_prefill_requests, self.max_requests),
+                        min(size, self.max_requests)
+                        - min(cuda_graph_max_prefill_requests, self.max_requests),
                     )
                 )
                 # We need to ensure the prefill requests are shorter than the max sequence length, considering the one decode token is used for prefill request construction
@@ -728,9 +731,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 continue
             filtered_cudagraph_config_list.append(config)
 
+        # remove duplicates
+        filtered_cudagraph_config_list = list(set(filtered_cudagraph_config_list))
+        # Sort by prefill token count for printing
         filtered_cudagraph_config_list.sort(
             key=lambda x: (x.token_count - x.decode_req_count), reverse=True
         )
+
         self.cudagraph_config_list = filtered_cudagraph_config_list
 
     @classmethod

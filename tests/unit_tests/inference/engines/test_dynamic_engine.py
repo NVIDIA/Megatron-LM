@@ -1220,7 +1220,6 @@ if __name__ == "__main__":
     test.test_multi_add()
     test.test_fixed_output_lengths()
     test.test_cuda_graph_token_counts()
-    # test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
     test.test_generate_function()
     asyncio.run(test.test_run_engine())
     test.test_return_log_probs()
