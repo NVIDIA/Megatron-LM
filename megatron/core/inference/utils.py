@@ -192,6 +192,8 @@ if sys.version_info < (3, 13):
 
         def put_nowait(self, item):
             """Put an item into the queue without blocking, validating None."""
+            if self._is_shutdown:
+                raise asyncio_QueueShutDown
             if item is None:
                 raise ValueError("None is reserved for shutdown purposes for Python < 3.13")
             super().put_nowait(item)
