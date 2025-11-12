@@ -3078,7 +3078,7 @@ def _add_moe_args(parser):
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
     group.add_argument('--expert-tensor-parallel-size', type=int, default=None,
-                       help='Degree of expert model parallelism. Default is None, which will be set to the value of --tensor-model-paralle-size.')
+                       help='Degree of expert tensor parallelism. Default is None, which will be set to the value of --tensor-model-parallel-size.')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,
