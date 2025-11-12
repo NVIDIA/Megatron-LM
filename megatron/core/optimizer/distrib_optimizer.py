@@ -49,6 +49,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from ..utils import unwrap_model
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -1153,7 +1154,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         "Ensure that each model chunk has unique parameter names."
                     )
                 name_to_param.update(_name_to_param)
-            name_to_param = handle_experts_in_state_dict(name_to_param)
+            unwrapped_model = unwrap_model(self.model_chunks[0])
+            num_experts = unwrapped_model.config.num_moe_experts
+            name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
             param in self.param_to_name
