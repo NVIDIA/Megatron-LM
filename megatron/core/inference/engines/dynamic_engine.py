@@ -125,25 +125,50 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        self.request_counter = Counter()
-        self.controller = controller
-        self.context = context
+        # Initialization options.
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
-        self.step_count = 0
-        self.finished_request_count = 0
-        self.waiting_request_ids = deque()
-        self.failed_request_ids = []  # deque()
-        self.request_counter = Counter()
-        self.requests: Dict[int, DynamicInferenceRequest] = {}
-        self.request_completion_futures: Dict[int, asyncio.Future] = {}
-        self.step_start_event = torch.cuda.Event(enable_timing=True)
-        self.step_end_event = torch.cuda.Event(enable_timing=True)
-        self.paused = False
-        self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
 
         self.inference_logging_step_interval = inference_logging_step_interval
+
+        if enable_cuda_graph is not None:
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
+        else:
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+
+        # Objects which sit on a lower level of the abstraction stack.
+        self.controller = controller
+        self.context = context
+
+        # Runtime state.
+        self.paused = False
+        self.stopped = False
+        self.use_coordinator = False
+        self._loop = get_asyncio_loop()
+        self._cond = asyncio.Condition()
+        self._step_queue: Optional[asyncio.Queue] = None
+        self._step_event: Optional[asyncio.Event] = None
+        self._forward_task: Optional[asyncio.Task] = None
+        self._bookkeep_task: Optional[asyncio.Task] = None
+        self._schedule_requests_task: Optional[asyncio.Task] = None
+        self.engine_loop_tasks: List[asyncio.Task] = []
+
+        # Request state tracking.
+        self.request_counter = Counter()
+        self.step_count = 0
+        self.finished_request_count = 0
+
+        self.requests: Dict[int, DynamicInferenceRequest] = {}
+        self.waiting_request_ids = deque()
+        self.failed_request_ids = []  # deque()
+        self.request_completion_futures: Dict[int, asyncio.Future] = {}
+
+        # Timing and logging variables.
+        self.step_start_event = torch.cuda.Event(enable_timing=True)
+        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.capture_stats = None
+
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
             logging.info(
@@ -169,21 +194,11 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Initialize the asyncio loop if it has not already been initialized.
-        # TODO: Start the engine loop here.
-        self._loop = get_asyncio_loop()
-        self._cond = asyncio.Condition()
-
         # Capture cuda graph.
-        self.capture_stats = None
-
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
-
         if self.cuda_graph_impl == "local":
             self.create_cuda_graphs()
+
+        # TODO: Start the engine loop here.
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -411,7 +426,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+        await self.run_engine(use_coordinator=True, loop=loop)
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -476,6 +491,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
+        else:
+            self.failed_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = self._loop.create_future()
@@ -497,7 +514,6 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
-
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -722,54 +738,41 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
-    async def async_step(
-        self, *, verbose: Optional[bool] = False
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
-        """
-        Wrapper for controller.generate_output_tokens_dynamic_batch(), to
-        match vLLM API. Uses `asyncio` for continuous generation which allows this
-        method to sleep and wake up when new requests are available.
+    async def async_bookkeep(
+        self,
+        step_result: Optional[Dict],
+        step_state: Tuple[bool, int, int, int],
+        step_time: float,
+        step_count: int,
+        *,
+        verbose: bool = False,
+    ):
+        """Uses `asyncio` for continuous bookkeeping.
 
         Args:
-            sampling_params (SamplingParams): The sampling parameters.
+            step_result (Optional[Dict]): The result of the step.
+            step_state (Tuple): is_decode_only, total/paused request count, active token count.
+            step_time (float): How long this step took.
+            step_count (int): The count of the step.
             verbose (bool): Whether to run in verbose mode.
 
         Returns:
-            A tuple comprised of:
-                1. Requests that ran in the last step and are still active.
-                2. Requests that ran in the last step and have now finished.
-                3. The step time in seconds.
+            A dictionary containing:
+                active_requests (List): Requests that ran in the last step and are still active.
+                finished_requests (List): Requests that ran in the last step and have now finished.
+                step_time (float): The step time in seconds.
+                cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        # schedule requests
-        self.schedule_waiting_requests()
-
-        # Previous context state, for printing output below.
-        prev_is_decode_only = self.context.is_decode_only()
-        prev_total_request_count = self.context.total_request_count
-        prev_paused_request_count = self.context.paused_request_count
-        prev_active_token_count = self.context.active_token_count
-
-        range_push("Prefill" if not prev_is_decode_only else "Decode")
-
-        # Generate tokens.
-        is_decode_only = self.context.is_decode_only()
-        # save the is_decode_only AFTER scheduling, BEFORE update
-        self.is_decode_only = is_decode_only
-        self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        self.step_end_event.record()
-        self.step_end_event.synchronize()
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-
+        is_decode_only, total_request_count, paused_request_count, active_token_count = step_state
         # Increment finished_request_count.
         cuda_graph_request_count = None
-        if result is not None:
-            active_request_ids = result["active_request_ids"]
-            newly_paused_request_ids = result["newly_paused_request_ids"]
-            finished_request_ids = result["finished_request_ids"]
-            sample = result["sample"]
-            log_probs = result["log_probs"]
-            cuda_graph_request_count = result["cuda_graph_request_count"]
+        if step_result is not None:
+            active_request_ids = step_result["active_request_ids"]
+            newly_paused_request_ids = step_result["newly_paused_request_ids"]
+            finished_request_ids = step_result["finished_request_ids"]
+            sample = step_result["sample"]
+            log_probs = step_result["log_probs"]
+            cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
@@ -797,11 +800,19 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures[failed_request_id].set_result(failed_request)
         self.failed_request_ids.clear()
 
+        # Handle necessary ZMQ DP coordinator communication.
+        if self.use_coordinator and self.is_tp0_and_pp0 and finished_requests:
+            payload = msgpack.packb(
+                [Headers.ENGINE_REPLY.value, [r.serializable() for r in finished_requests]],
+                use_bin_type=True,
+            )
+            self.socket_for_receiving_requests.send(payload)
+
         # Log KV cache utilization stats to W&B
         if (
             self.inference_logging_step_interval > 0
-            and self.step_count > 0
-            and self.step_count % self.inference_logging_step_interval == 0
+            and step_count > 0
+            and step_count % self.inference_logging_step_interval == 0
             and self.context.metrics_writer is not None
         ):
 
@@ -811,7 +822,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.inference_step_offset + int(self.step_count)),
+                'inference/inference_step': int(self.inference_step_offset + int(step_count)),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
@@ -842,7 +853,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
-                    self.step_count,
+                    step_count,
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
@@ -851,29 +862,26 @@ class DynamicInferenceEngine(AbstractEngine):
                             step_type,
                             (
                                 "DIM %d:%d"
-                                % (context.padded_active_token_count, prev_active_token_count)
+                                % (context.padded_active_token_count, active_token_count)
                                 if self.context.using_cuda_graph_this_step()
                                 else "OFF"
                             ),
                         )
                     ),
-                    prev_total_request_count,
+                    total_request_count,
                     context.gtd_request_count,
-                    prev_total_request_count - prev_paused_request_count,
-                    prev_paused_request_count,
+                    total_request_count - paused_request_count,
+                    paused_request_count,
                     self.finished_request_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
-            if prev_is_decode_only:
+            if is_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 
-        self.step_count += 1
-
-        range_pop()
         return {
             "active_requests": active_requests,
             "finished_requests": finished_requests,
@@ -881,14 +889,105 @@ class DynamicInferenceEngine(AbstractEngine):
             "cuda_graph_request_count": cuda_graph_request_count,
         }
 
+    async def async_forward(self) -> Tuple[Dict, Tuple, float]:
+        """Uses `asyncio` for continuous generation.
+        Sleeps when no requests are available, until new requests have been added.
+
+        Returns:
+            A tuple comprised of:
+                step_result (Optional[Dict]): The result of the step.
+                step_state (Tuple): is_decode_only, total/paused request count, active token count.
+                step_time (float): How long this step took.
+        """
+        # schedule requests
+        self.schedule_waiting_requests()
+
+        # Saving pre-step state, for printing output below.
+        is_decode_only = self.context.is_decode_only()
+        step_state = (
+            is_decode_only,
+            self.context.total_request_count,
+            self.context.paused_request_count,
+            self.context.active_token_count,
+        )
+
+        # Generate tokens.
+        range_push("Prefill" if not is_decode_only else "Decode")
+
+        self.step_start_event.record()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
+            step_event=self._step_event,
+        )
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        self.step_count += 1
+
+        range_pop()
+        return result, step_state, step_time, self.step_count
+
+    async def async_step(
+        self, *, verbose: bool = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """
+        Wrapper for controller.generate_output_tokens_dynamic_batch(), to
+        match vLLM API. Uses `asyncio` for continuous generation which allows this
+        method to sleep and wake up when new requests are available.
+
+        Args:
+            verbose (bool): Whether to run in verbose mode.
+
+        Returns:
+            A tuple comprised of:
+                1. Requests that ran in the last step and are still active.
+                2. Requests that ran in the last step and have now finished.
+                3. The step time in seconds.
+        """
+        step_data = await self.async_forward()
+
+        # Keep for compatibility with current test suite.
+        _, step_state, _, _ = step_data
+        self.is_decode_only, _, _, _ = step_state
+
+        ret = await self.async_bookkeep(*step_data, verbose=verbose)
+
+        return ret
+
+    async def run_bookkeep_task(self, *, verbose: Optional[bool] = False):
+        """Runs the bookkeeping task in an infinite loop."""
+        try:
+            while not self.stopped:
+                step_data = await self._step_queue.get()
+                await self._step_event.wait()
+                await self.async_bookkeep(*step_data, verbose=verbose)
+        except asyncio.CancelledError:
+            pass
+
+    async def run_forward_task(self):
+        """Runs the forward task in an infinite loop."""
+        try:
+            while not self.stopped:
+                async with self._cond:
+                    await self._cond.wait_for(
+                        lambda: self.context.get_active_request_count() > 0
+                        or self.waiting_request_ids
+                        or self.paused
+                    )
+                if not self.stopped and not self.paused:
+                    result = await self.async_forward()
+                    await self._step_queue.put(result)
+        except asyncio.CancelledError:
+            if self.use_coordinator:
+                self.stop()
+
     def step_modern(
-        self, *, verbose: Optional[bool] = False
+        self, *, verbose: bool = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         return self._loop.run_until_complete(self.async_step(verbose=verbose))
 
     def step_legacy(
-        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+        self, sampling_params: SamplingParams, *, verbose: bool = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         warnings.warn(
@@ -896,9 +995,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(
-            self.async_step(sampling_params=sampling_params, verbose=verbose)
-        )
+        result = self._loop.run_until_complete(self.async_step(verbose=verbose))
         return (result["active_requests"], result["finished_requests"], result["step_time"])
 
     # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
@@ -924,7 +1021,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_requests_list
 
-    def schedule_requests(self) -> int:
+    async def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
         This method is a collective and synchronous operation that must be called
@@ -1001,7 +1098,22 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.UNPAUSE:
                 self.paused = False
 
+        await self._notify_cond_for_new_request()
+
         return len(all_messages)
+
+    async def run_schedule_requests_task(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Runs schedule_requests in a loop as a background task.
+
+        NOTE: This method will be deprecated as soon as ZMQ is made async.
+        """
+        loop = get_asyncio_loop(loop)
+        try:
+            while not self.stopped:
+                await self.schedule_requests()
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            pass
 
     def stop(self):
         """
@@ -1017,82 +1129,49 @@ class DynamicInferenceEngine(AbstractEngine):
         for socket in self.zmq_sockets:
             socket.close()
         self.zmq_context.term()
-        parallel_state.destroy_model_parallel()
 
     @trace_async_exceptions
     async def run_engine(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+        self,
+        *,
+        use_coordinator=False,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        verbose: bool = False,
     ):
-        """Continually steps the engine asynchronously."""
-        self._loop = get_asyncio_loop(loop)
-        try:
-            while True:
-                # Wait until there are active requests before proceeding.
-                async with self._cond:
-                    await self._cond.wait_for(
-                        lambda: self.context.get_active_request_count() > 0
-                        or self.waiting_request_ids
-                    )
+        """Continually steps the engine asynchronously.
 
-                await self.async_step(verbose=verbose)
-        except asyncio.CancelledError:
-            pass
+        Args:
+            use_coordinator (bool): Whether to use the ZMQ-based DP coordinator.
+            loop (Optional[asyncio.AbstractEventLoop]): The event loop to use.
+            verbose (bool): Whether to run in verbose mode.
+        """
+        self._loop = get_asyncio_loop(loop)
+        self.use_coordinator = use_coordinator
+        self._step_queue = asyncio.Queue(maxsize=1)
+        self._step_event = asyncio.Event()
+        self.engine_loop_tasks = []
+
+        if self.use_coordinator:
+            self.is_tp0_and_pp0 = (
+                parallel_state.get_tensor_model_parallel_rank() == 0
+                and parallel_state.get_pipeline_model_parallel_rank() == 0
+            )
+            self._schedule_requests_task = self._loop.create_task(
+                self.run_schedule_requests_task(loop=self._loop)
+            )
+            self.engine_loop_tasks.append(self._schedule_requests_task)
+        self._forward_task = self._loop.create_task(self.run_forward_task())
+        self.engine_loop_tasks.append(self._forward_task)
+        self._bookkeep_task = self._loop.create_task(self.run_bookkeep_task(verbose=verbose))
+        self.engine_loop_tasks.append(self._bookkeep_task)
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
-        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: bool = False
     ):
         """Continually steps the engine asynchronously."""
-        self._loop = get_asyncio_loop(loop)
-        try:
-            while True:
-                self.schedule_requests()
-                if self.stopped:
-                    self.stop()
-                    return
-
-                # for the cases below (engine is paused or no active requests),
-                # do not use asyncio.sleep(0)
-                # as tp-rank=0 will flood the num_messages publisher
-                # with "0" repeatedly. This causes some packets to drop.
-                # Instead be nice, and sleep
-                # for a short time.
-                # The minimum sleep time needed is ~100us i.e. the time
-                # needed to send one message on an IPC socket. However
-                # just to be safe, we use 20ms here.
-
-                # todo [Siddharth]: Can this hardcoded sleep be avoided
-                # with asyncio zmq sockets?
-                if self.paused:
-                    await asyncio.sleep(0.02)
-                    continue
-
-                if (
-                    self.context.get_active_request_count() == 0
-                    and len(self.waiting_request_ids) == 0
-                ):
-                    await asyncio.sleep(0.02)
-                    continue
-
-                engine_output = await self.async_step(verbose=verbose)
-
-                is_tp0_and_pp0 = (
-                    parallel_state.get_tensor_model_parallel_rank() == 0
-                    and parallel_state.get_pipeline_model_parallel_rank() == 0
-                )
-                if (
-                    is_tp0_and_pp0
-                    and engine_output is not None
-                    and engine_output["finished_requests"]
-                ):
-                    payload = msgpack.packb(
-                        [
-                            Headers.ENGINE_REPLY.value,
-                            [r.serializable() for r in engine_output["finished_requests"]],
-                        ],
-                        use_bin_type=True,
-                    )
-                    self.socket_for_receiving_requests.send(payload)
-
-        except asyncio.CancelledError:
-            pass
+        warnings.warn(
+            "`run_engine_with_coordinator()` is deprecated and will be removed in `megatron-core` "
+            "0.16. Please use `run_engine(use_coordinator=True)` going forward"
+        )
+        await self.run_engine(use_coordinator=True, loop=loop, verbose=verbose)

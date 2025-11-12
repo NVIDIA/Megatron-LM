@@ -105,7 +105,7 @@ async def main(
         client.stop()
         
     # once the stop signal eventually makes its way to each GPU, the engines will stop.
-    await asyncio.gather(engine.engine_loop_task)
+    await asyncio.gather(*engine.engine_loop_tasks)
 
 if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp-8 optimizations 
