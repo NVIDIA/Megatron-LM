@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from megatron.core.inference.inference_client import InferenceClient
 from examples.inference.gpt.utils import add_common_inference_args
 import asyncio
@@ -18,13 +20,28 @@ import json
 from megatron.training.arguments import parse_args
 from megatron.core import parallel_state
 
-async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling_params: SamplingParams, port: int):
+import logging
+
+logging.basicConfig(level=logging.INFO, force=True)
+
+async def main(
+    engine: DynamicInferenceEngine,
+    requests: List[Request],
+    port: int,
+    sampling_params: SamplingParams | None = None,
+):
+    if sampling_params is not None:
+        warnings.warn(
+            "The `sampling_params` argument is deprecated. "
+            "Sampling parameters are specified per request.",
+            DeprecationWarning,
+        )
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator(sampling_params, 
-                                                inference_coordinator_port=port,
-                                                launch_inference_coordinator=True)   
+    await engine.start_listening_to_data_parallel_coordinator( 
+        inference_coordinator_port=port, launch_inference_coordinator=True
+    )
     # if you want to use your own inference coordinator - 
     # 1. set launch_inference_coordinator to False
     # 2. setup a router socket at tcp://MASTER_ADDR:PORT
@@ -50,8 +67,7 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 # These add-request calls will queue up the request on a zmq socket and return
                 # instantaneously. They will return an asyncio future which can be awaited for
                 # request completion.
-                futures.append(client.add_request(request.prompt_text, 
-                                                        sampling_params))
+                futures.append(client.add_request(request.prompt_text, request.sampling_params))
                 num_requests_added += 1
                 #tbar.update(1)
             if num_requests_added == num_requests_total:
@@ -74,7 +90,7 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                     "generated_tokens": req.generated_tokens,
                     "latency": req.latency, #InferenceClient populates this field in the returned future.
                 }
-                if sampling_params.return_log_probs:
+                if req.sampling_params["return_log_probs"]:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 json_results[req.request_id] = result_dict
             with open(args.output_path, "w") as fp:
@@ -115,13 +131,13 @@ if __name__ == "__main__":
             top_p=args.top_p,
             return_log_probs=args.return_log_probs,
             num_tokens_to_generate=args.num_tokens_to_generate,
+            termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         )
 
         # Requests, context, conroller.
         model = get_model()
-        requests = build_requests(args, tokenizer) if dist.get_rank() == 0 else None
+        requests = build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
 
-        
         context = get_inference_context(None, 
                                         None,
                                         calculate_max_sequence_length_from_requests=False)
@@ -132,7 +148,6 @@ if __name__ == "__main__":
         engine = DynamicInferenceEngine(
             controller,
             context,
-            termination_id=tokenizer.eod,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill
@@ -147,6 +162,5 @@ if __name__ == "__main__":
         
         asyncio.run(main(engine, 
                         requests,
-                        sampling_params,
                         args.inference_coordinator_port))
 

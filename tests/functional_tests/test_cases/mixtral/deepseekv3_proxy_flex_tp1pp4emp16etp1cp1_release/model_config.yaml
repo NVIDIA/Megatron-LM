@@ -135,6 +135,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 500
+  --save-retain-interval: 10000
   --dist-ckpt-strictness: log_all
 
   # Add initialization args
@@ -152,6 +153,7 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 
   # Add mixed precision args
   --bf16: true
