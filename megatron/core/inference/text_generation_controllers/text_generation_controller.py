@@ -834,7 +834,7 @@ class TextGenerationController:
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
-        self, loop: Optional[asyncio.AbstractEventLoop] = None,
+        self, loop: Optional[asyncio.AbstractEventLoop] = None
     ) -> Optional[Dict]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
         loop = get_asyncio_loop(loop)

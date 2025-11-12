@@ -1297,7 +1297,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_ids[current_id] = req.request_id
         # Handle request metadata.
         metadata = req.tracked_metadata
-        assert len(metadata) == self.num_request_metadata
+        assert (
+            len(metadata) == self.num_request_metadata
+        ), "Request added to context with invalid metadata length"
         self.request_metadata[current_id] = torch.tensor(
             metadata, dtype=torch.float32, device=self.request_metadata.device
         )
