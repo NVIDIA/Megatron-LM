@@ -862,7 +862,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             )
             state_dict["model"] = model_state_dict
     if args.num_experts:
-        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
+        state_dict["model"] = handle_experts_in_state_dict(state_dict["model"])
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
