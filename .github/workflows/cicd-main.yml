@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 name: CICD Megatron-LM
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: 0 0 * * *
   push:
     branches:
       - dev
@@ -23,6 +24,7 @@ on:
       - "deploy-release/*"
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -39,6 +41,7 @@ jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
     environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
     permissions:
@@ -148,17 +151,18 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
 
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
     if: |
       (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'true'
       ) || (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'false'
           && needs.pre-flight.outputs.docs_only == 'false'
       )
@@ -189,8 +193,8 @@ jobs:
           export GITLAB_ENDPOINT=github.com
           export CI_PROJECT_NAMESPACE=NVIDIA
           export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
-          export CHECK_ONLY=true 
-          export SKIP_DOCS=false 
+          export CHECK_ONLY=true
+          export SKIP_DOCS=false
           bash tools/autoformat.sh
 
   cicd-wait-in-queue:
@@ -213,7 +217,7 @@ jobs:
     environment: nemo-ci
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -228,10 +232,25 @@ jobs:
         with:
           python-version: 3.12
 
+      - name: Install GH CLI
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y gh
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
+
+      - name: Has lts label
+        id: has-lts-label
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          HAS_LTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "container::lts")') || echo "false"
+          echo "main=$HAS_LTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Download test data
         shell: bash
@@ -249,11 +268,6 @@ jobs:
           apt-get update
           apt-get install -y gh
 
-      - name: Pull cache
-        run: |
-          docker pull ${{ env.container-registry }}/megatron-lm:main || true
-          docker pull ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} || true
-
       - name: Get last merged PR
         id: cache_from
         env:
@@ -269,12 +283,31 @@ jobs:
                 }
               }
             }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-              echo "${{ env.container-registry }}/megatron-lm:$number"
+              echo "type=registry,ref=${{ env.container-registry }}/megatron-lm:$number-buildcache,mode=max"
             done)
 
           echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
           echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
           echo "EOF" | tee -a $GITHUB_OUTPUT
+
+      - name: Parse baseimage
+        shell: bash
+        id: base-image
+        env:
+          HAS_LTS_LABEL: ${{ steps.has-lts-label.outputs.main }}
+        run: |
+          if [ "$HAS_LTS_LABEL" == "true" ]; then
+            NGC_VERSION=$(cat docker/.ngc_version.lts)
+            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
+            echo "image_type=lts" | tee -a $GITHUB_OUTPUT
+          else
+            NGC_VERSION=$(cat docker/.ngc_version.dev)
+            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
+            echo "image_type=dev" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -284,11 +317,14 @@ jobs:
           context: .
           target: main
           build-args: |
-            FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
+            FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
+            IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
           cache-from: |
-            ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ env.container-registry }}/megatron-lm:main
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
             ${{ steps.cache_from.outputs.LAST_PRS }}
+          cache-to: |
+            type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           no-cache: false
           tags: |
             ${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
@@ -296,27 +332,47 @@ jobs:
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
-  cicd-unit-tests-latest:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - bucket: "unit_tests"
-          - bucket: "unit_tests/data/"
-          - bucket: "unit_tests/dist_checkpointing/*.py"
-          - bucket: "unit_tests/dist_checkpointing/models/"
-          - bucket: "unit_tests/transformer/*.py"
-          - bucket: "unit_tests/transformer/moe"
+  cicd-parse-unit-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-container-build
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.bucket }} - latest"
     environment: nemo-ci
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -332,7 +388,7 @@ jobs:
       - name: main
         uses: ./.github/actions
         with:
-          test_case: tests/${{ matrix.bucket }}
+          test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
@@ -346,6 +402,15 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
+    environment: nemo-ci
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && needs.pre-flight.outputs.is_merge_group == 'false'
+      && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
     steps:
@@ -369,18 +434,19 @@ jobs:
       - name: Parse functional tests
         id: main
         env:
-          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.HAS_RUN_TESTS_LABEL }}
+          HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
         run: |
           export PYTHONPATH=$(pwd)
 
           if [ "$HAS_RUN_TESTS_LABEL" == "true" ]; then
             ARGS=(
-              --scope mr
+              --scope mr-github
               --enable-lightweight-mode
             )
           else
             ARGS=(
               --scope mr-slim
+              --enable-lightweight-mode
             )
           fi
 
@@ -414,7 +480,7 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-integration-tests
-      # - cicd-unit-tests-latest
+      - cicd-unit-tests-latest
     runs-on: nvidia-ci-aws-gpu-x8
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     environment: nemo-ci
@@ -424,7 +490,7 @@ jobs:
       PIP_ROOT_USER_ACTION: ignore
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -442,7 +508,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:1864 # ${{ github.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
 
   Nemo_CICD_Test:
     needs:
@@ -458,6 +524,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -469,8 +536,8 @@ jobs:
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
           SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped")] | length') || echo 0
@@ -496,6 +563,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -505,7 +573,7 @@ jobs:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
-              repo: context.repo.repo, 
+              repo: context.repo.repo,
               sha: context.sha,
               state: 'success',
               description: 'No code changes - coverage check skipped',
@@ -521,6 +589,7 @@ jobs:
         || success()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
         flag: [unit-test]

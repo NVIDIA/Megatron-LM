@@ -8,30 +8,17 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-EXPECTED_HEADER = """# Copyright (c) {}-{}, NVIDIA CORPORATION.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
+EXPECTED_HEADER = """# Copyright (c) {} NVIDIA CORPORATION & AFFILIATES. All rights reserved."""
 
 
-def has_correct_header(file_path, from_year: int):
+def has_correct_header(file_path):
     """Check if file has the correct copyright header."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
         # Check if the expected header is at the start of the file
-        return content.startswith(EXPECTED_HEADER.format(from_year, str(datetime.now().year)))
+        return content.startswith(EXPECTED_HEADER.format(str(datetime.now().year)))
     except Exception as e:
         print(f"Error reading {file_path}: {e}")
         return False
@@ -45,12 +32,6 @@ def main():
         'files',
         nargs='+',
         help='Files to check/modify'
-    )
-    parser.add_argument(
-        '--from-year',
-        type=int,
-        required=True,
-        help='Project creation year'
     )
 
     args = parser.parse_args()
@@ -68,7 +49,7 @@ def main():
             print(f"Not a file: {file_path}")
             continue
 
-        if has_correct_header(path, args.from_year):
+        if has_correct_header(path):
             print(f"✓ Header present: {file_path}")
         else:
             print(f"✗ Header missing: {file_path}")
@@ -79,7 +60,7 @@ def main():
         print(f"\n{len(missing_headers)} file(s) missing copyright header.")
         print("\n")
         print("Add or replace the header in those files with the following content:")
-        print(EXPECTED_HEADER)
+        print(EXPECTED_HEADER.format(str(datetime.now().year)))
         print("\n")
         print(
             "Disclaimer: This must done irrespective of the magnitude of the change "
