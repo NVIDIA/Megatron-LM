@@ -35,6 +35,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
@@ -352,23 +353,6 @@ class CheckpointType(Enum):
     GLOBAL = auto()
     TORCH_DCP = auto()
     FSDP_DTENSOR = auto()
-
-def _clean_metadata_for_serialization(metadata: dict) -> dict:
-    """Create a clean copy of metadata for serialization by removing non-serializable objects.
-
-    Args:
-        metadata: Original metadata dict
-
-    Returns:
-        Clean metadata dict suitable for serialization
-    """
-    if metadata is None:
-        return None
-
-    clean_metadata = metadata.copy()
-    # Remove dp_cp_group as it's not serializable
-    clean_metadata.pop('dp_cp_group', None)
-    return clean_metadata
 
 
 def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None) -> dict:
