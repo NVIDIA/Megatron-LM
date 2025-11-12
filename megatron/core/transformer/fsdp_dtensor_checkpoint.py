@@ -45,25 +45,31 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import unwrap_model
 
 
-def get_ep_layer_offset(num_experts: int | None = None) -> int:
+def get_ep_layer_offset():
     """
     Get the expert layer offset for the current model.
-
-    Args:
-        num_experts: Total number of experts in the model. If None, returns 0.
-
-    Returns:
-        The expert layer offset for the current EP rank.
     """
+    from megatron.training.global_vars import get_args
+
+    args = get_args()
     ep_size = parallel_state.get_expert_model_parallel_world_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
-    num_local_experts = num_experts // ep_size if num_experts else 0
+    num_local_experts = args.num_experts // ep_size if args.num_experts else 0
     local_expert_offset = ep_rank * num_local_experts
 
     return local_expert_offset
+
+
+def get_total_num_experts():
+    """
+    Get the total number of experts for the current model.
+    """
+    from megatron.training.global_vars import get_args
+
+    args = get_args()
+    return args.num_experts if args.num_experts else 0
 
 
 def get_expert_index_from_key(key):
@@ -90,19 +96,12 @@ def get_expert_index_from_key(key):
     return None
 
 
-def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
+def handle_experts_in_state_dict(state_dict):
     """
     Rewrite expert keys in state dict.
-
-    Args:
-        state_dict: The state dictionary to process.
-        num_experts: Total number of experts in the model. If None, no expert processing occurs.
-
-    Returns:
-        The processed state dictionary with rewritten expert keys.
     """
-    local_expert_start = get_ep_layer_offset(num_experts)
-    local_expert_end = num_experts if num_experts else 0
+    local_expert_start = get_ep_layer_offset()
+    local_expert_end = get_total_num_experts()
 
     def should_keep_expert_key(expert_index):
         """Determine if this rank should keep this expert key based on expert index"""
@@ -148,17 +147,9 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
     return state_dict
 
 
-def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
-    """Get the module parameter corresponding to the key.
-
-    Args:
-        key: The parameter key to process.
-        num_experts: Total number of experts in the model. If None, no expert processing occurs.
-
-    Returns:
-        The local parameter key with adjusted expert indices.
-    """
-    local_expert_offset = get_ep_layer_offset(num_experts)
+def expert_param_local_key(key):
+    """Get the module parameter corresponding to the key."""
+    local_expert_offset = get_ep_layer_offset()
     expert_index = get_expert_index_from_key(key)
     if expert_index is not None:
         new_expert_index = expert_index - local_expert_offset
@@ -182,9 +173,6 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     Handle SWiGLU in model and optimizer state dicts.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
-
-    unwrapped_model = unwrap_model(model)
-    num_experts = unwrapped_model.config.num_moe_experts
 
     def intersection(s1, s2):
         # Only works for step=1
@@ -309,9 +297,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
-                    )
+                    dist_param = model.get_parameter(expert_param_local_key(key[len("module.") :]))
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
                         dist_param,
@@ -464,8 +450,6 @@ def get_global_unique_param_name(model_chunks, param):
             param_name = re.sub(r"layers\.(\d+)", f"layers.{tf_layer_number - 1}", param_name)
 
     # Get EP unique parameter name
-    unwrapped_model = unwrap_model(model_chunks[0])
-    num_experts = unwrapped_model.config.num_moe_experts
-    param_name = next(iter(handle_experts_in_state_dict({param_name: None}, num_experts).keys()))
+    param_name = list(handle_experts_in_state_dict({param_name: None}).keys())[0]
 
     return param_name
