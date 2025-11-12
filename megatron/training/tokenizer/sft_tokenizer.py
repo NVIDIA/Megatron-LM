@@ -62,7 +62,9 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
         self._prompt_format = prompt_format
-
+        if self._prompt_config.pad_token_id is None:
+            self._prompt_config.pad_token_id = self._tokenizer.eos_token_id - 1
+            print(f"pad token id is not set, set to (eos_token_id - 1): {self._prompt_config.pad_token_id} for {prompt_format}")
 
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool

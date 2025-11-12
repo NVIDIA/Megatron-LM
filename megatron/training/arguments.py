@@ -802,7 +802,13 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    if args.sft_sequence_packing:
+        args.variable_seq_lengths = True
+        # TODO(tailaim): add support for other dispatcher types
+        print(f"Setting moe_token_dispatcher_type to alltoall for sft sequence packing with pipeline parallelism")
+        args.moe_token_dispatcher_type = "alltoall"
+    else:
+        args.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
@@ -957,10 +963,27 @@ def validate_args(args, defaults={}):
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.hybrid_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
+        assert not (args.pipeline_model_parallel_size > 1 and args.use_megatron_fsdp), \
+        'Hybrid context parallelism not supported with pipeline parallelism when using FSDP'
         assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+        assert args.context_parallel_size == 1, 'context parallel size must be 1 for hybrid context parallelism'
+
+    if args.sft_sequence_packing:
+        # Validate that packed sequence buffer is large enough for single sequences
+        if args.hybrid_context_parallel:
+            # packed_buffer_size = hdp_size * max_seqlen_per_rank >= single_seq_max_len
+            hdp_size = args.world_size // (args.tensor_model_parallel_size * args.pipeline_model_parallel_size)
+            assert hdp_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+                f'Packed sequence buffer size ({hdp_size * args.max_seqlen_per_dp_cp_rank}) ' \
+                f'must be >= single sequence max length ({args.seq_length})'
+        else:
+            # packed_buffer_size = cp_size * max_seqlen_per_rank >= single_seq_max_len
+            assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
+                f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
+                f'must be >= single sequence max length ({args.seq_length})'
+        
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled

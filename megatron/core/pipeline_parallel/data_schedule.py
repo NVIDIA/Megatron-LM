@@ -113,13 +113,13 @@ def wrap_dataloader(
 
         return global_id_seqlens, global_ids_this_rank
 
-    def _gid_to_src_rank(gid: int, offsets: List[int], dp_group, tp_group) -> int:
+    def _gid_to_src_rank(gid: int, offsets: List[int], dp_group, tp_group, dp_cp_group) -> int:
         dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
         # Since the torch.distributed.get_process_group_ranks
         # provides the global rank, we need to consider TP
         hdp_rank = (
             torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
-        )
+        ) % dp_cp_group.size()
         return hdp_rank
 
     def _reroute_samples_to_hdp_ranks(
@@ -146,7 +146,8 @@ def wrap_dataloader(
         dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
         # Here we actually want to get the DP group's rank within the HDP group,
         # we need to consider TP
-        dp_ranks = [r // tp_group.size() for r in dp_ranks]
+        # tp-cp-ep-dp-pp
+        dp_ranks = [(r // tp_group.size()) % dp_cp_group.size() for r in dp_ranks]
 
         data_keys = batch[0].keys()
 
@@ -187,7 +188,7 @@ def wrap_dataloader(
         # Create the recv plan
         recv_sample_id_groups = [[] for _ in range(total_hdp_gpus)]
         for gid in combined_sample_id_groups[hdp_rank]:
-            src_rank = _gid_to_src_rank(gid, offsets, dp_group, tp_group)
+            src_rank = _gid_to_src_rank(gid, offsets, dp_group, tp_group, dp_cp_group)
             recv_sample_id_groups[src_rank].append(gid)
 
         recv_lens_split = [0] * total_hdp_gpus
@@ -231,10 +232,6 @@ def wrap_dataloader(
             recv_tensor = torch.empty(
                 recv_tensor_size, device=torch.cuda.current_device(), dtype=send_tensor.dtype
             )
-            # debugmtl
-            # print(f"ready to all to all for key:{key}, output_split_sizes:{output_split_sizes},
-            # input_split_sizes:{input_split_sizes}, recv_tensor_size:
-            # {tensor_size},send_tensor_size:{send_tensor.size(0)}")
             torch.distributed.all_to_all_single(
                 output=recv_tensor,
                 input=send_tensor,
@@ -310,10 +307,12 @@ def wrap_dataloader(
     if data_iterator is None:
         # TP-0 reads from data_iterator, others receive via broadcast.
         sample_id_groups, batch = None, None
-        num_total_groups_broadcast = torch.tensor([0], dtype=torch.int32, device=dev)
-        _broadcast(num_total_groups_broadcast)
-        num_micro_batches = int(num_total_groups_broadcast.item())
-        return None, num_micro_batches
+        info_to_broadcast_this_tpgroup = torch.tensor([0, 0, 0], dtype=torch.int32, device=dev)
+        _broadcast(info_to_broadcast_this_tpgroup)
+        num_micro_batches = info_to_broadcast_this_tpgroup[0].item()
+        num_total_tokens_this_GB = info_to_broadcast_this_tpgroup[1].item()
+        sequence_square_sum_this_GB = info_to_broadcast_this_tpgroup[2].item()
+        return None, num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB
     else:
         batch = next(data_iterator)
         subsample_seqlens = []
@@ -346,18 +345,21 @@ def wrap_dataloader(
 
         hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
         num_micro_batches = len(sample_id_groups)
-        num_total_groups_broadcast = torch.tensor(
-            [num_micro_batches], dtype=torch.int32, device=dev
+        # calculate this two values for tflops calculation
+        num_total_tokens_this_GB = sum(seqlens_gathered)
+        sequence_square_sum_this_GB = sum(seqlen**2 for seqlen in seqlens_gathered)
+        info_to_broadcast_this_tpgroup = torch.tensor(
+            [num_micro_batches, num_total_tokens_this_GB, sequence_square_sum_this_GB],
+            dtype=torch.int64,
+            device=dev,
         )
-        _broadcast(num_total_groups_broadcast)
+        _broadcast(info_to_broadcast_this_tpgroup)
 
-        # TODO(tailaim): calculate this two values properly
-        # num_total_tokens_this_GA = losses_reduced.pop(0)
-        # sequence_square_sum_this_GA = losses_reduced.pop(0)
-
-        # pack sequences in the same group and create a new data iterator
+        # TODO(tailaim): modify this to support different ranks
+        # have different num_microbatches within the HDP group
         new_samples = []
         for i in range(num_micro_batches):
+            # pack sequences in the same group and create a new data iterator
             sample_ids_this_group = sample_id_groups[i][hdp_rank]
             samples = [batch[sub_sample_id] for sub_sample_id in sample_ids_this_group]
             partner_cp_size = len(
@@ -413,16 +415,15 @@ def wrap_dataloader(
             new_sample["cu_seqlens"] = cu_seqlens
 
             new_samples.append(new_sample)
-        # debugmtl
-        # print(f"new_samples type: {type(new_samples)}, new_sample type: {type(new_samples[0])}")
+
         new_data_iterator = RerunDataIterator(iter(new_samples))
 
-        # debugmtl
-        # data = next(new_data_iterator)
-        # print(f"data type: {type(data)}")
-        # print(data)
-
-        return new_data_iterator, num_micro_batches
+        return (
+            new_data_iterator,
+            num_micro_batches,
+            num_total_tokens_this_GB,
+            sequence_square_sum_this_GB,
+        )
 
 
 class BaseScheduler:
@@ -443,9 +444,9 @@ class NaiveSequencePackingScheduler(BaseScheduler):
 
     def __init__(self, config):
         super().__init__(config)
-        self.max_seq_len_all_ranks = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
-        self.dp_size = parallel_state.get_data_parallel_world_size()
-        self.cp_size = parallel_state.get_context_parallel_world_size()
+        self.dp_size = int(parallel_state.get_data_parallel_world_size())
+        self.cp_size = int(parallel_state.get_context_parallel_world_size())
+        self.max_seq_len_all_ranks = config.max_seqlen_per_dp_cp_rank * self.cp_size
 
     def get_groups_and_subsamples(self, sample_id_seqlens, config):
         """
@@ -735,6 +736,8 @@ class BalancedHybridCPscheduler(BaseScheduler):
             # ---- Step 3 – assign the sequence to every member of that group ------
             per_gpu_cost = compute_estimator(seq_len)
 
+            # TODO(tailaim): remove this after to support different ranks have
+            # different num_microbatches within the HDP group
             packing_sequence_len[best_gid] = (
                 packing_sequence_len.get(best_gid, 0) + seq_len / needed
             )
@@ -838,6 +841,7 @@ class BalancedHybridCPscheduler(BaseScheduler):
                 else:
                     break
 
+        # TODO(tailaim): uncomment this to support different ranks have different num_microbatches
         # trim_overload()
 
         # Track samples in this group before redistribution to empty GPUs

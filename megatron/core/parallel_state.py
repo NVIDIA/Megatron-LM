@@ -422,7 +422,7 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    group_sizes = [2**i for i in range(int(log2(len(ranks))))]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
@@ -1444,6 +1444,10 @@ def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=N
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
+    elif group_size == 1:
+        if check_initialized:
+            assert _CONTEXT_PARALLEL_GROUP is not None
+        return _CONTEXT_PARALLEL_GROUP
     if check_initialized:
         assert _HYBRID_DP_CP_GROUPS is not None
     return _HYBRID_DP_CP_GROUPS[group_size]
