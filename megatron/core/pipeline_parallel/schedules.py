@@ -518,6 +518,7 @@ def forward_backward_no_pipelining(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
+    p2p_communicator: Optional[P2PCommunicator] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
