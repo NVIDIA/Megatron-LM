@@ -31,14 +31,7 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
-        x,
-        weight,
-        eps,
-        None,
-        None,
-        TE_DType[x.dtype],
-        16,  # sm-margin
-        False,  # zero centered gamma
+        x, weight, eps, None, None, TE_DType[x.dtype], 16, False  # sm-margin  # zero centered gamma
     )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
