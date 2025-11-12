@@ -169,13 +169,6 @@ class ContextErrorFactory:
         return error
 
 
-class WarmupEngineMode(Enum):
-    """Enumeration for warmup engine modes used during cuda graph capture."""
-
-    DECODE = "decode"
-    NON_DECODE = "non_decode"
-
-
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order

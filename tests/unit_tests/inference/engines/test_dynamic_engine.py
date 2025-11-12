@@ -18,7 +18,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
-    WarmupEngineMode,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status

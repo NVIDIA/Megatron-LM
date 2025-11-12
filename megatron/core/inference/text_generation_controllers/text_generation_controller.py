@@ -19,10 +19,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts.dynamic_context import (
-    MaxSequenceLengthOverflowError,
-    WarmupEngineMode,
-)
+from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -501,7 +498,6 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
-            assert warmup_engine_mode is not WarmupEngineMode.NON_DECODE
             if context.is_decode_only():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
