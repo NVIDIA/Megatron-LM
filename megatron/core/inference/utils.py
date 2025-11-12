@@ -167,6 +167,8 @@ async def await_process_event(
 # This is necessary because asyncio Queues are broken in Python < 3.13.
 if sys.version_info < (3, 13):
 
+    _SHUTDOWN_SENTINEL = object()
+
     class asyncio_QueueShutDown(Exception):
         """Compatibility exception for Python < 3.13."""
 
@@ -174,7 +176,6 @@ if sys.version_info < (3, 13):
 
     class asyncio_Queue(asyncio.Queue):
         """An asyncio.Queue with Python 3.13 compatibility features for Python < 3.13."""
-
         def __init__(self, maxsize: int = 0):
             super().__init__(maxsize)
             self._is_shutdown = False
@@ -184,18 +185,18 @@ if sys.version_info < (3, 13):
             if self._is_shutdown and self.empty():
                 raise asyncio_QueueShutDown
             ret = await super().get()
-            if ret is None:
-                super().put_nowait(None)
+            if ret is _SHUTDOWN_SENTINEL:
+                super().put_nowait(_SHUTDOWN_SENTINEL)
                 super().task_done()
                 raise asyncio_QueueShutDown
             return ret
 
         def put_nowait(self, item):
-            """Put an item into the queue without blocking, validating None."""
+            """Put an item into the queue without blocking"""
             if self._is_shutdown:
                 raise asyncio_QueueShutDown
-            if item is None:
-                raise ValueError("None is reserved for shutdown purposes for Python < 3.13")
+            if item is _SHUTDOWN_SENTINEL:
+                raise ValueError(f"{item} is reserved for shutdown purposes for Python < 3.13")
             super().put_nowait(item)
 
         def shutdown(self):
@@ -206,7 +207,7 @@ if sys.version_info < (3, 13):
             shutdowns when the queue is BOTH shutdown AND empty.
             """
             if not self._is_shutdown:
-                super().put_nowait(None)
+                super().put_nowait(_SHUTDOWN_SENTINEL)
                 super().task_done()
                 self._is_shutdown = True
 
