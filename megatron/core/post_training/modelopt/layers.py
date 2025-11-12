@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import logging
 from typing import Callable, List, Optional
 
 import torch
@@ -10,8 +9,6 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-
-logger = logging.getLogger(__name__)
 
 try:
     import transformer_engine as te
@@ -119,7 +116,6 @@ class Linear(torch.nn.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
-        self.tp_group = tp_group
 
         self._return_bias = skip_bias_add and bias
 
@@ -157,11 +153,7 @@ class Linear(torch.nn.Linear):
                 if v.ndim == 0:
                     state_dict[k] = v.view(1)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            state_dict, prefix, sharded_offsets=sharded_offsets
         )
         return sharded_state_dict
 
@@ -237,7 +229,7 @@ class RealQuantTransformerLayer(TransformerLayer):
                 if not isinstance(v, torch.Tensor):
                     continue
                 original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
-                logger.info(
+                print(
                     "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
                         k, original_dtype, original_shape, str(v.dtype), str(v.shape)
                     )

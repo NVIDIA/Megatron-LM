@@ -775,12 +775,6 @@ class GPTModel(LanguageModule):
         if self.mtp_process and not self.pre_process:
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
-            tie_word_embeddings_state_dict(
-                sharded_state_dict,
-                emb_weight,
-                emb_weight_key,
-                tp_group=self.tp_group,
-                dp_cp_group=metadata['dp_cp_group'],
-            )
+            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
 
         return sharded_state_dict
