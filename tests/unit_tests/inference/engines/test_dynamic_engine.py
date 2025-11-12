@@ -580,16 +580,6 @@ class TestDynamicInferenceEngine:
                 f"expected ({expected_generated_tokens})."
             )
 
-    # def test_inference_optimized_layer():
-    #     env = self._run_test(
-    #         model_provider=model_provider,
-    #         num_cuda_graphs=num_cuda_graphs,
-    #         context_max_requests_override=32,
-    #         cuda_graph_scope=cuda_graph_scope,
-    #         force_build_cuda_graphs=True,
-    #         transformer_impl=transformer_impl,
-    #     )
-
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
