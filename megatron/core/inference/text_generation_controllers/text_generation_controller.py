@@ -92,17 +92,17 @@ class TextGenerationController:
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         # Initialize bookkeeping tensors.
-        self.cu_sampling_logits = torch.empty(
+        self.sampling_logits_cuda = torch.empty(
             max_requests, vocab_size, dtype=logits_dtype, device=device
         )
-        self.cu_sampled_tokens = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self.sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
-        self.cu_temperature = torch.empty_like(self.cu_sampled_tokens, dtype=torch.float)
-        self.cu_top_k = torch.empty_like(self.cu_sampled_tokens, dtype=torch.int32)
-        self.cu_top_p = torch.empty_like(self.cu_sampled_tokens, dtype=torch.float)
-        self.cu_termination_id = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self.cu_return_log_probs = torch.empty(max_requests, dtype=torch.bool, device=device)
-        self.cu_skip_prompt_log_probs = torch.empty(max_requests, dtype=torch.bool, device=device)
+        self.temperature_cuda = torch.empty_like(self.sampled_tokens_cuda, dtype=torch.float)
+        self.top_k_cuda = torch.empty_like(self.sampled_tokens_cuda, dtype=torch.int32)
+        self.top_p_cuda = torch.empty_like(self.sampled_tokens_cuda, dtype=torch.float)
+        self.termination_id_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
+        self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
 
         # Used for inefficient torch sampling.
         self.torch_sampling_buckets: List[Tensor] = []
@@ -610,18 +610,18 @@ class TextGenerationController:
         top_p = request_metadata[:, request_metadata_labels["top_p"]]
 
         # Copy data into relevant tensors.
-        self.cu_temperature[:active_request_count].copy_(temp, non_blocking=True)
-        self.cu_top_k[:active_request_count] = top_k.to(
+        self.temperature_cuda[:active_request_count].copy_(temp, non_blocking=True)
+        self.top_k_cuda[:active_request_count] = top_k.to(
             dtype=torch.int32, copy=True, non_blocking=True
         )
-        self.cu_top_p[:active_request_count].copy_(top_p, non_blocking=True)
-        self.cu_termination_id[:active_request_count] = request_metadata[
+        self.top_p_cuda[:active_request_count].copy_(top_p, non_blocking=True)
+        self.termination_id_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["termination_id"]
         ].to(dtype=torch.int64, copy=True, non_blocking=True)
-        self.cu_return_log_probs[:active_request_count] = request_metadata[
+        self.return_log_probs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["return_log_probs"]
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
-        self.cu_skip_prompt_log_probs[:active_request_count] = request_metadata[
+        self.skip_prompt_log_probs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["skip_prompt_log_probs"]
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
@@ -671,7 +671,7 @@ class TextGenerationController:
             last_token_logits = context.last_token_logits(logits)
         active_request_count = last_token_logits.size(0)
         # Copy last_token_logits to contiguous buffer.
-        self.cu_sampling_logits[:active_request_count].copy_(last_token_logits, non_blocking=True)
+        self.sampling_logits_cuda[:active_request_count].copy_(last_token_logits, non_blocking=True)
 
         if backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
@@ -681,7 +681,7 @@ class TextGenerationController:
             for indices, temp, top_k, top_p in self.torch_sampling_buckets:
                 token_list.append(
                     self._torch_sampling_func(
-                        self.cu_sampling_logits[indices, :], temp, top_k, top_p
+                        self.sampling_logits_cuda[indices, :], temp, top_k, top_p
                     )
                 )
                 indices_list.append(indices)
@@ -689,8 +689,8 @@ class TextGenerationController:
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
             sampled_indices = torch.cat(indices_list, dim=0)
-            self.cu_sampled_tokens.index_copy_(0, sampled_indices, sampled_tokens)
-        return self.cu_sampled_tokens[:active_request_count].clone()
+            self.sampled_tokens_cuda.index_copy_(0, sampled_indices, sampled_tokens)
+        return self.sampled_tokens_cuda[:active_request_count].clone()
 
     def _dynamic_step_log_probs_bookkeeping(self) -> bool:
         """Perform bookkeeping necessary to compute log probs for dynamic batching."""
@@ -699,14 +699,14 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        to_check = self.cu_return_log_probs[:active_request_count]
-        to_check &= ~self.cu_skip_prompt_log_probs[:active_request_count]
+        to_check = self.return_log_probs_cuda[:active_request_count]
+        to_check &= ~self.skip_prompt_log_probs_cuda[:active_request_count]
 
         assert not (
             to_check.any() and materialize_only_last_token_logits
         ), "Prompt log probs cannot be calculated if only last token logits are materialized."
 
-        return self.cu_return_log_probs[:active_request_count].any()
+        return self.return_log_probs_cuda[:active_request_count].any()
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
@@ -717,7 +717,7 @@ class TextGenerationController:
 
         ret = context.calculate_log_probs(
             logits,
-            self.cu_sampled_tokens[:active_request_count],
+            self.sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=materialize_only_last_token_logits,
         )
         return ret
@@ -746,8 +746,8 @@ class TextGenerationController:
         # Request finished if termination_id or length >= max_sequence_length.
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
         active_request_mask = (
-            self.cu_sampled_tokens[:active_request_count]
-            != self.cu_termination_id[:active_request_count]
+            self.sampled_tokens_cuda[:active_request_count]
+            != self.termination_id_cuda[:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
