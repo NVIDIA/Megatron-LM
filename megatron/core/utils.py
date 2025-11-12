@@ -1880,18 +1880,10 @@ def get_thd_batch_on_this_cp_rank(
         # enable hybrid context parallel
         cp_size = local_cp_size
         if cp_group is None:
-            # TODO: debugmtl modify this comments
-            # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
-            if cp_size > 1:
-                cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
-                    group_size=cp_size
-                )
-                cp_rank = torch.distributed.get_rank(group=cp_group)
-                assert cp_group.size() == cp_size
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=cp_size)
+            cp_rank = torch.distributed.get_rank(group=cp_group)
+            assert cp_group.size() == cp_size
         else:
-            # TODO: debugmtl modify this comments
-            # If cp group is provided, it must match the local cp size
-            # as defined by the HybridCPDataLoaderWrapper
             assert cp_group.size() == local_cp_size
     else:
         cp_size = parallel_state.get_context_parallel_world_size()
@@ -1900,13 +1892,13 @@ def get_thd_batch_on_this_cp_rank(
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
-        local_cp_size=cp_size,
+        local_cp_size=local_cp_size,
         cp_group=cp_group,
     )
 

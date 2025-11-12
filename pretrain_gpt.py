@@ -63,7 +63,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -78,7 +78,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
         max_seqlen = int(batch.pop('max_seqlen').item())
         # local_cp_size is None if we disable hybrid-cp
-        local_cp_size = int(batch.pop('local_cp_size').item()) if 'local_cp_size' in batch else None
+        local_cp_size = int(batch.pop('local_cp_size').item()) if ('local_cp_size' in batch and args.hybrid_context_parallel) else None
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, 
                 cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
         

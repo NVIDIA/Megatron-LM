@@ -594,8 +594,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
             _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
             _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            _broadcast(batch['max_seqlen'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
@@ -720,7 +720,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
     if not args.sft_sequence_packing:
         keys_to_keep = ['tokens', 'labels', 'loss_mask', 'attention_mask', 'position_ids']
         batch = {k: v for k, v in batch.items() if k in keys_to_keep}
-
+    elif not args.hybrid_context_parallel:
+        batch.pop('local_cp_size')
+    
     return batch
 
 

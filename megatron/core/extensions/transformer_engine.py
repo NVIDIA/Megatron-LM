@@ -1041,7 +1041,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             elif packed_seq_params.local_cp_size is not None:
                 assert (
                     packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
+                ), f"local_cp_size must be == 1 if provided without cp_group, "
+                f"but got {packed_seq_params.local_cp_size}."
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")

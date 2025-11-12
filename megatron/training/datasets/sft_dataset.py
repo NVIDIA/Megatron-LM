@@ -86,16 +86,22 @@ class SFTDataset(MegatronDataset):
             cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
         else:
             # Standard CP: only consider CP
-            cp_pad = self.context_parallel_size * 2 if self.context_parallel_size > 1 else 1
+            cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
         tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
         divisor = cp_pad * tp_pad
+        # TODO(tailaim): do we need to pad for FP8 execution?
+        # divisor = ((divisor + 15) // 16) * 16
         return divisor
     
     def get_padding_size(
         self,
         seq_len: int,
     ) -> int:
-        return math.ceil(seq_len / self.padding_divisor) * self.padding_divisor
+        seq_len_padded = math.ceil(seq_len / self.padding_divisor) * self.padding_divisor
+        assert seq_len > seq_len_padded / 2 / self.config.context_parallel_size * (self.config.context_parallel_size - 1), \
+        f"sequence length {seq_len} is too short, the divisor is {self.padding_divisor}, that means cp_rank \
+        {self.config.context_parallel_size-1} will have no valid tokens"
+        return seq_len_padded
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sft_sequence_packing = self.config.sft_sequence_packing
@@ -154,7 +160,8 @@ class SFTDataset(MegatronDataset):
             }
 
         if sft_sequence_packing:
-            ret['original_seq_len'] = num_tokens
+            # sequence packing need both original sequence length and padded length
+            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
 
         return ret
 

@@ -1395,17 +1395,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
     
-    num_total_tokens_this_GA = losses_reduced.pop(0)
-    sequence_square_sum_this_GA = losses_reduced.pop(0)
     if args.sft_sequence_packing:
-        pack = torch.tensor([num_total_tokens_this_GA, sequence_square_sum_this_GA],
-                        device='cuda', dtype=torch.float32)
-        torch.distributed.all_reduce(pack, group=mpu.get_data_parallel_group())
-        num_total_tokens_this_GB = pack[0].item() * mpu.get_context_parallel_world_size()
-        sequence_square_sum_this_GB = pack[1].item() * mpu.get_context_parallel_world_size()
+        num_total_tokens_this_GB, sequence_square_sum_this_GB = losses_reduced.pop()
     else:
-        num_total_tokens_this_GB = num_total_tokens_this_GA * mpu.get_data_parallel_world_size(with_context_parallel=True)
-        sequence_square_sum_this_GB = sequence_square_sum_this_GA * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        sequence_square_sum_this_GB = args.seq_length ** 2 * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+        num_total_tokens_this_GB = args.seq_length * args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
