@@ -173,9 +173,9 @@ def get_layer_maps_from_layer_type_list(
 ) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each layer type in [Attention, Mamba, MLP] given a layer type list.
+    for each layer type in [Attention, Mamba, MLP, MoE] given a layer type list.
     """
-    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]
+    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
         layer_map = layer_maps[layer_type]
