@@ -147,6 +147,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.use_coordinator = False
         self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
+        self._step_queue: Optional[asyncio.Queue] = None
+        self._step_event: Optional[asyncio.Event] = None
+        self._forward_task: Optional[asyncio.Task] = None
+        self._bookkeep_task: Optional[asyncio.Task] = None
+        self._schedule_requests_task: Optional[asyncio.Task] = None
+        self.engine_loop_tasks: List[asyncio.Task] = []
 
         # Request state tracking.
         self.request_counter = Counter()
@@ -420,7 +426,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+        await self.run_engine(use_coordinator=True, loop=loop)
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -909,7 +915,9 @@ class DynamicInferenceEngine(AbstractEngine):
         range_push("Prefill" if not is_decode_only else "Decode")
 
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
+            step_event=self._step_event,
+        )
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -944,6 +952,33 @@ class DynamicInferenceEngine(AbstractEngine):
         ret = await self.async_bookkeep(*step_data, verbose=verbose)
 
         return ret
+
+    async def run_bookkeep_task(self, *, verbose: Optional[bool] = False):
+        """Runs the bookkeeping task in an infinite loop."""
+        try:
+            while not self.stopped:
+                step_data = await self._step_queue.get()
+                await self._step_event.wait()
+                await self.async_bookkeep(*step_data, verbose=verbose)
+        except asyncio.CancelledError:
+            pass
+
+    async def run_forward_task(self):
+        """Runs the forward task in an infinite loop."""
+        try:
+            while not self.stopped:
+                async with self._cond:
+                    await self._cond.wait_for(
+                        lambda: self.context.get_active_request_count() > 0
+                        or self.waiting_request_ids
+                        or self.paused
+                    )
+                if not self.stopped and not self.paused:
+                    result = await self.async_forward()
+                    await self._step_queue.put(result)
+        except asyncio.CancelledError:
+            if self.use_coordinator:
+                self.stop()
 
     def step_modern(
         self, *, verbose: bool = False
@@ -1094,7 +1129,6 @@ class DynamicInferenceEngine(AbstractEngine):
         for socket in self.zmq_sockets:
             socket.close()
         self.zmq_context.term()
-        parallel_state.destroy_model_parallel()
 
     @trace_async_exceptions
     async def run_engine(
@@ -1113,30 +1147,23 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = use_coordinator
+        self._step_queue = asyncio.Queue(maxsize=1)
+        self._step_event = asyncio.Event()
+        self.engine_loop_tasks = []
 
         if self.use_coordinator:
             self.is_tp0_and_pp0 = (
                 parallel_state.get_tensor_model_parallel_rank() == 0
                 and parallel_state.get_pipeline_model_parallel_rank() == 0
             )
-            self.schedule_requests_task = self._loop.create_task(
+            self._schedule_requests_task = self._loop.create_task(
                 self.run_schedule_requests_task(loop=self._loop)
             )
-        try:
-            while not self.stopped:
-                # Wait until there are active requests before proceeding.
-                async with self._cond:
-                    await self._cond.wait_for(
-                        lambda: self.context.get_active_request_count() > 0
-                        or self.waiting_request_ids
-                    )
-                if not self.stopped and not self.paused:
-                    await self.async_step(verbose=verbose)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if self.use_coordinator:
-                self.stop()
+            self.engine_loop_tasks.append(self._schedule_requests_task)
+        self._forward_task = self._loop.create_task(self.run_forward_task())
+        self.engine_loop_tasks.append(self._forward_task)
+        self._bookkeep_task = self._loop.create_task(self.run_bookkeep_task(verbose=verbose))
+        self.engine_loop_tasks.append(self._bookkeep_task)
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
