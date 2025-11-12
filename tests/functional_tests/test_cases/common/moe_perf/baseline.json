@@ -1,26 +1,50 @@
 {
   "deepseek_a2a_tp1ep8_bf16": {
-    "backward_ms": 10.269047927856445,
-    "forward_ms": 7.071804833412171,
-    "max_allocated_bytes": 3627643904,
+    "backward_ms": 10.309884643554687,
+    "forward_ms": 7.034489583969116,
+    "max_allocated_bytes": 3626813952,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_a2a_tp1ep8_fp8": {
+    "backward_ms": 10.18668475151062,
+    "forward_ms": 7.617563199996948,
+    "max_allocated_bytes": 4837189632,
     "max_regression_ratio": 1.02
   },
   "deepseek_deepep_tp1ep8_bf16": {
-    "backward_ms": 8.899030351638794,
-    "forward_ms": 5.496094369888306,
-    "max_allocated_bytes": 2729270528,
+    "backward_ms": 8.947673559188843,
+    "forward_ms": 5.455151987075806,
+    "max_allocated_bytes": 2730491136,
+    "max_regression_ratio": 1.02
+  },
+  "deepseek_deepep_tp1ep8_fp8": {
+    "backward_ms": 8.718684816360474,
+    "forward_ms": 5.996280002593994,
+    "max_allocated_bytes": 4130067712,
     "max_regression_ratio": 1.02
   },
   "mixtral_a2a_tp1ep8_bf16": {
-    "backward_ms": 7.5874943971633915,
-    "forward_ms": 4.209555172920227,
-    "max_allocated_bytes": 2857101312,
+    "backward_ms": 7.681614398956299,
+    "forward_ms": 4.157967972755432,
+    "max_allocated_bytes": 2856544256,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_a2a_tp1ep8_fp8": {
+    "backward_ms": 6.655782413482666,
+    "forward_ms": 3.6682991862297056,
+    "max_allocated_bytes": 3062679552,
     "max_regression_ratio": 1.02
   },
   "mixtral_deepep_tp1ep8_bf16": {
-    "backward_ms": 7.745809555053711,
-    "forward_ms": 4.60446879863739,
+    "backward_ms": 7.890902400016785,
+    "forward_ms": 4.512491202354431,
     "max_allocated_bytes": 2856743424,
+    "max_regression_ratio": 1.02
+  },
+  "mixtral_deepep_tp1ep8_fp8": {
+    "backward_ms": 6.849382376670837,
+    "forward_ms": 4.020219159126282,
+    "max_allocated_bytes": 3062223360,
     "max_regression_ratio": 1.02
   }
 }
