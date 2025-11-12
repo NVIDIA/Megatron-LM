@@ -1551,6 +1551,8 @@ class TransformerConfig(ModelParallelConfig):
                     'use cuda_graph_impl=transformer_engine instead.'
                 )
                 self.cuda_graph_impl = "transformer_engine"
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = []
         if self.cuda_graph_impl != "none":
             assert self.cuda_graph_impl in [
                 "transformer_engine",
@@ -1559,8 +1561,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
-            if self.cuda_graph_scope is None:
-                self.cuda_graph_scope = []
             elif not isinstance(self.cuda_graph_scope, list):
                 assert isinstance(self.cuda_graph_scope, str), (
                     "cuda_graph_scope must be a string or a list of strings, "
