@@ -34,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -105,6 +106,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     cuda_graph_scope: str = "full_iteration"
     force_build_cuda_graphs: bool = False
+    transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -292,16 +294,26 @@ class TestDynamicInferenceEngine:
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
-                add_bias_linear=test_config.expert_model_parallel_size == 1,
+                add_bias_linear=test_config.expert_model_parallel_size == 1
+                and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
+                transformer_impl=test_config.transformer_impl,
+                normalization=(
+                    "RMSNorm"
+                    if test_config.transformer_impl == "inference_optimized"
+                    else "LayerNorm"
+                ),
+                # inference optimized currently only supports RMS Norm
             )
-            if test_config.fp8:
+            if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec()
-            else:
+            elif test_config.transformer_impl == "local":
                 layer_spec = get_gpt_layer_local_spec()
+            elif test_config.transformer_impl == "inference_optimized":
+                layer_spec = get_gpt_layer_with_inference_spec()
 
             # GPT model.
             model = GPTModel(
@@ -948,6 +960,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("pp_size", [1, 2])
     @pytest.mark.parametrize("tp_size", [1, 2])
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
     @torch.inference_mode()
     def test_parallel_inference(
         self,
@@ -957,6 +970,7 @@ class TestDynamicInferenceEngine:
         ep_size,
         sequence_parallel,
         materialize_only_last_token_logits,
+        transformer_impl,
     ):
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -979,6 +993,22 @@ class TestDynamicInferenceEngine:
                     "pipeline stages is not supported yet."
                 )
             )
+        elif transformer_impl == "inference_optimized":
+            if ep_size > 1:
+                pytest.skip(
+                    reason="MoE models are not supported with the inference optimized transformer."
+                )
+            if tp_size > 1 and not sequence_parallel:
+                pytest.skip(
+                    reason=(
+                        "The inference optimized transformer requires sequence parallelism "
+                        "when tp_size > 1."
+                    )
+                )
+            if model_provider == "mamba":
+                pytest.skip(
+                    reason="Mamba model is not supported with the inference optimized transformer."
+                )
 
         env = self._run_test(
             model_provider=model_provider,
@@ -987,6 +1017,7 @@ class TestDynamicInferenceEngine:
             expert_model_parallel_size=ep_size,
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            transformer_impl=transformer_impl,
         )
 
     @pytest.mark.internal
