@@ -330,6 +330,17 @@ class RerunStateMachine:
                 self._maybe_report_stats()
                 self.saved_results = defaultdict(list)
                 return False
+            will_continue_tensor: torch.Tensor = torch.tensor(
+                [self.continue_requested], dtype=torch.int32, device='cuda'
+            )
+            torch.distributed.all_reduce(will_continue_tensor)
+            if will_continue_tensor.item() > 0:
+                if _safe_get_rank() == 0:
+                    logger.warning(
+                        "Continuing normal execution because failed validation was not fatal"
+                    )
+                self.state = RerunState.NOT_RUNNING_YET
+                return False
             will_checkpoint_tensor: torch.Tensor = torch.tensor(
                 [self.checkpoint_requested], dtype=torch.int32, device="cuda"
             )
@@ -454,8 +465,8 @@ class RerunStateMachine:
                 the 2. The default implementation is for 0-dim float tensors.
             tolerance: tolerance used in combination with comparison_func to determine
                 reproducibility of results. Default is no tolerance (deterministic calculations).
-            fatal: whether to abort the job when no HW fault was identified (unexpected result is
-                reproducible and correct).
+            fatal: whether to abort the job when fault attribution is complete
+                (transient/permanent/not HW)
         Returns:
             None
 
@@ -532,11 +543,16 @@ class RerunStateMachine:
                 self.stats[caller].record(diff)
             return
 
-        def log_failure(message: str) -> None:
+        def log_failure(message: str, fatal: bool = True) -> None:
             rank: int = _safe_get_rank()
             node: str = os.uname()[1]
             device: int = torch.cuda.current_device()
-            logger.error(f"Rank {rank}, node {node}, device {device}: {message}!")
+            if fatal:
+                logger.error(f"Rank {rank}, node {node}, device {device}, "
+                             f"iteration #{self.current_iteration}: {message}!")
+            else:
+                logger.warning(f"Rank {rank}, node {node}, device {device}, "
+                               f"iteration #{self.current_iteration}: {message}!")
 
         # Emit message in log so that we can identify which jobs have this instrumentation
         # enabled. We do this from the validate_result() method because some jobs may run with
@@ -582,18 +598,24 @@ class RerunStateMachine:
             # This is the first re-run.
             if self.state == RerunState.RERUNNING_IN_PLACE:
                 if comparison > tolerance:
-                    logger.warning(
+                    if not fatal:
+                        self.continue_requested = True
+                    log_failure(
                         "First rerun: unexpected result is not reproducible within the tolerance "
-                        f"({result} != {self.initial_result})"
+                        f"({result} != {self.initial_result})", fatal=fatal
                     )
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.FIRST_RERUN_NOT_REPRODUCIBLE,
                         result=result,
                         message=message,
                     )
-                    log_failure("Possible transient error!")
+                    log_failure("Possible transient error!", fatal=fatal)
+
                 else:
-                    self.checkpoint_requested = True
+                    if fatal:
+                        self.checkpoint_requested = True
+                    else:
+                        self.continue_requested = True
                     # Remember the node and device we're running on so that we can check we're not
                     # rerunning on the same GPU when we resume from the checkpoint.
                     self.suspicious_node = os.uname()[1]
@@ -603,10 +625,10 @@ class RerunStateMachine:
                         result=result,
                         message=message,
                     )
-                    logger.warning(
+                    log_failure(
                         "First rerun: unexpected result is reproducible within the tolerance "
                         f"({result} = {self.initial_result}). "
-                        "Need to rerun on a different GPU to verify correctness"
+                        "Need to rerun on a different GPU to verify correctness.", fatal=fatal
                     )
             # This is the second re-run.
             elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
@@ -630,6 +652,8 @@ class RerunStateMachine:
                         f"therefore was likely incorrect ({result} != {self.initial_result})"
                     )
                     log_failure("Possible persistent error!")
+                    if not fatal:
+                        self.continue_requested = True
                 else:
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.SECOND_RERUN_REPRODUCIBLE,
