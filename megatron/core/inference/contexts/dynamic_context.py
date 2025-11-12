@@ -1146,6 +1146,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
 
+        # Reset request metadata.
+        self.request_metadata.fill_(0)
+
         # Reset token indexes.
         self.token_to_input_ids.fill_(0)
         self.token_to_pos_ids.fill_(0)

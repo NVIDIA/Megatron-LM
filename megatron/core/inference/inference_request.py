@@ -295,14 +295,7 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [
-            sp.temperature,
-            sp.top_k,
-            sp.top_p,
-            sp.termination_id,
-            sp.return_log_probs,
-            getattr(sp, "skip_prompt_log_probs_for_dynamic_inference", False),
-        ]
+        return [getattr(sp, field) for field in self.get_metadata_labels().keys()]
 
     @staticmethod
     def get_metadata_labels() -> Dict[str, int]:

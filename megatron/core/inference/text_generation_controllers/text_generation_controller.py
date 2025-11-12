@@ -218,6 +218,24 @@ class TextGenerationController:
         top_p: float,
         vocab_size: Optional[int] = None,
     ):
+        """Samples the logits to generate outputs
+
+        Given the logits of the last token, this function samples it
+        according to the parameters defined in sampling_params
+        and returns the samples. If sampling parameters top_n_logprobs > 0
+        at each step it also updates the top_n_logprobs dict.
+
+        Args:
+            last_token_logits (torch.Tensor): The last token logits. A tensor of
+                size [batch_size, vocab_size].
+            temperature (float): The temperature to use for sampling.
+            top_k (int): The top-k value to use for sampling.
+            top_p (float): The top-p value to use for sampling.
+            vocab_size (int): Obtained from the tokenizer. Defaults to None.
+
+        Returns:
+            sampled_logits (torch.Tensor): 1D tensor with [batch_size] elements
+        """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
         assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
