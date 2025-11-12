@@ -68,6 +68,7 @@ pre:create_ci_branches_dev:
       - branch: ci-dev-rebuild-mcore-nemo-image
       - branch: ci-dev-mr
       - branch: ci-dev-nightly
+      - branch: ci-dev-weekly
       - branch: ci-dev-upgrade-dependencies
   tags:
     - arch/amd64
