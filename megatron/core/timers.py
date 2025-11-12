@@ -297,7 +297,6 @@ class Timers:
                 rank_name_to_time[rank, i] = self._timers[name].elapsed(reset=reset)
 
         # See the note above for why we are not using gather.
-
         dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
 
         return rank_name_to_time
@@ -307,7 +306,9 @@ class Timers:
 
         rank_name_to_time = self._get_elapsed_time_all_ranks(names, reset, barrier)
         # Using Python built-in methods to avoid the overhead of PyTorch operations.
-        rank_name_to_time = rank_name_to_time.permute(1, 0).tolist() if rank_name_to_time is not None else None
+        rank_name_to_time = (
+            rank_name_to_time.permute(1, 0).tolist() if rank_name_to_time is not None else None
+        )
         name_to_min_max_time = {}
         for i, name in enumerate(names):
             # filter out the ones we did not have any timings for
@@ -432,7 +433,7 @@ class Timers:
         if rank is None:
             rank = torch.distributed.get_world_size() - 1
         if rank == torch.distributed.get_rank() and output_string is not None:
-            print(output_string, flush=True)
+            print(output_string, flush=True)  # pylint: disable=W0141
 
     def write(
         self,
