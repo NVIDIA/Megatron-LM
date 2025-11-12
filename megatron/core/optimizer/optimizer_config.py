@@ -8,7 +8,7 @@ import torch
 from ..utils import is_te_min_version
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParamKey:
     """Key to group parameters by. All such grouped parameters can share an
     optimizer config specification."""
