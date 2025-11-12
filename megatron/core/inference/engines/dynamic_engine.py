@@ -94,9 +94,6 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
-        static_sampling (bool): If True, all requests are assumed to have the same
-            sampling parameters. This avoids needing to loop through all requests and
-            their sampling parameters every generation step, improving latency.
         inference_logging_step_interval (int): The step interval at which to log
         inference metrics to wandb. Defaults to 0, which means no logging.
     """
@@ -110,7 +107,6 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
-        static_sampling: bool = False,
         inference_logging_step_interval: int = 0,
     ):
 
@@ -146,7 +142,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.paused = False
         self.stopped = False
         self.enable_chunked_prefill = enable_chunked_prefill
-        self.static_sampling = static_sampling
 
         self.inference_logging_step_interval = inference_logging_step_interval
         # Configure wandb to use separate step counter for inference metrics (only once)
@@ -456,6 +451,17 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
             )
+        if request.sampling_params.termination_id is None:
+            try:
+                eod = self.controller.tokenizer.eod
+            except AttributeError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Termination ID not specified, and tokenizer does not define eod."
+                        "Defaulting to not using termination id."
+                    )
+                eod = -1
+            request.sampling_params.termination_id = eod
 
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
@@ -655,37 +661,6 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 break
 
-    def get_active_sampling_map(self) -> List[Tuple[SamplingParams, List[int]]]:
-        """Gets a map of sampling methods to active requests indices in the context."""
-        # Get all active request IDs.
-        active_request_ids = self.context.request_ids[
-            self.context.paused_request_count : self.context.total_request_count
-        ].tolist()
-        if self.static_sampling:
-            return [(next(iter(self.requests.values())).sampling_params, active_request_ids)]
-
-        # Get a map from request_id to context array index.
-        context_id_map = {r: i for i, r in enumerate(active_request_ids)}
-
-        # Create map of sampling methods to context array indices.
-        sampling_map: List[Tuple[SamplingParams, List[int]]] = []
-        for request_id, request in self.requests.items():
-            if request_id not in context_id_map:
-                continue
-            context_id = context_id_map[request_id]
-            sp = request.sampling_params
-
-            # Look for a pre-existing group with these sampling parameters.
-            for sampling, indices in sampling_map:
-                if sampling == sp:
-                    indices.append(context_id)
-                    break
-            # If no group exists, create a new one.
-            else:
-                sampling_map.append((sp, [context_id]))
-
-        return sampling_map
-
     def schedule_chunked_prefill(self):
         """
         This function schedules chunked prefill requests.
@@ -781,8 +756,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # save the is_decode_only AFTER scheduling, BEFORE update
         self.is_decode_only = is_decode_only
         self.step_start_event.record()
-        sampling_map = self.get_active_sampling_map()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
