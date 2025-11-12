@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import statistics
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, cast
@@ -15,6 +16,7 @@ import pytest  # type: ignore[import]
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -27,6 +29,8 @@ from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+from .test_cases import PERFORMANCE_CASES, MoEPerformanceCase
+
 # NOTE: Performance regression threshold
 DEFAULT_MAX_REGRESSION_RATIO = 1.02
 DEFAULT_MAX_VARIANCE_RATIO = 0.02  # The std/mean should be less than 2%
@@ -36,146 +40,6 @@ MEASURE_ITERS = 20
 
 BASELINES_PATH = Path(__file__).resolve().parent / "baseline.json"
 UPDATE_BASELINES_ENV = "MEGATRON_UPDATE_PERF_BASELINES"
-
-
-@dataclass(frozen=True)
-class MoEModelConfig:
-    seq_length: int
-    micro_batch_size: int
-    hidden_size: int
-    moe_ffn_hidden_size: int
-    num_experts: int
-    router_topk: int
-    num_attention_heads: int = 8
-    moe_shared_expert_intermediate_size: Optional[int] = None
-
-    # Router related
-    moe_router_load_balancing_type: str = "aux_loss"
-    moe_router_num_groups: Optional[int] = None
-    moe_router_group_topk: Optional[int] = None
-    moe_router_score_function: str = "softmax"
-    moe_router_dtype: str = "fp32"
-    moe_router_enable_expert_bias: bool = False
-
-
-@dataclass(frozen=True)
-class MoEPerformanceCase:
-    """Describes a single MoE performance configuration to exercise."""
-
-    name: str
-    model: MoEModelConfig
-
-    # Token dispatcher related
-    token_dispatcher: str
-    moe_flex_dispatcher_backend: str = "deepep"
-
-    # FP8 related
-    fp8: bool = False
-
-    # Tested GPU platform
-    gpu_platform: str = "H100"
-
-    # Parallelism related
-    tensor_model_parallel_size: int = 1
-    pipeline_model_parallel_size: int = 1
-    expert_model_parallel_size: int = 1
-    context_parallel_size: int = 1
-    expert_tensor_parallel_size: int = 1
-
-    # kernel fusion related
-    moe_permute_fusion: bool = True
-    moe_router_fusion: bool = True
-
-    # Performance stability related
-    moe_router_force_load_balancing: bool = True
-    manual_gc: bool = True
-
-    @property
-    def input_dtype(self) -> torch.dtype:
-        return torch.bfloat16
-
-    def is_current_platform(self) -> bool:
-        if self.gpu_platform is None:
-            return True
-        device_name = torch.cuda.get_device_name(torch.cuda.current_device())
-        return self.gpu_platform.lower() in device_name.lower()
-
-
-MIXTRAL_PROXY = MoEModelConfig(
-    seq_length=4096,
-    micro_batch_size=1,
-    hidden_size=4096,
-    moe_ffn_hidden_size=14336,
-    num_experts=8,
-    router_topk=2,
-    moe_router_load_balancing_type="aux_loss",
-)
-
-DEEPSEEK_PROXY = MoEModelConfig(
-    seq_length=4096,
-    micro_batch_size=1,
-    hidden_size=7168,
-    moe_ffn_hidden_size=2048,
-    num_experts=64,
-    router_topk=8,
-    moe_router_load_balancing_type="seq_aux_loss",
-    moe_router_num_groups=8,
-    moe_router_group_topk=4,
-    moe_router_score_function="sigmoid",
-    moe_router_dtype="fp32",
-    moe_router_enable_expert_bias=True,
-    moe_shared_expert_intermediate_size=2048,
-)
-
-
-PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
-    MoEPerformanceCase(
-        name="mixtral_a2a_tp1ep8_bf16",
-        token_dispatcher="alltoall",
-        model=MIXTRAL_PROXY,
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=8,
-    ),
-    MoEPerformanceCase(
-        name="mixtral_deepep_tp1ep8_bf16",
-        token_dispatcher="flex",
-        moe_flex_dispatcher_backend="deepep",
-        model=MIXTRAL_PROXY,
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=8,
-    ),
-    # MoEPerformanceCase(
-    #     name="mixtral_hybridep_tp1ep8_bf16",
-    #     token_dispatcher="flex",
-    #     moe_flex_dispatcher_backend="hybridep",
-    #     model=MIXTRAL_PROXY,
-    #     tensor_model_parallel_size=1,
-    #     expert_model_parallel_size=8,
-    # ),
-    MoEPerformanceCase(
-        name="deepseek_a2a_tp1ep8_bf16",
-        token_dispatcher="alltoall",
-        model=DEEPSEEK_PROXY,
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=8,
-    ),
-    MoEPerformanceCase(
-        name="deepseek_deepep_tp1ep8_bf16",
-        token_dispatcher="flex",
-        moe_flex_dispatcher_backend="deepep",
-        model=DEEPSEEK_PROXY,
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=8,
-    ),
-    # MoEPerformanceCase(
-    #     name="deepseek_hybridep_tp1ep8_bf16",
-    #     token_dispatcher="flex",
-    #     moe_flex_dispatcher_backend="hybridep",
-    #     model=DEEPSEEK_PROXY,
-    #     tensor_model_parallel_size=1,
-    #     expert_model_parallel_size=8,
-    # ),
-)
 
 
 def _build_transformer_config(case: MoEPerformanceCase) -> TransformerConfig:
@@ -362,14 +226,16 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
         bwd_start = torch.cuda.Event(enable_timing=True)
         bwd_end = torch.cuda.Event(enable_timing=True)
 
-        fwd_start.record()
-        output, _ = layer(input_tensor)
-        fwd_end.record()
+        context = get_fp8_context(layer.config) if case.fp8 else nullcontext()
+        with context:
+            fwd_start.record()
+            output, _ = layer(input_tensor)
+            fwd_end.record()
 
-        loss = output.sum()
-        bwd_start.record()
-        loss.backward()
-        bwd_end.record()
+            loss = output.sum()
+            bwd_start.record()
+            loss.backward()
+            bwd_end.record()
 
         torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
@@ -453,7 +319,7 @@ def _check_dependencies(case: MoEPerformanceCase):
                 pytest.skip("HybridEP is not available")
 
 
-@pytest.mark.flaky(reruns=5)
+@pytest.mark.flaky(reruns=4)
 @pytest.mark.internal
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for MoE performance benchmarking"
@@ -502,14 +368,14 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
         # Only rank 0 checks the baseline
         if Utils.rank == 0 and not debug_mode:
             baselines = _load_baselines()
-            if os.getenv(UPDATE_BASELINES_ENV) == "1":
-                _maybe_update_baseline(perf_case, metrics, baselines)
-            else:
-                try:
+            try:
+                if os.getenv(UPDATE_BASELINES_ENV) == "1":
+                    _maybe_update_baseline(perf_case, metrics, baselines)
+                else:
                     _assert_within_baseline(perf_case.name, metrics, baselines)
-                except AssertionError as exc:
-                    baseline_failed = True
-                    baseline_failure_message = str(exc)
+            except AssertionError as exc:
+                baseline_failed = True
+                baseline_failure_message = str(exc)
 
         failure_tensor = torch.tensor(
             [1 if baseline_failed else 0],
@@ -548,7 +414,7 @@ if __name__ == "__main__":
     # torch.cuda.cudart().cudaProfilerStart()
     # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
     # for case in PERFORMANCE_CASES:
-    #     if case.name == "deepseek_deepep_tp1ep8_bf16":
+    #     if case.name == "mixtral_a2a_tp1ep8_fp8":
     #         test_moe_layer_performance(case, debug_mode=True)
     # torch.cuda.cudart().cudaProfilerStop()
     # torch.distributed.destroy_process_group()
