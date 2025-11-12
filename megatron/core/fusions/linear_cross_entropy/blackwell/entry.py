@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import typing
+from dataclasses import dataclass, field
 
 import cuda.bindings.driver as cuda  # type: ignore
 import cutlass
@@ -18,23 +19,25 @@ from megatron.core.fusions.linear_cross_entropy.blackwell import fwd_mainloop as
 from megatron.core.fusions.linear_cross_entropy.blackwell import triton as triton_kernels
 
 
+@dataclass
 class FwdConfig:
     """
     The configuration for the forward pass.
     """
 
-    _dedicated_stream: torch.cuda.Stream = None
-    _dedicated_events: typing.List[torch.cuda.Event] = list()
-    _initialized: bool = False
-    _fwd_mainloop_kernels: typing.Dict[str, cute.kernel] = dict()
+    _dedicated_stream: torch.cuda.Stream = field(default_factory=torch.cuda.Stream)
+    _dedicated_events: typing.List[torch.cuda.Event] = field(default_factory=list)
+    _initialized: bool = field(default=False)
+    _fwd_mainloop_kernels: typing.Dict[str, cute.kernel] = field(default_factory=dict)
 
 
+@dataclass
 class BwdConfig:
     """
     The configuration for the backward pass.
     """
 
-    _bwd_kernel: typing.Dict[str, cute.kernel] = dict()
+    _bwd_kernel: typing.Dict[str, cute.kernel] = field(default_factory=dict)
 
 
 _fwd_config = FwdConfig()
@@ -46,7 +49,7 @@ def forward(
     weight: torch.Tensor,
     labels: torch.Tensor,
     tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
-    reduction: str = "mean",
+    reduction: typing.Literal["none", "sum", "mean"] = "mean",
     ignore_index: int = -100,
     sequence_parallel: bool = False,
 ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, torch.Tensor]:
@@ -201,7 +204,7 @@ def forward(
             _logprobs,
             _logprobs.stride(0),
             logprobs,
-            triton.language.constexpr(REDUCTION),
+            triton.language.constexpr(REDUCTION.value),
         )
     else:
         _max_backup = _max.clone()
@@ -251,7 +254,7 @@ def forward(
             accumulate,
             accumulate.stride(0),
             logprobs,
-            REDUCTION,
+            REDUCTION.value,
         )
 
     return logprobs, maximum, accumulate, num_valid_tokens, tp_rank, tp_world_size, global_hidden
@@ -265,7 +268,7 @@ def backward(
     maximum: torch.Tensor,
     accu: torch.Tensor,
     num_valid_tokens: torch.Tensor,
-    reduction: str = "mean",
+    reduction: typing.Literal["none", "sum", "mean"] = "mean",
     ignore_index: int = -100,
     tp_group: typing.Optional[dist.ProcessGroup] = None,
     tp_rank: int = 0,
@@ -334,7 +337,7 @@ def backward(
         key = f"vocab_size:{vocab_size}+dim:{dim}+reduction:{REDUCTION}+dtype:{hidden_view.dtype}"
         if _bwd_config._bwd_kernel.get(key) is None:
             bwd_kernel = bwd_partial_dlogits.BwdPartialDlogits(
-                reduction=REDUCTION, vocab_per_split=vocab_per_split
+                reduction=REDUCTION.value, vocab_per_split=vocab_per_split
             )
             bwd_kernel_compiled = cute.compile(
                 bwd_kernel,
