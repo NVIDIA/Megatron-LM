@@ -216,7 +216,6 @@ class TestDynamicInferenceEngine:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
-        pp_layer_offset: int = 0,
         layer_type_list: Optional[List[str]] = None,
         mamba_conv_states_shape: Optional[Tuple[int]] = None,
         mamba_ssm_states_shape: Optional[Tuple[int]] = None,
@@ -226,7 +225,8 @@ class TestDynamicInferenceEngine:
         # Inference context.
         context = DynamicInferenceContext(
             params_dtype=transformer_config.params_dtype,
-            num_layers=transformer_config.num_layers,
+            num_layers=transformer_config.num_layers
+            // transformer_config.pipeline_model_parallel_size,
             kv_channels=transformer_config.kv_channels,
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=test_config.max_sequence_length,
@@ -239,8 +239,6 @@ class TestDynamicInferenceEngine:
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
-            pp_layer_offset=pp_layer_offset,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,
@@ -377,7 +375,6 @@ class TestDynamicInferenceEngine:
 
         # Layer type list for hybrid models
         decoder = get_attr_wrapped_model(model, "decoder")
-        pp_layer_offset = getattr(decoder, "pp_layer_offset", 0)
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if test_config.model_provider == "mamba":
             mamba_states_shapes = decoder.mamba_state_shapes_per_request()
@@ -408,7 +405,6 @@ class TestDynamicInferenceEngine:
             test_config=test_config,
             transformer_config=transformer_config,
             requests=requests,
-            pp_layer_offset=pp_layer_offset,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,

@@ -31,6 +31,7 @@ async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
     port: int,
+    mp_port: int,
     sampling_params: SamplingParams | None = None,
 ):
     if sampling_params is not None:
@@ -43,7 +44,9 @@ async def main(
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
     await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=port, launch_inference_coordinator=True
+        inference_coordinator_port=port,
+        inference_mp_coordinator_port=mp_port,
+        launch_inference_coordinator=True
     )
     # if you want to use your own inference coordinator -
     # 1. set launch_inference_coordinator to False
@@ -152,7 +155,6 @@ if __name__ == "__main__":
 
         # Layer type list for hybrid models
         decoder = get_attr_wrapped_model(model, "decoder")
-        pp_layer_offset = getattr(decoder, "pp_layer_offset")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (
@@ -166,7 +168,6 @@ if __name__ == "__main__":
             None,
             None,
             calculate_max_sequence_length_from_requests=False,
-            pp_layer_offset=pp_layer_offset,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,
@@ -189,4 +190,11 @@ if __name__ == "__main__":
             print(setup_prefix)
             print("~~~")
 
-        asyncio.run(main(engine, requests, args.inference_coordinator_port))
+        asyncio.run(
+            main(
+                engine,
+                requests,
+                args.inference_coordinator_port,
+                args.inference_mp_coordinator_port
+            )
+        )

@@ -207,7 +207,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     Args:
         params_dtype (torch.dtype): Dtype used for KV cache.
-        num_layers (int): Number of layers.
+        num_layers (int): Number of layers on this pipeline parallel rank.
         kv_channels (int): Hidden dimension per attention head.
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
@@ -269,8 +269,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
-        pipeline_model_parallel_size: Optional[int] = None,
-        pp_layer_offset: int = 0,
         cache_mla_latent: bool = False,
         kv_lora_rank: Optional[int] = None,
         qk_pos_emb_head_dim: Optional[int] = None,
@@ -303,12 +301,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
-        if pipeline_model_parallel_size is None:
-            pp_size = parallel_state.get_pipeline_model_parallel_size()
-        else:
-            pp_size = pipeline_model_parallel_size
-        self.pp_layer_offset = pp_layer_offset
-
         # Mamba states.
         self.is_hybrid_model = layer_type_list is not None and Symbols.MAMBA in layer_type_list
         if self.is_hybrid_model:
@@ -333,12 +325,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
-            assert (
-                num_layers % pp_size == 0,
-                f"Model has {num_layers} attention layers which is not a multiple of "
-                f"pipeline parallel size {pp_size}",
-            )
-            self.num_attention_layers = num_layers // pp_size
+            self.num_attention_layers = num_layers
             self.num_mamba_layers = 0
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
@@ -781,7 +768,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
-        layer_number -= self.pp_layer_offset
         attention_layer_number = self.layer_map[layer_number - 1]
 
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
@@ -833,8 +819,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer.
         """
-        layer_number -= self.pp_layer_offset
         attention_layer_number = self.layer_map[layer_number - 1]
+
         if self.cache_mla_latent:
             return (
                 self.memory_buffer[attention_layer_number],
@@ -852,7 +838,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns the Mamba state tensors for the given layer."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
 
-        layer_number -= self.pp_layer_offset
         mamba_layer_number = self.layer_map[layer_number - 1]
         conv_state = self.mamba_conv_states[mamba_layer_number]
         ssm_state = self.mamba_ssm_states[mamba_layer_number]

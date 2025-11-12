@@ -80,6 +80,9 @@ class TestTextGenerationController:
             fp8="hybrid" if fp8 else None,
             fp8_recipe="tensorwise" if fp8 else None,
             fp8_param=fp8,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            pipeline_dtype=dtype,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -112,7 +115,7 @@ class TestTextGenerationController:
         else:
             inference_context = DynamicInferenceContext(
                 params_dtype=dtype,
-                num_layers=transformer_config.num_layers,
+                num_layers=transformer_config.num_layers // pipeline_model_parallel_size,
                 kv_channels=transformer_config.kv_channels,
                 num_attention_heads=transformer_config.num_attention_heads,
                 max_sequence_length=2048,

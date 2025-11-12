@@ -294,7 +294,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
-        self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
+        self,
+        inference_coordinator_port: int,
+        inference_mp_coordinator_port: int = 20000,
+        launch_inference_coordinator: bool = True,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -311,7 +314,7 @@ class DynamicInferenceEngine(AbstractEngine):
         2.  **MP Workers (all other ranks)**: These ranks use ZMQ `SUB` (subscriber)
             sockets to listen for requests broadcast by their local MP Coordinator.
 
-        This architecture uses TPC sockets for both inter-node and intra-node broadcasts
+        This architecture uses TCP sockets for both inter-node and intra-node broadcasts
         within an MP group.
 
         Finally, after setting up the communication channels and ensuring all ranks
@@ -321,6 +324,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             inference_coordinator_port (int): The network port where the central
                 `InferenceCoordinator` is or will be listening.
+            inference_mp_coordinator_port (int): The base network port where each model parallel
+                coordinator will broadcast messages from. Each MP group will compute an independent
+                port offset from this base port.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
@@ -368,12 +374,10 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         bcast_hostname = hostname_list[0]
 
-        # We need unique ports for each DP group, so we use a high base
-        # port and offset by DP rank.
+        # We need unique ports for each MP group, so we compute an offset using the DP rank.
         dp_rank = parallel_state.get_data_parallel_rank()
-        base_bcast_port = 20000  # Base port for intra-DP communication
-        req_port = base_bcast_port + (dp_rank * 2)
-        len_port = base_bcast_port + (dp_rank * 2) + 1
+        req_port = inference_mp_coordinator_port + (dp_rank * 2)
+        len_port = inference_mp_coordinator_port + (dp_rank * 2) + 1
 
         ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
         identity = f'mp-coord-{parallel_state.get_data_parallel_rank()}'

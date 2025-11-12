@@ -147,11 +147,13 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        transformer_layer_offset: int = 0,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
+        self.transformer_layer_offset = transformer_layer_offset
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -431,17 +433,23 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
-            inference_context.append_key_value_cache(self.layer_number, key, value)
+            inference_context.append_key_value_cache(
+                self.layer_number - self.transformer_layer_offset, key, value
+            )
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
             if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
-                kv_cache, _, block_table = inference_context.key_value_cache(self.layer_number)
+                kv_cache, _, block_table = inference_context.key_value_cache(
+                    self.layer_number - self.transformer_layer_offset
+                )
                 # Uncompress the KV cache for prefill/mixed mode
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
-                key, value, block_table = inference_context.key_value_cache(self.layer_number)
+                key, value, block_table = inference_context.key_value_cache(
+                    self.layer_number - self.transformer_layer_offset
+                )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
@@ -953,6 +961,7 @@ class SelfAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        transformer_layer_offset: int = 0,
     ):
         super().__init__(
             config=config,
@@ -962,6 +971,7 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            transformer_layer_offset=transformer_layer_offset,
         )
 
         self.linear_qkv = build_module(
@@ -1161,6 +1171,7 @@ class CrossAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
+        transformer_layer_offset: int = 0,
     ):
         super().__init__(
             config=config,
@@ -1170,6 +1181,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            transformer_layer_offset=transformer_layer_offset,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:

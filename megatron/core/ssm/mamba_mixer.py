@@ -153,6 +153,7 @@ class MambaMixer(MegatronModule):
         headdim=None,
         ngroups=None,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: int = 0,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -174,6 +175,7 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
@@ -440,7 +442,7 @@ class MambaMixer(MegatronModule):
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
+        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         # Fast path: decode-only
         if context.is_decode_only():
