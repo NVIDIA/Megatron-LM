@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import types
-import warnings
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +34,7 @@ from megatron.core.utils import (
 )
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.dist_signal_handler import SIGNAL_MAP
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -2171,7 +2171,10 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if signal is received')
+    group.add_argument('--exit-signal', type=str, default='SIGTERM',
+                       choices=list(SIGNAL_MAP.keys()),
+                       help='Signal to use for exit signal handler. If not specified, defaults to SIGTERM.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',

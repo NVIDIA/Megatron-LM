@@ -3,6 +3,12 @@ import signal
 
 import torch
 
+SIGNAL_MAP = {
+    'SIGTERM': signal.SIGTERM,
+    'SIGINT': signal.SIGINT,
+    'SIGUSR1': signal.SIGUSR1,
+    'SIGUSR2': signal.SIGUSR2
+}
 
 def get_world_size():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -49,8 +55,8 @@ def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
 
 
 class DistributedSignalHandler:
-    def __init__(self, sig=signal.SIGTERM):
-        self.sig = sig
+    def __init__(self, sig: str = 'SIGTERM'):
+        self.sig = SIGNAL_MAP.get(sig, signal.SIGTERM)
 
     def signals_received(self):
         all_received = all_gather_item(

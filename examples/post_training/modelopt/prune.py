@@ -20,6 +20,7 @@ import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
 
+from megatron.core.parallel_state import get_pipeline_model_parallel_group, get_tensor_model_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
@@ -92,6 +93,21 @@ def add_prune_args(parser):
         help="Prune dimension of Mamba attention heads to this value",
     )
     group.add_argument(
+        "--target-num-moe-experts",
+        type=int,
+        help="Prune number of MoE experts to this value",
+    )
+    group.add_argument(
+        "--target-moe-ffn-hidden-size",
+        type=int,
+        help="Prune MoE FFN hidden size to this value",
+    )
+    group.add_argument(
+        "--target-moe-shared-expert-intermediate-size",
+        type=int,
+        help="Prune MoE shared expert intermediate size to this value",
+    )
+    group.add_argument(
         "--target-num-layers",
         type=int,
         help="Prune number of transformer layers to this value based on "
@@ -103,6 +119,12 @@ def add_prune_args(parser):
         metavar="N",
         nargs="*",
         help="Drop specific model layers (1-indexed). Cannot be used with rest of the pruning options",
+    )
+    group.add_argument(
+        "--pruning-scores-path",
+        type=str,
+        default=None,
+        help="Path to the cache and reuse pruning scores for pruning again to different params",
     )
     add_modelopt_args(parser)
     return parser
@@ -123,6 +145,14 @@ def get_calib_dataloader(calib_size=1024, max_sequence_length=512):
     calib_size = min(len(dataset), calib_size)
     for i in range(calib_size):
         yield dataset[i][text_column][:max_sequence_length]
+
+
+def get_params(model):
+    params = sum(p.numel() for p in model.parameters())
+    reduced_params = torch.Tensor([params]).to(device=next(model.parameters()).device)
+    torch.distributed.all_reduce(reduced_params, group=get_pipeline_model_parallel_group())
+    torch.distributed.all_reduce(reduced_params, group=get_tensor_model_parallel_group())
+    return reduced_params.item()
 
 
 if __name__ == "__main__":
@@ -181,7 +211,7 @@ if __name__ == "__main__":
             simple_generate(model, tokens.input_ids.cuda(), osl=1)
 
     if args.layers_to_drop:
-        mtp.plugins.drop_mcore_language_model_layers(model, layers_to_drop=args.layers_to_drop)
+        mtp.mcore_minitron.drop_mcore_language_model_layers(model, layers_to_drop=args.layers_to_drop)
     else:
         print_rank_0("Pruning model...")
         export_config = {
@@ -189,18 +219,22 @@ if __name__ == "__main__":
             for k in SUPPORTED_HPARAMS
             if getattr(args, f"target_{k}", None) is not None
         }
+        config = {"forward_loop": _hf_dataset_forword_loop_func}
+        if args.pruning_scores_path is not None:
+            config["scores_path"] = args.pruning_scores_path
         mtp.prune(
             unwrapped_model,
             mode="mcore_minitron",
             constraints={"export_config": export_config},
             dummy_input=None,  # Not used
-            config={"forward_loop": _hf_dataset_forword_loop_func},
+            config=config,
         )
         # [WAR till modelopt 0.39]: Remove prune state to avoid converting again on restore which forces TP=1.
         if mto.ModeloptStateManager.has_state_for_mode_type("prune", model=unwrapped_model):
             mto.ModeloptStateManager.remove_state(unwrapped_model)
 
     print_rank_0(f"Pruned Model:\n {unwrapped_model}")
+    print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model)/1e9:.2f}B")
 
     _custom_prompt_forward_loop_func(unwrapped_model)
 
