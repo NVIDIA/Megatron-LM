@@ -3497,15 +3497,13 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
 
         def override_sharded_param_to_function_closure(p, to_function):
             def override_sharded_param_to_function(*args, **kwargs):
-                bucket_id = all_gather_pipeline.buffer.param_to_param_group[p]
-                status = all_gather_pipeline.bucket_status[bucket_id]
-                if status == BucketStatus.READY_TO_USE:
-                    return to_function(*args, **kwargs)
-                raise RuntimeError(
-                    "This parameter is already shard by MCore FSDP and the "
-                    "shared-state parameter does not support 'to' function."
-                    "please define the dtype and device of the parameter before FSDP wrap."
-                )
+                if p._typed_storage()._size() == 0:
+                    warnings.warn(
+                        "The parameter may be sharded by Megatron-FSDP, "
+                        "no actual 'to' operation is performed."
+                    )
+                    return torch.empty([])
+                return to_function(*args, **kwargs)
 
             return override_sharded_param_to_function
 
@@ -3513,15 +3511,13 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
 
         def override_sharded_param_cpu_function_closure(p, cpu_function):
             def override_sharded_param_cpu_function(*args, **kwargs):
-                bucket_id = all_gather_pipeline.buffer.param_to_param_group[p]
-                status = all_gather_pipeline.bucket_status[bucket_id]
-                if status == BucketStatus.READY_TO_USE:
-                    return cpu_function(*args, **kwargs)
-                warnings.warn(
-                    "The parameters are sharded by MCore FSDP, and no actual cpu "
-                    "operation is performed."
-                )
-                return torch.empty([], device="cpu")
+                if p._typed_storage()._size() == 0:
+                    warnings.warn(
+                        "The parameter may be sharded by Megatron-FSDP, "
+                        "no actual 'cpu' operation is performed."
+                    )
+                    return torch.empty([], device="cpu")
+                return cpu_function(*args, **kwargs)
 
             return override_sharded_param_cpu_function
 
