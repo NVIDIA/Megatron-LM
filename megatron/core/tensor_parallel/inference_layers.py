@@ -36,7 +36,7 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
         eps,
         None,
         None,
-        TE_DType[torch.bfloat16],
+        TE_DType[x.dtype],
         16,  # sm-margin
         False,  # zero centered gamma
     )
@@ -90,7 +90,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires transformer engine"
+            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -145,7 +145,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         if self.tp_size > 1:
             assert (
                 config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires transformer engine"
+            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
