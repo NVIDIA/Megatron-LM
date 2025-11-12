@@ -1154,7 +1154,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     await self._cond.wait_for(
                         lambda: self.context.get_active_request_count() > 0
                         or self.waiting_request_ids
-                        or self.paused
                     )
                 if not self.stopped and not self.paused:
                     await self.async_step(verbose=verbose)
