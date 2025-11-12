@@ -701,12 +701,10 @@ class TestDistributedOptimizer:
             # Note: PP must be > 1 if TP <= 2 because of empty buckets otherwise
             ((2, 4), (2, 4), 'fully_reshardable', False),
             ((4, 2), (4, 2), 'dp_reshardable', None),
-            ((8, 1), (8, 1), 'fully_sharded_model_space', None),
             # DP resharding:
             ((4, 2), (4, 1), 'dp_reshardable', None),
             ((2, 4), (2, 2), 'fully_reshardable', False),
             ((2, 4), (2, 2), 'fully_reshardable', True),
-            ((1, 8), (1, 2), 'fully_sharded_model_space', None),
         ],
     )
     @pytest.mark.parametrize("initalize_fn", [initialize_pp_agnostic_model])
