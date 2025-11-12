@@ -2176,10 +2176,6 @@ def _add_training_args(parser):
                        dest='bias_swiglu_fusion')
     group.add_argument('--use-fused-weighted-squared-relu', action='store_true',
                        help='Use fused weighted squared relu when using MoE.')
-    group.add_argument('--linear-cross-entropy-fusion', action='store_true',
-                       help='Enable fusion of linear layer and cross entropy '
-                       'loss calculation.',
-                       dest='linear_cross_entropy_fusion')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
@@ -2195,7 +2191,7 @@ def _add_training_args(parser):
                        help='Enabled fusion of cross entropy loss calculation.',
                        dest='cross_entropy_loss_fusion')
     group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
-                       choices=['native', 'te'],
+                       choices=['native', 'te', 'linear'],
                        help='Implementation of cross entropy loss calculation.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '

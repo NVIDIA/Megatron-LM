@@ -147,7 +147,10 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: Loss tensor of dimensions [batch size, sequence_length].
         """
-        if self.config.linear_cross_entropy_fusion:
+        if (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == 'linear'
+        ):
             assert (
                 weight is not None
             ), "weight cannot be None when using fused linear cross entropy."

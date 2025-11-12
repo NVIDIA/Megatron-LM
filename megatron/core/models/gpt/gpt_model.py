@@ -613,7 +613,7 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        if has_config_logger_enabled(self.config) or labels is not None:
+        if has_config_logger_enabled(self.config) or labels is None:
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
