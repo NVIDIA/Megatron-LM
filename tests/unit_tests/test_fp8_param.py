@@ -146,7 +146,6 @@ class TestFP8Param:
         if use_cuda_graph:
             args.cuda_graph_impl = "transformer_engine"
             args.cuda_graph_warmup_steps = 0
-            args.use_te_rng_tracker = args.cuda_graph_impl != "none"
 
         for key, value in kwargs.items():
             assert hasattr(args, key)
@@ -196,6 +195,7 @@ class TestFP8Param:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
