@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import types
-import warnings
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +34,7 @@ from megatron.core.utils import (
 )
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.dist_signal_handler import SIGNAL_MAP
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1319,9 +1319,13 @@ def _add_transformer_engine_args(parser):
                        dest='fp8')
     # per tensor current scaling recipe selection
     group.add_argument('--fp8-recipe', default='delayed',
-                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise', 'custom'],
                        help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
                        dest='fp8_recipe')
+    group.add_argument('--fp8-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp8_quantizer_factory')
     # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
@@ -1358,9 +1362,13 @@ def _add_transformer_engine_args(parser):
                        help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
                        dest='fp4')
     group.add_argument('--fp4-recipe', default='nvfp4',
-                       choices=['nvfp4'],
+                       choices=['nvfp4', 'custom'],
                        help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
                        dest='fp4_recipe')
+    group.add_argument('--fp4-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
@@ -2163,7 +2171,10 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if signal is received')
+    group.add_argument('--exit-signal', type=str, default='SIGTERM',
+                       choices=list(SIGNAL_MAP.keys()),
+                       help='Signal to use for exit signal handler. If not specified, defaults to SIGTERM.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
