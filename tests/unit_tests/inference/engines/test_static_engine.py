@@ -1,5 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import asyncio
 import random
 import string
@@ -51,7 +49,7 @@ class StaticInferenceEngineTestHarness:
 
         model_parallel_cuda_manual_seed(123)
         self.batch_size = 4
-        self.hidden_size = 32
+        self.hidden_size = 12
         self.vocab_size = vocab_size
         self.sequence_length = 64
         transformer_config = TransformerConfig(

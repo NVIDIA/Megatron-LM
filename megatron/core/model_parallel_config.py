@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from dataclasses import dataclass
 from typing import Callable, ContextManager, Optional
 

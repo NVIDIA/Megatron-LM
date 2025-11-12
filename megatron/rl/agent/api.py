@@ -1,14 +1,13 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
-from typing import Generic, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
 
-from ..__init__ import Request, TypeLookupable
+from ..__init__ import Request, trace_async_exceptions
 from ..inference import (
     ChatInferenceInterface,
     ChatInferenceRequest,
@@ -17,8 +16,6 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-
-from megatron.core.utils import trace_async_exceptions
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -88,22 +85,9 @@ class EvaluationRequest(Request):
     validation: bool = True
 
 
-class EvaluationResult(AgentBaseModel):
-    prompt: str | list[LLMChatMessage]
-    response: str | LLMChatMessage
-
-
-class RewardEvaluationResult(EvaluationResult):
-    reward: float
-    problem_id: str | None = None
-
-
-T = TypeVar('T', bound=EvaluationResult)
-
-
-class EvaluationResponse(AgentBaseModel, TypeLookupable, Generic[T]):
+class EvaluationResponse(AgentBaseModel):
     env_id: str | None = None
-    results: list[T]
+    results: list[AgentBaseModel]
 
     def metrics(self):
         raise NotImplementedError(f"{type(self)} did not provide metric aggregation.")
@@ -194,7 +178,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        @trace_async_exceptions(verbose=True)
+        @trace_async_exceptions
         async def group_task():
             nonlocal submitted_groups
             while request.num_groups == -1 or submitted_groups < request.num_groups:

@@ -26,7 +26,6 @@ DATASET_DIR=""
 TIME="1:00:00"
 RECIPES_DIR="tests/test_utils/recipes"
 CONTAINER_MOUNTS=""
-NO_GPUS_PER_TASK="FALSE"
 
 # Declare associative array for tracking unique mounts
 declare -A seen_mounts
@@ -54,10 +53,6 @@ while [[ $# -gt 0 ]]; do
         TIME="$2"
         shift 2
         ;;
-    --no-gpus-per-task)
-        NO_GPUS_PER_TASK="TRUE"
-        shift 1
-        ;;
     --help)
         print_usage
         exit 0
@@ -69,6 +64,12 @@ while [[ $# -gt 0 ]]; do
         ;;
     esac
 done
+
+# Check if yq is installed
+if ! command -v yq &>/dev/null; then
+    echo "Error: yq is not installed. Please install it first."
+    exit 1
+fi
 
 # Validate required arguments
 if [ -z "$PARTITION" ] || [ -z "$SLURM_ACCOUNT" ] || [ -z "$IMAGE" ] || [ -z "$DATASET_DIR" ]; then
@@ -88,7 +89,7 @@ SRUN_CMD="srun \
     --container-workdir=/opt/megatron-lm \
     --container-mounts=$CONTAINER_MOUNTS \
     --nodes=1 \
-    $(if [ "$NO_GPUS_PER_TASK" = "FALSE" ]; then echo "--gpus-per-task=8"; fi) \
+    --gpus-per-task=8 \
     --time=$TIME \
     --pty bash"
 

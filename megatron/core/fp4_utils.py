@@ -7,7 +7,6 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core.enums import Fp4Recipe
-from megatron.core.fp8_utils import _get_custom_recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -71,11 +70,9 @@ if HAVE_TE:
                         Transformer Engine. Please make sure you are using TE version 
                         >= 2.7.0.dev0."""
                     )
-            elif config.fp4_recipe == Fp4Recipe.custom:
-                fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
             else:
                 raise ValueError(
-                    "NVFP4BlockScaling and custom are the only supported FP4 recipes. "
+                    "NVFP4BlockScaling is the only supported FP4 recipe. "
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:

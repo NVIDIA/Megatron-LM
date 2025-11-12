@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
 import warnings
@@ -17,7 +17,6 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -102,6 +101,7 @@ class StaticInferenceEngine(AbstractEngine):
                     buffer_size_gb=buffer_size_gb,
                     num_cuda_graphs=1,
                 )
+                termination_id = self.controller.tokenizer.eod
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
                 self.controller.inference_wrapped_model.prep_model_for_inference()
 
@@ -109,8 +109,8 @@ class StaticInferenceEngine(AbstractEngine):
                     controller=self.controller,
                     random_seed=self.random_seed,
                     context=dynamic_context,
+                    termination_id=termination_id,
                     enable_cuda_graph=True,
-                    static_sampling=True,
                 )
         except Exception as e:
             # Get exception details for better debugging
@@ -218,6 +218,11 @@ class StaticInferenceEngine(AbstractEngine):
             generated tokens, texts and log probs if required
         """
         assert hasattr(self, 'dynamic_engine'), "Dynamic engine not initialized"
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 'RuntimeError: There is no current event loop...'
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
         if common_inference_params:
             sampling_params = common_inference_params
@@ -381,8 +386,8 @@ class StaticInferenceEngine(AbstractEngine):
         torch.cuda.set_device(cuda_device)
         self.run_engine()
 
-    async def run_engine_async(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    async def run_engine_async(self):
         """Runs the engine asynchronously using asyncio"""
-        loop = get_asyncio_loop(loop)
+        loop = asyncio.get_running_loop()
 
         await loop.run_in_executor(None, self._wrapped_run_engine, torch.cuda.current_device())

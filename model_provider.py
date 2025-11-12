@@ -11,7 +11,8 @@ from megatron.core.models.mamba import MambaModel
 from megatron.training import get_args, print_rank_0
 
 try:
-    from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+    from megatron.post_training.model_provider import model_provider as model_provider_modelopt
+
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
@@ -33,10 +34,14 @@ def model_provider(
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to compute output logits/loss. Defaults to True.
 
+
     Returns:
         Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]: The returned model
     """
     args = get_args()
+
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        return model_provider_modelopt(pre_process, post_process)
 
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(
@@ -59,10 +64,6 @@ def model_provider(
             )
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):
-        # [ModelOpt]: Use custom builder + spec when modelopt is enabled
-        model_builder = modelopt_gpt_mamba_builder
 
     return model_builder(args, pre_process, post_process, vp_stage)
 
