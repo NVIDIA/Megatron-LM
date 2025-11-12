@@ -1409,8 +1409,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
-    if args.qk_clip:
-        log_max_attention_logit = clip_qk(model)
+    if args.qk_clip or args.log_max_attention_logit:
+        log_max_attention_logit = clip_qk(model, log_only=not args.qk_clip)
             
     timers('optimizer').stop()
 

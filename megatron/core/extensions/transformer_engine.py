@@ -990,7 +990,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        if config.qk_clip:
+        if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
             assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
 
@@ -1068,7 +1068,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **packed_seq_kwargs,
             )
 
-            if self.config.qk_clip:
+            if self.config.qk_clip or self.config.log_max_attention_logit:
                 # qk-clip is only supported in TE 2.9.0 and later
                 assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
 

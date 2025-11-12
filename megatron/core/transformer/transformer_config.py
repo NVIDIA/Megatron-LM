@@ -202,6 +202,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_clip_threshold: float = 100
     """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
 
+    log_max_attention_logit: bool = False
+    """Whether to log the max attention logit, decoupled from qk-clip."""
+
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
