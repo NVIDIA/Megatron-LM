@@ -137,22 +137,22 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
 
 def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
     """Helper to print types of (nested) dict values."""
-    print_indent = lambda: print(" " * indent * len(prefix), end="")  # pylint: disable=bad-builtin
+    print_indent = lambda: print(" " * indent * len(prefix), end="")
     if isinstance(x, dict):
-        print()  # pylint: disable=bad-builtin
+        print()
         for k, v in x.items():
-            print_indent()  # pylint: disable=bad-builtin
-            print(f"> {k}: ", end="")  # pylint: disable=bad-builtin
+            print_indent()
+            print(f"> {k}: ", end="")
             inspect_types(v, prefix + (k,), indent)
     elif isinstance(x, list):
-        print()  # pylint: disable=bad-builtin
+        print()
         for i, v in enumerate(x):
-            print_indent()  # pylint: disable=bad-builtin
-            print(f"- {i}: ", end="")  # pylint: disable=bad-builtin
+            print_indent()
+            print(f"- {i}: ", end="")
             inspect_types(v, prefix + (i,), indent)
     else:
         if isinstance(x, torch.Tensor):
-            print(f"Tensor of shape {x.shape}")  # pylint: disable=bad-builtin
+            print(f"Tensor of shape {x.shape}")
         else:
             try:
                 x_str = str(x)
@@ -160,7 +160,7 @@ def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
                 x_str = "<no string repr>"
             if len(x_str) > 30:
                 x_str = x_str[:30] + "... (truncated)"
-            print(f"[{type(x)}]: {x_str}")  # pylint: disable=bad-builtin
+            print(f"[{type(x)}]: {x_str}")
 
 
 def nested_values(x: Union[dict, list]):
@@ -226,7 +226,6 @@ def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, in
             else:
                 x1[k] = merge(x1[k], v2, key=key + (k,))
     elif isinstance(x1, list) and isinstance(x2, list):
-        # For LayerWiseDistributedOptimizer, we may have empty lists in the state dict.
         if len(x1) != len(x2):
             raise ValueError(
                 f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "

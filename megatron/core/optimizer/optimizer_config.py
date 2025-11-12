@@ -146,8 +146,8 @@ class OptimizerConfig:
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
-    muon_extra_scale_factor: float = 0.2
-    """Additional scale factor for the muon update. Defaults to 0.2."""
+    muon_extra_scale_factor: float = 1.0
+    """Additional scale factor for the muon update."""
 
     #######################
     # Distributed optimizer
