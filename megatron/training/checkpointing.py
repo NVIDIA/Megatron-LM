@@ -1021,7 +1021,7 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness, layerwise_dist_opt=args.optimizer == 'dist_muon')
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 

@@ -64,6 +64,7 @@ def load(
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
+    layerwise_dist_opt: bool = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -160,7 +161,7 @@ def load(
 
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
-    merge(common_state_dict, loaded_state_dict)
+    merge(common_state_dict, loaded_state_dict, layerwise_dist_opt=True)
 
     loaded_state_dict = apply_factory_merges(common_state_dict, sh_ten_factories)
 
