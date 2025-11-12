@@ -1,10 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from dataclasses import dataclass
+import typing
+from enum import Enum
 
 
-@dataclass
-class EntropyReductionEnum:
+class EntropyReductionEnum(Enum):
     """
     Enum for the reduction method of cross entropy.
     """
@@ -14,7 +14,7 @@ class EntropyReductionEnum:
     kMean = 2
 
 
-def str_to_reduction_enum(reduction: str) -> int:
+def str_to_reduction_enum(reduction: typing.Literal["none", "sum", "mean"]) -> EntropyReductionEnum:
     """
     str -> EntropyReductionEnum
     """
@@ -30,8 +30,7 @@ def str_to_reduction_enum(reduction: str) -> int:
     return _enum
 
 
-@dataclass
-class BackwardMethodEnum:
+class BackwardMethodEnum(Enum):
     """
     Enum for the backward method of linear cross entropy.
     """

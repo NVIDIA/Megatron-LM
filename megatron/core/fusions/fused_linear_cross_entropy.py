@@ -63,7 +63,7 @@ class LinearCrossEntropy(torch.autograd.Function):
         weight: torch.Tensor,
         labels: torch.Tensor,
         tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
-        reduction: str = "mean",
+        reduction: typing.Literal["none", "sum", "mean"] = "mean",
         ignore_index: int = -100,
         sequence_parallel: bool = False,
     ) -> torch.Tensor:
@@ -216,7 +216,7 @@ def linear_cross_entropy(
     weight: torch.Tensor,
     labels: torch.Tensor,
     tp_group: typing.Optional[torch.distributed.ProcessGroup] = None,
-    reduction: str = "mean",
+    reduction: typing.Literal["none", "sum", "mean"] = "mean",
     ignore_index: int = -100,
     sequence_parallel: bool = False,
 ) -> torch.Tensor:

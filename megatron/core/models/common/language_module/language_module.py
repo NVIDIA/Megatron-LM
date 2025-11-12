@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -134,7 +134,7 @@ class LanguageModule(MegatronModule):
         sequence_parallel_enabled: bool = False,
         column_parallel_linear: torch.nn.Module = None,
         col_linear_kwargs: Dict[str, Any] = {},
-        reduction: str = "none",
+        reduction: Literal["none", "sum", "mean"] = "none",
         ignore_index: int = -100,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Computes the language model logits and loss (Cross entropy across vocabulary)
