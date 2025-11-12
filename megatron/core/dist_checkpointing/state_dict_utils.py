@@ -43,6 +43,14 @@ def save_preprocess(
     sharded_part = filter_out_empty_flatten_tensor(sharded_part)
     if validate_access_integrity:
         preprocessed_common_state_dict = common_state_dict
+        # M4 clean up dp_cp_group from metadata
+        from megatron.training.checkpointing import _clean_metadata_for_serialization
+
+        if "content_metadata" in preprocessed_common_state_dict:
+            preprocessed_common_state_dict["content_metadata"] = _clean_metadata_for_serialization(
+                preprocessed_common_state_dict["content_metadata"]
+            )
+
         if preprocess_common_before_consistancy_check:
             preprocessed_common_state_dict = preprocess_common_before_consistancy_check(
                 common_state_dict
