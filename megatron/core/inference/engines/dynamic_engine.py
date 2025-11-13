@@ -33,8 +33,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, set_decode_expert_padding
-from megatron.core.utils import get_asyncio_loop, get_model_config
+from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 try:
     from tqdm import tqdm
@@ -56,6 +56,14 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+try:
+    import wandb
+
+    HAVE_WANDB = True
+except ImportError:
+    HAVE_WANDB = False
+    wandb = None
 
 
 def format_mem_bytes(mem_bytes):
@@ -89,6 +97,8 @@ class DynamicInferenceEngine(AbstractEngine):
         static_sampling (bool): If True, all requests are assumed to have the same
             sampling parameters. This avoids needing to loop through all requests and
             their sampling parameters every generation step, improving latency.
+        inference_logging_step_interval (int): The step interval at which to log
+        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
     def __init__(
@@ -101,6 +111,7 @@ class DynamicInferenceEngine(AbstractEngine):
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
         static_sampling: bool = False,
+        inference_logging_step_interval: int = 0,
     ):
 
         if enable_cuda_graph is not None:
@@ -137,117 +148,156 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.static_sampling = static_sampling
 
+        self.inference_logging_step_interval = inference_logging_step_interval
+        # Configure wandb to use separate step counter for inference metrics (only once)
+        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
+            logging.info(
+                f"\033[1;93m[INFERENCE]\033[0m "
+                f"\033[1;95mLogging inference metrics to wandb (rank {torch.distributed.get_rank()})\033[0m"
+            )
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                # Make all inference/* metrics use inference_step as their x-axis
+                # This allows inference and training to have independent step counters
+                context.metrics_writer.define_metric(
+                    "inference/*", step_metric="inference/inference_step"
+                )
+                # Initialize inference step offset by querying existing run history
+                self.inference_step_offset = 0
+                if wandb.run is not None:
+                    api_run = wandb.Api().run(
+                        f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
+                    )
+                    max_step = 0
+                    for row in api_run.scan_history(keys=["inference/inference_step"]):
+                        val = row.get("inference/inference_step")
+                        if isinstance(val, (int, float)) and int(val) > max_step:
+                            max_step = int(val)
+                    self.inference_step_offset = int(max_step)
+
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
         self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
+        self.capture_stats = None
+
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
         else:
             self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
 
-        # Handle setting up expert padding for cuda graph inference if set.
-        if enable_cuda_graph:
-            model_config = get_model_config(controller.inference_wrapped_model.model)
-            inference_wrapper_config = controller.inference_wrapped_model.inference_wrapper_config
-            if inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference:
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(
-                    controller.inference_wrapped_model.model, True, capacity_factor=capacity_factor
+        if self.cuda_graph_impl == "local":
+            self.create_cuda_graphs()
+
+    def create_cuda_graphs(self, reset_context: bool = True):
+        """Create cuda graphs.
+
+        This method iterates the dynamic context's `cuda_graph_request_counts`
+        to record and capture cuda graphs.
+
+        Args:
+            reset_context (bool): Whether to reset the context after building cuda graphs.
+        """
+        context = self.context
+        controller = self.controller
+
+        config = controller.inference_wrapped_model.inference_wrapper_config
+        moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
+
+        if moe_pad_experts and context.non_decode_cuda_graphs:
+            context.non_decode_cuda_graphs = False
+            if torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    "MoE models do not support non-decode cuda graphs. "
+                    "Forcing non_decode_cuda_graphs to False."
                 )
 
-        self.capture_stats = None
-        if self.cuda_graph_impl == "local":
+        time_start = time.time()
+        mem_stats_start = torch.cuda.memory_stats()
 
-            time_start = time.time()
-            mem_stats_start = torch.cuda.memory_stats()
+        logging.info(
+            "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
+            len(context.cuda_graph_token_counts),
+            context.cuda_graph_token_counts,
+        )
+        for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
+            # Check whether to skip non-decode graphs.
+            if (
+                warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                and not context.non_decode_cuda_graphs
+            ):
+                continue
 
-            logging.info(
-                "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s.",
-                len(context.cuda_graph_token_counts),
-                context.cuda_graph_token_counts,
-            )
-            for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
-                # Iterate cuda graph dims.
+            tbar = enumerate(context.cuda_graph_token_counts)
+            if HAVE_TQDM:
+                tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+
+            # Iterate cuda graph dims.
+            for tbar_idx, cuda_graph_token_count in tbar:
                 if (
-                    warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    and not context.non_decode_cuda_graphs
+                    cuda_graph_token_count == 1
+                    and warmup_engine_mode == WarmupEngineMode.NON_DECODE
                 ):
+                    # This case is not supported`` as we require atleast two
+                    # tokens for a non-decode engine step.
                     continue
-                tbar = enumerate(context.cuda_graph_token_counts)
+
+                # Initialize context.
+                input_ids, position_ids = self.controller._dynamic_step_context_init(
+                    num_warmup_tokens=cuda_graph_token_count, warmup_engine_mode=warmup_engine_mode
+                )
+
+                # Initialize attention state.
+                assert (
+                    cuda_graph_token_count == context.padded_active_token_count
+                ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+
+                # Progress.
+                mode_str = warmup_engine_mode.name.lower()
+                tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
                 if HAVE_TQDM:
-                    tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
-                for tbar_idx, cuda_graph_token_count in tbar:
-                    if (
-                        cuda_graph_token_count == 1
-                        and warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    ):
-                        # This case is not supported`` as we require atleast two
-                        # tokens for a non-decode engine step.
-                        continue
-                    # Initialize attention state.
-                    context.initialize_attention_state(
-                        num_warmup_tokens=cuda_graph_token_count,
-                        warmup_engine_mode=warmup_engine_mode,
-                    )
-                    assert (
-                        cuda_graph_token_count == context.padded_active_token_count
-                    ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+                    tbar.set_description(tbar_str)
+                else:
+                    logging.info(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
 
-                    # Progress.
-                    mode_str = warmup_engine_mode.name.lower()
-                    tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
-                    if HAVE_TQDM:
-                        tbar.set_description(tbar_str)
-                    else:
-                        logging.info(
-                            f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}"
-                        )
+                # Forward pass -> logits.
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                    # Get flat tokens, position ids.
-                    input_ids, position_ids = context.current_input_and_position_ids(
-                        num_warmup_tokens=cuda_graph_token_count
-                    )
-
-                    # Forward pass -> logits.
+                if reset_context:
                     with torch.inference_mode():
-                        controller.inference_wrapped_model.run_one_forward_step(
-                            {
-                                "tokens": input_ids,
-                                "position_ids": position_ids,
-                                "attention_mask": None,
-                            }
-                        )
                         context.reset()  # todo: @lmcafee, remove if unnecessary.
 
-            # Memory usage.
-            time_end = time.time()
-            mem_stats_end = torch.cuda.memory_stats()
-            capture_stats = {
-                "time": time_end - time_start,
-                "allocated_bytes": (
-                    mem_stats_end["allocated_bytes.all.current"]
-                    - mem_stats_start["allocated_bytes.all.current"]
-                ),
-                "reserved_bytes": (
-                    mem_stats_end["reserved_bytes.all.current"]
-                    - mem_stats_start["reserved_bytes.all.current"]
-                ),
-            }
-            logging.info(
-                "> built cuda graph(s) in %.2f sec, with total memory usage: "
-                "allocated %s, reserved %s.",
-                capture_stats["time"],
-                format_mem_bytes(capture_stats["allocated_bytes"]),
-                format_mem_bytes(capture_stats["reserved_bytes"]),
-            )
+        # Memory usage.
+        time_end = time.time()
+        mem_stats_end = torch.cuda.memory_stats()
+        capture_stats = {
+            "time": time_end - time_start,
+            "allocated_bytes": (
+                mem_stats_end["allocated_bytes.all.current"]
+                - mem_stats_start["allocated_bytes.all.current"]
+            ),
+            "reserved_bytes": (
+                mem_stats_end["reserved_bytes.all.current"]
+                - mem_stats_start["reserved_bytes.all.current"]
+            ),
+        }
+        logging.info(
+            "> built cuda graph(s) in %.2f sec, with total memory usage: "
+            "allocated %s, reserved %s.",
+            capture_stats["time"],
+            format_mem_bytes(capture_stats["allocated_bytes"]),
+            format_mem_bytes(capture_stats["reserved_bytes"]),
+        )
 
-            self.capture_stats = capture_stats
+        self.capture_stats = capture_stats
 
     async def start_listening_to_data_parallel_coordinator(
-        self, inference_coordinator_port: int, launch_inference_coordinator: bool = True
+        self,
+        inference_coordinator_port: int,
+        launch_inference_coordinator: bool = True,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -361,12 +411,14 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.barrier(parallel_state.get_tensor_model_parallel_group())
 
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
-            coordinator_ready_event.wait()
+            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
 
         # Finally run the engine infinite loop
-        self.engine_loop_task = asyncio.create_task(self.run_engine_with_coordinator())
+        loop = get_asyncio_loop(loop)
+        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
+    @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
         async with self._cond:
@@ -420,7 +472,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
-        self.request_completion_futures[request_id] = asyncio.Future()
+        self.request_completion_futures[request_id] = self._loop.create_future()
         return self.request_completion_futures[request_id]
 
     def add_request(
@@ -595,7 +647,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
-                    asyncio.create_task, self._notify_cond_for_new_request()
+                    self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add()
@@ -656,7 +708,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id > 0
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -674,7 +726,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add()
@@ -686,7 +738,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
-                        asyncio.create_task, self._notify_cond_for_new_request()
+                        self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
@@ -770,6 +822,41 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_requests.append(failed_request)
             self.request_completion_futures[failed_request_id].set_result(failed_request)
         self.failed_request_ids.clear()
+
+        # Log KV cache utilization stats to W&B
+        if (
+            self.inference_logging_step_interval > 0
+            and self.step_count > 0
+            and self.step_count % self.inference_logging_step_interval == 0
+            and self.context.metrics_writer is not None
+        ):
+
+            # Get KV cache utilization stats from dynamic context
+            kv_stats = self.context.get_kvcache_utilization_stats()
+
+            # Prepare metrics dictionary with all stats
+            # Use 'inference/' prefix for all metrics to separate from training metrics
+            metrics = {
+                'inference/inference_step': int(self.inference_step_offset + int(self.step_count)),
+                'inference/step_time_s': float(step_time),
+                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
+                'inference/total_requests_dict_size': int(len(self.requests)),
+            }
+            # Add KV stats with inference/ prefix
+            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
+            for key, value in kv_stats.items():
+                if 'utilization' in key:
+                    # Convert to percentage (0-100) and group under kvcache_utilization
+                    metrics[f'inference/{key}'] = float(value * 100.0)
+                else:
+                    metrics[f'inference/{key}'] = value
+
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                self.context.metrics_writer.log(metrics, commit=True)
+            else:
+                raise ValueError(
+                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
+                )
 
         # Print context state.
         if verbose:
@@ -858,7 +945,7 @@ class DynamicInferenceEngine(AbstractEngine):
             result = self.step_modern()
             finished_requests_list.extend(result["finished_requests"])
 
-        # Ensure requests are returned in the same order they were passed in.
+        # Ensure requests are returned in the same order they were passed in
         finished_requests_list.sort(key=lambda x: x.request_id)
 
         return finished_requests_list
@@ -958,8 +1045,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_context.term()
         parallel_state.destroy_model_parallel()
 
-    async def run_engine(self, *, verbose: Optional[bool] = False):
+    @trace_async_exceptions
+    async def run_engine(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -973,8 +1064,12 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def run_engine_with_coordinator(self, *, verbose: Optional[bool] = False):
+    @trace_async_exceptions
+    async def run_engine_with_coordinator(
+        self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
+    ):
         """Continually steps the engine asynchronously."""
+        self._loop = get_asyncio_loop(loop)
         try:
             while True:
                 self.schedule_requests()

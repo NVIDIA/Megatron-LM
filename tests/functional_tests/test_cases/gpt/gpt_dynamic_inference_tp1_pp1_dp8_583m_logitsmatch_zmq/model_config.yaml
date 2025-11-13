@@ -22,7 +22,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
   --distributed-backend: nccl
   --log-interval: 1
-  --transformer-impl: transformer_engine
+  --transformer-impl: inference_optimized
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
   --deterministic-mode: true
