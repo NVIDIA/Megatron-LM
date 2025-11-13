@@ -172,6 +172,7 @@ class ContextErrorFactory:
         error.__class__ = error_cls  # todo (@lmcafe): better/safer alternative?
         return error
 
+
 def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
     for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (3, "KB"), (0, "bytes")):
@@ -179,6 +180,7 @@ def get_mem_size_str(n_bytes: int) -> str:
         if round(n_bytes / nquery) >= 1:
             return "%.3g %s" % (n_bytes / nquery, suffix)
     raise Exception(f"something went wrong, n_bytes={n_bytes}.")
+
 
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
@@ -505,7 +507,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen=self.max_sequence_length,
         )
 
-
         # CUDA graph config list
         self.cuda_graph_batch_dimensions_list = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
@@ -513,7 +514,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_cuda_graphs=num_cuda_graphs,
                 cuda_graph_max_tokens=cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
-                max_requests=self.max_total_requests,
+                max_requests=self.max_active_requests,
                 max_tokens=self.max_tokens,
                 max_sequence_length=self.max_sequence_length,
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
@@ -521,6 +522,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self._using_cuda_graph_this_step = False
+
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
             """Allocate Mamba states. This function is called below within
