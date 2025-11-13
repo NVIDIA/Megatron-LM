@@ -56,9 +56,9 @@ def compile_allocator():
 
     EXPORT void* managed_malloc(size_t size, int device, void* stream) {
       (void)stream;
-      int cur = -1;
-      cudaGetDevice(&cur);
-      if (device != cur && device >= 0) cudaSetDevice(device);
+      int prev_device = -1;
+      cudaGetDevice(&prev_device);
+      if (device != prev_device && device >= 0) cudaSetDevice(device);
 
       // cudaMallocManaged allows for more memory to be allocated than the device memory size.
       // The cudaMemAttachGlobal flag makes the memory accessible from both host and device.
@@ -94,6 +94,7 @@ def compile_allocator():
           cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
         #endif
       }
+      if (device != prev_device && prev_device >= 0) cudaSetDevice(prev_device);
       return ptr;
     }
 
@@ -118,10 +119,7 @@ def compile_allocator():
                 functions=[],
                 with_cuda=True,
                 extra_ldflags=_extra_ldflags,
-                # >>>
-                # verbose=False,
                 verbose=True,
-                # <<<
             )
             _so_path = Path(_mod.__file__).as_posix()
             _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
