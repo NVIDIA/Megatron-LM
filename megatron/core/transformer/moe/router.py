@@ -355,7 +355,8 @@ class TopKRouter(Router):
         # For seq_aux_loss, total_num_tokens should be seq_length (per sequence),
         # not seq_length * batch_size.
         # When padding_mask is not None, compute from tokens_per_expert to get accurate count.
-        # tokens_per_expert shape: [bsz * num_experts], tokens_per_expert.sum() = seq_length * bsz * topk
+        # tokens_per_expert shape: [bsz * num_experts]
+        # tokens_per_expert.sum() = seq_length * bsz * topk
         # Divide by (bsz * topk) to get seq_length
         if padding_mask is not None:
             total_num_tokens = tokens_per_expert.sum() / (bsz * self.topk)

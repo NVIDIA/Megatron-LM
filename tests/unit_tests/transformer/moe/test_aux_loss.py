@@ -582,7 +582,7 @@ class TestPaddingMaskAuxLoss:
 
     def setup_model_parallel(self, tp_size=1, ep_size=1, cp_size=1):
         """Initialize model parallel with given configuration.
-        
+
         Args:
             tp_size: Tensor parallel size.
             ep_size: Expert parallel size.
@@ -634,7 +634,7 @@ class TestPaddingMaskAuxLoss:
         """Test that padding tokens are correctly excluded from aux loss calculation."""
         # Initialize model parallel with given configuration
         self.setup_model_parallel(tp_size=tp_size, ep_size=ep_size, cp_size=cp_size)
-        
+
         try:
             clear_aux_losses_tracker()
 
@@ -685,7 +685,9 @@ class TestPaddingMaskAuxLoss:
             grad_without_mask = router.weight.grad.clone()
 
             # The aux loss with mask should be close to the aux loss without mask
-            torch.testing.assert_close(aux_loss_with_mask, aux_loss_without_mask, rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(
+                aux_loss_with_mask, aux_loss_without_mask, rtol=1e-2, atol=1e-3
+            )
             torch.testing.assert_close(grad_with_mask, grad_without_mask, rtol=1e-2, atol=1e-3)
 
             clear_aux_losses_tracker()
@@ -702,7 +704,7 @@ class TestPaddingMaskAuxLoss:
         """Test that padding mask works correctly with z_loss."""
         # Initialize model parallel with given configuration
         self.setup_model_parallel(tp_size=tp_size, ep_size=ep_size, cp_size=cp_size)
-        
+
         try:
             clear_aux_losses_tracker()
 
