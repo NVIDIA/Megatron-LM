@@ -288,7 +288,14 @@ class TopKRouter(Router):
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_cp_group
         )
-        total_num_tokens = num_tokens * self.tp_cp_group.size()
+        # When padding_mask is not None, total_num_tokens should be the sum across all ranks.
+        # After all_reduce, tokens_per_expert.sum() gives total token-expert assignments.
+        # Since each token is assigned to topk experts, we divide by topk to get actual token count.
+        # This avoids an extra all_reduce operation for num_tokens.
+        if padding_mask is not None:
+            total_num_tokens = tokens_per_expert.sum() / self.topk
+        else:
+            total_num_tokens = num_tokens * self.tp_cp_group.size()
 
         aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
@@ -346,8 +353,14 @@ class TopKRouter(Router):
             tokens_per_expert, self.tp_cp_group
         )
         # For seq_aux_loss, total_num_tokens should be seq_length (per sequence),
-        # not seq_length * batch_size
-        total_num_tokens = seq_length * self.tp_cp_group.size()
+        # not seq_length * batch_size.
+        # When padding_mask is not None, compute from tokens_per_expert to get accurate count.
+        # tokens_per_expert shape: [bsz * num_experts], tokens_per_expert.sum() = seq_length * bsz * topk
+        # Divide by (bsz * topk) to get seq_length
+        if padding_mask is not None:
+            total_num_tokens = tokens_per_expert.sum() / (bsz * self.topk)
+        else:
+            total_num_tokens = seq_length * self.tp_cp_group.size()
 
         aux_loss = (
             switch_load_balancing_loss_func(
@@ -403,7 +416,14 @@ class TopKRouter(Router):
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
 
-        total_num_tokens = num_tokens * self.tp_dp_cp_group.size()
+        # When padding_mask is not None, total_num_tokens should be the sum across all ranks.
+        # After all_reduce, tokens_per_expert.sum() gives total token-expert assignments.
+        # Since each token is assigned to topk experts, we divide by topk to get actual token count.
+        # This avoids an extra all_reduce operation for num_tokens.
+        if padding_mask is not None:
+            total_num_tokens = tokens_per_expert.sum() / self.topk
+        else:
+            total_num_tokens = num_tokens * self.tp_dp_cp_group.size()
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,

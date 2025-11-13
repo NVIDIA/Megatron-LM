@@ -433,7 +433,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
