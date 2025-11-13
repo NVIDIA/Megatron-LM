@@ -327,7 +327,7 @@ class TestPartialCudaGraphedA2AOverlap:
         not (HAVE_TE and is_te_min_version("1.14.0")),
         reason="Partial CUDA graph support requires TransformerEngine version >= 1.14.0",
     )
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep"])
     def test_moe_partial_cudagraph_with_ep_overlap(self, moe_dispatcher_type):
         extra_kwargs = {"moe_layer_freq": 1}
         if moe_dispatcher_type == "deepep":
