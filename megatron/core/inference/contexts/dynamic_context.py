@@ -435,7 +435,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_request_metadata = len(DynamicInferenceRequest.get_metadata_labels())
         self.num_request_metadata = num_request_metadata
         self.request_metadata = torch.empty(
-            (self.max_requests, self.num_request_metadata),
+            (self.max_total_requests, self.num_request_metadata),
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
