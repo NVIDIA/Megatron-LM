@@ -3,9 +3,11 @@
 from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -15,6 +17,13 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+
+moe = get_moe_module_spec(
+    use_te=True,
+    num_experts=8,  # Can be any positive integer (must not be None).
+    moe_grouped_gemm=True,
+    moe_use_legacy_grouped_gemm=False,
+)
 
 mamba_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -62,6 +71,13 @@ mamba_stack_spec = ModuleSpec(
                     ),
                 ),
                 mlp_bda=get_bias_dropout_add,
+            ),
+        ),
+        moe_layer=ModuleSpec(
+            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
     ),
