@@ -14,7 +14,7 @@
 
 import logging
 from importlib.metadata import version
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -104,7 +104,7 @@ except:
 
             multi_tensor_applier = local_multi_tensor_applier
             multi_tensor_scale_impl = local_multi_tensor_scale
-    
+
     def _multi_tensor_copy_this_to_that(
         this: List[torch.Tensor],
         that: List[torch.Tensor],
@@ -123,6 +123,7 @@ except:
         else:
             for this_, that_ in zip(this, that):
                 that_.copy_(this_)
+
 
 # Detect the "post_all_gather_processing" function of Transformer Engine
 try:
@@ -162,7 +163,7 @@ def fp8_need_transpose_data_for_meta_device_init(module: TransformerEngineBaseMo
 def fp8_discard_transpose_cache(tensor: torch.Tensor) -> None:
     """Discard the transpose cache of a FP8 tensor."""
     assert is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
-    
+
     if hasattr(tensor, "_transpose_invalid"):
         tensor._transpose_invalid = True
         tensor._transpose = None
@@ -201,8 +202,9 @@ def fp8_set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bo
 
     old_data = getattr(tensor, data_attr)
     assert old_data.dtype == data.dtype, "The data types of raw data don't match"
-    assert old_data.shape == data.shape, \
-        f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+    assert (
+        old_data.shape == data.shape
+    ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
     setattr(tensor, data_attr, data)
 
 
@@ -220,8 +222,9 @@ def fp8_get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch
 
 def fp8_dequantize(tensor: torch.Tensor) -> torch.Tensor:
     assert is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
-    assert is_te_min_version("2.0"), \
-        "Transformer Engine >= 2.0 is required for dequantizing parameters."
+    assert is_te_min_version(
+        "2.0"
+    ), "Transformer Engine >= 2.0 is required for dequantizing parameters."
     return tensor.dequantize()
 
 
@@ -230,7 +233,7 @@ def fp8_quantize(
     main_params: List[torch.Tensor],
     start_offsets: List[int],
     data_parallel_group: torch.distributed.ProcessGroup,
-    fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
 ) -> None:
     if len(model_params) == 0:
         return
@@ -251,7 +254,7 @@ def _fp8_quantize_fallback(
     main_params: List[torch.Tensor],
     start_offsets: List[int],
     data_parallel_group: torch.distributed.ProcessGroup,
-    fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
 ) -> None:
     for model_param, main_param, start_offset, fsdp_shard_model_param in zip(
         model_params, main_params, start_offsets, fsdp_shard_model_params
