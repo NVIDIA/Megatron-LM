@@ -325,7 +325,7 @@ class TestLayerWiseOptimizer:
 
         if dest_tp * dest_pp > 8:
             pytest.skip(f"DEST_TP*DEST_PP > 8 is larger than world size")
-        
+
         Utils.initialize_model_parallel(src_tp, src_pp)
 
         with TempNamedDir(
