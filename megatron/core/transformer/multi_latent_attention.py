@@ -93,6 +93,7 @@ class MultiLatentAttention(Attention):
         attention_type: str,
         cp_comm_type: Optional[str] = None,
         pg_collection: ProcessGroupCollection = None,
+        transformer_layer_offset: int = 0,
     ) -> None:
 
         super().__init__(
@@ -102,6 +103,7 @@ class MultiLatentAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            transformer_layer_offset=transformer_layer_offset,
         )
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
