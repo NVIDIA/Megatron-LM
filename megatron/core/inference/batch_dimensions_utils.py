@@ -71,14 +71,12 @@ class InferenceBatchDimensions:
                 >= real_batch_dim.prefill_req_count + real_batch_dim.decode_req_count
             )
 
-    def valid(self, max_requests: int, block_size_tokens: int, block_avail: int) -> bool:
+    def valid(self, max_requests: int) -> bool:
         """
         Checks if the batch dimension is valid based on resource constraints.
 
         Args:
             max_requests: Maximum number of requests allowed
-            block_size_tokens: Size of memory blocks in tokens
-            block_avail: Number of available memory blocks
 
         Returns:
             True if the config is valid, False otherwise
@@ -93,15 +91,6 @@ class InferenceBatchDimensions:
 
         # Check if token count is sufficient for requests
         if self.token_count < self.prefill_req_count + self.decode_req_count:
-            return False
-
-        # Check if available blocks can accommodate requests and tokens
-        if (
-            self.prefill_req_count
-            + self.decode_req_count
-            + math.ceil(self.token_count / block_size_tokens)
-            > block_avail
-        ):
             return False
 
         return True
@@ -151,8 +140,6 @@ class CUDAGraphBatchDimensionBuilder:
         max_requests: int,
         max_tokens: int,
         max_sequence_length: int,
-        block_size_tokens: int,
-        block_avail: int,
         use_cuda_graphs_for_non_decode_steps: bool,
     ) -> List[InferenceBatchDimensions]:
         """
@@ -176,7 +163,6 @@ class CUDAGraphBatchDimensionBuilder:
         1. Request limit: prefill_req_count + decode_req_count <= max_requests
         2. Non-negative counts: Both prefill_req_count and decode_req_count must be >= 0
         3. Token sufficiency: token_count >= prefill_req_count + decode_req_count
-        4. Block availability: Total requests + required blocks <= available blocks
 
         Sorting Rules for Attention Metadata Construction:
         1. Batch dimensions are sorted by prefill token count (token_count - decode_req_count)
@@ -190,8 +176,6 @@ class CUDAGraphBatchDimensionBuilder:
             max_requests: Maximum number of requests
             max_tokens: Maximum total tokens
             max_sequence_length: Maximum sequence length
-            block_size_tokens: Size of memory blocks in tokens
-            block_avail: Number of available memory blocks
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
 
         Returns:
@@ -202,7 +186,7 @@ class CUDAGraphBatchDimensionBuilder:
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
-            if batch_dim.valid(max_requests, block_size_tokens, block_avail):
+            if batch_dim.valid(max_requests):
                 cuda_graph_batch_dimensions_list.append(batch_dim)
 
         # Cuda graph token-counts

@@ -1136,9 +1136,8 @@ def validate_args(args, defaults={}):
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
     if args.inference_dynamic_batching:
-        assert args.inference_dynamic_batching_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_active_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
-        assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
 
     # MoE upcycling check
     if args.moe_use_upcycling:
@@ -1443,36 +1442,19 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
-    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
+    group.add_argument('--inference-dynamic-batching-active-buffer-size-gb',
                        type=float, default=40.,
-                       help='Total buffer size (GB) allocated for the block-level KV '
-                       'memory.')
+                       help='Buffer size (GB) allocated for the active (on-GPU) '
+                       'portion of the chunked KV memory. The total buffer size '
+                       'is 2x this value, which includes the same-size on-CPU '
+                       'paused buffer.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
                        'It should be a multiple of 256')
-    group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
-                       type=float, default=0.2,
-                       help='Space is reserved within the inference context '
-                       'memory buffer to guarantee that a minimum number of '
-                       'active requests will always be able to run to '
-                       'completion. This is to avoid the context being deadlocked '
-                       'by paused requests.')
-    group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
-                       type=float, default=None,
-                       help='Scaling factor over the memory buffer size for auto '
-                       'computing `max_requests` and `max_tokens`. This scaling '
-                       'factor is used for fitting more requests and tokens in '
-                       'the memory buffer than it can safely hold, which in turn '
-                       'increases throughput.')
-    group.add_argument('--inference-dynamic-batching-max-requests-override',
+    group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
-                       help='If set, this overrides the max requests as computed '
-                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
-    group.add_argument('--inference-dynamic-batching-max-tokens-override',
-                       type=int, default=None,
-                       help='If set, this overrides the max tokens as computed '
-                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+                       help='Override the inference context\'s default `max_tokens`.')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
                        help='Maximum number of cuda graphs to capture, where the '
@@ -1489,7 +1471,7 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=0, choices=[0, 1],
+                       type=int, default=1, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
