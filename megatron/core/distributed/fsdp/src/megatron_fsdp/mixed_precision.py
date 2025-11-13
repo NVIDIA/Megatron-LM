@@ -209,6 +209,7 @@ def fp8_set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bo
 
 
 def fp8_get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch.Tensor:
+    """Get the underlying raw storage of a FP8 tensor."""
     assert is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
 
     if get_transpose:
@@ -221,6 +222,7 @@ def fp8_get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch
 
 
 def fp8_dequantize(tensor: torch.Tensor) -> torch.Tensor:
+    """Dequantize a FP8 tensor to a higher precision."""
     assert is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
     assert is_te_min_version(
         "2.0"
@@ -235,6 +237,7 @@ def fp8_quantize(
     data_parallel_group: torch.distributed.ProcessGroup,
     fsdp_shard_model_params: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
 ) -> None:
+    """Quantize sharded parameters to FP8."""
     if len(model_params) == 0:
         return
     fsdp_shard_model_params = [x[0] if x[1] is None else x for x in fsdp_shard_model_params]
