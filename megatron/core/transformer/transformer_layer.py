@@ -573,7 +573,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         padding_mask_for_moe = None
-        if self.is_moe_layer and padding_mask is not None:
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        if isinstance(self.mlp, MoELayer) and padding_mask is not None:
             # padding_mask from GPTModel: [bsz, seq_length]
             # MoE layer needs: [seq_length, bsz]
             padding_mask_for_moe = padding_mask.transpose(0, 1).bool()
@@ -600,11 +602,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
-                if self.is_moe_layer:
+                if isinstance(self.mlp, MoELayer):
                     # For MoE with checkpointing, we need a wrapper to pass padding_mask
                     def mlp_forward_with_padding(hidden_states):
                         return self.mlp(hidden_states, padding_mask=padding_mask_for_moe)
-                    
+
                     mlp_output_with_bias = te_checkpoint(
                         mlp_forward_with_padding,
                         False,
@@ -621,11 +623,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                         pre_mlp_layernorm_output,
                     )
             else:
-                if self.is_moe_layer:
+                if isinstance(self.mlp, MoELayer):
                     # For MoE with checkpointing, we need a wrapper to pass padding_mask
                     def mlp_forward_with_padding(hidden_states):
                         return self.mlp(hidden_states, padding_mask=padding_mask_for_moe)
-                    
+
                     mlp_output_with_bias = tensor_parallel.checkpoint(
                         mlp_forward_with_padding, False, pre_mlp_layernorm_output
                     )
@@ -648,8 +650,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
 
         else:
-            if self.is_moe_layer:
-                mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask_for_moe)
+            if isinstance(self.mlp, MoELayer):
+                mlp_output_with_bias = self.mlp(
+                    pre_mlp_layernorm_output, padding_mask=padding_mask_for_moe
+                )
             else:
                 mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
