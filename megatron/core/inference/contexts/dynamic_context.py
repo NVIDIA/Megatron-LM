@@ -494,10 +494,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-        # >>>
-        print("dynamic_context.py ... allocated memory_buffer.")
-        exit()
-        # <<<
 
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
