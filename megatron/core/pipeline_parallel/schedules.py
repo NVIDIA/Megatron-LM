@@ -813,7 +813,7 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     return order
 
 
-def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk):
+def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
     """
     Get the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list.
@@ -852,16 +852,31 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk):
         order[first_backward_idx : last_forward_idx + 1 : 2],
         order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
     ):
-        for l_b, l_f in zip_longest(get_layer_range(c_id_b), get_layer_range(c_id_f), fillvalue=0):
-            if l_f != 0 and l_b != 0:
-                new_order += [l_f, l_b]
-            elif l_f != 0:
-                new_order += [l_f]
-            else:
-                new_order += [l_b]
+        layer_range_f = get_layer_range(c_id_f)
+        layer_range_b = get_layer_range(c_id_b)
+        index = 0
+        for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
+            if l_f != 0:
+                new_order.append(l_f)
+            if l_b != 0:
+                new_order.append(l_b)
+                if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                    new_order.append(l_b - 0.5)
+            index += 1
+        # last wgrad backward
+        if capture_wgrad_graph and layer_range_b:
+            new_order.append(layer_range_b[-1] - 0.5)
 
     for c_id in order[last_forward_idx + 1 :]:
-        new_order += get_layer_range(c_id)
+        base_layer_range = get_layer_range(c_id)
+        if capture_wgrad_graph:
+            layer_range = [None for _ in range(2 * len(base_layer_range))]
+            for i in range(len(base_layer_range)):
+                layer_range[2 * i] = base_layer_range[i]
+                layer_range[2 * i + 1] = base_layer_range[i] - 0.5
+        else:
+            layer_range = base_layer_range
+        new_order += layer_range
 
     return new_order
 

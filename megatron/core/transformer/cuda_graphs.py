@@ -1566,7 +1566,15 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
         if self.config.overlap_moe_expert_parallel_comm:
-            order = get_overlap_moe_expert_parallel_comm_order(order, self.num_layers_per_chunk)
+            wgrad_in_graph_scope = "attn" in self.config.cuda_graph_scope or (
+                "moe_router" in self.config.cuda_graph_scope
+                and self.config.moe_shared_expert_intermediate_size is not None
+                and not self.config.moe_shared_expert_overlap
+            )
+            capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
+            order = get_overlap_moe_expert_parallel_comm_order(
+                order, self.num_layers_per_chunk, capture_wgrad_graph
+            )
             self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
             log_on_each_pipeline_stage(
                 logger=logger,
