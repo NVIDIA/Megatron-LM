@@ -1575,6 +1575,12 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
+
+        if args.is_hybrid_model:
+            layers = args.hybrid_override_pattern.count('E')
+        else:
+            layers = args.num_layers
+
         track_moe_metrics(
             loss_scale=moe_loss_scale,
             iteration=iteration,
@@ -1584,7 +1590,7 @@ def training_log(
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
-            num_layers=args.num_layers,
+            num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
