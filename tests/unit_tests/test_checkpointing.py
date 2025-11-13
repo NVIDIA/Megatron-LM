@@ -53,6 +53,9 @@ class MockState:
         self.is_stub_optimizer = False
         self._called_metadata = []
 
+        # Optimizers are expected to have this attribute for checkpointing.
+        self.param_groups = []
+
     def state_dict(self, is_loading=False):
         return self._state_dict
 
