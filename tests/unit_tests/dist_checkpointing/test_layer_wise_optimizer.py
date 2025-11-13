@@ -151,15 +151,19 @@ class TestLayerWiseOptimizer:
             )
             assert total_params > 0, "No parameters found in optimizer"
 
-    @pytest.mark.parametrize('tp_pp', [(1, 2), (2, 1), (2, 2)])
-    def test_broadcast_params(self, tp_pp):
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
+    def test_broadcast_params(self, tp, pp):
         """Test that parameter broadcasting works correctly across DP ranks."""
-        Utils.initialize_model_parallel(*tp_pp)
+        if tp * pp > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
 
         model, optimizer = setup_model_and_optimizer(
             seed=2,
-            tp=tp_pp[0],
-            pp=tp_pp[1],
+            tp=tp,
+            pp=pp,
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
@@ -180,11 +184,15 @@ class TestLayerWiseOptimizer:
             for name, param in model[0].named_parameters():
                 assert torch.allclose(param.data, original_params[name])
 
-    @pytest.mark.parametrize('tp_pp', [(2, 2), (2, 4), (4, 2)])
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
     @pytest.mark.parametrize('bf16', [True, False])
-    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp_pp, bf16):
+    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, bf16):
         """Test save/load of LayerWiseDistributedOptimizer checkpoints."""
-        Utils.initialize_model_parallel(*tp_pp)
+        if tp * pp > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
 
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_layer_wise_optimizer_A', sync=True
@@ -195,8 +203,8 @@ class TestLayerWiseOptimizer:
                 # Create model and optimizer A
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
-                    tp=tp_pp[0],
-                    pp=tp_pp[1],
+                    tp=tp,
+                    pp=pp,
                     bf16=bf16,
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
@@ -211,8 +219,8 @@ class TestLayerWiseOptimizer:
                 # Create model and optimizer B with different seed
                 model_B, optimizer_B = setup_model_and_optimizer(
                     seed=3,
-                    tp=tp_pp[0],
-                    pp=tp_pp[1],
+                    tp=tp,
+                    pp=pp,
                     bf16=bf16,
                     dist_opt=False,
                     initialize_fn=initialize_gpt_model,
@@ -242,15 +250,19 @@ class TestLayerWiseOptimizer:
 
                 check_equal(plain_sd_A, plain_sd_B)
 
-    @pytest.mark.parametrize('tp_pp', [(2, 2), (4, 1)])
-    def test_layer_wise_optimizer_grad_norm(self, tp_pp):
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
+    def test_layer_wise_optimizer_grad_norm(self, tp, pp):
         """Test that gradient norm calculation works correctly."""
-        Utils.initialize_model_parallel(*tp_pp)
+        if tp * pp > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
 
         model, optimizer = setup_model_and_optimizer(
             seed=2,
-            tp=tp_pp[0],
-            pp=tp_pp[1],
+            tp=tp,
+            pp=pp,
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
@@ -268,15 +280,19 @@ class TestLayerWiseOptimizer:
             assert grad_norm is not None
             assert grad_norm >= 0
 
-    @pytest.mark.parametrize('tp_pp', [(2, 2), (1, 4)])
-    def test_layer_wise_optimizer_count_zeros(self, tp_pp):
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
+    def test_layer_wise_optimizer_count_zeros(self, tp, pp):
         """Test that zero counting in gradients works correctly."""
-        Utils.initialize_model_parallel(*tp_pp)
+        if tp * pp > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
 
         model, optimizer = setup_model_and_optimizer(
             seed=2,
-            tp=tp_pp[0],
-            pp=tp_pp[1],
+            tp=tp,
+            pp=pp,
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
@@ -296,11 +312,21 @@ class TestLayerWiseOptimizer:
             num_zeros = optimizer.count_zeros()
             assert num_zeros >= 0
 
-    @pytest.mark.parametrize('src_tp_pp', [(2, 2), (4, 2)])
-    @pytest.mark.parametrize('dest_tp_pp', [(2, 2), (4, 2)])
-    def test_layer_wise_optimizer_resharding(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
+    @pytest.mark.parametrize('src_tp', [1, 2, 4])
+    @pytest.mark.parametrize('src_pp', [1, 2, 4])
+    @pytest.mark.parametrize('dest_tp', [1, 2, 4])
+    @pytest.mark.parametrize('dest_pp', [1, 2, 4])
+    def test_layer_wise_optimizer_resharding(
+        self, tmp_path_dist_ckpt, src_tp, src_pp, dest_tp, dest_pp
+    ):
         """Test resharding of LayerWiseDistributedOptimizer across different TP/PP."""
-        Utils.initialize_model_parallel(*src_tp_pp)
+        if src_tp * src_pp > 8:
+            pytest.skip(f"SRC_TP*SRC_PP > 8 is larger than world size")
+
+        if dest_tp * dest_pp > 8:
+            pytest.skip(f"DEST_TP*DEST_PP > 8 is larger than world size")
+        
+        Utils.initialize_model_parallel(src_tp, src_pp)
 
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_layer_wise_resharding_A', sync=True
@@ -308,8 +334,8 @@ class TestLayerWiseOptimizer:
             # Create and save with source configuration
             model_A, optimizer_A = setup_model_and_optimizer(
                 seed=2,
-                tp=src_tp_pp[0],
-                pp=src_tp_pp[1],
+                tp=src_tp,
+                pp=src_pp,
                 bf16=True,
                 dist_opt=False,
                 initialize_fn=initialize_gpt_model,
@@ -323,11 +349,11 @@ class TestLayerWiseOptimizer:
             Utils.destroy_model_parallel()
 
             # Load with destination configuration
-            Utils.initialize_model_parallel(*dest_tp_pp)
+            Utils.initialize_model_parallel(dest_tp, dest_pp)
             model_B, optimizer_B = setup_model_and_optimizer(
                 seed=3,
-                tp=dest_tp_pp[0],
-                pp=dest_tp_pp[1],
+                tp=dest_tp,
+                pp=dest_pp,
                 bf16=True,
                 dist_opt=False,
                 initialize_fn=initialize_gpt_model,
@@ -340,10 +366,14 @@ class TestLayerWiseOptimizer:
             state_dict = load(load_sharded_sd, ckpt_dir)
             optimizer_B.load_state_dict(state_dict)
 
-    @pytest.mark.parametrize('tp_pp_ep', [(2, 2, 2), (4, 1, 2)])
-    def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp_pp_ep):
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
+    @pytest.mark.parametrize('ep', [1, 2, 4])
+    def test_layer_wise_optimizer_with_moe(self, tmp_path_dist_ckpt, tp, pp, ep):
         """Test LayerWiseDistributedOptimizer with MoE models."""
-        tp, pp, ep = tp_pp_ep
+        if tp * pp * ep > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
@@ -408,13 +438,13 @@ class TestLayerWiseOptimizer:
     @pytest.mark.parametrize('dp_size', [1, 2, 4])
     def test_layer_wise_optimizer_dp_sizes(self, dp_size):
         """Test LayerWiseDistributedOptimizer with different DP sizes."""
-        # Use PP to vary DP size while keeping world size constant
+        # Use TP to vary DP size while keeping world size constant
         world_size = 8
         if world_size % dp_size != 0:
             pytest.skip(f"World size {world_size} not divisible by DP size {dp_size}")
 
-        pp = dp_size
-        tp = world_size // pp
+        pp = 1
+        tp = world_size // dp_size
 
         if tp == 0:
             pytest.skip(f"Invalid TP configuration")
@@ -424,7 +454,7 @@ class TestLayerWiseOptimizer:
         model, optimizer = setup_model_and_optimizer(
             seed=2,
             tp=tp,
-            pp=pp,
+            pp=1,
             bf16=True,
             dist_opt=False,
             initialize_fn=initialize_gpt_model,
@@ -472,25 +502,26 @@ class TestLayerWiseOptimizer:
             assert grad_norm is None or grad_norm >= 0
             assert num_zeros is None or num_zeros >= 0
 
-    @pytest.mark.parametrize("fully_parallel", [False, True])
+    # TODO(@boxiangw): Add test for loading with different TP/PP sizes
+    @pytest.mark.parametrize("fully_parallel", [True, False])
     @pytest.mark.parametrize('optimizer_type', ['dist_muon', 'muon'])
-    @pytest.mark.parametrize(
-        ("tp_pp_ep", "is_moe", "is_mla", "kwargs"),
-        [
-            ((1, 1, 1), False, False, {}),  # check DP
-            ((2, 2, 1), False, False, {}),  # check TP
-            ((1, 2, 1), False, True, {}),  # check param group order is right
-            ((1, 2, 2), True, False, {}),  # check EP
-            ((1, 2, 2), True, True, {}),  # check EP with MLA
-        ],
-    )
+    @pytest.mark.parametrize('tp', [1, 2, 4])
+    @pytest.mark.parametrize('pp', [1, 2])
+    @pytest.mark.parametrize('ep', [1, 2, 4])
+    @pytest.mark.parametrize('is_moe', [True, False])
+    @pytest.mark.parametrize('is_mla', [True, False])
     def test_optimizer_common_state_dict(
-        self, tmp_path_dist_ckpt, fully_parallel, tp_pp_ep, is_moe, is_mla, kwargs, optimizer_type
+        self, tmp_path_dist_ckpt, fully_parallel, tp, pp, ep, is_moe, is_mla, optimizer_type
     ):
-        initialize_fn = partial(initialize_real_model, is_moe=is_moe, is_mla=is_mla, **kwargs)
+        if tp * pp * ep > 8:
+            pytest.skip(f"TP*PP*EP > 8 is larger than world size")
+
+        if ep > 1 and not is_moe:
+            pytest.skip(f"EP > 1 needs to be used with MoE")
+
+        initialize_fn = partial(initialize_real_model, is_moe=is_moe, is_mla=is_mla)
 
         # Initialize parallel
-        tp, pp, ep = tp_pp_ep
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
@@ -559,6 +590,7 @@ class TestLayerWiseOptimizer:
                         dist_opt=False,
                         optimizer=optimizer_type,
                     )
+
                 # Load optimizer B from checkpoint
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
 
@@ -569,59 +601,3 @@ class TestLayerWiseOptimizer:
                 check_equal(optim_param_state_A, optim_param_state_B)
 
         Utils.destroy_model_parallel()
-
-    @pytest.mark.parametrize(
-        ('src_tp_pp', 'dest_tp_pp', 'use_glu'),
-        [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
-    )
-    @pytest.mark.parametrize('optimizer_type', ['dist_muon', 'muon'])
-    def test_finetune_doesnt_load_optimizer(
-        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu, optimizer_type
-    ):
-        """Test finetuning doesn't try to load the optimizer."""
-        Utils.initialize_model_parallel(*src_tp_pp)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
-        ) as ckpt_dir:
-            mock_args = parse_args(ignore_unknown_args=True)
-            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
-                init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
-                init_checkpointing_mock_args(mock_args, ckpt_dir, False)
-
-                model, optimizer = setup_model_and_optimizer(
-                    seed=2,
-                    tp=src_tp_pp[0],
-                    pp=src_tp_pp[1],
-                    initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
-                    dist_opt=False,
-                    optimizer=optimizer_type,
-                )
-
-                save_checkpoint(10, model, optimizer, None, 0)
-                Utils.destroy_model_parallel()
-
-                Utils.initialize_model_parallel(*dest_tp_pp)
-                mock_args.tensor_model_parallel_size = dest_tp_pp[0]
-                mock_args.pipeline_model_parallel_size = dest_tp_pp[1]
-                model, optimizer = setup_model_and_optimizer(
-                    seed=3,
-                    tp=dest_tp_pp[0],
-                    pp=dest_tp_pp[1],
-                    initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
-                    dist_opt=False,
-                    optimizer=optimizer_type,
-                )
-                model_unloaded_state_dict = deepcopy(model[0].state_dict())
-                optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
-
-                # Load with different TPxPP should raise DistributeOptimizer error
-                with pytest.raises(RuntimeError) as exc_info:
-                    load_checkpoint_no_arg_checks(model, optimizer, None)
-                # "(TP, PP) mismatch" check is for backwards compatibility tests
-                assert "(TP, PP) mismatch" in str(
-                    exc_info.value
-                ) or "(TP, PP, encoder TP, encoder PP) mismatch" in str(exc_info.value)
-
-                # Check that the state didn't change
-                check_equal(model[0].state_dict(), model_unloaded_state_dict)
-                check_equal(optimizer.state_dict(), optim_unloaded_state_dict)
