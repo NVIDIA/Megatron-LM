@@ -19,7 +19,7 @@ import operator
 from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 try:
     import einops

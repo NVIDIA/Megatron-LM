@@ -1322,12 +1322,6 @@ def _get_parameter_groups(
         is_fp8 = is_float8tensor(param)
         is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]
         param_attrs = dict(
-            dtype=(
-                "float8"
-                if is_float8tensor(param) or meta_device_init_fp8_params.get(name, False)
-                else param.dtype
-            ),
-            is_expert_param=is_expert_parameter(name, param),
             dtype="float8" if (is_fp8 or is_fp8_meta_device_init) else param.dtype,
             is_expert_param=is_expert_parameter(name, param),
             requires_grad=param.requires_grad,
@@ -1908,7 +1902,8 @@ class ParamAndGradBuffer:
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
-                        temporary_bucket_allocator=self.weight_alloc,  # TODO(mxfp8): Do we need separate alloc for transpose buffer?
+                        # TODO(mxfp8): Do we need separate alloc for transpose buffer?
+                        temporary_bucket_allocator=self.weight_alloc,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
                         mem_alloc_context=self.mem_alloc_context,
@@ -3220,6 +3215,7 @@ class AllGatherPipeline:
             self.outer_fsdp_group_param_gather_stream = torch.cuda.Stream()
 
     def get_bucket_key(self, bucket_id, bwd):
+        """Get the key for the bucket."""
         has_transpose_buffer = (
             self.buffer.parameter_groups[bucket_id].transpose_weight_buffer is not None
         )
