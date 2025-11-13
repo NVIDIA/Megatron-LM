@@ -1,11 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import json
 import itertools
 import random
 import time
 import torch
-from argparse import ArgumentParser, Namespace
+from argparse import Action, ArgumentError, ArgumentParser, Namespace
 from tqdm import tqdm
 from typing import Any, List, Optional
 
@@ -15,6 +16,17 @@ from megatron.core.transformer.module import MegatronModule
 
 from megatron.core.inference.sampling_params import SamplingParams
 
+
+class SplitArgs(Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        parts = []
+        for v in values:
+            parts.extend(v.split(" "))
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            raise ArgumentError(self, f"Could not parse {parts} as integers")
+        setattr(namespace, self.dest, nums)
 
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -40,11 +52,20 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     )
     group.add_argument(
         "--num-tokens-to-prompt",
-        type=int,
         nargs="+",
+        action=SplitArgs,
         default=[64, 1024],
         help='Number of tokens to use for simulated prompts. This should be a '
         'space-separated pair of integers, and the generated prompt lengths will '
+        'be uniformly sampled within this range.',
+    )
+    group.add_argument(
+        "--num-tokens-to-generate-random",
+        nargs="+",
+        action=SplitArgs,
+        default=None,
+        help='Number of tokens to generate for each prompt. This can be a '
+        'space-separated pair of integers, and the generated output lengths will '
         'be uniformly sampled within this range.',
     )
     group.add_argument(
@@ -176,6 +197,7 @@ class Request:
         self.time_end = None
         self.state = "not-started"
         self.sampling_params: SamplingParams = sampling_params if sampling_params is not None else get_default_sampling_params(tokenizer.eod)
+        self.sampling_params = copy.deepcopy(self.sampling_params)
 
     def __str__(self) -> str:
         return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
@@ -261,6 +283,9 @@ def get_synthetic_requests(
         args.incoming_requests_per_sec,
         int(args.incoming_requests_per_sec * args.incoming_requests_duration),
     )
+
+    if args.num_tokens_to_generate_random is not None:
+        sampling_params.num_tokens_to_generate = random.randint(*args.num_tokens_to_generate_random)
 
     # Init requests.
     requests = [
