@@ -99,7 +99,7 @@ class StaticInferenceEngine(AbstractEngine):
                     inference_config=inference_wrapper_config,
                     model=text_generation_controller.inference_wrapped_model.model,
                     max_batch_size=max_batch_size,
-                    buffer_size_gb=buffer_size_gb,
+                    active_buffer_size_gb=buffer_size_gb,
                     num_cuda_graphs=1,
                 )
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
