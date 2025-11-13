@@ -24,7 +24,7 @@ import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .utils import FSDPDistributedIndex
-from .low_precision import is_float8tensor, fp8_discard_transpose_cache, fp8_create_transpose_cache
+from .mixed_precision import is_float8tensor, fp8_discard_transpose_cache, fp8_create_transpose_cache
 from .param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,

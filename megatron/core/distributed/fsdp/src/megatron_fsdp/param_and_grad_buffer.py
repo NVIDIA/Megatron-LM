@@ -41,7 +41,7 @@ from .utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
-from .low_precision import (
+from .mixed_precision import (
     is_te_min_version,
     is_float8tensor,
     fp8_need_transpose_data,
