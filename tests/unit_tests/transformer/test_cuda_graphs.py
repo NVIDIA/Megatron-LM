@@ -26,6 +26,7 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -785,12 +786,19 @@ class TestPartialCudaGraph:
         loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
         for cuda_graph_scope in [
             None,
-            ["attn"],
-            ["moe"],
-            ["mlp", "moe_router"],
-            ["attn", "mlp", "moe_router", "moe_preprocess"],
+            [CudaGraphScope.attn],
+            [CudaGraphScope.moe],
+            [CudaGraphScope.mlp, CudaGraphScope.moe_router],
+            [
+                CudaGraphScope.attn,
+                CudaGraphScope.mlp,
+                CudaGraphScope.moe_router,
+                CudaGraphScope.moe_preprocess,
+            ],
         ]:
-            if moe_dropless_dispatcher and (cuda_graph_scope is None or "moe" in cuda_graph_scope):
+            if moe_dropless_dispatcher and (
+                cuda_graph_scope is None or CudaGraphScope.moe in cuda_graph_scope
+            ):
                 # Dropless MoE doesn't work with "moe" scope cudagraph. Skip.
                 continue
             cuda_graph_warmup_steps = 3
