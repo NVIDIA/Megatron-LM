@@ -14,6 +14,7 @@ from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
 )
@@ -73,9 +74,10 @@ class BertModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         add_binary_head=True,
         return_embeddings=False,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
-        super(BertModel, self).__init__(config=config)
+        super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

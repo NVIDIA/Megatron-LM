@@ -37,7 +37,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   # Data args
   --data-path: ${DATA_BLEND}
-  --vocab-file: ${DATA_PATH}/text/the_pile/t5_shard00/bert-large-cased-vocab.txt
+  --vocab-file: ${DATA_PATH}/bert-large-cased-vocab.txt
   --tokenizer-type: BertWordPieceCase
   --split: 99982,9,9
   --data-cache-path: ${DATA_CACHE_PATH}
@@ -46,6 +46,7 @@ MODEL_ARGS:
   --log-interval: 100
   --save-interval: 2000
   --eval-interval: 1000
+  --save-retain-interval: 10000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --eval-iters: 10
@@ -58,6 +59,7 @@ MODEL_ARGS:
   --timing-log-level: 0
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"
