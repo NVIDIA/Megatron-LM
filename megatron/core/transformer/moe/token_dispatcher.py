@@ -22,13 +22,13 @@ from megatron.core.transformer.moe.fused_a2a import (
 )
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
+    get_align_size_for_quantization,
     get_capacity,
     maybe_move_tensor_to_cpu,
     pad_routing_map,
     permute,
     sort_chunks_by_idxs,
     unpermute,
-    get_align_size_for_quantization,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
