@@ -1771,9 +1771,10 @@ class TransformerConfig(ModelParallelConfig):
                 not self.moe_use_legacy_grouped_gemm
             ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
             if self.cuda_graph_impl == "transformer_engine":
-                assert is_te_min_version(
-                    "2.10.0"
-                ), 'TE version >= 2.10.0 is required for delay_wgrad_compute with partial cuda graph'
+                assert is_te_min_version("2.10.0"), (
+                    'TE version >= 2.10.0 is required for delay_wgrad_compute with '
+                    'partial cuda graph'
+                )
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
