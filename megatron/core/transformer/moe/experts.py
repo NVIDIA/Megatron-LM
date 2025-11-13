@@ -21,7 +21,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -40,7 +39,10 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.moe.moe_utils import (
+    ProcessGroupCollection,
+    get_align_size_for_quantization,
+)
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
