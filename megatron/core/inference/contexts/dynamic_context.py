@@ -1040,6 +1040,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.padded_active_token_count = min(
                     self.padded_active_token_count, self.max_requests
                 )
+        self.padding_slice = slice(active_token_count, self.padded_active_token_count)
 
         # How are we calculating the padded active request count?
         # Case 1: Using cuda graphs:
