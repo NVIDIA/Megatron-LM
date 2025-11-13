@@ -102,6 +102,42 @@ deployment.
 
 See [Adanvanced Topics](./ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 training example using `slurm`.
 
+### ⭐ Offline BF16 EAGLE3 Training
+Unlike online EAGLE3 training, offline workflow precomputes target model `hidden_states` and dumps to disk.
+Then only the draft model is called during training. AL is no longer reported during training. After training,
+`export.sh` is used to export EAGLE3 checkpoint.
+
+```sh
+\
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
+    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3 \
+    MLM_EXTRA_ARGS="--output-dir /tmp/offline_data" \
+    ./offline_feature_extrach.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
+    MLM_EXTRA_ARGS="--export-offline-model" \
+    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
+    MLM_EXTRA_ARGS="--export-offline-model" \
+    ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
+
+\
+    PP=1 \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Eagle3-Export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
 ### ⭐ Pruning
 
 Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/TensorRT-Model-Optimizer/tree/main/examples/pruning).
