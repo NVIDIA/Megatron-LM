@@ -1168,6 +1168,16 @@ wheels = [
 ]
 
 [[package]]
+name = "emerging-optimizers"
+version = "0.1.0"
+source = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=cf9909b777ffac18e05b67a6708282cadc000942#cf9909b777ffac18e05b67a6708282cadc000942" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "typing-extensions" },
+]
+
+[[package]]
 name = "exceptiongroup"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2216,6 +2226,9 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+emerging-optimizers = [
+    { name = "emerging-optimizers" },
+]
 flash-mla = [
     { name = "flash-mla" },
 ]
@@ -2251,6 +2264,8 @@ requires-dist = [
     { name = "causal-conv1d", marker = "extra == 'lts'", specifier = "~=1.5" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "einops", marker = "extra == 'lts'", specifier = "~=0.8" },
+    { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=cf9909b777ffac18e05b67a6708282cadc000942" },
+    { name = "flash-linear-attention", marker = "extra == 'dev'", specifier = "~=0.3.2" },
     { name = "flashinfer-python", marker = "extra == 'dev'" },
     { name = "flashinfer-python", marker = "extra == 'lts'" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
@@ -2312,6 +2327,7 @@ docs = [
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
 ]
+emerging-optimizers = [{ name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=fb1add873e7851ec34b48581ea1b15761b73d189" }]
 flash-mla = [{ name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=9edee0c022cd0938148a18e334203b0aab43aa19" }]
 linting = [
     { name = "black", specifier = "==24.4.2" },

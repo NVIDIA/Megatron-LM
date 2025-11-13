@@ -75,6 +75,7 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1103,18 +1104,31 @@ def setup_model_and_optimizer(
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
-    optimizer = get_megatron_optimizer(
-        config,
-        model,
-        no_wd_decay_cond,
-        scale_lr_cond,
-        lr_mult,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
-        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-        #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-        dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-    )
+
+    if 'muon' not in config.optimizer:
+        optimizer = get_megatron_optimizer(
+            config,
+            model,
+            no_wd_decay_cond,
+            scale_lr_cond,
+            lr_mult,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+            #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+            default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+        )
+    else:
+        optimizer = get_megatron_muon_optimizer(
+            config,
+            model,
+            no_wd_decay_cond,
+            scale_lr_cond,
+            lr_mult,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+            layer_wise_distributed_optimizer='dist' in config.optimizer,
+        )
+
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
