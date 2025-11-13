@@ -176,7 +176,7 @@ def get_inference_context(
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
-        cuda_graph_max_prefill_requests=args.inference_dynamic_batching_cuda_graph_max_prefill_requests,
+        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
     )
 

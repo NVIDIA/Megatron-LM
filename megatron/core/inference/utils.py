@@ -2,7 +2,6 @@
 
 import asyncio
 import multiprocessing
-from dataclasses import dataclass
 
 import torch
 
@@ -137,89 +136,6 @@ def tensor_swap(x, src_idxs, dst_idxs):
     Swap x[src_idxs] and x[dst_idxs]
     """
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
-
-
-@dataclass(order=True)
-class CUDAGraphConfig:
-    """Configuration for CUDA graphs generation.
-
-    Attributes:
-        token_count : number of total input tokens
-        prefill_req_count : number of prefill requests
-        decode_req_count : number of decode requests
-
-    The graphs are ordered by token_count, then by prefill_req_count, then by decode_req_count.
-
-    We use this order as an estimation of the graph runtime, since token_count
-    directly determines the GEMM time, which typically dominates the graph
-    runtime, and the prefill_request_count can also moderately affects graph run time.
-
-    """
-
-    token_count: int = 0
-    prefill_req_count: int = 0
-    decode_req_count: int = 0
-
-    def __str__(self):
-        """
-        Returns a string representation of the graph config.
-        """
-        return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
-
-    def valid(self, real_config, strict=False) -> bool:
-        """
-        Checks if the graph config is valid for the given real config.
-        Valid graphs are those that have enough tokens and
-        requests budget to handle the real configurations.
-
-        Note that if strict is False, prefill slots can be used
-        for prefill or decode requests. Otherwise, prefill slots
-        can only be used for prefill requests.
-        """
-        if real_config.prefill_req_count == 0:
-            return (
-                self.token_count >= real_config.token_count
-                and self.decode_req_count >= real_config.decode_req_count
-                and self.prefill_req_count == 0  # keep decode only property
-            )
-        if strict:
-            return (
-                self.token_count >= real_config.token_count
-                and self.prefill_req_count >= real_config.prefill_req_count
-                and self.decode_req_count >= real_config.decode_req_count
-            )
-        else:
-            return (
-                self.token_count >= real_config.token_count
-                and self.prefill_req_count >= real_config.prefill_req_count
-                and self.prefill_req_count + self.decode_req_count
-                >= real_config.prefill_req_count + real_config.decode_req_count
-            )
-
-    def __hash__(self):
-        """
-        Returns a hash of the graph config.
-        """
-        return hash((self.token_count, self.prefill_req_count, self.decode_req_count))
-
-    def __eq__(self, other):
-        """
-        Checks if the graph config is equal to the other graph config.
-        """
-        if other is None:
-            return False
-        return (self.token_count, self.prefill_req_count, self.decode_req_count) == (
-            other.token_count,
-            other.prefill_req_count,
-            other.decode_req_count,
-        )
-
-    @property
-    def req_count(self) -> int:
-        """
-        Returns the total number of requests.
-        """
-        return self.prefill_req_count + self.decode_req_count
 
 
 async def await_process_event(

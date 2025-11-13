@@ -11,6 +11,10 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import (
+    CUDAGraphBatchDimensionBuilder,
+    InferenceBatchDimensions,
+)
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -20,7 +24,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import CUDAGraphConfig, tensor_swap
+from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import (
@@ -274,7 +278,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 0,
         cuda_graph_max_tokens: Optional[int] = None,
-        cuda_graph_max_prefill_requests: Optional[int] = 16,
+        cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
@@ -427,8 +431,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = 0
         self.active_token_count = 0
         self.paused_request_count = 0
-        self.real_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
-        self.padded_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
+        self.batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
+        self.padded_batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
         self.padded_active_token_count = 0
         self.padded_active_request_count = 0
         self.paused_tokens = None
@@ -552,13 +560,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
-        self.populate_cudagraph_config_list(
-            tp_size,
-            num_cuda_graphs,
-            cuda_graph_max_tokens,
-            cuda_graph_max_prefill_requests,
-            block_count_total - self.gtd_block_count,
-            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+        self.cuda_graph_batch_dimensions_list = (
+            CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=tp_size,
+                num_cuda_graphs=num_cuda_graphs,
+                cuda_graph_max_tokens=cuda_graph_max_tokens,
+                cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                max_sequence_length=self.max_sequence_length,
+                block_size_tokens=self.block_size_tokens,
+                block_avail=block_count_total - self.gtd_block_count,
+                use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
+            )
         )
 
         self._using_cuda_graph_this_step = False
@@ -599,138 +613,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
-    CUDA_GRAPH_ROUNDER = 8
-
-    def populate_cudagraph_config_list(
-        self,
-        tp_size,
-        num_cuda_graphs,
-        cuda_graph_max_tokens,
-        cuda_graph_max_prefill_requests,
-        block_avail,
-        use_cuda_graphs_for_non_decode_steps,
-    ):
-        """
-        Initialize the cudagraph config list.
-
-        This function constructs CUDA graph configurations for different token counts and request patterns,
-        then filters them based on resource constraints. The construction process involves:
-
-        Construction Rules:
-        1. Token count generation: Creates token counts from step_size to max_tokens, rounded to multiples of 8
-        2. Tensor parallelism alignment: Ensures step_size is divisible by tensor parallel size
-        3. Configuration creation: For each token count, creates three types of configs:
-           - Decode-only: (token_count, 0, token_count) - all tokens used for decode requests
-           - Mixed prefill+decode: (token_count, prefill_req_count, token_count - prefill_req_count)
-           - Prefill-only: (token_count, max(prefill_req_count, ceil(token_count/(max_seq_len-1))), 0)
-
-        Filtering Rules:
-        1. Request limit: prefill_req_count + decode_req_count <= max_requests
-        2. Non-negative counts: Both prefill_req_count and decode_req_count must be >= 0
-        3. Token sufficiency: token_count >= prefill_req_count + decode_req_count
-        4. Block availability: Total requests + required blocks <= available blocks
-
-        Sorting Rules for Attention Metadata Construction:
-        1. Configs are sorted by prefill token count (token_count - decode_req_count) in descending order
-
-        """
-        # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
-        self.cuda_graph_token_counts = None
-        if num_cuda_graphs is not None:
-
-            # Ensure valid num_cuda_graphs.
-            if (
-                cuda_graph_max_tokens is None
-                or cuda_graph_max_tokens > self.max_tokens
-                or cuda_graph_max_tokens < 0
-            ):
-                cuda_graph_max_tokens = self.max_tokens
-            num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
-
-            # Cuda graph step size.
-            self.cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-            self.cuda_graph_step_size = self.CUDA_GRAPH_ROUNDER * int(
-                math.ceil(int(self.cuda_graph_step_size) / self.CUDA_GRAPH_ROUNDER)
-            )
-            # Make sure divisble by TP size
-            self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size
-
-            # Cuda graph token counts.
-            if num_cuda_graphs == 1:
-                self.cuda_graph_token_counts = [cuda_graph_max_tokens]
-            else:
-                self.cuda_graph_token_counts = list(
-                    range(
-                        self.cuda_graph_step_size, cuda_graph_max_tokens, self.cuda_graph_step_size
-                    )
-                )
-                if self.cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
-                    self.cuda_graph_token_counts.append(cuda_graph_max_tokens)
-                self.cuda_graph_token_counts.reverse()
-
-        self.cudagraph_config_list = []
-        if num_cuda_graphs is None:
-            self.cudagraph_config_list = []
-        elif (
-            not cuda_graph_max_prefill_requests
-            or cuda_graph_max_prefill_requests <= 0
-            or not use_cuda_graphs_for_non_decode_steps
-        ):  # decode only
-            for size in self.cuda_graph_token_counts:
-                self.cudagraph_config_list.append(
-                    CUDAGraphConfig(min(size, self.max_requests), 0, min(size, self.max_requests))
-                )
-        else:
-            for size in self.cuda_graph_token_counts:
-                self.cudagraph_config_list.append(
-                    CUDAGraphConfig(min(size, self.max_requests), 0, min(size, self.max_requests))
-                )
-                self.cudagraph_config_list.append(
-                    CUDAGraphConfig(
-                        min(size, self.max_requests),
-                        min(cuda_graph_max_prefill_requests, self.max_requests),
-                        min(size, self.max_requests)
-                        - min(cuda_graph_max_prefill_requests, self.max_requests),
-                    )
-                )
-                # We need to ensure the prefill requests are shorter than the max sequence length, considering the one decode token is used for prefill request construction
-                prefill_only_minimal_num = max(
-                    cuda_graph_max_prefill_requests,
-                    math.ceil(size / max(1, self.max_sequence_length - 1)),
-                )
-                if prefill_only_minimal_num < self.max_requests:
-                    self.cudagraph_config_list.append(
-                        CUDAGraphConfig(
-                            size, max(prefill_only_minimal_num, min(self.max_requests, size)), 0
-                        )
-                    )
-
-        # filter out configurations that have too many requests or too many blocks
-        filtered_cudagraph_config_list = []
-        for config in self.cudagraph_config_list:
-            if config.prefill_req_count + config.decode_req_count > self.max_requests:
-                continue
-            if config.prefill_req_count < 0 or config.decode_req_count < 0:
-                continue
-            if config.token_count < config.prefill_req_count + config.decode_req_count:
-                continue
-            if (
-                config.prefill_req_count
-                + config.decode_req_count
-                + math.ceil(config.token_count // self.block_size_tokens)
-                > block_avail
-            ):
-                continue
-            filtered_cudagraph_config_list.append(config)
-
-        # remove duplicates
-        filtered_cudagraph_config_list = list(set(filtered_cudagraph_config_list))
-        # Sort by prefill token count for printing
-        filtered_cudagraph_config_list.sort(
-            key=lambda x: (x.token_count - x.decode_req_count), reverse=True
-        )
-
-        self.cudagraph_config_list = filtered_cudagraph_config_list
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -1072,14 +954,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
-    def add_dummy_requests_for_cudagraph_capture(self, graph_config: CUDAGraphConfig) -> None:
+    def add_dummy_requests_for_cudagraph_capture(
+        self, graph_dimensions: InferenceBatchDimensions
+    ) -> None:
         """
         Adds dummy requests to reflect the number of prefill and decode requests in the graph config.
         These are using during cuda graph captures.
         """
-        prefill_tokens = graph_config.token_count - graph_config.decode_req_count
+        prefill_tokens = graph_dimensions.token_count - graph_dimensions.decode_req_count
 
-        for i in range(graph_config.decode_req_count):
+        for i in range(graph_dimensions.decode_req_count):
             self.add_request(
                 DynamicInferenceRequest(
                     request_id=i,
@@ -1089,14 +973,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     sampling_params=SamplingParams(num_tokens_to_generate=1),
                 )
             )
-        if graph_config.prefill_req_count == 0:
+        if graph_dimensions.prefill_req_count == 0:
             self.num_prefill_requests = 0
             return
 
-        per_prefill_tokens = prefill_tokens // graph_config.prefill_req_count
-        rem_prefill_tokens = prefill_tokens % graph_config.prefill_req_count
+        per_prefill_tokens = prefill_tokens // graph_dimensions.prefill_req_count
+        rem_prefill_tokens = prefill_tokens % graph_dimensions.prefill_req_count
         prefill_token_counts = torch.full(
-            (graph_config.prefill_req_count,),
+            (graph_dimensions.prefill_req_count,),
             per_prefill_tokens,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
@@ -1104,10 +988,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if rem_prefill_tokens > 0:
             prefill_token_counts[:rem_prefill_tokens] += 1
         assert per_prefill_tokens > 0
-        for i in range(graph_config.prefill_req_count):
+        for i in range(graph_dimensions.prefill_req_count):
             self.add_request(
                 DynamicInferenceRequest(
-                    request_id=i + graph_config.decode_req_count,
+                    request_id=i + graph_dimensions.decode_req_count,
                     prompt_tokens=torch.zeros(
                         prefill_token_counts[i],
                         dtype=torch.long,
@@ -1116,23 +1000,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     sampling_params=SamplingParams(num_tokens_to_generate=1),
                 )
             )
-        self.num_prefill_requests = graph_config.prefill_req_count
-
-    def graph_matching(self, real_config: CUDAGraphConfig) -> Optional[CUDAGraphConfig]:
-        """
-        Matches the best graph for the given token count, prefill request count, and decode request count.
-        """
-        # first filter out graphs with smaller token count, prefill req count, or decode req count, as they are not valid
-        graph_configs_valid = [
-            graph_config
-            for graph_config in self.cudagraph_config_list
-            if graph_config.valid(real_config)
-        ]
-        if len(graph_configs_valid) == 0:
-            return None
-        # then find the best graph
-        best_graph = min(graph_configs_valid)
-        return best_graph
+        self.num_prefill_requests = graph_dimensions.prefill_req_count
 
     @property
     def num_decode_requests(self) -> int:
@@ -1142,68 +1010,73 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
     def initialize_attention_state(
-        self, *, construct_graph_config: Optional[CUDAGraphConfig] = None
+        self, *, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
         Args:
-            construct_graph_config (Optional[CUDAGraphConfig]): The graph config to use for constructing the cuda graphs.
+            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use for constructing the cuda graphs.
         Return:
             None.
         """
         # if in recording mode, add dummy requests for cuda graph capture
-        if construct_graph_config is not None:
+        if construct_graph_dimensions is not None:
             self.reset()
             if (
-                construct_graph_config.prefill_req_count + construct_graph_config.decode_req_count
+                construct_graph_dimensions.prefill_req_count
+                + construct_graph_dimensions.decode_req_count
                 > self.max_requests
             ):
                 raise ActiveRequestCountOverflowError(
                     self.max_requests,
-                    construct_graph_config.prefill_req_count
-                    + construct_graph_config.decode_req_count,
+                    construct_graph_dimensions.prefill_req_count
+                    + construct_graph_dimensions.decode_req_count,
                 )
-            self.add_dummy_requests_for_cudagraph_capture(construct_graph_config)
+            self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
-        real_config = CUDAGraphConfig(
+        batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
         )
-        self.real_config = real_config
-        best_graph = self.graph_matching(real_config)
+        self.batch_dimensions = batch_dimensions
+        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            batch_dimensions, self.cuda_graph_batch_dimensions_list
+        )
         self._using_cuda_graph_this_step = best_graph is not None
-        if construct_graph_config is not None:
+        if construct_graph_dimensions is not None:
             assert (
-                real_config == construct_graph_config == best_graph
-            ), f"real_config: {real_config}, construct_graph_config: {construct_graph_config}, best_graph: {best_graph}"
+                batch_dimensions == construct_graph_dimensions == best_graph
+            ), f"batch_dimensions: {batch_dimensions}, construct_graph_dimensions: {construct_graph_dimensions}, best_graph: {best_graph}"
 
         if self.using_cuda_graph_this_step():
-            self.padded_config = best_graph
-            self.padded_active_token_count = self.padded_config.token_count
-            self.padded_active_request_count = self.padded_config.req_count
+            self.padded_batch_dimensions = best_graph
+            self.padded_active_token_count = self.padded_batch_dimensions.token_count
+            self.padded_active_request_count = self.padded_batch_dimensions.req_count
         else:
-            self.padded_config = CUDAGraphConfig()
-            self.padded_config.token_count = self.round_up_tokens(self.active_token_count)
+            self.padded_batch_dimensions = InferenceBatchDimensions()
+            self.padded_batch_dimensions.token_count = self.round_up_tokens(self.active_token_count)
             if self.is_decode_only():
-                self.padded_config.token_count = min(
+                self.padded_batch_dimensions.token_count = min(
                     self.max_tokens,
                     self.max_requests,
                     self.round_up_tokens(self.active_token_count),
                 )
-                self.padded_config.decode_req_count = self.padded_config.token_count
-                self.padded_config.prefill_req_count = 0
+                self.padded_batch_dimensions.decode_req_count = (
+                    self.padded_batch_dimensions.token_count
+                )
+                self.padded_batch_dimensions.prefill_req_count = 0
             else:
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
                 )
-                self.padded_config.decode_req_count = self.num_decode_requests
-                self.padded_config.prefill_req_count = (
-                    target_padding_req_count - self.padded_config.decode_req_count
+                self.padded_batch_dimensions.decode_req_count = self.num_decode_requests
+                self.padded_batch_dimensions.prefill_req_count = (
+                    target_padding_req_count - self.padded_batch_dimensions.decode_req_count
                 )
-            self.padded_active_token_count = self.padded_config.token_count
-            self.padded_active_request_count = self.padded_config.req_count
+            self.padded_active_token_count = self.padded_batch_dimensions.token_count
+            self.padded_active_request_count = self.padded_batch_dimensions.req_count
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -1228,19 +1101,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
         request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
 
-        attn_config = real_config
-        if real_config.decode_req_count > self.padded_config.decode_req_count:
-            attn_config.prefill_req_count = (
-                attn_config.req_count - self.padded_config.decode_req_count
-            )
-            attn_config.decode_req_count = self.padded_config.decode_req_count
+        attn_dimensions = batch_dimensions
+        if self.using_cuda_graph_this_step():
+            # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
+            if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
+                attn_dimensions.prefill_req_count = (
+                    attn_dimensions.req_count - self.padded_batch_dimensions.decode_req_count
+                )
+                attn_dimensions.decode_req_count = self.padded_batch_dimensions.decode_req_count
 
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
             request_kv_length_offsets=request_kv_length_offsets_view,
             request_to_kv_block_ids=request_to_kv_block_ids_view,
-            real_config=attn_config,
-            padded_config=self.padded_config,
+            batch_dimensions=attn_dimensions,
+            padded_batch_dimensions=self.padded_batch_dimensions,
         )
 
         # Create Mamba state block table if it's a hybrid model
@@ -1270,7 +1145,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = 0
         self.active_token_count = 0
         self.paused_request_count = 0
-        self.real_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
+        self.batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
         self.padded_active_token_count = 0
         self.padded_active_request_count = 0
         self.paused_tokens = None
@@ -1303,7 +1180,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
-        self.padded_config = CUDAGraphConfig(token_count=0, prefill_req_count=0, decode_req_count=0)
+        self.padded_batch_dimensions = InferenceBatchDimensions(
+            token_count=0, prefill_req_count=0, decode_req_count=0
+        )
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None

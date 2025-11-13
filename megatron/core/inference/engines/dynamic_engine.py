@@ -205,42 +205,41 @@ class DynamicInferenceEngine(AbstractEngine):
         moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
 
         if moe_pad_experts:
-            filtered_cudagraph_config_list = []
-            for config in context.cudagraph_config_list:
+            filtered_cuda_graph_batch_dimensions_list = []
+            for config in context.cuda_graph_batch_dimensions_list:
                 if config.prefill_req_count == 0:
-                    filtered_cudagraph_config_list.append(config)
-            if len(filtered_cudagraph_config_list) != len(context.cudagraph_config_list):
+                    filtered_cuda_graph_batch_dimensions_list.append(config)
+            if len(filtered_cuda_graph_batch_dimensions_list) != len(
+                context.cuda_graph_batch_dimensions_list
+            ):
                 warnings.warn(
                     "MoE models do not support non-decode cuda graphs. "
                     "Forcing non_decode_cuda_graphs to False."
                 )
-            context.cudagraph_config_list = filtered_cudagraph_config_list
+            context.cuda_graph_batch_dimensions_list = filtered_cuda_graph_batch_dimensions_list
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
         logging.info("> dynamic_engine.py: building cuda graphs for ")
-        for graph in context.cudagraph_config_list:
+        for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
 
-        tbar = enumerate(context.cudagraph_config_list)
+        tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
-            tbar = tqdm(tbar, total=len(context.cudagraph_config_list))
-        for tbar_idx, cudagraph_config in tbar:
+            tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
+        for tbar_idx, cuda_graph_batch_dimension in tbar:
             input_ids, position_ids = self.controller._dynamic_step_context_init(
-                construct_graph_config=cudagraph_config
+                construct_graph_dimensions=cuda_graph_batch_dimension
             )
             # Progress.
-            tbar_str = f"cuda graph warmup - {cudagraph_config}"
+            tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
             if HAVE_TQDM:
                 tbar.set_description(tbar_str)
             else:
-                logging.info(f"{tbar_idx}/{len(context.cudagraph_config_list)}. {tbar_str}")
-
-            # Get flat tokens, position ids.
-            input_ids, position_ids = context.current_input_and_position_ids(
-                num_warmup_tokens=cudagraph_config.token_count
-            )
+                logging.info(
+                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
+                )
 
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
@@ -854,11 +853,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         " [%s + real config %s + cuda graph %s]"
                         % (
                             step_type,
-                            context.real_config,
+                            context.batch_dimensions,
                             (
                                 "OFF"
                                 if not context.using_cuda_graph_this_step()
-                                else context.padded_config
+                                else context.padded_batch_dimensions
                             ),
                         )
                     ),

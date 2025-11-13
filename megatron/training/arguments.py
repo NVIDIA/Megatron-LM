@@ -1509,9 +1509,9 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=None,
                        help='Maximum number of tokens to capture in a cuda graph.')
-    group.add_argument('--inference-dynamic-batching-cuda-graph-max-prefill-requests',
+    group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
-                       help='Maximum number of prefill requests to capture in a cuda graph.')
+                       help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics to wandb. '
                             'Default to 0 to disable inference wandb logging.')
