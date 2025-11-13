@@ -72,16 +72,17 @@ def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) ->
         target_names = [param_key.name]
     else:
         target_names = list(param_key.name)
-    if param_name in target_names:
-        return True
+    for target_name in target_names:
+        if param_name in target_name:
+            return True
 
     # Check if attribute matches.
     if isinstance(param_key.attr, str):
         target_attrs = [param_key.attr]
     else:
         target_attrs = list(param_key.attr)
-    for attr in target_attrs:
-        if getattr(param, attr, False):
+    for target_attr in target_attrs:
+        if getattr(param, target_attr, False):
             return True
 
     return False
