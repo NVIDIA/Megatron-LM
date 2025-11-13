@@ -24,8 +24,8 @@ MODEL_ARGS:
   --log-interval: 1
   --transformer-impl: inference_optimized
   --sequence-parallel: true
-  --tensor-model-parallel-size: 8
-  --pipeline-model-parallel-size: 1
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 2
   --deterministic-mode: true
   --ckpt-format: torch_dist
   --bf16: true
