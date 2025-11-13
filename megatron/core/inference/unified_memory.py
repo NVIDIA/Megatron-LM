@@ -83,9 +83,6 @@ def compile_allocator():
     #define EXPORT extern "C"
 
     EXPORT void* managed_malloc(size_t size, int device, void* stream) {
-      // >>>
-      std::cout << "..... ....... CUDART_VERSION: " << CUDART_VERSION << ".\n";
-      // <<<
       (void)stream;
       int cur = -1;
       cudaGetDevice(&cur);
