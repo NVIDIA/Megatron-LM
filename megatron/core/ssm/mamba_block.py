@@ -25,6 +25,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymb
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -292,7 +293,7 @@ class MambaStack(MegatronModule):
             (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and "full_iteration" not in self.config.cuda_graph_scope
+                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )

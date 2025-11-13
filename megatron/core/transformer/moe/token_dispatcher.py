@@ -16,6 +16,7 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
@@ -433,7 +434,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         }
         if (
             config.cuda_graph_impl == "transformer_engine"
-            and 'moe_preprocess' in config.cuda_graph_scope
+            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
         else:

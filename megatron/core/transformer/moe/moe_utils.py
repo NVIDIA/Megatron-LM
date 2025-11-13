@@ -9,6 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.enums import CudaGraphScope
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -1190,13 +1191,13 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         ):
             if (
                 step_condition == "route"
-                and 'moe_router' in moe_layer.config.cuda_graph_scope
-                and 'moe_preprocess' not in moe_layer.config.cuda_graph_scope
+                and CudaGraphScope.moe_router in moe_layer.config.cuda_graph_scope
+                and CudaGraphScope.moe_preprocess not in moe_layer.config.cuda_graph_scope
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
             elif (
                 step_condition == "preprocess"
-                and 'moe_preprocess' in moe_layer.config.cuda_graph_scope
+                and CudaGraphScope.moe_preprocess in moe_layer.config.cuda_graph_scope
             ):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 

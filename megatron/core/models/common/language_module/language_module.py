@@ -21,7 +21,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, make_tp_sharded_tensor_for_checkpoint
@@ -136,7 +136,8 @@ class LanguageModule(MegatronModule):
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
-                        and 'full_iteration' in self.config.cuda_graph_scope
+                        and self.config.cuda_graph_scope
+                        and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version

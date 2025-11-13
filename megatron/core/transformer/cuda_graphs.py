@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel.random import (
     get_all_rng_states,
     get_cuda_rng_tracker,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1344,24 +1345,24 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and 'mamba' in config.cuda_graph_scope:
+    if isinstance(layer, MambaLayer) and CudaGraphScope.mamba in config.cuda_graph_scope:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if 'attn' in config.cuda_graph_scope and not (
+        if CudaGraphScope.attn in config.cuda_graph_scope and not (
             isinstance(layer.self_attention, IdentityOp)
             and isinstance(layer.cross_attention, IdentityOp)
         ):
             # attn layer.
             return True
         if (
-            'moe' in config.cuda_graph_scope
-            or 'moe_router' in config.cuda_graph_scope
-            or 'moe_preprocess' in config.cuda_graph_scope
+            CudaGraphScope.moe in config.cuda_graph_scope
+            or CudaGraphScope.moe_router in config.cuda_graph_scope
+            or CudaGraphScope.moe_preprocess in config.cuda_graph_scope
         ) and isinstance(layer.mlp, MoELayer):
             # moe layer.
             return True
-        if 'mlp' in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+        if CudaGraphScope.mlp in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
             # mlp layer.
             return True
     return False
@@ -1388,7 +1389,7 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert "full_iteration" not in config.cuda_graph_scope, (
+        assert CudaGraphScope.full_iteration not in config.cuda_graph_scope, (
             "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
             "Please use cuda_graph_impl=local instead."
         )
@@ -1529,7 +1530,7 @@ class TECudaGraphHelper:
                         and not isinstance(layer.self_attention, IdentityOp)
                         and (
                             not self.config.cuda_graph_scope
-                            or 'attn' in self.config.cuda_graph_scope
+                            or CudaGraphScope.attn in self.config.cuda_graph_scope
                         )
                     )
                     if is_te_min_version("1.10.0"):
