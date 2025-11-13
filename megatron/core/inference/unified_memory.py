@@ -137,7 +137,6 @@ def compile_allocator():
             """,
         ]
     else:
-        raise Exception("12.")
         cuda_mem_advise_blocks = [
             r"""
         cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
@@ -146,7 +145,6 @@ def compile_allocator():
         cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
             """,
         ]
-    # <<<
 
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
