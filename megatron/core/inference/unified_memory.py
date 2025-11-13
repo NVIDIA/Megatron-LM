@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
-import torch
 import warnings
 from enum import Enum, auto
 from pathlib import Path
@@ -49,33 +48,6 @@ def compile_allocator():
     if _compilation_state != CompilationState.UNATTEMPTED:
         return
 
-    # Specialize `cudaMemAdvise` args for different CUDA versions.
-    cuda_version = float(torch.version.cuda)
-    if cuda_version >= 13:
-        cuda_mem_advise_blocks = [
-            r"""
-        // For CUDA >= 13, the cudaMemAdvise device arg is type cudaMemLocation
-        // instead of an int, so we setup the location and conditionally use it
-        // in calls to cudaMemAdvise.
-        cudaMemLocation location;
-        location.type = cudaMemLocationTypeDevice;
-        location.id = device;
-        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, location);
-            """,
-            r"""
-        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, location);
-            """,
-        ]
-    else:
-        cuda_mem_advise_blocks = [
-            r"""
-        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
-            """,
-            r"""
-        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
-            """,
-        ]
-
     _mempool_c_src = r"""
     #include <cuda_runtime_api.h>
     #include <cstddef>
@@ -97,17 +69,12 @@ def compile_allocator():
       if (device >= 0) {
         // cudaMemAdviseSetPreferredLocation sets the preferred location for the memory.
         // This is a hint that tries to prevent data from being migrated away from the device.
-        // >>>
-    """
-    _mempool_c_src += cuda_mem_advise_blocks[0]
-    _mempool_c_src += r"""
+        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
         // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
         // Even if the memory has to be migrated away from the device, it still does not page fault.
         // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
         // but there is no harm in adding this flag as well for future-proofing.
-    """
-    _mempool_c_src += cuda_mem_advise_blocks[1]
-    _mempool_c_src += r"""
+        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
       }
       return ptr;
     }

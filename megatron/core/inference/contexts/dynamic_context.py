@@ -494,6 +494,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
+        # >>>
+        print("~~~")
+        print(f"unified memory level: {self.unified_memory_level}.")
+        exit()
+        from lutil import pax
+        pax({"unified_memory_level": self.unified_memory_level})
+        # <<<
 
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
