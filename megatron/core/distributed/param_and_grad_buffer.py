@@ -17,7 +17,12 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
+from ..fp8_utils import (
+    is_float8tensor,
+    is_mxfp8tensor,
+    modify_underlying_storage,
+    post_all_gather_processing,
+)
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
@@ -311,10 +316,7 @@ class _ParamAndGradBucketGroup:
             # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
             # we need to copy the param_data from the shared_param/grad_buffer to param.data
             # after the param all-gather.
-            if (
-                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                and self.ddp_config.overlap_param_gather
-            ):
+            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     for param in bucket.params:
                         param_start, param_end = bucket.param_to_index[param]
@@ -326,6 +328,14 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
+            else:
+                fp8_params = []
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        if is_float8tensor(param):
+                            fp8_params.append(param)
+                if len(fp8_params) > 0:
+                    post_all_gather_processing(fp8_params)
 
     def start_grad_sync(self):
         """
