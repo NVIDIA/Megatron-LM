@@ -2510,6 +2510,10 @@ def train(
         if should_exit:
             break
 
+    # Destroy CUDA Graphs.
+    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+        cuda_graph_helper.destroy_cudagraphs()
+
     one_logger_utils.track_e2e_metrics()
 
     # Flush TensorBoard, WandB writers and one-logger.
