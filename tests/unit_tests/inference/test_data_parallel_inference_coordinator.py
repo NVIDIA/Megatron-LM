@@ -188,8 +188,22 @@ class TestCoordinator:
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_tp(self):
-        """Simple test with no TP or PP."""
+        """Simple test with TP, but no PP."""
         env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_pp(self):
+        """Simple test with no TP, but PP."""
+        env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_tp_pp(self):
+        """Simple test with both TP and PP."""
+        env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -213,6 +227,9 @@ if __name__ == "__main__":
     test = TestCoordinator()
     test.test_simple()
     test.test_tp()
+    test.test_pp()
+    test_test.tp_pp()
+    test_test.throughput()
     test.teardown_method(None)
     print("~~~")
     print("success.")
