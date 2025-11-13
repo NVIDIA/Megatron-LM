@@ -23,8 +23,11 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
-from .utils import FSDPDistributedIndex
-from .mixed_precision import is_float8tensor, fp8_discard_transpose_cache, fp8_create_transpose_cache
+from .mixed_precision import (
+    fp8_create_transpose_cache,
+    fp8_discard_transpose_cache,
+    is_float8tensor,
+)
 from .param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,
@@ -34,6 +37,8 @@ from .param_and_grad_buffer import (
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
 )
+from .utils import FSDPDistributedIndex
+
 logger = logging.getLogger(__name__)
 
 
@@ -617,9 +622,7 @@ class MegatronFSDP(torch.nn.Module):
                 param_list = list(module.parameters(recurse=False))
                 # TODO(mxfp8): Do we really need this?
                 self.all_gather_and_wait_parameters_ready(
-                    params=param_list,
-                    prefetch=False,
-                    bwd=True,
+                    params=param_list, prefetch=False, bwd=True
                 )
 
             # All-gather the parameters before the forward pass.
@@ -735,7 +738,7 @@ class MegatronFSDP(torch.nn.Module):
                 self.all_gather_and_wait_parameters_ready(
                     list(module.parameters()),
                     prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
-                    bwd=True
+                    bwd=True,
                 )
 
         self._root_pre_backward_hook_issued = False
@@ -763,9 +766,9 @@ class MegatronFSDP(torch.nn.Module):
                 for bucket_id in range(ag_pipeline.num_buckets):
                     group = self.param_and_grad_buffer.parameter_groups[bucket_id]
                     if group.fsdp_unit_id is not None:
-                            ag_pipeline.bucket_can_be_released[
-                                ag_pipeline.get_bucket_key(bucket_id, bwd=False)
-                            ] = True
+                        ag_pipeline.bucket_can_be_released[
+                            ag_pipeline.get_bucket_key(bucket_id, bwd=False)
+                        ] = True
             # Track parameters that require gradient reduction and optimization.
             self._params_require_handle_grad = set()
             for param_group in self.param_and_grad_buffer.parameter_groups:
