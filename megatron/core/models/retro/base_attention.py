@@ -31,6 +31,7 @@ class BaseRetroCrossAttention(MegatronModule):
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         pg_collection: ProcessGroupCollection = None,
+        transformer_layer_offset: int = 0,
     ):
         super().__init__(config=config)
 
@@ -40,6 +41,7 @@ class BaseRetroCrossAttention(MegatronModule):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            transformer_layer_offset=transformer_layer_offset,
         )
 
         self.retro_num_neighbors = config.retro_num_neighbors

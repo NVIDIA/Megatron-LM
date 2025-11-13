@@ -342,6 +342,7 @@ class MLASelfAttention(MultiLatentAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: ProcessGroupCollection = None,
+        transformer_layer_offset: int = 0,
     ):
         super().__init__(
             config=config,
@@ -351,6 +352,7 @@ class MLASelfAttention(MultiLatentAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            transformer_layer_offset=transformer_layer_offset,
         )
 
         if self.config.q_lora_rank is None:
