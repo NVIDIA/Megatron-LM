@@ -81,7 +81,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                 continue
             assert is_not_tp_duplicate
             if not getattr(param, 'allreduce', True):
-                # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
                 if args.bf16:
@@ -94,7 +93,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                     else:
                         # Fallback to original logic of making a fp32 copy of the
                         # parameter if `.main_param` attribute is not available.
-                        print("Using float conversion")
                         moe_params_data.append(param.data.float())
                 else:
                     moe_params_data.append(param.data)
