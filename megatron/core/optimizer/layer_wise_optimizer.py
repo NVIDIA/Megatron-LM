@@ -268,3 +268,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     group['step'] = step
 
         return sharded_state_dict
+
+    def save_state_dict_to_file(self, filename: str) -> None:
+        """Save the parameter state of the optimizer. For torch format only.
+        Args:
+            filename: The filename to save the parameter state.
+        """
+        torch.save(super().state_dict(), filename)
+
+    def load_state_dict_from_file(self, filename: str) -> None:
+        """Load the parameter state of the optimizer. For torch format only."""
+        super().load_state_dict(torch.load(filename))

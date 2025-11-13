@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 import os
 import random
 import sys
@@ -763,6 +764,7 @@ class TestPartialCudaGraph:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        gc.collect()
 
     def model_provider(
         self,
