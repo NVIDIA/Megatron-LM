@@ -138,7 +138,7 @@ def should_skip_object(obj: Object) -> bool:
     return False
 
 
-def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, package_root: str = "megatron.core"):
+def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
     """
     Recursively filter objects and mark which should be skipped.
     
@@ -146,40 +146,34 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, pa
         obj: A griffe Object to examine
         filtered: Set to populate with paths of objects to skip
         visited: Set of already visited paths to prevent infinite recursion
-        package_root: The root package being analyzed (e.g., "megatron.core")
     """
     if visited is None:
         visited = set()
     
-    # FIRST: Hard limit on path length - malformed paths are very long
-    if len(obj.path) > 150:  # Normal paths are much shorter
+    # Hard limit on path length - catch malformed circular paths early
+    if len(obj.path) > 150:
         filtered.add(obj.path)
-        return  # Don't even process it
+        return
     
     # Prevent infinite recursion by tracking visited paths
     if obj.path in visited:
         return
     visited.add(obj.path)
     
-    # Filter out objects with malformed paths (path explosion from circular refs)
-    # Look for any repeated path segments indicating circular references
-    # E.g., "a.b.a.b" or "megatron.core.megatron.core"
+    # Detect circular references by checking for repeated path patterns
     path_parts = obj.path.split('.')
-    # Check if any 2+ segment sequence repeats (start from 2 to catch "megatron.core" repetitions)
-    for length in range(2, min(len(path_parts) // 2 + 1, 10)):  # Check up to 10-segment patterns
+    for length in range(2, min(len(path_parts) // 2 + 1, 10)):
         for start in range(len(path_parts) - 2 * length + 1):
             pattern = '.'.join(path_parts[start:start + length])
             rest_of_path = '.'.join(path_parts[start + length:])
             if rest_of_path.startswith(pattern):
                 filtered.add(obj.path)
-                if len(visited) < 5:  # Only print first few to avoid spam
+                if len(visited) < 5:  # Print first few for visibility
                     print(f"  ⏭️  Skipping {obj.path[:80]}... (circular: {pattern[:40]})", file=sys.stderr)
                 return
     
-    # NEVER recurse into aliases - they're just references, not real objects
-    # Recursing into them causes infinite loops and path explosion
+    # Skip aliases (imports) - they're not real API definitions
     if obj.kind.value == "alias":
-        # Filter out external aliases from comparison
         try:
             if hasattr(obj, 'target_path'):
                 target = str(obj.target_path)
@@ -187,9 +181,9 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, pa
                     filtered.add(obj.path)
         except Exception:
             filtered.add(obj.path)
-        # Always return early - never recurse into aliases
         return
     
+    # Check if object should be skipped (decorators, path patterns, etc.)
     if should_skip_object(obj):
         filtered.add(obj.path)
         return
@@ -197,36 +191,7 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, pa
     # Recurse into members (for classes, modules, etc.)
     if hasattr(obj, 'members'):
         for member in obj.members.values():
-            # CRITICAL: Check for malformed paths BEFORE recursing
-            # If a member already has a circular path, don't recurse into it
-            member_parts = member.path.split('.')
-            has_circular = False
-            for length in range(2, min(len(member_parts) // 2 + 1, 10)):
-                for start in range(len(member_parts) - 2 * length + 1):
-                    pattern = '.'.join(member_parts[start:start + length])
-                    rest = '.'.join(member_parts[start + length:])
-                    if rest.startswith(pattern):
-                        has_circular = True
-                        break
-                if has_circular:
-                    break
-            
-            if has_circular:
-                filtered.add(member.path)
-                continue  # Don't recurse
-            
-            # Skip aliases completely to prevent recursion
-            if member.kind.value != "alias":
-                filter_objects(member, filtered, visited, package_root)
-            else:
-                # Just check if external alias needs filtering
-                try:
-                    if hasattr(member, 'target_path'):
-                        target = str(member.target_path)
-                        if not target.startswith('megatron'):
-                            filtered.add(member.path)
-                except Exception:
-                    filtered.add(member.path)
+            filter_objects(member, filtered, visited)
 
 
 def remove_filtered_objects(obj: Object, filtered: Set[str]):
@@ -237,6 +202,10 @@ def remove_filtered_objects(obj: Object, filtered: Set[str]):
         obj: A griffe Object to clean
         filtered: Set of paths to remove
     """
+    # Skip aliases - checking their members tries to resolve them
+    if obj.kind.value == "alias":
+        return
+    
     if not hasattr(obj, 'members'):
         return
     
@@ -287,7 +256,7 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
     filtered = set()
     if verbose:
         print(f"   Applying filters...", file=sys.stderr)
-    filter_objects(package, filtered, package_root=package_name)
+    filter_objects(package, filtered)
     
     if filtered:
         print(f"   Filtered {len(filtered)} objects", file=sys.stderr)
