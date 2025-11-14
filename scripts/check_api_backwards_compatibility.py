@@ -93,15 +93,35 @@ def should_skip_object(obj: Object) -> bool:
     Returns:
         True if object should be skipped, False otherwise
     """
-    # Check decorators
-    if hasattr(obj, 'decorators') and obj.decorators:
-        decorator_names = {
-            dec.value.name if hasattr(dec.value, 'name') else str(dec.value)
-            for dec in obj.decorators
-        }
-        if decorator_names & EXEMPT_DECORATORS:
-            print(f"  ⏭️  Skipping {obj.path} (has exempt decorator)", file=sys.stderr)
+    # Skip aliases to external packages (e.g., import torch)
+    if obj.kind.value == "alias":
+        try:
+            # Try to check if it's an external import
+            if hasattr(obj, 'target_path'):
+                target = str(obj.target_path)
+                # Skip if it's pointing to external packages
+                if not target.startswith('megatron'):
+                    print(f"  ⏭️  Skipping {obj.path} (external alias)", file=sys.stderr)
+                    return True
+        except Exception:
+            # If we can't resolve it, skip it
+            print(f"  ⏭️  Skipping {obj.path} (unresolvable alias)", file=sys.stderr)
             return True
+    
+    # Check decorators
+    try:
+        if hasattr(obj, 'decorators') and obj.decorators:
+            decorator_names = {
+                dec.value.name if hasattr(dec.value, 'name') else str(dec.value)
+                for dec in obj.decorators
+            }
+            if decorator_names & EXEMPT_DECORATORS:
+                print(f"  ⏭️  Skipping {obj.path} (has exempt decorator)", file=sys.stderr)
+                return True
+    except Exception as e:
+        # If we can't check decorators (e.g., alias resolution error), skip it
+        print(f"  ⏭️  Skipping {obj.path} (decorator check failed: {type(e).__name__})", file=sys.stderr)
+        return True
     
     # Check name prefixes
     for prefix in EXCLUDE_PREFIXES:
