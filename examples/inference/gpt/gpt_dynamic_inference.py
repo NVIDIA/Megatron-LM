@@ -317,6 +317,10 @@ def run_inference(
                     request.log_probs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
+                if finished_request.sampling_params.top_n_logprobs > 0:
+                    request.generated_top_n_logprobs = getattr(
+                        finished_request, 'generated_top_n_logprobs', None
+                    )
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
 
@@ -362,6 +366,7 @@ def main():
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
+        top_n_logprobs=args.top_n_logprobs,
     )
 
     # Requests, context, conroller.
@@ -463,6 +468,7 @@ def main():
             # Write every 'n' requests, plus the final request.
             for i, req in enumerate(requests):
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
+                    print(f' Attributes of request {i}: {req.__dict__}')
                     result_dict = {
                         "input_prompt": req.prompt_text,
                         "generated_text": req.output_text,
@@ -470,6 +476,7 @@ def main():
                         "latency": req.time_end - req.time_start,
                         "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
                         "step_count" : engine.step_count,
+                        "top_n_logprobs" : getattr(req, 'generated_top_n_logprobs', None),
                     }
                     if req.sampling_params.return_log_probs:
                         response_logprobs = req.log_probs
@@ -479,6 +486,7 @@ def main():
             # Track system-level throughput as a test / debug metric
             json_results["throughput"] = throughputs
 
+            print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
