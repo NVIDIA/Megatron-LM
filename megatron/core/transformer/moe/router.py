@@ -385,7 +385,7 @@ class TopKRouter(Router):
         skip_dp_reduction: bool = False,
     ):
         """Attach aux loss function to activation and add to logging.
-        
+
         Args:
             activation (torch.Tensor): The activation tensor to attach the loss to.
             aux_loss_coeff (float): The coefficient for the auxiliary loss.
