@@ -132,6 +132,7 @@ def get_inference_context(
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
+
     # Max sequence length.
     if calculate_max_sequence_length_from_requests:
         max_gen_length = sampling_params.num_tokens_to_generate    
@@ -159,11 +160,8 @@ def get_inference_context(
             else None
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
-        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
-        max_requests_override=args.inference_dynamic_batching_max_requests_override,
-        max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
+        active_buffer_size_gb=args.inference_dynamic_batching_active_buffer_size_gb,
+        max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         layer_type_list=layer_type_list,
@@ -546,14 +544,14 @@ def main():
         if engine.capture_stats else
         "--"
     )
-    print(
-        f"{setup_prefix} … "
-        f"capture {capture_str} … "
-        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        f"total time: {total_time:.3f}s … "
-        f"steps: {engine.step_count:d} … "
-        f"throughput: {throughput:.3f} tok/s"
-    )
+    print(" … ".join((
+        f"{setup_prefix}",
+        f"throughput: {throughput:.3f} tok/s",
+        f"total time: {total_time:.3f}s",
+        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB",
+        f"steps: {engine.step_count:d}",
+        f"capture {capture_str}",
+    )))
     print("~~~")
 
     # Stop Nsight profiler.
