@@ -81,7 +81,7 @@ dev = [
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
-    "av<16.0.0",                                                          # At the time, av 16.0.0 is not compatible with Python 3.12
+    "av<16.0.0",                                        # At the time, av 16.0.0 is not compatible with Python 3.12
     "flashinfer-python",
     "wget",
     "onnxscript",
@@ -91,20 +91,13 @@ dev = [
 
 lts = [
     "tqdm",
-    "einops~=0.8",
-    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
-    "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "einops",
+    "tensorstore!=0.1.46,!=0.1.72",
+    "nvtx",
+    "transformers",
+    "zarr",
     "setuptools<80.0.0",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
-    "megatron-energon[av_decode]~=6.0",
-    "av<16.0.0",                          # At the time, av 16.0.0 is not compatible with Python 3.12
-    "flashinfer-python",
     "wget",
-    "onnxscript",
 ]
 
 [dependency-groups]
