@@ -371,6 +371,7 @@ class TopKRouter(Router):
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
+            skip_dp_reduction=True,
         )
         return probs
 
@@ -381,8 +382,19 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
+        skip_dp_reduction: bool = False,
     ):
-        """Attach aux loss function to activation and add to logging."""
+        """Attach aux loss function to activation and add to logging.
+        
+        Args:
+            activation (torch.Tensor): The activation tensor to attach the loss to.
+            aux_loss_coeff (float): The coefficient for the auxiliary loss.
+            aux_loss (torch.Tensor): The auxiliary loss tensor.
+            aux_loss_name (str): The name of the auxiliary loss for logging.
+            reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
+            skip_dp_reduction (bool): Whether to skip the additional data parallel reduction.
+                Set this to True if reduce_group already includes the DP group.
+        """
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
@@ -396,6 +408,7 @@ class TopKRouter(Router):
             self.layer_number,
             num_layers,
             reduce_group=reduce_group,
+            skip_dp_reduction=skip_dp_reduction,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.

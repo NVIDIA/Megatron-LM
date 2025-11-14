@@ -719,6 +719,7 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: torch.distributed.ProcessGroup = None,
     avg_group: torch.distributed.ProcessGroup = None,
+    skip_dp_reduction: bool = False,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -727,7 +728,10 @@ def save_to_aux_losses_tracker(
         layer_number (int): Layer index of the loss.
         num_layers (int): The number of total layers.
         reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-        mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        skip_dp_reduction (bool): Whether to skip the additional data parallel reduction.
+            Set this to True if the loss has already been reduced across the DP group
+            (e.g., when reduce_group already includes DP like tp_dp_cp_group).
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
@@ -740,6 +744,7 @@ def save_to_aux_losses_tracker(
     tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
     tracker[name]["reduce_group"] = reduce_group
     tracker[name]["avg_group"] = avg_group
+    tracker[name]["skip_dp_reduction"] = skip_dp_reduction
 
 
 def clear_aux_losses_tracker():
@@ -769,9 +774,9 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
                 values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
         # Average aux losses across data parallel ranks.
-        # The `global_load_balancing_loss` already uses `tp_dp_cp_group` in `reduce_group`,
-        # so we don't need to reduce it again. Others use tp_cp_group in `reduce_group`.
-        if name != "global_load_balancing_loss":
+        # Skip if the loss has already been reduced across DP group (e.g., when
+        # reduce_group already includes DP like tp_dp_cp_group).
+        if not tracker[name].get('skip_dp_reduction', False):
             torch.distributed.all_reduce(
                 values,
                 group=parallel_state.get_data_parallel_group(with_context_parallel=False),
@@ -804,6 +809,7 @@ def track_moe_metrics(
                     tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
+                    tracker[key]["skip_dp_reduction"] = False
     reduce_aux_losses_tracker_across_ranks(track_names)
 
     # Get number of MoE layers
