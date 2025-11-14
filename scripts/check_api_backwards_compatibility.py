@@ -194,56 +194,11 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
             filter_objects(member, filtered, visited)
 
 
-def remove_filtered_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, _progress_counter: list = None):
-    """
-    Remove filtered objects from the object tree.
-    
-    Args:
-        obj: A griffe Object to clean
-        filtered: Set of paths to remove
-        visited: Set of already visited paths to prevent infinite recursion
-        _progress_counter: Internal counter for progress reporting
-    """
-    if visited is None:
-        visited = set()
-        _progress_counter = [0]  # Use list so it's mutable across recursion
-    
-    # Prevent infinite recursion
-    if obj.path in visited:
-        return
-    visited.add(obj.path)
-    
-    # Progress reporting every 1000 objects
-    _progress_counter[0] += 1
-    if _progress_counter[0] % 1000 == 0:
-        print(f"     Cleaned {_progress_counter[0]} objects...", file=sys.stderr)
-    
-    # Skip aliases - checking their members tries to resolve them
-    if obj.kind.value == "alias":
-        return
-    
-    if not hasattr(obj, 'members'):
-        return
-    
-    # Remove filtered members
-    members_to_remove = [
-        name for name, member in obj.members.items()
-        if member.path in filtered
-    ]
-    
-    for name in members_to_remove:
-        del obj.members[name]
-    
-    # Recurse into remaining members
-    for member in obj.members.values():
-        remove_filtered_objects(member, filtered, visited, _progress_counter)
-
-
 # ============================================================================
 # Main comparison logic
 # ============================================================================
 
-def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -> Object:
+def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -> tuple:
     """
     Load package and apply filters.
     
@@ -253,7 +208,7 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
         verbose: Enable verbose output
     
     Returns:
-        Filtered griffe Object
+        Tuple of (griffe Object, set of filtered object paths)
     """
     ref_label = f" @ {ref}" if ref else " (current)"
     print(f"📦 Loading {package_name}{ref_label}", file=sys.stderr)
@@ -277,12 +232,11 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
     if filtered:
         print(f"   Filtered {len(filtered)} objects", file=sys.stderr)
     
-    # Remove filtered objects
-    print(f"   Removing filtered objects from tree...", file=sys.stderr)
-    remove_filtered_objects(package, filtered)
-    print(f"   ✓ Cleanup complete", file=sys.stderr)
+    # Note: We don't physically remove filtered objects from the tree because
+    # the circular structure makes tree traversal extremely slow (300K+ objects).
+    # Instead, we'll filter breaking changes after comparison.
     
-    return package
+    return package, filtered
 
 
 def print_breaking_changes(changes: List, verbose: bool = False) -> bool:
@@ -408,10 +362,13 @@ Exit codes:
             print(f"{'=' * 80}", file=sys.stderr)
             
             # Load baseline version
-            baseline = load_and_filter(package_name, ref=args.baseline, verbose=args.verbose)
+            baseline, baseline_filtered = load_and_filter(package_name, ref=args.baseline, verbose=args.verbose)
             
             # Load current version
-            current = load_and_filter(package_name, ref=args.current, verbose=args.verbose)
+            current, current_filtered = load_and_filter(package_name, ref=args.current, verbose=args.verbose)
+            
+            # Combine filtered sets
+            all_filtered = baseline_filtered | current_filtered
             
             # Find breaking changes
             print(f"\n🔍 Comparing {package_name}:", file=sys.stderr)
@@ -419,8 +376,18 @@ Exit codes:
             print(f"   Current:  {args.current or 'working directory'}", file=sys.stderr)
             print(f"   Running comparison...", file=sys.stderr)
             
-            breaking_changes = list(griffe.find_breaking_changes(baseline, current))
+            all_breaking_changes_raw = list(griffe.find_breaking_changes(baseline, current))
             print(f"   ✓ Comparison complete", file=sys.stderr)
+            
+            # Filter out breaking changes involving filtered objects
+            breaking_changes = [
+                change for change in all_breaking_changes_raw
+                if (change.old_path not in all_filtered if change.old_path else True) and
+                   (change.new_path not in all_filtered if change.new_path else True)
+            ]
+            
+            if len(all_breaking_changes_raw) > len(breaking_changes):
+                print(f"   Filtered out {len(all_breaking_changes_raw) - len(breaking_changes)} changes in excluded code", file=sys.stderr)
             
             if breaking_changes:
                 all_breaking_changes.extend([(package_name, change) for change in breaking_changes])
