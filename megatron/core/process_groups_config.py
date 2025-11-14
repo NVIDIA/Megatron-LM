@@ -52,6 +52,11 @@ class ProcessGroupCollection:
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
         inter_dist_opt: Inter distributed optimizer instance group
+        dp_gloo: Gloo data parallel process group
+        dp_cp_gloo: Gloo data and context parallel group
+        intra_dp_cp_gloo: Gloo intra partial data parallel group
+        expt_dp_gloo: Gloo expert data parallel group
+        intra_expt_dp_gloo: Gloo intra partial expert data parallel group
 
     Example:
         # Create instance and set needed process groups
@@ -133,6 +138,24 @@ class ProcessGroupCollection:
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     intra_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
+    # -------------------------
+    # Gloo Data Parallel Groups
+    # -------------------------
+    # _DATA_PARALLEL_GROUP_GLOO
+    dp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
+    # _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    dp_cp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    intra_dp_cp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_DATA_PARALLEL_GROUP_GLOO
+    expt_dp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    intra_expt_dp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
     def __init__(self, **kwargs):
         for key in kwargs:
             if key in [field.name for field in fields(self)]:
@@ -141,7 +164,9 @@ class ProcessGroupCollection:
                 raise ValueError(f"Unknown attribute: {key}")
 
     @classmethod
-    def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
+    def use_mpu_process_groups(
+        cls, required_pgs: Optional[List[str]] = None, use_gloo: bool = False
+    ):
         """
         Use the default process groups from parallel_state.
 
@@ -149,13 +174,19 @@ class ProcessGroupCollection:
             required_pgs (List[str], optional): List of process group names to initialize.
                 If None, pull all default process groups. Each string should correspond to
                 one of the dataclass process group attributes.
+            use_gloo (bool, optional): If True and required_pgs is None, also include Gloo
+                variants of process groups where available. If False, Gloo groups are excluded
+                unless explicitly requested in required_pgs.
         """
         # Get all available process groups
         all_pgs = {field.name for field in fields(cls)}
 
         # If no specific process groups requested, use all
         if required_pgs is None:
-            required_pgs = list(all_pgs)
+            if use_gloo:
+                required_pgs = list(all_pgs)
+            else:
+                required_pgs = [pg for pg in all_pgs if not pg.endswith('_gloo')]
 
         # Validate requested process groups
         invalid_pgs = [pg for pg in required_pgs if pg not in all_pgs]
@@ -219,6 +250,30 @@ class ProcessGroupCollection:
                 parallel_state.get_tensor_and_data_parallel_group,
                 check_initialized=False,
                 with_context_parallel=True,
+            ),
+            # Gloo variants
+            'dp_gloo': partial(
+                parallel_state.get_data_parallel_group_gloo,
+                with_context_parallel=False,
+                partial_data_parallel=False,
+            ),
+            'dp_cp_gloo': partial(
+                parallel_state.get_data_parallel_group_gloo,
+                with_context_parallel=True,
+                partial_data_parallel=False,
+            ),
+            'intra_dp_cp_gloo': partial(
+                parallel_state.get_data_parallel_group_gloo,
+                with_context_parallel=True,
+                partial_data_parallel=True,
+            ),
+            'expt_dp_gloo': partial(
+                parallel_state.get_expert_data_parallel_group_gloo,
+                partial_expert_data_parallel=False,
+            ),
+            'intra_expt_dp_gloo': partial(
+                parallel_state.get_expert_data_parallel_group_gloo,
+                partial_expert_data_parallel=True,
             ),
         }
 
