@@ -200,22 +200,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     divided into blocks and dynamically assigned to requests. At any given step,
     any unassigned blocks equate to unused space.
 
-    Additionally, a fraction of the memory buffer (`gtd_request_fraction`, i.e.,
-    the 'guaranteed' request fraction) is reserved for guaranteeing that a
-    minimum number of active requests may continue to generate tokens on any step.
-    The reason for this is that the context manages two pools of requests: 1)
-    active requests, and 2) paused requests. Paused requests are requests where
-    insufficient memory blocks remain for future assignment, and these requests
-    are set aside until enough memory blocks are available. Active requests are
-    requests that have sufficient memory blocks to proceed with their generations.
-
-    The situation can arise where all requests eventually become paused due to all
-    memory blocks being assigned. In this case, there are no active requests and
-    thus no progress can be made. To handle this case, a fraction of the memory
-    buffer is reserved that only allows active requests, and no paused requests.
-    This fraction must be carefully tuned, as it can have an order of magnitude
-    impact on overall latency.
-
     Args:
         params_dtype (torch.dtype): Dtype used for KV cache.
         num_layers (int): Number of layers.
@@ -373,14 +357,47 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
 
+        # Unified memory.
+        self.unified_memory_level = unified_memory_level
+        if unified_memory_level > 0:
+            try:
+                self.unified_memory_mempool = create_unified_mempool()
+            except UnifiedMemoryUnsupportedError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Unified memory requested but not available; defaulting to GPU memory."
+                    )
+                self.unified_memory_level = 0
+
         # Initialize block allocator.
-        active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
-        active_block_count_total = active_buffer_size_bytes // (
+        buffer_size_bytes = int(buffer_size_gb * 1024**3)
+        block_count_total = buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
-        self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
-        del active_block_count_total  # use self.block_allocator.active_count
-        active_buffer_size_bytes = self.block_allocator.active_count * self.block_size_bytes
+        # >>>
+        # self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
+        # +++
+        self.block_allocator = BlockAllocator(
+            context=self,
+            total_count=(
+                block_count_total
+                if self.unified_memory_level == 0 else
+                2 * block_count_total
+            ),
+        )
+        # <<<
+        # >>>
+        # from lutil import pax
+        # pax({
+        #     "unified_memory_level" : self.unified_memory_level,
+        #     "block_allocator" : self.block_allocator,
+        # })
+        # <<<
+        # >>>
+        del buffer_size_gb
+        del buffer_size_bytes
+        del block_count_total  # use self.block_allocator.active_count
+        # <<<
 
         # Set max_total_requests, max_active_requests, max_tokens.
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
@@ -396,18 +413,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Initialize context state.
         self.params_dtype = params_dtype
         self.max_sequence_length = max_sequence_length
-
-        # Unified memory.
-        self.unified_memory_level = unified_memory_level
-        if unified_memory_level > 0:
-            try:
-                self.unified_memory_mempool = create_unified_mempool()
-            except UnifiedMemoryUnsupportedError:
-                if torch.distributed.get_rank() == 0:
-                    warnings.warn(
-                        "Unified memory requested but not available; defaulting to GPU memory."
-                    )
-                self.unified_memory_level = 0
 
         # Request and token counts.
         self.total_request_count = 0
@@ -608,7 +613,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Print info.
         logging.info(
             "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
-            % (get_mem_size_str(active_buffer_size_bytes), self.block_allocator.active_count)
+            % (
+                get_mem_size_str(self.block_allocator.active_count * self.block_size_bytes),
+                self.block_allocator.active_count,
+            )
         )
 
     @classmethod
@@ -638,7 +646,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         inference_config: InferenceWrapperConfig,
         model,
         max_batch_size: int,
-        active_buffer_size_gb: float = 40,
+        buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
     ):
         """
@@ -657,7 +665,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=inference_config.inference_max_seq_length,
-            active_buffer_size_gb=active_buffer_size_gb,
+            buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,

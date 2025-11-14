@@ -21,11 +21,29 @@ class BlockAllocator:
             space for paused requests that live on the CPU.
     """
 
-    def __init__(self, context: "DynamicInferenceContext", active_count: int):
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def __init__(self, context: "DynamicInferenceContext", active_count: int):
+
+    #     self.context = context
+
+    #     active_count -= 1  # -1 for dummy_block_idx (see below)
+    #     active_count = max(1, active_count)  # need at least one block
+    #     self.total_count = 2 * active_count + 1  # +1 for dummy_block_idx
+    #     self.total_avail = self.total_count - 1  # -1 for dummy_block_idx
+    #     self.active_count = active_count
+    #     self.paused_count = self.total_count - self.active_count - 1  # -1 for dummy_block_idx
+    #     self.dummy_block_idx = self.total_count - 1
+
+    #     # Initialize block pool as a "stack" data structure
+    #     self.block_bag = torch.arange(
+    #         self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+    #     )
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    def __init__(self, context: "DynamicInferenceContext", total_count: int):
 
         self.context = context
 
-        active_count -= 1  # -1 for dummy_block_idx (see below)
+        active_count = (total_count - 1) // 2  # -1 for dummy_block_idx (see below)
         active_count = max(1, active_count)  # need at least one block
         self.total_count = 2 * active_count + 1  # +1 for dummy_block_idx
         self.total_avail = self.total_count - 1  # -1 for dummy_block_idx
@@ -37,6 +55,7 @@ class BlockAllocator:
         self.block_bag = torch.arange(
             self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def __str__(self):
         return (
