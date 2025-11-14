@@ -330,3 +330,20 @@ def debug_msg(msg: str):
     """
     with logger_stack(None, None) as (stacked_name, last_logger):
         last_logger.debug(f"{stacked_name} {msg}")
+
+
+def _clean_metadata_for_serialization(metadata: dict) -> dict:
+    """Create a clean copy of metadata for serialization by removing non-serializable objects.
+
+    Args:
+        metadata: Original metadata dict
+
+    Returns:
+        Clean metadata dict suitable for serialization
+    """
+    if metadata is None:
+        return None
+    clean_metadata = metadata.copy()
+    # Remove dp_cp_group as it's not serializable
+    clean_metadata.pop('dp_cp_group', None)
+    return clean_metadata
