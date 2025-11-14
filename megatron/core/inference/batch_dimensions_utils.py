@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """
-Batch dimensions utilities for CUDA Graph inference.
+Batch dimensions utilities.
 
-This module contains utilities for managing batch dimensions in CUDA graph inference,
+This module contains utilities for managing batch dimensions,
 including the InferenceBatchDimensions dataclass and CUDAGraphBatchDimensionBuilder for generating
 and matching CUDA graph batch dimensions.
 """
@@ -15,7 +15,7 @@ from typing import List, Optional
 
 @dataclass(order=True)
 class InferenceBatchDimensions:
-    """Batch dimensions for CUDA graph inference.
+    """Batch dimensions for dynamic inference.
 
     Attributes:
         token_count : number of total input tokens
@@ -24,10 +24,6 @@ class InferenceBatchDimensions:
 
     The batch dimensions are ordered by token_count, then by prefill_req_count,
     then by decode_req_count.
-
-    We use this order as an estimation of the graph runtime, since token_count
-    directly determines the GEMM time, which typically dominates the graph
-    runtime, and the prefill_request_count can also moderately affects graph run time.
 
     """
 
