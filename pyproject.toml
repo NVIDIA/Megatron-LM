@@ -87,6 +87,7 @@ dev = [
     "onnxscript",
     "flash-linear-attention~=0.3.2",
     "emerging_optimizers",
+    "pydantic<1.8.0",
 ]
 
 lts = [
