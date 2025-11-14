@@ -599,9 +599,9 @@ def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_de
     # Default case: no_wd_decay_cond_type is None
     no_wd_decay_cond_fn = None
 
-    if no_wd_decay_cond_type == 'qwen3_next':
+    if no_wd_decay_cond_type == 'apply_wd_to_qk_layernorm':
         # Qwen3-Next applies weight decay to qk layernorm as a special case
-        def qwen3_next_no_wd_decay_cond(name, param):
+        def apply_wd_to_qk_layernorm_fn(name, param):
             if "q_layernorm" in name or "k_layernorm" in name:
                 no_wd = False
             else:
@@ -611,7 +611,7 @@ def get_no_wd_decay_cond(no_wd_decay_cond_type, default_skip_embedding_weight_de
                     or (default_skip_embedding_weight_decay and "embedding" in name)
                 )
             return no_wd
-        no_wd_decay_cond_fn = qwen3_next_no_wd_decay_cond
+        no_wd_decay_cond_fn = apply_wd_to_qk_layernorm_fn
     elif no_wd_decay_cond_type is not None:
         raise ValueError(f"Invalid no_wd_decay_cond_type: {no_wd_decay_cond_type}")
 
