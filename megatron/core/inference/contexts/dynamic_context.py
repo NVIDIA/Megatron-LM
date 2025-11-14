@@ -377,9 +377,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.block_allocator = BlockAllocator(
             context=self,
             total_count=(
-                block_count_total
-                if self.unified_memory_level == 0 else
-                2 * block_count_total
+                block_count_total if self.unified_memory_level == 0 else 2 * block_count_total
             ),
         )
 
