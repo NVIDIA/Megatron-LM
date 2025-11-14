@@ -138,7 +138,7 @@ def should_skip_object(obj: Object) -> bool:
     return False
 
 
-def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
+def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, package_root: str = "megatron.core"):
     """
     Recursively filter objects and mark which should be skipped.
     
@@ -146,6 +146,7 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
         obj: A griffe Object to examine
         filtered: Set to populate with paths of objects to skip
         visited: Set of already visited paths to prevent infinite recursion
+        package_root: The root package being analyzed (e.g., "megatron.core")
     """
     if visited is None:
         visited = set()
@@ -154,6 +155,15 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
     if obj.path in visited:
         return
     visited.add(obj.path)
+    
+    # Filter out objects with malformed paths (path explosion from circular refs)
+    # Paths like "megatron.core.megatron.core..." indicate circular references
+    repeated_pattern = f"{package_root}.{package_root.split('.')[0]}"
+    if repeated_pattern in obj.path:
+        filtered.add(obj.path)
+        if len(visited) < 10:  # Only print first few to avoid spam
+            print(f"  ⏭️  Skipping {obj.path[:100]}... (circular reference detected)", file=sys.stderr)
+        return
     
     # NEVER recurse into aliases - they're just references, not real objects
     # Recursing into them causes infinite loops and path explosion
@@ -178,7 +188,7 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
         for member in obj.members.values():
             # Skip aliases completely to prevent recursion
             if member.kind.value != "alias":
-                filter_objects(member, filtered, visited)
+                filter_objects(member, filtered, visited, package_root)
             else:
                 # Just check if external alias needs filtering
                 try:
@@ -248,7 +258,7 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
     filtered = set()
     if verbose:
         print(f"   Applying filters...", file=sys.stderr)
-    filter_objects(package, filtered)
+    filter_objects(package, filtered, package_root=package_name)
     
     if filtered:
         print(f"   Filtered {len(filtered)} objects", file=sys.stderr)
