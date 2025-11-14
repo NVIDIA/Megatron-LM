@@ -67,7 +67,7 @@ Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
     "nvidia-resiliency-ext",
     "tqdm",
@@ -177,7 +177,7 @@ flash_mla = [
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.9" } # on `release_v2.9`
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "cf9909b777ffac18e05b67a6708282cadc000942" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "fb1add873e7851ec34b48581ea1b15761b73d189" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
