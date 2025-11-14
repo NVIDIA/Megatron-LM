@@ -35,6 +35,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
@@ -353,23 +354,6 @@ class CheckpointType(Enum):
     TORCH_DCP = auto()
     FSDP_DTENSOR = auto()
 
-def _clean_metadata_for_serialization(metadata: dict) -> dict:
-    """Create a clean copy of metadata for serialization by removing non-serializable objects.
-
-    Args:
-        metadata: Original metadata dict
-
-    Returns:
-        Clean metadata dict suitable for serialization
-    """
-    if metadata is None:
-        return None
-
-    clean_metadata = metadata.copy()
-    # Remove dp_cp_group as it's not serializable
-    clean_metadata.pop('dp_cp_group', None)
-    return clean_metadata
-
 
 def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
@@ -512,6 +496,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
+    
+    # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
+    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+        dp_rank = mpu.get_data_parallel_rank()
+        optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
+        ensure_directory_exists(optim_checkpoint_name)
+        if not optimizer.is_stub_optimizer:
+            optimizer.save_state_dict_to_file(optim_checkpoint_name)
 
     async_save_request = None
     if args.async_save:
@@ -1716,7 +1708,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
+            if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+                # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
+                dp_rank = mpu.get_data_parallel_rank()
+                optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
+                optimizer.load_state_dict_from_file(optim_checkpoint_name)
+            elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
