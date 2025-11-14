@@ -194,14 +194,23 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
             filter_objects(member, filtered, visited)
 
 
-def remove_filtered_objects(obj: Object, filtered: Set[str]):
+def remove_filtered_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
     """
     Remove filtered objects from the object tree.
     
     Args:
         obj: A griffe Object to clean
         filtered: Set of paths to remove
+        visited: Set of already visited paths to prevent infinite recursion
     """
+    if visited is None:
+        visited = set()
+    
+    # Prevent infinite recursion
+    if obj.path in visited:
+        return
+    visited.add(obj.path)
+    
     # Skip aliases - checking their members tries to resolve them
     if obj.kind.value == "alias":
         return
@@ -220,7 +229,7 @@ def remove_filtered_objects(obj: Object, filtered: Set[str]):
     
     # Recurse into remaining members
     for member in obj.members.values():
-        remove_filtered_objects(member, filtered)
+        remove_filtered_objects(member, filtered, visited)
 
 
 # ============================================================================
