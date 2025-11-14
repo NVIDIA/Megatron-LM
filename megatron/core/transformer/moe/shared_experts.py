@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from copy import deepcopy
+from copy import copy
 from typing import Optional
 
 import torch
@@ -43,7 +43,7 @@ class SharedExpertMLP(MLP):
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        config = deepcopy(config)
+        config = copy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 

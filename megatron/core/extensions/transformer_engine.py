@@ -421,9 +421,6 @@ class TELinear(te.pytorch.Linear):
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
-        self._tp_group = tp_group
-
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = (
@@ -453,7 +450,7 @@ class TELinear(te.pytorch.Linear):
             prefix,
             None,
             sharded_offsets,
-            tp_group=self._tp_group,
+            tp_group=None,
             dp_cp_group=metadata["dp_cp_group"],
         )
 
