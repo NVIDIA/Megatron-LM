@@ -1,0 +1,120 @@
+name: API Compatibility Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'megatron/core/**/*.py'
+      - '!megatron/core/tests/**'
+      - '!megatron/legacy/**'
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Baseline git reference (tag/branch)'
+        required: true
+
+jobs:
+  check-compatibility:
+    name: Check API Backward Compatibility
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to access baseline ref
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install griffe
+        run: |
+          pip install griffe
+      
+      - name: Determine baseline reference
+        id: baseline
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Use manually specified baseline
+            BASELINE="${{ github.event.inputs.baseline }}"
+          else
+            # Auto-detect latest core release tag
+            BASELINE=$(git tag -l 'core_r*' | sort -V | tail -1)
+            
+            # Fallback if no tags found
+            if [ -z "$BASELINE" ]; then
+              echo "Warning: No core_r* tags found, using main" >&2
+              BASELINE="main"
+            fi
+          fi
+          
+          echo "baseline=$BASELINE" >> $GITHUB_OUTPUT
+          echo "Using baseline: $BASELINE"
+      
+      - name: Run compatibility check
+        id: compat_check
+        run: |
+          python scripts/check_api_backwards_compatibility.py \
+            --baseline ${{ steps.baseline.outputs.baseline }} \
+            --verbose
+        continue-on-error: true
+      
+      - name: Comment on PR (if breaking changes found)
+        if: steps.compat_check.outcome == 'failure' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const baseline = '${{ steps.baseline.outputs.baseline }}';
+            const body = `## ❌ API Backward Compatibility Check Failed
+            
+            Breaking changes detected compared to baseline: \`${baseline}\`
+            
+            Please review the job logs for details on what changed.
+            
+            ### Options:
+            
+            1. **Revert the breaking changes** - Recommended if unintentional
+            2. **Mark as exempt** - If this is an internal or experimental API:
+               \`\`\`python
+               from megatron.core.backwards_compatibility_decorators import exempt_from_compat_check
+               
+               @exempt_from_compat_check
+               def your_function():
+                   pass
+               \`\`\`
+            3. **Use deprecation** - If phasing out an API:
+               \`\`\`python
+               from megatron.core.backwards_compatibility_decorators import deprecated
+               
+               @deprecated(version="1.0.0", removal_version="2.0.0", 
+                          alternative="new_function")
+               def old_function():
+                   pass
+               \`\`\`
+            
+            For more information, see the [API Compatibility Guide](../blob/main/docs/api-backwards-compatibility-checking.md).
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+      
+      - name: Fail job if breaking changes detected
+        if: steps.compat_check.outcome == 'failure'
+        run: |
+          echo "::error::Breaking API changes detected. See logs above for details."
+          exit 1
+      
+      - name: Success message
+        if: steps.compat_check.outcome == 'success'
+        run: |
+          echo "::notice::✅ No breaking API changes detected!"
+
