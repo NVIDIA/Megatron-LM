@@ -22,6 +22,7 @@ class BaseRetroCrossAttention(MegatronModule):
         layer_number (int): Layer number within transformer block.
         attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
         pg_collection (ProcessGroupCollection): Model communication process groups.
+        transformer_layer_offset (int): Transformer layer offset for pipeline parallelism.
     """
 
     def __init__(
