@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import Optional, Tuple
@@ -17,6 +17,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.utils import get_te_version, is_te_min_version
@@ -24,6 +25,10 @@ from megatron.core.utils import get_te_version, is_te_min_version
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    def __init__(self, fallback_to_eager_attn: bool = False):
+        super().__init__()
+        self.fallback_to_eager_attn = fallback_to_eager_attn
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -56,6 +61,8 @@ class TESpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
+        if self.fallback_to_eager_attn:
+            return DotProductAttention
         return TEDotProductAttention
 
     def grouped_mlp_modules(
