@@ -475,7 +475,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.full(
+                # Use empty instead of full to speedup init and
+                # graph capture since unified memory filling can be slow
+                self.memory_buffer = torch.empty(
                     (
                         2,  # key and value
                         self.num_attention_layers,
@@ -484,7 +486,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                         num_attention_heads_per_partition,
                         hidden_size_per_attention_head,
                     ),
-                    -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
@@ -941,7 +942,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     prompt_tokens=torch.zeros(
                         1, dtype=torch.long, device=torch.cuda.current_device()
                     ),
-                    sampling_params=SamplingParams(num_tokens_to_generate=1),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
                 )
             )
         if graph_dimensions.prefill_req_count == 0:
@@ -968,7 +969,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         dtype=torch.long,
                         device=torch.cuda.current_device(),
                     ),
-                    sampling_params=SamplingParams(num_tokens_to_generate=1),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
                 )
             )
         self.num_prefill_requests = graph_dimensions.prefill_req_count

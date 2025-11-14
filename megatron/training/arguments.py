@@ -1487,7 +1487,7 @@ def _add_inference_args(parser):
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')  
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
-                       type=int, default=None,
+                       type=int, default=2048,
                        help='Maximum number of tokens to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,

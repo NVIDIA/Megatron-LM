@@ -43,6 +43,7 @@ from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 
 from megatron.core.utils import configure_nvtx_profiling
+import logging
 
 import json
 
@@ -361,6 +362,10 @@ def main():
     if os.environ.get("NSIGHT_PREFIX"):
         torch.cuda.cudart().cudaProfilerStart()
     
+    level_str = os.getenv("LOG_LEVEL", "INFO").upper() 
+    level = getattr(logging, level_str, logging.INFO) 
+    logging.basicConfig(level=level, force=True)
+
     configure_nvtx_profiling(True)
 
     args = get_args()

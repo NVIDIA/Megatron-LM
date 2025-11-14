@@ -67,7 +67,7 @@ class InferenceBatchDimensions:
                 >= real_batch_dim.prefill_req_count + real_batch_dim.decode_req_count
             )
 
-    def valid(self, max_requests: int) -> bool:
+    def valid(self, max_requests: int, max_sequence_length: int) -> bool:
         """
         Checks if the batch dimension is valid based on resource constraints.
 
@@ -87,6 +87,10 @@ class InferenceBatchDimensions:
 
         # Check if token count is sufficient for requests
         if self.token_count < self.prefill_req_count + self.decode_req_count:
+            return False
+
+        # Check if the prefill requests are shorter than the max sequence length
+        if self.token_count > self.prefill_req_count * max_sequence_length + self.decode_req_count:
             return False
 
         return True
@@ -184,7 +188,7 @@ class CUDAGraphBatchDimensionBuilder:
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
-            if batch_dim.valid(max_requests):
+            if batch_dim.valid(max_requests, max_sequence_length):
                 cuda_graph_batch_dimensions_list.append(batch_dim)
 
         # Cuda graph token-counts
@@ -244,7 +248,7 @@ class CUDAGraphBatchDimensionBuilder:
                     decode_req_count=min(size, max_requests),
                 )
                 add_if_valid(
-                    token_count=min(size, max_requests),
+                    token_count=size,
                     prefill_req_count=min(cuda_graph_mixed_prefill_count, max_requests),
                     decode_req_count=min(size, max_requests)
                     - min(cuda_graph_mixed_prefill_count, max_requests),
@@ -265,7 +269,7 @@ class CUDAGraphBatchDimensionBuilder:
         # Remove duplicates and sort by prefill token count
         cuda_graph_batch_dimensions_list = list(set(cuda_graph_batch_dimensions_list))
         cuda_graph_batch_dimensions_list.sort(
-            key=lambda x: (x.token_count - x.decode_req_count), reverse=True
+            key=lambda x: ((x.token_count - x.decode_req_count), x.decode_req_count), reverse=True
         )
 
         return cuda_graph_batch_dimensions_list, cuda_graph_token_counts
