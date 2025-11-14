@@ -2,7 +2,7 @@
 
 import typing
 from typing import Any, Optional
-from argparse import ArgumentParser
+from argparse import ArgumentParser, _ArgumentGroup
 import inspect
 import itertools
 import builtins
@@ -105,7 +105,7 @@ class ArgumentGroupFactory:
 
         return argparse_kwargs
 
-    def build_group(self, parser: ArgumentParser, title: Optional[str] = None) -> ArgumentParser:
+    def build_group(self, parser: ArgumentParser, title: Optional[str] = None) -> _ArgumentGroup:
         """Entrypoint method that adds the argument group to the parser.
 
         Args:
@@ -122,7 +122,7 @@ class ArgumentGroupFactory:
             arg_name = add_arg_kwargs.pop("arg_name")
             arg_group.add_argument(arg_name, **add_arg_kwargs)
 
-        return parser
+        return arg_group
 
     def _get_field_docstrings(self, src_cfg_class: type) -> dict[str, str]:
         """Extract field-level docstrings from a dataclass by inspecting its AST.
