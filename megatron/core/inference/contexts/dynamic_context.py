@@ -374,9 +374,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         block_count_total = buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
-        # >>>
-        # self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
-        # +++
         self.block_allocator = BlockAllocator(
             context=self,
             total_count=(
@@ -385,19 +382,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 2 * block_count_total
             ),
         )
-        # <<<
-        # >>>
-        # from lutil import pax
-        # pax({
-        #     "unified_memory_level" : self.unified_memory_level,
-        #     "block_allocator" : self.block_allocator,
-        # })
-        # <<<
-        # >>>
-        del buffer_size_gb
-        del buffer_size_bytes
-        del block_count_total  # use self.block_allocator.active_count
-        # <<<
 
         # Set max_total_requests, max_active_requests, max_tokens.
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
