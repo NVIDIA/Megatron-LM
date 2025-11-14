@@ -1,10 +1,11 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
@@ -42,6 +43,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             use_te = args.transformer_impl == "transformer_engine"
 
             if args.num_experts:
+                assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -51,12 +53,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
                     vp_stage=vp_stage,
                 )
             elif args.heterogeneous_layers_config_path is not None:
+                assert not (config.transformer_impl == "inference_optimized")
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
                 transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
+            assert not (config.transformer_impl == "inference_optimized")
             if (
                 hasattr(transformer_layer_spec, 'layer_specs')
                 and len(transformer_layer_spec.layer_specs) == 0
@@ -115,6 +119,12 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+        )
+    elif config.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            qk_l2_norm=args.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(

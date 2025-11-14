@@ -167,7 +167,7 @@ class SFTDataset(torch.utils.data.Dataset):
             hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
                 self.hf_dataset, {"split": "train"}
             )
-            self._raw_samples = datasets.load_dataset(self.hf_dataset, **hf_dataset_kwargs)
+            self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
             self._raw_samples = self._raw_samples.shard(
                 num_shards=self.num_shards, index=shard_index
             )
@@ -455,7 +455,10 @@ def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
     if not args.export_offline_model:
-        report_draft_acceptance_length(model)
+        try:
+            report_draft_acceptance_length(model)
+        except Exception as e:
+            print(e)
 
 
 

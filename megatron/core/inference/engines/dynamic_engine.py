@@ -107,9 +107,6 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
         random_seed (Optional[int]): Use a random seed if you want deterministic
             results. Defaults to None.
-        static_sampling (bool): If True, all requests are assumed to have the same
-            sampling parameters. This avoids needing to loop through all requests and
-            their sampling parameters every generation step, improving latency.
         inference_logging_step_interval (int): The step interval at which to log
         inference metrics to wandb. Defaults to 0, which means no logging.
     """
@@ -123,7 +120,6 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         track_paused_request_events: bool = False,
         enable_chunked_prefill: bool = True,
-        static_sampling: bool = False,
         inference_logging_step_interval: int = 0,
     ):
 
@@ -141,7 +137,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.random_seed = random_seed
         self.track_paused_request_events = track_paused_request_events
         self.enable_chunked_prefill = enable_chunked_prefill
-        self.static_sampling = static_sampling
         self.unified_memory_level = context.unified_memory_level
 
         self.inference_logging_step_interval = inference_logging_step_interval
@@ -460,10 +455,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(
-            loop=loop,
-            verbose=verbose
-        ))
+        self.engine_loop_task = loop.create_task(
+            self.run_engine_with_coordinator(loop=loop, verbose=verbose)
+        )
         self.engine_loop_task = asyncio.create_task(
             self.run_engine_with_coordinator(verbose=verbose)
         )
@@ -659,6 +653,17 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
             )
+        if request.sampling_params.termination_id is None:
+            try:
+                eod = self.controller.tokenizer.eod
+            except AttributeError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Termination ID not specified, and tokenizer does not define eod."
+                        "Defaulting to not using termination id."
+                    )
+                eod = -1
+            request.sampling_params.termination_id = eod
 
         if (
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
@@ -848,9 +853,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Perform the same original scheduling logic for non-chunked runs
         """
         while self.waiting_request_ids:
-            req = self.get_requests(self.waiting_request_ids[0])
+            req = self.get_request(self.waiting_request_ids[0])
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req, safe=True)
+                self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
@@ -862,39 +867,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.waiting_request_ids.popleft()
             else:
                 break
-
-    def get_active_sampling_map(self) -> List[Tuple[SamplingParams, List[int]]]:
-        """Gets a map of sampling methods to active requests indices in the context."""
-        # Get all active request IDs.
-        active_request_ids = self.context.request_ids[
-            self.context.paused_request_count : self.context.total_request_count
-        ].tolist()
-        if self.static_sampling:
-            return [
-                (next(iter(self.request_records.values()))[-1].sampling_params, active_request_ids)
-            ]
-
-        # Get a map from request_id to context array index.
-        context_id_map = {r: i for i, r in enumerate(active_request_ids)}
-
-        # Create map of sampling methods to context array indices.
-        sampling_map: List[Tuple[SamplingParams, List[int]]] = []
-        for request_id, request_record in self.request_records.items():
-            if request_id not in context_id_map:
-                continue
-            context_id = context_id_map[request_id]
-            sp = request_record[-1].sampling_params
-
-            # Look for a pre-existing group with these sampling parameters.
-            for sampling, indices in sampling_map:
-                if sampling == sp:
-                    indices.append(context_id)
-                    break
-            # If no group exists, create a new one.
-            else:
-                sampling_map.append((sp, [context_id]))
-
-        return sampling_map
 
     def schedule_chunked_prefill(self):
         """
@@ -926,9 +898,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.active_token_count + remaining_len <= self.context.max_tokens
             )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(
-                req, safe=not is_continuing_chunked_prefill
-            )
+            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
             if request_can_be_added and kv_cache_available:
@@ -996,8 +966,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # save the is_decode_only AFTER scheduling, BEFORE update
         self.is_decode_only = is_decode_only
         self.step_start_event.record()
-        sampling_map = self.get_active_sampling_map()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(sampling_map)
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -1081,7 +1050,8 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
+                "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
+                "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.step_count,
@@ -1099,11 +1069,16 @@ class DynamicInferenceEngine(AbstractEngine):
                             ),
                         )
                     ),
-                    prev_total_request_count,
-                    context.gtd_request_count,
                     prev_total_request_count - prev_paused_request_count,
+                    context.block_allocator.active_count,
                     prev_paused_request_count,
+                    context.block_allocator.paused_count,
+                    len(self.waiting_request_ids),
                     self.finished_request_count,
+                    context.block_allocator.get_active_used(),
+                    context.block_allocator.active_count,
+                    context.block_allocator.get_paused_used(),
+                    context.block_allocator.paused_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),

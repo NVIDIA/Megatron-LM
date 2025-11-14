@@ -21,6 +21,7 @@ class SamplingParams:
     top_k: int = 0
     top_p: float = 0.0
     return_log_probs: bool = False
+    skip_prompt_log_probs: bool = False
     return_segments: bool = False  # Whether to return individually detokenized tokens
     num_tokens_to_generate: int = 30
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate

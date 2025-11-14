@@ -1,10 +1,14 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    InferenceSpecProvider,
+    LocalSpecProvider,
+)
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
@@ -67,6 +71,102 @@ except ImportError:
     warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
     HAVE_APEX = False
+
+
+def get_gpt_layer_with_inference_spec(
+    qk_layernorm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    qk_l2_norm: Optional[bool] = False,
+) -> ModuleSpec:
+    """Use this spec to use inference optimized linear layers.
+    Args:
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+    """
+    assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
+    backend = InferenceSpecProvider()
+
+    mlp = get_mlp_module_spec_for_backend(
+        backend=backend,
+        num_experts=None,
+        moe_grouped_gemm=False,
+        moe_use_legacy_grouped_gemm=False,
+        use_te_op_fuser=False,
+        use_te_activation_func=False,
+    )
+
+    if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        linear_q_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        linear_kv_up_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if qk_layernorm
+            else backend.column_parallel_linear()
+        )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=backend.layer_norm(),
+                self_attention=ModuleSpec(
+                    module=MLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=backend.column_parallel_linear(),
+                        linear_q_down_proj=backend.linear(),
+                        linear_q_up_proj=linear_q_up_proj,
+                        linear_kv_down_proj=backend.linear(),
+                        linear_kv_up_proj=linear_kv_up_proj,
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+            ),
+        )
+    else:
+        qk_norm = backend.layer_norm(for_qk=True)
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=SelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=SelfAttentionSubmodules(
+                        linear_qkv=backend.column_parallel_layer_norm_linear(),
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map={
+                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+                },
+            ),
+        )
 
 
 def get_gpt_layer_with_transformer_engine_spec(
