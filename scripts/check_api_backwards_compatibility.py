@@ -251,11 +251,11 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
     print(f"📦 Loading {package_name}{ref_label}", file=sys.stderr)
     
     try:
-        # Load the package
+        # Load the package (without resolving aliases to prevent circular refs)
         if ref:
-            package = griffe.load_git(package_name, ref=ref)
+            package = griffe.load_git(package_name, ref=ref, resolve_aliases=False, resolve_external=False)
         else:
-            package = griffe.load(package_name)
+            package = griffe.load(package_name, resolve_aliases=False, resolve_external=False)
     except Exception as e:
         print(f"❌ Error loading {package_name}{ref_label}: {e}", file=sys.stderr)
         raise
