@@ -86,7 +86,6 @@ class MambaStackSubmodules:
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
-    moe_layer: Union[ModuleSpec, type] = IdentityOp
 
 
 class MambaStack(MegatronModule):
@@ -188,11 +187,6 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,
-                    )
-                elif layer_type == LayerSymbols.MOE:
-                    # Transformer layers apply their own pp_layer_offset
-                    layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
                     )
                 else:
                     assert False, "unexpected layer_type"
