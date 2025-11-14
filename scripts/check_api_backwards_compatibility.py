@@ -194,7 +194,7 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
             filter_objects(member, filtered, visited)
 
 
-def remove_filtered_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
+def remove_filtered_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, _progress_counter: list = None):
     """
     Remove filtered objects from the object tree.
     
@@ -202,14 +202,21 @@ def remove_filtered_objects(obj: Object, filtered: Set[str], visited: Set[str] =
         obj: A griffe Object to clean
         filtered: Set of paths to remove
         visited: Set of already visited paths to prevent infinite recursion
+        _progress_counter: Internal counter for progress reporting
     """
     if visited is None:
         visited = set()
+        _progress_counter = [0]  # Use list so it's mutable across recursion
     
     # Prevent infinite recursion
     if obj.path in visited:
         return
     visited.add(obj.path)
+    
+    # Progress reporting every 1000 objects
+    _progress_counter[0] += 1
+    if _progress_counter[0] % 1000 == 0:
+        print(f"     Cleaned {_progress_counter[0]} objects...", file=sys.stderr)
     
     # Skip aliases - checking their members tries to resolve them
     if obj.kind.value == "alias":
@@ -229,7 +236,7 @@ def remove_filtered_objects(obj: Object, filtered: Set[str], visited: Set[str] =
     
     # Recurse into remaining members
     for member in obj.members.values():
-        remove_filtered_objects(member, filtered, visited)
+        remove_filtered_objects(member, filtered, visited, _progress_counter)
 
 
 # ============================================================================
@@ -271,7 +278,9 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
         print(f"   Filtered {len(filtered)} objects", file=sys.stderr)
     
     # Remove filtered objects
+    print(f"   Removing filtered objects from tree...", file=sys.stderr)
     remove_filtered_objects(package, filtered)
+    print(f"   ✓ Cleanup complete", file=sys.stderr)
     
     return package
 
@@ -408,8 +417,10 @@ Exit codes:
             print(f"\n🔍 Comparing {package_name}:", file=sys.stderr)
             print(f"   Baseline: {args.baseline}", file=sys.stderr)
             print(f"   Current:  {args.current or 'working directory'}", file=sys.stderr)
+            print(f"   Running comparison...", file=sys.stderr)
             
             breaking_changes = list(griffe.find_breaking_changes(baseline, current))
+            print(f"   ✓ Comparison complete", file=sys.stderr)
             
             if breaking_changes:
                 all_breaking_changes.extend([(package_name, change) for change in breaking_changes])
