@@ -686,7 +686,10 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         return super().commit_tensor(read_item, tensor)
 
 
-class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
+from .pure_dcp import TorchDistSaveShardedStrategy
+
+
+class LegacyTorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
     """Async save strategy for the PyT Distributed format.
 
     The idea is to translate MCore ShardedTensors into PyT ShardedTensors
@@ -902,7 +905,10 @@ def get_reformulation_metadata(
     return reformulation_metadata
 
 
-class TorchDistLoadShardedStrategy(LoadShardedStrategy):
+from .pure_dcp import TorchDistLoadShardedStrategy
+
+
+class LegacyTorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
     def __init__(self):
@@ -997,7 +1003,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if nd_orig_global_shape is None:
                 # Regular tensor
                 sharded_metadata[k] = ShardedTensor.from_rank_offsets(
-                    k, torch.empty(tp.size, **tp.properties.__dict__, device='meta')
+                    k, torch.empty(tp.size, **tp.properties.__dict__, device='meta'),
+                    dtensor_ckpt_device_mesh=DeviceMesh.from_group(torch.distributed.GroupMember.WORLD, "cuda"),
                 ).without_data()
             else:
                 # N-D flattened tensor
