@@ -508,7 +508,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
-        self.cuda_graph_batch_dimensions_list = (
+        self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,

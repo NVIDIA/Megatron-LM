@@ -10,7 +10,7 @@ and matching CUDA graph batch dimensions.
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 @dataclass(order=True)
@@ -137,7 +137,7 @@ class CUDAGraphBatchDimensionBuilder:
         max_tokens: int,
         max_sequence_length: int,
         use_cuda_graphs_for_non_decode_steps: bool,
-    ) -> List[InferenceBatchDimensions]:
+    ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
 
@@ -175,8 +175,9 @@ class CUDAGraphBatchDimensionBuilder:
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
 
         Returns:
-            List of InferenceBatchDimensions objects,
-            sorted by prefill token count in descending order
+            Tuple containing:
+            - List of InferenceBatchDimensions objects, sorted by prefill token count in descending order
+            - Optional list of CUDA graph token counts
         """
 
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
@@ -266,7 +267,7 @@ class CUDAGraphBatchDimensionBuilder:
             key=lambda x: (x.token_count - x.decode_req_count), reverse=True
         )
 
-        return cuda_graph_batch_dimensions_list
+        return cuda_graph_batch_dimensions_list, cuda_graph_token_counts
 
     @staticmethod
     def match_graph_config(
