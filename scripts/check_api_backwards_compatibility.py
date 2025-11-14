@@ -138,14 +138,23 @@ def should_skip_object(obj: Object) -> bool:
     return False
 
 
-def filter_objects(obj: Object, filtered: Set[str]):
+def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
     """
     Recursively filter objects and mark which should be skipped.
     
     Args:
         obj: A griffe Object to examine
         filtered: Set to populate with paths of objects to skip
+        visited: Set of already visited paths to prevent infinite recursion
     """
+    if visited is None:
+        visited = set()
+    
+    # Prevent infinite recursion by tracking visited paths
+    if obj.path in visited:
+        return
+    visited.add(obj.path)
+    
     # NEVER recurse into aliases - they're just references, not real objects
     # Recursing into them causes infinite loops and path explosion
     if obj.kind.value == "alias":
@@ -169,7 +178,7 @@ def filter_objects(obj: Object, filtered: Set[str]):
         for member in obj.members.values():
             # Skip aliases completely to prevent recursion
             if member.kind.value != "alias":
-                filter_objects(member, filtered)
+                filter_objects(member, filtered, visited)
             else:
                 # Just check if external alias needs filtering
                 try:
