@@ -37,6 +37,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install griffe
           python -c "import griffe; print('Griffe installed successfully')"
+          python -c "from griffe import Object; print('Object import successful')" || echo "Object import from griffe failed"
+          python -c "from griffe.dataclasses import Object; print('Object import from dataclasses successful')" || echo "Object import from dataclasses failed"
       
       - name: Determine baseline reference
         id: baseline
@@ -61,12 +63,6 @@ jobs:
       - name: Run compatibility check
         id: compat_check
         run: |
-          which python
-          python --version
-          python -c "import sys; print(sys.executable)"
-          python -m pip list | grep griffe
-          ls -la scripts/check_api_backwards_compatibility.py
-          chmod +x scripts/check_api_backwards_compatibility.py
           python scripts/check_api_backwards_compatibility.py \
             --baseline ${{ steps.baseline.outputs.baseline }} \
             --verbose

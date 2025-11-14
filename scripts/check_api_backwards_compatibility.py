@@ -33,9 +33,13 @@ from typing import Set, List
 
 try:
     import griffe
-    from griffe.dataclasses import Object
-except ImportError:
-    print("ERROR: griffe is not installed.", file=sys.stderr)
+    try:
+        from griffe.dataclasses import Object
+    except (ImportError, AttributeError):
+        # Newer versions of griffe
+        from griffe import Object
+except ImportError as e:
+    print(f"ERROR: griffe is not installed or import failed: {e}", file=sys.stderr)
     print("Install it with: pip install griffe", file=sys.stderr)
     sys.exit(2)
 
