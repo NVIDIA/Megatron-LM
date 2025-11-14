@@ -192,6 +192,24 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, pa
     # Recurse into members (for classes, modules, etc.)
     if hasattr(obj, 'members'):
         for member in obj.members.values():
+            # CRITICAL: Check for malformed paths BEFORE recursing
+            # If a member already has a circular path, don't recurse into it
+            member_parts = member.path.split('.')
+            has_circular = False
+            for length in range(2, min(len(member_parts) // 2 + 1, 10)):
+                for start in range(len(member_parts) - 2 * length + 1):
+                    pattern = '.'.join(member_parts[start:start + length])
+                    rest = '.'.join(member_parts[start + length:])
+                    if rest.startswith(pattern):
+                        has_circular = True
+                        break
+                if has_circular:
+                    break
+            
+            if has_circular:
+                filtered.add(member.path)
+                continue  # Don't recurse
+            
             # Skip aliases completely to prevent recursion
             if member.kind.value != "alias":
                 filter_objects(member, filtered, visited, package_root)
