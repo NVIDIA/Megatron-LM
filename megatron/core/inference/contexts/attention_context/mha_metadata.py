@@ -101,6 +101,7 @@ class MHAMetadata(MetadataBase):
         if padded_batch_dimensions.prefill_req_count == 0:
             self._max_seqlen_q = 1
         else:
+            # Make sure we will launch the prefill kernel for prefill graphs
             self._max_seqlen_q = max(2, padded_batch_dimensions.token_count)
 
         self._max_seqlen_k = self.max_seqlen

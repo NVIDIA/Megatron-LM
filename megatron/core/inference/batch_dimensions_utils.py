@@ -37,7 +37,7 @@ class InferenceBatchDimensions:
         """
         return f"[{self.token_count}]: {self.prefill_req_count} P + {self.decode_req_count} D"
 
-    def applicable(self, real_batch_dim, strict=False) -> bool:
+    def is_applicable_for_batch_dim(self, real_batch_dim, strict=False) -> bool:
         """
         Checks if this batch dimension is applicable for the given real batch dimension.
         Applicable batch dimensions are those that have enough tokens and
@@ -67,7 +67,7 @@ class InferenceBatchDimensions:
                 >= real_batch_dim.prefill_req_count + real_batch_dim.decode_req_count
             )
 
-    def valid(self, max_requests: int, max_sequence_length: int) -> bool:
+    def is_valid(self, max_requests: int, max_sequence_length: int) -> bool:
         """
         Checks if the batch dimension is valid based on resource constraints.
 
@@ -188,7 +188,7 @@ class CUDAGraphBatchDimensionBuilder:
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
-            if batch_dim.valid(max_requests, max_sequence_length):
+            if batch_dim.is_valid(max_requests, max_sequence_length):
                 cuda_graph_batch_dimensions_list.append(batch_dim)
 
         # Cuda graph token-counts
@@ -297,7 +297,7 @@ class CUDAGraphBatchDimensionBuilder:
         graph_batch_dims_applicable = [
             graph_batch_dim
             for graph_batch_dim in cuda_graph_batch_dimensions_list
-            if graph_batch_dim.applicable(real_batch_dim, strict=strict)
+            if graph_batch_dim.is_applicable_for_batch_dim(real_batch_dim, strict=strict)
         ]
         if len(graph_batch_dims_applicable) == 0:
             return None
