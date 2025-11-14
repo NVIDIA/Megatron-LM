@@ -158,17 +158,17 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, pa
     
     # Filter out objects with malformed paths (path explosion from circular refs)
     # Look for any repeated path segments indicating circular references
-    # E.g., "a.b.c.a.b.c" or "x.y.core.megatron.x.y.core.megatron"
+    # E.g., "a.b.a.b" or "megatron.core.megatron.core"
     path_parts = obj.path.split('.')
-    # Check if any 3+ segment sequence repeats
-    for length in range(3, min(len(path_parts) // 2 + 1, 10)):  # Check up to 10-segment patterns
+    # Check if any 2+ segment sequence repeats (start from 2 to catch "megatron.core" repetitions)
+    for length in range(2, min(len(path_parts) // 2 + 1, 10)):  # Check up to 10-segment patterns
         for start in range(len(path_parts) - 2 * length + 1):
             pattern = '.'.join(path_parts[start:start + length])
             rest_of_path = '.'.join(path_parts[start + length:])
             if rest_of_path.startswith(pattern):
                 filtered.add(obj.path)
                 if len(visited) < 5:  # Only print first few to avoid spam
-                    print(f"  ⏭️  Skipping {obj.path[:80]}... (circular ref pattern: {pattern[:40]})", file=sys.stderr)
+                    print(f"  ⏭️  Skipping {obj.path[:80]}... (circular: {pattern[:40]})", file=sys.stderr)
                 return
     
     # NEVER recurse into aliases - they're just references, not real objects
