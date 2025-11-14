@@ -151,6 +151,11 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None, pa
     if visited is None:
         visited = set()
     
+    # FIRST: Hard limit on path length - malformed paths are very long
+    if len(obj.path) > 150:  # Normal paths are much shorter
+        filtered.add(obj.path)
+        return  # Don't even process it
+    
     # Prevent infinite recursion by tracking visited paths
     if obj.path in visited:
         return
