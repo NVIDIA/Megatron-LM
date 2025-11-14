@@ -390,28 +390,40 @@ class _ParamAndGradBucketGroup:
             communication_group = self.data_parallel_group
 
         # Coalesce communication kernels across buckets in the bucket group.
+        # NOTE: only sync on core GPUs (not spares) for nonuniform TP
         grad_reduce_handle = None
-        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-            for idx, bucket in enumerate(self.buckets):
-                if self.ddp_config.use_distributed_optimizer:
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+        should_sync = True
+        if self.ddp_config.tp_spares > 0:
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            should_sync = tp_rank < self.ddp_config.tp_base - self.ddp_config.tp_spares
+
+        if should_sync:
+            with stream_context, _coalescing_manager(
+                communication_group, async_ops=async_op
+            ) as cm:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.ddp_config.use_distributed_optimizer:
+                        if self.cached_grad_buffer_shard_list[idx] is None:
+                            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                                bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                            )
+                        local_data_view = self.cached_grad_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        grad_reduce_handle = dist_reduce_scatter_func(
+                            local_data_view,
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
                         )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    grad_reduce_handle = dist_reduce_scatter_func(
-                        local_data_view,
-                        bucket.grad_data,
-                        op=reduce_op,
-                        group=communication_group,
-                        async_op=async_op,
-                    )
-                else:
-                    torch.distributed.all_reduce(
-                        bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
-                    )
+                    else:
+                        torch.distributed.all_reduce(
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -442,7 +454,8 @@ class _ParamAndGradBucketGroup:
                         async_op=async_op,
                     )
 
-        if async_op:
+        # NOTE: cm only exists for core GPUs when nonuniform TP is enabled
+        if async_op and should_sync:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation:
                 assert (
                     len(self.buckets) == 1
@@ -658,6 +671,16 @@ class _ParamAndGradBuffer:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
             this_numel = param.data.nelement()
+            # Adjust numel for nonuniform tensor parallelism
+            if (
+                self.ddp_config.tp_spares > 0
+                and hasattr(param, 'tensor_model_parallel')
+                and param.tensor_model_parallel
+            ):
+                tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+                this_numel = int(
+                    tp_world_size * this_numel / (self.ddp_config.tp_base - self.ddp_config.tp_spares)
+                )
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
             # Create bucket with collected parameters if current param needs its own bucket.
@@ -770,9 +793,48 @@ class _ParamAndGradBuffer:
                         param.data.detach().copy_(old_param_data)
                         del old_param_data
 
-            param.main_grad = self._get(
-                param.data.shape, param_start_index, buffer_type=BufferType.GRAD
-            )
+            # Handle nonuniform tensor parallelism: split grad buffer into main_grad and side_grad
+            if (
+                self.ddp_config.tp_spares > 0
+                and hasattr(param, 'tensor_model_parallel')
+                and param.tensor_model_parallel
+            ):
+                tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+                shape = list(param.data.shape)
+                shape[param.partition_dim] = int(
+                    shape[param.partition_dim]
+                    * tp_world_size
+                    / (self.ddp_config.tp_base - self.ddp_config.tp_spares)
+                )
+                grad_buffer = self._get(
+                    torch.Size(shape), param_start_index, buffer_type=BufferType.GRAD
+                )
+
+                # Calculate sizes for contiguous split
+                main_size = param.shape[param.partition_dim]
+                side_size = shape[param.partition_dim] - param.shape[param.partition_dim]
+
+                # Create target shapes for main_grad and side_grad
+                main_shape = list(shape)
+                main_shape[param.partition_dim] = main_size
+                side_shape = list(shape)
+                side_shape[param.partition_dim] = side_size
+
+                # Calculate total elements for main_grad
+                main_numel = torch.Size(main_shape).numel()
+
+                # Split the flattened grad_buffer to ensure contiguity
+                grad_buffer_flat = grad_buffer.view(-1)
+                main_grad_flat = grad_buffer_flat[:main_numel]
+                side_grad_flat = grad_buffer_flat[main_numel:]
+
+                # Reshape to final dimensions - these will be contiguous
+                param.main_grad = main_grad_flat.view(main_shape)
+                param.side_grad = side_grad_flat.view(side_shape)
+            else:
+                param.main_grad = self._get(
+                    param.data.shape, param_start_index, buffer_type=BufferType.GRAD
+                )
             if bucket_id != cur_bucket_id:
                 bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
                 self.buckets.append(

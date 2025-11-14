@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -139,6 +139,28 @@ class DistributedDataParallelConfig:
 
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    tp_base: int = 8
+    """Base for tensor parallelism. This is the number of ranks in healthy tensor parallel groups.
+       Used for nonuniform tensor parallelism."""
+
+    tp_spares: int = 0
+    """Number of spares for nonuniform tensor parallelism. When > 0, enables nonuniform TP mode
+       where (tp_base - tp_spares) ranks handle computation and tp_spares ranks provide fault tolerance."""
+
+    num_reduced_tp_dp_ranks: int = 1
+    """Number of DP ranks that use reduced TP (tp_base - tp_spares). The remaining DP ranks use
+       full tp_base. Reduced TP ranks are assumed to come first in the global rank ordering."""
+
+    non_active_ranks_per_dp: Optional[Dict[Tuple[int, int, int], List[int]]] = None
+    """Mapping of (DP rank, CP rank, PP rank) to list of non-active (spare) local TP rank IDs.
+       This allows specifying arbitrary GPU failures across all parallelism dimensions.
+       Example: {(0,0,0): [0,3], (0,1,0): [1,2], (1,0,0): [0,3]} means:
+         - DP rank 0, CP rank 0, PP rank 0 has local TP ranks 0,3 as spares
+         - DP rank 0, CP rank 1, PP rank 0 has local TP ranks 1,2 as spares
+         - DP rank 1, CP rank 0, PP rank 0 has local TP ranks 0,3 as spares
+       The number of non-active ranks must be consistent across CP replicas within each DP rank.
+       If None, defaults to last tp_spares ranks as non-active."""
 
     def __post_init__(self):
         import os
