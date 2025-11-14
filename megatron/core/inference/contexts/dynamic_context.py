@@ -253,8 +253,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             allocate `memory_buffer` in unified memory. Eventually, additional
             levels will be included to control other tensors within the context.
         use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
-        If None, defaults to using flash-infer if available.
+            If None, defaults to using flash-infer if available.
         metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
+        num_request_metadata (Optional[int]): Number of metadata fields to track per request.
+            These represent metadata that is needed by the text generation controller,
+            and that must be kept in sync with active requests through update_requests.
     """
 
     DEFAULT_MAX_TOKENS = 16384
@@ -285,6 +288,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 1,
         metrics_writer: Optional['WandbModule'] = None,
+        num_request_metadata: Optional[int] = None,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -425,6 +429,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id = torch.empty_like(self.request_ids)
         # request_last_kv_block_offset represents number of tokens in the last kv block
         self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
+
+        # Track request metadata.
+        if num_request_metadata is None:
+            num_request_metadata = len(DynamicInferenceRequest.get_metadata_labels())
+        self.num_request_metadata = num_request_metadata
+        self.request_metadata = torch.empty(
+            (self.max_total_requests, self.num_request_metadata),
+            dtype=torch.float32,
+            device=torch.cuda.current_device(),
+        )
 
         # Per-token state.
         self.token_to_input_ids = torch.full(
@@ -1098,6 +1112,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
+        self.request_metadata.fill_(0)
 
         # Reset token indexes.
         self.token_to_input_ids.fill_(0)
@@ -1243,6 +1258,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
+        # Handle request metadata.
+        metadata = req.tracked_metadata
+        assert (
+            len(metadata) == self.num_request_metadata
+        ), "Request added to context with invalid metadata length"
+        self.request_metadata[current_id] = torch.tensor(
+            metadata, dtype=torch.float32, device=self.request_metadata.device
+        )
+        # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
@@ -1307,6 +1331,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
+        self.request_metadata[dst_idxs] = self.request_metadata[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
         next_tokens[dst_idxs] = next_tokens[src_idxs]
 
@@ -1327,6 +1352,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_metadata, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)

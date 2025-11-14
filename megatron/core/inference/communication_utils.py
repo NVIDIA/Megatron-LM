@@ -71,8 +71,7 @@ def broadcast_from_last_pipeline_stage(
             tensor.shape
         ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
         assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
-        _is_cuda(tensor)
-        assert tensor.is_contiguous()
+        _is_cuda_contiguous(tensor)
     else:
         tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
 
