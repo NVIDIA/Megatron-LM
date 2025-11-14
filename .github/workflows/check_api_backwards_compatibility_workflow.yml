@@ -34,7 +34,8 @@ jobs:
       
       - name: Install griffe
         run: |
-          pip install griffe
+          python -m pip install --upgrade pip
+          python -m pip install griffe
       
       - name: Determine baseline reference
         id: baseline
