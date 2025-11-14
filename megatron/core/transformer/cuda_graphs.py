@@ -1719,13 +1719,13 @@ class TECudaGraphHelper:
         Destroy CUDA Graphs.
         """
         assert self._graphs_created, "CUDA Graphs have not been created."
-        graphs_destoryed, graphs_not_destroyed = 0, 0
+        graphs_destroyed, graphs_not_destroyed = 0, 0
         for _, layers in enumerate(self.callables_per_chunk):
             for layer in layers:
                 for graph in layer.cuda_graphs:
                     if is_te_min_version("2.10.0"):
                         graph.reset()
-                        graphs_destoryed += 1
+                        graphs_destroyed += 1
                     else:
                         graphs_not_destroyed += 1
                 layer.cuda_graphs = []
@@ -1733,6 +1733,6 @@ class TECudaGraphHelper:
         log_single_rank(
             logger,
             logging.INFO,
-            f'{graphs_destoryed} graphs destroyed, {graphs_not_destroyed} graphs not destroyed.',
+            f'{graphs_destroyed} graphs destroyed, {graphs_not_destroyed} graphs not destroyed.',
         )
         self._graphs_created = False

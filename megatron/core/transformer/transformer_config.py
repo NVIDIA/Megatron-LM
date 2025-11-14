@@ -1455,15 +1455,15 @@ class TransformerConfig(ModelParallelConfig):
                 assert not self.cuda_graph_scope or self.cuda_graph_scope == [
                     CudaGraphScope.full_iteration
                 ], (
-                    "For local cuda graph implementation, the only valid value "
-                    "for cuda_graph_scope is full_iteration. "
-                    "To use other scopes, use cuda_graph_impl=transformer_engine."
+                    "For local cuda graph implementation, the only valid value for "
+                    "cuda_graph_scope is full_iteration, or an empty list to denote layerwise "
+                    "graphs. To use other scopes, use cuda_graph_impl=transformer_engine."
                 )
 
             if self.cuda_graph_impl == "transformer_engine":
                 assert CudaGraphScope.full_iteration not in self.cuda_graph_scope, (
                     "To use full iteration cuda graph, please use "
-                    "cuda_graph_impl=transformer_engine instead of cuda_graph_impl=local."
+                    "cuda_graph_impl=local instead of cuda_graph_impl=transformer_engine."
                 )
                 assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
