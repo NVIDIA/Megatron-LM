@@ -95,15 +95,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
 
+        weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         super().__init__(
             params,
             lr,
             momentum_beta,
-            use_nesterov,
-            weight_decay,
-            use_decoupled_weight_decay,
-            fp32_matmul_prec,
-            scaled_orthogonalize_fn,
+            use_nesterov=use_nesterov,
+            weight_decay=weight_decay,
+            weight_decay_method=weight_decay_method,
+            fp32_matmul_prec=fp32_matmul_prec,
+            scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:

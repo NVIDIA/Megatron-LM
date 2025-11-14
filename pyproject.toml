@@ -76,7 +76,6 @@ dev = [
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
-    "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
@@ -170,7 +169,7 @@ flash_mla = [
 ]
 transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.9" } # on `release_v2.9`
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "cf9909b777ffac18e05b67a6708282cadc000942" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
