@@ -364,9 +364,7 @@ class TextGenerationController:
         # Create generation_started tensor if not provided
         # For dynamic batching, we assume all active requests have started generation
         # unless we're in the first prefill step
-        if generation_started is None:
-            context = self.inference_wrapped_model.inference_context
-            generation_started = torch.ones(batch_size, dtype=torch.bool, device=last_token_logits.device)
+        generation_started = torch.ones(batch_size, dtype=torch.bool, device=last_token_logits.device)
 
         for sampling_params, mask in active_sampling_map:
             # Filter out indices that are out of bounds for the current batch
@@ -386,7 +384,7 @@ class TextGenerationController:
                     last_token_logits[valid_mask],
                     sampling_params=sampling_params,
                     vocab_size=vocab_size,
-                    generation_started=generation_started[valid_mask] if generation_started is not None else None,
+                    generation_started=generation_started[valid_mask],
                     top_n_logprobs_dict=sub_top_n_logprobs_dict,
                     logits=None,  # We don't support prompt top_n_logprobs in dynamic inference yet
                 )
