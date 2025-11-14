@@ -195,7 +195,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
     that the context is defined to support. For the block-level KV cache, a memory
-    buffer is allocated up front (size `2 * active_buffer_size_gb`), that is
+    buffer is allocated up front (size `buffer_size_gb` if `unified_memory_level`
+    == 0, or `2 * buffer_size_gb` if `unified_memory_level` == 1), that is
     divided into blocks and dynamically assigned to requests. At any given step,
     any unassigned blocks equate to unused space.
 
@@ -222,10 +223,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
-        active_buffer_size_gb (float): Buffer size reserved for active requests
-            that live on the GPU. The total buffer size (stored in unified memory)
-            is 2x this value, with the the other half of the buffer reserved for
-            paused requests that live on the CPU.
+        buffer_size_gb (float): Buffer size reserved on the GPU for the KV cache.
+            if `unified_memory_level` >= 1, then CPU memory is additionally
+            utilized, resulting in a total buffer size of `2 * buffer_size_gb`.
+            Regardless of total buffer size, the KV cache is conceptually divided
+            into 50% active requests and 50% paused requests.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage. (Defaults to
             16384).
@@ -272,7 +274,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_channels: int,
         num_attention_heads: int,
         max_sequence_length: int,
-        active_buffer_size_gb: float,
+        buffer_size_gb: float,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,

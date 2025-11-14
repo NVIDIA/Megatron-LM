@@ -85,7 +85,7 @@ class DynamicEngineTestConfig:
 
     num_gap_steps: int = 2
 
-    context_active_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
@@ -215,7 +215,7 @@ class TestDynamicInferenceEngine:
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
-            active_buffer_size_gb=test_config.context_active_buffer_size_gb,
+            buffer_size_gb=test_config.context_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
@@ -607,9 +607,9 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
         block_size_bytes = context.block_size_bytes
-        active_buffer_size_gb = (block_size_bytes + 1) / 1024**3
+        buffer_size_gb = (block_size_bytes + 1) / 1024**3
         test_config = DynamicEngineTestConfig(
-            context_active_buffer_size_gb=active_buffer_size_gb, model_provider=model_provider
+            context_buffer_size_gb=buffer_size_gb, model_provider=model_provider
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -657,7 +657,7 @@ class TestDynamicInferenceEngine:
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
-                    context_active_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
+                    context_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
@@ -706,7 +706,7 @@ class TestDynamicInferenceEngine:
         # Initialize context.
         env = self._build_test_env(
             DynamicEngineTestConfig(
-                context_active_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
+                context_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
             )
         )
 
@@ -1015,7 +1015,7 @@ class TestDynamicInferenceEngine:
             num_requests=16,
             max_prompt_length=10,
             num_tokens_to_generate=32,
-            context_active_buffer_size_gb=0.001,  # 0.001, # 8 blocks
+            context_buffer_size_gb=0.001,  # 0.001, # 8 blocks
             context_max_tokens=8,
             num_gap_steps=1,
         )
