@@ -283,7 +283,7 @@ class MambaModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss_without_logits(
+        loss = self.compute_output_layer_and_language_model_loss(
             hidden_states,
             labels,
             weight=self.shared_embedding_or_output_weight(),

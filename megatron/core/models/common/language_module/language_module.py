@@ -118,7 +118,7 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
 
-    def compute_language_model_loss_without_logits(
+    def compute_output_layer_and_language_model_loss(
         self,
         hidden: Tensor,
         labels: Optional[Tensor],

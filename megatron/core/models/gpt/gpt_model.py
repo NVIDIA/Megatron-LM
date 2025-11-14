@@ -555,7 +555,7 @@ class GPTModel(LanguageModule):
                 )
 
                 # Compute mtp loss without storing logits to save memory.
-                mtp_loss = self.compute_language_model_loss_without_logits(
+                mtp_loss = self.compute_output_layer_and_language_model_loss(
                     hidden_states_list[mtp_layer_number + 1],
                     labels=mtp_labels,
                     weight=self.shared_embedding_or_output_weight(),
@@ -642,7 +642,7 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss_without_logits(
+        loss = self.compute_output_layer_and_language_model_loss(
             hidden_states,
             labels=labels,
             weight=self.shared_embedding_or_output_weight(),
