@@ -387,11 +387,19 @@ Exit codes:
             print(f"   ✓ Comparison complete", file=sys.stderr)
             
             # Filter out breaking changes involving filtered objects
-            breaking_changes = [
-                change for change in all_breaking_changes_raw
-                if (change.old_path not in all_filtered if change.old_path else True) and
-                   (change.new_path not in all_filtered if change.new_path else True)
-            ]
+            breaking_changes = []
+            for change in all_breaking_changes_raw:
+                # Different breakage types have different path attributes
+                old_path = getattr(change, 'old_path', None) or getattr(change, 'path', None)
+                new_path = getattr(change, 'new_path', None) or getattr(change, 'path', None)
+                
+                # Skip if either path is in our filtered set
+                if old_path and old_path in all_filtered:
+                    continue
+                if new_path and new_path in all_filtered:
+                    continue
+                
+                breaking_changes.append(change)
             
             if len(all_breaking_changes_raw) > len(breaking_changes):
                 print(f"   Filtered out {len(all_breaking_changes_raw) - len(breaking_changes)} changes in excluded code", file=sys.stderr)
