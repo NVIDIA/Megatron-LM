@@ -46,9 +46,7 @@ MODEL_ARGS:
   --return-log-probs: true
   --num-tokens-to-generate: 30
   --enable-cuda-graph: true
-  --inference-dynamic-batching-buffer-guaranteed-fraction: 0
-  --inference-dynamic-batching-buffer-overflow-factor: 0.2
-  --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-active-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
   --output-path: ${TENSORBOARD_PATH}
