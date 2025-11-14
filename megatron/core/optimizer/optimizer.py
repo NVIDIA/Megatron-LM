@@ -1224,10 +1224,9 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             # Mostly for Layerwise Dist Opt situation but it can be a general check
             # if the state dict optimizer is in this rank, load the state dict
-            maybe_optimizer_state = state['optimizer'] if 'optimizer' in state else state['optimizer_state_dict']
-            if 'state' in maybe_optimizer_state:
-                pass
-                # optimizer.load_state_dict(state)
+            if 'optimizer' in state:
+                if 'state' in state['optimizer']:
+                    optimizer.load_state_dict(state)
             # else:
             #     print(f"state_dict: {torch.distributed.get_rank()} {state['optimizer']} {type(optimizer)} \n")
             #     assert False
