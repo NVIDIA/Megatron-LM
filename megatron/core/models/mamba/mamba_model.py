@@ -61,7 +61,7 @@ class MambaModel(LanguageModule):
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
-        hybrid_override_pattern: str = None,
+        hybrid_override_pattern: Optional[str] = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
@@ -247,14 +247,23 @@ class MambaModel(LanguageModule):
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-
         if labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_output_layer_and_language_model_loss(
+            hidden_states,
+            labels,
+            weight=self.shared_embedding_or_output_weight(),
+            sequence_parallel_enabled=self.output_layer.sequence_parallel,
+            column_parallel_linear=self.output_layer,
+            col_linear_kwargs={
+                "weight": output_weight,
+                "runtime_gather_output": runtime_gather_output,
+            },
+        )
 
         return loss
