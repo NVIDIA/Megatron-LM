@@ -28,6 +28,7 @@ For more information, see: docs/api-backwards-compatibility-checking.md
 """
 
 import argparse
+import os
 import sys
 from typing import Set, List
 
@@ -218,7 +219,13 @@ def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -
         if ref:
             package = griffe.load_git(package_name, ref=ref, resolve_aliases=False, resolve_external=False)
         else:
-            package = griffe.load(package_name, resolve_aliases=False, resolve_external=False)
+            # For current version, load from working directory using static analysis
+            package = griffe.load(
+                package_name,
+                search_paths=[os.getcwd()],  # Search in current directory
+                resolve_aliases=False,
+                resolve_external=False
+            )
     except Exception as e:
         print(f"❌ Error loading {package_name}{ref_label}: {e}", file=sys.stderr)
         raise
