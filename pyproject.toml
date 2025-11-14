@@ -170,6 +170,7 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    "pydantic<1.8.0",
 ]
 
 [tool.uv.sources]
