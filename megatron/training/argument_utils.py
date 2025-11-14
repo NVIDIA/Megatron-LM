@@ -9,7 +9,7 @@ import builtins
 import ast
 from dataclasses import Field, fields
 
-# TODO: support arg renames, bool name invert
+# TODO: support arg renames
 # TODO: if metadata handles types, ignore exceptions from _extract_type()
 
 class ArgumentGroupFactory:
@@ -34,13 +34,18 @@ class ArgumentGroupFactory:
         self.field_docstrings = self._get_field_docstrings(src_cfg_class)
         self.exclude = set(exclude) if exclude is not None else set()
 
-    def _format_arg_name(self, config_attr_name: str) -> str:
+    def _format_arg_name(self, config_attr_name: str, prefix: Optional[str] = None) -> str:
         """Convert dataclass name into appropriate argparse flag name.
 
         Args:
             config_attr_name: dataclass attribute name
+            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool 
+                settings that are default True. A hyphen is added after the prefix. Default: None
         """
-        arg_name = "--" + config_attr_name.replace("_", "-")
+        arg_name = config_attr_name
+        if prefix:
+            arg_name = prefix + '_' + arg_name
+        arg_name = "--" + arg_name.replace("_", "-")
         return arg_name
 
     def _extract_type(self, config_type: type) -> dict[str, Any]:
@@ -87,7 +92,7 @@ class ArgumentGroupFactory:
             attribute: dataclass attribute
         """
         argparse_kwargs = {}
-        argparse_kwargs["arg_name"] = self._format_arg_name(attribute.name)
+        argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
         argparse_kwargs["default"] = attribute.default
         argparse_kwargs["help"] = self.field_docstrings[attribute.name]
@@ -98,6 +103,10 @@ class ArgumentGroupFactory:
         if argparse_kwargs["type"] == bool:
             argparse_kwargs["action"] = "store_true" if attribute.default == False else "store_false"
             argparse_kwargs.pop("type")
+
+            # add '--no-*' and '--disable-*' prefix if this is a store_false argument
+            if argparse_kwargs["action"] == "store_false":
+                argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
 
         # metadata provided by field takes precedence 
         if attribute.metadata != {} and "argparse_meta" in attribute.metadata:
@@ -119,8 +128,8 @@ class ArgumentGroupFactory:
 
             add_arg_kwargs = self._build_argparse_kwargs_from_field(attr)
 
-            arg_name = add_arg_kwargs.pop("arg_name")
-            arg_group.add_argument(arg_name, **add_arg_kwargs)
+            arg_names = add_arg_kwargs.pop("arg_names")
+            arg_group.add_argument(*arg_names, **add_arg_kwargs)
 
         return arg_group
 
