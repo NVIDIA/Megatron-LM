@@ -266,7 +266,12 @@ def print_breaking_changes(changes: List, verbose: bool = False) -> bool:
     
     for i, change in enumerate(changes, 1):
         print(f"\n{i}. {change.kind.value}")
-        print(f"   Object: {change.old_path or change.new_path}")
+        
+        # Different breakage types have different path attributes
+        old_path = getattr(change, 'old_path', None) or getattr(change, 'path', None)
+        new_path = getattr(change, 'new_path', None) or getattr(change, 'path', None)
+        obj_path = old_path or new_path or "Unknown"
+        print(f"   Object: {obj_path}")
         
         # Print location if available
         if hasattr(change, 'old_value') and hasattr(change.old_value, 'filepath'):
