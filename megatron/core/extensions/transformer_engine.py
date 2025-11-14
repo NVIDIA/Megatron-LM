@@ -1090,6 +1090,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )
+
         else:
             core_attn_out = super().forward(
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs

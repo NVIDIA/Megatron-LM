@@ -217,22 +217,25 @@ def dict_list_map_outplace(f: Callable[[U], V], x: Union[Dict, List, U]) -> Unio
         return f(x)
 
 
-def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, int], ...] = ()):
+def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, int], ...] = (), layerwise_dist_opt: bool = False):
     """Merges dicts and lists recursively."""
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
             if k not in x1:
                 x1[k] = v2
             else:
-                x1[k] = merge(x1[k], v2, key=key + (k,))
+                x1[k] = merge(x1[k], v2, key=key + (k,), layerwise_dist_opt=layerwise_dist_opt)
     elif isinstance(x1, list) and isinstance(x2, list):
-        if len(x1) != len(x2):
+        # for layerwise dist opt, if the common list is empty, return the loaded list
+        if layerwise_dist_opt and len(x1) == 0:
+            return x2
+        elif len(x1) != len(x2):
             raise ValueError(
                 f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "
                 f"encountered at level {key})"
             )
         for i, v2 in enumerate(x2):
-            x1[i] = merge(x1[i], v2, key=key + (i,))
+            x1[i] = merge(x1[i], v2, key=key + (i,), layerwise_dist_opt=layerwise_dist_opt)
     else:
         raise ValueError(
             f"Duplicate non-dict and non-list values encountered: `{x1}` and `{x2}` "

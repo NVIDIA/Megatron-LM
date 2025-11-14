@@ -1222,7 +1222,14 @@ class ChainedOptimizer(MegatronOptimizer):
         if isinstance(state_dict, dict):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
-            optimizer.load_state_dict(state)
+            # Mostly for Layerwise Dist Opt situation but it can be a general check
+            # if the state dict optimizer is in this rank, load the state dict
+            if 'optimizer' in state:
+                if 'state' in state['optimizer']:
+                    optimizer.load_state_dict(state)
+            # else:
+            #     print(f"state_dict: {torch.distributed.get_rank()} {state['optimizer']} {type(optimizer)} \n")
+            #     assert False
         self._synchronize_steps()
 
     @torch.no_grad()
