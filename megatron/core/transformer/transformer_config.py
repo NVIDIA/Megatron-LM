@@ -192,6 +192,16 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_clip: bool = False
+    """Whether to clip the query and key weights. Introduced in TE 2.9.0. Needed for Muon LLM 
+    training."""
+
+    qk_clip_alpha: float = 0.5
+    """The balancing alpha for qk-clip. Q = Q * (eta ** alpha)"""
+
+    qk_clip_threshold: float = 100
+    """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
+
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 

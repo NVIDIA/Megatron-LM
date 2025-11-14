@@ -1003,6 +1003,14 @@ def validate_args(args, defaults={}):
     if args.add_bias_linear:
         args.add_qkv_bias = True
 
+    if args.qk_clip:
+        assert is_te_min_version("2.9.0"), \
+            '--qk-clip is only supported with TE >= 2.9.0.'
+        assert 0.0 < args.qk_clip_alpha < 1.0, \
+            '--qk-clip-alpha must be between 0.0 and 1.0 when using --qk-clip.'
+        assert args.qk_clip_threshold > 0, \
+            '--qk-clip-threshold must be greater than 0 when using --qk-clip.'
+
     # Retro checks.
     if args.retro_add_retriever:
 
@@ -1245,6 +1253,9 @@ def validate_args(args, defaults={}):
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
+    
+    if args.multi_latent_attention:
+        assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1919,6 +1930,8 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
+    group.add_argument('--log-max-attention-logit', action='store_true',
+                       help='Enable max attention logit logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-entity', type=str, default='',
@@ -2288,6 +2301,12 @@ def _add_training_args(parser):
     group.add_argument('--add-qkv-bias', action='store_true',
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
+    group.add_argument('--qk-clip', action='store_true',
+                       help='Whether to use qk-clip for training stabilization, strongly recommended for Muon.')
+    group.add_argument('--qk-clip-alpha', type=float, default=0.5,
+                       help='The balancing alpha for qk-clip.')
+    group.add_argument('--qk-clip-threshold', type=float, default=100,
+                       help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon'],
                        help='Optimizer function')
@@ -3294,7 +3313,7 @@ def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")
     group.add_argument('--q-lora-rank', type=int, default=None,
                        help="Rank of Query tensor's low rank representation.")
-    group.add_argument('--kv-lora-rank', type=int, default=32,
+    group.add_argument('--kv-lora-rank', type=int, default=512,
                        help="Rank of Key and Value tensors' low rank representation.")
     group.add_argument('--qk-head-dim', type=int, default=128,
                        help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim")
