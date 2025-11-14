@@ -176,7 +176,7 @@ class CUDAGraphBatchDimensionBuilder:
 
         Returns:
             Tuple containing:
-            - List of InferenceBatchDimensions objects, 
+            - List of InferenceBatchDimensions objects,
               sorted by prefill token count in descending order
             - Optional list of CUDA graph token counts
         """
