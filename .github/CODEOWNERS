@@ -5,6 +5,7 @@ megatron/core/models/gpt/ @NVIDIA/gpt
 megatron/core/models/multimodal/ @NVIDIA/multi-modal
 
 megatron/core/models/mamba/ @NVIDIA/hybrid-mamba
+megatron/core/ssm/ @NVIDIA/hybrid-mamba
 
 megatron/core/datasets/ @NVIDIA/datasets
 
@@ -24,7 +25,7 @@ megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
 
 megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-devtech
+megatron/core/transformer/moe/ @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
 
 megatron/core/inference/ @NVIDIA/inference
 

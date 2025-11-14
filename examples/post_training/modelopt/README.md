@@ -28,11 +28,14 @@ neural architecture search, and speulative decoding.
 
 | Model (`conf/`) | Quantization | EAGLE3 | Pruning (PP only) | Distillation |
 | :---: | :---: | :---: | :---: | :---: |
-| `moonshotai/Kimi-K2-Instruct` | ✅ | ✅ | - | - |
-| `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | - | - |
-| `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
 | `deepseek-ai/DeepSeek-R1` | ✅ | ✅ | - | - |
 | `meta-llama/Llama-{3.1-8B, 3.1-405B, 3.2-1B}-Instruct` | ✅ | ✅ | ✅ | ✅ |
+| `meta-llama/Llama-4-{Scout,Maverick}-17B-{16,128}E-Instruct` | ✅ | ✅ | - | - |
+| `moonshotai/Kimi-K2-Instruct` | ✅ | ✅ | - | - |
+| `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | ✅ | - | ✅ | ✅ |
+| `openai/gpt-oss-{20b, 120b}` | ✅ | **Online** | ✅ | ✅ |
+| `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
+| `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | ✅ | ✅ |
 
 ## Getting Started in a Local Environment
 
@@ -125,13 +128,17 @@ See [Adanvanced Topics](ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 
 
 Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/TensorRT-Model-Optimizer/tree/main/examples/pruning).
 
-Pruning is supported for GPT and Mamba models. Available pruning options are:
+Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. Available pruning dimensions are:
+
 - `TARGET_FFN_HIDDEN_SIZE`
 - `TARGET_HIDDEN_SIZE`
 - `TARGET_NUM_ATTENTION_HEADS`
 - `TARGET_NUM_QUERY_GROUPS`
 - `TARGET_MAMBA_NUM_HEADS`
 - `TARGET_MAMBA_HEAD_DIM`
+- `TARGET_NUM_MOE_EXPERTS`
+- `TARGET_MOE_FFN_HIDDEN_SIZE`
+- `TARGET_MOE_SHARED_EXPERT_INTERMEDIATE_SIZE`
 - `TARGET_NUM_LAYERS`
 - `LAYERS_TO_DROP` (comma separated, 1-indexed list of layer numbers to directly drop)
 
@@ -142,12 +149,21 @@ PP=1 \
 TARGET_NUM_LAYERS=24 \
 HF_MODEL_CKPT=<pretrained_model_name_or_path> \
 MLM_MODEL_SAVE=Qwen3-8B-Pruned \
-./prune.sh qwen/Qwen3-8B
+./prune.sh Qwen/Qwen3-8B
 ```
 
 > [!TIP]
 > If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven
 > PP by setting `MLM_EXTRA_ARGS="--decoder-first-pipeline-num-layers <X> --decoder-last-pipeline-num-layers <Y>"`
+
+> [!TIP]
+> You can reuse pruning scores for pruning same model again to different architectures by setting
+> `PRUNE_ARGS="--pruning-scores-path <path_to_save_scores>"`
+
+> [!NOTE]
+> When loading pruned M-LM checkpoint for subsequent steps, make sure overwrite the pruned parameters in the
+> default `conf/` by setting `MLM_EXTRA_ARGS`. E.g.: for loading above pruned Qwen3-8B checkpoint for mmlu, set:
+> `MLM_EXTRA_ARGS="--num-layers 24"`
 
 ## Advanced Usage
 TBD
