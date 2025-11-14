@@ -940,7 +940,7 @@ class TestFP32Optimizer:
                     optimizer_B.sharded_state_dict(
                         model_B[0].sharded_state_dict(), metadata=metadata
                     ),
-                    ckpt_dir_B
+                    ckpt_dir_B,
                 )
                 Utils.destroy_model_parallel()
 
