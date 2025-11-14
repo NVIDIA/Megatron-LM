@@ -146,11 +146,23 @@ def filter_objects(obj: Object, filtered: Set[str]):
         obj: A griffe Object to examine
         filtered: Set to populate with paths of objects to skip
     """
+    # Skip aliases entirely - they're just references, not API definitions
+    if obj.kind.value == "alias":
+        # Only skip external aliases
+        try:
+            if hasattr(obj, 'target_path'):
+                target = str(obj.target_path)
+                if not target.startswith('megatron'):
+                    filtered.add(obj.path)
+        except Exception:
+            filtered.add(obj.path)
+        return
+    
     if should_skip_object(obj):
         filtered.add(obj.path)
         return
     
-    # Recurse into members (for classes, modules, etc.)
+    # Recurse into members (for classes, modules, etc.), but not into aliases
     if hasattr(obj, 'members'):
         for member in obj.members.values():
             filter_objects(member, filtered)
