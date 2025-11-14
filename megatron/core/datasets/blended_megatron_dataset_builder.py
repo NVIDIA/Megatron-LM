@@ -47,13 +47,11 @@ class BlendedMegatronDatasetBuilder(object):
         sizes: List[int],
         is_built_on_rank: Callable,
         config: BlendedMegatronDatasetConfig,
-        vp_stage: Optional[int] = None,
     ):
         self.cls = cls
         self.sizes = sizes
         self.is_built_on_rank = is_built_on_rank
         self.config = config
-        self.vp_stage = vp_stage
 
         log_single_rank(
             logger,
