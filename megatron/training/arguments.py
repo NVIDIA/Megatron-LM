@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import types
-import warnings
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +34,7 @@ from megatron.core.utils import (
 )
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.dist_signal_handler import SIGNAL_MAP
 from megatron.training.utils import (
     get_device_arch_version,
     update_use_dist_ckpt,
@@ -1023,8 +1023,6 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
-    if args.num_experts is not None:
-        assert args.spec is None, "Model Spec must be None when using MoEs"
     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
         print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
@@ -1136,9 +1134,8 @@ def validate_args(args, defaults={}):
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
     if args.inference_dynamic_batching:
-        assert args.inference_dynamic_batching_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_active_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
-        assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
 
     # MoE upcycling check
     if args.moe_use_upcycling:
@@ -1319,9 +1316,13 @@ def _add_transformer_engine_args(parser):
                        dest='fp8')
     # per tensor current scaling recipe selection
     group.add_argument('--fp8-recipe', default='delayed',
-                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise', 'custom'],
                        help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
                        dest='fp8_recipe')
+    group.add_argument('--fp8-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp8_quantizer_factory')
     # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
@@ -1340,7 +1341,7 @@ def _add_transformer_engine_args(parser):
                        help='Execute wgrad in higher precision even for FP8 runs',
                        dest='fp8_wgrad')
     group.add_argument('--transformer-impl', default='transformer_engine',
-                       choices=['local', 'transformer_engine'],
+                       choices=['local', 'transformer_engine', 'inference_optimized'],
                        help='Which Transformer implementation to use.')
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
@@ -1358,9 +1359,13 @@ def _add_transformer_engine_args(parser):
                        help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
                        dest='fp4')
     group.add_argument('--fp4-recipe', default='nvfp4',
-                       choices=['nvfp4'],
+                       choices=['nvfp4', 'custom'],
                        help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
                        dest='fp4_recipe')
+    group.add_argument('--fp4-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
@@ -1435,36 +1440,19 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
-    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
+    group.add_argument('--inference-dynamic-batching-active-buffer-size-gb',
                        type=float, default=40.,
-                       help='Total buffer size (GB) allocated for the block-level KV '
-                       'memory.')
+                       help='Buffer size (GB) allocated for the active (on-GPU) '
+                       'portion of the chunked KV memory. The total buffer size '
+                       'is 2x this value, which includes the same-size on-CPU '
+                       'paused buffer.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
                        'It should be a multiple of 256')
-    group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
-                       type=float, default=0.2,
-                       help='Space is reserved within the inference context '
-                       'memory buffer to guarantee that a minimum number of '
-                       'active requests will always be able to run to '
-                       'completion. This is to avoid the context being deadlocked '
-                       'by paused requests.')
-    group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
-                       type=float, default=None,
-                       help='Scaling factor over the memory buffer size for auto '
-                       'computing `max_requests` and `max_tokens`. This scaling '
-                       'factor is used for fitting more requests and tokens in '
-                       'the memory buffer than it can safely hold, which in turn '
-                       'increases throughput.')
-    group.add_argument('--inference-dynamic-batching-max-requests-override',
+    group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
-                       help='If set, this overrides the max requests as computed '
-                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
-    group.add_argument('--inference-dynamic-batching-max-tokens-override',
-                       type=int, default=None,
-                       help='If set, this overrides the max tokens as computed '
-                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+                       help='Override the inference context\'s default `max_tokens`.')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
                        help='Maximum number of cuda graphs to capture, where the '
@@ -1481,7 +1469,7 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=0, choices=[0, 1],
+                       type=int, default=1, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
@@ -2163,7 +2151,10 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if signal is received')
+    group.add_argument('--exit-signal', type=str, default='SIGTERM',
+                       choices=list(SIGNAL_MAP.keys()),
+                       help='Signal to use for exit signal handler. If not specified, defaults to SIGTERM.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',

@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import faulthandler
 import logging
+import signal
 from collections import deque
 from itertools import cycle
 from multiprocessing import Event
@@ -22,6 +24,11 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
+
+# Register faulthandler to emit stack traces upon process kill.
+faulthandler.enable()
+faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
+faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
 class DataParallelInferenceCoordinator:
