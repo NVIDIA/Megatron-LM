@@ -19,6 +19,8 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
+    hybrid_ep_combine,
+    hybrid_ep_dispatch,
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
@@ -42,6 +44,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
+
+logger = logging.getLogger(__name__)
 
 
 class MoETokenDispatcher:
@@ -889,11 +893,6 @@ class _DispatchManager(ABC):
         pass
 
     @abstractmethod
-    def get_dispached_metadata(self) -> torch.Tensor:
-        """Get the metadata of the dispatched hidden_states."""
-        pass
-
-    @abstractmethod
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Get the permuted hidden states by instances."""
         pass
@@ -902,6 +901,161 @@ class _DispatchManager(ABC):
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Get the restored hidden states by instances."""
         pass
+
+
+class _HybridEPManager(_DispatchManager):
+    """
+    A manager class to handle fused all-to-all communication processes for MoE models using
+    HybridEP backend. See https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep for more details.
+
+    The workflow of the HybridEP dispatcher is:
+    (1) setup_metadata(): Process routing map and probabilities to prepare dispatch metadata
+    (2) dispatch():
+        - Permute tokens for communication, perform all-to-all communication,
+        and permute tokens for experts in single step
+    (3) combine():
+        - Unpermute tokens for communication, perform all-to-all communication,
+        and unpermute tokens for attention in single step
+    """
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        """
+        Initialize the HybridEP dispatcher.
+
+        Args:
+            group (torch.distributed.ProcessGroup): The process group to use for communication.
+                This should be the ETPxEP group.
+            num_local_experts (int): The number of local experts.
+            num_experts (int): The total number of experts in the group.
+            config (TransformerConfig): The configuration for the transformer model.
+        """
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.num_experts = num_experts
+        self.config = config
+        self.permute_fusion = config.moe_permute_fusion
+        self.capacity_factor = config.moe_expert_capacity_factor
+        # Drop and pad the input to capacity.
+        self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
+        if self.drop_and_pad:
+            assert self.capacity_factor is not None
+        self.capacity = None
+        # The up-bound for the number of tokens after dispatch op, -1 means no up-bound,
+        # which will cause a CPU sync
+        self.num_dispatched_tokens = None
+        # Actually the sum of tokens_per_expert, the up-bound for the number of tokens
+        # after permute op, -1 means no up-bound, will cause a CPU sync
+        self.num_permuted_tokens = None
+
+        # Metadata
+        self.token_probs: Optional[torch.Tensor] = None
+        # Handle used for combine operation
+        self.handle = None
+        # Used for padding the output for each expert
+        self.pad_multiple = None
+
+        if hybrid_ep_dispatch is None:
+            raise ImportError(
+                "HybridEP is not installed. Please install HybridEP package from "
+                "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
+            )
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        num_tokens = routing_map.shape[0]
+        self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        self.token_probs = probs.reshape(num_tokens, self.num_experts)
+        # Compute the capacity for each expert at the drop_and_pad mode
+        if self.drop_and_pad:
+            num_out_tokens = num_tokens * self.config.moe_router_topk
+            # Drop and pad the input to capacity.
+            self.capacity = get_capacity(
+                num_tokens=num_out_tokens,
+                num_experts=self.num_experts,
+                capacity_factor=self.capacity_factor,
+            )
+            # We cannot predict the actual number of tokens after the dispatch op,
+            # so we set it to the worst case in drop_and_pad mode
+            self.num_dispatched_tokens = self.capacity * self.group.size() * self.num_local_experts
+            # In drop_and_pad mode, the number of tokens after the permute op
+            # can be computed on the CPU
+            self.num_permuted_tokens = self.num_dispatched_tokens
+            self.tokens_per_expert = torch.full(
+                (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
+            )
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        # HybridEP only supports float32 probs
+        if self.token_probs.dtype != torch.float32:
+            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                logger.warning(
+                    "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
+            self.token_probs = self.token_probs.float()  # downcast or upcast
+        if self.config.fp8:
+            self.pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
+            hybrid_ep_dispatch(
+                x=hidden_states,
+                routing_map=self.routing_map,
+                probs=self.token_probs,
+                group=self.group,
+                num_local_experts=self.num_local_experts,
+                num_sms_dispatch_api=self.config.moe_hybridep_num_sms,
+                num_sms_combine_api=self.config.moe_hybridep_num_sms,
+                num_dispatched_tokens=self.num_dispatched_tokens,
+                num_permuted_tokens=self.num_permuted_tokens,
+                pad_multiple=self.pad_multiple,
+            )
+        )
+
+        if not self.drop_and_pad:
+            self.tokens_per_expert = tokens_per_expert
+            # self.num_permuted_tokens is necessary to allocate the output tensor for permute
+            self.num_permuted_tokens = self.tokens_per_expert.sum()
+
+        return dispatched_hidden
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = hybrid_ep_combine(
+            x=hidden_states,
+            handle=self.handle,
+            num_dispatched_tokens=self.num_dispatched_tokens,
+            num_permuted_tokens=self.num_permuted_tokens,
+            pad_multiple=self.pad_multiple,
+        )
+        # Release the used handle/num_permuted_tokens which could change in each iteration
+        self.handle = None
+        self.num_permuted_tokens = None
+        self.num_dispatched_tokens = None
+        return hidden_states
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states, self.dispatched_probs
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        '''
+        Get the number of tokens per expert.
+        '''
+        return self.tokens_per_expert
 
 
 class _DeepepManager(_DispatchManager):
@@ -989,7 +1143,9 @@ class _DeepepManager(_DispatchManager):
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
-                print("DeepEP only supports float32 probs, please set --moe-router-dtype=fp32")
+                logger.warning(
+                    "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
             self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
@@ -1039,9 +1195,6 @@ class _DeepepManager(_DispatchManager):
         multihot_probs[row_indices, valid_indices] = probs[mask]
         return multihot_routing_map.bool(), multihot_probs
 
-    def get_dispached_metadata(self) -> torch.Tensor:
-        return self.dispatched_indices, self.dispatched_probs
-
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
         """
         Get the number of tokens per expert.
@@ -1081,7 +1234,6 @@ class _DeepepManager(_DispatchManager):
         # Check if there are enough tokens to pad
         enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
         if not enough_tokens_to_pad:
-            logger = logging.getLogger(__name__)
             logger.warning(
                 "Not enough tokens to pad. The total number of tokens received in this rank "
                 "is smaller than the target number of tokens for each expert. "
@@ -1162,19 +1314,27 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
-        assert (
-            self.config.moe_enable_deepep
-        ), "DeepEP is not enabled. Please set --moe-enable-deepep to use DeepEP backend."
-        assert (
-            self.config.moe_pad_expert_input_to_capacity is False
-        ), "Flex token dispatcher does not support --moe-pad-expert-input-to-capacity"
-        self._comm_manager = _DeepepManager(
-            group=self.tp_ep_group,
-            num_local_experts=self.num_local_experts,
-            router_topk=self.tp_size * self.config.moe_router_topk,
-            num_experts=self.tp_size * self.config.num_moe_experts,
-            config=self.config,
-        )
+        if self.config.moe_flex_dispatcher_backend == "deepep":
+            self._comm_manager = _DeepepManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+        elif self.config.moe_flex_dispatcher_backend == "hybridep":
+            self._comm_manager = _HybridEPManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+        else:
+            raise ValueError(
+                f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
+                "Please set --moe-flex-dispatcher-backend=deepep or "
+                "--moe-flex-dispatcher-backend=hybridep"
+            )
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
