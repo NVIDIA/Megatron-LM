@@ -2677,20 +2677,10 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    group = parser.add_argument_group(title='validation')
+    from megatron.training.config import ValidationConfig
 
-    group.add_argument('--full-validation', action='store_true', help='If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!')
-    group.add_argument('--multiple-validation-sets', action='store_true', help='If set, multiple datasets listed in the validation split are evaluated independently with a separate loss for each dataset in the list. This argument requires that no weights are included in the list')
-    group.add_argument('--eval-iters', type=int, default=100,
-                       help='Number of iterations to run for evaluation'
-                       'validation/test for.')
-    group.add_argument('--eval-interval', type=int, default=1000,
-                       help='Interval between running evaluation on '
-                       'validation set.')
-    group.add_argument("--test-mode", action="store_true", help='Run all real-time test alongside the experiment.')
-    group.add_argument('--skip-train', action='store_true',
-                       default=False, help='If set, bypass the training loop, '
-                       'optionally do evaluation for validation/test, and exit.')
+    val_factory = ArgumentGroupFactory(ValidationConfig)
+    group = val_factory.build_group(parser, "validation")
 
     return parser
 

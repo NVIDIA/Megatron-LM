@@ -5,9 +5,7 @@ from typing import Optional, Literal
 
 @dataclass(kw_only=True)
 class TrainingConfig:
-    """Configuration settings related to the training loop and validation."""
-
-    # ---------------- Training config. ----------------
+    """Configuration settings related to the training loop."""
 
     micro_batch_size: Optional[int] = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
@@ -89,17 +87,29 @@ class TrainingConfig:
     """List of iterations to skip during training, empty by default."""
 
 
-    # ---------------- Validation config. ----------------
+@dataclass(kw_only=True)
+class ValidationConfig:
+    """Configuration settings related to validation during or after model training."""
 
-    eval_samples: Optional[int] = None
-    """Number of samples to run for evaluation. Used for both validation and test. If not set,
-    evaluation will not run.
-    """
+    val_iters: Optional[int] = field(default=100, metadata={"argparse_meta": {"arg_names": ["--eval-iters", "--val-iters"], "dest": "eval_iters"}})
+    """Number of iterations to run validation/test for."""
 
-    eval_interval: Optional[int] = None
+    val_interval: Optional[int] = field(default=None, metadata={"argparse_meta": {"arg_names": ["--eval-interval", "--val-interval"], "dest": "eval_interval"}})
     """Interval between running evaluation on validation set. If not set, evaluation will not run
     during training.
     """
 
     skip_train: bool = False
-    """If set, bypass the training loop, optionally do evaluation for validation/test, and exit."""
+    """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
+
+    test_mode: bool = False
+    """Run all real-time test alongside the experiment."""
+
+    full_validation: bool = False
+    """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
+
+    multiple_validation_sets: bool = False
+    """If set, multiple datasets listed in the validation split are evaluated independently with a
+       separate loss for each dataset in the list. This argument requires that no weights are 
+       included in the list.
+    """
