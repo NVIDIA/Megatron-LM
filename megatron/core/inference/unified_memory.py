@@ -56,9 +56,9 @@ def compile_allocator():
 
     EXPORT void* managed_malloc(size_t size, int device, void* stream) {
       (void)stream;
-      int cur = -1;
-      cudaGetDevice(&cur);
-      if (device != cur && device >= 0) cudaSetDevice(device);
+      int prev_device = -1;
+      cudaGetDevice(&prev_device);
+      if (device != prev_device && device >= 0) cudaSetDevice(device);
 
       // cudaMallocManaged allows for more memory to be allocated than the device memory size.
       // The cudaMemAttachGlobal flag makes the memory accessible from both host and device.
@@ -69,13 +69,32 @@ def compile_allocator():
       if (device >= 0) {
         // cudaMemAdviseSetPreferredLocation sets the preferred location for the memory.
         // This is a hint that tries to prevent data from being migrated away from the device.
-        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
-        // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
-        // Even if the memory has to be migrated away from the device, it still does not page fault.
-        // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
-        // but there is no harm in adding this flag as well for future-proofing.
-        cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
+
+        #if CUDART_VERSION >= 13000
+          // For CUDA >= 13, the cudaMemAdvise device arg is type cudaMemLocation
+          // instead of an int, so we setup the location and conditionally use it
+          // in calls to cudaMemAdvise.
+          cudaMemLocation location;
+          location.type = cudaMemLocationTypeDevice;
+          location.id = device;
+
+          cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, location);
+
+          // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
+          // Even if the memory has to be migrated away from the device, it still does not page fault.
+          // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
+          // but there is no harm in adding this flag as well for future-proofing.
+          cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, location);
+        #else
+          cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
+          // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
+          // Even if the memory has to be migrated away from the device, it still does not page fault.
+          // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
+          // but there is no harm in adding this flag as well for future-proofing.
+          cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
+        #endif
       }
+      if (device != prev_device && prev_device >= 0) cudaSetDevice(prev_device);
       return ptr;
     }
 
@@ -100,7 +119,7 @@ def compile_allocator():
                 functions=[],
                 with_cuda=True,
                 extra_ldflags=_extra_ldflags,
-                verbose=False,
+                verbose=True,
             )
             _so_path = Path(_mod.__file__).as_posix()
             _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
