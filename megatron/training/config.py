@@ -79,6 +79,10 @@ class TrainingConfig:
     end of each evaluation run.
     """
 
+    iterations_to_skip: list[int] = field(default_factory=list)
+    """List of iterations to skip during training, empty by default."""
+
+
     # ---------------- Validation config. ----------------
 
     eval_samples: Optional[int] = None

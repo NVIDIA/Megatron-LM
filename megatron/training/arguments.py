@@ -2065,8 +2065,6 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
-    group.add_argument('--iterations-to-skip', nargs='+', type=int, default=[],
-                       help='List of iterations to skip, empty by default.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--disable-gloo-process-groups', action='store_false',
