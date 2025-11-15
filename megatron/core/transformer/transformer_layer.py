@@ -274,10 +274,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.pg_collection = pg_collection
 
         self.submodules_config = submodules
-        transformer_layer_offset = get_transformer_layer_offset(
+        self.layer_number = layer_number + get_transformer_layer_offset(
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
-        self.layer_number = layer_number + transformer_layer_offset
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
@@ -303,7 +302,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             submodules.self_attention,
             config=self.config,
             layer_number=self.layer_number,
-            transformer_layer_offset=transformer_layer_offset,
             **attention_optional_kwargs,
         )
 
@@ -323,7 +321,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             submodules.cross_attention,
             config=self.config,
             layer_number=self.layer_number,
-            transformer_layer_offset=transformer_layer_offset,
             **attention_optional_kwargs,
         )
 

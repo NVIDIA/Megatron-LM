@@ -29,6 +29,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    get_pg_rank,
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
@@ -147,13 +148,19 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
-        transformer_layer_offset: int = 0,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
-        self.transformer_layer_offset = transformer_layer_offset
+
+        # Import here to avoid circular imports
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        self.transformer_layer_offset = get_transformer_layer_offset(
+            self.config, vp_stage=None, pp_rank=get_pg_rank(pg_collection.pp)
+        )
+
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -967,7 +974,6 @@ class SelfAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
-        transformer_layer_offset: int = 0,
     ):
         super().__init__(
             config=config,
@@ -977,7 +983,6 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
-            transformer_layer_offset=transformer_layer_offset,
         )
 
         self.linear_qkv = build_module(
@@ -1177,7 +1182,6 @@ class CrossAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
-        transformer_layer_offset: int = 0,
     ):
         super().__init__(
             config=config,
@@ -1187,7 +1191,6 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
-            transformer_layer_offset=transformer_layer_offset,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
