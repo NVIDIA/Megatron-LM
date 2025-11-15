@@ -11,11 +11,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
 
 def get_moe_module_spec(
