@@ -19,7 +19,7 @@ NOTE: For faster performance, if your entire model will fit into gpu memory, pre
 
 ##### 1.1 Understanding The Code
 ***STEP 1 - We initialize model parallel and other default arguments***
-We initalize tp and pp to 1 so that we can get the full model state dict on cpu
+We initialize tp and pp to 1 so that we can get the full model state dict on cpu
 ```python
     initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 ```
@@ -30,7 +30,7 @@ NOTE: We create a simple gpt model
 ```python
     transformer_config = TransformerConfig(
         num_layers=2, 
-        hidden_size=64, # Needs to be atleast 32 times num_attn_heads
+        hidden_size=64, # Needs to be at least 32 times num_attn_heads
         num_attention_heads=2, 
         use_cpu_initialization=True, 
         pipeline_dtype=torch.float32,
@@ -155,7 +155,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2  examples/export/trtllm_exp
 
 #### 3. Future work
 The following are planned for the future releases . 
-* Pipeline parallellism for export (Work in progress) 
+* Pipeline parallelism for export (Work in progress) 
 * GPU Export for more models (Work in progress for some models)
 * Refit functionality
 * VLLM Support

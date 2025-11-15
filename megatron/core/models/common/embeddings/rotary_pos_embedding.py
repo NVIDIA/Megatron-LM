@@ -175,7 +175,7 @@ class RotaryEmbedding(nn.Module):
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
         if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension and select the parition of the current
+            # slice rotary_pos_emb along sequence dimension and select the partition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb
@@ -319,7 +319,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
         if self.cp_group is not None and self.cp_group.size() > 1:
-            # slice rotary_pos_emb along sequence dimension and select the parition of the current
+            # slice rotary_pos_emb along sequence dimension and select the partition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb

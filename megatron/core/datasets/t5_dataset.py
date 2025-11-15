@@ -143,7 +143,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             encoder_mask (torch.tensor): A 2-D array of tokens (bs, kv_len)
             decoder_mask (torch.tensor): A 2-D array of tokens (bs, q_len)
             use_local (bool): Whether the current T5 model uses local (vs TE)
-                transformer implmentation
+                transformer implementation
 
         Returns:
             Configured encoder_mask, decoder_mask, encoder_decoder_mask
@@ -169,14 +169,14 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         else:
             # If using transformer_engine transformer implementation:
             # 1. For TE version >= 1.10, across all 3 backends,
-            #    The padding mask is configued as
+            #    The padding mask is configured as
             #    [bs, 1, 1, seq_len] for self-attention and
             #    ([bs, 1, 1, q_len], [bs, 1, 1, kv_len]) for cross-attention
             # 2. For TE version >=1.7 and <1.10, when using Non-fused backend,
-            #    The padding mask is configued as
+            #    The padding mask is configured as
             #    [bs, 1, q_len, kv_len] for both self-attention and for cross-attention
             # 3. For TE version <1.7, only support Non-fused backend
-            #    The padding mask is configued as
+            #    The padding mask is configured as
             #    [bs, 1, q_len, kv_len] for both self-attention and for cross-attention
 
             # Process for Flash/Fused

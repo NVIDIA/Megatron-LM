@@ -502,7 +502,7 @@ class DistributedDataParallel(_BaseDataParallel):
             bucket_group.start_param_sync(force_sync=force_sync)
             # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
             # the param.data, since param buffer is not mapped to model params for MXFP8 case.
-            # The paramaters are cast from bf16 to MXFP8 during copy.
+            # The parameters are cast from bf16 to MXFP8 during copy.
             # In the case of "overlap_param_gather=True", the param copy is done
             # in "finish_param_sync" stage after zeroing the shared gardient buffers.
             if (

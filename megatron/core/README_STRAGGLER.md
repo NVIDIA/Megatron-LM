@@ -29,7 +29,7 @@ Each metric is prefixed with `Mn` or `Mx` to represent `Minimum` or `Maximum`. E
 
 ### Command Line activation
 To start using the StragglerDetector, need to pass the following argument `--log-straggler`. It optionally also takes two additional parameters. Default disabled
-- `--disable-straggler-on-startup` - whether to keept the StragglerDetector disabled on startup and enable later. Default enabled
+- `--disable-straggler-on-startup` - whether to keep the StragglerDetector disabled on startup and enable later. Default enabled
 - `--straggler-ctrlr-port` - The StragglerDetector can toggle between on/off just by sending `curl Rank0Host:port`. Default port is 65535. Every time it is turned 
 - `--straggler-minmax-count` - If set to > 1 (N), it prints N Top and Bottom Etpt/Rank pairs as shown below
 ```
@@ -67,7 +67,7 @@ The StragglerDetector class supports context, and its implementation is a Single
 - To Capture time
 
 ```
- # whereever timing need to be captured
+ # wherever timing need to be captured
  with stimer:
      do_operation()
 

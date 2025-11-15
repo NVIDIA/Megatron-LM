@@ -5,4 +5,4 @@ The data is loaded from the below HF dataset and most of the evaluation code (in
 
 https://huggingface.co/datasets/Jiayi-Pan/Countdown-Tasks-3to4
 
-It is an example of a `megatron.rl.agent.reward_only_agent` so many tasks that have only a reward calcuation can use this as a prototype.
+It is an example of a `megatron.rl.agent.reward_only_agent` so many tasks that have only a reward calculation can use this as a prototype.

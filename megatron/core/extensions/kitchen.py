@@ -706,7 +706,7 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None
     ):
         """
-        prefix should be module_name to make keys identical to sequetial ones.
+        prefix should be module_name to make keys identical to sequential ones.
         """
         assert self.init_finished
         sharded_state_dict = {}

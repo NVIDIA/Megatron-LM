@@ -203,7 +203,7 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
         any parallelism or only tensor parallelism.
 
         Args:
-            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt
                 model [tokens, position ids, attention mask]
 
         Returns:

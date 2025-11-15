@@ -90,13 +90,13 @@ class TRTLLMLayers(Enum):
         map the original layer name to equivalent trtllm layer name and add layer number back.
         CPU Conversion will pass in model state dict without layer numbers
         (i.e decoder.layers.mlp.linear_fc1.weight of shape [num_layers, hidden_dim, 4 * hidden_dim]) .
-        GPU conversion will pass model state dict with each layer seperated
+        GPU conversion will pass model state dict with each layer separated
         (i.e decoder.layers.2.mlp.linear_fc1.weight of shape [hidden_dim, 4 * hidden_dim]).
 
         Args:
             model_state_dict (dict): The original model state dict
             trtllm_conversion_dict (dict): The conversion dictionary mapping input model layer names to trtllm layer names
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use representation 2 set this to True. Defaults to True
 
         Raises:
             ValueError: In case the keys dont match to trtllm keys or if all model layers are not mapped to equivalent trtllm keys
@@ -144,7 +144,7 @@ class TRTLLMLayers(Enum):
 
 
 # These layers are not associated within the transformer block.
-# So they dont have a layer number (i.e independant of number of layers in the model)
+# So they dont have a layer number (i.e independent of number of layers in the model)
 NON_TRANSFORMER_LAYERS_NAMES = [
     TRTLLMLayers.vocab_embedding.value,
     TRTLLMLayers.position_embedding.value,

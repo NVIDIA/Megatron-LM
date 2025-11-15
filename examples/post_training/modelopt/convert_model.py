@@ -34,7 +34,7 @@ ALGO_TO_CONFIG = {
 
 
 def add_convert_args(parser):
-    """Add additional arguments for ModelOpt checkpoint convertion."""
+    """Add additional arguments for ModelOpt checkpoint conversion."""
     group = parser.add_argument_group(title='ModelOpt MCore checkpoint convertion')
     group.add_argument(
         "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"

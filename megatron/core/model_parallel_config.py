@@ -88,7 +88,7 @@ class ModelParallelConfig:
     """If true, train with bf16 mixed precision training."""
 
     params_dtype: torch.dtype = torch.float32
-    """dtype used when intializing the weights."""
+    """dtype used when initializing the weights."""
 
     timers: Optional[Callable] = None
     """Timers object to call for various timing functions. See megatron.core.timers.Timers"""

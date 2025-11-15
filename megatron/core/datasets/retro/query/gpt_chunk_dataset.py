@@ -55,7 +55,7 @@ class GPTChunkDataset(torch.utils.data.Dataset):
             idx (int): Sample index.
 
         Returns:
-            A sample, which contains both the chunk-length token sample ('text') along with all document_ids ('doc_ids') contained withing the full `sequence_length` sample.
+            A sample, which contains both the chunk-length token sample ('text') along with all document_ids ('doc_ids') contained within the full `sequence_length` sample.
         """
 
         # Convert global chunk index to global sample index & local chunk index.

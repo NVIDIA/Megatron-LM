@@ -125,7 +125,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """
         Backward implementation for the cross entropy loss.
         """
-        # Retreive tensors from the forward path.
+        # Retrieve tensors from the forward path.
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
 
         grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)

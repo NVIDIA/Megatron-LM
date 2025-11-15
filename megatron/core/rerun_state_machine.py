@@ -517,7 +517,7 @@ class RerunStateMachine:
         # Handle the stats reporting mode. In that mode, we rerun every iteration once to collect
         # stats about any non-determinism in the calculations (as a relative difference between the
         # calculations in the initial run and in the re-run). The only assumption here is that the
-        # control flow is deterministic (so that the results corresponding to the nth invokation of
+        # control flow is deterministic (so that the results corresponding to the nth invocation of
         # validate_result() can be compared).
 
         if self.mode == RerunMode.REPORT_DETERMINISM_STATS:

@@ -60,7 +60,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
     This class parallelizes both 1) encoding vectors, and 2) adding codes to the
     index. This class is more performant than naive use of Faiss, because most
     of the computational work is in encoding the vectors, which is an
-    embarassingly parallel operation.
+    embarrassingly parallel operation.
     """
 
     def encode_block(

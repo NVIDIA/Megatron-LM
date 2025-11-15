@@ -423,7 +423,7 @@ def get_batch(data_iterator):
     labels = tokens_[:, 1 : 1 + args.seq_length].contiguous()
     answer_only_loss_mask = data_b["loss_mask"][:, 1 : 1 + args.seq_length].contiguous()
 
-    # Get the masks and postition ids.
+    # Get the masks and position ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens, get_eos_id(), get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss, False
     )

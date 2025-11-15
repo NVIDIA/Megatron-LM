@@ -248,7 +248,7 @@ class Timers:
         # the timers class, just ignore it and return a dummy timer.
         if log_level > self._log_level:
             return self._dummy_timer
-        # Otherwise, initalize the timer and set the level.
+        # Otherwise, initialize the timer and set the level.
         self._timers[name] = Timer(name)
         self._log_levels[name] = log_level
         return self._timers[name]
@@ -264,7 +264,7 @@ class Timers:
         Args:
             names (List[str]): list of timer names
             reset (bool): reset the timer after recording the elapsed time
-            barrier (bool): if set, do a global barrier before time measurments
+            barrier (bool): if set, do a global barrier before time measurements
 
         Returns:
             torch.tensor: Tensor of size [world_size, len(names)] with times in float.
@@ -370,7 +370,7 @@ class Timers:
             normalizer (float, optional): Normalizes the timer values by the factor.
                                           Defaults to 1.0.
             reset (bool, optional): Whether to reset timer values after logging. Defaults to True.
-            barrier (bool, optional): Whether to do a global barrier before time measurments.
+            barrier (bool, optional): Whether to do a global barrier before time measurements.
                                       Defaults to False.
 
         Raises:
@@ -418,7 +418,7 @@ class Timers:
             normalizer (float, optional): Normalizes the timer values by the factor.
                                           Defaults to 1.0.
             reset (bool, optional): Whether to reset timer values after logging. Defaults to True.
-            barrier (bool, optional): Whether to do a global barrier before time measurments.
+            barrier (bool, optional): Whether to do a global barrier before time measurements.
                                       Defaults to False.
         """
 
@@ -448,12 +448,12 @@ class Timers:
             normalizer (float, optional): Normalizes the timer values by the factor.
                                           Defaults to 1.0.
             reset (bool, optional): Whether to reset timer values after logging. Defaults to True.
-            barrier (bool, optional): Whether to do a global barrier before time measurments.
+            barrier (bool, optional): Whether to do a global barrier before time measurements.
                                       Defaults to False.
         """
         # currently when using add_scalars,
         # torch.utils.add_scalars makes each timer its own run, which
-        # polutes the runs list, so we just add each as a scalar
+        # pollutes the runs list, so we just add each as a scalar
         assert normalizer > 0.0
         name_to_min_max_time = self._get_global_min_max_time(names, reset, barrier, normalizer)
         if writer is not None:

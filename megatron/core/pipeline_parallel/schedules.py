@@ -316,7 +316,7 @@ def forward_step(
 
                 1. The output object from the forward step. This output object needs to be a
                     tensor or some kind of collection of tensors. The only hard requirement
-                    for this object is that it needs to be acceptible as input into the second
+                    for this object is that it needs to be acceptable as input into the second
                     function.
                 2. A function to reduce (optionally) the output from the forward step. This
                     could be a reduction over the loss from the model, it could be a function that

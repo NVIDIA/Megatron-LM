@@ -19,9 +19,9 @@ to achieve the the highest tokens-per-second-per-user (or TPS) without changing 
 the model. We provide quantization-aware training (QAT) receipt with self-distillation in the following.
 
 
-### Model Convertion
+### Model Conversion
 
-To ensure no quality degredation, base model is frozen and the draft model is attached as a
+To ensure no quality degradation, base model is frozen and the draft model is attached as a
 transformation. For Medusa, set `--export-algorithm medusa` and provide `--export-num-medusa-heads`.
 For EAGLE, set `--export-algorithm eagle` and provide `--export-eagle-algorithm`.
 the resulting model stored in `${MLM_MODEL_SAVE}` will have randomly initialized draft model weights.

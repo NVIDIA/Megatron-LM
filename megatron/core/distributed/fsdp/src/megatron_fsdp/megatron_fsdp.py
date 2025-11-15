@@ -63,7 +63,7 @@ class TrainingState(Enum):
     PRE_BACKWARD = auto()
     # After backward computation, where gradients should be re-sharded
     POST_BACKWARD = auto()
-    # Before and after module forward computaton or before pre-backward and
+    # Before and after module forward computation or before pre-backward and
     # after post-backward states, where no un/sharding activity happens
     IDLE = auto()
 

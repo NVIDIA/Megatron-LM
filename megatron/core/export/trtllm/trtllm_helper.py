@@ -68,7 +68,7 @@ class TRTLLMHelper:
             model_type (ModelType): The type of the input model. Enum (megatron.core.export.model_type.ModelType)
             trtllm_conversion_dict (dict, optional): A conversion dictionary that will map your model layer names to trtllm equivalent layer names. Default dictionary is given megatron/core/export/model_to_trtllm_mapping. This dict is merged into the default dict. NOTE: Ignore layer numbers in the model layer names. (e.g) decoder.layers.0.attention_qkv.weight will be decoder.layers.attention_qkv.weight in the mapping dictionary. Defaults to {}.
             position_embedding_type (str, optional): The position embedding type. Defaults to None.
-            max_position_embeddings (int, optional): Max posistion embeddings value. Defaults to None.
+            max_position_embeddings (int, optional): Max position embeddings value. Defaults to None.
             rotary_percentage (int, optional): The rotary percentage if using rope embedding. Defaults to 1.0.
             rotary_base (int, optional): The rotary base (theta value) if using rope embeddings. Defaults to 10000.
             moe_tp_mode (int, optional): TRTLLM Config. Defaults to 2.
@@ -288,7 +288,7 @@ class TRTLLMHelper:
             on_device_distributed_conversion (bool, optional): Convert on gpus in distributed setting. This assumes that the model state dict is sharded according to required inference model parallelism and that each gpu gets its part of the model state dict . Defaults to False.
             vocab_size (int, optional): The vocabulary size. Defaults to None.
             gpus_per_node (int, optional): The number of gpus per node. Used for on device conversion.
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use representation 2 set this to True. Defaults to True
 
         Returns:
             Two lists . First list of trtllm converted model weights(Either on device, or a list of weights for each gpu) and the trtllm_model_configs.
@@ -468,7 +468,7 @@ class TRTLLMHelper:
             model_state_dict (dict): The model state dictionary (All collected on cpu)
             dtype (DataType): The data type or model precision
             gpus_per_node (int, optional): Number of gpus per node
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use representation 2 set this to True. Defaults to True
             scales (dict): Dictionary with fp8 scaling factors
             fp8_quantized (bool): True for fp8 checkpoint export
             fp8_kvcache (bool): True for fp8 KV-cache quantization
@@ -579,7 +579,7 @@ class TRTLLMHelper:
             max_seq_len (int, optional): Max seq length. Defaults to None.
             opt_num_tokens (int, optional): Opt number of tokens. Defaults to None.
             max_beam_width (int, optional): Max beam width. Defaults to 1.
-            tokens_per_block (int, optional): Nmber of tokens per block. Defaults to 128.
+            tokens_per_block (int, optional): Number of tokens per block. Defaults to 128.
             multiple_profiles (bool, optional): Use multiple profiles. Defaults to False.
             gpt_attention_plugin (str, optional): Gpt attention plugin to use. Defaults to "auto".
             gemm_plugin (str, optional): Gemma plugin to use. Defaults to "auto".

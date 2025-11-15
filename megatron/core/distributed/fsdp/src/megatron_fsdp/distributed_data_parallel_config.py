@@ -97,7 +97,7 @@ class DistributedDataParallelConfig:
       This flag enables SM efficient nccl algorithm that could improve the performance
       of FSDP and DP with comm_overlap. This flag will be much more effective when used
       together with sharp. 
-      The follwoing will be the expected number of SM usage for various cases.
+      The following will be the expected number of SM usage for various cases.
       (Note that this is just a reference number and the number of SM usage could vary 
       on message size, communication domain size and nccl version.)
       ----------------------------------------------------------
