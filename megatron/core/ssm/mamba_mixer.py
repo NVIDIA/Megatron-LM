@@ -289,7 +289,7 @@ class MambaMixer(MegatronModule):
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
 
-            if self.conv_init is not None:
+            if self.config.perform_initialization and self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
         self.activation = "silu"
@@ -322,7 +322,9 @@ class MambaMixer(MegatronModule):
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
             A = torch.empty(
                 self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-            ).uniform_(*A_init_range)
+            )
+            if self.config.perform_initialization:
+                A = A.uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
             self.A_log._no_weight_decay = True
