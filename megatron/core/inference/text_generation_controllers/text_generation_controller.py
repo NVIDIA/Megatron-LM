@@ -103,6 +103,7 @@ class TextGenerationController:
         self.termination_id_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
         self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
+        self.top_n_logprobs_cuda = torch.empty(max_requests, dtype=torch.int32, device=device)
 
         # Used for inefficient torch sampling.
         self.torch_sampling_buckets: List[Tensor] = []
@@ -624,6 +625,9 @@ class TextGenerationController:
         self.skip_prompt_log_probs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["skip_prompt_log_probs"]
         ].to(dtype=torch.bool, copy=True, non_blocking=True)
+        self.top_n_logprobs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["top_n_logprobs"]
+        ].to(dtype=torch.int32, copy=True, non_blocking=True)
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
@@ -708,6 +712,16 @@ class TextGenerationController:
 
         return self.return_log_probs_cuda[:active_request_count].any()
 
+    def _dynamic_step_top_n_logprobs_bookkeeping(self) -> bool:
+        """Perform bookkeeping necessary to compute top-n log probs for dynamic batching."""
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # Check if any request has top_n_logprobs > 0
+        return (self.top_n_logprobs_cuda[:active_request_count] > 0).any()
+
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
@@ -721,6 +735,54 @@ class TextGenerationController:
             only_last_token_logits=materialize_only_last_token_logits,
         )
         return ret
+
+    def _dynamic_step_calculate_top_n_logprobs(self, logits: Tensor) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+        """Calculate top-n log probs from logits for dynamic batching.
+        
+        Returns:
+            A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
+            Each tuple in the list represents one token position.
+        """
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # Get logits - handle both decode (last token only) and prefill (all tokens) modes
+        if materialize_only_last_token_logits:
+            # Decode mode: only last token logits
+            # Shape: [1, active_request_count, vocab_size] -> [active_request_count, vocab_size]
+            last_token_logits = logits.squeeze(0)
+            # Compute log probabilities
+            log_probs = torch.nn.functional.log_softmax(last_token_logits, dim=-1).to(torch.float32)
+            
+            # For each request, get top-n logprobs based on its top_n_logprobs value
+            top_n_results = {}
+            for req_idx in range(active_request_count):
+                top_n = int(self.top_n_logprobs_cuda[req_idx].item())
+                if top_n > 0:
+                    # Get top-n logprobs and indices for this request (single token)
+                    top_n_logits = torch.topk(log_probs[req_idx], k=min(top_n, log_probs.size(-1)))
+                    top_n_results[req_idx] = [(top_n_logits.values, top_n_logits.indices)]
+        else:
+            # Prefill/non-decode mode: all tokens
+            # Shape: [1, num_tokens, vocab_size]
+            # Need to extract per-request logits using last_token_logits helper
+            last_token_logits = context.last_token_logits(logits)  # Shape: [active_request_count, vocab_size]
+            
+            # Compute log probabilities for last tokens
+            log_probs = torch.nn.functional.log_softmax(last_token_logits, dim=-1).to(torch.float32)
+            
+            # For each request, get top-n logprobs
+            top_n_results = {}
+            for req_idx in range(active_request_count):
+                top_n = int(self.top_n_logprobs_cuda[req_idx].item())
+                if top_n > 0:
+                    # Get top-n logprobs and indices for this request
+                    top_n_logits = torch.topk(log_probs[req_idx], k=min(top_n, log_probs.size(-1)))
+                    top_n_results[req_idx] = [(top_n_logits.values, top_n_logits.indices)]
+
+        return top_n_results if top_n_results else None
 
     def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -819,6 +881,12 @@ class TextGenerationController:
         else:
             log_probs = None
 
+        return_top_n_logprobs = self._dynamic_step_top_n_logprobs_bookkeeping()
+        if return_top_n_logprobs:
+            top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(logits)
+        else:
+            top_n_logprobs = None
+
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
@@ -827,6 +895,7 @@ class TextGenerationController:
         ret = {
             "sample": new_sample,
             "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookkeeping)

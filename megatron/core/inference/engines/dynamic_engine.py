@@ -542,6 +542,7 @@ class DynamicInferenceEngine(AbstractEngine):
         step_time: float,
         sample: torch.Tensor,
         log_probs: torch.Tensor,
+        top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -552,6 +553,8 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
+            top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to 
+                list of (top_n_logprobs, top_n_indices) tuples.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -563,9 +566,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
-        for request_id, token, request_log_probs in zip(
+        for req_idx, (request_id, token, request_log_probs) in enumerate(zip(
             request_ids.tolist(), sample.tolist(), log_probs_iter
-        ):
+        )):
             request: DynamicInferenceRequest = self.requests[request_id]
             if request_id != self.context.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
@@ -596,6 +599,25 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_log_probs.extend(request_log_probs)
                         else:
                             request.generated_log_probs.extend(request_log_probs)
+
+                # Process top_n_logprobs if available
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    top_n_data_list = top_n_logprobs[req_idx]
+                    for top_n_values, top_n_indices in top_n_data_list:
+                        # Convert to dictionary format: {token_str: logprob}
+                        logit_dict = {}
+                        for logprob, logprob_index in zip(top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()):
+                            key = self.controller.tokenizer.detokenize([logprob_index])
+                            logit_dict[key] = logprob
+                        
+                        # Initialize lists if they don't exist
+                        if not hasattr(request, 'prompt_top_n_logprobs') or request.prompt_top_n_logprobs is None:
+                            request.prompt_top_n_logprobs = []
+                        if not hasattr(request, 'generated_top_n_logprobs') or request.generated_top_n_logprobs is None:
+                            request.generated_top_n_logprobs = []
+                        
+                        # Append to generated_top_n_logprobs (we're in decode mode for dynamic inference)
+                        request.generated_top_n_logprobs.append(logit_dict)
 
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
@@ -630,7 +652,25 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_log_probs = []
                         request.prompt_log_probs.extend(request_log_probs)
                         request.generated_log_probs = []
-                    active_requests.append(request)
+                
+                # Process top_n_logprobs for chunked prefill if available
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    top_n_data_list = top_n_logprobs[req_idx]
+                    for top_n_values, top_n_indices in top_n_data_list:
+                        # Convert to dictionary format: {token_str: logprob}
+                        logit_dict = {}
+                        for logprob, logprob_index in zip(top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()):
+                            key = self.controller.tokenizer.detokenize([logprob_index])
+                            logit_dict[key] = logprob
+                        
+                        # Initialize lists if they don't exist
+                        if not hasattr(request, 'prompt_top_n_logprobs') or request.prompt_top_n_logprobs is None:
+                            request.prompt_top_n_logprobs = []
+                        
+                        # For chunked prefill, append to prompt_top_n_logprobs
+                        request.prompt_top_n_logprobs.append(logit_dict)
+                
+                active_requests.append(request)
 
         return active_requests, finished_requests
 
@@ -767,6 +807,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids = result["finished_request_ids"]
             sample = result["sample"]
             log_probs = result["log_probs"]
+            top_n_logprobs = result.get("top_n_logprobs", None)
             cuda_graph_request_count = result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -779,7 +820,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Add finished events.
             (active_requests, finished_requests) = self.post_process_requests(
-                active_request_ids, finished_request_ids, step_time, sample, log_probs
+                active_request_ids, finished_request_ids, step_time, sample, log_probs, top_n_logprobs
             )
 
         else:
