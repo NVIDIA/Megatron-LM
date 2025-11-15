@@ -17,7 +17,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.utils import get_asyncio_loop
+from megatron.core.utils import get_asyncio_loop, get_mamba_inference_metadata_from_model
 
 try:
     from tqdm import tqdm
@@ -93,6 +93,10 @@ class StaticInferenceEngine(AbstractEngine):
         # Store original context in case we need to fall back to legacy static engine
         original_context = text_generation_controller.inference_wrapped_model.inference_context
 
+        mamba_inference_metadata = get_mamba_inference_metadata(
+            text_generation_controller.inference_wrapped_model.model
+        )
+
         try:
             if not legacy:
                 dynamic_context = DynamicInferenceContext.from_config(
@@ -101,6 +105,7 @@ class StaticInferenceEngine(AbstractEngine):
                     max_batch_size=max_batch_size,
                     active_buffer_size_gb=buffer_size_gb,
                     num_cuda_graphs=1,
+                    mamba_inference_metadata=mamba_inference_metadata,
                 )
                 self.controller.inference_wrapped_model.inference_context = dynamic_context
                 self.controller.inference_wrapped_model.prep_model_for_inference()

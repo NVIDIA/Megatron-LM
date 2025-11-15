@@ -24,7 +24,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_mamba_inference_metadata_from_model, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -106,7 +106,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     if args.enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
-    module = model.module.module if hasattr(model.module, "module") else model.module
+    mamba_inference_metadata = get_mamba_inference_metadata_from_model(model)
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -127,13 +127,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
         unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
-        is_hybrid_model=args.is_hybrid_model,
-        layer_type_list=module.decoder.layer_type_list if args.is_hybrid_model else None,
-        mamba_head_dim=args.mamba_head_dim,
-        mamba_num_groups=args.mamba_num_groups,
-        mamba_d_model=args.hidden_size,
-        mamba_d_conv=4 if args.is_hybrid_model else None,
-        mamba_d_state=args.mamba_state_dim,
+        mamba_inference_metadata=mamba_inference_metadata,
         metrics_writer=metrics_writer,
     )
 
