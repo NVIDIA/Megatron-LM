@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import typing
 from typing import Any, Optional
 from argparse import ArgumentParser, _ArgumentGroup
@@ -94,8 +95,14 @@ class ArgumentGroupFactory:
         argparse_kwargs = {}
         argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["default"] = attribute.default
         argparse_kwargs["help"] = self.field_docstrings[attribute.name]
+
+        # dataclasses specifies that both should not be set
+        if isinstance(attribute.default, type(dataclasses.MISSING)):
+            # dataclasses specified default_factory must be a zero-argument callable
+            argparse_kwargs["default"] = attribute.default_factory()
+        else:
+            argparse_kwargs["default"] = attribute.default
 
         argparse_kwargs.update(self._extract_type(attribute.type))
 
