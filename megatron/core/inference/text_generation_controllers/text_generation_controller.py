@@ -782,6 +782,7 @@ class TextGenerationController:
                 finished_request_ids (Tensor): Finished request IDs.
                 sample (Tensor): New sample.
                 log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                top_n_logprobs_dict (Optional[Dict]): Top n log probabilities for each request, if requested.
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
