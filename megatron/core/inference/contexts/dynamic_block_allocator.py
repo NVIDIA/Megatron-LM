@@ -21,11 +21,11 @@ class BlockAllocator:
             space for paused requests that live on the CPU.
     """
 
-    def __init__(self, context: "DynamicInferenceContext", active_count: int):
+    def __init__(self, context: "DynamicInferenceContext", total_count: int):
 
         self.context = context
 
-        active_count -= 1  # -1 for dummy_block_idx (see below)
+        active_count = (total_count - 1) // 2  # -1 for dummy_block_idx (see below)
         active_count = max(1, active_count)  # need at least one block
         self.total_count = 2 * active_count + 1  # +1 for dummy_block_idx
         self.total_avail = self.total_count - 1  # -1 for dummy_block_idx

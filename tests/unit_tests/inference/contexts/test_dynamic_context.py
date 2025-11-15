@@ -41,7 +41,7 @@ class TestDynamicContext:
         kv_channels,
         num_attention_heads,
         max_sequence_length,
-        active_buffer_size_gb,
+        buffer_size_gb,
         block_size_tokens,
         max_tokens,
         is_hybrid_model=False,
@@ -61,7 +61,7 @@ class TestDynamicContext:
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
             use_cuda_graphs_for_non_decode_steps=not is_hybrid_model,
-            active_buffer_size_gb=active_buffer_size_gb,
+            buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
             layer_type_list=layer_type_list,
@@ -86,7 +86,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -121,7 +121,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
         )
@@ -137,7 +137,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -161,7 +161,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
-            active_buffer_size_gb=0.01,
+            buffer_size_gb=0.01,
             block_size_tokens=32,
             max_tokens=None,
             rounder=1,
@@ -191,7 +191,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
-            active_buffer_size_gb=0.1,
+            buffer_size_gb=0.1,
             block_size_tokens=128,
             max_tokens=200,  # setting low, but >= context.max_active_requests.
             rounder=1,
@@ -220,7 +220,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
-            active_buffer_size_gb=1.0,
+            buffer_size_gb=1.0,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -293,7 +293,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -342,7 +342,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -415,7 +415,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -459,7 +459,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -618,7 +618,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -690,7 +690,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -763,7 +763,7 @@ class TestDynamicContext:
                 kv_channels=8,
                 num_attention_heads=2,
                 max_sequence_length=512,
-                active_buffer_size_gb=0.03,
+                buffer_size_gb=0.03,
                 block_size_tokens=128,
                 max_tokens=None,
                 is_hybrid_model=False,
@@ -778,7 +778,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
@@ -834,7 +834,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
-            active_buffer_size_gb=0.03,
+            buffer_size_gb=0.03,
             block_size_tokens=128,
             max_tokens=None,
         )
@@ -1061,8 +1061,8 @@ class TestDynamicContext:
         gpu_size_gb = (
             torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
         )
-        active_buffer_size_gb = 20
-        num_contexts = math.ceil(gpu_size_gb / active_buffer_size_gb) + 1
+        buffer_size_gb = 20
+        num_contexts = math.ceil(gpu_size_gb / buffer_size_gb) + 1
 
         # Allocate enough contexts to fill GPU memory.
         def init_contexts(*, unified_memory_level):
@@ -1075,7 +1075,7 @@ class TestDynamicContext:
                         kv_channels=16,
                         num_attention_heads=4,
                         max_sequence_length=512,
-                        active_buffer_size_gb=active_buffer_size_gb,
+                        buffer_size_gb=buffer_size_gb,
                         unified_memory_level=unified_memory_level,
                     )
                 )
