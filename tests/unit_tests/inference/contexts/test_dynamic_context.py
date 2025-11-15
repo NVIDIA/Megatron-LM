@@ -28,6 +28,8 @@ class TestDynamicContext:
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
 
+        self.pp_size = pipeline_parallel_size
+
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
@@ -55,7 +57,7 @@ class TestDynamicContext:
 
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
-            num_layers=num_layers,
+            num_layers=num_layers // self.pp_size,
             kv_channels=kv_channels,
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,

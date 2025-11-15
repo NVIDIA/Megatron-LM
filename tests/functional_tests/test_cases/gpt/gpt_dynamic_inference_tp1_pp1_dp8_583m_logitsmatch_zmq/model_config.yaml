@@ -23,6 +23,7 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --log-interval: 1
   --transformer-impl: inference_optimized
+  --sequence-parallel: true
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
   --deterministic-mode: true

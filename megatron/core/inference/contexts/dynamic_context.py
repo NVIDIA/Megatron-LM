@@ -217,7 +217,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     Args:
         params_dtype (torch.dtype): Dtype used for KV cache.
-        num_layers (int): Number of layers.
+        num_layers (int): Number of layers on this pipeline parallel rank.
         kv_channels (int): Hidden dimension per attention head.
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
@@ -799,6 +799,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             to blocks within the block-level memory buffer.
         """
         attention_layer_number = self.layer_map[layer_number - 1]
+
         if self.cache_mla_latent:
             return (
                 self.memory_buffer[attention_layer_number],
