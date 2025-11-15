@@ -12,7 +12,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.ssm.mamba_hybrid_layer_allocation import MambaInferenceMetadata
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -50,8 +50,16 @@ class TestDynamicContext:
     ):
         set_rounder(rounder)
 
-        if is_hybrid_model and layer_type_list is None:
-            layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+        if is_hybrid_model:
+            if layer_type_list is None:
+                layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+            mamba_conv_states_shape = (544, 4)
+            mamba_ssm_states_shape = (8, 64, 16)
+            mamba_inference_metadata = MambaInferenceMetadata(
+                layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+            )
+        else:
+            mamba_inference_metadata = None
 
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
@@ -64,9 +72,7 @@ class TestDynamicContext:
             active_buffer_size_gb=active_buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=(544, 4),
-            mamba_ssm_states_shape=(8, 64, 16),
+            mamba_inference_metadata=mamba_inference_metadata,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
         )

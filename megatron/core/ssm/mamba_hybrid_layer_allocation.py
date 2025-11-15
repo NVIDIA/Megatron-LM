@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 if __name__ != "__main__":
@@ -20,6 +21,23 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MambaInferenceMetadata:
+    """Metadata required for Mamba model inference."""
+
+    layer_type_list: List[str]
+    """
+    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    """
+
+    mamba_conv_states_shape: Tuple[int]
+    """Mamba conv states shape per request."""
+
+    mamba_ssm_states_shape: Tuple[int]
+    """Mamba ssm states shape per request."""
 
 
 class Symbols:
