@@ -1,53 +1,48 @@
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/models/gpt/ @NVIDIA/gpt
+megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
-megatron/core/models/multimodal/ @NVIDIA/multi-modal
+megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
 
-megatron/core/models/mamba/ @NVIDIA/hybrid-mamba
-megatron/core/ssm/ @NVIDIA/hybrid-mamba
+megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
+megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
 
-megatron/core/datasets/ @NVIDIA/datasets
+megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
-megatron/core/distributed/fsdp/ @NVIDIA/megatron-fsdp
+megatron/core/distributed/fsdp/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
-megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/megatron-fsdp
+megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
-megatron/core/dist_checkpointing/ @NVIDIA/dist-checkpointing
+megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
-megatron/core/optimizer/distrib_optimizer/ @NVIDIA/dist-optimizer
+megatron/core/optimizer/distrib_optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
 
-megatron/core/inference/modelopt_support @NVIDIA/quantization-and-inference
+megatron/core/inference/modelopt_support @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/quantization-and-inference
 
-megatron/core/datasets/ @NVIDIA/datasets
+megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
-megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
+megatron/core/pipeline_parallel/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/pipeline-parallelism
 
 megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/transformer/moe/ @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
+megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
 
-megatron/core/inference/ @NVIDIA/inference
+megatron/core/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference
 
-megatron/core/parallel_state.py @NVIDIA/core-nemo
+megatron/core/parallel_state.py @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/post_training/ @NVIDIA/post-training
+megatron/core/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
 
-megatron/post_training/ @NVIDIA/post-training
+megatron/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
 
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
 .gitlab-ci.yml @NVIDIA/ci
 docker/  @NVIDIA/ci
-tests/unit_tests/run_ci_test.sh @NVIDIA/ci
-tests/test_utils/python_scripts/ 
 tests/functional_tests/python_test_utils/ @NVIDIA/ci
 tests/functional_tests/shell_test_utils/ @NVIDIA/ci
-megatron/core/transformer/transformer_block.py @NVIDIA/ci
-megatron/core/transformer/transformer_layer.py @NVIDIA/ci
-tests/functional_tests/test_cases/ @NVIDIA/ci
-tests/functional_tests/recipes/ @NVIDIA/ci
-tests/unit_tests/ @NVIDIA/ci
+tests/test_utils/recipes/ @NVIDIA/ci
+tests/unit_tests/run_ci_test.sh @NVIDIA/ci
 
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
