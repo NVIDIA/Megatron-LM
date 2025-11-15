@@ -9,9 +9,10 @@ class Headers(Enum):
     """
 
     CONNECT = 0
-    ACK = 1
+    CONNECT_ACK = 1
     SUBMIT_REQUEST = 2
     ENGINE_REPLY = 3
     PAUSE = 4
-    UNPAUSE = 5
-    STOP = 6
+    PAUSE_ACK = 5
+    UNPAUSE = 6
+    STOP = 7
