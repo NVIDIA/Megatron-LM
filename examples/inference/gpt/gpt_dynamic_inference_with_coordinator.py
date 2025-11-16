@@ -90,6 +90,7 @@ async def main(
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
 
+
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
@@ -153,9 +154,6 @@ if __name__ == "__main__":
             num_tokens_to_generate=args.num_tokens_to_generate,
             termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         )
-
-        if args.prompts and not args.prompt_file:
-            args.prompts = args.prompts * args.inference_repeat_n
 
         # Requests, context, conroller.
         model = get_model()

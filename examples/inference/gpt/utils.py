@@ -61,19 +61,16 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'be uniformly sampled within this range.',
     )
     group.add_argument(
-        "--num-tokens-to-generate-random",
-        nargs="+",
-        action=SplitArgs,
-        default=None,
-        help='Number of tokens to generate for each prompt. This can be a '
-        'space-separated pair of integers, and the generated output lengths will '
-        'be uniformly sampled within this range.',
-    )
-    group.add_argument(
         "--num-tokens-to-generate",
         type=int,
         default=30,
         help='Number of tokens to generate for each prompt',
+    )
+    group.add_argument(
+        "--num-tokens-from-file",
+        action='store_true',
+        default=False,
+        help='Use per-prompt num_tokens_to_generate from prompt file',
     )
     group.add_argument(
         "--top-n-logprobs",
@@ -324,9 +321,11 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
+    num_tokens_to_generate = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
             prompts.append(json.loads(line)["text"])
+            num_tokens_to_generate.append(json.loads(line)["chatgpt_output_token_length"])
             if len(prompts) == args.prompt_file_num_truncate:
                 break
 
@@ -338,10 +337,20 @@ def get_requests_from_file(
         len(prompts),
     )
 
+    # Update sampling params with per-prompt values.
+    sampling_params_list = []
+    if args.num_tokens_from_file:
+        if sampling_params is None:
+            sampling_params = get_default_sampling_params(tokenizer.eod)
+        for i in range(len(prompts)):
+            sp = copy.deepcopy(sampling_params)
+            sp.num_tokens_to_generate = num_tokens_to_generate[i]
+            sampling_params_list.append(sp)
+
     # Init requests.
     requests = [
-        Request(p, t, tokenizer, sampling_params)
-        for p, t in tqdm(zip(prompts, time_offsets), "init requests", total=len(prompts))
+        Request(p, t, tokenizer, sp)
+        for p, t, sp in tqdm(zip(prompts, time_offsets, sampling_params_list), "init requests", total=len(prompts))
     ]
 
     return requests
