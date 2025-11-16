@@ -1768,6 +1768,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
 
+    # Patch checkpoint as needed if required field is not found.
+    if optimizer is not None:
+        log_printed = False
+        for param_group in optimizer.param_groups:
+            if 'default_config' not in param_group:
+                param_group['default_config'] = True
+                if not log_printed:
+                    print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
+                log_printed = True
+
     return iteration, num_floating_point_operations_so_far
 
 
