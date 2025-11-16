@@ -228,6 +228,13 @@ test:linting_docs_build:
     - mv megatron-lm/ documentation/
     - cd documentation/
     - ./repo docs
+  rules:
+    - if: $PUBLISH == "yes"
+      when: never
+    - if: $BUILD == "no"
+      when: never
+    - when: on_success
+      allow_failure: true
 
 # Override from template
 secret_detection:

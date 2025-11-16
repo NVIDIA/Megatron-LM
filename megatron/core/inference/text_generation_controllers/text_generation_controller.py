@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import concurrent
@@ -19,8 +19,15 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.contexts.dynamic_context import (
+    MaxSequenceLengthOverflowError,
+    WarmupEngineMode,
+)
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    InferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
@@ -70,6 +77,35 @@ class TextGenerationController:
         model_config = get_model_config(self.inference_wrapped_model.model)
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
+
+        if self.inference_wrapped_model.inference_context.is_dynamic_batching():
+            self._init_dynamic_sampling_tensors()
+
+    def _init_dynamic_sampling_tensors(self):
+        """Initialize tensors needed for dynamic sampling."""
+        context = self.inference_wrapped_model.inference_context
+        max_requests = context.max_total_requests
+
+        device = torch.cuda.current_device()
+        logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
+        # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+
+        # Initialize bookkeeping tensors.
+        self.sampling_logits_cuda = torch.empty(
+            max_requests, vocab_size, dtype=logits_dtype, device=device
+        )
+        self.sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+
+        self.temperature_cuda = torch.empty_like(self.sampled_tokens_cuda, dtype=torch.float)
+        self.top_k_cuda = torch.empty_like(self.sampled_tokens_cuda, dtype=torch.int32)
+        self.top_p_cuda = torch.empty_like(self.sampled_tokens_cuda, dtype=torch.float)
+        self.termination_id_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
+        self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
+
+        # Used for inefficient torch sampling.
+        self.torch_sampling_buckets: List[Tensor] = []
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -174,6 +210,91 @@ class TextGenerationController:
 
         return text, prompts_plus_generations_segments
 
+    def _torch_sampling_func(
+        self,
+        last_token_logits: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        vocab_size: Optional[int] = None,
+    ):
+        """Samples the logits to generate outputs
+
+        Given the logits of the last token, this function samples it
+        according to the parameters defined in sampling_params
+        and returns the samples. If sampling parameters top_n_logprobs > 0
+        at each step it also updates the top_n_logprobs dict.
+
+        Args:
+            last_token_logits (torch.Tensor): The last token logits. A tensor of
+                size [batch_size, vocab_size].
+            temperature (float): The temperature to use for sampling.
+            top_k (int): The top-k value to use for sampling.
+            top_p (float): The top-p value to use for sampling.
+            vocab_size (int): Obtained from the tokenizer. Defaults to None.
+
+        Returns:
+            sampled_logits (torch.Tensor): 1D tensor with [batch_size] elements
+        """
+        assert isinstance(top_p, float)
+        assert isinstance(top_k, int)
+        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
+        assert top_p <= 1.0, "top-p should be in (0,1]"
+
+        def modify_logits_for_top_k_filtering(logits, top_k):
+            """Set the logits for none top-k values to -inf."""
+            filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits.masked_fill_(filter_, float("-Inf"))
+
+        def modify_logits_for_top_p_filtering(logits, top_p):
+            """Set the logits for none top-p values to -inf."""
+            # First sort and calculate cumulative sum of probabilities.
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+            # Filteration based on the cumulative sum.
+            filter_ = cumulative_probs > top_p
+            # This shift by 1 is weird and I cannot justify it. This existed
+            # in the original implementation:
+            #   https://github.com/ari-holtzman/degen/blob/master/gen.py
+            # and I guess it is needed so keeping it for now.
+            filter_[:, 1:] = filter_[:, :-1].clone()
+            # Make sure we at least have one token to select from.
+            filter_[..., 0] = 0
+
+            # Fill in the filtered part
+            filter_ = filter_.scatter(1, sorted_indices, filter_)
+            logits.masked_fill_(filter_, float("-Inf"))
+
+        # Greedy sampling
+        if top_k == 1:
+            sampled_logits = torch.argmax(last_token_logits, dim=-1)
+        else:
+            last_token_logits = last_token_logits.clone()
+            if temperature != 1.0:
+                last_token_logits.div_(temperature)
+            if top_k > 1:
+                assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
+                if vocab_size:
+                    assert top_k < vocab_size, "top-k is larger than vocab size."
+                modify_logits_for_top_k_filtering(last_token_logits, top_k)
+
+            elif top_p > 0.0:
+                modify_logits_for_top_p_filtering(last_token_logits, top_p)
+
+            # After filtering, we need to recalculate the distribution.
+            probabilities = last_token_logits.softmax(dim=-1)
+
+            sampled_logits = torch.multinomial(
+                probabilities, num_samples=1, generator=self.sampling_rng
+            ).view(-1)
+
+            # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
+            if vocab_size:
+                sampled_logits = torch.clamp(sampled_logits, min=0, max=(vocab_size - 1))
+
+        return sampled_logits
+
     def sample_from_logits(
         self,
         last_token_logits: torch.Tensor,
@@ -208,40 +329,6 @@ class TextGenerationController:
 
         if kwargs.get("common_inference_params"):
             sampling_params = kwargs["common_inference_params"]
-
-        top_p = sampling_params.top_p
-        top_k = sampling_params.top_k
-        temperature = sampling_params.temperature
-
-        assert isinstance(top_p, float)
-        assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
-
-        def modify_logits_for_top_k_filtering(logits, top_k):
-            """Set the logits for none top-k values to -inf."""
-            filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits.masked_fill_(filter_, float("-Inf"))
-
-        def modify_logits_for_top_p_filtering(logits, top_p):
-            """Set the logits for none top-p values to -inf."""
-            # First sort and calculate cumulative sum of probabilities.
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-
-            # Filteration based on the cumulative sum.
-            filter_ = cumulative_probs > top_p
-            # This shift by 1 is weird and I cannot justify it. This existed
-            # in the original implementation:
-            #   https://github.com/ari-holtzman/degen/blob/master/gen.py
-            # and I guess it is needed so keeping it for now.
-            filter_[:, 1:] = filter_[:, :-1].clone()
-            # Make sure we at least have one token to select from.
-            filter_[..., 0] = 0
-
-            # Fill in the filtered part
-            filter_ = filter_.scatter(1, sorted_indices, filter_)
-            logits.masked_fill_(filter_, float("-Inf"))
 
         if sampling_params.top_n_logprobs > 0:
             # NOTE : This thing can also be clubbed with where we compute log probs
@@ -290,34 +377,11 @@ class TextGenerationController:
                         top_n_logprobs_dict,
                     )
 
-        # Greedy sampling
-        if top_k == 1:
-            sampled_logits = torch.argmax(last_token_logits, dim=-1)
-        else:
-            last_token_logits = last_token_logits.clone()
-            if temperature != 1.0:
-                last_token_logits.div_(temperature)
-            if top_k > 1:
-                assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
-                if vocab_size:
-                    assert top_k < vocab_size, "top-k is larger than vocab size."
-                modify_logits_for_top_k_filtering(last_token_logits, top_k)
+        top_p = sampling_params.top_p
+        top_k = sampling_params.top_k
+        temperature = sampling_params.temperature
 
-            elif top_p > 0.0:
-                modify_logits_for_top_p_filtering(last_token_logits, top_p)
-
-            # After filtering, we need to recalculate the distribution.
-            probabilities = last_token_logits.softmax(dim=-1)
-
-            sampled_logits = torch.multinomial(
-                probabilities, num_samples=1, generator=self.sampling_rng
-            ).view(-1)
-
-            # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
-            if vocab_size:
-                sampled_logits = torch.clamp(sampled_logits, min=0, max=(vocab_size - 1))
-
-        return sampled_logits
+        return self._torch_sampling_func(last_token_logits, temperature, top_k, top_p, vocab_size)
 
     def update_generation_status(
         self,
@@ -412,49 +476,35 @@ class TextGenerationController:
         """
         return padded_batch_prompt_tokens[:original_batch_size]
 
-    @torch.inference_mode()
-    async def async_generate_output_tokens_dynamic_batch(
-        self, sampling_params: SamplingParams, termination_id: int
-    ) -> Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]:
-        """Forward step the model and update the inference context.
+    def _dynamic_step_context_init(
+        self,
+        num_warmup_tokens: Optional[int] = None,
+        warmup_engine_mode: Optional[WarmupEngineMode] = None,
+    ):
+        """Initializes the inference context for dynamic batching.
 
         Args:
-            sampling_params (SamplingParams): Parameters for sampling logits.
+            num_warmup_tokens (Optional[int]): Number of tokens to use for
+                warming up cuda graphs. Must be less than or equal to
+                `max_requests`.
+            warmup_engine_mode (WarmupEngineMode): Denote whether to setup
+                for a decode or a non-decode cuda-graph warmup.
 
         Return:
-            (Optional[Tuple[Tensor, Tensor, Tensor, Tensor]]) Current request IDs,
-                paused request IDs, finished request IDs, new sample.
+            input_ids (Tensor): The active input IDs.
+            position_ids (Tensor): The active position IDs.
         """
         context = self.inference_wrapped_model.inference_context
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # Remove Float16Module wrapper if it exists
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
-        if sampling_params.return_log_probs:
-            skip_prompt_log_probs_for_dynamic_inference = getattr(
-                sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
-            )
-            assert (
-                skip_prompt_log_probs_for_dynamic_inference
-                or materialize_only_last_token_logits is False
-            ), "Materialize only last token logits must be false for returning log probs"
-
-        # No tokens?
-        if context.active_token_count == 0:
-            return None
+        model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state()
-        cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
+        context.initialize_attention_state(
+            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
         )
-
-        # Get flat tokens, position ids.
-        input_ids, position_ids = context.current_input_and_position_ids()
-
-        model_config = get_model_config(unwrapped_model)
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -465,6 +515,7 @@ class TextGenerationController:
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
+            assert warmup_engine_mode is not WarmupEngineMode.NON_DECODE
             if context.is_decode_only():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
@@ -479,16 +530,33 @@ class TextGenerationController:
                 # Turn off symmetric all reduces for prefill
                 unwrapped_model.set_symmetric_ar(None)
 
-        # Forward pass -> logits.
+        # Get flat tokens, position ids.
+        return context.current_input_and_position_ids(num_warmup_tokens=num_warmup_tokens)
+
+    def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
+        """Forward step the model to get logits for dynamic batching.
+
+        This also handles logits-broadcasting for pipeline parallelism.
+
+        Args:
+            input_ids (Tensor): The input token IDs.
+            position_ids (Tensor): The position IDs.
+        """
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
 
         if self.model_is_pipeline_parallel:
-            batch_size = context.total_request_count - context.paused_request_count
             logits_seq_len = (
-                batch_size if materialize_only_last_token_logits else input_ids.shape[1]
+                active_request_count if materialize_only_last_token_logits else input_ids.shape[1]
             )
             vocab_size = inference_wrapper_config.padded_vocab_size
             logits_shape = [1, logits_seq_len, vocab_size]
@@ -496,22 +564,103 @@ class TextGenerationController:
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
-            # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
-            # and then broadcast the sampled tokens rather than broadcasting the raw logits.
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
                 dtype=inference_wrapper_config.params_dtype,
                 tensor=logits,
                 pp_group=self.pp_group,
             )
+        return logits
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        await asyncio.sleep(0)
+    def _dynamic_step_sample_bookkeeping(
+        self,
+        *,
+        backend: str = "torch",
+        request_metadata: Optional[Tensor] = None,
+        request_metadata_labels: Dict[str, int] = None,
+    ):
+        """Perform bookkeeping necessary to sample logits for dynamic batching.
+
+        The ability to override the context's data is solely intended for
+            standalone use or testing, and should never be used in a running system.
+
+        Args:
+            backend (str): The sampling backend to use.
+            request_metadata (Optional[Tensor]): An override for the tensor that manages all
+                request metadata, such as sampling parameters. By default, this metadata is
+                retrieved from the context.
+            request_metadata_labels (Optional[Dict]): An override for the map of metadata labels
+                to their index in the request_metadata tensor. By default, this metadata is
+                retrieved from the request object.
+        """
+        assert backend in ["torch"]
+        context = self.inference_wrapped_model.inference_context
+
+        if request_metadata is None:
+            request_metadata = context.request_metadata[
+                context.paused_request_count : context.total_request_count, :
+            ]
+        if request_metadata_labels is None:
+            request_metadata_labels = DynamicInferenceRequest.get_metadata_labels()
+        active_request_count = request_metadata.size(0)
+
+        # Shorthand these, because the torch backend needs them.
+        temp = request_metadata[:, request_metadata_labels["temperature"]]
+        top_k = request_metadata[:, request_metadata_labels["top_k"]]
+        top_p = request_metadata[:, request_metadata_labels["top_p"]]
+
+        # Copy data into relevant tensors.
+        self.temperature_cuda[:active_request_count].copy_(temp, non_blocking=True)
+        self.top_k_cuda[:active_request_count] = top_k.to(
+            dtype=torch.int32, copy=True, non_blocking=True
+        )
+        self.top_p_cuda[:active_request_count].copy_(top_p, non_blocking=True)
+        self.termination_id_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["termination_id"]
+        ].to(dtype=torch.int64, copy=True, non_blocking=True)
+        self.return_log_probs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["return_log_probs"]
+        ].to(dtype=torch.bool, copy=True, non_blocking=True)
+        self.skip_prompt_log_probs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["skip_prompt_log_probs"]
+        ].to(dtype=torch.bool, copy=True, non_blocking=True)
+
+        if backend == "torch":
+            # Bucketize the core sampling parameters.
+            core_params = torch.stack((temp, top_k, top_p), dim=1)
+            _, inv_indices, cnts = torch.unique(
+                core_params, dim=0, return_inverse=True, return_counts=True
+            )
+            order = torch.argsort(inv_indices, stable=True)
+            sampling_buckets = torch.split(order, cnts.tolist())
+            # Perform the D2H sync needed by `_torch_sampling_func` here.
+            group_reps = torch.stack([indices[0] for indices in sampling_buckets], dim=0)
+            core_params_reps = core_params[group_reps].detach().cpu()
+            temp_reps = core_params_reps[:, 0].tolist()
+            top_k_reps = core_params_reps[:, 1].to(torch.int32).tolist()
+            top_p_reps = core_params_reps[:, 2].tolist()
+            # Store the buckets and their equivalence class representatives.
+            self.torch_sampling_buckets = (
+                (sampling_buckets[idx], temp_reps[idx], top_k_reps[idx], top_p_reps[idx])
+                for idx in range(len(sampling_buckets))
+            )
+
+    def _dynamic_step_sample_logits(self, logits: Tensor, backend: str = "torch") -> Tensor:
+        """Sample tokens from logits for dynamic batching.
+
+        Args:
+            logits (Tensor): The logits to sample from.
+            backend (str): The sampling backend to use.
+
+        Returns:
+            new_sample (Tensor): The sampled tokens.
+        """
+        # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
+        # and then broadcast the sampled tokens rather than broadcasting the raw logits.
+        assert backend in ["torch"]
+
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
         # Last token logits.
         if materialize_only_last_token_logits:
@@ -520,14 +669,71 @@ class TextGenerationController:
             last_token_logits = logits.squeeze(0)
         else:
             last_token_logits = context.last_token_logits(logits)
+        active_request_count = last_token_logits.size(0)
+        # Copy last_token_logits to contiguous buffer.
+        self.sampling_logits_cuda[:active_request_count].copy_(last_token_logits, non_blocking=True)
 
-        # Sample.
-        # Use padded vocab size because tokenizer vocab size might not include padding
-        # to nearest power of 2.
-        vocab_size = inference_wrapper_config.padded_vocab_size
-        new_sample = self.sample_from_logits(
-            last_token_logits, sampling_params, vocab_size=vocab_size
+        if backend == "torch":
+            # Concatenate the outputs once to prevent repeated small writes.
+            token_list = []
+            indices_list = []
+
+            for indices, temp, top_k, top_p in self.torch_sampling_buckets:
+                token_list.append(
+                    self._torch_sampling_func(
+                        self.sampling_logits_cuda[indices, :], temp, top_k, top_p
+                    )
+                )
+                indices_list.append(indices)
+
+            # Single write to the output tensor.
+            sampled_tokens = torch.cat(token_list, dim=0)
+            sampled_indices = torch.cat(indices_list, dim=0)
+            self.sampled_tokens_cuda.index_copy_(0, sampled_indices, sampled_tokens)
+        return self.sampled_tokens_cuda[:active_request_count].clone()
+
+    def _dynamic_step_log_probs_bookkeeping(self) -> bool:
+        """Perform bookkeeping necessary to compute log probs for dynamic batching."""
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        to_check = self.return_log_probs_cuda[:active_request_count]
+        to_check &= ~self.skip_prompt_log_probs_cuda[:active_request_count]
+
+        assert not (
+            to_check.any() and materialize_only_last_token_logits
+        ), "Prompt log probs cannot be calculated if only last token logits are materialized."
+
+        return self.return_log_probs_cuda[:active_request_count].any()
+
+    def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
+        """Calculate log probs from logits."""
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        ret = context.calculate_log_probs(
+            logits,
+            self.sampled_tokens_cuda[:active_request_count],
+            only_last_token_logits=materialize_only_last_token_logits,
         )
+        return ret
+
+    def _dynamic_step_context_bookkeeping(self, new_sample) -> Dict[str, Tensor]:
+        """Update the dynamic inference context after sampling.
+
+        Return:
+            Dict [str, Tensor]: A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        active_request_count = context.total_request_count - context.paused_request_count
 
         # Active sequence lengths.
         active_request_ids = context.request_ids[
@@ -538,9 +744,11 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-        active_request_mask = (new_sample != termination_id).byte() & torch.less(
-            active_sequence_lengths, max_sequence_lengths
-        ).byte()
+        # Note: termination_id tensor has per-request termination IDs from mixed sampling
+        active_request_mask = (
+            self.sampled_tokens_cuda[:active_request_count]
+            != self.termination_id_cuda[:active_request_count]
+        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -549,12 +757,6 @@ class TextGenerationController:
         # New sample gets updated in update_requests, so we pass in a clone
         new_sample_copy = new_sample.clone()
 
-        log_probs = None
-        if sampling_params.return_log_probs:
-            log_probs = context.calculate_log_probs(
-                logits, new_sample_copy, only_last_token_logits=materialize_only_last_token_logits
-            )
-
         # Update requests.
         newly_paused_request_ids = context.update_requests(active_request_mask, new_sample_copy)
 
@@ -562,20 +764,81 @@ class TextGenerationController:
             "active_request_ids": active_request_ids,
             "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
+        }
+
+    @torch.inference_mode()
+    async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context.
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Return:
+            (Optional[Dict]): A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+                sample (Tensor): New sample.
+                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        """
+        context = self.inference_wrapped_model.inference_context
+        materialize_only_last_token_logits = context.materialize_only_last_token_logits
+
+        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+
+        # No tokens?
+        if context.active_token_count == 0:
+            return None
+
+        input_ids, position_ids = self._dynamic_step_context_init()
+
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
+
+        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        # This is the best place to yield control back to event loop.
+        # At this point we have enqueued FW pass GPU kernels asynchronously.
+        # While they are running, we can do other useful CPU work.
+        # Note: This can be moved further ahead if sampling can be made
+        # asynchronous.
+        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
+        await asyncio.sleep(0)
+
+        self._dynamic_step_sample_bookkeeping()
+        new_sample = self._dynamic_step_sample_logits(logits)
+
+        return_log_probs = self._dynamic_step_log_probs_bookkeeping()
+        if return_log_probs:
+            log_probs = self._dynamic_step_calculate_log_probs(logits)
+        else:
+            log_probs = None
+
+        if skip_bookkeeping:
+            request_bookkeeping = {}
+        else:
+            request_bookkeeping = self._dynamic_step_context_bookkeeping(new_sample)
+
+        ret = {
             "sample": new_sample,
             "log_probs": log_probs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+        ret.update(request_bookkeeping)
+        return ret
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
-        self, sampling_params: SamplingParams, termination_id: int
-    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        self, loop: Optional[asyncio.AbstractEventLoop] = None
+    ) -> Optional[Dict]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
-        loop = get_asyncio_loop()
-        return loop.run_until_complete(
-            self.async_generate_output_tokens_dynamic_batch(sampling_params, termination_id)
-        )
+        loop = get_asyncio_loop(loop)
+        return loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
 
     def _update_top_n_logprobs_dict(
         self,

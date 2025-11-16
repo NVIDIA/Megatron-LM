@@ -35,10 +35,14 @@ Megatron-FSDP can provide up to 25% speed up and 23% memory savings compared to 
 - **Advanced Bucketing**: Data-type aware bucketing system to minimize the overhead of collective operations
 - **Buffer Management**: Zero copy communication is achieved by reorganizing the storage of parameters and main grad with `ParamAndGradBuffer` class
 - **Communication Overlapping**: Improved communication overlap of paramter all-gather and gradient reduce-scatter
-- **User-Buffer-Registration NCCL communication**: Offload NCCL collective communication to NVL/IB Sharp to reduce GPU SM usage for communication
 - **FP8 Mixed Precision with Transformer Engine**: Compatibility with Transformer Engine enables efficient FP8 mixed precision training
 - **Gradient accumulate fusion support with Transformer Engine**: Remove the explicit gradient copy to the communication buffer in backwards pass
 
+### Advanced Collective Communication
+- **SM Usage Reduction with SHARP**: FSDP's `All-Gather` (AG) and `Reduce-Scatter` (RS) collectives are designed to overlap with compute kernels. However, standard NCCL communication kernels can consume a significant number of GPU SMs (e.g., 16-32 SMs), "stealing" resources from compute (GEMM) kernels and reducing overall TFLOPS.
+- **In-Switch Processing**: We leverage **SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol) to offload these collective operations. SHARP performs aggregation and reduction computations directly on the network switches (InfiniBand or NVLink Switch) instead of on the GPU SMs. This dramatically reduces the SM consumption for communication to **1-6 SM** freeing up GPU resources for compute. It also provides lower communication latency, especially in large, scaled-out workloads.
+- **Symmetric Optimizations for MNNVL**: We support **symmetric-based optimizations**, introduced in NCCL v2.27, which enable switch offloading for **Multi-Node NVLink (MNNVL)** systems such as GB200/GB300. This allows the same SM-saving benefits over the high-bandwidth NVLink fabric itself.
+- **Hierarchical Collectives**: When an FSDP sharding domain spans both NVLink and InfiniBand, the library utilizes **hierarchical SHARP collectives** (e.g., NVL-SHARP + IB-SHARP) to optimize the communication path across the entire system topology.
 <!-- ## 📊 Performance  -->
 
 ## 📦 Installation
@@ -218,6 +222,9 @@ optimizer.load_state_dict(ckpt_state_dict["optimizer"])
 - `nccl_ub` will allocate and register the NCCL userbuffer for param and grad buffers. This option enables an SM-efficient NCCL algorithm that could improve the performance of overlapped computations. This flag will be much more effective when used together with SHARP if the FSDP communication includes both NVL and IB domains. Enabling this option will cause additional memory overhead due to the requirement to enable the `fsdp_double_buffer` option.
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`.
+    - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registraion.
+- `disable_symmetric_registration` will disable NCCL window (i.e. symmetric) registraion when using `nccl_ub`. 
+    - Dafaults to `False`.
 - `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
     - **Only effective when using Megatron-LM.**
     - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
