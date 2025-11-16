@@ -105,8 +105,8 @@ def compile_allocator():
             _so_path = Path(_mod.__file__).as_posix()
             _alloc = CUDAPluggableAllocator(_so_path, "managed_malloc", "managed_free").allocator()
             _compilation_state = CompilationState.SUCCESS
-        except (RuntimeError, ImportError, OSError):
-            warnings.warn("Failed to create unified memory mempool.")
+        except (RuntimeError, ImportError, OSError) as e:
+            warnings.warn(f"Failed to create unified memory mempool: '{e}'.")
             _compilation_state = CompilationState.FAILURE
 
 
