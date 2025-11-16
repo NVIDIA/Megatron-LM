@@ -662,7 +662,7 @@ class DynamicInferenceEngine(AbstractEngine):
         while self.waiting_request_ids:
             req = self.requests[self.waiting_request_ids[0]]
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req, safe=True)
+                self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 self.context.add_request(req)
@@ -705,9 +705,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.active_token_count + remaining_len <= self.context.max_tokens
             )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(
-                req, safe=not is_continuing_chunked_prefill
-            )
+            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
             if request_can_be_added and kv_cache_available:
@@ -766,10 +764,15 @@ class DynamicInferenceEngine(AbstractEngine):
             total_request_count,
             paused_request_count,
             active_token_count,
+            waiting_request_count,
+            finished_request_count,
             kv_stats,
             padded_active_token_count,
-            gtd_request_count,
             using_cuda_graph_this_step,
+            total_active_block_count,
+            total_paused_block_count,
+            total_active_used_blocks,
+            total_paused_used_blocks,
         ) = context_state
         # Increment finished_request_count.
         cuda_graph_request_count = None
@@ -847,7 +850,8 @@ class DynamicInferenceEngine(AbstractEngine):
             step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
-                "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
+                "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
+                "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     step_count,
@@ -864,11 +868,16 @@ class DynamicInferenceEngine(AbstractEngine):
                             ),
                         )
                     ),
-                    total_request_count,
-                    gtd_request_count,
                     total_request_count - paused_request_count,
+                    total_active_block_count,
                     paused_request_count,
-                    self.finished_request_count,
+                    total_paused_block_count,
+                    waiting_request_count,
+                    finished_request_count,
+                    total_active_used_blocks,
+                    total_active_block_count,
+                    total_paused_used_blocks,
+                    total_paused_block_count,
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
@@ -931,10 +940,15 @@ class DynamicInferenceEngine(AbstractEngine):
             kvcache_util_stats = None
 
         post_step_context_state = (
+            len(self.waiting_request_ids),
+            self.finished_request_count,
             kvcache_util_stats,
             context.padded_active_token_count,
-            context.gtd_request_count,
             context.using_cuda_graph_this_step(),
+            context.block_allocator.active_count,
+            context.block_allocator.paused_count,
+            context.block_allcoator.get_active_used(),
+            context.block_allocator.get_paused_used(),
         )
         context_state = pre_step_context_state + post_step_context_state
 

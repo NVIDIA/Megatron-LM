@@ -84,7 +84,7 @@ class TextGenerationController:
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
-        max_requests = context.max_requests
+        max_requests = context.max_total_requests
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
