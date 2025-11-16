@@ -179,7 +179,7 @@ class FullCudaGraphWrapper:
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            logger.info(f'CUDA graph capture done!!!')
+            logger.info(f'CUDA graph capture done for {training_str}!!!')
 
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
