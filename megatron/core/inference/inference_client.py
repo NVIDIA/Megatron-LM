@@ -73,6 +73,10 @@ class InferenceClient:
         inference_coordinator_address = os.getenv('MASTER_ADDR', '127.0.0.1')
         socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
 
+        self._loop = None
+        self._engines_paused = asyncio.Event()
+        self._engines_stopped = asyncio.Event()
+
         self.socket = socket
         self.completion_futures = {}
         self.request_submission_times = {}
@@ -104,29 +108,36 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = get_asyncio_loop().create_future()
+        self.completion_futures[request_id] = self._loop.create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
     @trace_async_exceptions
-    async def _listen_for_completed_requests(self):
+    async def _recv_task(self):
         """
         Listens for completed inference requests from the coordinator.
 
         This coroutine runs in an infinite loop, continuously polling the socket
-        for replies. When a reply is received, it unpacks the message, finds the
+        for data.
+        When a request reply is received, it unpacks the message, finds the
         corresponding Future using the request ID, and sets the result.
+        Other control packets are handled appropriately.
 
         This method is started as a background task by the `start()` method.
         """
         while True:
             try:
-                request_id, reply = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
-                reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
-                    request_id
-                )
-                completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
+                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
+                header = Headers(data[0])
+                if header == Headers.ENGINE_REPLY:
+                    request_id, reply = data[1:2]
+                    reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
+                        request_id
+                    )
+                    completion_future = self.completion_futures.pop(request_id)
+                    completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
+                elif header == Headers.PAUSE_ACK:
+                    self._engines_paused.set()
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -137,15 +148,15 @@ class InferenceClient:
         """
         Performs the initial handshake with the inference coordinator.
 
-        Sends a CONNECT signal and waits for an ACK reply to ensure the
+        Sends a CONNECT signal and waits for a CONNECT_ACK reply to ensure the
         connection is established and acknowledged by the coordinator.
         """
         payload = [Headers.CONNECT.value]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
-        assert Headers(reply) == Headers.ACK
+        assert Headers(reply) == Headers.CONNECT_ACK
 
-    async def start(self):
+    async def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """
         Connects to the coordinator and starts the background listener task.
 
@@ -154,8 +165,11 @@ class InferenceClient:
         coroutine.
         """
         logging.info("Client: Connecting to InferenceCoordinator...")
+        self._loop = get_asyncio_loop(loop)
+        self._engines_paused.clear()
+        self._engines_stopped.clear()
         self._connect_with_inference_coordinator()
-        self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
+        self.listener_task = self._loop.create_task(self._recv_task())
 
     def _send_signal_to_engines(self, signal):
         """
@@ -168,9 +182,15 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
-    def pause_engines(self):
-        """Sends a signal to pause all inference engines."""
+    async def pause_engines(self):
+        """Sends a signal to pause all inference engines.
+
+        The user needs to know when pausing is complete.
+        As such, this method first broadcasts the PAUSE signal down into each engine.
+        Then gathers a PAUSE_ACK signal from each engine.
+        """
         self._send_signal_to_engines(Headers.PAUSE)
+        await self._engines_paused.wait()
 
     def unpause_engines(self):
         """Sends a signal to unpause all inference engines."""
@@ -186,11 +206,12 @@ class InferenceClient:
         self._send_signal_to_engines(Headers.RESUME)
         self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def stop_engines(self):
+    async def stop_engines(self):
         """Sends a signal to gracefully stop all inference engines."""
         self._send_signal_to_engines(Headers.STOP)
+        await self._engines_stopped.wait()
 
-    def stop(self):
+    async def stop(self):
         """
         Stops the client and cleans up all resources.
 
