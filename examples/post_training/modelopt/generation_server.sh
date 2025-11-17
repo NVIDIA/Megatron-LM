@@ -14,9 +14,11 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
     exit 1
 fi
 
-TOOLS_DIR="$(realpath ${SCRIPT_DIR}/../../../tools)"
+if [ -z ${DRAFT_LEN} ]; then
+    DRAFT_LEN=0
+fi
 
-${LAUNCH_SCRIPT} ${TOOLS_DIR}/run_text_generation_server.py \
+${LAUNCH_SCRIPT} ${SCRIPT_DIR}/generation_server.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \

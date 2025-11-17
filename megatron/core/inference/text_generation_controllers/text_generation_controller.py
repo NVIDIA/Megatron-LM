@@ -626,8 +626,11 @@ class TextGenerationController:
         return_log_probs = False
         for sampling_params, mask in active_sampling_map:
             if sampling_params.return_log_probs:
+                skip_prompt_log_probs_for_dynamic_inference = getattr(
+                    sampling_params, "skip_prompt_log_probs_for_dynamic_inference", False
+                )
                 assert (
-                    sampling_params.skip_prompt_log_probs
+                    skip_prompt_log_probs_for_dynamic_inference
                     or materialize_only_last_token_logits is False
                 ), "Materialize only last token logits must be false for returning log probs"
                 return_log_probs = True
@@ -759,12 +762,10 @@ class TextGenerationController:
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
-        self,
-        active_sampling_map: List[Tuple[SamplingParams, List[int]]],
-        loop: Optional[asyncio.AbstractEventLoop] = None,
+        self, active_sampling_map: List[Tuple[SamplingParams, List[int]]]
     ) -> Optional[Dict]:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
-        loop = get_asyncio_loop(loop)
+        loop = get_asyncio_loop()
         return loop.run_until_complete(
             self.async_generate_output_tokens_dynamic_batch(active_sampling_map)
         )

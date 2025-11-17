@@ -1,5 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 from argparse import Namespace
 
 import pytest
@@ -34,7 +32,7 @@ class TestGPTInferenceWrapper:
         self.vocab_size = 100
         self.batch_size = 4
         self.sequence_length = 32
-        hidden_size = 32
+        hidden_size = 12
 
         transformer_config = TransformerConfig(
             num_layers=4,
