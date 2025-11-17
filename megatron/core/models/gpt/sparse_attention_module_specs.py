@@ -55,7 +55,7 @@ def get_sparse_attention_module_spec_for_backend(
         return ModuleSpec(
             module=SparseAttention,
             submodules=SparseAttentionSubmodules(
-                indexer=get_indexer_spec_for_backend(backend, normalization=normalization),
+                indexer=get_indexer_spec_for_backend(backend, normalization=normalization)
             ),
         )
     else:

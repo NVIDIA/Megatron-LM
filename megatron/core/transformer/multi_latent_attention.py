@@ -830,8 +830,11 @@ class MLASelfAttention(MultiLatentAttention):
         return query, key, value, q_compressed, kv_compressed
 
     def get_query_key_value_tensors(self, *args, **kwargs):
+        """
+        Derives `query`, `key` and `value` tensors from `hidden_states`.
+        """
         query, key, value, q_compressed, kv_compressed = (
-            self.get_query_key_value_and_compressed_tensors(self, *args, **kwargs)
+            self.get_query_key_value_and_compressed_tensors(*args, **kwargs)
         )
         # Only return query, key and value.
         return query, key, value

@@ -231,11 +231,15 @@ class TransformerConfig(ModelParallelConfig):
     index_head_dim: Optional[int] = None
     """Dimension per indexer head. If None, defaults to kv_channels."""
 
-    index_topk: int = 256
+    index_topk: Optional[int] = None
     """Number of top-k tokens to select in sparse attention indexer."""
 
-    indexer_loss_coeff: float = 0.0
+    indexer_loss_coeff: Optional[float] = None
     """Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    use_sparse_indexer_loss: Optional[bool] = None
+    """Whether to use sparse indexer loss. If True, the indexer loss will be computed using the
+    top-k indices."""
 
     ####################
     # linear attention
