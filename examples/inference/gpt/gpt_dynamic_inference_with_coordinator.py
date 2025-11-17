@@ -108,7 +108,6 @@ async def main(
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 throughput = len(req.generated_tokens) / req.latency
                 throughputs.append(throughput)
-                result_dict["throughput"] = throughput
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
