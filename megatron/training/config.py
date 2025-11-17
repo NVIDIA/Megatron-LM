@@ -91,10 +91,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    val_iters: Optional[int] = field(default=100, metadata={"argparse_meta": {"arg_names": ["--eval-iters", "--val-iters"], "dest": "eval_iters"}})
-    """Number of iterations to run validation/test for."""
+    eval_iters: Optional[int] = 100
+    """Number of iterations to run for evaluation. Used for both validation and test. If not set,
+    evaluation will not run."""
 
-    val_interval: Optional[int] = field(default=None, metadata={"argparse_meta": {"arg_names": ["--eval-interval", "--val-interval"], "dest": "eval_interval"}})
+    eval_interval: Optional[int] = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
     during training.
     """
