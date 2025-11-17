@@ -24,7 +24,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_inference_metadata_from_model, log_single_rank
+from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -106,7 +106,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     if args.enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
-    mamba_inference_metadata = get_mamba_inference_metadata_from_model(model)
+    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -127,7 +127,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
         unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
-        mamba_inference_metadata=mamba_inference_metadata,
+        mamba_inference_state_config=mamba_inference_state_config,
         metrics_writer=metrics_writer,
     )
 

@@ -2154,15 +2154,18 @@ def trace_async_exceptions(
     return _decorate if func is None else _decorate(func)
 
 
-def get_mamba_inference_metadata_from_model(model) -> Optional["MambaInferenceMetadata"]:
-    """Returns Mamba inference data from the model if it is a hybrid model."""
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import MambaInferenceMetadata, Symbols
+def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
+    """Returns Mamba inference state config from the model if it is a hybrid model."""
+    from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+        MambaInferenceStateConfig,
+    )
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 
     decoder = get_attr_wrapped_model(model, "decoder")
     layer_type_list = getattr(decoder, "layer_type_list", None)
     if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
         (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-        return MambaInferenceMetadata(
+        return MambaInferenceStateConfig(
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,

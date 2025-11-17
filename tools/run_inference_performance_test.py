@@ -25,7 +25,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_metadata_from_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model
 from model_provider import model_provider
 
 sys.path.append(
@@ -88,7 +88,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         moe_pad_experts_for_cuda_graph_inference=args.moe_pad_experts_for_cuda_graph_inference,
     )
 
-    mamba_inference_metadata = get_mamba_inference_metadata_from_model(model)
+    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
     if args.engine_type == "static":
         inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
@@ -121,7 +121,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             block_size_tokens=args.inference_dynamic_batching_block_size,
             tensor_model_parallel_size=args.tensor_model_parallel_size,
             materialize_only_last_token_logits=not args.return_log_probs,
-            mamba_inference_metadata=mamba_inference_metadata,
+            mamba_inference_state_config=mamba_inference_state_config,
             cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
             kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,

@@ -21,7 +21,7 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.utils import get_mamba_inference_metadata_from_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 
 logging.basicConfig(level=logging.INFO, force=True)
@@ -149,7 +149,7 @@ if __name__ == "__main__":
 
         # Requests, context, conroller.
         model = get_model()
-        mamba_inference_metadata = get_mamba_inference_metadata_from_model(model)
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
         requests = (
             build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
         )
@@ -158,7 +158,7 @@ if __name__ == "__main__":
             None,
             None,
             calculate_max_sequence_length_from_requests=False,
-            mamba_inference_metadata=mamba_inference_metadata,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         controller = get_inference_controller(model, context)

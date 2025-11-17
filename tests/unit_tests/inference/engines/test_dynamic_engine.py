@@ -12,6 +12,9 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -40,13 +43,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
-from megatron.core.ssm.mamba_hybrid_layer_allocation import MambaInferenceMetadata
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     check_mamba_sequence_packing_support,
-    get_mamba_inference_metadata_from_model,
+    get_mamba_inference_state_config_from_model,
     is_fa_min_version,
     is_te_min_version,
 )
@@ -201,7 +203,7 @@ class TestDynamicInferenceEngine:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
-        mamba_inference_metadata: Optional[MambaInferenceMetadata] = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -218,7 +220,7 @@ class TestDynamicInferenceEngine:
             block_size_tokens=test_config.context_block_size_tokens,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-            mamba_inference_metadata=mamba_inference_metadata,
+            mamba_inference_state_config=mamba_inference_state_config,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
@@ -357,7 +359,7 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        mamba_inference_metadata = get_mamba_inference_metadata_from_model(model)
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
         # Inference config.
         inference_config = InferenceWrapperConfig(
@@ -374,7 +376,7 @@ class TestDynamicInferenceEngine:
             test_config=test_config,
             transformer_config=transformer_config,
             requests=requests,
-            mamba_inference_metadata=mamba_inference_metadata,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         # Inference model wrapper.
