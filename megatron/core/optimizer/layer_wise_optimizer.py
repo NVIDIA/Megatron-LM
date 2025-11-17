@@ -290,15 +290,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(get_pg_size(self.pg_collection.dp_cp))]
-                torch.distributed.all_gather_object(
-                    all_rank_groups, group, self.pg_collection.dp_cp
-                )
-                nonempty_rank_group = next((g for g in all_rank_groups if g['params']), None)
-                if nonempty_rank_group is None:
-                    raise ValueError(
-                        'LayerWiseDistributedOptimizer dist save seeing empty groups on all ranks.'
-                    )
+                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather_object(all_rank_groups, group)
+                nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params
                 sd['optimizer']['param_groups'][i] = nonempty_rank_group
         return sharded_state_dict
