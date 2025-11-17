@@ -139,7 +139,7 @@ class LanguageModule(MegatronModule):
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
                         and self.config.cuda_graph_scope
-                        and 'full_iteration' in self.config.cuda_graph_scope
+                        and (self.config.cuda_graph_scope is not None and 'full_iteration' in self.config.cuda_graph_scope)
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
