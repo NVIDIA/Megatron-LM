@@ -1089,6 +1089,9 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+    packed_moe_expert_offloading: bool = False
+    """If True, enable packed moe expert offloading."""
+
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1624,6 +1627,17 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+        if self.packed_moe_expert_offloading:
+            assert (
+                not self.cpu_offloading and not self.fine_grained_activation_offloading
+            ), "packed_moe_expert_offloading cannot be enabled with cpu_offloading."
+            assert self.offload_modules is not None and len(self.offload_modules) > 0
+            allowed_modules = {"expert_fc1", "expert_fc2", "moe_act"}
+            invalid_modules = set(self.offload_modules) - allowed_modules
+            assert not invalid_modules, (
+                f'Invalid choices for offload_modules: {invalid_modules}. '
+                f'Allowed modules are: {allowed_modules}'
+            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
