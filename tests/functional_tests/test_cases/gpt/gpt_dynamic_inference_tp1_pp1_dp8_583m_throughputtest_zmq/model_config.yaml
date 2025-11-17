@@ -40,10 +40,8 @@ MODEL_ARGS:
   --top_k: 1
   --seed: 42
   --return-log-probs: true
-  --inference-dynamic-batching-max-requests-override: 512
-  --inference-dynamic-batching-buffer-guaranteed-fraction: 0
-  --inference-dynamic-batching-buffer-overflow-factor: 0.2
-  --inference-dynamic-batching-buffer-size-gb: 40
+  --num-tokens-from-file: true
+  --inference-dynamic-batching-active-buffer-size-gb: 20
   --cuda-graph-impl: local
   --cuda-graph-scope: full
   --disable-chunked-prefill: true
@@ -52,9 +50,8 @@ MODEL_ARGS:
   --output-path: ${TENSORBOARD_PATH}
   --output-every-n-results: 32
   --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
-  --prompt-file-num-truncate: 1024 # originally 1024
-  --num-tokens-from-file
-  --incoming-requests-per-step: 128
+  --prompt-file-num-truncate: 512
+  --incoming-requests-per-step: 64
   --use-flashinfer-fused-rope: true
   --throughput-check-only: true
 METRICS:
