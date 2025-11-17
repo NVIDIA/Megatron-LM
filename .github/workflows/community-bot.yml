@@ -21,6 +21,8 @@ on:
 
 jobs:
   community-bot:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_bot.yml@v0.49.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_bot.yml@v0.65.10
+    if: github.repository == 'NVIDIA/Megatron-LM'
     secrets:
       GH_TOKEN: ${{ secrets.PAT }}
+      environment: main

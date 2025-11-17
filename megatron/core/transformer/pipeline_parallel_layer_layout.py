@@ -15,8 +15,11 @@ logger = logging.getLogger(__name__)
 class PipelineParallelLayerLayout:
     """Configuration of custom pipeline parallel layer partitioning."""
 
-    def __repr__(self):
-        return self.input_data
+    def __repr__(self) -> str:
+        if isinstance(self.input_data, str):
+            return self.input_data
+        else:
+            return str(self.input_data)
 
     def __init__(self, layout: str | list, pipeline_model_parallel_size: int):
         """Initialize PipelineParallelLayerLayout from a list or a str.

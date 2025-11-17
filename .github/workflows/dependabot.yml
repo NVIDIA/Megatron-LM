@@ -14,6 +14,7 @@ jobs:
     environment: nemo-ci
     outputs:
       mcore: ${{ steps.get-branch.outputs.mcore_release_branch }}
+    if: github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Get release branch names
         id: get-branch
@@ -28,6 +29,7 @@ jobs:
 
   bump-tags:
     needs: [get-release-branch-names]
+    if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +48,7 @@ jobs:
       SSH_PWD: ${{ secrets.SSH_PWD }}
 
   notify:
-    if: failure()
+    if: failure() && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     needs: [bump-tags]
     steps:

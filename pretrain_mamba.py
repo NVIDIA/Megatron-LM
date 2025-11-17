@@ -1,52 +1,39 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
-import os
-import torch
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
-from model_provider import model_provider
+import torch
+
 from mamba_builders import mamba_builder
-
-from megatron.training import get_args
-from megatron.training import get_tokenizer
-from megatron.training import inprocess_restart
-from megatron.training import print_rank_0
-from megatron.training import get_timers
 from megatron.core import mpu
-from megatron.core.enums import ModelType
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.enums import ModelType
 from megatron.core.models.mamba import MambaModel
-from megatron.training import pretrain
-from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
+from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tokenizers import MegatronTokenizer
+from model_provider import model_provider
 
-from megatron.training.datasets.sft_dataset import SFTDataset
-
-# modelopt distillation
 try:
-    from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
+    from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
 
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
@@ -67,7 +54,6 @@ def get_batch(data_iterator, vp_stage=None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
-
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None):
     """Loss function.
 
@@ -82,13 +68,15 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             the data parallel ranks
     """
     args = get_args()
-    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
-        return loss_func_modelopt(loss_mask, output_tensor, model=model)
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
+    else:
+        losses = output_tensor.view(-1).float()
+        loss_mask = loss_mask.view(-1).float()
+        loss = torch.sum(losses * loss_mask)
 
-
-    losses = output_tensor.view(-1).float()
-    loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses * loss_mask)
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -121,11 +109,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             fatal=False,
         )
 
-
-    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
-
-    return (loss, num_tokens, {'lm loss': reporting_loss})
+    return loss, num_tokens, report
 
 
 def forward_step(data_iterator, model: MambaModel):
@@ -135,7 +119,6 @@ def forward_step(data_iterator, model: MambaModel):
         data_iterator : Input data iterator
         model (MambaModel): The GPT Model
     """
-    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -152,7 +135,6 @@ def forward_step(data_iterator, model: MambaModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
-
 
 
 def is_dataset_built_on_rank(vp_stage=None):
@@ -186,6 +168,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
 
@@ -196,7 +179,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
-
     config = core_gpt_dataset_config_from_args(args)
 
     if args.sft:

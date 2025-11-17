@@ -3,6 +3,7 @@ from unittest import mock
 
 import pytest
 import torch
+from torch.distributed.checkpoint import CheckpointException
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
@@ -18,7 +19,7 @@ def write_data_os_err_mock_fn(
 ):
     """Raises an error on worker #2 during storage save"""
     try:
-        if local_proc_idx == 2:
+        if Utils.rank == 2 and local_proc_idx == 2:
             raise OSError('worker #2 critical failure')
         output = (local_proc_idx, [])
     except Exception as e:
@@ -77,30 +78,32 @@ class TestAsyncSave:
     @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn])
     def test_errors_are_reported(self, tmp_path_dist_ckpt, async_save, worker_fn):
         Utils.initialize_model_parallel(2, 4)
+        orig_fn = FileSystemWriterAsync.write_preloaded_data
+        FileSystemWriterAsync.write_preloaded_data = worker_fn
+
         sharded_state_dict = {
             f'key{i}': ShardedTensor.from_rank_offsets(f'key{i}_rank{Utils.rank}', torch.ones(2, 4))
             for i in range(4)  # make sure there is enough non-empty saving workers
         }
+        save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=8)
 
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_errors_are_reported') as ckpt_dir:
-            async_calls = AsyncCallsQueue()
-            save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=8)
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'test_errors_are_reported') as ckpt_dir,
+            pytest.raises(CheckpointException) as exc_info,
+        ):
+            if async_save:
+                async_calls = AsyncCallsQueue()
+                async_request = save(
+                    sharded_state_dict, ckpt_dir, save_strategy, async_sharded_save=True
+                )
+                async_calls.schedule_async_request(async_request)
+                async_calls.maybe_finalize_async_calls(blocking=True)
+            else:
+                save(sharded_state_dict, ckpt_dir, save_strategy)
+        if Utils.rank == 0:
+            assert 'Worker failure' in str(exc_info.value)
+        else:
+            assert 'Worker failure' not in str(exc_info.value)
 
-            try:
-                orig_fn = FileSystemWriterAsync.write_preloaded_data
-                FileSystemWriterAsync.write_preloaded_data = worker_fn
-                with pytest.raises(RuntimeError) as exc_info:
-                    if async_save:
-                        async_request = save(
-                            sharded_state_dict, ckpt_dir, save_strategy, async_sharded_save=True
-                        )
-                        async_calls.schedule_async_request(async_request)
-                        async_calls.maybe_finalize_async_calls(blocking=True)
-                    else:
-                        save(sharded_state_dict, ckpt_dir, save_strategy)
-                assert 'Worker failure' in str(exc_info.value)
-
-            finally:
-                FileSystemWriterAsync.write_preloaded_data = orig_fn
-
+        FileSystemWriterAsync.write_preloaded_data = orig_fn
         Utils.destroy_model_parallel()

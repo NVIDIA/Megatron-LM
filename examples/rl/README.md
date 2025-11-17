@@ -69,7 +69,7 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --bf16 \
     --te-rng-tracker \
-    --enable-cuda-graph \
+    --cuda-graph-impl local \
     --inference-dynamic-batching-num-cuda-graphs 1 \
     --inference-dynamic-batching-buffer-size-gb 20 \
     --data-parallel-random-init \

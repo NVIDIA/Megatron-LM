@@ -243,5 +243,16 @@ def save_state_dict_async_finalize(
             storage_writer.finish(global_metadata, all_results)
             write_end = time()
             logger.debug(f"{write_end}, metadata_write: {write_end - write_start}")
-        else:
-            raise CheckpointException("write", node_failures)
+    else:
+        node_failures = {}
+
+    # Broadcast failure status to all ranks to raise exceptions everywhere if needed.
+    # The failure details are only raised on the coordinator.
+    failures_occurred = torch.tensor(
+        [int(len(node_failures) > 0)], dtype=torch.int, device=torch.cuda.current_device()
+    )
+    torch.distributed.broadcast(
+        failures_occurred, src=dist_wrapper.coordinator_rank, group=dist_wrapper.group
+    )
+    if failures_occurred:
+        raise CheckpointException("write", node_failures)

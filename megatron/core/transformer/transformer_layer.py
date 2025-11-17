@@ -112,14 +112,14 @@ def get_transformer_layer_offset(
                     else config.num_layers_in_last_pipeline_stage // vp_size
                 )
 
-                num_layers_per_vritual_model_chunk_in_middle_pipeline_stage = (
+                num_layers_per_virtual_model_chunk_in_middle_pipeline_stage = (
                     middle_num_layers // vp_size
                 )
 
                 # First stage + middle stage + last stage
                 total_virtual_chunks = (
                     num_layers_per_virtual_model_chunk_in_first_pipeline_stage
-                    + num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
+                    + num_layers_per_virtual_model_chunk_in_middle_pipeline_stage
                     + num_layers_per_virtual_model_chunk_in_last_pipeline_stage
                 )
 
@@ -132,7 +132,7 @@ def get_transformer_layer_offset(
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
                         + middle_pipeline_rank
                         * (
-                            num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
+                            num_layers_per_virtual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
                         )
                     )
@@ -378,7 +378,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "layernorm" in self.config.recompute_modules:
                 if (
                     not isinstance(self.input_layernorm, IdentityOp)
-                    and not self.config.external_cuda_graph
+                    and self.config.cuda_graph_impl == "none"
                 ):
                     self.recompute_input_layernorm = True
                     if self.config.fp8:
@@ -738,7 +738,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ), (
             "CUDA graph accepts only Tensor inputs. "
             "inference_context and packed_seq_params are excluded from input list. "
-            "For inference cuda graph, please use enable_cuda_graph instead."
+            "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
         cuda_graph_output = super()._te_cuda_graph_replay(*args, **kwargs)

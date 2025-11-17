@@ -153,27 +153,23 @@ class GraphableMegatronModule(MegatronModule):
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert not (
-                config.enable_cuda_graph and config.external_cuda_graph
-            ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
-            if config.enable_cuda_graph:
-                from megatron.core.transformer.cuda_graphs import CudaGraphManager
+        if config.cuda_graph_impl == "local":
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-                self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
-            else:
-                # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
-                # the number of microbatches. Multiple CUDA graphs per layer is required to support
-                # pipelining which requires running FWD graph of multiple microbatches before BWD
-                # graph. To enable CUDA graph, this list should be populated in the model training
-                # script with the graphs returned by make_graphed_callables API before the first
-                # training step.
-                self.cuda_graphs = []
-                # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
-                # graphs. Those hooks and args are collected in this list and should be manually
-                # triggered before CUDA Graph running. This is required to ensure the correct param
-                # all-gather overlap with forward compute.
-                self.cuda_graph_manual_hooks = []
+            self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
+        elif config.cuda_graph_impl == "transformer_engine":
+            # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
+            # the number of microbatches. Multiple CUDA graphs per layer is required to support
+            # pipelining which requires running FWD graph of multiple microbatches before BWD
+            # graph. To enable CUDA graph, this list should be populated in the model training
+            # script with the graphs returned by make_graphed_callables API before the first
+            # training step.
+            self.cuda_graphs = []
+            # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
+            # graphs. Those hooks and args are collected in this list and should be manually
+            # triggered before CUDA Graph running. This is required to ensure the correct param
+            # all-gather overlap with forward compute.
+            self.cuda_graph_manual_hooks = []
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -286,7 +282,7 @@ class GraphableMegatronModule(MegatronModule):
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
         return (
-            self.config.external_cuda_graph
+            self.config.cuda_graph_impl == "transformer_engine"
             and self.training
             and (is_graph_capturing() or self.cuda_graphs)
         )

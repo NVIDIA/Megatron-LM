@@ -2,7 +2,8 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -10,11 +11,27 @@ import torch.distributed as dist
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
 
+class CommRole(Enum):
+    """Communication role for ranks in bridge communication.
+
+    SENDER: Leader tp-cp rank within each DP replica of source grid.
+            Sends data to destination grid receivers.
+    RECEIVER: Leader tp-cp rank within each DP replica of destination grid.
+              Receives data from source grid senders.
+    MEMBER: Non-leader ranks within DP replicas.
+            Participate in broadcasts from their local leader.
+    """
+
+    SENDER = "SENDER"
+    RECEIVER = "RECEIVER"
+    MEMBER = "MEMBER"
+
+
 @dataclass
 class RankCommInfo:
     """Explicit communication plan for a single rank."""
 
-    role: Literal['SENDER', 'RECEIVER', 'MEMBER'] = 'MEMBER'
+    role: CommRole = CommRole.MEMBER
     send_to_ranks: List[int] = field(default_factory=list)
     recv_from_ranks: List[int] = field(default_factory=list)
 
@@ -235,7 +252,7 @@ class BridgeCommunicator:
 
         # Initialize all ranks as MEMBER by default
         for rank in all_ranks:
-            self.comm_map[rank] = RankCommInfo(role='MEMBER')
+            self.comm_map[rank] = RankCommInfo(role=CommRole.MEMBER)
 
         scale_factor = int(src_count / dest_count)
         if scale_factor > 1:
@@ -246,10 +263,14 @@ class BridgeCommunicator:
 
                 # Set up senders
                 for src_rank in src_ranks:
-                    self.comm_map[src_rank] = RankCommInfo(role='SENDER', send_to_ranks=[dest_rank])
+                    self.comm_map[src_rank] = RankCommInfo(
+                        role=CommRole.SENDER, send_to_ranks=[dest_rank]
+                    )
 
                 # Set up receiver
-                self.comm_map[dest_rank] = RankCommInfo(role='RECEIVER', recv_from_ranks=src_ranks)
+                self.comm_map[dest_rank] = RankCommInfo(
+                    role=CommRole.RECEIVER, recv_from_ranks=src_ranks
+                )
         else:
             # Fan-out: fewer source leaders send to more destination leaders
             scale_factor = int(dest_count / src_count)
@@ -258,13 +279,515 @@ class BridgeCommunicator:
                 dest_ranks = dest_tp_leaders[i * scale_factor : (i + 1) * scale_factor]
 
                 # Set up sender
-                self.comm_map[src_rank] = RankCommInfo(role='SENDER', send_to_ranks=dest_ranks)
+                self.comm_map[src_rank] = RankCommInfo(
+                    role=CommRole.SENDER, send_to_ranks=dest_ranks
+                )
 
                 # Set up receivers
                 for dest_rank in dest_ranks:
                     self.comm_map[dest_rank] = RankCommInfo(
-                        role='RECEIVER', recv_from_ranks=[src_rank]
+                        role=CommRole.RECEIVER, recv_from_ranks=[src_rank]
                     )
+
+    def send_forward(self, tensor_to_send: torch.Tensor):
+        """Send forward activation tensor.
+
+        Args:
+            tensor_to_send: The tensor to send to the destination grid
+        """
+        if not self.is_current_rank_in_grid(self.src_grid):
+            raise ValueError(
+                f"[Bridge Communicator] [send_forward] Rank {self.current_rank} "
+                "is not in the source grid."
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+
+        if rank_info.role == CommRole.SENDER:
+            # Send splits to destination ranks
+            num_sends = len(rank_info.send_to_ranks)
+            if num_sends > 0:
+                tensor_splits = self._split_tensor_at_batch_dim(tensor_to_send, num_sends)
+                self._communicate_shapes(tensor_to_send_next=tensor_splits[0])
+                for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
+                    logging.debug(
+                        f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
+                        f"send to rank {dest_rank}"
+                    )
+                    dist.send(tensor_split, dst=dest_rank)
+
+    def recv_forward(self) -> torch.Tensor:
+        """Receive forward activation tensor.
+
+        Args:
+            tensor_shape: Expected tensor shape (None if using shape communication)
+
+        Returns:
+            torch.Tensor: The received activation tensor
+        """
+        # receive forward only gets called on the dest grid
+        if not self.is_current_rank_in_grid(self.dest_grid):
+            raise ValueError(
+                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                "is not in the destination grid."
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+        logging.debug(
+            f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+            f"[src - {self.src_module_name}] [dest - {self.dest_module_name}] "
+            f"rank_info: {rank_info}"
+        )
+        if rank_info.role == CommRole.RECEIVER:
+            assert (
+                self.current_rank == self.dest_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+            # p2p call to receive the tensor
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_prev=True)
+            logging.debug(
+                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
+            )
+            received_tensors_list = []
+            for src_rank, shape in zip(rank_info.recv_from_ranks, recv_forward_shapes):
+                tensor_to_recv = torch.empty(
+                    shape,
+                    device=torch.cuda.current_device(),
+                    dtype=self.comm_dtype,
+                    requires_grad=True,
+                )
+                dist.recv(tensor_to_recv, src=src_rank)
+                logging.debug(
+                    f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                    f"received tensor from src rank {src_rank} "
+                    f"shape {tensor_to_recv.shape} sum {tensor_to_recv.sum()}"
+                )
+                received_tensors_list.append(tensor_to_recv)
+            aggregated_tensor = torch.cat(received_tensors_list, dim=self.dim_mapping['b'])
+            logging.debug(
+                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                f"broadcasting tensor {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
+            )
+
+            # Step 1: broadcast its shape so receivers can allocate
+            shape_tensor = torch.tensor(
+                aggregated_tensor.shape, device=aggregated_tensor.device, dtype=torch.int64
+            )
+            dist.broadcast(shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg)
+
+            # Step 2: broadcast the actual tensor
+            dist.broadcast(
+                aggregated_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
+            )
+
+            return aggregated_tensor
+
+        elif (
+            rank_info.role == CommRole.MEMBER
+            and self.current_rank in self.dest_grid_broadcast_ranks
+        ):
+            # Non-leader rank - participate in broadcast
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
+            )
+
+            received_shape = tuple(shape_tensor.tolist())
+            received_tensor = torch.empty(
+                received_shape,
+                device=torch.cuda.current_device(),
+                dtype=self.comm_dtype,
+                requires_grad=True,
+            )
+
+            # Receive the full tensor via broadcast
+            dist.broadcast(
+                received_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
+            )
+
+            logging.debug(
+                f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
+                f"received tensor via broadcast, shape {received_tensor.shape}"
+            )
+            return received_tensor
+
+    def send_backward(self, grad_tensor: torch.Tensor):
+        """Send backward gradient tensor.
+
+        Note: Gradient senders are activation 'RECEIVERS'
+
+        Args:
+            grad_tensor: The gradient tensor to send back
+        """
+        if not self.is_current_rank_in_grid(self.dest_grid):
+            raise ValueError(
+                f"[Bridge Communicator] [send_backward] Rank {self.current_rank} "
+                "is not in the destination grid."
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+
+        if rank_info.role == CommRole.RECEIVER:
+            assert (
+                self.current_rank == self.dest_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+            # Send gradients back to source ranks
+            num_receives = len(rank_info.recv_from_ranks)
+            tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            self._communicate_shapes(tensor_to_send_prev=tensor_splits[0])
+            if num_receives > 0:
+                for src_rank, tensor_split in zip(rank_info.recv_from_ranks, tensor_splits):
+                    # Send the gradient split back to the source rank
+                    logging.debug(
+                        f"[Bridge Communicator] [send_backward] Rank {self.current_rank} "
+                        f"sending gradient to src rank {src_rank} "
+                        f"shape {tensor_split.shape} sum {tensor_split.sum()}"
+                    )
+                    dist.send(tensor_split, dst=src_rank)
+
+    def recv_backward(self) -> torch.Tensor:
+        """Receive backward gradient tensor.
+
+        Note: Gradient receivers are activation 'SENDERS'
+
+        Args:
+            tensor_shape: Expected gradient tensor shape
+
+        Returns:
+            torch.Tensor: The received gradient tensor
+        """
+        # receive backward only gets called on the src grid
+        if not self.is_current_rank_in_grid(self.src_grid):
+            raise ValueError(
+                f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
+                "is not in the source grid."
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+
+        if rank_info.role == CommRole.SENDER:
+            assert (
+                self.current_rank == self.src_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_next=True)
+            logging.debug(
+                f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
+                f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
+            )
+            # Receive gradient tensors from destination ranks
+            received_gradients_list = []
+            for dest_rank, grad_shape in zip(rank_info.send_to_ranks, recv_grad_shapes):
+                # The destination rank that we sent to will send us gradients back
+                grad_tensor = torch.empty(
+                    grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                )
+                dist.recv(grad_tensor, src=dest_rank)
+                logging.debug(
+                    f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
+                    f"received gradient from dest rank {dest_rank} "
+                    f"shape {grad_tensor.shape} sum {grad_tensor.sum()}"
+                )
+                received_gradients_list.append(grad_tensor)
+
+            # Concatenate received gradients
+            aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+            logging.debug(
+                f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
+                f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
+            )
+
+            shape_tensor = torch.tensor(
+                aggregated_gradient.shape, device=torch.cuda.current_device(), dtype=torch.int64
+            )
+            dist.broadcast(shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg)
+
+            # Scatter the tensors to all ranks in the group
+            dist.broadcast(
+                aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
+            )
+            return aggregated_gradient
+
+        elif (
+            rank_info.role == CommRole.MEMBER and self.current_rank in self.src_grid_broadcast_ranks
+        ):
+            # Non-leader rank - participate in gather for gradients
+            # Receive broadcasted tensor shape from leader rank
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
+            )
+
+            logging.debug(
+                f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
+                f"received shape tensor {shape_tensor}"
+            )
+            received_shape = tuple(shape_tensor.tolist())
+            received_gradient = torch.empty(
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+            )
+
+            dist.broadcast(
+                received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
+            )
+            logging.debug(
+                f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
+                f"received gradient from scatter operation, shape {received_gradient.shape}"
+            )
+            return received_gradient
+
+    def send_forward_recv_backward(
+        self, input_tensor: torch.Tensor, grad_shape: Optional[Tuple[int, ...]] = None
+    ) -> torch.Tensor:
+        """Combined operation: send forward activation and receive backward gradient.
+
+        Args:
+            input_tensor: The tensor to send forward
+            grad_shape: Expected gradient tensor shape
+
+        Returns:
+            torch.Tensor: The received gradient tensor
+        """
+        if not self.is_current_rank_in_grid(self.src_grid):
+            raise ValueError(
+                f"Rank {self.current_rank} is not in the source grid. "
+                "send_forward_recv_backward is only allowed on src grid"
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+        logging.debug(
+            f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
+            f"[src - {self.src_module_name}] [dest - {self.dest_module_name}] "
+            f"rank_info: {rank_info}"
+        )
+        if rank_info.role == CommRole.SENDER:
+            assert (
+                self.current_rank == self.src_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+
+            num_sends = len(rank_info.send_to_ranks)
+            activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
+            # Communicate shapes for both directions (send forward, receive backward)
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
+                tensor_to_send_next=activation_splits[0], recv_next=True
+            )
+            logging.debug(
+                f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
+                f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
+            )
+
+            # Prepare simultaneous send/receive operations
+            if num_sends > 0:
+                # Prepare gradient receive tensors
+                received_gradients_list = []
+                for i, recv_grad_shape in enumerate(recv_grad_shapes):
+                    grad_tensor = torch.empty(
+                        recv_grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                    )
+                    received_gradients_list.append(grad_tensor)
+
+                # Create batch P2P operations for simultaneous send/receive
+                ops = []
+                for dest_rank, activation_split, grad_tensor in zip(
+                    rank_info.send_to_ranks, activation_splits, received_gradients_list
+                ):
+                    # Send activation
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, activation_split, dest_rank
+                        )
+                    )
+                    # Receive gradient
+                    ops.append(
+                        torch.distributed.P2POp(torch.distributed.irecv, grad_tensor, dest_rank)
+                    )
+
+                logging.debug(
+                    f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
+                    f"executing {len(ops)} simultaneous P2P operations"
+                )
+                reqs = torch.distributed.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+                # Concatenate received gradients
+                aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+                logging.debug(
+                    f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
+                    f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
+                )
+                # Broadcast tensor shape to all ranks in scatter_pg
+                tensor_shape_to_broadcast = aggregated_gradient.shape
+                shape_tensor = torch.tensor(
+                    tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
+                )
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
+
+                # Broadcast the tensors to all ranks in the group
+                dist.broadcast(
+                    aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
+
+                return aggregated_gradient
+
+        elif (
+            rank_info.role == CommRole.MEMBER and self.current_rank in self.src_grid_broadcast_ranks
+        ):
+            # participate in both gather for gradients
+            # Receive gradient from leader using broadcast
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
+            )
+
+            # Use the received shape to create tensor for broadcast
+            received_shape = tuple(shape_tensor.tolist())
+            received_gradient = torch.empty(
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+            )
+            dist.broadcast(
+                received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
+            )
+            logging.debug(
+                f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
+                f"received gradient from broadcast, shape {received_gradient.shape}"
+            )
+            return received_gradient
+
+    def send_backward_recv_forward(
+        self, grad_tensor: torch.Tensor, forward_shape: Optional[Tuple[int, ...]] = None
+    ) -> torch.Tensor:
+        """Combined operation: send backward gradient and receive forward activation.
+
+        Args:
+            grad_tensor: The gradient tensor to send backward
+            forward_shape: Expected forward tensor shape
+
+        Returns:
+            torch.Tensor: The received activation tensor
+        """
+        if not self.is_current_rank_in_grid(self.dest_grid):
+            raise ValueError(
+                f"Rank {self.current_rank} is not in the destination grid. "
+                "send_backward_recv_forward is only allowed on dest grid"
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+
+        if rank_info.role == CommRole.RECEIVER:
+            assert (
+                self.current_rank == self.dest_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+
+            num_receives = len(rank_info.recv_from_ranks)
+            gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            # Communicate shapes for both directions (send backward, receive forward)
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
+                tensor_to_send_prev=gradient_splits[0], recv_prev=True
+            )
+            logging.debug(
+                f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
+                f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
+            )
+
+            # Prepare simultaneous send/receive operations
+            if num_receives > 0:
+                # Prepare activation receive tensors
+                received_activations_list = []
+                for i, recv_forward_shape in enumerate(recv_forward_shapes):
+                    activation_tensor = torch.empty(
+                        recv_forward_shape,
+                        device=torch.cuda.current_device(),
+                        dtype=self.comm_dtype,
+                        requires_grad=True,
+                    )
+                    received_activations_list.append(activation_tensor)
+
+                # Create batch P2P operations for simultaneous send/receive
+                ops = []
+                for src_rank, gradient_split, activation_tensor in zip(
+                    rank_info.recv_from_ranks, gradient_splits, received_activations_list
+                ):
+                    # Send gradient
+                    ops.append(
+                        torch.distributed.P2POp(torch.distributed.isend, gradient_split, src_rank)
+                    )
+
+                    # Receive activation
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, activation_tensor, src_rank
+                        )
+                    )
+
+                # Execute all operations simultaneously
+                logging.debug(
+                    f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
+                    f"executing {len(ops)} simultaneous P2P operations"
+                )
+                reqs = torch.distributed.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+                # Concatenate received activations
+                aggregated_activation = torch.cat(received_activations_list, dim=0)
+                logging.debug(
+                    f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
+                    f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
+                )
+
+                # Broadcast tensor shape to all ranks in scatter_pg
+                tensor_shape_to_scatter = aggregated_activation.shape
+                shape_tensor = torch.tensor(
+                    tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
+                )
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
+                )
+
+                # Scatter the tensors to all ranks in the group
+                dist.broadcast(
+                    aggregated_activation, src=self.current_rank, group=self.dest_grid_broadcast_pg
+                )
+                return aggregated_activation
+
+        elif (
+            rank_info.role == CommRole.MEMBER
+            and self.current_rank in self.dest_grid_broadcast_ranks
+        ):
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
+            )
+
+            # Use the received shape to create tensor for scatter operation
+            received_shape = tuple(shape_tensor.tolist())
+            received_activation = torch.empty(
+                received_shape,
+                device=torch.cuda.current_device(),
+                dtype=self.comm_dtype,
+                requires_grad=True,
+            )
+            dist.broadcast(
+                received_activation,
+                src=self.dest_local_leader_rank,
+                group=self.dest_grid_broadcast_pg,
+            )
+            logging.debug(
+                f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank}  "
+                f"received activation from scatter operation, shape {received_activation.shape}"
+            )
+            return received_activation
 
     def _communicate_shapes(
         self,
@@ -290,7 +813,7 @@ class BridgeCommunicator:
             - List of gradient shapes that will be received (empty if not expecting gradients)
         """
         rank_info = self.comm_map.get(self.current_rank)
-        if not rank_info or rank_info.role == 'MEMBER':
+        if not rank_info or rank_info.role == CommRole.MEMBER:
             return [], []
 
         recv_forward_shapes = []
@@ -304,7 +827,7 @@ class BridgeCommunicator:
         recv_forward_shape_tensors = []
         recv_grad_shape_tensors = []
 
-        if rank_info.role == 'SENDER':
+        if rank_info.role == CommRole.SENDER:
             # Prepare send operations for forward shapes
             if tensor_to_send_next is not None:
                 send_shape = tensor_to_send_next.shape
@@ -332,7 +855,7 @@ class BridgeCommunicator:
                         )
                     )
 
-        elif rank_info.role == 'RECEIVER':
+        elif rank_info.role == CommRole.RECEIVER:
             # Prepare receive operations for forward shapes
             if recv_prev:
                 for src_rank in rank_info.recv_from_ranks:
