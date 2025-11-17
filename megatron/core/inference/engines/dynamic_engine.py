@@ -755,7 +755,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_request_count": self.context.total_request_count,
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
-        )
+        }
 
         # Generate tokens.
         range_push("Prefill" if not is_decode_only else "Decode")
@@ -822,21 +822,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        (
-            is_decode_only,
-            total_request_count,
-            paused_request_count,
-            active_token_count,
-            waiting_request_count,
-            finished_request_count,
-            kv_stats,
-            padded_active_token_count,
-            using_cuda_graph_this_step,
-            total_active_block_count,
-            total_paused_block_count,
-            total_active_used_blocks,
-            total_paused_used_blocks,
-        ) = context_state
         # Increment finished_request_count.
         cuda_graph_request_count = None
         if step_result is not None:
@@ -882,7 +867,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.send(payload)
 
         # Log KV cache utilization stats to W&B
-        if kv_stats is not None:
+        if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
@@ -893,7 +878,7 @@ class DynamicInferenceEngine(AbstractEngine):
             }
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
-            for key, value in kv_stats.items():
+            for key, value in context_state["kv_stats"].items():
                 if 'utilization' in key:
                     # Convert to percentage (0-100) and group under kvcache_utilization
                     metrics[f'inference/{key}'] = float(value * 100.0)
@@ -910,7 +895,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Print context state.
         if verbose:
             mem = torch.cuda.memory_stats()
-            step_type = "decode" if is_decode_only else "non-decode"
+            step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
                 "reqs: a %d/%d, p %d/%d, w %d, f %d ... "
@@ -931,22 +916,21 @@ class DynamicInferenceEngine(AbstractEngine):
                             ),
                         )
                     ),
-                    total_request_count - paused_request_count,
-                    total_active_block_count,
-                    paused_request_count,
-                    total_paused_block_count,
-                    waiting_request_count,
-                    finished_request_count,
-                    total_active_used_blocks,
-                    total_active_block_count,
-                    total_paused_used_blocks,
-                    total_paused_block_count,
+                    context_state["total_request_count"] - context_state["paused_request_count"],
+                    context_state["paused_request_count"],
+                    context_state["total_paused_block_count"],
+                    context_state["waiting_request_count"],
+                    context_state["finished_request_count"],
+                    context_state["total_active_used_blocks"],
+                    context_state["total_active_block_count"],
+                    context_state["total_paused_used_blocks"],
+                    context_state["total_paused_block_count"],
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
-            if is_decode_only:
+            if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 
