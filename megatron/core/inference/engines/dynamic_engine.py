@@ -734,7 +734,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
-    async def async_forward(self) -> Tuple[Dict, Tuple, float]:
+    async def async_forward(self) -> Tuple[Dict, Dict, float, int]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
 
@@ -792,14 +792,15 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_active_used_blocks": self.context.block_allocator.get_active_used(),
             "total_paused_used_blocks": self.context.block_allocator.get_paused_used(),
         }
-        context_state = pre_step_context_state + post_step_context_state
+
+        context_state = {**pre_step_context_state, **post_step_context_state}
 
         return result, context_state, step_time, self.step_count
 
     async def async_bookkeep(
         self,
         step_result: Optional[Dict],
-        context_state: Tuple[bool, int, int, int],
+        context_state: Dict,
         step_time: float,
         step_count: int,
         *,
