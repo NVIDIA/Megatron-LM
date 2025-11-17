@@ -1142,6 +1142,8 @@ def validate_args(args, defaults={}):
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
+    if args.fake_process_group:
+        assert not args.enable_gloo_process_groups, "Fake distributed group requires disabling Gloo process groups."
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -2866,6 +2868,10 @@ def _add_distributed_args(parser):
                        "and must be consistent across all ranks.")
     group.add_argument('--replication-factor', default=2, type=int,
                        help="Number of machines storing the replica of a given rank's data.")
+    group.add_argument('--fake-process-group', action='store_true', default=False,
+                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
+                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
+                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 

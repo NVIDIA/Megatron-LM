@@ -1788,7 +1788,9 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            report_memory_flag = False
+            if iteration > 1:
+                # Make sure the memory after the second iteration is reported to include optimizer state memory.
+                report_memory_flag = False
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
