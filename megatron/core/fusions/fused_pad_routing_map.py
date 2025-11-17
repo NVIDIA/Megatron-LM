@@ -4,7 +4,6 @@ from unittest.mock import MagicMock
 import torch
 from packaging import version
 
-from megatron.core.jit import jit_fuser
 from megatron.core.utils import null_decorator
 
 try:
