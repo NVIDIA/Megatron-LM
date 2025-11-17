@@ -223,6 +223,10 @@ class DataParallelInferenceCoordinator:
                         self.router_socket.send_multipart(
                             [client_id, msgpack.packb([header.value, sender_identity], use_bin_type=True)]
                         )
+                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
+                        self.router_socket.send_multipart(
+                            [data_parallel_rank_id, msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)]
+                        )
             elif header in [Headers.STOP_ACK]:
                 # control signal ack from the engine
                 assert sender_identity in self.identities_of_data_parallel_ranks
@@ -233,6 +237,10 @@ class DataParallelInferenceCoordinator:
                     for client_id in known_clients:
                         self.router_socket.send_multipart(
                             [client_id, msgpack.packb([header.value, sender_identity], use_bin_type=True)]
+                        )
+                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
+                        self.router_socket.send_multipart(
+                            [data_parallel_rank_id, msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)]
                         )
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
