@@ -2782,6 +2782,7 @@ class GradReducePipeline:
             outer_fsdp_group_grad_reduce (bool, optional): Whether to reduce gradients
                 across outer-DP groups. Defaults to False.
         """
+        params = sorted(list(params), key=lambda x: self.buffer.param_to_param_group[x])
         for param in params:
             bucket_id = self.buffer.param_to_param_group[param]
             param_group = self.buffer.parameter_groups[bucket_id]
