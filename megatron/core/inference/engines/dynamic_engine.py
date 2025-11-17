@@ -943,12 +943,12 @@ class DynamicInferenceEngine(AbstractEngine):
             len(self.waiting_request_ids),
             self.finished_request_count,
             kvcache_util_stats,
-            context.padded_active_token_count,
-            context.using_cuda_graph_this_step(),
-            context.block_allocator.active_count,
-            context.block_allocator.paused_count,
-            context.block_allcoator.get_active_used(),
-            context.block_allocator.get_paused_used(),
+            self.context.padded_active_token_count,
+            self.context.using_cuda_graph_this_step(),
+            self.context.block_allocator.active_count,
+            self.context.block_allocator.paused_count,
+            self.context.block_allocator.get_active_used(),
+            self.context.block_allocator.get_paused_used(),
         )
         context_state = pre_step_context_state + post_step_context_state
 
@@ -975,7 +975,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Keep for compatibility with current test suite.
         _, context_state, _, _ = last_step_data
-        self.is_decode_only, _, _, _ = context_state
+        self.is_decode_only = context_state[0]
 
         ret = await self.async_bookkeep(*last_step_data, verbose=verbose)
 
@@ -1142,6 +1142,7 @@ class DynamicInferenceEngine(AbstractEngine):
     ):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
+        self.use_coordinator = True
         try:
             while True:
                 self.schedule_requests()
