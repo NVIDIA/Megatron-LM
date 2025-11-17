@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -923,7 +924,7 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._torch_compiled_output_gate(core_attn_out, gate)
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -936,8 +937,8 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
-    @torch.compile
-    def _torch_compiled_output_gate(self, x, gate):
+    @jit_fuser
+    def _apply_output_gate(self, x, gate):
         x_dtype = x.dtype
         gate = gate.contiguous()
         gate = gate.view(*x.shape)
