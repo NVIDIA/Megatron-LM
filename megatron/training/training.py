@@ -87,6 +87,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
@@ -98,7 +99,6 @@ from megatron.core.parallel_state import (
 )
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.hybrid_cp_schedule import HybridCPDataLoaderWrapper
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
