@@ -734,6 +734,68 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
+    async def async_forward(self) -> Tuple[Dict, Tuple, float]:
+        """Uses `asyncio` for continuous generation.
+        Sleeps when no requests are available, until new requests have been added.
+
+        Returns:
+            A tuple comprised of:
+                step_result (Optional[Dict]): The result of the step.
+                context_state (Tuple): A tuple consisting of the state of the context.
+                is_decode_only, total/paused request count, active token count.
+                step_time (float): How long this step took.
+        """
+        # schedule requests
+        self.schedule_waiting_requests()
+
+        # Saving pre-step state, for printing output below.
+        is_decode_only = self.context.is_decode_only()
+        pre_step_context_state = {
+            "is_decode_only": is_decode_only,
+            "total_request_count": self.context.total_request_count,
+            "paused_request_count": self.context.paused_request_count,
+            "active_token_count": self.context.active_token_count,
+        )
+
+        # Generate tokens.
+        range_push("Prefill" if not is_decode_only else "Decode")
+        # TODO @tde: Remember to account for this line when overlapping forward and bookkeep.
+        self.is_decode_only = is_decode_only
+
+        self.step_start_event.record()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        self.step_count += 1
+
+        range_pop()
+
+        if (
+            self.inference_logging_step_interval > 0
+            and step_count > 0
+            and step_count % self.inference_logging_step_interval == 0
+            and self.context.metrics_writer is not None
+        ):
+            kvcache_util_stats = self.context.get_kvcache_utilization_stats()
+        else:
+            kvcache_util_stats = None
+
+        post_step_context_state = {
+            "waiting_request_count": len(self.waiting_request_ids),
+            "finished_request_count": self.finished_request_count,
+            "kv_stats": kvcache_util_stats,
+            "padded_active_token_count": self.context.padded_active_token_count,
+            "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
+            "total_active_block_count": self.context.block_allocator.active_count,
+            "total_paused_block_count": self.context.block_allocator.paused_count,
+            "total_active_used_blocks": self.context.block_allocator.get_active_used(),
+            "total_paused_used_blocks": self.context.block_allocator.get_paused_used(),
+        }
+        context_state = pre_step_context_state + post_step_context_state
+
+        return result, context_state, step_time, self.step_count
+
     async def async_bookkeep(
         self,
         step_result: Optional[Dict],
@@ -894,66 +956,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "cuda_graph_request_count": cuda_graph_request_count,
         }
 
-    async def async_forward(self) -> Tuple[Dict, Tuple, float]:
-        """Uses `asyncio` for continuous generation.
-        Sleeps when no requests are available, until new requests have been added.
-
-        Returns:
-            A tuple comprised of:
-                step_result (Optional[Dict]): The result of the step.
-                context_state (Tuple): A tuple consisting of the state of the context.
-                is_decode_only, total/paused request count, active token count.
-                step_time (float): How long this step took.
-        """
-        # schedule requests
-        self.schedule_waiting_requests()
-
-        # Saving pre-step state, for printing output below.
-        is_decode_only = self.context.is_decode_only()
-        pre_step_context_state = (
-            is_decode_only,
-            self.context.total_request_count,
-            self.context.paused_request_count,
-            self.context.active_token_count,
-        )
-
-        # Generate tokens.
-        range_push("Prefill" if not is_decode_only else "Decode")
-
-        self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        self.step_end_event.record()
-        self.step_end_event.synchronize()
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-        self.step_count += 1
-
-        range_pop()
-
-        if (
-            self.inference_logging_step_interval > 0
-            and step_count > 0
-            and step_count % self.inference_logging_step_interval == 0
-            and self.context.metrics_writer is not None
-        ):
-            kvcache_util_stats = self.context.get_kvcache_utilization_stats()
-        else:
-            kvcache_util_stats = None
-
-        post_step_context_state = (
-            len(self.waiting_request_ids),
-            self.finished_request_count,
-            kvcache_util_stats,
-            self.context.padded_active_token_count,
-            self.context.using_cuda_graph_this_step(),
-            self.context.block_allocator.active_count,
-            self.context.block_allocator.paused_count,
-            self.context.block_allocator.get_active_used(),
-            self.context.block_allocator.get_paused_used(),
-        )
-        context_state = pre_step_context_state + post_step_context_state
-
-        return result, context_state, step_time, self.step_count
-
     async def async_step(
         self, *, verbose: bool = False
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
@@ -972,13 +974,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 3. The step time in seconds.
         """
         last_step_data = await self.async_forward()
-
-        # Keep for compatibility with current test suite.
-        _, context_state, _, _ = last_step_data
-        self.is_decode_only = context_state[0]
-
         ret = await self.async_bookkeep(*last_step_data, verbose=verbose)
-
+        # Keep for compatibility with current test suite.
         return ret
 
     def step_modern(
