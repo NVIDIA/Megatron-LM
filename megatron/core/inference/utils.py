@@ -176,6 +176,7 @@ if sys.version_info < (3, 13):
 
     class asyncio_Queue(asyncio.Queue):
         """An asyncio.Queue with Python 3.13 compatibility features for Python < 3.13."""
+
         def __init__(self, maxsize: int = 0):
             super().__init__(maxsize)
             self._is_shutdown = False
