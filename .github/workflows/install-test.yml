@@ -22,8 +22,8 @@ on:
     branches:
       - dev
       - main
-      - "pull-request/[0-9]+"
-      - "deploy-release/*"
+      - 'pull-request/[0-9]+'
+      - 'deploy-release/*'
   merge_group:
     types: [checks_requested]
 
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        python-version: ['3.12']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        python-version: ['3.12']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -140,6 +140,9 @@ jobs:
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}
