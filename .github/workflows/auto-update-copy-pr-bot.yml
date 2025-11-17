@@ -9,6 +9,7 @@ jobs:
   auto-update-copy-pr-bot:
     runs-on: ubuntu-latest
     environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3

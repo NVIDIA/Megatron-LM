@@ -66,7 +66,7 @@ class TestTextGenerationController:
         else:
             model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
         self.batch_size = batch_size
-        self.hidden_size = 12
+        self.hidden_size = 32
         self.vocab_size = 100
         self.sequence_length = 60 if fp8 else 64  # Test padding for fp8
         transformer_config = TransformerConfig(
