@@ -76,6 +76,7 @@ dev = [
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
+    "setuptools<80.0.0",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
