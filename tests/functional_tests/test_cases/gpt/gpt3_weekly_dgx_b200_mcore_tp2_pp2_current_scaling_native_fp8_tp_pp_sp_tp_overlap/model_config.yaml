@@ -41,7 +41,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 2
   --sequence-parallel: true
   --tp-comm-overlap: true
-  --tp-comm-overlap-cfg: tests/functional_tests/test_cases/gpt/gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap/tp_comm_overlap_cfg.yaml
+  --tp-comm-overlap-cfg: tests/functional_tests/test_cases/gpt/gpt3_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap/tp_comm_overlap_cfg.yaml
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --fp8-format: hybrid

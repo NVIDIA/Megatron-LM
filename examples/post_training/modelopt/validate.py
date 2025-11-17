@@ -2,29 +2,23 @@
 
 """Sample Generate GPT."""
 import functools
+import json
 import os
 import sys
 import warnings
-import json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
-import modelopt
-from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
 import torch
-from datasets import load_dataset
-from tqdm import tqdm
+from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
 
-from megatron.core import mpu
-from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
-from megatron.training.utils import get_ltor_masks_and_position_ids, print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -121,7 +115,7 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
 
     report_current_memory_info()
 

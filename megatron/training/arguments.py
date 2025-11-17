@@ -1234,6 +1234,9 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.cpu_offloading_num_layers > 0:
+        args.cpu_offloading = True
+
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
@@ -1363,9 +1366,13 @@ def _add_transformer_engine_args(parser):
                        dest='fp8')
     # per tensor current scaling recipe selection
     group.add_argument('--fp8-recipe', default='delayed',
-                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise', 'custom'],
                        help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
                        dest='fp8_recipe')
+    group.add_argument('--fp8-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp8_quantizer_factory')
     # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
@@ -1402,9 +1409,13 @@ def _add_transformer_engine_args(parser):
                        help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
                        dest='fp4')
     group.add_argument('--fp4-recipe', default='nvfp4',
-                       choices=['nvfp4'],
+                       choices=['nvfp4', 'custom'],
                        help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
                        dest='fp4_recipe')
+    group.add_argument('--fp4-quantizer-factory', default=None,
+                       help='Python import path to a callable quantizer factory, '
+                            'e.g., package.module.quantizer_factory.',
+                       dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.',
@@ -1469,6 +1480,9 @@ def _add_inference_args(parser):
                        '"full_iteration": captures a whole iteration. '
                        'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer.')
+    group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
+                       help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
+                       dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -1543,7 +1557,11 @@ def _add_inference_args(parser):
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')  
+                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
+                       help='Step interval for logging inference metrics to wandb. '
+                            'Default to 0 to disable inference wandb logging.')
+
     return parser
 
 
@@ -2137,6 +2155,8 @@ def _add_training_args(parser):
                        '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
                        '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
+    group.add_argument('--cpu-offloading-num-layers', type=int, default=0,
+                       help='The number of Transformer layers to offload to CPU.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2353,7 +2373,7 @@ def _add_training_args(parser):
     group.add_argument('--fine-grained-activation-offloading', action='store_true',
                        help='Enable fine-grained activation offloading.')
     group.add_argument('--offload-modules', nargs='*', type=str, default=[],
-                       help='The submodules to offload its input. Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
+                       help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
     group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
                        help='The minimum size of the tensor to be offloaded.')
     group.add_argument('--disable-jit-fuser', action='store_true',
@@ -2716,6 +2736,10 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
+                       'values over the wire (using an all-to-all to keep total communication overhead in line '
+                       'with the standard ring implementation) but performs accumulation locally in FP32.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',

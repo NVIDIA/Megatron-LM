@@ -54,14 +54,25 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
-    from flashattn_hopper.flash_attn_interface import (
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
 
     HAVE_FA3 = True
-except:
+except ImportError as e:
     HAVE_FA3 = False
+
+if not HAVE_FA3:
+    try:
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+
+        HAVE_FA3 = True
+    except ImportError as e:
+        pass
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -165,6 +176,7 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
         world_size = get_pg_size(self.pg_collection.tp)

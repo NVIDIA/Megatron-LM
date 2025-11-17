@@ -71,6 +71,7 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 5000
+  --save-retain-interval: 10000
   # Add initialization args
   --init-method-std: 0.0134
   # Add logging args
@@ -87,6 +88,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 51000
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"
