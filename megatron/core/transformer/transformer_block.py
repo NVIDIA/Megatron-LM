@@ -19,6 +19,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_set_last_layer,
 )
+from megatron.core.pipeline_parallel.moe_packed_offload import (
+    packed_moe_expert_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
@@ -729,6 +732,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if self.config.fine_grained_activation_offloading:
                         fine_grained_offloading_set_last_layer(
                             l_no == self.num_layers_per_pipeline_rank - 1
+                        )
+                    if self.config.packed_moe_expert_offloading:
+                        packed_moe_expert_offloading_set_last_layer(
+                            is_last_layer = (l_no == self.num_layers_per_pipeline_rank - 1)
                         )
 
                     with self.offload_context, inner_quantization_context:

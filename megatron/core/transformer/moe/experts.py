@@ -3,6 +3,7 @@
 import copy
 import itertools
 from copy import deepcopy
+from contextlib import nullcontext
 from functools import partial
 from math import ceil
 from typing import Optional, Tuple
@@ -29,6 +30,12 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
     fine_grained_offloading_group_start,
     get_fine_grained_offloading_context,
+)
+from megatron.core.pipeline_parallel.moe_packed_offload import (
+    packed_moe_expert_offloading_group_start,
+    get_packed_moe_expert_offloading_context,
+    packed_moe_expert_offloading_reset,
+    packed_moe_expert_offloading_group_commit,
 )
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -803,6 +810,12 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
+        self.packed_offload_expert_fc1 = self.config.packed_moe_expert_offloading and "expert_fc1" in self.config.offload_modules
+        self.packed_offload_moe_act = self.config.packed_moe_expert_offloading and "moe_act" in self.config.offload_modules
+        self.packed_offload_expert_fc2 = self.config.packed_moe_expert_offloading and "expert_fc2" in self.config.offload_modules
+
+        if torch.distributed.get_rank() == 0:
+            print(f'packed_offload_expert_fc1 {self.packed_offload_expert_fc1}, packed_offload_moe_act {self.packed_offload_moe_act}, packed_offload_expert_fc2 {self.packed_offload_expert_fc2}')
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -895,7 +908,11 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states = fine_grained_offloading_group_start(
                 permuted_local_hidden_states, name="expert_fc1"
             )
-        with get_fine_grained_offloading_context(self.offload_expert_fc1):
+        if self.packed_offload_expert_fc1:
+            offload_context = get_packed_moe_expert_offloading_context(name="expert_fc1", max_num_tokens=permuted_local_hidden_states.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+        else:
+            offload_context = get_fine_grained_offloading_context(self.offload_expert_fc1)
+        with offload_context:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
             )
@@ -975,16 +992,29 @@ class TEGroupedMLP(MegatronModule):
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_moe_act):
+            if self.packed_offload_moe_act:
+                offload_context = get_packed_moe_expert_offloading_context(name="moe_act", max_num_tokens=fc1_output.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+            else:
+                offload_context = get_fine_grained_offloading_context(self.offload_moe_act)                
+            with offload_context:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+        if self.offload_moe_act:
+            (bias_act_output,) = fine_grained_offloading_group_commit(
+                bias_act_output, name="moe_act", forced_released_tensors=[fc1_output]
+            )
 
-        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
+        if self.packed_offload_expert_fc2:
+            offload_context = get_packed_moe_expert_offloading_context(name="expert_fc2", max_num_tokens=bias_act_output.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+        else:
+            offload_context = nullcontext()
+        with offload_context:
+            output, output_bias = self.linear_fc2(
+                bias_act_output, tokens_per_expert
+            )
+        if self.config.packed_moe_expert_offloading:
+            output = packed_moe_expert_offloading_group_commit(output, name="expert_fc2")
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
-        if self.offload_moe_act:
-            (output,) = fine_grained_offloading_group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
-            )
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
