@@ -376,6 +376,12 @@ class PP_ScheduleFunction(torch.autograd.Function):
             current_stream.wait_stream(offload_manager.pack_stream)
             offload_manager._pack_stream_status = 'idle'
 
+            # Deallocate original tensor after offload is complete
+            while len(offload_manager.packed_tensors_offload_in_progress) > 0:
+                packed_tensor = offload_manager.packed_tensors_offload_in_progress.pop(0)
+                if not DEBUG:
+                    packed_tensor._original_tensor = None
+
         if offload_manager.status == 'captured':
             current_schedule_layer = (ctx.vp_stage+1)*100 + ctx.layer_no*10 + ctx.microbatch_no
             next_schedule_layer = ctx.offload_manager._pp_schedule[ctx.offload_manager.current_schedule_index+1]
@@ -435,6 +441,7 @@ class PackedOffloadManager:
         self._pack_stream_status = 'idle' # idle, offloading
         self._unpack_stream_status = 'idle' # idle, reloading
         self.packed_tensors_to_offload = []
+        self.packed_tensors_offload_in_progress = []
         self.packed_tensors_to_reload = {}
 
         self.iteration = 0
@@ -507,6 +514,7 @@ class PackedOffloadManager:
                     packed_tensor = self.packed_tensors_to_offload.pop(0)
                     packed_tensor.offload_to_stash(self.stash_buffers[packed_tensor.vp_stage][packed_tensor.dtype])
                     self.packed_tensors_to_reload[pp_schedule_layer].append(packed_tensor)
+                    self.packed_tensors_offload_in_progress.append(packed_tensor)
             else:
                 pass
         assert len(self.packed_tensors_to_offload) == 0, f"packed_tensors_to_offload is not empty {self.packed_tensors_to_offload}"
@@ -721,4 +729,5 @@ def packed_moe_expert_offloading_reset():
         offload_manager.current_layer = [1 for _ in range(offload_manager.vp_size)]
         offload_manager.current_microbatch = [1 for _ in range(offload_manager.vp_size)]
         assert len(offload_manager.packed_tensors_to_offload) == 0, f"packed_tensors_to_offload is not empty {offload_manager.packed_tensors_to_offload}"
-    
+        assert len(offload_manager.packed_tensors_offload_in_progress) == 0, f"packed_tensors_offload_in_progress is not empty {offload_manager.packed_tensors_offload_in_progress}"
+
