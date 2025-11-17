@@ -9,6 +9,7 @@ import asyncio
 from typing import Any, AsyncGenerator, Callable, Optional, Type, Union
 
 from megatron.core.inference.inference_request import InferenceRequest
+from megatron.core.utils import get_asyncio_loop
 
 STOP_ITERATION = Exception()
 
@@ -20,12 +21,17 @@ class AsyncStream:
     Adopted from https://github.com/vllm-project/vllm/blob/eb881ed006ca458b052905e33f0d16dbb428063a/vllm/v1/engine/async_stream.py # pylint: disable=line-too-long
     """
 
-    def __init__(self, request_id: int, cancel: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        request_id: int,
+        cancel: Callable[[str], None],
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
         self._request_id = request_id
         self._cancel = cancel
         self._queue: asyncio.Queue = asyncio.Queue()
         self._finished = False
-        self._loop = asyncio.get_running_loop()
+        self._loop = get_asyncio_loop(loop)
 
     def put(self, item: Union[InferenceRequest, Exception]) -> None:
         """Adds a new value to the stream"""
