@@ -63,7 +63,7 @@ RUN bash -ex <<"EOF"
 
     git clone -b tongliu/inter_node https://github.com/Autumn1998/DeepEP.git
     pushd DeepEP
-        git checkout ef73fd9a4c098e09929e48dfd696505ddc8e2043
+        git checkout ea718f06618222db9ed974f662ed187e1064c395
         patch -p1 < /workspace/deepep.patch
     popd
     HYBRID_EP_MULTINODE=0 TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
