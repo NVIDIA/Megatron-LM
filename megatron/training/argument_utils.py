@@ -11,7 +11,10 @@ import ast
 from dataclasses import Field, fields
 
 # TODO: support arg renames
-# TODO: if metadata handles types, ignore exceptions from _extract_type()
+
+class TypeInferenceError(Exception):
+    """Custom exception type to be conditionally handled by ArgumentGroupFactory."""
+    pass
 
 class ArgumentGroupFactory:
     """Utility that adds an argument group to an ArgumentParser based on the attributes of a dataclass.
@@ -67,7 +70,7 @@ class ArgumentGroupFactory:
             if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
                 return self._extract_type(type_tuple[0])
             else:
-                raise TypeError(f"Unions not supported by argparse: {config_type}")
+                raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
 
         elif origin is list:
             if len(type_tuple) == 1:
@@ -75,7 +78,7 @@ class ArgumentGroupFactory:
                 kwargs["nargs"] = "+"
                 return kwargs
             else:
-                raise TypeError(f"Multi-type lists not supported by argparse: {config_type}")
+                raise TypeInferenceError(f"Multi-type lists not supported by argparse: {config_type}")
 
         elif origin is typing.Literal:
             choices_types = [type(choice) for choice in type_tuple]
@@ -83,7 +86,7 @@ class ArgumentGroupFactory:
             kwargs = {"type": choices_types[0], "choices": type_tuple}
             return kwargs
         else:
-            raise TypeError(f"Unsupported type: {config_type}")
+            raise TypeInferenceError(f"Unsupported type: {config_type}")
 
 
     def _build_argparse_kwargs_from_field(self, attribute: Field) -> dict[str, Any]:
@@ -104,20 +107,39 @@ class ArgumentGroupFactory:
         else:
             argparse_kwargs["default"] = attribute.default
 
-        argparse_kwargs.update(self._extract_type(attribute.type))
+        attr_argparse_meta = None
+        if attribute.metadata != {} and "argparse_meta" in attribute.metadata:
+            # save metadata here, but update at the end so the metadata has highest precedence
+            attr_argparse_meta = attribute.metadata["argparse_meta"]
 
-        # use store_true or store_false action for enable/disable flags, which doesn't accept a 'type'
-        if argparse_kwargs["type"] == bool:
-            argparse_kwargs["action"] = "store_true" if attribute.default == False else "store_false"
-            argparse_kwargs.pop("type")
 
-            # add '--no-*' and '--disable-*' prefix if this is a store_false argument
-            if argparse_kwargs["action"] == "store_false":
-                argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+        # if we cannot infer the argparse type, all of this logic may fail. we try to defer
+        # to the developer-specified metadata if present
+        try:
+            argparse_kwargs.update(self._extract_type(attribute.type))
+
+            # use store_true or store_false action for enable/disable flags, which doesn't accept a 'type'
+            if argparse_kwargs["type"] == bool:
+                argparse_kwargs["action"] = "store_true" if attribute.default == False else "store_false"
+                argparse_kwargs.pop("type")
+
+                # add '--no-*' and '--disable-*' prefix if this is a store_false argument
+                if argparse_kwargs["action"] == "store_false":
+                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+        except TypeInferenceError as e:
+            if attr_argparse_meta is not None:
+                print(
+                    f"WARNING: Inferring the appropriate argparse argument type from {self.src_cfg_class} "
+                    f"failed for {attribute.name}: {attribute.type}.\n"
+                    "Deferring to attribute metadata. If the metadata is incomplete, 'parser.add_argument()' may fail.\n"
+                    f"Original failure: {e}"
+                )
+            else:
+                raise e
 
         # metadata provided by field takes precedence 
-        if attribute.metadata != {} and "argparse_meta" in attribute.metadata:
-            argparse_kwargs.update(attribute.metadata["argparse_meta"])
+        if attr_argparse_meta is not None:
+            argparse_kwargs.update(attr_argparse_meta)
 
         return argparse_kwargs
 
