@@ -221,11 +221,17 @@ class DataParallelInferenceCoordinator:
                 if len(self.data_parallel_pause_acks) == self.data_parallel_size:
                     for client_id in known_clients:
                         self.router_socket.send_multipart(
-                            [client_id, msgpack.packb([header.value, sender_identity], use_bin_type=True)]
+                            [
+                                client_id,
+                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
+                            ]
                         )
                     for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
                         self.router_socket.send_multipart(
-                            [data_parallel_rank_id, msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)]
+                            [
+                                data_parallel_rank_id,
+                                msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True),
+                            ]
                         )
             elif header == Headers.STOP_ACK:
                 # control signal ack from the engine
@@ -236,11 +242,17 @@ class DataParallelInferenceCoordinator:
                 if len(self.data_parallel_stop_acks) == self.data_parallel_size:
                     for client_id in known_clients:
                         self.router_socket.send_multipart(
-                            [client_id, msgpack.packb([header.value, sender_identity], use_bin_type=True)]
+                            [
+                                client_id,
+                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
+                            ]
                         )
                     for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
                         self.router_socket.send_multipart(
-                            [data_parallel_rank_id, msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)]
+                            [
+                                data_parallel_rank_id,
+                                msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True),
+                            ]
                         )
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
@@ -258,7 +270,12 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
+<<<<<<< HEAD
                                 [header.value, client_request_identity, finished_request_record], use_bin_type=True
+=======
+                                [header.value, client_request_identity, finished_request],
+                                use_bin_type=True,
+>>>>>>> 03e4c6ca49 (lint)
                             ),
                         ]
                     )
