@@ -78,6 +78,7 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+        self.ep_rank = utils.get_pg_rank(self.ep_group)
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
@@ -1001,10 +1002,15 @@ class _HybridEPManager(_DispatchManager):
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor, budget_local: int = None):
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
+        #if torch.distributed.get_rank() == 0:
+        #    print (f'setup_metadata budget_local {budget_local}')
+        if budget_local is not None:
+            self.num_dispatched_tokens = budget_local
+            self.num_permuted_tokens = budget_local
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = num_tokens * self.config.moe_router_topk
@@ -1050,11 +1056,12 @@ class _HybridEPManager(_DispatchManager):
             )
         )
 
-        if not self.drop_and_pad:
-            self.tokens_per_expert = tokens_per_expert
+        if self.num_permuted_tokens is None:
+            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # self.num_permuted_tokens is necessary to allocate the output tensor for permute
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-
+        if self.config.moe_expert_capacity_factor_for_packed_offloading is not None:
+            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
     def combine(
@@ -1369,6 +1376,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 "Please set --moe-flex-dispatcher-backend=deepep or "
                 "--moe-flex-dispatcher-backend=hybridep"
             )
+        self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
+        self.budget_local_gpu = None
 
     def set_shared_experts(self, shared_experts):
         raise NotImplementedError(
@@ -1400,6 +1409,14 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             .expand(-1, -1, self.tp_size, -1)
             .reshape(num_local_tokens, world_size, self.num_local_experts)
         ).contiguous()
+
+        if self.packed_offloading_capacity_factor is not None:
+            budget_local = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
+            #if self.ep_rank == 0:
+            #    print (f'budget_local {budget_local} = {routing_map.shape[0]} x {self.config.moe_router_topk} x {self.packed_offloading_capacity_factor}')
+            self.budget_local_gpu = torch.full((1,), budget_local, device='cuda')
+        else:
+            self.budget_local_gpu = None
         return routing_map, probs
 
     @jit_fuser
@@ -1426,7 +1443,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
-        self._comm_manager.setup_metadata(routing_map, probs)
+        budget_local = None
+        if self.packed_offloading_capacity_factor is not None:
+            budget_local = int(routing_map.shape[0] * self.config.moe_router_topk  * self.packed_offloading_capacity_factor)
+#            if self.ep_rank == 0:
+#                print (f'budget_local {budget_local} = {routing_map.shape[0]} x {self.config.moe_router_topk} x {self.packed_offloading_capacity_factor}')
+        self._comm_manager.setup_metadata(routing_map, probs, budget_local)
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(

@@ -21,6 +21,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.moe_packed_offload import (
+    packed_moe_expert_offloading_init_chunk_handler,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -473,6 +476,13 @@ class GPTModel(LanguageModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
+    def preprocess_for_packed_moe_expert_offloading(self):
+        """Preprocess for packed moe expert offloading."""
+        return packed_moe_expert_offloading_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_stage=self.vp_stage,
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -505,6 +515,9 @@ class GPTModel(LanguageModule):
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
+        if self.config.packed_moe_expert_offloading:
+            self.preprocess_for_packed_moe_expert_offloading()
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         preproc_output = self._preprocess(
@@ -526,6 +539,7 @@ class GPTModel(LanguageModule):
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
+
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -813,6 +827,8 @@ class GPTModel(LanguageModule):
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+        if self.config.packed_moe_expert_offloading:
+            self.preprocess_for_packed_moe_expert_offloading()
 
         from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 

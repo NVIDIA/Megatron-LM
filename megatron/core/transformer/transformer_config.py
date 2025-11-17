@@ -742,6 +742,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
 
+    moe_expert_capacity_factor_for_packed_offloading: Optional[float] = None
+    """moe_expert_capacity_factor_for_packed_offloading (float): The capacity factor for each expert, None means no token
+    will be dropped. The default is None."""
     ##################
     # Context Parallel
     ##################
@@ -924,6 +927,10 @@ class TransformerConfig(ModelParallelConfig):
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
+
+    packed_moe_expert_offloading: bool = False
+    """If True, enable packed moe expert offloading."""
+
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1320,6 +1327,17 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+        if self.packed_moe_expert_offloading:
+            assert (
+                not self.cpu_offloading and not self.fine_grained_activation_offloading
+            ), "packed_moe_expert_offloading cannot be enabled with cpu_offloading."
+            assert self.offload_modules is not None and len(self.offload_modules) > 0
+            allowed_modules = {"expert_fc1", "expert_fc2", "moe_act"}
+            invalid_modules = set(self.offload_modules) - allowed_modules
+            assert not invalid_modules, (
+                f'Invalid choices for offload_modules: {invalid_modules}. '
+                f'Allowed modules are: {allowed_modules}'
+            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
