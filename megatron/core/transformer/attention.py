@@ -1279,67 +1279,69 @@ class SelfAttention(Attention):
                 self.num_query_groups_per_partition,
             ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
                 but {grouped_max_attn_logits.shape}"
-            qk_clip_balancing_eta = torch.clamp(
+            self.qk_clip_balancing_eta = torch.clamp(
                 self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
             ).view(self.num_query_groups_per_partition, 1, 1)
-            assert torch.all(qk_clip_balancing_eta <= 1.0)
+            assert torch.all(self.qk_clip_balancing_eta <= 1.0)
 
             # Handle different weight access patterns (main_param vs direct access)
             if hasattr(self.linear_qkv.weight, 'main_param'):
-                weight = self.linear_qkv.weight.main_param.data
-            else:
-                weight = self.linear_qkv.weight.data
-
-            # Reshape to (g, query_projection_size + 2 * kv_projection_size, -1)
-            weight_reshaped = weight.view(
-                self.num_query_groups_per_partition,
-                (self.query_projection_size + 2 * self.kv_projection_size)
-                // self.num_query_groups_per_partition,
-                -1,
-            )
-
-            # Split into query_projection_size and 2 * kv_projection_size parts:
-            # (n, a, -1) and (n, b, -1)
-            weight_q = weight_reshaped[
-                :, : self.query_projection_size // self.num_query_groups_per_partition, :
-            ]
-            weight_k = weight_reshaped[
-                :,
-                self.query_projection_size
-                // self.num_query_groups_per_partition : (
-                    self.query_projection_size + self.kv_projection_size
+                self.linear_qkv.weight.main_param.data.copy_(
+                    self._clip_linear_qkv(self.linear_qkv.weight.main_param.data)
                 )
-                // self.num_query_groups_per_partition,
-                :,
-            ]
-            weight_v = weight_reshaped[
-                :,
-                (self.query_projection_size + self.kv_projection_size)
-                // self.num_query_groups_per_partition :,
-                :,
-            ]
 
-            # extend the qk_clip_balancing_eta to the same shape as weight_q and weight_k
-            qk_clip_balancing_eta_extended = qk_clip_balancing_eta.repeat(1, weight_q.size(1), 1)
-
-            # Clipping
-            weight_q.mul_(torch.pow(qk_clip_balancing_eta_extended, self.config.qk_clip_alpha))
-            weight_k.mul_(torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
-
-            # Concatenate back and reshape to original shape
-            weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
-            weight_updated = weight_updated.view(
-                self.query_projection_size + 2 * self.kv_projection_size, -1
-            )
-
-            # Apply the updated weights
-            if hasattr(self.linear_qkv.weight, 'main_param'):
-                self.linear_qkv.weight.main_param.data.copy_(weight_updated)
-            else:
-                self.linear_qkv.weight.data.copy_(weight_updated)
+            self.linear_qkv.weight.data.copy_(self._clip_linear_qkv(self.linear_qkv.weight.data))
 
         # reset current_max_attn_logits
         self.core_attention.current_max_attn_logits = None
+
+    def _clip_linear_qkv(self, weight):
+        """Apply qkclip to linear_qkv layer"""
+        # Reshape to (g, query_projection_size + 2 * kv_projection_size, -1)
+        weight_reshaped = weight.view(
+            self.num_query_groups_per_partition,
+            (self.query_projection_size + 2 * self.kv_projection_size)
+            // self.num_query_groups_per_partition,
+            -1,
+        )
+
+        # Split into query_projection_size and 2 * kv_projection_size parts:
+        # (n, a, -1) and (n, b, -1)
+        weight_q = weight_reshaped[
+            :, : self.query_projection_size // self.num_query_groups_per_partition, :
+        ]
+        weight_k = weight_reshaped[
+            :,
+            self.query_projection_size
+            // self.num_query_groups_per_partition : (
+                self.query_projection_size + self.kv_projection_size
+            )
+            // self.num_query_groups_per_partition,
+            :,
+        ]
+        weight_v = weight_reshaped[
+            :,
+            (self.query_projection_size + self.kv_projection_size)
+            // self.num_query_groups_per_partition :,
+            :,
+        ]
+
+        # extend the qk_clip_balancing_eta to the same shape as weight_q and weight_k
+        self.qk_clip_balancing_eta_extended = self.qk_clip_balancing_eta.repeat(
+            1, weight_q.size(1), 1
+        )
+
+        # Clipping
+        weight_q.mul_(torch.pow(self.qk_clip_balancing_eta_extended, self.config.qk_clip_alpha))
+        weight_k.mul_(torch.pow(self.qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
+
+        # Concatenate back and reshape to original shape
+        weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)
+        weight_updated = weight_updated.view(
+            self.query_projection_size + 2 * self.kv_projection_size, -1
+        )
+
+        return weight_updated
 
 
 class CrossAttention(Attention):
