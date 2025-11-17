@@ -323,14 +323,14 @@ def get_requests_from_file(
     )
 
     # Update sampling params with per-prompt values.
-    sampling_params_list = []
+    sampling_params_list = [sampling_params] * len(prompts)
     if args.num_tokens_from_file:
         if sampling_params is None:
             sampling_params = get_default_sampling_params(tokenizer.eod)
         for i in range(len(prompts)):
             sp = copy.deepcopy(sampling_params)
             sp.num_tokens_to_generate = num_tokens_to_generate[i]
-            sampling_params_list.append(sp)
+            sampling_params_list[i] = sp
 
     # Init requests.
     requests = [
