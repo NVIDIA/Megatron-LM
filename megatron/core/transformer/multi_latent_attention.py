@@ -1003,10 +1003,8 @@ class MLASelfAttention(MultiLatentAttention):
             weight_q_pe = weight_reshaped[:, self.config.qk_head_dim :, :]
 
             # Clipping
-            weight_q_nope = weight_q_nope * torch.pow(
-                qk_clip_balancing_eta, self.config.qk_clip_alpha
-            )
-            weight_q_pe = weight_q_pe * qk_clip_balancing_eta
+            weight_q_nope.mul_(torch.pow(qk_clip_balancing_eta, self.config.qk_clip_alpha))
+            weight_q_pe.mul_(qk_clip_balancing_eta)
 
             # Concatenate back and reshape to original shape
             weight_q_updated = torch.cat([weight_q_nope, weight_q_pe], dim=1)
@@ -1043,7 +1041,7 @@ class MLASelfAttention(MultiLatentAttention):
             weight_v = weight_reshaped[:, self.config.qk_head_dim :, :]
 
             # Clipping
-            weight_k = weight_k * torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha)
+            weight_k.mul(torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
 
             # Concatenate back and reshape to original shape
             weight_kv_updated = torch.cat([weight_k, weight_v], dim=1)
