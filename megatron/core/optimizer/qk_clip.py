@@ -2,8 +2,10 @@
 
 import torch
 
+from megatron.core import mpu
 
-def clip_qk(model, log_only=False) -> float:
+
+def clip_qk(model, log_max_only=False) -> float:
     """
     Clip the QK attention logits to the threshold, recommended for Muon optimizer.
 
@@ -15,17 +17,23 @@ def clip_qk(model, log_only=False) -> float:
         The maximum attention logit, a float.
     """
 
-    log_max_attention_logit = 0
-    for model_chunk in model:
-        for transformer_layer in model_chunk.module.module.decoder.layers:
-            if hasattr(transformer_layer.self_attention, 'clip_qk'):
-                log_max_attention_logit = max(
-                    log_max_attention_logit,
-                    torch.max(
-                        transformer_layer.self_attention.core_attention.current_max_attn_logits
-                    ).item(),
-                )
-                if not log_only:
-                    transformer_layer.self_attention.clip_qk()
+    with torch.no_grad():
+        log_max_attention_logit = 0
+        for model_chunk in model:
+            for transformer_layer in model_chunk.module.module.decoder.layers:
+                if hasattr(transformer_layer.self_attention, 'clip_qk'):
+                    torch.distributed.all_reduce(
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits,
+                        op=torch.distributed.ReduceOp.MAX,
+                        group=mpu.get_data_parallel_group(),
+                    )
+                    log_max_attention_logit = max(
+                        log_max_attention_logit,
+                        torch.max(
+                            transformer_layer.self_attention.core_attention.current_max_attn_logits
+                        ).item(),
+                    )
+                    if not log_max_only:
+                        transformer_layer.self_attention.clip_qk()
 
     return log_max_attention_logit

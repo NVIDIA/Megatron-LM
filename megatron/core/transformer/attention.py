@@ -1229,10 +1229,8 @@ class SelfAttention(Attention):
             qk_clip_balancing_eta_extended = qk_clip_balancing_eta.repeat(1, weight_q.size(1), 1)
 
             # Clipping
-            weight_q = weight_q * torch.pow(
-                qk_clip_balancing_eta_extended, self.config.qk_clip_alpha
-            )
-            weight_k = weight_k * torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha)
+            weight_q.mul_(torch.pow(qk_clip_balancing_eta_extended, self.config.qk_clip_alpha))
+            weight_k.mul_(torch.pow(qk_clip_balancing_eta, 1 - self.config.qk_clip_alpha))
 
             # Concatenate back and reshape to original shape
             weight_updated = torch.cat([weight_q, weight_k, weight_v], dim=1)

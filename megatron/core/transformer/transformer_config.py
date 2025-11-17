@@ -193,8 +193,7 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
     qk_clip: bool = False
-    """Whether to clip the query and key weights. Introduced in TE 2.9.0. Needed for Muon LLM 
-    training."""
+    """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
 
     qk_clip_alpha: float = 0.5
     """The balancing alpha for qk-clip. Q = Q * (eta ** alpha)"""
@@ -203,7 +202,8 @@ class TransformerConfig(ModelParallelConfig):
     """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
 
     log_max_attention_logit: bool = False
-    """Whether to log the max attention logit, decoupled from qk-clip."""
+    """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
+    defualts to False. Setting qk_clip will automatically log the max logit"""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
