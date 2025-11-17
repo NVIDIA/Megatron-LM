@@ -618,12 +618,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
 
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
-
         # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
         # consistent input shapes, which is required to use cuda graphs.
         # During these steps, the `*_cudagraph_only`
