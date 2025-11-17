@@ -102,7 +102,7 @@ class DynamicEngineTestConfig:
     model_provider: str = "gpt"
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
-    skip_prompt_log_probs_for_dynamic_inference: bool = False
+    skip_prompt_log_probs: bool = False
     cuda_graph_scope: List[str] = None
     force_build_cuda_graphs: bool = False
     # If False, do not build cuda graphs in the tests, even if
