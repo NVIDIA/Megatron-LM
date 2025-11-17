@@ -650,15 +650,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             `with ctx_manager:`."""
             if self.is_hybrid_model:
                 self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
-                mamba_tensor_shape = (
-                    self.num_mamba_layers,
-                    self.max_total_requests,
-                ) + self.mamba_conv_states_shape
                 self.mamba_conv_states = torch.zeros(
-                    mamba_tensor_shape, dtype=self.params_dtype, device=torch.cuda.current_device()
+                    (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
                 )
                 self.mamba_ssm_states = torch.zeros(
-                    mamba_tensor_shape, dtype=self.params_dtype, device=torch.cuda.current_device()
+                    (self.num_mamba_layers, self.max_total_requests) + self.mamba_ssm_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
                 )
 
             else:
