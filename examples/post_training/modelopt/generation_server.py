@@ -4,6 +4,7 @@
 import os
 import sys
 import warnings
+from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 import os
@@ -11,6 +12,10 @@ import sys
 from argparse import Namespace
 from contextlib import nullcontext
 
+import torch
+
+from megatron.core import mpu
+from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -19,13 +24,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-import torch
-
-from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
-from megatron.training import get_model
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.text_generation import beam_search_and_post_process
 from megatron.inference.text_generation.mcore_engine_server import (
@@ -33,15 +31,10 @@ from megatron.inference.text_generation.mcore_engine_server import (
     run_mcore_engine,
 )
 from megatron.inference.text_generation_server import MegatronServer
-from megatron.training import print_rank_0
-
-from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
+from megatron.post_training.arguments import add_modelopt_args
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-
-
-from megatron.post_training.arguments import add_modelopt_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
@@ -144,9 +137,10 @@ def main(model_provider: str = "gpt"):
         load_context = fp8_model_init()
     with load_context:
 
-        from megatron.post_training.model_provider import model_provider as modelopt_model_provider
+        from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+        from model_provider import model_provider as root_model_provider
         if model_provider == "gpt":
-            model = get_model(modelopt_model_provider, wrap_with_ddp=False)
+            model = get_model(partial(root_model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
         elif model_provider == "mamba":
             pass
         else:

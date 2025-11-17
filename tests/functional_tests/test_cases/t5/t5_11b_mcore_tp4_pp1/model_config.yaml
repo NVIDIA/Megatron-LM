@@ -54,7 +54,6 @@ MODEL_ARGS:
   --legacy-tokenizer: true
 TEST_TYPE: regular
 METRICS:
-  - "iteration-time"
   - "lm loss"
   - "num-zeros"
   - "mem-allocated-bytes"
