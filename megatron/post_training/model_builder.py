@@ -2,13 +2,11 @@
 
 """ModelOpt GPT model provider."""
 
-import json
 import os
 from argparse import Namespace
 from typing import Any, Dict
 
 import modelopt.torch.distill as mtd
-import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -33,6 +31,7 @@ def count_parameters_in_layer(model, layer_name):
             num_params += param.numel()
             print_rank_0(f" - {name}: {param.numel()}")
     return num_params
+
 
 def _add_load_convert_hooks(model: MCoreGPTModel):
     """Register some load_state_dict prehooks to handle some known state_dict key mismatch.
@@ -130,22 +129,19 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
     return teacher
 
 
-def model_provider(pre_process=True, post_process=True, parallel_output=True) -> MCoreGPTModel:
+def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, config=None) -> MCoreGPTModel | MCoreMambaModel:
     """Builds the model.
 
-    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
-
     Args:
+        args (Namespace): The arguments namespace.
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-        parallel_output (bool): whether to allgather the output logits? This must be
-            True if `model_provider` is called in text_generation_server.
+        vp_stage (int, optional): The virtual pipeline stage.
+        config (TransformerConfig, optional): The configuration object.
 
     Returns:
-        MCoreGPTModel: The returned model
+        MCoreGPTModel | MCoreMambaModel: The returned model
     """
-    args = get_args()
-
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
@@ -166,6 +162,8 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         config.yarn_mscale_all_dim = 0.0
         config.yarn_correction_range_round_to_int = False
 
+    if vp_stage is not None:
+        raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
     if args.use_legacy_models:
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
@@ -174,8 +172,8 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
     # Llama-4 Scout/Maverick support
-    config.qk_l2_norm = args.export_qk_l2_norm 
-    config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input 
+    config.qk_l2_norm = args.export_qk_l2_norm
+    config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input
 
     if args.export_model_type == "GPTModel":
         if args.export_offline_model:
@@ -216,7 +214,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
-            "parallel_output": parallel_output,
+            "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
@@ -257,7 +255,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
 
     # [IMPORTANT] Load modelopt_state immediately before returning the model back to `get_model()`.
-    # 
+    #
     # ModelOpt can create additional trainable parameters (e.g. for online speculative
     # decoding training or PEFT). Hence resuming modelopt_state during checkpoint loading is already
     # too late since Megatron created the optimizer right after calling model_provider before loading
