@@ -50,8 +50,8 @@ MODEL_ARGS:
   --output-path: ${TENSORBOARD_PATH}
   --output-every-n-results: 32
   --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
-  --prompt-file-num-truncate: 512
-  --incoming-requests-per-step: 64
+  --prompt-file-num-truncate: 1024
+  --incoming-requests-per-step: 128
   --use-flashinfer-fused-rope: true
   --throughput-check-only: true
 METRICS:
