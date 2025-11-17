@@ -309,7 +309,8 @@ def get_requests_from_file(
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
             prompts.append(json.loads(line)["text"])
-            num_tokens_to_generate.append(json.loads(line)["chatgpt_output_token_length"])
+            if args.num_tokens_from_file:
+                num_tokens_to_generate.append(json.loads(line)["chatgpt_output_token_length"])
             if len(prompts) == args.prompt_file_num_truncate:
                 break
 
