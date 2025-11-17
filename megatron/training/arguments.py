@@ -1248,6 +1248,12 @@ def validate_args(args, defaults={}):
         if is_te_min_version("2.10.0"):
             assert os.getenv("NVTE_CPU_OFFLOAD_V1", "0") == "1", \
                 "For fine-grained activation offloading with TE >= 2.10.0, NVTE_CPU_OFFLOAD_V1 should be set to 1 to avoid offloading weights."
+        assert not args.packed_moe_expert_offloading, "Fine-grained activation offloading and packed moe expert offloading cannot be enabled at the same time"
+
+    if args.packed_moe_expert_offloading:
+        assert args.transformer_impl == 'transformer_engine', \
+            "Packed moe expert offloading is only supported with transformer_engine implementation"
+        assert not args.fine_grained_activation_offloading, "Packed moe expert offloading and fine-grained activation offloading cannot be enabled at the same time"
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -1467,6 +1473,8 @@ def _add_inference_args(parser):
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
+    group.add_argument('--moe-expert-capacity-factor-for-packed-offloading', type=float, default=None,
+                       help='The capacity factor for each EP rank when packed offloading is enabled.')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
