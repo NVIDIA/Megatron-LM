@@ -1042,6 +1042,28 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    def should_run_dummy_forward_for_expert_model_parallelism(self):
+        """Determines if a dummy forward pass should be run on this rank. 
+        This is used to keep expert parallel ranks in sync when some ranks have no work to do.
+        """
+        if parallel_state.get_expert_model_parallel_world_size() == 1:
+            return False
+        local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
+        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        # all reduce local work across expert model parallel group
+
+        local_work_tensor = torch.tensor(
+            [local_work], device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(
+            local_work_tensor,
+            op=torch.distributed.ReduceOp.SUM,
+            group=expert_model_parallel_group,
+        )
+        global_work = local_work_tensor.item()
+        return (local_work == 0 and global_work > 0)
+            
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None, verbose: Optional[bool] = False
@@ -1054,6 +1076,19 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.stopped:
                     self.stop()
                     return
+                local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
+                expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+                # all reduce local work across expert model parallel group
+                
+                # we need to run dummy forwards in the case of expert model parallelism
+                # when there's some work on other EP ranks but not on this one.
+                if self.should_run_dummy_forward_for_expert_model_parallelism():
+                    self.controller.dummy_forward()
+                    # the continue is extremely important to avoid premature pauses/stops 
+                    # example - say this rank has received a stop signal but others still have work
+                    # if we don't continue here, this rank will process the stop signal
+                    # and stop the engine prematurely 
+                    continue
 
                 # for the cases below (engine is paused or no active requests),
                 # do not use asyncio.sleep(0)

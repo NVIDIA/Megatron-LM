@@ -832,6 +832,12 @@ class TextGenerationController:
         ret.update(request_bookkeeping)
         return ret
 
+    def dummy_forward(self):
+        rank = torch.distributed.get_rank()
+        print(f"Rank {rank} dummy forward called")
+        return self.inference_wrapped_model.dummy_forward()
+        
+
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
         self, loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1472,3 +1478,5 @@ class TextGenerationController:
             output_log_probs,
         )
         list(ret)
+
+        
