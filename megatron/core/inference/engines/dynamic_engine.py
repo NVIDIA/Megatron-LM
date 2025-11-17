@@ -741,7 +741,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A tuple comprised of:
                 step_result (Optional[Dict]): The result of the step.
-                context_state (Tuple): A tuple consisting of the state of the context.
+                context_state (Dict): A tuple consisting of the state of the context.
                 is_decode_only, total/paused request count, active token count.
                 step_time (float): How long this step took.
         """
@@ -810,7 +810,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Args:
             step_result (Optional[Dict]): The result of the step.
-            context_state (Tuple): is_decode_only, total/paused request count, active token count.
+            context_state (Dict): is_decode_only, total/paused request count, active token count.
             step_time (float): How long this step took.
             step_count (int): The count of the step.
             verbose (bool): Whether to run in verbose mode.
