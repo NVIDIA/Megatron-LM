@@ -1161,32 +1161,30 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
-            self.padded_active_token_count = self.padded_batch_dimensions.token_count
-            self.padded_active_request_count = self.padded_batch_dimensions.req_count
         else:
-            self.padded_batch_dimensions = InferenceBatchDimensions()
-            self.padded_batch_dimensions.token_count = self.round_up_tokens(self.active_token_count)
+            padded_token_count = self.round_up_tokens(self.active_token_count)
             if self.is_decode_only():
-                self.padded_batch_dimensions.token_count = min(
+                padded_token_count = min(
                     self.max_tokens,
                     self.max_active_requests,
                     self.round_up_tokens(self.active_token_count),
                 )
-                self.padded_batch_dimensions.decode_req_count = (
-                    self.padded_batch_dimensions.token_count
-                )
-                self.padded_batch_dimensions.prefill_req_count = 0
+                padded_decode_req_count = padded_token_count
+                padded_prefill_req_count = 0
             else:
                 target_padding_req_count = min(
                     self.max_active_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
                 )
-                self.padded_batch_dimensions.decode_req_count = self.num_decode_requests
-                self.padded_batch_dimensions.prefill_req_count = (
-                    target_padding_req_count - self.padded_batch_dimensions.decode_req_count
-                )
-            self.padded_active_token_count = self.padded_batch_dimensions.token_count
-            self.padded_active_request_count = self.padded_batch_dimensions.req_count
+                padded_decode_req_count = self.num_decode_requests
+                padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
+            self.padded_batch_dimensions = InferenceBatchDimensions(
+                token_count=padded_token_count,
+                prefill_req_count=padded_prefill_req_count,
+                decode_req_count=padded_decode_req_count,
+            )
+        self.padded_active_token_count = self.padded_batch_dimensions.token_count
+        self.padded_active_request_count = self.padded_batch_dimensions.req_count
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -1215,10 +1213,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.using_cuda_graph_this_step():
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
-                attn_dimensions.prefill_req_count = (
-                    attn_dimensions.req_count - self.padded_batch_dimensions.decode_req_count
+                total_req = batch_dimensions.req_count
+                adjusted_decode_req_count = self.padded_batch_dimensions.decode_req_count
+                adjusted_prefill_req_count = total_req - adjusted_decode_req_count
+                attn_dimensions = InferenceBatchDimensions(
+                    token_count=batch_dimensions.token_count,
+                    prefill_req_count=adjusted_prefill_req_count,
+                    decode_req_count=adjusted_decode_req_count,
                 )
-                attn_dimensions.decode_req_count = self.padded_batch_dimensions.decode_req_count
 
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,

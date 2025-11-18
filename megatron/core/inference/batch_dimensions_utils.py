@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 
-@dataclass(order=True)
+@dataclass(order=True, frozen=True)
 class InferenceBatchDimensions:
     """Batch dimensions for dynamic inference.
 
