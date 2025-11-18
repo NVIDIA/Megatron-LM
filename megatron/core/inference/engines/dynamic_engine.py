@@ -464,9 +464,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.engine_loop_task = loop.create_task(
             self.run_engine_with_coordinator(loop=loop, verbose=verbose)
         )
-        self.engine_loop_task = asyncio.create_task(
-            self.run_engine_with_coordinator(verbose=verbose)
-        )
 
     @contextmanager
     @staticmethod
