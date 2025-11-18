@@ -50,6 +50,7 @@ DOCKER_BUILDKIT=1 docker build \
     --builder=container \
     --build-arg JET_API_VERSION=$JET_API_VERSION \
     --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID} \
+    --cache-from type=registry,ref=${IMAGE}-buildcache:dev \
     --cache-from type=registry,ref=${IMAGE}-buildcache:main \
     --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
     --push \
