@@ -153,7 +153,7 @@ def get_object_path(change) -> str:
     return None
 
 
-def should_skip_change(change, filtered_paths: set, debug=False) -> bool:
+def should_skip_change(change, filtered_paths: set) -> bool:
     """Check if a breaking change should be skipped based on filters."""
     path = get_object_path(change)
     if not path:
@@ -163,34 +163,18 @@ def should_skip_change(change, filtered_paths: set, debug=False) -> bool:
     # e.g., "Class.__init__(param)" -> "Class.__init__"
     clean_path = path.split('(')[0] if '(' in path else path
     
-    # Debug specific paths
-    if debug and ('ModelParallelConfig' in path or 'DistributedDataParallel' in path):
-        print(f"\n  🔍 DEBUG matching:", file=sys.stderr)
-        print(f"     Original path: {path}", file=sys.stderr)
-        print(f"     Clean path: {clean_path}", file=sys.stderr)
-        print(f"     Filtered paths: {filtered_paths}", file=sys.stderr)
-    
     # Check exact match
     if clean_path in filtered_paths or path in filtered_paths:
-        if debug and ('ModelParallelConfig' in path or 'DistributedDataParallel' in path):
-            print(f"     ✓ EXACT MATCH!", file=sys.stderr)
         return True
     
     # Check if it's a child of a filtered object
     # e.g., MyClass.__init__ is child of MyClass, MyClass.attr is child of MyClass
     for filtered_path in filtered_paths:
         if clean_path.startswith(filtered_path + '.'):
-            if debug and ('ModelParallelConfig' in path or 'DistributedDataParallel' in path):
-                print(f"     ✓ CHILD MATCH with: {filtered_path}", file=sys.stderr)
             return True
         # Also check the original path in case parameter names matter
         if path.startswith(filtered_path + '.'):
-            if debug and ('ModelParallelConfig' in path or 'DistributedDataParallel' in path):
-                print(f"     ✓ CHILD MATCH (orig) with: {filtered_path}", file=sys.stderr)
             return True
-    
-    if debug and ('ModelParallelConfig' in path or 'DistributedDataParallel' in path):
-        print(f"     ✗ NO MATCH", file=sys.stderr)
     
     return False
 
