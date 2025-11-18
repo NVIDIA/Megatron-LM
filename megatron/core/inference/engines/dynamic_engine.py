@@ -375,16 +375,7 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
-<<<<<<< HEAD
             verbose (bool): Whether to run in verbose mode.
-
-        Note:
-            The current implementation uses `ipc` sockets for broadcasting requests
-            within a Tensor Parallel group, which limits each TP group to a single
-            physical node. For example, if you have 8 GPUs per node, then this will only
-            work with TP=[1,2,4,8]
-=======
->>>>>>> a28d34db94 (Clean up DP coord unit-test and code reuse)
         """
 
         assert HAVE_ZMQ, (
@@ -1285,7 +1276,6 @@ class DynamicInferenceEngine(AbstractEngine):
         for socket in self.zmq_sockets:
             socket.close()
         self.zmq_context.term()
-        parallel_state.destroy_model_parallel()
 
     @trace_async_exceptions
     async def run_engine(
@@ -1306,7 +1296,6 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
                         )
                     )
-
                 await self.async_step(verbose=verbose)
         except asyncio.CancelledError:
             pass
@@ -1345,7 +1334,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.suspend()
                     await asyncio.sleep(0.02)
                     continue
-
                 else:
                     self.resume()
 
