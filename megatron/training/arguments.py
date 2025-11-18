@@ -1143,7 +1143,10 @@ def validate_args(args, defaults={}):
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
     if args.fake_process_group:
-        assert not args.enable_gloo_process_groups, "Fake distributed group requires disabling Gloo process groups."
+        # Disable nan check for fake process group
+        args.check_for_nan_in_loss_and_grad = False
+        # Disable gloo process groups for fake process group
+        args.enable_gloo_process_groups = False
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
