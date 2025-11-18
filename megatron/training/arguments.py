@@ -1076,6 +1076,7 @@ def validate_args(args, defaults={}):
             args.fim_eod_token,
         ]
         assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
+        assert not args.legacy_tokenizer, "FIM dataset is not supported with legacy tokenizers."
         assert args.fim_rate, "--fim-rate should be specified."
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
