@@ -1,5 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
+import multiprocessing
+
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -133,3 +136,28 @@ def tensor_swap(x, src_idxs, dst_idxs):
     Swap x[src_idxs] and x[dst_idxs]
     """
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
+
+
+async def await_process_event(
+    event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
+) -> None:
+    """Repeatedly wait for a multiprocessing event to be set, aborting upon process failure.
+
+    Note that the timeout in this function is only for checking process liveness.
+    Its value should be set to a relatively high number. The only problem a high timeout
+    introduces is that an error is raised slighly later.
+    The timeout does not have any effect on the event-waiting, only on process failure detection.
+
+    Args:
+        event: The multiprocessing event to wait on.
+        process: The process to monitor for failure.
+        timeout: The timeout for each wait iteration in seconds.
+    """
+    while True:
+        signal = await asyncio.to_thread(event.wait, timeout)
+        if signal:
+            return
+        if not process.is_alive():
+            raise RuntimeError(
+                f"Process {process.name} (pid {process.pid}) has exited unexpectedly."
+            )

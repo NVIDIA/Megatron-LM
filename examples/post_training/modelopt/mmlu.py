@@ -14,10 +14,11 @@ from datasets import load_dataset
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_provider import model_provider
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -28,6 +29,7 @@ def add_mmlu_args(parser):
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
     group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
     group.add_argument("--lower-bound", type=float, default=None)
+    group.add_argument("--no-subject-prompt", action="store_true", help="Use empty prompt instead of subject-based prompt.")
     add_modelopt_args(parser)
     return parser
 
@@ -101,17 +103,20 @@ def format_example(example, include_answer: bool = True):
     for choice, answer in zip(["A", "B", "C", "D"], example["choices"]):
         prompt += "\n{}. {}".format(choice, answer)
     if include_answer:
-        prompt += "Answer: {}\n\n".format(example["answer"])
+        prompt += "\nAnswer: {}\n\n".format(["A", "B", "C", "D"][example["answer"]])
     else:
         prompt += "\nAnswer:"
     return prompt
 
 
-def generate_prompt(test_example, dev_examples, few_shots=0):
+def generate_prompt(test_example, dev_examples, few_shots=0, no_subject_prompt=False):
     """Generating few-shot prompts."""
-    prompt = "The following are multiple choice questions (with answers) about {}.\n\n".format(
-        " ".join(test_example["subject"].split("_"))
-    )
+    if no_subject_prompt:
+        prompt = ""
+    else:
+        prompt = "The following are multiple choice questions (with answers) about {}.\n\n".format(
+            " ".join(test_example["subject"].split("_"))
+        )
     for i in range(few_shots):
         prompt += format_example(dev_examples[i])
     prompt += format_example(test_example, include_answer=False)
@@ -144,12 +149,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
-    report_current_memory_info()
-
-    # Materialize the model from meta device to gpu before loading the checkpoint.
-    unwrapped_model = unwrap_model(model)[0]
-    unwrapped_model.to_empty(device="cuda")
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
@@ -159,6 +159,9 @@ if __name__ == "__main__":
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
+
+    unwrapped_model = unwrap_model(model)[0]
+    unwrapped_model.eval()
 
     all_subjects = get_all_subjects()
 
@@ -172,12 +175,13 @@ if __name__ == "__main__":
         for idx, test_example in enumerate(test_data):
             if idx > args.fraction * len(test_data):
                 break
-            prompt = generate_prompt(test_example, dev_data, few_shots=0)
+            prompt = generate_prompt(test_example, dev_data, few_shots=0, no_subject_prompt=args.no_subject_prompt)
             label = ["A", "B", "C", "D"][test_example["answer"]]
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = simple_generate(
-                unwrapped_model, tokens.input_ids.cuda(), osl=2, disable_tqdm=disable_tqdm
-            )
+            with torch.no_grad():
+                generated_ids = simple_generate(
+                    unwrapped_model, tokens.input_ids.cuda(), osl=2, disable_tqdm=disable_tqdm
+                )
             predict = tokenizer.batch_decode(generated_ids)[0].strip()
             correct += [True] if predict.startswith(label) else [False]
         all_correct[subject] = correct

@@ -1,0 +1,61 @@
+name: Auto Update Copy PR Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  auto-update-copy-pr-bot:
+    runs-on: ubuntu-latest
+    environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Fetch list of members in mcore-reviewers team
+        shell: bash -euxo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          #!/bin/bash
+
+          get_members() {
+              local org=$1 team=$2 seen_file=$3    
+
+              gh api "/orgs/$org/teams/$team/members" --paginate --jq '.[].login' >> "$seen_file"
+              
+              gh api "/orgs/$org/teams/$team/teams" --paginate --jq '.[].slug' | while read -r child; do
+                  get_members "$org" "$child" "$seen_file"
+              done
+
+              cat "$seen_file"
+          }
+
+          tmp=$(mktemp)
+          echo "" > final.txt
+          get_members "NVIDIA" "mcore-engineers" "$tmp" | sort -u >> final.txt && rm "$tmp"
+
+          tmp=$(mktemp)
+          get_members "NVIDIA" "mcore-reviewers" "$tmp" | sort -u >> final.txt && rm "$tmp"
+
+          cat final.txt | jq -sR 'split("\n") | map(select(. != "")) | flatten | unique'
+
+          export TRUSTEES=$(cat final.txt | jq -csR 'split("\n") | map(select(. != "")) | flatten | unique')
+          yq '.trustees_override = env(TRUSTEES)' .github/copy-pr-bot.yaml | yq -o yaml > .github/copy-pr-bot.yaml.new
+
+          mv .github/copy-pr-bot.yaml.new .github/copy-pr-bot.yaml
+
+      - name: Commit changes
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/NVIDIA/Megatron-LM.git
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/copy-pr-bot.yaml
+          if git diff --cached --exit-code --quiet; then
+            echo "No changes to commit. Exiting gracefully."
+            exit 0
+          fi
+          git commit -m "Update copy-pr-bot.yaml [skip ci]"
+          git push
