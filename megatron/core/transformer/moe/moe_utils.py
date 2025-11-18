@@ -6,7 +6,10 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp4_utils import get_fp4_align_size
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -1006,6 +1009,15 @@ def router_gating_linear(
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+
+
+def get_align_size_for_quantization(config: TransformerConfig):
+    """Get the alignment size for quantization."""
+    if config.fp8:
+        return get_fp8_align_size(config.fp8_recipe)
+    elif config.fp4:
+        return get_fp4_align_size(config.fp4_recipe)
+    return 16
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
