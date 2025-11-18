@@ -63,6 +63,7 @@ class TestInferenceWandbLogging:
             active_buffer_size_gb=active_buffer_size_gb,
             block_size_tokens=block_size_tokens,
             metrics_writer=metrics_writer,
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
     @pytest.mark.internal
@@ -236,6 +237,7 @@ class TestInferenceWandbLogging:
             num_cuda_graphs=None,
             active_buffer_size_gb=0.01,  # Small buffer to force pausing
             block_size_tokens=32,
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
         # Add multiple requests to potentially trigger pausing
