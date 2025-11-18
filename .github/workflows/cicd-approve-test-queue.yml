@@ -23,6 +23,7 @@ jobs:
   approve-queue:
     runs-on: ubuntu-latest
     environment: main
+    if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
         branch: [main, dev, others]

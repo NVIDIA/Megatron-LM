@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Union
@@ -14,6 +15,9 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.utils import Split
 
 LowLevelDataset = Union[IndexedDataset, Iterable]
+
+
+_PAD_TOKEN_ID = -1
 
 
 class MegatronDataset(ABC, torch.utils.data.Dataset):
@@ -65,6 +69,49 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         self.unique_description_hash = hashlib.md5(
             self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
+
+        # Handle pad token id provided by the tokenizer
+        try:
+            self._pad_token_id = self.config.tokenizer.pad
+        except Exception:
+            self._pad_token_id = _PAD_TOKEN_ID
+
+        # Check if pad token id collides with any other special tokens
+        try:
+            _special_tokens_list = [
+                v for k, v in self.config.tokenizer.special_tokens_dict.items() if k != "pad_token"
+            ]
+        except (AttributeError, IndexError, ValueError):
+            _special_tokens_list = []
+        # If the tokenizer does not have a special_tokens_dict attribute, at least check eos and eod
+        if not _special_tokens_list:
+            try:
+                _special_tokens_list.append(self.config.tokenizer.eos)
+            except (AttributeError, NotImplementedError):
+                pass
+            try:
+                _special_tokens_list.append(self.config.tokenizer.eod)
+            except (AttributeError, NotImplementedError):
+                pass
+
+        if self._pad_token_id in _special_tokens_list:
+            if self.config.allow_ambiguous_pad_tokens:
+                # This will break training, but users must explicitly opt-in to this behavior.
+                warnings.warn(
+                    "The pad token id in the tokenizer collides with another special token id. "
+                    "This may cause instability and lack of covergence during training. "
+                    "Do not ignore this warning if you do not understand the implications. "
+                )
+            else:
+                # Reset the pad token id to a value which is guaranteed not to be in the dataset.
+                self._pad_token_id = _PAD_TOKEN_ID
+                warnings.warn(
+                    "The pad token id in the tokenizer collides with another special token id. "
+                    "This may cause instability and lack of covergence during training. "
+                    "As such, the training flow will avoid masking out any pad tokens already "
+                    "present in the dataset. If you would like to disable this behavior, "
+                    "please provide a tokenizer with a uniquely-defined pad token id."
+                )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
