@@ -136,7 +136,7 @@ class CUDAGraphBatchDimensionBuilder:
         tp_size: int,
         num_cuda_graphs: Optional[int],
         cuda_graph_max_tokens: int,
-        cuda_graph_mixed_prefill_count: int,
+        cuda_graph_mixed_prefill_count: Optional[int],
         max_requests: int,
         max_tokens: int,
         max_sequence_length: int,
@@ -200,7 +200,7 @@ class CUDAGraphBatchDimensionBuilder:
             if (
                 cuda_graph_max_tokens is None
                 or cuda_graph_max_tokens > max_tokens
-                or cuda_graph_max_tokens < 0
+                or cuda_graph_max_tokens <= 0
             ):
                 cuda_graph_max_tokens = max_tokens
             num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
@@ -222,7 +222,7 @@ class CUDAGraphBatchDimensionBuilder:
                 cuda_graph_token_counts = list(
                     range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
                 )
-                if cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
+                if len(cuda_graph_token_counts) == 0 or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
                     cuda_graph_token_counts.append(cuda_graph_max_tokens)
                 cuda_graph_token_counts.reverse()
 

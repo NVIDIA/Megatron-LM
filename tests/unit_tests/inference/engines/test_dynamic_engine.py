@@ -643,7 +643,6 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            # num_cuda_graphs, updated_expected_values
             (0, [16384]),
             (1, [16384]),
             (2, [16384, 8192]),
