@@ -7,7 +7,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.enums import Fp8Recipe
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -191,6 +191,19 @@ class TransformerConfig(ModelParallelConfig):
 
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
+
+    qk_clip: bool = False
+    """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
+
+    qk_clip_alpha: float = 0.5
+    """The balancing alpha for qk-clip. Q = Q * (eta ** alpha)"""
+
+    qk_clip_threshold: float = 100
+    """The balancing threshold for qk-clip. eta = min(threshold / max_attention_logits, 1.0)"""
+
+    log_max_attention_logit: bool = False
+    """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
+    defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
@@ -382,10 +395,10 @@ class TransformerConfig(ModelParallelConfig):
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
 
     fp8_recipe: Optional[str] = "delayed"
-    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
+    """If set, enables the use of FP8 precision through Transformer Engine. There are 5 predefined
     choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
-    4) 'blockwise' for blockwise scaling recipe."""
+    4) 'blockwise' for blockwise scaling recipe, 5) 'custom' for custom quantization recipe."""
 
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
@@ -393,6 +406,10 @@ class TransformerConfig(ModelParallelConfig):
     will be converted to fp8; for example, biases will remain unchanged. The parameters affected are
     primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
     determined by TE."""
+
+    fp8_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp8_recipe is custom."""
 
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
@@ -454,6 +471,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, keep the parameters in fp4 precision to save memory. This option must be used
     together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
     will be converted to fp4; for example, biases will remain unchanged."""
+
+    fp4_quantizer_factory: Optional[str] = None
+    """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
+    Required when fp4_recipe is custom."""
 
     ####################
     # MoE related
@@ -693,7 +714,7 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_scope: Optional[List[str]] = None
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
-    "moe_router", "moe_preprocess", "mamba". None means ["attn", "mlp"].
+    "moe_router", "moe_preprocess", "mamba". None means the full layer.
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
@@ -913,6 +934,14 @@ class TransformerConfig(ModelParallelConfig):
                         f"({max_bf16_layers_per_pipeline_stage})."
                     )
 
+            if self.fp8_recipe == Fp8Recipe.custom:
+                if not self.fp8_quantizer_factory:
+                    raise ValueError(
+                        "fp8_quantizer_factory must be provided when fp8_recipe is 'custom'. "
+                        "Specify a Python import path (e.g., package.module.quantizer_factory) "
+                        "via --fp8-quantizer-factory."
+                    )
+
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
@@ -922,6 +951,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp4 and self.fp8:
             raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")
+
+        if self.fp4 and self.fp4_recipe == Fp4Recipe.custom:
+            if not self.fp4_quantizer_factory:
+                raise ValueError(
+                    "fp4_quantizer_factory must be provided when fp4_recipe is 'custom'. "
+                    "Specify a Python import path (e.g., package.module.quantizer_factory) "
+                    "via --fp4-quantizer-factory."
+                )
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
@@ -1555,6 +1592,8 @@ class TransformerConfig(ModelParallelConfig):
                     'use cuda_graph_impl=transformer_engine instead.'
                 )
                 self.cuda_graph_impl = "transformer_engine"
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = []
         if self.cuda_graph_impl != "none":
             assert self.cuda_graph_impl in [
                 "transformer_engine",
@@ -1563,8 +1602,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
-            if self.cuda_graph_scope is None:
-                self.cuda_graph_scope = []
             elif not isinstance(self.cuda_graph_scope, list):
                 assert isinstance(self.cuda_graph_scope, str), (
                     "cuda_graph_scope must be a string or a list of strings, "
