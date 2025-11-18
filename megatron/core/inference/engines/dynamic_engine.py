@@ -553,7 +553,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
             log_probs: (List): Log probs for each request
-            top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to 
+            top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
 
         Returns:
@@ -566,9 +566,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
-        for req_idx, (request_id, token, request_log_probs) in enumerate(zip(
-            request_ids.tolist(), sample.tolist(), log_probs_iter
-        )):
+        for req_idx, (request_id, token, request_log_probs) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
+        ):
             request: DynamicInferenceRequest = self.requests[request_id]
             if request_id != self.context.chunked_prefill_request_id:
                 request.generated_tokens.append(token)
@@ -603,47 +603,37 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Process top_n_logprobs if available
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     # Initialize lists if they don't exist
-                    if not hasattr(request, 'prompt_top_n_logprobs') or request.prompt_top_n_logprobs is None:
+                    if request.prompt_top_n_logprobs is None:
                         request.prompt_top_n_logprobs = []
-                    if not hasattr(request, 'generated_top_n_logprobs') or request.generated_top_n_logprobs is None:
+                    if request.generated_top_n_logprobs is None:
                         request.generated_top_n_logprobs = []
-                    
+
                     top_n_data_list = top_n_logprobs[req_idx]
-                    
-                    # Similar logic to log_probs: if we have > 1 token, we're in prefill
-                    if len(top_n_data_list) > 1:
-                        # Prefill mode - add all but last token to prompt_top_n_logprobs
-                        # Last token is for first generated token
-                        for top_n_values, top_n_indices in top_n_data_list[:-1]:
-                            logit_dict = {}
-                            for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
-                                key = self.controller.tokenizer.detokenize([logprob_index])
-                                logit_dict[key] = logprob
-                            request.prompt_top_n_logprobs.append(logit_dict)
-                        # Add the last token to generated_top_n_logprobs (first generated token)
-                        top_n_values, top_n_indices = top_n_data_list[-1]
+                    prompt_length = len(request.prompt_tokens)
+
+                    # Process each token's top-n logprobs
+                    for top_n_values, top_n_indices in top_n_data_list:
                         logit_dict = {}
-                        for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
+                        for logprob, logprob_index in zip(
+                            top_n_values.tolist(), top_n_indices.tolist()
+                        ):
                             key = self.controller.tokenizer.detokenize([logprob_index])
                             logit_dict[key] = logprob
-                        request.generated_top_n_logprobs.append(logit_dict)
-                    else:
-                        # Decode mode - single token
-                        for top_n_values, top_n_indices in top_n_data_list:
-                            logit_dict = {}
-                            for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
-                                key = self.controller.tokenizer.detokenize([logprob_index])
-                                logit_dict[key] = logprob
-                            
-                            # Handle chunked prefill case similar to log_probs
-                            if (
-                                len(request.prompt_top_n_logprobs) > 0
-                                and len(request.prompt_top_n_logprobs) < len(request.prompt_tokens) - 1
-                                and not self.context.materialize_only_last_token_logits
-                            ):
-                                request.prompt_top_n_logprobs.append(logit_dict)
-                            else:
-                                request.generated_top_n_logprobs.append(logit_dict)
+
+                        # Simple decision: check total count accumulated so far
+                        total_accumulated = len(request.prompt_top_n_logprobs) + len(
+                            request.generated_top_n_logprobs
+                        )
+
+                        # If return_prompt_top_n_logprobs is True and we haven't reached prompt end,
+                        # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
+                        if (
+                            request.sampling_params.return_prompt_top_n_logprobs
+                            and total_accumulated < prompt_length - 1
+                        ):
+                            request.prompt_top_n_logprobs.append(logit_dict)
+                        else:
+                            request.generated_top_n_logprobs.append(logit_dict)
 
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
@@ -678,24 +668,48 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_log_probs = []
                         request.prompt_log_probs.extend(request_log_probs)
                         request.generated_log_probs = []
-                
+
                 # Process top_n_logprobs for chunked prefill if available
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    # Initialize lists if they don't exist
+                    if (
+                        not hasattr(request, 'prompt_top_n_logprobs')
+                        or request.prompt_top_n_logprobs is None
+                    ):
+                        request.prompt_top_n_logprobs = []
+                    if (
+                        not hasattr(request, 'generated_top_n_logprobs')
+                        or request.generated_top_n_logprobs is None
+                    ):
+                        request.generated_top_n_logprobs = []
+
                     top_n_data_list = top_n_logprobs[req_idx]
+                    prompt_length = len(request.prompt_tokens)
+
                     for top_n_values, top_n_indices in top_n_data_list:
                         # Convert to dictionary format: {token_str: logprob}
                         logit_dict = {}
-                        for logprob, logprob_index in zip(top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()):
+                        for logprob, logprob_index in zip(
+                            top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
+                        ):
                             key = self.controller.tokenizer.detokenize([logprob_index])
                             logit_dict[key] = logprob
-                        
-                        # Initialize lists if they don't exist
-                        if not hasattr(request, 'prompt_top_n_logprobs') or request.prompt_top_n_logprobs is None:
-                            request.prompt_top_n_logprobs = []
-                        
-                        # For chunked prefill, append to prompt_top_n_logprobs
-                        request.prompt_top_n_logprobs.append(logit_dict)
-                
+
+                        # Simple decision: check total count accumulated so far
+                        total_accumulated = len(request.prompt_top_n_logprobs) + len(
+                            request.generated_top_n_logprobs
+                        )
+
+                        # If return_prompt_top_n_logprobs is True and we haven't reached prompt end,
+                        # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
+                        if (
+                            request.sampling_params.return_prompt_top_n_logprobs
+                            and total_accumulated < prompt_length - 1
+                        ):
+                            request.prompt_top_n_logprobs.append(logit_dict)
+                        else:
+                            request.generated_top_n_logprobs.append(logit_dict)
+
                 active_requests.append(request)
 
         return active_requests, finished_requests
@@ -843,10 +857,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Mark requests finished.
             [self.requests[i].add_event_finish() for i in finished_request_ids.tolist()]
-
             # Add finished events.
             (active_requests, finished_requests) = self.post_process_requests(
-                active_request_ids, finished_request_ids, step_time, sample, log_probs, top_n_logprobs
+                active_request_ids,
+                finished_request_ids,
+                step_time,
+                sample,
+                log_probs,
+                top_n_logprobs,
             )
 
         else:

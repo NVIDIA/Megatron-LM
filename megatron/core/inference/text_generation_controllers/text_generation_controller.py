@@ -104,6 +104,9 @@ class TextGenerationController:
         self.return_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.skip_prompt_log_probs_cuda = torch.empty(max_requests, dtype=torch.bool, device=device)
         self.top_n_logprobs_cuda = torch.empty(max_requests, dtype=torch.int32, device=device)
+        self.return_prompt_top_n_logprobs_cuda = torch.empty(
+            max_requests, dtype=torch.bool, device=device
+        )
 
         # Used for inefficient torch sampling.
         self.torch_sampling_buckets: List[Tensor] = []
@@ -628,6 +631,9 @@ class TextGenerationController:
         self.top_n_logprobs_cuda[:active_request_count] = request_metadata[
             :, request_metadata_labels["top_n_logprobs"]
         ].to(dtype=torch.int32, copy=True, non_blocking=True)
+        self.return_prompt_top_n_logprobs_cuda[:active_request_count] = request_metadata[
+            :, request_metadata_labels["return_prompt_top_n_logprobs"]
+        ].to(dtype=torch.bool, copy=True, non_blocking=True)
 
         if backend == "torch":
             # Bucketize the core sampling parameters.
@@ -715,7 +721,6 @@ class TextGenerationController:
     def _dynamic_step_top_n_logprobs_bookkeeping(self) -> bool:
         """Perform bookkeeping necessary to compute top-n log probs for dynamic batching."""
         context = self.inference_wrapped_model.inference_context
-        materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -736,9 +741,11 @@ class TextGenerationController:
         )
         return ret
 
-    def _dynamic_step_calculate_top_n_logprobs(self, logits: Tensor) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
+    def _dynamic_step_calculate_top_n_logprobs(
+        self, logits: Tensor
+    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """Calculate top-n log probs from logits for dynamic batching.
-        
+
         Returns:
             A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
             Each tuple in the list represents one token position.
@@ -748,14 +755,11 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Last token logits
-        if materialize_only_last_token_logits:
-            last_token_logits = logits.squeeze(0)
-        else:
-            last_token_logits = context.last_token_logits(logits)
-
         # Handle decode-only mode (only last token)
         if materialize_only_last_token_logits or context.is_decode_only():
+            # In decode mode or when only last token logits are materialized,
+            # logits already represent only the last tokens
+            last_token_logits = logits.squeeze(0)
             # Compute log probabilities only for last tokens
             log_probs = F.log_softmax(last_token_logits.float(), dim=-1)
             top_n_results = {}
@@ -763,38 +767,50 @@ class TextGenerationController:
                 top_n = int(self.top_n_logprobs_cuda[req_idx].item())
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
-                    top_n_logits = torch.topk(log_probs[req_idx], k=min(top_n, log_probs.size(-1)))
-                    top_n_results[req_idx] = [(top_n_logits.values.cpu(), top_n_logits.indices.cpu())]
+                    top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
+                    top_n_results[req_idx] = [
+                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                    ]
             return top_n_results if top_n_results else None
 
-        # Handle prefill mode - need to extract top-n for all tokens per request
+        # Handle prefill mode - need to extract top-n for tokens per request
         # This follows the same pattern as calculate_log_probs in dynamic_context.py
-        # Compute log probabilities for all tokens (only in prefill mode)
         # Note: logits may be padded, so we only take the first active_token_count tokens
-        log_probs = F.log_softmax(logits.squeeze(0)[:context.active_token_count].float(), dim=-1)
-        
+        log_probs = F.log_softmax(logits.squeeze(0)[: context.active_token_count].float(), dim=-1)
+
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
         ]
-        
+
         # Split log_probs across request boundaries
         # log_probs has shape [active_token_count, vocab_size]
         log_probs_per_request = log_probs.split(active_query_lengths.tolist(), dim=0)
-        
+
         top_n_results = {}
         for req_idx in range(active_request_count):
             top_n = int(self.top_n_logprobs_cuda[req_idx].item())
             if top_n > 0:
-                request_log_probs = log_probs_per_request[req_idx]  # [num_tokens_for_request, vocab_size]
-                # For each token in this request, get top-n
-                top_n_per_token = []
-                for token_idx in range(request_log_probs.size(0)):
-                    top_n_logits = torch.topk(
-                        request_log_probs[token_idx], 
-                        k=min(top_n, request_log_probs.size(-1))
-                    )
-                    top_n_per_token.append((top_n_logits.values.cpu(), top_n_logits.indices.cpu()))
-                top_n_results[req_idx] = top_n_per_token
+                request_log_probs = log_probs_per_request[
+                    req_idx
+                ]  # [num_tokens_for_request, vocab_size]
+                return_prompt_top_n = bool(self.return_prompt_top_n_logprobs_cuda[req_idx].item())
+
+                # If return_prompt_top_n_logprobs is False, only compute for last token
+                if not return_prompt_top_n and request_log_probs.size(0) > 1:
+                    # Only compute top-n for the last token (first generated token)
+                    top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
+                    top_n_results[req_idx] = [
+                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                    ]
+                else:
+                    # Compute top-n for all tokens in the request
+                    top_n_per_token = []
+                    for token_idx in range(request_log_probs.size(0)):
+                        top_n_logits = torch.topk(request_log_probs[token_idx], k=top_n)
+                        top_n_per_token.append(
+                            (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                        )
+                    top_n_results[req_idx] = top_n_per_token
 
         return top_n_results if top_n_results else None
 
