@@ -468,6 +468,14 @@ Exit codes:
                 filtered_count = len(all_breaking_changes_raw) - len(breaking_changes)
                 print(f"   Filtered out {filtered_count} duplicate/excluded changes (aliases, excluded code, circular paths)", file=sys.stderr)
             
+            # Categorize breaking changes by type
+            if breaking_changes:
+                from collections import Counter
+                change_types = Counter(change.kind.value for change in breaking_changes)
+                print(f"\n   📊 Breaking changes by type:", file=sys.stderr)
+                for change_type, count in sorted(change_types.items(), key=lambda x: -x[1]):
+                    print(f"      • {change_type}: {count}", file=sys.stderr)
+            
             if breaking_changes:
                 all_breaking_changes.extend([(package_name, change) for change in breaking_changes])
                 all_success = False
