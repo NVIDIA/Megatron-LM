@@ -109,7 +109,8 @@ def compile_allocator():
             warnings.warn(f"Failed to create unified memory mempool: '{e}'.")
             _compilation_state = CompilationState.FAILURE
 
-        # Synchronize failure state across ranks.
+        # Synchronize failure state across ranks. (For currently unknown reasons,
+        # one rank can show as FAILURE while the remaining ranks show as SUCCESS.)
         import torch
         local_state = torch.tensor(
             [ _compilation_state.value ],
@@ -125,11 +126,6 @@ def compile_allocator():
         if CompilationState.FAILURE.value in world_states:
             _compilation_state = CompilationState.FAILURE
 
-        # >>>
-        from lutil import pax, print_seq
-        # pax("local_state, world_states")
-        print_seq("_compilation_state: %s (%s)." % (_compilation_state, _compilation_state.value))
-        # <<<
 
 def create_unified_mempool() -> "MemPool":
     """Create a unified memory mempool using CUDA managed memory.

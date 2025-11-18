@@ -232,8 +232,8 @@ class TestDynamicInferenceEngine:
             # this is for compatibility with the LTS environment
         )
         # >>>
-        from lutil import print_seq
-        print_seq("uvm: %d." % context.unified_memory_level)
+        # from lutil import print_seq
+        # print_seq("uvm: %d." % context.unified_memory_level)
         # <<<
 
         return context
@@ -1174,7 +1174,7 @@ class TestDynamicInferenceEngine:
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 if __name__ == "__main__":
     test = TestDynamicInferenceEngine()
-    test.test_simple("gpt", None, "full")
-    # test.test_simple("mamba", None, "full")
+    # test.test_simple("gpt", None, "full")
+    test.test_simple("mamba", None, "full")
     print("~~~\nsuccess.")
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
