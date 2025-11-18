@@ -633,7 +633,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 answer_idx = np.random.choice(weight_list.shape[0], 1, p=weight_list)[0]
                 cur_answer = answer_list[answer_idx]
             else:
-                cur_answer = sample.answers
+                cur_answer = sample.answers['value']
         else:
             raise NotImplementedError("Unsupported data type provided", sample)
 
