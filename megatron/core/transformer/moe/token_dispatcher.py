@@ -8,7 +8,6 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.tensor_parallel import (
@@ -25,6 +24,7 @@ from megatron.core.transformer.moe.fused_a2a import (
 )
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
+    get_align_size_for_quantization,
     get_capacity,
     maybe_move_tensor_to_cpu,
     pad_routing_map,
@@ -476,7 +476,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         if (
             self.config.moe_expert_capacity_factor is not None
-            or self.config.moe_router_padding_for_fp8
+            or self.config.moe_router_padding_for_quantization
         ):
             # When using token dropping or router padding, output size is dynamic.
             # Need to sync output size GPU->CPU before allocating output buffer
@@ -578,8 +578,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
-        if self.config.moe_router_padding_for_fp8:
-            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        if self.config.moe_router_padding_for_quantization:
+            pad_multiple = get_align_size_for_quantization(self.config)
             if is_experimental_enabled() and self.config.moe_permute_fusion:
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
@@ -1002,8 +1002,8 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        if self.config.fp8:
-            self.pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        if self.config.fp8 or self.config.fp4:
+            self.pad_multiple = get_align_size_for_quantization(self.config)
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
@@ -1224,7 +1224,7 @@ class _DeepepManager(_DispatchManager):
         """
         Pad the routing map to the nearest multiple of the pad_multiple.
         """
-        pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+        pad_multiple = get_align_size_for_quantization(self.config)
 
         num_input_tokens = routing_map.shape[0]
         target_tokens_per_expert = (
@@ -1258,7 +1258,7 @@ class _DeepepManager(_DispatchManager):
             self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs
             )
-        if self.config.moe_router_padding_for_fp8:
+        if self.config.moe_router_padding_for_quantization:
             self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
                 self.dispatched_routing_map, self.tokens_per_expert
             )
