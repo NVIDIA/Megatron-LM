@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
 import unittest.mock
 
@@ -23,7 +25,7 @@ def gpt2_tiktoken_tokenizer(gpt2_tiktok_vocab):
 @pytest.fixture(scope="module")
 def static_inference_engine(gpt2_tiktoken_tokenizer):
     engine_wrapper = StaticInferenceEngineTestHarness()
-    engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size)
+    engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size, legacy=True)
 
     controller = engine_wrapper.static_engine.controller
     controller.tokenizer = gpt2_tiktoken_tokenizer
