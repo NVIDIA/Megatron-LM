@@ -214,7 +214,6 @@ def bert_vocab(odir):
 
 
 @pytest.mark.flaky
-@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:

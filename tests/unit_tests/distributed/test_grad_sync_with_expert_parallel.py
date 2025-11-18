@@ -109,7 +109,6 @@ def get_moe_model_and_buffers(
 @pytest.mark.parametrize("etp_size", [1, 2])
 @pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
 @pytest.mark.flaky
-@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_grad_sync(
     use_distributed_optimizer: bool,
