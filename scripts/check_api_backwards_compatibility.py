@@ -199,6 +199,27 @@ def filter_objects(obj: Object, filtered: Set[str], visited: Set[str] = None):
 # Main comparison logic
 # ============================================================================
 
+def extract_path_from_explanation(change) -> str:
+    """
+    Extract object path from a breakage's explanation text.
+    
+    Format: "filepath:line: object_path: description"
+    Example: "megatron/core/model_parallel_config.py:338: ModelParallelConfig.cpu_offloading_weights: Attribute value was changed"
+    
+    Returns the object path or None if not found.
+    """
+    try:
+        explanation = change.explain()
+        # Split by ": " and get the second part (object path)
+        parts = explanation.split(': ')
+        if len(parts) >= 2:
+            # First part is "filepath:line", second is object path
+            return parts[1]
+    except:
+        pass
+    return None
+
+
 def load_and_filter(package_name: str, ref: str = None, verbose: bool = False) -> tuple:
     """
     Load package and apply filters.
@@ -397,10 +418,12 @@ Exit codes:
                 # Different breakage types have different path attributes
                 old_path = (getattr(change, 'old_path', None) or 
                            getattr(change, 'path', None) or
-                           (getattr(change, 'old_value', None) and getattr(change.old_value, 'path', None)))
+                           (getattr(change, 'old_value', None) and getattr(change.old_value, 'path', None)) or
+                           extract_path_from_explanation(change))
                 new_path = (getattr(change, 'new_path', None) or 
                            getattr(change, 'path', None) or
-                           (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)))
+                           (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)) or
+                           extract_path_from_explanation(change))
                 
                 # Skip if either path is in our filtered set
                 if old_path and old_path in all_filtered:
@@ -451,10 +474,12 @@ Exit codes:
                     # Different breakage types have different path attributes
                     old_path = (getattr(change, 'old_path', None) or 
                                getattr(change, 'path', None) or
-                               (getattr(change, 'old_value', None) and getattr(change.old_value, 'path', None)))
+                               (getattr(change, 'old_value', None) and getattr(change.old_value, 'path', None)) or
+                               extract_path_from_explanation(change))
                     new_path = (getattr(change, 'new_path', None) or 
                                getattr(change, 'path', None) or
-                               (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)))
+                               (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)) or
+                               extract_path_from_explanation(change))
                     obj_path = old_path or new_path or "Unknown"
                     print(f"   Object: {obj_path}")
                     
