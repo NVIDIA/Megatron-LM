@@ -38,7 +38,14 @@ EXEMPT_DECORATORS = ['exempt_from_compat_check', 'deprecated', 'internal_api']
 
 
 def has_exempt_decorator(obj: Object) -> bool:
-    """Check if object has any exempt decorator."""
+    """Check if a Griffe object has any exempt decorator.
+    
+    Args:
+        obj: A Griffe Object to check for exempt decorators
+        
+    Returns:
+        bool: True if the object has any decorator matching EXEMPT_DECORATORS list
+    """
     if not hasattr(obj, 'decorators'):
         return False
     if not obj.decorators:
@@ -52,7 +59,19 @@ def has_exempt_decorator(obj: Object) -> bool:
 
 
 def get_filtered_paths(package: Object, package_name: str) -> set:
-    """Get all paths that should be filtered (have exempt decorators)."""
+    """Recursively collect all object paths with exempt decorators from a package.
+    
+    This function traverses the entire package tree and identifies objects that are
+    decorated with any of the EXEMPT_DECORATORS, building a set of their full paths.
+    
+    Args:
+        package: The Griffe package object to traverse
+        package_name: The full package name (e.g., "megatron.core") for path construction
+        
+    Returns:
+        set: A set of full object paths (e.g., "megatron.core.ModelParallelConfig") 
+             that should be filtered from compatibility checks
+    """
     filtered = set()
     visited = set()
     
@@ -92,7 +111,17 @@ def get_filtered_paths(package: Object, package_name: str) -> set:
 
 
 def strip_ansi_codes(text):
-    """Remove ANSI escape codes from text."""
+    """Remove ANSI escape codes (terminal formatting) from text.
+    
+    Griffe includes ANSI codes for terminal formatting in some strings,
+    which breaks string matching. This strips them out.
+    
+    Args:
+        text: String potentially containing ANSI escape codes
+        
+    Returns:
+        str: Clean text with ANSI codes removed
+    """
     if not text:
         return text
     # Pattern to match ANSI escape codes
@@ -101,7 +130,20 @@ def strip_ansi_codes(text):
 
 
 def get_object_path(change) -> str:
-    """Extract the object path from a breaking change."""
+    """Extract the full object path from a Griffe breaking change.
+    
+    Tries multiple sources to get the object path:
+    1. Direct path attributes (new_path, old_path, path)
+    2. Path from new_value or old_value objects
+    3. Parse from the explanation string as last resort
+    
+    Args:
+        change: A Griffe breaking change object
+        
+    Returns:
+        str: The full object path (e.g., "megatron.core.ModelParallelConfig.__init__")
+             or None if unable to extract
+    """
     # Try different attributes
     path = (getattr(change, 'new_path', None) or 
             getattr(change, 'old_path', None) or
@@ -154,7 +196,19 @@ def get_object_path(change) -> str:
 
 
 def should_skip_change(change, filtered_paths: set) -> bool:
-    """Check if a breaking change should be skipped based on filters."""
+    """Determine if a breaking change should be skipped based on exempt decorators.
+    
+    A change is skipped if:
+    - The changed object itself is in filtered_paths (exact match)
+    - The changed object is a child of an exempt object (prefix match)
+    
+    Args:
+        change: A Griffe breaking change object
+        filtered_paths: Set of paths with exempt decorators
+        
+    Returns:
+        bool: True if the change should be skipped (filtered out)
+    """
     path = get_object_path(change)
     if not path:
         return False
