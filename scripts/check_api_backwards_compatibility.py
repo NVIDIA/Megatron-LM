@@ -404,10 +404,33 @@ Exit codes:
                 if new_path and new_path in all_filtered:
                     continue
                 
+                # Skip paths with circular/repeated segments (false positives from import cycles)
+                # e.g., "megatron.core.pipeline_parallel.p2p_communication.core.megatron.training"
+                should_skip = False
+                for path in [old_path, new_path]:
+                    if path:
+                        parts = path.split('.')
+                        # Check for repeated 2-3 segment patterns
+                        for length in range(2, min(4, len(parts) // 2 + 1)):
+                            for start in range(len(parts) - 2 * length + 1):
+                                pattern = '.'.join(parts[start:start + length])
+                                rest = '.'.join(parts[start + length:])
+                                if rest.startswith(pattern):
+                                    should_skip = True
+                                    break
+                            if should_skip:
+                                break
+                    if should_skip:
+                        break
+                
+                if should_skip:
+                    continue
+                
                 breaking_changes.append(change)
             
             if len(all_breaking_changes_raw) > len(breaking_changes):
-                print(f"   Filtered out {len(all_breaking_changes_raw) - len(breaking_changes)} changes in excluded code", file=sys.stderr)
+                filtered_count = len(all_breaking_changes_raw) - len(breaking_changes)
+                print(f"   Filtered out {filtered_count} changes (excluded code + circular paths)", file=sys.stderr)
             
             if breaking_changes:
                 all_breaking_changes.extend([(package_name, change) for change in breaking_changes])
