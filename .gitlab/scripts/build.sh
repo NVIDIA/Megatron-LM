@@ -9,7 +9,7 @@ docker run -d --name download_test_data -w /workdir/ python:3.12-slim bash -c 's
 docker cp tests/. download_test_data:/workdir/tests
 docker exec download_test_data bash -c '
     ls -al /workdir/
-    pip install --no-cache-dir click
+    pip install --no-cache-dir click requests
     python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
 '
 docker cp download_test_data:/workdir/assets ./
