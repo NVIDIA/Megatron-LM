@@ -15,11 +15,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequest,
-    DynamicInferenceRequestRecord,
-    Status,
-)
+from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop
 from tests.unit_tests.test_utilities import Utils
@@ -48,27 +44,23 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
-        self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
+        self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
         self.paused = False
         self.stopped = False
-        self.suspend_signal = False
-        self.is_suspended = False
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
-    ) -> asyncio.Future[DynamicInferenceRequestRecord]:
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         """Dummy add_request."""
 
-        self.request_records[request_id] = DynamicInferenceRequestRecord.from_request(
-            DynamicInferenceRequest(
-                prompt=prompt,
-                request_id=request_id,
-                sampling_params=sampling_params,
-                status=Status.WAITING_IN_QUEUE,
-            )
+        self.requests[request_id] = DynamicInferenceRequest(
+            prompt=prompt,
+            request_id=request_id,
+            sampling_params=sampling_params,
+            status=Status.WAITING_IN_QUEUE,
         )
         self.waiting_request_ids.append(request_id)
 
@@ -76,33 +68,35 @@ class DummyEngine(DynamicInferenceEngine):
         self.request_completion_futures[request_id] = fut
         return fut
 
-    async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
+    async def async_step(
+        self, *, verbose: Optional[bool] = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Dummy async_step."""
         # Finish "active" requests.
-        finished_request_records = []
+        finished_requests = []
         to_remove = []
-        for request_id, record in self.request_records.items():
-            if record[-1].status == Status.ACTIVE_AND_GENERATING_TOKENS:
-                record[-1].status = Status.COMPLETED
+        for request_id, request in self.requests.items():
+            if request.status == Status.ACTIVE_AND_GENERATING_TOKENS:
+                request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
-                finished_request_records.append(record)
-                self.request_completion_futures[request_id].set_result(record)
+                finished_requests.append(request)
+                self.request_completion_futures[request_id].set_result(request)
                 to_remove.append(request_id)
         for request_id in to_remove:
-            del self.request_records[request_id]
+            del self.requests[request_id]
 
         # Activate queued requests. They will "process" for 1 step.
-        active_request_ids = []
+        active_requests = []
         while self.waiting_request_ids:
             request_id = self.waiting_request_ids.popleft()
-            record = self.request_records[request_id]
-            record[-1].status = Status.ACTIVE_AND_GENERATING_TOKENS
+            request = self.requests[request_id]
+            request.status = Status.ACTIVE_AND_GENERATING_TOKENS
             self.context.active_cnt += 1
-            active_request_ids.append(request_id)
+            active_requests.append(request)
 
         return {
-            "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "active_requests": active_requests,
+            "finished_requests": finished_requests,
             "step_time": 0.01,
             "cuda_graph_request_count": 1,
         }
@@ -171,7 +165,7 @@ class TestCoordinator:
                 await asyncio.sleep(arrival_delta)
                 fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
                 futures.append(fut)
-            results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+            results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
 
             client.stop_engines()
             client.stop()
@@ -217,7 +211,7 @@ class TestCoordinator:
 
 if __name__ == "__main__":
     test = TestCoordinator()
-    asyncio.run(test.test_simple())
+    test.test_simple()
     test.test_tp()
     test.teardown_method(None)
     print("~~~")
