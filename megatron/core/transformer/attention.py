@@ -24,7 +24,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -131,7 +131,7 @@ class CrossAttentionSubmodules:
     linear_proj: Union[ModuleSpec, type] = None
 
 
-class Attention(MegatronModule, ABC):
+class Attention(GraphableMegatronModule, MegatronModule, ABC):
     """Attention layer abstract class.
 
     This layer only contains common modules required for the "self attn" and
@@ -637,6 +637,67 @@ class Attention(MegatronModule, ABC):
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs['attention_mask'] is None
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and self.config.cuda_graph_scope == 'attn'
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+    
+    def __call__(self, 
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,):
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        kwargs = {
+            'hidden_states': hidden_states,
+            'attention_mask': attention_mask,
+            'key_value_states': key_value_states,
+            'inference_context': inference_context,
+            'rotary_pos_emb': rotary_pos_emb,
+            'rotary_pos_cos': rotary_pos_cos,
+            'rotary_pos_sin': rotary_pos_sin,
+            'rotary_pos_cos_sin': rotary_pos_cos_sin,
+            'attention_bias': attention_bias,
+            'packed_seq_params': packed_seq_params,
+            'sequence_len_offset': sequence_len_offset,
+            'inference_params': inference_context,
+        }
+        if self._should_call_local_cudagraph(**kwargs):
+            # dynamic_inference_decode_only is not a real argument to forward, it is only used
+            # to differentiate the cuda graph used for decode from the one used for non-decode
+            # inference.
+            dynamic_inference_decode_only = kwargs['inference_context'].is_decode_only()
+            return super().__call__(
+                dynamic_inference_decode_only=dynamic_inference_decode_only, **kwargs
+            )
+        return super().__call__(**kwargs)
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -652,6 +713,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        dynamic_inference_decode_only: Optional[bool] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
