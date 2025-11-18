@@ -9,11 +9,17 @@ This script tests that:
 4. Basic functionality works
 
 Usage:
-    python scripts/api_backwards_compat_setup_sanity_test.py
+    python tests/unit_tests/test_api_backwards_compat_setup.py
 """
 
 import sys
 from pathlib import Path
+
+# Configure UTF-8 for Windows
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 def test_griffe_installed():
     """Test that griffe is installed"""
@@ -33,13 +39,12 @@ def test_decorator_module():
     """Test that the compat decorator module exists"""
     print("\n2. Testing decorator module...", end=" ")
     try:
-        from megatron.core.backwards_compatibility_decorators import (
-            exempt_from_compat_check,
+        from megatron.core.utils import (
             deprecated,
             internal_api
         )
         print("✅ Decorator module found")
-        print("   Available: @exempt_from_compat_check, @deprecated, @internal_api")
+        print("   Available: @internal_api, @deprecated")
         return True
     except ImportError as e:
         print("❌ Decorator module NOT found")
@@ -79,14 +84,14 @@ def test_decorators_work():
     """Test that decorators can be applied"""
     print("\n5. Testing decorator functionality...", end=" ")
     try:
-        from megatron.core.backwards_compatibility_decorators import exempt_from_compat_check, deprecated
+        from megatron.core.utils import internal_api, deprecated
         
-        # Test exempt decorator
-        @exempt_from_compat_check
+        # Test internal_api decorator
+        @internal_api
         def test_func1():
             pass
         
-        assert hasattr(test_func1, '_exempt_from_compat_check')
+        assert hasattr(test_func1, '_internal_api')
         
         # Test deprecated decorator
         @deprecated(version="1.0", removal_version="2.0", alternative="new_func")
