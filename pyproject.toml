@@ -68,7 +68,7 @@ mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.10.0",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
@@ -84,7 +84,7 @@ dev = [
     "flashinfer-python",
     "wget",
     "onnxscript",
-    "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
 ]
 
 lts = [
