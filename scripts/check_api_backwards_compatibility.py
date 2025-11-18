@@ -425,10 +425,31 @@ Exit codes:
                            (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)) or
                            extract_path_from_explanation(change))
                 
-                # Skip if either path is in our filtered set
-                if old_path and old_path in all_filtered:
-                    continue
-                if new_path and new_path in all_filtered:
+                # Skip if either path is in our filtered set or is a child of a filtered object
+                skip_old = False
+                skip_new = False
+                
+                if old_path:
+                    # Check exact match or if it's a child (e.g., MyClass.__init__)
+                    if old_path in all_filtered:
+                        skip_old = True
+                    else:
+                        for filtered_path in all_filtered:
+                            if old_path.startswith(filtered_path + '.'):
+                                skip_old = True
+                                break
+                
+                if new_path:
+                    # Check exact match or if it's a child (e.g., MyClass.__init__)
+                    if new_path in all_filtered:
+                        skip_new = True
+                    else:
+                        for filtered_path in all_filtered:
+                            if new_path.startswith(filtered_path + '.'):
+                                skip_new = True
+                                break
+                
+                if skip_old or skip_new:
                     continue
                 
                 # Skip paths with circular/repeated segments (false positives from import cycles)
