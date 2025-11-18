@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -928,6 +928,142 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states.fill_(0)
             self.mamba_metadata.reset()
 
+    def add_dummy_requests_parallel(
+        self,
+        requests: Sequence[DynamicInferenceRequest],
+        *,
+        count_as_prefill: bool = True,
+    ) -> None:
+        """Fast path to add dummy requests without allocating real KV blocks."""
+
+        if not requests:
+            return
+
+        num_new_requests = len(requests)
+        if self.total_request_count + num_new_requests > self.max_active_requests:
+            raise RequestOverflowError(requests[-1].request_id)
+
+        lengths: List[int] = []
+        num_tokens_to_generate: List[int] = []
+        request_ids: List[int] = []
+        prompt_tokens: List[Tensor] = []
+        metadata_rows: List[List[float]] = []
+
+        for req in requests:
+            assert isinstance(
+                req, DynamicInferenceRequest
+            ), "add_dummy_requests_parallel expects DynamicInferenceRequest objects"
+            assert (
+                req.finished_chunk_token_count == 0
+            ), "chunked requests are not supported in add_dummy_requests_parallel"
+            assert req.remaining_prompt_tokens is not None, "request missing prompt tokens"
+            assert req.sampling_params is not None, "request missing sampling params"
+            chunk_length = req.remaining_prompt_length
+            assert chunk_length > 0, "request without prompt tokens is not supported"
+            lengths.append(chunk_length)
+            num_tokens_to_generate.append(req.sampling_params.num_tokens_to_generate)
+            request_ids.append(req.request_id)
+            prompt_tokens.append(
+                req.remaining_prompt_tokens.to(
+                    device=self.token_to_input_ids.device, dtype=self.token_to_input_ids.dtype
+                )
+            )
+            metadata_rows.append(req.tracked_metadata)
+
+        total_new_tokens = sum(lengths)
+        if self.active_token_count + total_new_tokens > self.max_tokens:
+            raise TokenOverflowError(requests[-1].request_id)
+
+        device = self.request_ids.device
+        lengths_tensor = torch.tensor(lengths, dtype=self.request_query_lengths.dtype, device=device)
+        tokens_to_generate_tensor = torch.tensor(
+            num_tokens_to_generate, dtype=self.request_query_lengths.dtype, device=device
+        )
+        request_ids_tensor = torch.tensor(request_ids, dtype=self.request_ids.dtype, device=device)
+        metadata_tensor = torch.tensor(
+            metadata_rows, dtype=self.request_metadata.dtype, device=self.request_metadata.device
+        )
+
+        block_counts = torch.div(
+            lengths_tensor + (self.block_size_tokens - 1),
+            self.block_size_tokens,
+            rounding_mode="floor",
+        )
+
+        start_request_idx = self.total_request_count
+        end_request_idx = start_request_idx + num_new_requests
+        request_slice = slice(start_request_idx, end_request_idx)
+
+        self.request_ids[request_slice] = request_ids_tensor
+        self.request_query_lengths[request_slice] = lengths_tensor
+        self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
+        self.request_kv_length_offsets[request_slice] = 0
+        self.request_kv_block_counts[request_slice] = block_counts
+        self.request_metadata[request_slice] = metadata_tensor
+
+        dummy_block_idx = self.block_allocator.dummy_block_idx
+        self.request_last_kv_block_id[request_slice] = dummy_block_idx
+        self.request_last_kv_block_offset[request_slice] = torch.remainder(
+            lengths_tensor - 1, self.block_size_tokens
+        )
+
+        kv_block_view = self.request_to_kv_block_ids[request_slice]
+        kv_block_view.fill_(-1)
+        block_counts_list = block_counts.tolist()
+        for row, block_count in enumerate(block_counts_list):
+            kv_block_view[row, :block_count] = dummy_block_idx
+
+        token_start = self.active_token_count
+        token_end = token_start + total_new_tokens
+        token_slice = slice(token_start, token_end)
+
+        concatenated_tokens = torch.cat(prompt_tokens, dim=0)
+        assert concatenated_tokens.numel() == total_new_tokens
+        self.token_to_input_ids[token_slice] = concatenated_tokens
+
+        lengths_long = lengths_tensor.to(dtype=torch.long)
+        request_indices = torch.arange(
+            start_request_idx,
+            end_request_idx,
+            device=self.token_to_request_idx.device,
+            dtype=self.token_to_request_idx.dtype,
+        )
+        token_request_indices = torch.repeat_interleave(
+            request_indices.to(dtype=torch.long), lengths_long
+        )
+        self.token_to_request_idx[token_slice] = token_request_indices
+
+        max_length = int(lengths_tensor.max().item())
+        position_template = torch.arange(
+            max_length,
+            device=self.token_to_position_in_request.device,
+            dtype=self.token_to_position_in_request.dtype,
+        )
+        expanded_positions = position_template.unsqueeze(0).expand(num_new_requests, -1)
+        mask = position_template.unsqueeze(0) < lengths_long.unsqueeze(1)
+        positions = expanded_positions[mask]
+        assert positions.numel() == total_new_tokens
+        self.token_to_position_in_request[token_slice] = positions
+        self.token_to_pos_ids[token_slice] = positions
+        self.token_to_local_position_within_kv_block[token_slice] = torch.remainder(
+            positions, self.block_size_tokens
+        )
+        self.token_to_block_idx[token_slice] = dummy_block_idx
+
+        if self.is_hybrid_model:
+            for logical_idx, request_idx in enumerate(range(start_request_idx, end_request_idx)):
+                mamba_idx = self.mamba_metadata.allocate_slot()
+                if mamba_idx is None:
+                    raise ContextOverflowError(requests[logical_idx].request_id, "No Mamba slots available")
+                self.mamba_conv_states[:, mamba_idx] = 0.0
+                self.mamba_ssm_states[:, mamba_idx] = 0.0
+                self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
+
+        self.active_token_count = token_end
+        self.total_request_count = end_request_idx
+        if count_as_prefill:
+            self.num_prefill_requests += num_new_requests
+
     def add_dummy_requests_for_cudagraph_capture(
         self, graph_dimensions: InferenceBatchDimensions
     ) -> None:
@@ -943,14 +1079,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             1, dtype=torch.long, device=torch.cuda.current_device()
         )
 
-        for i in range(graph_dimensions.decode_req_count):
-            self.add_request(
-                DynamicInferenceRequest(
-                    request_id=i,
-                    prompt_tokens=shared_decode_tokens,
-                    sampling_params=shared_sampling_params,
-                )
+        decode_requests = [
+            DynamicInferenceRequest(
+                request_id=i,
+                prompt_tokens=shared_decode_tokens,
+                sampling_params=shared_sampling_params,
             )
+            for i in range(graph_dimensions.decode_req_count)
+        ]
+        self.add_dummy_requests_parallel(decode_requests, count_as_prefill=False)
         if graph_dimensions.prefill_req_count == 0:
             self.num_prefill_requests = 0
             return
@@ -973,14 +1110,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_prefill_tokens, dtype=torch.long, device=torch.cuda.current_device()
         )
 
-        for i in range(graph_dimensions.prefill_req_count):
-            self.add_request(
-                DynamicInferenceRequest(
-                    request_id=i + graph_dimensions.decode_req_count,
-                    prompt_tokens=shared_prefill_tokens[:prefill_token_counts[i]],
-                    sampling_params=shared_sampling_params,
-                )
+        prefill_requests = [
+            DynamicInferenceRequest(
+                request_id=i + graph_dimensions.decode_req_count,
+                prompt_tokens=shared_prefill_tokens[:prefill_token_counts[i]],
+                sampling_params=shared_sampling_params,
             )
+            for i in range(graph_dimensions.prefill_req_count)
+        ]
+        self.add_dummy_requests_parallel(prefill_requests)
         self.num_prefill_requests = graph_dimensions.prefill_req_count
 
     @property
