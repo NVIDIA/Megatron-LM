@@ -251,14 +251,6 @@ class DataParallelInferenceCoordinator:
         """
         coordinator = cls(inference_coordinator_port, data_parallel_size)
         ready_event.set()
-        # >>>
-        if 1:
-            from megatron.core import parallel_state
-            from lutil import pax
-            pax({
-                "tp rank" : parallel_state.get_tensor_model_parallel_rank(),
-            })
-        # <<<
         try:
             coordinator.start()
         except KeyboardInterrupt:

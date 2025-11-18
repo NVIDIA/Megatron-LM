@@ -388,12 +388,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        # >>>
-        # if 1:
-        #     from megatron.core import parallel_state
-        #     from lutil import print_seq
-        #     print_seq("tp rank: %d." % parallel_state.get_tensor_model_parallel_rank())
-        # <<<
         if launch_inference_coordinator and torch.distributed.get_rank() == 0:
             spawn_context = multiprocessing.get_context('spawn')
             coordinator_ready_event = spawn_context.Event()
