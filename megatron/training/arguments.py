@@ -1489,7 +1489,8 @@ def _add_inference_args(parser):
     group.add_argument('--inference-wandb-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics to wandb. '
                             'Default to 0 to disable inference wandb logging.')
-
+    group.add_argument("--inference-coordinator-port", type=int, default=12346,
+                       help="This port will be used to setup the inference coordinator on node-0")
     return parser
 
 

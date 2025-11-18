@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, force=True)
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
-    port: int,
+    port: int | None = None,
     sampling_params: SamplingParams | None = None,
 ):
     if sampling_params is not None:
@@ -38,19 +38,21 @@ async def main(
         )
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
-    # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator( 
-        inference_coordinator_port=port, launch_inference_coordinator=True
+    # and processing them in an asyncio coroutine.
+    # leaving inference_coordinator_port as None will find a free port automatically.
+    dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+        inference_coordinator_port=port,
+        launch_inference_coordinator=True
     )
     # if you want to use your own inference coordinator - 
     # 1. set launch_inference_coordinator to False
     # 2. setup a router socket at tcp://MASTER_ADDR:PORT
     # 3. wait for data parallel groups to establish connection (BasicInferenceCoordinator.__init__)
     # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
-    #   based on headers. 
-    # 5. look at InferenceClient to see how we create requests with headers. 
-    if dist.get_rank() == 0: 
-        client = InferenceClient(port) # submits requests to the inference coordinator
+    #   based on headers.
+    # 5. look at InferenceClient to see how we create requests with headers.
+    if dist.get_rank() == 0:
+        client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
         await client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -163,4 +165,3 @@ if __name__ == "__main__":
         asyncio.run(main(engine, 
                         requests,
                         args.inference_coordinator_port))
-
