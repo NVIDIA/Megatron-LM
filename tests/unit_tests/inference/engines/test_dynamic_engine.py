@@ -34,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -84,12 +85,9 @@ class DynamicEngineTestConfig:
 
     num_gap_steps: int = 2
 
-    context_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_active_buffer_size_gb: float = 0.1  # enough room for all tokens.
     context_block_size_tokens: int = 256
-    context_buffer_guaranteed_fraction: float = 0.01
-    context_buffer_overflow_factor: Optional[float] = None
-    context_max_requests_override: Optional[int] = None
-    context_max_tokens_override: Optional[int] = None
+    context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
@@ -105,6 +103,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     cuda_graph_scope: str = "full_iteration"
     force_build_cuda_graphs: bool = False
+    transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -124,17 +123,6 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
-
-        # Update overrides if not using overflow factor.
-        if self.context_buffer_overflow_factor is None:
-
-            # Enough room for all requests.
-            if self.context_max_requests_override is None:
-                self.context_max_requests_override = self.num_requests
-
-            # Enough room for all tokens.
-            if self.context_max_tokens_override is None:
-                self.context_max_tokens_override = self.num_requests * self.max_sequence_length
 
 
 @dataclass
@@ -227,12 +215,9 @@ class TestDynamicInferenceEngine:
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
-            buffer_size_gb=test_config.context_buffer_size_gb,
-            buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
+            active_buffer_size_gb=test_config.context_active_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
-            buffer_overflow_factor=test_config.context_buffer_overflow_factor,
-            max_requests_override=test_config.context_max_requests_override,
-            max_tokens_override=test_config.context_max_tokens_override,
+            max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
@@ -292,16 +277,26 @@ class TestDynamicInferenceEngine:
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
-                add_bias_linear=test_config.expert_model_parallel_size == 1,
+                add_bias_linear=test_config.expert_model_parallel_size == 1
+                and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
+                transformer_impl=test_config.transformer_impl,
+                normalization=(
+                    "RMSNorm"
+                    if test_config.transformer_impl == "inference_optimized"
+                    else "LayerNorm"
+                ),
+                # inference optimized currently only supports RMS Norm
             )
-            if test_config.fp8:
+            if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec()
-            else:
+            elif test_config.transformer_impl == "local":
                 layer_spec = get_gpt_layer_local_spec()
+            elif test_config.transformer_impl == "inference_optimized":
+                layer_spec = get_gpt_layer_with_inference_spec()
 
             # GPT model.
             model = GPTModel(
@@ -520,14 +515,12 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             model_provider=model_provider,
             num_cuda_graphs=num_cuda_graphs,
-            context_max_requests_override=32,
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
         )
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 32
-        assert env.engine.context.max_tokens == 160
+        assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
 
         # Validate output tokens.
         gpt_expected_generated_tokens = [
@@ -568,41 +561,6 @@ class TestDynamicInferenceEngine:
                 f"expected ({expected_generated_tokens})."
             )
 
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    def test_overflow_factor(self, model_provider: str = "gpt") -> None:
-        """Test overflow factor arg."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        # Run test.
-        env = self._run_test(
-            context_buffer_overflow_factor=0.1,
-            context_max_requests_override=None,
-            context_max_tokens_override=None,
-            model_provider=model_provider,
-        )
-
-        # Validate max_requests, max_tokens.
-        if model_provider == "gpt":
-            assert env.engine.context.max_requests == 420
-            assert env.engine.context.max_tokens == 420
-        elif model_provider == "mamba":
-            assert env.engine.context.max_requests == 16
-            assert env.engine.context.max_tokens == 16
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    def test_request_overflow(self, model_provider: str) -> None:
-        """Test request overflow."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        self._run_test(context_max_requests_override=4, model_provider=model_provider)
-
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -610,7 +568,7 @@ class TestDynamicInferenceEngine:
     def test_token_overflow_transient(self) -> None:
         """Test token overflow."""
         test_config = DynamicEngineTestConfig(
-            num_requests=2, min_prompt_length=8, max_prompt_length=8, context_max_tokens_override=12
+            num_requests=2, min_prompt_length=512, max_prompt_length=512, context_max_tokens=900
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -629,7 +587,7 @@ class TestDynamicInferenceEngine:
     )
     def test_token_overflow_nontransient(self) -> None:
         """Test token overflow (non-transient)."""
-        test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
+        test_config = DynamicEngineTestConfig(context_max_tokens=8)
         env = self._build_test_env(test_config)
         try:
             env.engine._add_request(env.requests[0])
@@ -649,9 +607,9 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
         block_size_bytes = context.block_size_bytes
-        buffer_size_gb = (block_size_bytes + 1) / 1024**3
+        active_buffer_size_gb = (block_size_bytes + 1) / 1024**3
         test_config = DynamicEngineTestConfig(
-            context_buffer_size_gb=buffer_size_gb, model_provider=model_provider
+            context_active_buffer_size_gb=active_buffer_size_gb, model_provider=model_provider
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -686,19 +644,21 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [64]),
-            (1, [64]),
-            (2, [64, 32]),
-            (4, [64, 48, 32, 16]),
-            (8, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (16, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (64, [64, 56, 48, 40, 32, 24, 16, 8]),
-            (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (64, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (1024, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
-                DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
+                DynamicEngineTestConfig(
+                    context_active_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
+                )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
             assert (
@@ -745,7 +705,9 @@ class TestDynamicInferenceEngine:
 
         # Initialize context.
         env = self._build_test_env(
-            DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8, num_tokens_to_generate=1)
+            DynamicEngineTestConfig(
+                context_active_buffer_size_gb=0.0041, num_cuda_graphs=8, num_tokens_to_generate=1
+            )
         )
 
         context = env.engine.context
@@ -948,6 +910,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("pp_size", [1, 2])
     @pytest.mark.parametrize("tp_size", [1, 2])
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
     @torch.inference_mode()
     def test_parallel_inference(
         self,
@@ -957,6 +920,7 @@ class TestDynamicInferenceEngine:
         ep_size,
         sequence_parallel,
         materialize_only_last_token_logits,
+        transformer_impl,
     ):
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -979,6 +943,22 @@ class TestDynamicInferenceEngine:
                     "pipeline stages is not supported yet."
                 )
             )
+        elif transformer_impl == "inference_optimized":
+            if ep_size > 1:
+                pytest.skip(
+                    reason="MoE models are not supported with the inference optimized transformer."
+                )
+            if tp_size > 1 and not sequence_parallel:
+                pytest.skip(
+                    reason=(
+                        "The inference optimized transformer requires sequence parallelism "
+                        "when tp_size > 1."
+                    )
+                )
+            if model_provider == "mamba":
+                pytest.skip(
+                    reason="Mamba model is not supported with the inference optimized transformer."
+                )
 
         env = self._run_test(
             model_provider=model_provider,
@@ -987,6 +967,7 @@ class TestDynamicInferenceEngine:
             expert_model_parallel_size=ep_size,
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            transformer_impl=transformer_impl,
         )
 
     @pytest.mark.internal
@@ -1034,9 +1015,8 @@ class TestDynamicInferenceEngine:
             num_requests=16,
             max_prompt_length=10,
             num_tokens_to_generate=32,
-            context_buffer_size_gb=0.001,  # 0.001, # 8 blocks
-            context_max_requests_override=8,
-            context_max_tokens_override=8,
+            context_active_buffer_size_gb=0.001,  # 0.001, # 8 blocks
+            context_max_tokens=8,
             num_gap_steps=1,
         )
 
@@ -1085,27 +1065,5 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=False,
             model_provider=model_provider,
             context_block_size_tokens=256,
-            context_max_tokens_override=300,
+            context_max_tokens=1000,
         )
-
-
-if __name__ == "__main__":
-    test = TestDynamicInferenceEngine()
-    test.test_simple(4)
-    test.test_overflow_factor()
-    test.test_request_overflow()
-    test.test_token_overflow_transient()
-    # test.test_token_overflow_nontransient() # uncomment in megatron-core 0.16
-    test.test_block_overflow()
-    test.test_multi_add()
-    test.test_fixed_output_lengths()
-    test.test_cuda_graph_request_counts()
-    test.test_cuda_graph_warmup(WarmupEngineMode.DECODE, 1, 8)
-    test.test_generate_function()
-    asyncio.run(test.test_run_engine())
-    test.test_return_log_probs()
-    test.test_parallel_inference()
-    # test.test_events() # uncomment in megatron-core 0.16
-    test.teardown_method(None)
-    print("~~~")
-    print("success.")
