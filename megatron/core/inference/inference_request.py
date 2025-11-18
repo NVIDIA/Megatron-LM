@@ -375,6 +375,14 @@ class DynamicInferenceRequestRecord:
 
     @classmethod
     def from_request(cls, request: DynamicInferenceRequest) -> "DynamicInferenceRequestRecord":
+        """Initialize record from a single request.
+
+        Args:
+            request (DynamicInferenceRequest): Initial request.
+
+        Returns:
+            (DynamicInferenceRequestRecord) A record.
+        """
         record = cls()
         record.requests.append(request)
         return record
