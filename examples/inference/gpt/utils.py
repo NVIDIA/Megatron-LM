@@ -314,7 +314,7 @@ def get_requests_from_file(
 
             sp = copy.deepcopy(sampling_params)
             if args.num_tokens_from_file:
-                sp.num_tokens_to_generate = line_dict["num_tokens_to_generate"]
+                sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
             sampling_params_list.append(sp)
 
             if len(prompts) == args.prompt_file_num_truncate:
