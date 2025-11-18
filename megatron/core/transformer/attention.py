@@ -59,7 +59,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flash_attn_3.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -216,12 +216,17 @@ class Attention(MegatronModule, ABC):
 
         if (
             HAVE_TE
-            and self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
         ):
-            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -1146,7 +1151,7 @@ class SelfAttention(Attention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         set_save_original_input(self.linear_qkv)
