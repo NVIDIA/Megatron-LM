@@ -2159,31 +2159,6 @@ def trace_async_exceptions(
 # ============================================================================
 
 
-def exempt_from_compat_check(func: Callable) -> Callable:
-    """
-    Mark a function as exempt from backward compatibility checks.
-    
-    Use this decorator for:
-    - Internal APIs not intended for external use
-    - Experimental features that may change
-    - Functions explicitly documented as unstable
-    
-    Args:
-        func: The function to mark as exempt
-    
-    Returns:
-        The original function with an exemption marker
-    
-    Example:
-        @exempt_from_compat_check
-        def experimental_api():
-            '''This API may change without notice'''
-            pass
-    """
-    func._exempt_from_compat_check = True
-    return func
-
-
 def deprecated(
     version: str,
     removal_version: Optional[str] = None,
@@ -2254,23 +2229,32 @@ def deprecated(
 
 def internal_api(func: Callable) -> Callable:
     """
-    Mark a function as internal API (not for external use).
+    Mark a function or class as internal API (not for external use).
     
-    This is semantically similar to exempt_from_compat_check but
-    more explicitly communicates that the function is internal.
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+    
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
     
     Args:
-        func: The function to mark as internal
+        func: The function or class to mark as internal
     
     Returns:
-        The original function with an internal API marker
+        The original function/class with an internal API marker
     
     Example:
         @internal_api
         def _internal_helper():
             '''For internal use only'''
             pass
+        
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
     """
     func._internal_api = True
-    func._exempt_from_compat_check = True  # Also exempt from checks
     return func

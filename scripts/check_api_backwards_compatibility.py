@@ -3,7 +3,7 @@
 Megatron Core API Compatibility Checker
 
 Simple checker using Griffe to find breaking changes between two versions.
-Objects decorated with @exempt_from_compat_check are excluded from checks.
+Objects decorated with @internal_api or @deprecated are excluded from checks.
 
 Usage:
     python scripts/check_api_backwards_compatibility.py --baseline core_v0.14.0
@@ -43,7 +43,7 @@ if sys.platform == 'win32':
 
 
 # Decorators that exempt objects from compatibility checks
-EXEMPT_DECORATORS = ['exempt_from_compat_check', 'deprecated', 'internal_api']
+EXEMPT_DECORATORS = ['internal_api', 'deprecated']
 
 
 def has_exempt_decorator(obj: Object) -> bool:
