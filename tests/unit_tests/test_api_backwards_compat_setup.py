@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
 """
 Sanity test script to verify API backward compatibility checker setup
