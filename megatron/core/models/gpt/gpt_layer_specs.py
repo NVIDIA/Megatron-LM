@@ -327,19 +327,20 @@ def get_attention_module_spec_for_backend(
             if mla_down_proj_use_column_parallel
             else backend.linear()
         )
+        fuse_norm_and_linear = backend.fuse_layernorm_and_linear() and sparse_attention_type is None
         linear_q_up_proj = (
             backend.column_parallel_layer_norm_linear()
-            if qk_layernorm and backend.fuse_layernorm_and_linear()
+            if qk_layernorm and fuse_norm_and_linear
             else backend.column_parallel_linear()
         )
         linear_kv_up_proj = (
             backend.column_parallel_layer_norm_linear()
-            if qk_layernorm and backend.fuse_layernorm_and_linear()
+            if qk_layernorm and fuse_norm_and_linear
             else backend.column_parallel_linear()
         )
         qk_norm = (
             backend.layer_norm(rms_norm=rms_norm, for_qk=True)
-            if qk_layernorm and not backend.fuse_layernorm_and_linear()
+            if qk_layernorm and not fuse_norm_and_linear
             else IdentityOp
         )
         attention = ModuleSpec(

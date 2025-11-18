@@ -301,9 +301,6 @@ class Indexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-        for param in self.parameters():
-            setattr(param, 'sequence_parallel', self.config.sequence_parallel)
-
     def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, mscale: float):
         """Apply RoPE to the input tensor."""
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
