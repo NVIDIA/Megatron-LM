@@ -602,22 +602,40 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Process top_n_logprobs if available
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    # Initialize lists if they don't exist
+                    if not hasattr(request, 'prompt_top_n_logprobs') or request.prompt_top_n_logprobs is None:
+                        request.prompt_top_n_logprobs = []
+                    if not hasattr(request, 'generated_top_n_logprobs') or request.generated_top_n_logprobs is None:
+                        request.generated_top_n_logprobs = []
+                    
                     top_n_data_list = top_n_logprobs[req_idx]
-                    for top_n_values, top_n_indices in top_n_data_list:
-                        # Convert to dictionary format: {token_str: logprob}
-                        logit_dict = {}
-                        for logprob, logprob_index in zip(top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()):
-                            key = self.controller.tokenizer.detokenize([logprob_index])
-                            logit_dict[key] = logprob
-                        
-                        # Initialize lists if they don't exist
-                        if not hasattr(request, 'prompt_top_n_logprobs') or request.prompt_top_n_logprobs is None:
-                            request.prompt_top_n_logprobs = []
-                        if not hasattr(request, 'generated_top_n_logprobs') or request.generated_top_n_logprobs is None:
-                            request.generated_top_n_logprobs = []
-                        
-                        # Append to generated_top_n_logprobs (we're in decode mode for dynamic inference)
-                        request.generated_top_n_logprobs.append(logit_dict)
+                    
+                    # Similar logic to log_probs: if we have > 1 token, we're in prefill
+                    if len(top_n_data_list) > 1:
+                        # Prefill mode - add all tokens to prompt_top_n_logprobs
+                        for top_n_values, top_n_indices in top_n_data_list:
+                            logit_dict = {}
+                            for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
+                                key = self.controller.tokenizer.detokenize([logprob_index])
+                                logit_dict[key] = logprob
+                            request.prompt_top_n_logprobs.append(logit_dict)
+                    else:
+                        # Decode mode - single token
+                        for top_n_values, top_n_indices in top_n_data_list:
+                            logit_dict = {}
+                            for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
+                                key = self.controller.tokenizer.detokenize([logprob_index])
+                                logit_dict[key] = logprob
+                            
+                            # Handle chunked prefill case similar to log_probs
+                            if (
+                                len(request.prompt_top_n_logprobs) > 0
+                                and len(request.prompt_top_n_logprobs) < len(request.prompt_tokens)
+                                and not self.context.materialize_only_last_token_logits
+                            ):
+                                request.prompt_top_n_logprobs.append(logit_dict)
+                            else:
+                                request.generated_top_n_logprobs.append(logit_dict)
 
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)

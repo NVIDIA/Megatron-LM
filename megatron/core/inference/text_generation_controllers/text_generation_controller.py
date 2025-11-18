@@ -748,39 +748,53 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Get logits - handle both decode (last token only) and prefill (all tokens) modes
+        # Last token logits
         if materialize_only_last_token_logits:
-            # Decode mode: only last token logits
-            # Shape: [1, active_request_count, vocab_size] -> [active_request_count, vocab_size]
             last_token_logits = logits.squeeze(0)
-            # Compute log probabilities
-            log_probs = torch.nn.functional.log_softmax(last_token_logits, dim=-1).to(torch.float32)
-            
-            # For each request, get top-n logprobs based on its top_n_logprobs value
+        else:
+            last_token_logits = context.last_token_logits(logits)
+
+        # Handle decode-only mode (only last token)
+        if materialize_only_last_token_logits or context.is_decode_only():
+            # Compute log probabilities only for last tokens
+            log_probs = F.log_softmax(last_token_logits.float(), dim=-1)
             top_n_results = {}
             for req_idx in range(active_request_count):
                 top_n = int(self.top_n_logprobs_cuda[req_idx].item())
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
                     top_n_logits = torch.topk(log_probs[req_idx], k=min(top_n, log_probs.size(-1)))
-                    top_n_results[req_idx] = [(top_n_logits.values, top_n_logits.indices)]
-        else:
-            # Prefill/non-decode mode: all tokens
-            # Shape: [1, num_tokens, vocab_size]
-            # Need to extract per-request logits using last_token_logits helper
-            last_token_logits = context.last_token_logits(logits)  # Shape: [active_request_count, vocab_size]
-            
-            # Compute log probabilities for last tokens
-            log_probs = torch.nn.functional.log_softmax(last_token_logits, dim=-1).to(torch.float32)
-            
-            # For each request, get top-n logprobs
-            top_n_results = {}
-            for req_idx in range(active_request_count):
-                top_n = int(self.top_n_logprobs_cuda[req_idx].item())
-                if top_n > 0:
-                    # Get top-n logprobs and indices for this request
-                    top_n_logits = torch.topk(log_probs[req_idx], k=min(top_n, log_probs.size(-1)))
-                    top_n_results[req_idx] = [(top_n_logits.values, top_n_logits.indices)]
+                    top_n_results[req_idx] = [(top_n_logits.values.cpu(), top_n_logits.indices.cpu())]
+            return top_n_results if top_n_results else None
+
+        # Handle prefill mode - need to extract top-n for all tokens per request
+        # This follows the same pattern as calculate_log_probs in dynamic_context.py
+        # Compute log probabilities for all tokens (only in prefill mode)
+        # Note: logits may be padded, so we only take the first active_token_count tokens
+        log_probs = F.log_softmax(logits.squeeze(0)[:context.active_token_count].float(), dim=-1)
+        
+        active_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+        
+        # Split log_probs across request boundaries
+        # log_probs has shape [active_token_count, vocab_size]
+        log_probs_per_request = log_probs.split(active_query_lengths.tolist(), dim=0)
+        
+        top_n_results = {}
+        for req_idx in range(active_request_count):
+            top_n = int(self.top_n_logprobs_cuda[req_idx].item())
+            if top_n > 0:
+                request_log_probs = log_probs_per_request[req_idx]  # [num_tokens_for_request, vocab_size]
+                # For each token in this request, get top-n
+                top_n_per_token = []
+                for token_idx in range(request_log_probs.size(0)):
+                    top_n_logits = torch.topk(
+                        request_log_probs[token_idx], 
+                        k=min(top_n, request_log_probs.size(-1))
+                    )
+                    top_n_per_token.append((top_n_logits.values.cpu(), top_n_logits.indices.cpu()))
+                top_n_results[req_idx] = top_n_per_token
 
         return top_n_results if top_n_results else None
 

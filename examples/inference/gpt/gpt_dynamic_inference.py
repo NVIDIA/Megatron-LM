@@ -163,7 +163,7 @@ def get_inference_context(
         active_buffer_size_gb=args.inference_dynamic_batching_active_buffer_size_gb,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
-        materialize_only_last_token_logits=not args.return_log_probs,
+        materialize_only_last_token_logits=not (args.return_log_probs or args.return_prompt_top_n_logprobs),
         layer_type_list=layer_type_list,
         mamba_conv_states_shape=mamba_conv_states_shape,
         mamba_ssm_states_shape=mamba_ssm_states_shape,
@@ -334,6 +334,10 @@ def run_inference(
                     request.generated_top_n_logprobs = getattr(
                         finished_request, 'generated_top_n_logprobs', None
                     )
+                if finished_request.sampling_params.return_prompt_top_n_logprobs:
+                    request.prompt_top_n_logprobs = getattr(
+                        finished_request, 'prompt_top_n_logprobs', None
+                    )
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
 
@@ -380,6 +384,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
+        return_prompt_top_n_logprobs=args.return_prompt_top_n_logprobs,
     )
 
     model = get_model()
@@ -507,6 +512,7 @@ def main():
                         "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
                         "step_count" : engine.step_count,
                         "top_n_logprobs" : getattr(req, 'generated_top_n_logprobs', None),
+                        "prompt_top_n_logprobs" : getattr(req, 'prompt_top_n_logprobs', None),
                     }
                     if req.sampling_params.return_log_probs:
                         response_logprobs = req.log_probs
