@@ -196,13 +196,21 @@ def core_gpt_dataset_config_from_args(args):
 
     # add FIM args to the config
     if args.fim_data:
+        extra_tokens = {
+            "prefix": args.fim_prefix_token,
+            "middle": args.fim_middle_token,
+            "suffix": args.fim_suffix_token,
+            "pad": args.fim_pad_token,
+            "eod": args.fim_eod_token,
+        }
         data_args.update(
             {
                 "rate": args.fim_rate,
                 "spm_rate": args.fim_spm_rate,
-                "spli_sample": args.fim_split_sample,
-                "fragment_rate": args.fragment_rate,
-                "no_prefix": args.no_prefix,
+                "extra_tokens": extra_tokens,
+                "split_sample": args.fim_split_sample,
+                "fragment_rate": args.fim_fragment_rate,
+                "no_prefix": args.fim_no_prefix,
             }
         )
         return GPTFIMDatasetConfig(**data_args)

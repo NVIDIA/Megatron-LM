@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+from dataclasses import dataclass, field
 
 import numpy as np
 import logging
@@ -16,11 +16,14 @@ logger = logging.getLogger(__name__)
 class GPTFIMDatasetConfig(GPTDatasetConfig):
     """Configuration object for Megatron Core GPT FIM datasets"""
 
-    rate: float = 0.5
+    rate: float = None
     """Probability to convert a training sample into a FIM format"""
 
-    spm_rate: float = 0.5
+    spm_rate: float = None
     """Probability that the a FIM sample uses the SPM format over the PSM format"""
+
+    extra_tokens: Dict = None
+    """FIM extra tokens. Should consist of prefix, middle, suffix, PAD, and EOD tokens."""
 
     split_sample: Optional[str] = None
     """String around which to split the sample for FIM"""
@@ -28,7 +31,7 @@ class GPTFIMDatasetConfig(GPTDatasetConfig):
     fragment_rate: Optional[float] = None
     """Rate of FIM on each fragment when split_sample is not None"""
 
-    no_prefix: Optional[bool] = None
+    no_prefix: Optional[str] = None
     """Do not apply FIM to fragments that start with this prefix"""
 
 
@@ -67,13 +70,13 @@ class GPTFIMDataset(GPTDataset):
         self.fim_spm_rate = self.config.spm_rate
         self.fragment_fim_rate = self.config.fragment_rate
         split_sample = self.config.split_sample
-        self.fim_split_sample = self.config.tokenizer.tokens_to_ids(split_sample) if split_sample else None
-        self.no_fim_prefix = self.config.fim.no_prefix
+        self.fim_split_sample = self.config.tokenizer._tokenizer.tokens_to_ids(split_sample) if split_sample else None
+        self.no_fim_prefix = self.config.no_prefix
 
         # get extra tokens ids
-        fim_tokens = self.config.fim.extra_tokens
-        fim_tokens = [fim_tokens.prefix, fim_tokens.middle, fim_tokens.suffix, fim_tokens.pad, fim_tokens.eod]
-        fim_tokens_ids = self.config.tokenizer.tokens_to_ids(fim_tokens)
+        fim_tokens = self.config.extra_tokens
+        fim_tokens = [fim_tokens["prefix"], fim_tokens["middle"], fim_tokens["suffix"], fim_tokens["pad"], fim_tokens["eod"]]
+        fim_tokens_ids = self.config.tokenizer._tokenizer.tokens_to_ids(fim_tokens)
         (
             self.prefix_tok_id,
             self.middle_tok_id,
@@ -232,7 +235,7 @@ class GPTFIMDataset(GPTDataset):
         """
         if np_rng.binomial(1, fim_rate):  # sample bernoulli dist
 
-            contents = tokenizer.ids_to_text(sample)
+            contents = tokenizer._tokenizer.ids_to_text(sample)
 
             # Do not apply FIM if the sample starts with no_fim_prefix
             if no_fim_prefix is not None and contents.startswith(no_fim_prefix):
@@ -253,9 +256,9 @@ class GPTFIMDataset(GPTDataset):
             middle = contents[boundaries[0] : boundaries[1]]
             suffix = contents[boundaries[1] :]
 
-            prefix = np.array([*tokenizer.text_to_ids(prefix)], dtype=np.int64)
-            middle = np.array([*tokenizer.text_to_ids(middle)], dtype=np.int64)
-            suffix = np.array([*tokenizer.text_to_ids(suffix)], dtype=np.int64)
+            prefix = np.array([*tokenizer._tokenizer.text_to_ids(prefix)], dtype=np.int64)
+            middle = np.array([*tokenizer._tokenizer.text_to_ids(middle)], dtype=np.int64)
+            suffix = np.array([*tokenizer._tokenizer.text_to_ids(suffix)], dtype=np.int64)
 
             # here we truncate each given segment to fit the same length as it was before
             # A consequence is that we never reach the end of a file?

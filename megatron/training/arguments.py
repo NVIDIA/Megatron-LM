@@ -2916,8 +2916,18 @@ def _add_data_args(parser):
                        help='String around which to split the sample for FIM.')
     group.add_argument('--fim-fragment-rate', type=float, default=None,
                        help='Rate of FIM on each fragment when --fim-split-sample is not None.')
-    group.add_argument('--fim-no-prefix', action='store_true',
+    group.add_argument('--fim-no-prefix', type=str, default=None,
                        help='Do not apply FIM to fragments that start with this prefix')
+    group.add_argument('--fim-prefix-token', type=str, default='<fim_prefix>',
+                       help='FIM prefix token')
+    group.add_argument('--fim-middle-token', type=str, default='<fim_middle>',
+                       help='FIM middle token')
+    group.add_argument('--fim-suffix-token', type=str, default='<fim_suffix>',
+                       help='FIM suffix token')
+    group.add_argument('--fim-pad-token', type=str, default='<fim_pad>',
+                       help='FIM PAD token')
+    group.add_argument('--fim-eod-token', type=str, default='<|endoftext|>',
+                       help='FIM EOD token')
     return parser
 
 
