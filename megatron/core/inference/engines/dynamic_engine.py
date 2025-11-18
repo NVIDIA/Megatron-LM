@@ -13,7 +13,6 @@ from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
@@ -71,6 +70,13 @@ try:
 except ImportError:
     HAVE_WANDB = False
     wandb = None
+
+try:
+    import psutil
+
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
 
 
 class EngineSuspendedError(Exception):
@@ -501,11 +507,16 @@ class DynamicInferenceEngine(AbstractEngine):
             relative_time_str = f"{end_time - start_time:.3f} sec"
             relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
 
-            process = psutil.Process()
-            mem_info = process.memory_info()
+            if HAVE_PSUTIL:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                cpu_mem_str = f"{mem_info.rss / 1024**3:.1f} gb"
+            else:
+                cpu_mem_str = "--"
+
             total_mem_str = ", ".join(
                 (
-                    f"cpu: {mem_info.rss / 1024**3:.1f} gb",
+                    f"cpu: {cpu_mem_str}",
                     f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
                     f"res {end_mem_res / 1024**3:.1f} gb",
                 )
