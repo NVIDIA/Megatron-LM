@@ -305,12 +305,18 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
-    num_tokens_to_generate = []
+    sampling_params = get_default_sampling_params(tokenizer.eod)
+    sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
-            prompts.append(json.loads(line)["text"])
+            line_dict = json.loads(line)]
+            prompts.append(line_dict["text"])
+
+            sp = copy.deepcopy(sampling_params)
             if args.num_tokens_from_file:
-                num_tokens_to_generate.append(json.loads(line)["chatgpt_output_token_length"])
+                sp.num_tokens_to_generate = line_dict["num_tokens_to_generate"]
+            sampling_params_list.append(sp)
+
             if len(prompts) == args.prompt_file_num_truncate:
                 break
 
@@ -321,16 +327,6 @@ def get_requests_from_file(
         args.incoming_requests_per_sec,
         len(prompts),
     )
-
-    # Update sampling params with per-prompt values.
-    sampling_params_list = [sampling_params] * len(prompts)
-    if args.num_tokens_from_file:
-        if sampling_params is None:
-            sampling_params = get_default_sampling_params(tokenizer.eod)
-        for i in range(len(prompts)):
-            sp = copy.deepcopy(sampling_params)
-            sp.num_tokens_to_generate = num_tokens_to_generate[i]
-            sampling_params_list[i] = sp
 
     # Init requests.
     requests = [

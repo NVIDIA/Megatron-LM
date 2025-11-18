@@ -58,7 +58,6 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        #tbar = tqdm(total=num_requests_total)
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
@@ -70,7 +69,6 @@ async def main(
                     # request completion.
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
-                    #tbar.update(1)
             else:
                 # Add deterministic number of requests (generally used for debugging).
                 for i in range(min(
