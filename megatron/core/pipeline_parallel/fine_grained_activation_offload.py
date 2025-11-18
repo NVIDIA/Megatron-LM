@@ -200,6 +200,8 @@ class PipelineOffloadManager:
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = True
+        else:
+            raise RuntimeError("TE CPU offload is not available")
         self.inside_context = True
 
         torch._C._autograd._push_saved_tensors_default_hooks(
@@ -213,6 +215,8 @@ class PipelineOffloadManager:
 
         if cpu_offload is not None:
             cpu_offload.CPUOffloadEnabled = False
+        else:
+            raise RuntimeError("TE CPU offload is not available")
         self.inside_context = False
         torch._C._autograd._pop_saved_tensors_default_hooks()
 
@@ -244,23 +248,17 @@ class ChunkOffloadHandler:
     def offload(src_tensor, pin_memory=True):
         """Offload."""
         debug_rank("--------offload")
-        from megatron.core.extensions.transformer_engine import Float8Tensor
-
-        fp8_offload = isinstance(src_tensor, Float8Tensor) if Float8Tensor is not None else False
 
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 
         cpu_backup = torch.empty(
             src_tensor.size(),
-            dtype=torch.uint8 if fp8_offload else src_tensor.dtype,
+            dtype=src_tensor.dtype,
             layout=src_tensor.layout,
             device="cpu",
             pin_memory=pin_memory,
         )
-
-        if fp8_offload:
-            cpu_backup = Float8Tensor.make_like(src_tensor, data=cpu_backup)
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
         state = (src_tensor.device, cpu_backup)
