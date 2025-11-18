@@ -23,9 +23,14 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    Symbols,
+    get_layer_maps_from_layer_type_list,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
+from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
@@ -227,8 +232,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             where the cuda graph batch sizes range from 1 to `max_requests` (as
             computed below). Due to rounding, the actual number of cuda graphs may
             not equal this argument.
-        materialize_only_last_token_logits (bool): If True, only the last token logits
-            are materialized in the context.
+        materialize_only_last_token_logits (Optional[bool]): Whether to only
+            materialize logits for the last token. This should be set to False
+            if returning log probs.
+        layer_type_list (Optional[List[str]]): A list of strings that indicates
+            the layer type (Mamba / Attention / MLP) for each layer.
+            See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list
+            of symbols. This must be provided for hybrid models.
+        mamba_conv_states_shape: (Optional[Tuple[int]]): Mamba conv states shape per request.
+            This must be provided for hybrid models.
+        mamba_ssm_states_shape: (Optional[Tuple[int]]): Mamba ssm states shape per request.
+            This must be provided for hybrid models.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
             engine steps.
         unified_memory_level (Optional[int]): Set unified memory usage within the
@@ -259,7 +273,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_lora_rank: Optional[int] = None,
         qk_pos_emb_head_dim: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
-        materialize_only_last_token_logits: bool = True,
+        materialize_only_last_token_logits: Optional[bool] = True,
+        layer_type_list: Optional[List[str]] = None,
+        mamba_conv_states_shape: Optional[Tuple[int]] = None,
+        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 0,
@@ -283,6 +300,41 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = tensor_model_parallel_size
         hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+
+        # Mamba states.
+        self.is_hybrid_model = layer_type_list is not None and Symbols.MAMBA in layer_type_list
+        if self.is_hybrid_model:
+            assert (
+                mamba_conv_states_shape is not None
+            ), "`mamba_conv_states_shape` must be specified for hybrid models"
+            assert (
+                mamba_ssm_states_shape is not None
+            ), "`mamba_ssm_states_shape` must be specified for hybrid models"
+            assert (
+                not use_cuda_graphs_for_non_decode_steps
+            ), "Non-decode CUDA graphs not yet supported for hybrid models"
+
+            # For hybrid models, the layer map converts the global layer index to the
+            # corresponding attention layer index or Mamba layer index depending on the
+            # layer type.
+            attention_layer_map, mamba_layer_map, _ = get_layer_maps_from_layer_type_list(
+                layer_type_list
+            )
+            self.num_attention_layers = len(attention_layer_map)
+            self.num_mamba_layers = len(mamba_layer_map)
+            self.layer_map = attention_layer_map | mamba_layer_map
+        else:
+            # The layer map is the identity function for pure Transformer models.
+            self.num_attention_layers = num_layers
+            self.num_mamba_layers = 0
+            (mamba_conv_states_shape, mamba_ssm_states_shape) = (None, None)
+            self.layer_map = {i: i for i in range(self.num_attention_layers)}
+
+        if self.num_attention_layers == 0:
+            raise NotImplementedError(
+                f"Using `DynamicInferenceContext` with no attention is not supported."
+            )
+
         # Block size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.block_size_tokens = block_size_tokens
@@ -297,24 +349,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.block_size_bytes = (
                 dtype_size_bytes
                 * 2  # key, value
-                * num_layers
+                * self.num_attention_layers
                 * self.block_size_tokens
                 * num_attention_heads_per_partition
                 * hidden_size_per_attention_head
             )
+        assert self.block_size_bytes > 0
 
         # Adjust buffer to be a multiple of block size.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
         buffer_size_bytes_rem = buffer_size_bytes % self.block_size_bytes
         buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
 
-        # Compute max_requets, max_tokens from buffer size and overflow factor.
+        mamba_states_memory_per_request = 0
+        if self.is_hybrid_model:
+            mamba_states_memory_per_request += math.prod(mamba_conv_states_shape)
+            mamba_states_memory_per_request += math.prod(mamba_ssm_states_shape)
+            mamba_states_memory_per_request *= self.num_mamba_layers
+            mamba_states_memory_per_request *= dtype_size_bytes
+
+        # Compute max_requets, max_tokens from buffer size, overflow factor, and Mamba state size.
         def bytes_to_max_requests_and_tokens(n_bytes):
-            n_tokens = n_bytes / self.block_size_bytes * self.block_size_tokens
-            n_requests = n_tokens / max_sequence_length
-            return self.round_up_requests(int(n_requests), tp_size=tp_size), self.round_up_tokens(
-                int(n_tokens), tp_size=tp_size
+            bytes_per_token = self.block_size_bytes / self.block_size_tokens
+            cost_per_request_bytes = (
+                mamba_states_memory_per_request + max_sequence_length * bytes_per_token
             )
+            # TODO(ksanthanam): Leave room for an extra request in the event of padding
+            # for non-decode CUDA graphs
+            n_requests = n_bytes / cost_per_request_bytes
+            n_tokens = n_requests * max_sequence_length
+            n_requests = self.round_up_requests(int(n_requests), tp_size=tp_size)
+            n_tokens = self.round_up_tokens(int(n_tokens), tp_size=tp_size)
+            return n_requests, n_tokens
 
         self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
         if buffer_overflow_factor is not None:
@@ -339,7 +405,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize context state.
         self.params_dtype = params_dtype
-        self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
 
         # Unified memory.
@@ -390,8 +455,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
-        # Calculate the total number of blocks available in the buffer
-        block_count_total = buffer_size_bytes // self.block_size_bytes
+        # Calculate the total number of chunks available in the buffer
+        total_mamba_states_memory = mamba_states_memory_per_request * self.max_requests
+        block_count_total = (
+            max(0, buffer_size_bytes - total_mamba_states_memory) // self.block_size_bytes
+        )
 
         # Memory buffer.
         ctx_manager = (
@@ -402,7 +470,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             if cache_mla_latent:
                 self.memory_buffer = torch.full(
-                    (self.num_layers, block_count_total, self.block_size_tokens, kv_reduced_dim),
+                    (
+                        self.num_attention_layers,
+                        block_count_total,
+                        self.block_size_tokens,
+                        kv_reduced_dim,
+                    ),
                     -1,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
@@ -411,7 +484,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.memory_buffer = torch.full(
                     (
                         2,  # key and value
-                        self.num_layers,
+                        self.num_attention_layers,
                         block_count_total,
                         self.block_size_tokens,
                         num_attention_heads_per_partition,
@@ -516,14 +589,34 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count_total=block_count_total, gtd_block_count=self.gtd_block_count
         )
 
+        # Optional state tensors for hybrid models
+        if self.is_hybrid_model:
+            self.mamba_metadata = MambaMetadata(max_requests=self.max_requests)
+
+            with ctx_manager:
+                self.mamba_conv_states = torch.zeros(
+                    (self.num_mamba_layers, self.max_requests) + mamba_conv_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.zeros(
+                    (self.num_mamba_layers, self.max_requests) + mamba_ssm_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
+        else:
+            self.mamba_metadata = None
+
         # Store the dummy block idx reference for convenience
         self.dummy_block_idx = self.block_allocator.dummy_block_idx
 
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
 
-        # Reset attention state.
+        # Reset attention and Mamba state.
         self.reset_attention_state()
+        self.reset_mamba_state()
 
         if use_flashinfer_fused_rope is True:
             assert HAVE_FLASHINFER, "flashinfer is not installed"
@@ -628,7 +721,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Test if all active requests are in decode phase.
 
         For a request in prefill phase active_tokens = query length
-        Once the request moves to decode phase active tokens is 1 for that request. So if all active requests are in decode phase, they will be equal to active token count.
+        Once the request moves to decode phase active tokens is 1 for that request.
+        So if all active requests are in decode phase, they will be equal to active token count.
         """
         total_active_requests = self.total_request_count - self.paused_request_count
         return total_active_requests == self.active_token_count
@@ -664,11 +758,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def get_active_request_count(self):
         """Returns the current number of active requests."""
-        active_sequence_lengths = self.get_active_sequence_lengths()
-        max_sequence_lengths = self.get_max_sequence_lengths()
-        active_requests_mask = torch.less(active_sequence_lengths, max_sequence_lengths).byte()
-        active_request_count = (active_requests_mask == 1).sum().item()
-        return active_request_count
+        return self.total_request_count - self.paused_request_count
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -678,10 +768,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
+        attention_layer_number = self.layer_map[layer_number - 1]
+
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
             # currently does not support MLA latent cache
             return triton_append_key_value_cache(
-                layer_number=layer_number,
+                layer_number=attention_layer_number,
                 key=key,
                 value=value,
                 memory_buffer=self.memory_buffer,
@@ -706,14 +798,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.cache_mla_latent:
             # We pass the kv_concat as the key in cache_mla_latent
             kv_concat = key
-            self.memory_buffer[layer_number - 1, block_idx, local_kv_seq_idx] = kv_concat[
+            self.memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = kv_concat[
                 : self.padded_active_token_count
             ]
         else:
-            self.memory_buffer[0, layer_number - 1, block_idx, local_kv_seq_idx] = key[
+            self.memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
                 : self.padded_active_token_count
             ]
-            self.memory_buffer[1, layer_number - 1, block_idx, local_kv_seq_idx] = value[
+            self.memory_buffer[1, attention_layer_number, block_idx, local_kv_seq_idx] = value[
                 : self.padded_active_token_count
             ]
 
@@ -727,18 +819,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer.
         """
+        attention_layer_number = self.layer_map[layer_number - 1]
         if self.cache_mla_latent:
             return (
-                self.memory_buffer[layer_number - 1],
+                self.memory_buffer[attention_layer_number],
                 None,
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
         else:
             return (
-                self.memory_buffer[0, layer_number - 1],
-                self.memory_buffer[1, layer_number - 1],
+                self.memory_buffer[0, attention_layer_number],
+                self.memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
+
+    def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Returns the Mamba state tensors for the given layer."""
+        assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
+
+        mamba_layer_number = self.layer_map[layer_number - 1]
+        conv_state = self.mamba_conv_states[mamba_layer_number]
+        ssm_state = self.mamba_ssm_states[mamba_layer_number]
+
+        return (conv_state, ssm_state)
 
     def apply_fused_qk_rotary_emb(
         self, query: Tensor, key: Tensor, cos_sin_emb: Tensor, config: TransformerConfig
@@ -853,6 +956,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         for attn_metadata in self.graph_attn_metadata.values():
             attn_metadata.reset()
         self.active_attn_metadata = None
+
+        if self.is_hybrid_model:
+            self.mamba_metadata.reset_cudagraph_mapping()
+
+    def reset_mamba_state(self) -> None:
+        """Reset state used within Mamba layers."""
+        if self.is_hybrid_model:
+            self.mamba_conv_states.fill_(0)
+            self.mamba_ssm_states.fill_(0)
+            self.mamba_metadata.reset()
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -977,6 +1090,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # All attention metadata calculations are now handled by MHAMetadata.update()
 
+        # Create Mamba state block table if it's a hybrid model
+        if self.is_hybrid_model:
+            active_mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[
+                self.paused_request_count : self.total_request_count
+            ]
+
+            if self.is_decode_only() or self.using_cuda_graph_this_step():
+                self.mamba_metadata.update_cudagraph_mapping(
+                    active_mamba_indices, self.total_request_count - self.paused_request_count
+                )
+
     def reset(self) -> None:
         """Reset entire context.
 
@@ -1018,11 +1142,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset available block count.
         self.reset_attention_state()
+        self.reset_mamba_state()
         self.block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
-
-        # Reset chunked prefill state
-        self.chunked_prefill_request_id = -1
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
@@ -1198,6 +1320,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.block_size_tokens)
+
+        if self.is_hybrid_model and not is_chunked_prefill:
+            # Allocate a slot for Mamba states
+            mamba_idx = self.mamba_metadata.allocate_slot()
+            if mamba_idx is None:
+                raise ContextOverflowError(req.request_id, "No Mamba slots available")
+
+            # Initialize the allocated Mamba state
+            self.mamba_conv_states[:, mamba_idx] = 0.0
+            self.mamba_ssm_states[:, mamba_idx] = 0.0
+            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
+
         self.active_token_count += chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
 
@@ -1216,6 +1350,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
         self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
 
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+            )
+
     def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
@@ -1229,6 +1368,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
+
+        if self.is_hybrid_model:
+            tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
@@ -1301,10 +1443,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
                 self.block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
 
+                if self.is_hybrid_model:
+                    self.mamba_metadata.free_slots(finished_idxs)
+
             # Reset request/token counts.
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
             self.active_token_count = 0
+
+            # Reset Mamba state.
+            self.reset_mamba_state()
+
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -1332,6 +1481,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             # and updates it instead of the original tensor.
             self.request_to_kv_block_ids[finished_idxs] = -1
 
+            if self.is_hybrid_model:
+                # Get the Mamba state indices for finished requests and free them
+                self.mamba_metadata.free_slots(finished_idxs)
+
             if active_request_count > 0:
                 finished_idxs_on_left = (
                     torch.nonzero(active_requests_mask[:active_request_count] == 0, as_tuple=True)[
@@ -1351,8 +1504,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     next_tokens=next_tokens,
                 )
 
-                # Reset block ids for recently moved requests.
+                # Reset chunk ids for recently moved requests.
                 self.request_to_kv_block_ids[active_idxs_on_right] = -1
+                if self.is_hybrid_model:
+                    self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
 
         # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily
@@ -1450,6 +1605,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         self.total_request_count = active_request_count + self.paused_request_count
+
         # All these active requests are in decode phase, so they need only 1 token per request
         self.active_token_count = active_request_count
         # Always the first section of token input ids are only used.
