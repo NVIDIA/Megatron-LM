@@ -19,6 +19,7 @@ from pathlib import Path
 # Configure UTF-8 for Windows
 if sys.platform == 'win32':
     import io
+
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -42,10 +43,7 @@ def test_decorator_module():
     """Test that the compat decorator module exists"""
     print("\n2. Testing decorator module...", end=" ")
     try:
-        from megatron.core.utils import (
-            deprecated,
-            internal_api,
-        )
+        from megatron.core.utils import deprecated, internal_api
 
         print("✅ Decorator module found")
         print("   Available: @internal_api, @deprecated")
@@ -88,10 +86,7 @@ def test_decorators_work():
     """Test that decorators can be applied"""
     print("\n5. Testing decorator functionality...", end=" ")
     try:
-        from megatron.core.utils import (
-            internal_api,
-            deprecated,
-        )
+        from megatron.core.utils import internal_api, deprecated
 
         # Test internal_api decorator
         @internal_api
