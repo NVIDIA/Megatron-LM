@@ -47,12 +47,12 @@ jobs:
             # Use manually specified baseline
             BASELINE="${{ github.event.inputs.baseline }}"
           else
-            # Auto-detect latest core release tag
-            BASELINE=$(git tag -l 'core_r*' | sort -V | tail -1)
+            # Auto-detect latest core release tag (stable versions only, no rc)
+            BASELINE=$(git tag -l 'core_v*' | grep -E '^core_v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
             
             # Fallback if no tags found
             if [ -z "$BASELINE" ]; then
-              echo "Warning: No core_r* tags found, using main" >&2
+              echo "Warning: No core_v* tags found, using main" >&2
               BASELINE="main"
             fi
           fi
