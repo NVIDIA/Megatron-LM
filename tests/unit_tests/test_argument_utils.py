@@ -3,8 +3,8 @@
 import pytest
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
-from typing import Optional, Literal
-from megatron.training.argument_utils import ArgumentGroupFactory
+from typing import Callable, Optional, Literal
+from megatron.training.argument_utils import ArgumentGroupFactory, TypeInferenceError
 
 
 @dataclass
@@ -348,3 +348,238 @@ class TestArgumentGroupFactoryHelpers:
         result = factory._extract_type(Literal[1, 2, 3])
         assert result == {"type": int, "choices": (1, 2, 3)}
 
+
+@dataclass
+class ConfigWithArgparseMeta:
+    """Config with argparse_meta metadata for testing overrides."""
+    
+    custom_help: str = field(
+        default="default_value",
+        metadata={"argparse_meta": {"help": "Custom help text from metadata"}}
+    )
+    """Original help text"""
+    
+    custom_type: str = field(
+        default="100",
+        metadata={"argparse_meta": {"type": int}}
+    )
+    """Field with type override"""
+    
+    custom_default: str = field(
+        default="original_default",
+        metadata={"argparse_meta": {"default": "overridden_default"}}
+    )
+    """Field with default override"""
+    
+    custom_choices: str = field(
+        default="option1",
+        metadata={"argparse_meta": {"choices": ["option1", "option2", "option3"]}}
+    )
+    """Field with choices override"""
+    
+    custom_dest: str = field(
+        default="value",
+        metadata={"argparse_meta": {"dest": "renamed_destination"}}
+    )
+    """Field with dest override"""
+    
+    custom_action: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"action": "store_const", "const": "special_value"}}
+    )
+    """Field with custom action override"""
+    
+    multiple_overrides: int = field(
+        default=42,
+        metadata={"argparse_meta": {
+            "type": str,
+            "help": "Multiple overrides applied",
+            "default": "999",
+            "dest": "multi_override_dest"
+        }}
+    )
+    """Field with multiple metadata overrides"""
+    
+    nargs_override: str = field(
+        default="single",
+        metadata={"argparse_meta": {"nargs": "?"}}
+    )
+    """Field with nargs override"""
+
+
+@dataclass
+class ConfigWithUnsupportedTypes:
+    """Config with argparse_meta metadata for testing overrides."""
+    
+    unsupported_type: Optional[Callable] = None
+    """Cannot take a callable over CLI"""
+
+    unsupported_with_metadata: Optional[Callable] = field(default=None, metadata={"argparse_meta": {"type": int, "choices": (0, 1, 2)}})
+    """This argument should be 0, 1, or 2. The appropriate
+    Callable will be set by some other logic.
+    """
+
+
+class TestArgumentGroupFactoryArgparseMeta:
+    """Test argparse_meta metadata override functionality."""
+    
+    def test_help_override(self):
+        """Test that argparse_meta can override help text."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # Find the action for this argument
+        for action in parser._actions:
+            if hasattr(action, 'dest') and action.dest == 'custom_help':
+                assert action.help == "Custom help text from metadata"
+                return
+        
+        pytest.fail("custom_help argument not found")
+    
+    def test_type_override(self):
+        """Test that argparse_meta can override argument type."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # Parse with integer value (metadata overrides type to int)
+        args = parser.parse_args(['--custom-type', '42'])
+        
+        # Should be parsed as int, not str
+        assert isinstance(args.custom_type, int)
+        assert args.custom_type == 42
+    
+    def test_default_override(self):
+        """Test that argparse_meta can override default value."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # Parse with no arguments
+        args = parser.parse_args([])
+        
+        # Should use metadata default, not field default
+        assert args.custom_default == "overridden_default"
+    
+    def test_choices_override(self):
+        """Test that argparse_meta can override choices."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # Valid choice from metadata
+        args = parser.parse_args(['--custom-choices', 'option2'])
+        assert args.custom_choices == "option2"
+        
+        # Invalid choice should fail
+        with pytest.raises(SystemExit):
+            parser.parse_args(['--custom-choices', 'invalid_option'])
+    
+    def test_dest_override(self):
+        """Test that argparse_meta can override destination name."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        args = parser.parse_args(['--custom-dest', 'test_value'])
+        
+        # Should be stored in renamed destination
+        assert hasattr(args, 'renamed_destination')
+        assert args.renamed_destination == "test_value"
+    
+    def test_action_override(self):
+        """Test that argparse_meta can override action."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # With custom action=store_const and const="special_value"
+        args = parser.parse_args(['--custom-action'])
+        assert args.custom_action == "special_value"
+        
+        # Without flag, should use default
+        args = parser.parse_args([])
+        assert args.custom_action == False
+    
+    def test_multiple_overrides(self):
+        """Test that multiple argparse_meta overrides work together."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # Parse with no arguments to check default override
+        args = parser.parse_args([])
+        
+        # Check all overrides applied
+        assert hasattr(args, 'multi_override_dest')
+        assert args.multi_override_dest == "999"  # default override
+        
+        # Parse with value to check type override
+        args = parser.parse_args(['--multiple-overrides', 'text_value'])
+        assert isinstance(args.multi_override_dest, str)  # type override
+        assert args.multi_override_dest == "text_value"
+        
+        # Check help override was applied
+        for action in parser._actions:
+            if hasattr(action, 'dest') and action.dest == 'multi_override_dest':
+                assert action.help == "Multiple overrides applied"
+                break
+    
+    def test_nargs_override(self):
+        """Test that argparse_meta can override nargs."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        factory.build_group(parser, title="Test Group")
+        
+        # With nargs='?', argument is optional
+        args = parser.parse_args(['--nargs-override'])
+        assert args.nargs_override is None  # No value provided with '?'
+        
+        # With value
+        args = parser.parse_args(['--nargs-override', 'provided_value'])
+        assert args.nargs_override == "provided_value"
+        
+        # Without flag at all, should use default
+        args = parser.parse_args([])
+        assert args.nargs_override == "single"
+    
+    def test_metadata_takes_precedence_over_inference(self):
+        """Test that metadata has highest precedence over type inference."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithArgparseMeta)
+        
+        # Build kwargs for custom_type field which is str but metadata says int
+        from dataclasses import fields as dc_fields
+        for f in dc_fields(ConfigWithArgparseMeta):
+            if f.name == 'custom_type':
+                kwargs = factory._build_argparse_kwargs_from_field(f)
+                # Metadata type should override inferred type
+                assert kwargs['type'] == int
+                break
+
+    def test_unhandled_unsupported_type(self):
+        """Test that an unsupported type produces a TypInferenceError."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithUnsupportedTypes, exclude=["unsupported_with_metadata"])
+
+        with pytest.raises(TypeInferenceError, match="Unsupported type"):
+            factory.build_group(parser, title="Test Group")
+
+    def test_handled_unsupported_type(self):
+        """Test an attribute with an unsupported type that has type info in the metadata."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(ConfigWithUnsupportedTypes, exclude=["unsupported_type"])
+
+        factory.build_group(parser, title="Test Group")
+
+        args = parser.parse_args(['--unsupported-with-metadata', '0'])
+        assert args.unsupported_with_metadata == 0
