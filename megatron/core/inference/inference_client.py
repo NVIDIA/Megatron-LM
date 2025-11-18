@@ -236,7 +236,7 @@ class InferenceClient:
         self.running.clear()
         return self.stopped.wait()
 
-    async def stop(self):
+    def stop(self):
         """
         Stops the client and cleans up all resources.
 

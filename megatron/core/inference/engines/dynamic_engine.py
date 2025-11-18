@@ -1342,7 +1342,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.microbatch_pause = True
                 self.running.clear()
                 # Send PAUSE_ACK back to coordinator.
-                if rank == 0:
+                if self.is_mp_coordinator:
                     payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
                 break
@@ -1351,7 +1351,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.microbatch_stop = True
                 self.running.clear()
                 # Send STOP_ACK back to coordinator.
-                if rank == 0:
+                if self.is_mp_coordinator:
                     payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
                 break

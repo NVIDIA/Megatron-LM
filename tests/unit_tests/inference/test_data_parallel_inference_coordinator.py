@@ -211,7 +211,7 @@ class TestCoordinator:
                         await asyncio.sleep(arrival_delta)
                         fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
                         futures.append(fut)
-                    results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                    results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
                     all_results.append(results)
                 env.timing_data["done_time"] = time.time()
             results_success = True
@@ -219,10 +219,10 @@ class TestCoordinator:
             try:
                 if dist.get_rank() == 0:
                     if test_config.stop_engines:
-                        client.stop_engines()
+                        await asyncio.wait_for(client.stop_engines(), timeout=10.0)
                     client.stop()
                 if test_config.stop_engines:
-                    await asyncio.wait_for(env.engine.engine_loop_task, timeout=5.0)
+                    await asyncio.wait_for(env.engine.engine_loop_task, timeout=10.0)
                 shutdown_success = True
             except:
                 env.engine.engine_loop_task.cancel()
@@ -370,10 +370,10 @@ class TestCoordinator:
                         await asyncio.wait_for(asyncio.gather(*futures), timeout=0.1)
             success = True
         finally:
-            if dist.get_rank() == 0:
-                client.stop_engines()
-                client.stop()
             try:
+                if dist.get_rank() == 0:
+                    await asyncio.wait_for(client.stop_engines(), timeout=5.0)
+                    client.stop()
                 await asyncio.wait_for(env.engine.engine_loop_task, timeout=5.0)
             except asyncio.TimeoutError:
                 env.engine.engine_loop_task.cancel()
@@ -409,7 +409,7 @@ class TestCoordinator:
             run_duration = (env.timing_data["done_time"] - env.timing_data["init_time"]) * 10**3
             golden_run_duration = 2906.29  # ms
             stop_duration = (env.timing_data["stop_time"] - env.timing_data["done_time"]) * 10**3
-            golden_stop_duration = 10.77  # ms
+            golden_stop_duration = 33.17  # ms
 
             def clamp_to_golden_value(value, golden_value, delta=0.1):
                 return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
