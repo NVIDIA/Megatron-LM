@@ -587,12 +587,13 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
 
 
 def get_environment_rollouts(
-    model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
+    model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
 ):
     """Sample environment rollouts from an LLM.
 
     Args:
         model: Model to sample from.
+        inference_model: Inference model to use for inference.
         n_prompts: Number of prompts to sample for across *all* data parallel workers.
         samples_per_group: Amount of trajectories per prompt.
 
@@ -602,6 +603,13 @@ def get_environment_rollouts(
     args = get_args()
     nvtx_range = get_nvtx_range()
 
+    # If we have seperate training and inference models we to refit weights from the training model to the inference model.
+    if inference_model is not None:
+        swap_train_to_inference_model(model, inference_model, args.refit_method)
+    else:
+        inference_model = model
+
+    #TODO(peter): We need to get the models process group collection and use that for these checks
     assert (
         n_prompts % mpu.get_expert_data_parallel_world_size() == 0
     ), "n_prompts must be divisible by data_parallel_world_size"
@@ -609,7 +617,7 @@ def get_environment_rollouts(
     with nvtx_range("rollout-collection"):
         loop = get_event_loop()
         with megatron_rl_inference_mode(
-            model,
+            inference_model,
             optimizer,
             args.enable_cuda_graph,
             args.rl_reset_cuda_graphs,
@@ -649,6 +657,7 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
         print(f"Got rollouts on rank {rank}")
 
+    #TODO(Peter): We need to use the proper models MPU here.
     if lang_rl_log_dir and rank == get_tensor_model_parallel_src_rank():
         with open(
             lang_rl_log_dir
@@ -1930,6 +1939,7 @@ def prepare_data_for_update(
 
 def get_rollout_data_iterator(
     model: LanguageModule,
+    inference_model: LanguageModule | None,
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
@@ -1939,7 +1949,7 @@ def get_rollout_data_iterator(
     tokenizer = get_tokenizer()
 
     buffered_rollouts = get_environment_rollouts(
-        model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
+        model, inference_model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
     )
     buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, tokenizer)
 
@@ -1948,6 +1958,7 @@ def get_rollout_data_iterator(
 
 def setup_grpo_data_iterator(
     model: LanguageModule,
+    inference_model: LanguageModule | None,
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
@@ -1968,13 +1979,18 @@ def setup_grpo_data_iterator(
     """
     args = get_args()
 
+    if inference_model is not None:
+        inference_mpu = inference_model.pg_collection
+    else:
+        inference_mpu = mpu
+
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     if (
         iteration
         % (args.grpo_iterations * ((args.grpo_samples_per_iteration) // args.global_batch_size))
         == 0
     ):
-        buffered_rollouts = get_rollout_data_iterator(model, optimizer, iteration, ref_state_dict)
+        buffered_rollouts = get_rollout_data_iterator(model, inference_model, optimizer, iteration, ref_state_dict)
 
         # Reset packing step counter when new rollouts are collected
         runtime_state = get_rl_runtime_state()
@@ -2006,7 +2022,7 @@ def setup_grpo_data_iterator(
                 if bin_idx.item() < len(my_bin_seq_indices)
             )
             # Estimate global sequences for this step
-            est_global_sequences = step_sequences * mpu.get_data_parallel_world_size()
+            est_global_sequences = step_sequences * inference_mpu.get_data_parallel_world_size()
             print_rank_0(
                 f"[Sequence Packing] Optimizer step {plan['current_step']}/{plan['total_steps']}: "
                 f"processing {len(step_bin_indices)} bins (~{est_global_sequences} sequences globally)"
@@ -2366,9 +2382,21 @@ def get_sequence_packing_tensorboard_metrics(args):
     """Get tensorboard metrics for sequence packing mode."""
     metrics = {}
     if args.consumed_train_bins > 0:
+        # TODO(Peter) We need to use the proper models MPU for refitting. If you forget you probably need to change this all over this 
+        # file
         bin_batch_size = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
         metrics['bin-batch-size'] = bin_batch_size
         metrics['consumed-bins'] = args.consumed_train_bins
     return metrics
+
+def swap_train_to_inference_model(train_model: LanguageModule, inference_model: LanguageModule, refit_method: str):
+    """Swap the train model to the inference model.
+
+    Args:
+        train_model: The train model to swap to the inference model.
+        inference_model: The inference model to swap to the train model.
+    """
+    from megatron.core.model_refitting import swap_model_weights
+    swap_model_weights(train_model, inference_model, refit_method)

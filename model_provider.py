@@ -23,7 +23,7 @@ import megatron.legacy.model  # isort: skip
 
 
 def model_provider(
-    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None
+    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, pg_collection=None, config=None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
     """Builds the model.
 
@@ -65,7 +65,7 @@ def model_provider(
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
-    return model_builder(args, pre_process, post_process, vp_stage)
+    return model_builder(args, pre_process, post_process, vp_stage, pg_collection, config)
 
 
 def count_parameters_in_layer(model, layer_name):

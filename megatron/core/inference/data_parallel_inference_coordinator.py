@@ -23,7 +23,7 @@ try:
 except:
     HAVE_MSGPACK = False
 
-
+#TODO We need to see where the process group collection is used.
 class DataParallelInferenceCoordinator:
     """
     Coordinates inference requests between clients and distributed model engines.

@@ -53,6 +53,9 @@ from megatron.core.utils import (
     get_model_config,
     StragglerDetector,
 )
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.process_groups_config import ProcessGroupCollection
+
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
@@ -671,6 +674,46 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
+        # Build a separate inference model for RL if requested.
+    inference_model = None
+    if args.perform_rl_step:
+        pg_collection = None
+        if args.rl_inference_tensor_model_parallel_size is not None:
+            print_rank_0(f"Setting tensor model parallel size to {args.rl_inference_tensor_model_parallel_size} for inference model")
+            # Build custom process groups for inference with a different TP size, keeping CP and PP the same as training
+            tp_size = args.rl_inference_tensor_model_parallel_size
+            cp_size = mpu.get_context_parallel_world_size()
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            dp_size = args.world_size // (tp_size * cp_size * pp_size)
+            assert dp_size >= 1 and (tp_size * cp_size * pp_size * dp_size) == args.world_size, \
+                "World size must be divisible by tp*cp*pp for inference PG layout"
+
+            grid = HyperCommGrid([tp_size, cp_size, 1, pp_size, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+            tp_group = grid.create_pg("tp")
+            cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
+            ep_group = grid.create_pg("ep")
+            dp_group = grid.create_pg("dp")
+            embd_group_ranks = mpu.default_embedding_ranks(
+                torch.distributed.get_process_group_ranks(pp_group)
+            )
+            embd_group = torch.distributed.new_group(ranks=embd_group_ranks)
+            inference_pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group, dp=dp_group)
+
+            # Build an isolated inference config so training config remains unchanged
+            inference_config = copy.deepcopy(config)
+            inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+    
+            inference_model = get_model(
+                model_provider,
+                model_type,
+                wrap_with_ddp=False,
+                pg_collection=inference_pg_collection,
+                config=inference_config,
+            )
+            inference_model[0].eval()
+
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
@@ -745,6 +788,7 @@ def pretrain(
                 config,
                 checkpointing_context,
                 non_loss_data_func,
+                inference_model,
             )
 
         print_datetime('after training is done')
@@ -850,31 +894,34 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, pg_collection=None, config=None):
     """Build the model."""
     args = get_args()
     args.model_type = model_type
+    if pg_collection is None:
+        pg_collection = mpu
+
 
     # Build model.
     def build_model():
         if (
-            mpu.get_pipeline_model_parallel_world_size() > 1
+            pg_collection.get_pipeline_model_parallel_world_size() > 1
             and args.virtual_pipeline_model_parallel_size is not None
         ):
             model = []
             for i in range(args.virtual_pipeline_model_parallel_size):
                 # Set pre_process and post_process only after virtual rank is set.
-                pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
-                post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
+                pre_process = pg_collection.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
+                post_process = pg_collection.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
                 this_model = model_provider_func(
-                    pre_process=pre_process, post_process=post_process, vp_stage=i)
+                    pre_process=pre_process, post_process=post_process, vp_stage=i, pg_collection=pg_collection, config=config)
                 this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)
         else:
-            pre_process = mpu.is_pipeline_first_stage()
-            post_process = mpu.is_pipeline_last_stage()
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            pre_process = pg_collection.is_pipeline_first_stage()
+            post_process = pg_collection.is_pipeline_last_stage()
+            model = model_provider_func(pre_process=pre_process, post_process=post_process, pg_collection=pg_collection, config=config)
             model.model_type = model_type
         return model
 
@@ -893,18 +940,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # are set for all params so the optimizer can use them.
     for model_module in model:
         for param in model_module.parameters():
+            #TODO(Peter) We need to use the proper models MPU here.
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
     num_parameters = sum(
         [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
     )
-    if mpu.get_data_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
+    if pg_collection.get_data_parallel_rank() == 0 and pg_collection.get_context_parallel_rank() == 0:
         print(
             ' > number of parameters on (tensor, pipeline) '
             'model parallel rank ({}, {}): {}'.format(
-                mpu.get_tensor_model_parallel_rank(),
-                mpu.get_pipeline_model_parallel_rank(),
+                pg_collection.get_tensor_model_parallel_rank(),
+                pg_collection.get_pipeline_model_parallel_rank(),
                 num_parameters,
             ),
             flush=True,
@@ -1952,6 +2000,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    inference_model=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2288,7 +2337,7 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
                 )
                 buffered_rollouts = train_data_iterator
 

@@ -58,7 +58,7 @@ _IS_GRAPH_CAPTURING = False
 
 logger = logging.getLogger(__name__)
 
-
+#TODO(Peter) We have changes needed in this for refit to work properly.
 def is_graph_capturing():
     """Query if currently capturing."""
     global _IS_GRAPH_CAPTURING

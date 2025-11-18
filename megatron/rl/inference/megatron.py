@@ -100,6 +100,20 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
 
     module = model.module.module if hasattr(model.module, "module") else model.module
 
+
+    # DynamicInferenceContext must use the inference model's TP size, not the
+    # training TP size from global args. The inference model may have a custom
+    # ProcessGroupCollection with a different TP size.
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
+    if tp_group is not None:
+        inference_tp_size = dist.get_world_size(group=tp_group)
+    elif getattr(args, 'rl_inference_tensor_model_parallel_size', None) is not None:
+        inference_tp_size = args.rl_inference_tensor_model_parallel_size
+    else:
+        inference_tp_size = args.tensor_model_parallel_size
+
+
     # Inference context.
     inference_context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -116,7 +130,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule) -> Abst
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        tensor_model_parallel_size=inference_tp_size,
         materialize_only_last_token_logits=True,
         unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
         is_hybrid_model=args.is_hybrid_model,
@@ -197,6 +211,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             )
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model)
+        # TODO(Peter) We need to pass the pg_collection to the coordinator, but like where is the coordinator even defined
         coordinator = DynamicEngineCoordinator(
             inference_engine,
             inference_max_requests=inference_engine.context.max_requests,
