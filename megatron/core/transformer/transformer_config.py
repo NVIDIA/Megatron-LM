@@ -873,7 +873,7 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
-            if self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "hybrid_ep":
+            if self.moe_enable_deepep and self.moe_flex_dispatcher_backend == "hybrid_ep":
                 raise ValueError("Only one type of backend is supported for flex token dispatcher.")
 
         if self.moe_shared_expert_intermediate_size is not None:
