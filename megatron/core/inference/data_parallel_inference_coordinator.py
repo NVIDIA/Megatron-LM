@@ -153,7 +153,7 @@ class DataParallelInferenceCoordinator:
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.ACK.value], use_bin_type=True)]
+                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
                 )
 
             elif header == Headers.SUBMIT_REQUEST:
@@ -270,12 +270,8 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-<<<<<<< HEAD
-                                [header.value, client_request_identity, finished_request_record], use_bin_type=True
-=======
-                                [header.value, client_request_identity, finished_request],
+                                [header.value, client_request_identity, finished_request_record],
                                 use_bin_type=True,
->>>>>>> 03e4c6ca49 (lint)
                             ),
                         ]
                     )
