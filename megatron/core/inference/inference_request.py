@@ -373,6 +373,12 @@ class DynamicInferenceRequestRecord:
     requests: list[DynamicInferenceRequest] = field(default_factory=list)
     latency: Optional[float] = None
 
+    @classmethod
+    def from_request(cls, request: DynamicInferenceRequest) -> "DynamicInferenceRequestRecord":
+        record = cls()
+        record.requests.append(request)
+        return record
+
     def __getitem__(self, idx: int) -> DynamicInferenceRequest:
         """Get request by index.
 

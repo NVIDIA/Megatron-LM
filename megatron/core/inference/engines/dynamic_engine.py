@@ -635,8 +635,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # Add request to self.request_records. If the engine has previously been
         # suspended, then the request may already exist.
         if request_id not in self.request_records:
-            self.request_records[request_id] = DynamicInferenceRequestRecord()
-            self.request_records[request_id].requests.append(request)
+            # >>>
+            # self.request_records[request_id] = DynamicInferenceRequestRecord()
+            # self.request_records[request_id].requests.append(request)
+            # +++
+            self.request_records[request_id] = DynamicInferenceRequestRecord.from_request(request)
+            # <<<
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
