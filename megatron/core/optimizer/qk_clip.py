@@ -25,7 +25,7 @@ def clip_qk(model, log_max_only=False) -> float:
                     torch.distributed.all_reduce(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=mpu.get_data_parallel_group(),
+                        group=mpu.get_data_parallel_group(with_context_parallel=True),
                     )
                     log_max_attention_logit = max(
                         log_max_attention_logit,
