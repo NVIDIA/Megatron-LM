@@ -832,7 +832,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-            logging.warning(
+            self.moe_flex_dispatcher_backend = "deepep"
+            warnings.warn(
                 "moe_enable_deepep is deprecated."
                 "Please use --moe-flex-dispatcher-backend=deepep instead."
             )
@@ -844,6 +845,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
+                )
+            if self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "hybrid_ep":
+                raise ValueError(
+                    "Only one type of backend is supported for flex token dispatcher."
                 )
 
         if self.moe_shared_expert_intermediate_size is not None:
