@@ -559,9 +559,20 @@ class SparseAttention(MegatronModule):
         qr = qr.detach()
 
         # Get a FP32 mask with -inf for masked positions.
-        # [b, 1, sq, skv] -> [b, sq, skv]
-        mask = attention_mask.squeeze()
-        float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(mask, float('-inf'))
+        if attn_mask_type is not None:
+            assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
+            # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
+            # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
+            float_mask = torch.triu(
+                torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=x.device),
+                diagonal=1
+            )
+        else:
+            assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
+            # [b, 1, sq, skv] -> [b, sq, skv]
+            mask = attention_mask.squeeze()
+            # float_mask [b, sq, skv]
+            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(mask, float('-inf'))
 
         # ===================================
         # Get index scores and top-k indices

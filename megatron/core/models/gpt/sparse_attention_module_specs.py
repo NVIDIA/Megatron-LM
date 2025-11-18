@@ -24,13 +24,12 @@ def get_indexer_spec_for_backend(
     Returns:
         ModuleSpec for Indexer with appropriate submodules.
     """
-    rms_norm = normalization == "RMSNorm"
     return ModuleSpec(
         module=Indexer,
         submodules=IndexerSubmodules(
             linear_wq_b=backend.linear(),
             linear_wk=backend.linear(),
-            k_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+            k_norm=backend.layer_norm(rms_norm=False, for_qk=True),
             linear_weights_proj=backend.linear(),
         ),
     )
