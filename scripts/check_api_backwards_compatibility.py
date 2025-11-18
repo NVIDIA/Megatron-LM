@@ -395,8 +395,12 @@ Exit codes:
             breaking_changes = []
             for change in all_breaking_changes_raw:
                 # Different breakage types have different path attributes
-                old_path = getattr(change, 'old_path', None) or getattr(change, 'path', None)
-                new_path = getattr(change, 'new_path', None) or getattr(change, 'path', None)
+                old_path = (getattr(change, 'old_path', None) or 
+                           getattr(change, 'path', None) or
+                           (getattr(change, 'old_value', None) and getattr(change.old_value, 'path', None)))
+                new_path = (getattr(change, 'new_path', None) or 
+                           getattr(change, 'path', None) or
+                           (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)))
                 
                 # Skip if either path is in our filtered set
                 if old_path and old_path in all_filtered:
@@ -445,8 +449,12 @@ Exit codes:
                     print(f"   Package: {package_name}")
                     
                     # Different breakage types have different path attributes
-                    old_path = getattr(change, 'old_path', None) or getattr(change, 'path', None)
-                    new_path = getattr(change, 'new_path', None) or getattr(change, 'path', None)
+                    old_path = (getattr(change, 'old_path', None) or 
+                               getattr(change, 'path', None) or
+                               (getattr(change, 'old_value', None) and getattr(change.old_value, 'path', None)))
+                    new_path = (getattr(change, 'new_path', None) or 
+                               getattr(change, 'path', None) or
+                               (getattr(change, 'new_value', None) and getattr(change.new_value, 'path', None)))
                     obj_path = old_path or new_path or "Unknown"
                     print(f"   Object: {obj_path}")
                     
