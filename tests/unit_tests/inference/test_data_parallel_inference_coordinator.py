@@ -218,10 +218,6 @@ class TestCoordinator:
 if __name__ == "__main__":
     test = TestCoordinator()
     asyncio.run(test.test_simple())
-    # >>>
-    print("~~~\nsuccess.")
-    exit()
-    # <<<
     test.test_tp()
     test.teardown_method(None)
     print("~~~")
