@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -37,7 +38,9 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     Returns:
         Rotated tensor.
     """
-    assert x.dtype == torch.bfloat16
+    assert (
+        x.dtype == torch.bfloat16
+    ), f"rotate_activation only support bf16 input, but got {x.dtype}"
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size**-0.5)
@@ -252,7 +255,7 @@ class Indexer(MegatronModule):
                 f'"yarn"'
             )
 
-        self.wq_b = build_module(
+        self.linear_wq_b = build_module(
             submodules.linear_wq_b,
             self.q_lora_rank,
             self.index_n_heads * self.index_head_dim,
@@ -264,7 +267,7 @@ class Indexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-        self.wk = build_module(
+        self.linear_wk = build_module(
             submodules.linear_wk,
             self.hidden_size,
             self.index_head_dim,
@@ -276,15 +279,17 @@ class Indexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
+        k_norm_config = copy.copy(self.config)
+        k_norm_config.normalization = "LayerNorm"
         self.k_norm = build_module(
             submodules.k_norm,
-            config=self.config,
+            config=k_norm_config,
             hidden_size=self.index_head_dim,
             eps=self.config.layernorm_epsilon,
         )
 
         # TODO(kunlunl): The dtype of this module should be torch.get_default_dtype().
-        self.weights_proj = build_module(
+        self.linear_weights_proj = build_module(
             submodules.linear_weights_proj,
             self.hidden_size,
             self.index_n_heads,
@@ -415,7 +420,7 @@ class Indexer(MegatronModule):
         # q linear and apply rope to q
         # =========================================
         # [seqlen, batch, q_lora_rank] -> [seqlen, batch, index_n_heads * index_head_dim]
-        q, _ = self.wq_b(qr)
+        q, _ = self.linear_wq_b(qr)
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
@@ -425,7 +430,7 @@ class Indexer(MegatronModule):
         # k linear and apply rope to k
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
-        k, _ = self.wk(x)
+        k, _ = self.linear_wk(x)
         k = self.k_norm(k)
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
@@ -443,7 +448,7 @@ class Indexer(MegatronModule):
         # Compute index scores
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
-        weights, _ = self.weights_proj(x)
+        weights, _ = self.linear_weights_proj(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
         # [batch, seqlen, seqlen]
         index_scores = self._compute_index_scores(q, weights, k)
