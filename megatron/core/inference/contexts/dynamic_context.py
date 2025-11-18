@@ -45,7 +45,7 @@ try:
 except ImportError:
     triton_append_key_value_cache = None
 
-from megatron.core.utils import nvtx_range_push, nvtx_range_pop
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from packaging.version import Version as PkgVersion
@@ -929,10 +929,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.reset()
 
     def add_dummy_requests_parallel(
-        self,
-        requests: Sequence[DynamicInferenceRequest],
-        *,
-        count_as_prefill: bool = True,
+        self, requests: Sequence[DynamicInferenceRequest], *, count_as_prefill: bool = True
     ) -> None:
         """Fast path to add dummy requests without allocating real KV blocks."""
 
@@ -975,7 +972,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(requests[-1].request_id)
 
         device = self.request_ids.device
-        lengths_tensor = torch.tensor(lengths, dtype=self.request_query_lengths.dtype, device=device)
+        lengths_tensor = torch.tensor(
+            lengths, dtype=self.request_query_lengths.dtype, device=device
+        )
         tokens_to_generate_tensor = torch.tensor(
             num_tokens_to_generate, dtype=self.request_query_lengths.dtype, device=device
         )
@@ -1054,7 +1053,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             for logical_idx, request_idx in enumerate(range(start_request_idx, end_request_idx)):
                 mamba_idx = self.mamba_metadata.allocate_slot()
                 if mamba_idx is None:
-                    raise ContextOverflowError(requests[logical_idx].request_id, "No Mamba slots available")
+                    raise ContextOverflowError(
+                        requests[logical_idx].request_id, "No Mamba slots available"
+                    )
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
@@ -1075,9 +1076,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
         shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
-        shared_decode_tokens = torch.zeros(
-            1, dtype=torch.long, device=torch.cuda.current_device()
-        )
+        shared_decode_tokens = torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device())
 
         decode_requests = [
             DynamicInferenceRequest(
@@ -1113,7 +1112,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         prefill_requests = [
             DynamicInferenceRequest(
                 request_id=i + graph_dimensions.decode_req_count,
-                prompt_tokens=shared_prefill_tokens[:prefill_token_counts[i]],
+                prompt_tokens=shared_prefill_tokens[: prefill_token_counts[i]],
                 sampling_params=shared_sampling_params,
             )
             for i in range(graph_dimensions.prefill_req_count)

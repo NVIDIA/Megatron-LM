@@ -222,7 +222,10 @@ class CUDAGraphBatchDimensionBuilder:
                 cuda_graph_token_counts = list(
                     range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
                 )
-                if len(cuda_graph_token_counts) == 0 or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
+                if (
+                    len(cuda_graph_token_counts) == 0
+                    or cuda_graph_token_counts[-1] != cuda_graph_max_tokens
+                ):
                     cuda_graph_token_counts.append(cuda_graph_max_tokens)
                 cuda_graph_token_counts.reverse()
 

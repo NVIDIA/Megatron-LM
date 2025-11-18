@@ -443,19 +443,25 @@ class TestDynamicContext:
         assert dynamic_context.num_prefill_requests == 0
         assert dynamic_context.block_allocator.total_avail == block_avail_before
 
-        expected_tokens = torch.cat([torch.arange(0, 3, device='cuda'), torch.arange(3, 9, device='cuda')])
+        expected_tokens = torch.cat(
+            [torch.arange(0, 3, device='cuda'), torch.arange(3, 9, device='cuda')]
+        )
         assert torch.equal(dynamic_context.token_to_input_ids[:total_tokens], expected_tokens)
 
         expected_positions = torch.tensor(
             [0, 1, 2, 0, 1, 2, 3, 4, 5], device='cuda', dtype=torch.long
         )
-        assert torch.equal(dynamic_context.token_to_position_in_request[:total_tokens], expected_positions)
+        assert torch.equal(
+            dynamic_context.token_to_position_in_request[:total_tokens], expected_positions
+        )
         assert torch.equal(dynamic_context.token_to_pos_ids[:total_tokens], expected_positions)
 
         expected_request_indices = torch.tensor(
             [0, 0, 0, 1, 1, 1, 1, 1, 1], device='cuda', dtype=torch.long
         )
-        assert torch.equal(dynamic_context.token_to_request_idx[:total_tokens], expected_request_indices)
+        assert torch.equal(
+            dynamic_context.token_to_request_idx[:total_tokens], expected_request_indices
+        )
 
         expected_local = expected_positions % dynamic_context.block_size_tokens
         assert torch.equal(
