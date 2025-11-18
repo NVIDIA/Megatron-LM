@@ -2907,6 +2907,17 @@ def _add_data_args(parser):
                        'If instead this argument is set, the training flow will treat all tokens '
                        'that share the same id as the pad token as true pad tokens, potentially '
                        'causing severe training instability.')
+    group.add_argument('--fim-data', action='store_true', help='Whether to use the FIM dataset.')
+    group.add_argument('--fim-rate', type=float, default=0.5,
+                       help='Probability to convert a training sample into a FIM format.')
+    group.add_argument('--fim-spm-rate', type=float, default=0.5,
+                       help='Probability that the a FIM sample uses the SPM format over the PSM format.')
+    group.add_argument('--fim-split-sample', type=str, default=None,
+                       help='String around which to split the sample for FIM.')
+    group.add_argument('--fim-fragment-rate', type=float, default=None,
+                       help='Rate of FIM on each fragment when --fim-split-sample is not None.')
+    group.add_argument('--fim-no-prefix', action='store_true',
+                       help='Do not apply FIM to fragments that start with this prefix')
     return parser
 
 
