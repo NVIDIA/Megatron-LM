@@ -1,9 +1,9 @@
 name: API Compatibility Check
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - "pull-request/[0-9]+"
     paths:
       - 'megatron/core/**/*.py'
       - '!megatron/core/tests/**'
@@ -50,10 +50,10 @@ jobs:
             # Auto-detect latest core release tag (stable versions only, no rc)
             BASELINE=$(git tag -l 'core_v*' | grep -E '^core_v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
             
-            # Fallback if no tags found
+            # Error out if no tags found
             if [ -z "$BASELINE" ]; then
-              echo "Warning: No core_v* tags found, using main" >&2
-              BASELINE="main"
+              echo "Error: No core_v* release tags found. Cannot determine baseline." >&2
+              exit 1
             fi
           fi
           
