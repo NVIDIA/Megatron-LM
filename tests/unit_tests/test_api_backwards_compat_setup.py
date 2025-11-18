@@ -21,11 +21,13 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
+
 def test_griffe_installed():
     """Test that griffe is installed"""
     print("1. Testing griffe installation...", end=" ")
     try:
         import griffe
+
         print("✅ griffe is installed")
         print(f"   Version: {griffe.__version__ if hasattr(griffe, '__version__') else 'unknown'}")
         return True
@@ -41,8 +43,9 @@ def test_decorator_module():
     try:
         from megatron.core.utils import (
             deprecated,
-            internal_api
+            internal_api,
         )
+
         print("✅ Decorator module found")
         print("   Available: @internal_api, @deprecated")
         return True
@@ -84,22 +87,25 @@ def test_decorators_work():
     """Test that decorators can be applied"""
     print("\n5. Testing decorator functionality...", end=" ")
     try:
-        from megatron.core.utils import internal_api, deprecated
-        
+        from megatron.core.utils import (
+            internal_api,
+            deprecated,
+        )
+
         # Test internal_api decorator
         @internal_api
         def test_func1():
             pass
-        
+
         assert hasattr(test_func1, '_internal_api')
-        
+
         # Test deprecated decorator
         @deprecated(version="1.0", removal_version="2.0", alternative="new_func")
         def test_func2():
             pass
-        
+
         assert hasattr(test_func2, '_deprecated')
-        
+
         print("✅ Decorators work correctly")
         return True
     except Exception as e:
@@ -112,22 +118,22 @@ def test_basic_comparison():
     print("\n6. Testing griffe comparison...", end=" ")
     try:
         import griffe
-        
+
         # Create two simple code snippets
         old_code = """
 def example_func(x, y):
     pass
 """
-        
+
         new_code = """
 def example_func(x, y, z=None):
     pass
 """
-        
+
         # This would normally use griffe.load_git, but we'll skip the actual test
         # since it requires a git repo. Just verify griffe has the function.
         assert hasattr(griffe, 'find_breaking_changes')
-        
+
         print("✅ Griffe comparison available")
         return True
     except Exception as e:
@@ -139,7 +145,7 @@ def main():
     print("=" * 70)
     print("API Backward Compatibility Checker Setup Sanity Test")
     print("=" * 70)
-    
+
     results = []
     results.append(test_griffe_installed())
     results.append(test_decorator_module())
@@ -147,14 +153,14 @@ def main():
     results.append(test_workflow())
     results.append(test_decorators_work())
     results.append(test_basic_comparison())
-    
+
     print("\n" + "=" * 70)
     print("Summary")
     print("=" * 70)
-    
+
     passed = sum(results)
     total = len(results)
-    
+
     if all(results):
         print(f"✅ All tests passed ({passed}/{total})")
         print("\nYou're ready to use the API compatibility checker!")
@@ -170,4 +176,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
