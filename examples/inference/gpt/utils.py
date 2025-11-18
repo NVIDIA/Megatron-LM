@@ -309,7 +309,7 @@ def get_requests_from_file(
     sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
-            line_dict = json.loads(line)]
+            line_dict = json.loads(line)
             prompts.append(line_dict["text"])
 
             sp = copy.deepcopy(sampling_params)
