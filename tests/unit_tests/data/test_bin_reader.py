@@ -143,7 +143,6 @@ setattr(msc, "resolve_storage_client", _msc_resolve_storage_client)
 
 
 @pytest.mark.flaky
-@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_bin_reader():
     with tempfile.TemporaryDirectory() as temp_dir:
