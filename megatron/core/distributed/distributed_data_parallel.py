@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 
 from .. import parallel_state
+from ..backwards_compatibility_decorators import exempt_from_compat_check
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor
 from ..process_groups_config import ProcessGroupCollection
@@ -20,6 +21,7 @@ from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 logger = logging.getLogger(__name__)
 
 
+@exempt_from_compat_check
 class DistributedDataParallel(_BaseDataParallel):
     """
     DDP wrapper which stores grads in contiguous buffers. Also has option of overlapping

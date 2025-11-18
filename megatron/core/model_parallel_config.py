@@ -4,9 +4,11 @@ import warnings
 from dataclasses import dataclass
 from typing import Callable, ContextManager, Optional
 
+from .backwards_compatibility_decorators import exempt_from_compat_check
+
 import torch
 
-
+@exempt_from_compat_check
 @dataclass
 class ModelParallelConfig:
     """Base configuration for Megatron Core
