@@ -45,6 +45,8 @@ try:
 except ImportError:
     triton_append_key_value_cache = None
 
+from megatron.core.utils import nvtx_range_push, nvtx_range_pop
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -935,14 +937,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         prefill_tokens = graph_dimensions.token_count - graph_dimensions.decode_req_count
 
+        # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
+        shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
+        shared_decode_tokens = torch.zeros(
+            1, dtype=torch.long, device=torch.cuda.current_device()
+        )
+
         for i in range(graph_dimensions.decode_req_count):
             self.add_request(
                 DynamicInferenceRequest(
                     request_id=i,
-                    prompt_tokens=torch.zeros(
-                        1, dtype=torch.long, device=torch.cuda.current_device()
-                    ),
-                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+                    prompt_tokens=shared_decode_tokens,
+                    sampling_params=shared_sampling_params,
                 )
             )
         if graph_dimensions.prefill_req_count == 0:
@@ -951,25 +957,28 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         per_prefill_tokens = prefill_tokens // graph_dimensions.prefill_req_count
         rem_prefill_tokens = prefill_tokens % graph_dimensions.prefill_req_count
-        prefill_token_counts = torch.full(
-            (graph_dimensions.prefill_req_count,),
-            per_prefill_tokens,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        )
-        if rem_prefill_tokens > 0:
-            prefill_token_counts[:rem_prefill_tokens] += 1
+
+        # If there are remaining prefill tokens, we evenly distribute them to the prefill requests
+        # starting from the first prefill request until we run out of remaining prefill tokens
+
+        prefill_token_counts = [
+            per_prefill_tokens + (1 if i < rem_prefill_tokens else 0)
+            for i in range(graph_dimensions.prefill_req_count)
+        ]
+
         assert per_prefill_tokens > 0
+        # Create a single large tensor and slice from it for each prefill request
+        max_prefill_tokens = per_prefill_tokens + (1 if rem_prefill_tokens > 0 else 0)
+        shared_prefill_tokens = torch.zeros(
+            max_prefill_tokens, dtype=torch.long, device=torch.cuda.current_device()
+        )
+
         for i in range(graph_dimensions.prefill_req_count):
             self.add_request(
                 DynamicInferenceRequest(
                     request_id=i + graph_dimensions.decode_req_count,
-                    prompt_tokens=torch.zeros(
-                        prefill_token_counts[i],
-                        dtype=torch.long,
-                        device=torch.cuda.current_device(),
-                    ),
-                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+                    prompt_tokens=shared_prefill_tokens[:prefill_token_counts[i]],
+                    sampling_params=shared_sampling_params,
                 )
             )
         self.num_prefill_requests = graph_dimensions.prefill_req_count
@@ -993,7 +1002,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # if in recording mode, add dummy requests for cuda graph capture
         if construct_graph_dimensions is not None:
+            nvtx_range_push("add_dummy_requests_for_cudagraph_capture")
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+            nvtx_range_pop("add_dummy_requests_for_cudagraph_capture")
 
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
