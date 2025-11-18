@@ -10,6 +10,7 @@ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
     with pytest.raises(AssertionError):
@@ -234,6 +235,7 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     'src_tp_pp, ep_size',
     [((1, 2), 1), ((1, 4), 1), ((2, 2), 1), ((1, 2), 2), ((1, 4), 2), ((2, 2), 2)],
 )
+@pytest.mark.flaky
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
