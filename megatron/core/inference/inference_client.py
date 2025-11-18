@@ -6,7 +6,7 @@ import os
 import time
 from typing import List, Union
 
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -92,15 +92,15 @@ class InferenceClient:
             prompt (str): The input prompt to send to the language model.
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
-                `serialize()` method.
+                `serializable()` method.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
-            `DynamicInferenceRequestRecord` object containing the completed result.
+            `DynamicInferenceRequest` object containing the completed result.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serializable()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
@@ -126,7 +126,7 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
+                completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -174,16 +174,6 @@ class InferenceClient:
 
     def unpause_engines(self):
         """Sends a signal to unpause all inference engines."""
-        self._send_signal_to_engines(Headers.UNPAUSE)
-
-    def suspend_engines(self):
-        """Sends a signal to pause all inference engines."""
-        self._send_signal_to_engines(Headers.PAUSE)
-        self._send_signal_to_engines(Headers.SUSPEND)
-
-    def resume_engines(self):
-        """Sends a signal to unpause all inference engines."""
-        self._send_signal_to_engines(Headers.RESUME)
         self._send_signal_to_engines(Headers.UNPAUSE)
 
     def stop_engines(self):
