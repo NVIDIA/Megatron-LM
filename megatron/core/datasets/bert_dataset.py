@@ -5,7 +5,6 @@ from typing import Dict, List, Optional, Union
 
 import numpy
 
-from megatron.core.backwards_compatibility_decorators import exempt_from_compat_check
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.masked_dataset import (
     MaskedWordPieceDataset,
@@ -14,7 +13,6 @@ from megatron.core.datasets.masked_dataset import (
 from megatron.core.datasets.utils import Split
 
 
-@exempt_from_compat_check
 @dataclass
 class BERTMaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """Configuration object for Megatron Core BERT WordPiece datasets"""

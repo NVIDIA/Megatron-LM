@@ -10,7 +10,6 @@ from typing import List, Optional, Tuple
 import numpy
 import torch
 
-from megatron.core.backwards_compatibility_decorators import exempt_from_compat_check
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -20,7 +19,6 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
-@exempt_from_compat_check
 @dataclass
 class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core Masked WordPiece datasets"""
