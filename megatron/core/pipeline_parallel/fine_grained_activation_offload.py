@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import warnings
 from collections import deque
 from contextlib import nullcontext
 from typing import Any
