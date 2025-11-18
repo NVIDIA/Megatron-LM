@@ -2427,6 +2427,8 @@ def _add_checkpointing_args(parser):
     group.add_argument('--load-model-opt-format', action='store_true',
                        help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
                             'This function can also be used to load NeMo .nemo sharded checkpoints.')
+    group.add_argument('--defragment-memory-before-ckpt-save', action='store_true', default=False,
+                       help='Defragment memory before saving checkpoint. Default is False.')
     return parser
 
 
