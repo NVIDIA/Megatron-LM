@@ -148,6 +148,14 @@ class TestCoordinator:
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
         )
+        # >>>
+        if 0:
+            from megatron.core import parallel_state
+            from lutil import pax
+            pax({
+                "tp rank" : parallel_state.get_tensor_model_parallel_rank(),
+            })
+        # <<<
         requests = cls._build_requests(test_config)
         engine = DummyEngine()
         return CoordinatorTestEnv(config=test_config, requests=requests, engine=engine)
@@ -218,6 +226,10 @@ class TestCoordinator:
 if __name__ == "__main__":
     test = TestCoordinator()
     asyncio.run(test.test_simple())
+    # >>>
+    print("~~~\nsuccess.")
+    exit()
+    # <<<
     test.test_tp()
     test.teardown_method(None)
     print("~~~")

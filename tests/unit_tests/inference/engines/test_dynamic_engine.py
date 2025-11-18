@@ -231,6 +231,10 @@ class TestDynamicInferenceEngine:
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
         )
+        # >>>
+        from lutil import print_seq
+        print_seq("uvm: %d." % context.unified_memory_level)
+        # <<<
 
         return context
 
@@ -1167,3 +1171,10 @@ class TestDynamicInferenceEngine:
             assert math.isclose(
                 suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
             ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+if __name__ == "__main__":
+    test = TestDynamicInferenceEngine()
+    test.test_simple("gpt", None, "full")
+    # test.test_simple("mamba", None, "full")
+    print("~~~\nsuccess.")
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
