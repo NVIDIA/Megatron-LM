@@ -10,10 +10,19 @@ Usage:
 """
 
 import argparse
+import logging
 import os
 import re
 import sys
 from collections import Counter
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger(__name__)
 
 try:
     import griffe
@@ -22,8 +31,8 @@ try:
     except (ImportError, AttributeError):
         from griffe import Object
 except ImportError as e:
-    print(f"ERROR: griffe not installed: {e}", file=sys.stderr)
-    print("Install with: pip install griffe", file=sys.stderr)
+    logger.error(f"griffe not installed: {e}")
+    logger.error("Install with: pip install griffe")
     sys.exit(2)
 
 # Configure UTF-8 for Windows
@@ -98,7 +107,7 @@ def get_filtered_paths(package: Object, package_name: str) -> set:
         # Check for exempt decorator
         if has_exempt_decorator(obj):
             filtered.add(current_path)
-            print(f"  ⏭️  Exempt: {current_path}", file=sys.stderr)
+            logger.info(f"  ⏭️  Exempt: {current_path}")
         
         # Visit children
         if hasattr(obj, 'members'):
@@ -244,17 +253,17 @@ def main():
     try:
         package_name = args.package
         
-        print(f"\n{'='*80}\nAPI COMPATIBILITY CHECK: {package_name}\n{'='*80}\n", file=sys.stderr)
+        logger.info(f"\n{'='*80}\nAPI COMPATIBILITY CHECK: {package_name}\n{'='*80}\n")
         
         # Load baseline
-        print(f"📦 Loading baseline @ {args.baseline}...", file=sys.stderr)
+        logger.info(f"📦 Loading baseline @ {args.baseline}...")
         baseline = griffe.load_git(
             package_name, ref=args.baseline, resolve_aliases=False, 
             resolve_external=False, allow_inspection=False)
-        print(f"   ✓ Loaded", file=sys.stderr)
+        logger.info(f"   ✓ Loaded")
         
         # Load current
-        print(f"\n📦 Loading current @ {args.current or 'working directory'}...", file=sys.stderr)
+        logger.info(f"\n📦 Loading current @ {args.current or 'working directory'}...")
         if args.current:
             current = griffe.load_git(
                 package_name, ref=args.current, resolve_aliases=False,
@@ -263,42 +272,42 @@ def main():
             current = griffe.load(
                 package_name, search_paths=[os.getcwd()], resolve_aliases=False,
                 resolve_external=False, allow_inspection=False)
-        print(f"   ✓ Loaded", file=sys.stderr)
+        logger.info(f"   ✓ Loaded")
         
         # Get filtered paths from CURRENT version only
-        print(f"\n🔍 Finding exempt objects in current version...", file=sys.stderr)
+        logger.info(f"\n🔍 Finding exempt objects in current version...")
         filtered_paths = get_filtered_paths(current, package_name)
-        print(f"   Found {len(filtered_paths)} exempt objects", file=sys.stderr)
+        logger.info(f"   Found {len(filtered_paths)} exempt objects")
         
         # Find breaking changes
-        print(f"\n🔍 Comparing versions...", file=sys.stderr)
+        logger.info(f"\n🔍 Comparing versions...")
         all_changes = list(griffe.find_breaking_changes(baseline, current))
-        print(f"   Found {len(all_changes)} potential breaking changes", file=sys.stderr)
+        logger.info(f"   Found {len(all_changes)} potential breaking changes")
         
         # Filter out exempt changes  
         breaking_changes = []
         skipped_count = 0
         
-        # DEBUG: Print first 5 breaking changes to STDOUT for debugging
-        print("\n===TEST DEBUG (first 5 changes)===", flush=True)
-        print(f"Filtered paths: {filtered_paths}", flush=True)
+        # DEBUG: Print first 5 breaking changes for debugging
+        print("\n===TEST DEBUG (first 5 changes)===")
+        print(f"Filtered paths: {filtered_paths}")
         for i, change in enumerate(all_changes[:5]):
             path = get_object_path(change)
             clean_path = path.split('(')[0] if path and '(' in path else path
-            print(f"\nChange {i+1}: {path}", flush=True)
-            print(f"  Clean: {clean_path}", flush=True)
-            print(f"  Clean repr: {repr(clean_path)}", flush=True)
+            print(f"\nChange {i+1}: {path}")
+            print(f"  Clean: {clean_path}")
+            print(f"  Clean repr: {repr(clean_path)}")
             
             # Test matching
             matched = False
             for fpath in filtered_paths:
                 if clean_path and (clean_path == fpath or clean_path.startswith(fpath + '.')):
-                    print(f"  ✓ MATCH with: {fpath}", flush=True)
+                    print(f"  ✓ MATCH with: {fpath}")
                     matched = True
                     break
             if not matched:
-                print(f"  ✗ NO MATCH", flush=True)
-        print("\n===END TEST DEBUG===\n", flush=True)
+                print(f"  ✗ NO MATCH")
+        print("\n===END TEST DEBUG===\n")
         
         for change in all_changes:
             if should_skip_change(change, filtered_paths):
@@ -306,18 +315,18 @@ def main():
             else:
                 breaking_changes.append(change)
         
-        print(f"\n   Skipped {skipped_count} exempt | Reporting {len(breaking_changes)} breaking changes", file=sys.stderr)
+        logger.info(f"\n   Skipped {skipped_count} exempt | Reporting {len(breaking_changes)} breaking changes")
         
         # Print results
         if not breaking_changes:
-            print(f"\n✅ No breaking changes detected!", file=sys.stderr)
+            logger.info(f"\n✅ No breaking changes detected!")
             return 0
         
         # Count by type
         change_types = Counter(change.kind.value for change in breaking_changes)
-        print(f"\n📊 Breaking changes by type:", file=sys.stderr)
+        logger.info(f"\n📊 Breaking changes by type:")
         for change_type, count in sorted(change_types.items(), key=lambda x: -x[1]):
-            print(f"   • {change_type}: {count}", file=sys.stderr)
+            logger.info(f"   • {change_type}: {count}")
         
         # Print detailed changes
         print(f"\n❌ Found {len(breaking_changes)} breaking change(s):\n{'='*80}")
@@ -332,7 +341,7 @@ def main():
         return 1
         
     except Exception as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
+        logger.error(f"\n❌ Error: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
