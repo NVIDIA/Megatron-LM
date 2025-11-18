@@ -15,7 +15,11 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+    Status,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop
 from tests.unit_tests.test_utilities import Utils
@@ -64,7 +68,7 @@ class DummyEngine(DynamicInferenceEngine):
                 request_id=request_id,
                 sampling_params=sampling_params,
                 status=Status.WAITING_IN_QUEUE,
-            ),
+            )
         )
         self.waiting_request_ids.append(request_id)
 
@@ -72,9 +76,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.request_completion_futures[request_id] = fut
         return fut
 
-    async def async_step(
-        self, *, verbose: Optional[bool] = False
-    ) -> Dict:
+    async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
         """Dummy async_step."""
         # Finish "active" requests.
         finished_request_records = []
@@ -93,7 +95,7 @@ class DummyEngine(DynamicInferenceEngine):
         active_request_ids = []
         while self.waiting_request_ids:
             request_id = self.waiting_request_ids.popleft()
-            record = self.requests[request_id]
+            record = self.request_records[request_id]
             record[-1].status = Status.ACTIVE_AND_GENERATING_TOKENS
             self.context.active_cnt += 1
             active_request_ids.append(request_id)
@@ -169,7 +171,7 @@ class TestCoordinator:
                 await asyncio.sleep(arrival_delta)
                 fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
                 futures.append(fut)
-            results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
+            results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
 
             client.stop_engines()
             client.stop()
