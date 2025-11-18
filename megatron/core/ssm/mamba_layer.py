@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -82,6 +82,10 @@ class MambaLayer(GraphableMegatronModule):
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+        """Returns the Mamba conv and ssm states shapes per request."""
+        return self.mixer.mamba_state_shapes_per_request()
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -126,10 +130,6 @@ class MambaLayer(GraphableMegatronModule):
             )(mixer_out_with_bias, residual, self.hidden_dropout)
 
         return hidden_states
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """Allocate the inference cache."""
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
