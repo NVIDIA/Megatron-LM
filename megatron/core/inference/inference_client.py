@@ -141,6 +141,8 @@ class InferenceClient:
                     completion_future.set_result(DynamicInferenceRequestRecord.deserialize(reply))
                 elif header == Headers.PAUSE_ACK:
                     self.paused.set()
+                elif header == Headers.STOP_ACK:
+                    self.stopped.set()
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
