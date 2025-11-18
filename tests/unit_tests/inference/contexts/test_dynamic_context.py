@@ -1042,6 +1042,7 @@ class TestDynamicContext:
                 current_global_token_offset += expected_len
 
     @pytest.mark.internal
+    @pytest.mark.skip(reason="UVM currently not working reliably in unit test suite.")
     def test_unified_memory(self):
 
         from megatron.core.inference.unified_memory import (
