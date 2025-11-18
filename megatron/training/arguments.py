@@ -1067,6 +1067,19 @@ def validate_args(args, defaults={}):
            any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
            <= 1, "A single data source must be provided in training mode, else None"
 
+    if args.fim_data:
+        extra_tokens = [
+            args.fim_prefix_token,
+            args.fim_middle_token,
+            args.fim_suffix_token,
+            args.fim_pad_token,
+            args.fim_eod_token,
+        ]
+        assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
+        assert args.fim_rate, "--fim-rate should be specified."
+        assert args.fim_spm_rate, "--fim-spm-rate should be specified."
+        assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
