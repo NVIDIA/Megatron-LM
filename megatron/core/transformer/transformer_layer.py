@@ -558,7 +558,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.offload_attn_norm:
             (hidden_states,) = fine_grained_offloading_group_commit(
-                hidden_states, name="attn_norm", forced_released_tensors=[residual]
+                hidden_states, name="attn_norm", forced_released_tensors=[]
             )
 
         # Residual connection.
@@ -601,7 +601,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             fine_grained_offloading_group_start,
             get_fine_grained_offloading_context,
+            fine_grained_offloading_flush_delay_offload_groups,
         )
+        if self.config.fine_grained_activation_offloading:
+            hidden_states = fine_grained_offloading_flush_delay_offload_groups(hidden_states)
 
         # Residual connection.
         residual = hidden_states
@@ -803,6 +806,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        from megatron.core.pipeline_parallel import (
+            fine_grained_activation_offload,
+        )
+        fine_grained_activation_offload.DEBUG = True
         context = None
         if not self.config.cuda_graph_scope or 'attn' in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
@@ -839,6 +846,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         However, CUDA graph accepts only Tensor inputs.
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_flush_delay_offload_groups,
+            fine_grained_offloading_flush_delay_reload_groups,
+        )
+        # if torch.distributed.get_rank() == 0:
+        #     print("te_cuda_graph_replay")
+        #     breakpoint()
+        # torch.cuda.synchronize()
+        # torch.distributed.barrier()
         context = None
         if self.config.cuda_graph_scope and 'attn' not in self.config.cuda_graph_scope:
             hidden_states, context = self._forward_attention(*args, **kwargs)
@@ -908,6 +924,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 residual=residual,
                 shared_expert_output=shared_expert_output,
             )
+            if self.config.fine_grained_activation_offloading:
+                hidden_states = fine_grained_offloading_flush_delay_offload_groups(hidden_states)
             mlp_output_with_bias = self.mlp(hidden_states)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
