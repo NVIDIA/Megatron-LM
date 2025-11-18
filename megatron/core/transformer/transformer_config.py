@@ -792,6 +792,10 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    fallback_to_eager_attn: bool = False
+    """Whether to fallback to eager attention in TE implementation.
+    Suggested for when desired features are not available in TE implementation."""
+
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -1849,6 +1853,25 @@ class TransformerConfig(ModelParallelConfig):
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
                 )
+
+        if self.fallback_to_eager_attn:
+            assert self.transformer_impl == "transformer_engine", (
+                f"fallback_to_eager_attn is only available with transformer_engine implementation,"
+                f" but got {self.transformer_impl=}."
+            )
+
+        if self.fallback_to_eager_attn or self.transformer_impl == "local":
+            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+                all_cp_comm_types_are_all_gather = (
+                    all(item == "all_gather" for item in self.cp_comm_type)
+                    if isinstance(self.cp_comm_type, list)
+                    else self.cp_comm_type == "all_gather"
+                )
+                if not all_cp_comm_types_are_all_gather:
+                    raise ValueError(
+                        f"fallback_to_eager_attn only supports all_gather communication type "
+                        f"for context parallelism, but got {self.cp_comm_type=} instead."
+                    )
 
 
 @dataclass

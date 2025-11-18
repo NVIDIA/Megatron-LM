@@ -1402,6 +1402,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--fallback-to-eager-attn', action='store_true',
+                       help='Fallback to eager attention in TE implementation. '
+                       'Suggested for when desired features are not available in TE implementation.')
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
