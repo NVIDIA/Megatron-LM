@@ -847,9 +847,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
             if self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "hybrid_ep":
-                raise ValueError(
-                    "Only one type of backend is supported for flex token dispatcher."
-                )
+                raise ValueError("Only one type of backend is supported for flex token dispatcher.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
