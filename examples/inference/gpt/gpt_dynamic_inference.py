@@ -381,7 +381,7 @@ def main():
     (
         layer_type_list,
         mamba_conv_states_shape,
-        mamba_ssm_states
+        mamba_ssm_states_shape,
     ) = get_mamba_inference_metadata_from_model(model)
 
     # Requests, context, controller.

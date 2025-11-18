@@ -14,11 +14,12 @@ except ImportError as e:
 
 import megatron.core.inference.text_generation_server.endpoints as endpoints
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.utils import temp_log_level
+from megatron.core.utils import temp_log_level, trace_async_exceptions
 
 logger = logging.getLogger(__name__)
 
 
+@trace_async_exceptions
 async def run_flask_server(coordinator_port: int, tokenizer, rank: int, flask_port: int):
     """Initializes and runs the async Flask server."""
     if not HAS_FLASK:

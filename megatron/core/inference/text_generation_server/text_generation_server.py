@@ -8,8 +8,10 @@ import torch
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.flask_server import run_flask_server
+from megatron.core.utils import trace_async_exceptions
 
 
+@trace_async_exceptions
 async def run_text_generation_server(
     engine: DynamicInferenceEngine,
     coordinator_port: int,
@@ -29,9 +31,7 @@ async def run_text_generation_server(
     rank = torch.distributed.get_rank()
 
     await engine.start_listening_to_data_parallel_coordinator(
-        default_sampling_params,
-        inference_coordinator_port=coordinator_port,
-        launch_inference_coordinator=True,
+        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True
     )
 
     server_task = None

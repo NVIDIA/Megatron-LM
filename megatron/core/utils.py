@@ -2125,6 +2125,7 @@ def get_mamba_inference_metadata_from_model(model):
 
     return layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
 
+
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
 
 

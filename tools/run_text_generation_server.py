@@ -15,9 +15,10 @@ from examples.inference.gpt.gpt_dynamic_inference import (
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server import run_text_generation_server
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_mamba_inference_metadata_from_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.training import get_args
+from megatron.training import get_args, get_tokenizer
 from megatron.training.initialize import initialize_megatron
 
 
@@ -39,6 +40,11 @@ if __name__ == "__main__":
         args = get_args()
         model = get_model()
 
+        if args.legacy_tokenizer:
+            tokenizer = get_tokenizer()
+        else:
+            tokenizer = build_tokenizer(args)
+
         (layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape) = (
             get_mamba_inference_metadata_from_model(model)
         )
@@ -57,7 +63,6 @@ if __name__ == "__main__":
         engine = DynamicInferenceEngine(
             controller,
             context,
-            termination_id=-1,
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
         )
@@ -68,6 +73,7 @@ if __name__ == "__main__":
             top_p=args.top_p,
             return_log_probs=args.return_log_probs,
             num_tokens_to_generate=args.num_tokens_to_generate,
+            termination_id=tokenizer.eod,
         )
 
         asyncio.run(
