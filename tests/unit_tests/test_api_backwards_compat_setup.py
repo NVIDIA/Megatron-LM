@@ -13,13 +13,12 @@ Usage:
     python tests/unit_tests/test_api_backwards_compat_setup.py
 """
 
+import io
 import sys
 from pathlib import Path
 
 # Configure UTF-8 for Windows
 if sys.platform == 'win32':
-    import io
-
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -86,7 +85,7 @@ def test_decorators_work():
     """Test that decorators can be applied"""
     print("\n5. Testing decorator functionality...", end=" ")
     try:
-        from megatron.core.utils import internal_api, deprecated
+        from megatron.core.utils import deprecated, internal_api
 
         # Test internal_api decorator
         @internal_api
