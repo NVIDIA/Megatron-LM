@@ -68,7 +68,9 @@ def download_and_extract_asset(assets_dir: Path) -> bool:
                 with tarfile.open(temp_file, 'r') as tar_ref:
                     tar_ref.extractall(assets_dir)
             else:
-                logger.warning(f"  Warning: Unknown file type for {asset_name}, skipping extraction")
+                logger.warning(
+                    f"  Warning: Unknown file type for {asset_name}, skipping extraction"
+                )
                 return False
 
             # Clean up temporary file
