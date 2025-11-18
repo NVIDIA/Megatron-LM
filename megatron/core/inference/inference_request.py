@@ -277,6 +277,39 @@ class DynamicInferenceRequest(InferenceRequest):
         request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
         return request
 
+    @property
+    def tracked_metadata(self) -> List[Any]:
+        """Obtain an ordered list of all request metadata to be tracked by the context.
+
+        This consists of metadata that is used to inform text generation.
+        The values of such fields are tensorized and kept aligned with the current active batch.
+
+        Note that while the general request object is mutable, this metadata is
+        inherently assumed to remain immutable once the request becomes active.
+        """
+        sp = self.sampling_params
+        if sp.termination_id is None:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                warnings.warn(
+                    f"DynamicInferenceRequest {self.request_id} has no termination_id set "
+                    "in its sampling_params. Defaulting to -1."
+                )
+            sp.termination_id = -1
+        return [getattr(sp, field) for field in self.get_metadata_labels().keys()]
+
+    @staticmethod
+    def get_metadata_labels() -> Dict[str, int]:
+        """Provides human-readable labels for the tracked metadata fields."""
+        ret = [
+            "temperature",
+            "top_k",
+            "top_p",
+            "termination_id",
+            "return_log_probs",
+            "skip_prompt_log_probs",
+        ]
+        return {k: v for v, k in enumerate(ret)}
+
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""
         self.events.append(DynamicInferenceEvent(type=type, payload=payload))

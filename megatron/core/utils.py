@@ -17,14 +17,16 @@ import threading
 import time
 import traceback
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
 
+import numpy
 import torch
 
 from megatron.core import config
@@ -65,6 +67,8 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+_mamba_ssm_version = None
+_causal_conv1d_version = None
 
 
 @contextmanager
@@ -386,6 +390,79 @@ def is_fa_min_version(version, check_equality=True):
     if check_equality:
         return get_fa_version() >= PkgVersion(version)
     return get_fa_version() > PkgVersion(version)
+
+
+def get_mamba_version():
+    """Get mamba version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_mamba_version_str():
+        import mamba_ssm
+
+        if hasattr(mamba_ssm, "__version__"):
+            return str(mamba_ssm.__version__)
+        else:
+            return version("mamba_ssm")
+
+    global _mamba_ssm_version
+    if _mamba_ssm_version is None:
+        _mamba_ssm_version = PkgVersion(get_mamba_version_str())
+    return _mamba_ssm_version
+
+
+def is_mamba_min_version(version, check_equality=True):
+    """Check if minimum version of `mamba_ssm` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_mamba_version() >= PkgVersion(version)
+    return get_mamba_version() > PkgVersion(version)
+
+
+def get_causal_conv1d_version():
+    """Get causal_conv1d version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_causal_conv1d_version_str():
+        import causal_conv1d
+
+        if hasattr(causal_conv1d, "__version__"):
+            return str(causal_conv1d.__version__)
+        else:
+            return version("causal_conv1d")
+
+    global _causal_conv1d_version
+    if _causal_conv1d_version is None:
+        _causal_conv1d_version = PkgVersion(get_causal_conv1d_version_str())
+    return _causal_conv1d_version
+
+
+def is_causal_conv1d_min_version(version, check_equality=True):
+    """Check if minimum version of `causal_conv1d` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_causal_conv1d_version() >= PkgVersion(version)
+    return get_causal_conv1d_version() > PkgVersion(version)
+
+
+def check_mamba_sequence_packing_support() -> Tuple[bool, Optional[str]]:
+    """Checks whether `causal_conv1d` and `mamba_ssm` support sequence packing."""
+    if not is_causal_conv1d_min_version("1.5.3.post1"):
+        return False, "causal_conv1d >= 1.5.3.post1 is required"
+    elif not is_mamba_min_version("2.2.6.post3"):
+        return False, "mamba_ssm >= 2.2.6.post3 is required"
+    return True, None
 
 
 def ensure_divisibility(numerator, denominator):
@@ -2001,6 +2078,16 @@ def unwrap_model(model, module_instances=None):
     return unwrapped_model
 
 
+def maybe_cat(a, b, dim=0, *, required=False):
+    """Concatenates `a` and `b` along `dim` if `a` and `b` exist."""
+    xs = [t for t in (a, b) if t is not None]
+    if not xs:
+        if required:
+            raise ValueError("both tensors are None")
+        return None
+    return xs[0] if len(xs) == 1 else torch.cat(xs, dim=dim)
+
+
 def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop:
     """Creates an asyncio loop if necessary and then returns the current asyncio loop."""
     if loop is None:
@@ -2010,3 +2097,58 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
     return loop
+
+
+_ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
+
+
+def trace_async_exceptions(
+    func: Optional[Callable[..., Coroutine]], *, verbose: bool = False
+) -> Callable[..., Coroutine]:
+    """Decorator to be applied to every coroutine that runs in a separate task.
+
+    This is needed because asyncio tasks do not propagate exceptions.
+    Coroutines running inside separate tasks will fail silently if not decorated.
+
+    Passing in `verbose=True` will print additional lifetime logging information about the task.
+    Such functionality is relied on by some users, and can be enabled as shown below:
+    ```
+        @trace_async_exceptions(verbose=True)
+        async def my_coroutine(...):
+            ...
+    ```
+    """
+
+    def _decorate(fn):
+        if not asyncio.iscoroutinefunction(fn):
+            raise TypeError("trace_async_exceptions can only be used with async functions")
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if verbose:
+                start = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"Exception in async function {fn.__name__}: {e}")
+                traceback.print_exc()
+                sys.exit(1)
+            finally:
+                if verbose:
+                    elapsed = (time.perf_counter() - start) * 1000.0
+                    name = fn.__qualname__
+                    cnt, tot = _ASYNC_TASK_STATS[name]
+                    _ASYNC_TASK_STATS[name] = [cnt + 1, tot + elapsed]
+                    avg = _ASYNC_TASK_STATS[name][1] / _ASYNC_TASK_STATS[name][0]
+
+                    log10 = numpy.log10(max(cnt, 1))
+                    if numpy.isclose(log10, round(log10)):
+                        logger.info(
+                            f"{name} completed in {elapsed:.3f} ms, "
+                            f"lifetime avg: {avg:.3f} ms, "
+                            f"lifetime cnt: {cnt + 1}"
+                        )
+
+        return wrapper
+
+    return _decorate if func is None else _decorate(func)
