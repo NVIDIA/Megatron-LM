@@ -453,11 +453,20 @@ Exit codes:
                 if should_skip:
                     continue
                 
+                # Skip aliases (re-exported imports) - only check original definitions
+                # This prevents duplicate reports for the same change at every import location
+                old_value = getattr(change, 'old_value', None)
+                new_value = getattr(change, 'new_value', None)
+                if old_value and hasattr(old_value, 'kind') and old_value.kind.value == 'alias':
+                    continue
+                if new_value and hasattr(new_value, 'kind') and new_value.kind.value == 'alias':
+                    continue
+                
                 breaking_changes.append(change)
             
             if len(all_breaking_changes_raw) > len(breaking_changes):
                 filtered_count = len(all_breaking_changes_raw) - len(breaking_changes)
-                print(f"   Filtered out {filtered_count} changes (excluded code + circular paths)", file=sys.stderr)
+                print(f"   Filtered out {filtered_count} duplicate/excluded changes (aliases, excluded code, circular paths)", file=sys.stderr)
             
             if breaking_changes:
                 all_breaking_changes.extend([(package_name, change) for change in breaking_changes])
