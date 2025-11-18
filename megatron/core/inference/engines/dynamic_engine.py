@@ -1046,14 +1046,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """Determines if a dummy forward pass should be run on this rank. 
         This is used to keep expert parallel ranks in sync when some ranks have no work to do.
         """
+        range_push("should_run_dummy_forward_for_expert_model_parallelism")
         if parallel_state.get_expert_model_parallel_world_size() == 1:
             return False
         local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
-        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group_gloo()
         # all reduce local work across expert model parallel group
 
         local_work_tensor = torch.tensor(
-            [local_work], device=torch.cuda.current_device()
+            [local_work], device='cpu'
         )
         torch.distributed.all_reduce(
             local_work_tensor,
@@ -1061,6 +1062,7 @@ class DynamicInferenceEngine(AbstractEngine):
             group=expert_model_parallel_group,
         )
         global_work = local_work_tensor.item()
+        range_pop()
         return (local_work == 0 and global_work > 0)
             
 

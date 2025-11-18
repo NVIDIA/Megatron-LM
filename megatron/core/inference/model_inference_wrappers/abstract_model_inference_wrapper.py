@@ -158,6 +158,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+        print(tokens.shape, position_ids.shape)
         return self.model(
             tokens,
             position_ids,
@@ -165,6 +166,15 @@ class AbstractModelInferenceWrapper(abc.ABC):
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
         )
+
+    def dummy_forward(self): 
+        tokens = torch.zeros((1, 1), dtype=torch.long, device=torch.cuda.current_device())
+        position_ids = torch.zeros((1, 1), dtype=torch.long, device=torch.cuda.current_device())
+        attention_mask = None 
+        return self.model(
+            tokens,
+            position_ids,
+            attention_mask)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None

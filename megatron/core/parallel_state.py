@@ -51,6 +51,7 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
+_EXPERT_MODEL_PARALLEL_GROUP_GLOO = None
 # Expert tensor parallel group that current rank belongs to.
 _EXPERT_TENSOR_PARALLEL_GROUP = None
 # Expert tensor and model combined parallel group
@@ -1117,16 +1118,27 @@ def initialize_model_parallel(
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
-    global _EXPERT_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_GROUP_GLOO
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
+    assert _EXPERT_MODEL_PARALLEL_GROUP_GLOO is None, "Expert parallel group-gloo is already initialized"
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
             ranks,
             pg_options=get_nccl_options("ep", nccl_comm_cfgs),
             group_desc="EXPERT_MODEL_PARALLEL_GROUP",
         )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, 
+                timeout=timeout, 
+                backend="gloo", 
+                group_desc="EXPERT_MODEL_PARALLEL_GROUP_GLOO"
+            )
+        else:
+            group_gloo = None
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+            _EXPERT_MODEL_PARALLEL_GROUP_GLOO = group_gloo
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1721,6 +1733,14 @@ def get_expert_model_parallel_group(check_initialized=True):
         ), "expert model parallel group is not initialized"
     return _EXPERT_MODEL_PARALLEL_GROUP
 
+### Expert-related parallel states functions
+def get_expert_model_parallel_group_gloo(check_initialized=True):
+    """Get the expert-model-parallel group the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _EXPERT_MODEL_PARALLEL_GROUP_GLOO is not None
+        ), "expert model parallel group gloo is not initialized"
+    return _EXPERT_MODEL_PARALLEL_GROUP_GLOO
 
 def get_expert_model_parallel_world_size():
     """Return world size for the expert-model-parallel group."""

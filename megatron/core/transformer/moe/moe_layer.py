@@ -77,6 +77,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.shared_experts = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
+        
 
     @abstractmethod
     def forward(self, hidden_states):
@@ -122,7 +123,7 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
-
+        
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
@@ -174,11 +175,15 @@ class MoELayer(BaseMoELayer):
         hidden states and probabilities for the token dispatcher. The original
         hidden states are returned as a residual connection.
         """
+        rank = torch.distributed.get_rank()
         residual = hidden_states
+        print(f"{rank}: about to run router...")
         probs, routing_map = self.router(hidden_states)
+        print(f"{rank}: ran router...")
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
+        print(f"{rank}: ran dispatch preprocess...")
         return hidden_states, probs, residual
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -262,6 +267,8 @@ class MoELayer(BaseMoELayer):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
+        rank = torch.distributed.get_rank()
+        print(f"{rank}: inside moe layer FW pass...")
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
@@ -271,10 +278,15 @@ class MoELayer(BaseMoELayer):
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
             shared_expert_output = self.shared_experts_compute(hidden_states)
+            print(f"{rank}: ran shared experts compute ...")
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+            print(f"{rank}: ran router and preprocess ...")
             dispatched_input, probs = self.dispatch(hidden_states, probs)
+            print(f"{rank}: ran dispatch ...")
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+            print(f"{rank}: ran routed experts compute ...")
             output = self.combine(output, shared_expert_output)
+            print(f"{rank}: ran combine ...")
             return output, mlp_bias
 
         if self.moe_layer_recompute:

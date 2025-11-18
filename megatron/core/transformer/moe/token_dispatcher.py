@@ -442,6 +442,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tensor with the number of tokens for each local expert.
         """
+        rank = torch.distributed.get_rank()
+        print(f"Rank {rank} start preprocess....")
         if self.drop_and_pad:
             # Drop and pad the input to capacity.
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
@@ -469,7 +471,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
-
+        print(f"Rank {rank} routing map sum")
         if (
             self.config.moe_expert_capacity_factor is not None
             or self.config.moe_router_padding_for_fp8
@@ -482,7 +484,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # For dropless training, output size is static (num_tokens * topk)
             # No explicit sync needed
             self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
+        print(f"Rank {rank} calculated num_out_tokens...")
         if self.ep_size > 1 or self.tp_size > 1:
+            print(f"Rank {rank} starting calculate splits...")
             # ===================================================
             # Calculate input_splits, output_splits for alltoall/allgather in variable size.
             # ===================================================
@@ -495,6 +499,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
+            print(f"Rank {rank} starting gather from SP region")
+            print(f"Size of tp_ep group = {utils.get_pg_size(self.tp_ep_group)}")
             num_global_tokens_per_expert = (
                 gather_from_sequence_parallel_region(
                     num_local_tokens_per_expert, group=self.tp_ep_group
@@ -502,6 +508,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
+            print(f"Rank {rank} completed gather from SP region")
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -521,7 +528,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
             # A synchronization is needed before expert parallel AlltoAll communication
             # to get the `input_splits` and `output_splits` CPU values.
+            print(f"Rank {rank} starting update cuda sync point")
             self._maybe_update_cuda_sync_point("before_ep_alltoall")
+            print(f"Rank {rank} finished update cuda sync point")
         else:
             num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
                 self.num_experts
@@ -531,7 +540,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # A synchronization is needed before the returns
             # to get the `num_tokens_per_local_expert` CPU value.
             self._maybe_update_cuda_sync_point("before_finish")
-
+        print(f"Rank {rank} finished calculating splits...")
         if self.num_local_experts > 1:
             # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
             # to each local expert by all ranks.
@@ -542,7 +551,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 # A synchronization is needed before permutation 2
                 # to get the `num_global_tokens_per_local_expert` CPU value.
                 self._maybe_update_cuda_sync_point("before_permutation_2")
-
+        print(f"Rank {rank} finished preprocess....")
         assert (
             self.cuda_sync_point_priority[self.cuda_dtoh_point]
             <= self.cuda_sync_point_priority[self.cuda_sync_point]
@@ -566,6 +575,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             A tuple of permuted hidden states and probabilities.
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
+        rank = torch.distributed.get_rank()
         self.hidden_shape = hidden_states.shape
         self.probs = probs
         self.routing_map = routing_map
@@ -580,15 +590,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
+        print(f"Rank {rank} start preprocess....")
         self.tokens_per_expert = self.preprocess(self.routing_map)
-
+        print(f"Rank {rank} finished preprocess....")
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
-
+        print(f"Rank {rank} finished pre forward comm")
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_1", self.tokens_per_expert
         )
+        print(f"Rank {rank} finished d2h synchronize....")
         self.hidden_shape_before_permute = hidden_states.shape
         (
             permutated_local_input_tokens,
@@ -602,6 +614,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
+        print(f"Rank {rank} finished permute...")
         return permutated_local_input_tokens, permuted_probs
 
     def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
@@ -619,17 +632,21 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
+        rank = torch.distributed.get_rank()
+        print(f"Rank {rank} is using MoEAlltoAll dispatch....")
         # Perform expert parallel AlltoAll communication
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
+        print(f"Rank {rank} finished cuda sync before ep alltoall....")
         global_input_tokens = all_to_all(
             self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
         )
+        print(f"Rank {rank} finished all to all on tokens...")
         global_probs = all_to_all(
             self.ep_group, permuted_probs, self.output_splits, self.input_splits
         )
-
+        print(f"Rank {rank} finished all to all on probs...")
         return global_input_tokens, global_probs
 
     def dispatch_postprocess(self, global_input_tokens, global_probs):
@@ -1257,7 +1274,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Returns:
             A tuple of dispatched tokens and probabilities.
-        """
+        """   
         return (
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
             self._comm_manager.dispatched_probs,
