@@ -206,15 +206,27 @@ def extract_path_from_explanation(change) -> str:
     Format: "filepath:line: object_path: description"
     Example: "megatron/core/model_parallel_config.py:338: ModelParallelConfig.cpu_offloading_weights: Attribute value was changed"
     
-    Returns the object path or None if not found.
+    Returns the full object path or None if not found.
     """
     try:
         explanation = change.explain()
         # Split by ": " and get the second part (object path)
         parts = explanation.split(': ')
         if len(parts) >= 2:
-            # First part is "filepath:line", second is object path
-            return parts[1]
+            short_path = parts[1]
+            
+            # Try to get the full path from the file path (first part)
+            file_path = parts[0].split(':')[0]  # Get just the file path, remove line number
+            
+            # Convert file path to module path
+            # e.g., "megatron/core/model_parallel_config.py" -> "megatron.core.model_parallel_config"
+            module_path = file_path.replace('/', '.').replace('\\', '.').replace('.py', '')
+            
+            # Construct full path by combining module and short path
+            # e.g., "megatron.core.model_parallel_config" + "ModelParallelConfig.cpu_offloading_weights"
+            full_path = f"{module_path}.{short_path}"
+            
+            return full_path
     except:
         pass
     return None
@@ -428,6 +440,14 @@ Exit codes:
                 # Skip if either path is in our filtered set or is a child of a filtered object
                 skip_old = False
                 skip_new = False
+                
+                # Debug: Check if this is a DistributedDataParallel change
+                if old_path and 'DistributedDataParallel' in old_path and len(breaking_changes) < 5:
+                    print(f"\n🔍 DEBUG: Breaking change path: {old_path}", file=sys.stderr)
+                    print(f"   Checking against {len(all_filtered)} filtered paths", file=sys.stderr)
+                    matching = [f for f in all_filtered if 'DistributedDataParallel' in f]
+                    if matching:
+                        print(f"   Found filtered paths with DistributedDataParallel: {matching[:3]}", file=sys.stderr)
                 
                 if old_path:
                     # Check exact match or if it's a child (e.g., MyClass.__init__)
