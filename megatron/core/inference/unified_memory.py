@@ -131,10 +131,9 @@ def compile_allocator():
         # Synchronize failure state across ranks. (For currently unknown reasons,
         # one rank can show as FAILURE while the remaining ranks show as SUCCESS.)
         import torch
+
         local_state = torch.tensor(
-            [ _compilation_state.value ],
-            dtype=torch.uint8,
-            device=torch.cuda.current_device(),
+            [_compilation_state.value], dtype=torch.uint8, device=torch.cuda.current_device()
         )
         world_states = [
             torch.empty(1, dtype=torch.uint8, device=torch.cuda.current_device())
