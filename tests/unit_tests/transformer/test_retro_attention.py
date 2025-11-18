@@ -197,7 +197,7 @@ class TestRetroAttention:
         )
 
     @pytest.mark.flaky
-@pytest.mark.flaky_in_dev
+    @pytest.mark.flaky_in_dev
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):
             for use_transformer_engine in (True, False):

@@ -104,7 +104,7 @@ class TestT5Model:
             assert self.t5_model.encoder_hidden_state.shape[2] == config.hidden_size
 
     @pytest.mark.flaky
-@pytest.mark.flaky_in_dev
+    @pytest.mark.flaky_in_dev
     def test_post_process_forward(self):
         pass
 
