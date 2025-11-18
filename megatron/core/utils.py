@@ -2,8 +2,6 @@
 
 """Utility functions used throughout Megatron core"""
 
-from .backwards_compatibility_decorators import exempt_from_compat_check
-
 import array
 import asyncio
 import functools
@@ -282,7 +280,6 @@ def experimental_cls(introduced_with_version: str):
     return validator
 
 
-@exempt_from_compat_check  # TEST: Decorator functionality
 def get_torch_version():
     """Get pytorch version from __version__; if not available use pip's. Use caching."""
 
