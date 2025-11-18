@@ -441,21 +441,18 @@ Exit codes:
                 skip_old = False
                 skip_new = False
                 
-                # Debug: Check if this is a DistributedDataParallel change
-                if old_path and 'DistributedDataParallel' in old_path and len(breaking_changes) < 5:
-                    print(f"\n🔍 DEBUG: Breaking change path: {old_path}", file=sys.stderr)
-                    print(f"   Checking against {len(all_filtered)} filtered paths", file=sys.stderr)
-                    matching = [f for f in all_filtered if 'DistributedDataParallel' in f]
-                    if matching:
-                        print(f"   Found filtered paths with DistributedDataParallel: {matching[:3]}", file=sys.stderr)
-                
                 if old_path:
                     # Check exact match or if it's a child (e.g., MyClass.__init__)
+                    # Also check if ANY filtered path is a prefix (handles alias vs full path mismatches)
                     if old_path in all_filtered:
                         skip_old = True
                     else:
+                        # Check if old_path starts with any filtered path
+                        # This handles cases where filtered has "a.b.C" but change has "a.b.c.C.__init__"
                         for filtered_path in all_filtered:
-                            if old_path.startswith(filtered_path + '.'):
+                            # Match if old_path starts with filtered_path followed by . or (
+                            if (old_path.startswith(filtered_path + '.') or 
+                                old_path.startswith(filtered_path + '(')):
                                 skip_old = True
                                 break
                 
@@ -464,8 +461,11 @@ Exit codes:
                     if new_path in all_filtered:
                         skip_new = True
                     else:
+                        # Check if new_path starts with any filtered path  
                         for filtered_path in all_filtered:
-                            if new_path.startswith(filtered_path + '.'):
+                            # Match if new_path starts with filtered_path followed by . or (
+                            if (new_path.startswith(filtered_path + '.') or 
+                                new_path.startswith(filtered_path + '(')):
                                 skip_new = True
                                 break
                 
