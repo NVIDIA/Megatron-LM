@@ -583,19 +583,19 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs = []
                     # If the request log probs span > 1 token we are in prefill
                     if len(request_log_probs) > 1:
-                        request.prompt_log_probs.extend(request_log_probs)
+                        # Add all but the last logprob to prompt_log_probs (last is for first generated token)
+                        request.prompt_log_probs.extend(request_log_probs[:-1])
+                        # Add the last logprob to generated_log_probs (first generated token)
+                        request.generated_log_probs.extend(request_log_probs[-1:])
                     else:
                         if (
                             # If it is a chunked prefill request
                             len(request.prompt_log_probs) > 0
                             # And we are missing the last token for prefill
-                            and len(request.prompt_log_probs) < len(request.prompt_tokens)
+                            and len(request.prompt_log_probs) < len(request.prompt_tokens) - 1
                             # And we need to track full prefill
                             and not self.context.materialize_only_last_token_logits
                         ):
-                            assert (
-                                len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
-                            ), "Prompt log probs length is not equal to prompt tokens length - 1"
                             request.prompt_log_probs.extend(request_log_probs)
                         else:
                             request.generated_log_probs.extend(request_log_probs)
@@ -612,13 +612,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     
                     # Similar logic to log_probs: if we have > 1 token, we're in prefill
                     if len(top_n_data_list) > 1:
-                        # Prefill mode - add all tokens to prompt_top_n_logprobs
-                        for top_n_values, top_n_indices in top_n_data_list:
+                        # Prefill mode - add all but last token to prompt_top_n_logprobs
+                        # Last token is for first generated token
+                        for top_n_values, top_n_indices in top_n_data_list[:-1]:
                             logit_dict = {}
                             for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
                                 key = self.controller.tokenizer.detokenize([logprob_index])
                                 logit_dict[key] = logprob
                             request.prompt_top_n_logprobs.append(logit_dict)
+                        # Add the last token to generated_top_n_logprobs (first generated token)
+                        top_n_values, top_n_indices = top_n_data_list[-1]
+                        logit_dict = {}
+                        for logprob, logprob_index in zip(top_n_values.tolist(), top_n_indices.tolist()):
+                            key = self.controller.tokenizer.detokenize([logprob_index])
+                            logit_dict[key] = logprob
+                        request.generated_top_n_logprobs.append(logit_dict)
                     else:
                         # Decode mode - single token
                         for top_n_values, top_n_indices in top_n_data_list:
@@ -630,7 +638,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             # Handle chunked prefill case similar to log_probs
                             if (
                                 len(request.prompt_top_n_logprobs) > 0
-                                and len(request.prompt_top_n_logprobs) < len(request.prompt_tokens)
+                                and len(request.prompt_top_n_logprobs) < len(request.prompt_tokens) - 1
                                 and not self.context.materialize_only_last_token_logits
                             ):
                                 request.prompt_top_n_logprobs.append(logit_dict)
