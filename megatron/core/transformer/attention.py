@@ -154,15 +154,6 @@ class Attention(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
 
-        # Import here to avoid circular imports
-        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-
-        # Set the transformer layer offset for PP inference. Virtual pipeline parallelism
-        # is not supported with inference so vp_stage is not necessary.
-        self.transformer_layer_offset = get_transformer_layer_offset(
-            self.config, vp_stage=None, pp_rank=get_pg_rank(pg_collection.pp)
-        )
-
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
@@ -293,6 +284,19 @@ class Attention(MegatronModule, ABC):
             dim,
             dtype=dtype,
             device=torch.cuda.current_device(),
+        )
+
+    def _get_pp_layer_offset_for_inference(self):
+        """Return the pipeline parallel layer offset for inference."""
+        assert (
+            self.config.virtual_pipeline_model_parallel_size is None
+        ), "Virtual pipeline parallelism is not supported for inference"
+
+        # Import here to avoid circular imports
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        return get_transformer_layer_offset(
+            self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
         )
 
     def _adjust_key_value_for_inference(
@@ -439,6 +443,8 @@ class Attention(MegatronModule, ABC):
             key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
             value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
         else:
+            pp_layer_offset = self._get_pp_layer_offset_for_inference()
+
             # Apply rotary embeddings before appending KV cache.
             if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
                 query, key = inference_context.apply_fused_qk_rotary_emb(
@@ -454,21 +460,21 @@ class Attention(MegatronModule, ABC):
 
             # Append key/value data tensors to cache.
             inference_context.append_key_value_cache(
-                self.layer_number - self.transformer_layer_offset, key, value
+                self.layer_number - pp_layer_offset, key, value
             )
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
             if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
-                    self.layer_number - self.transformer_layer_offset
+                    self.layer_number - pp_layer_offset
                 )
                 # Uncompress the KV cache for prefill/mixed mode
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
                 key, value, block_table = inference_context.key_value_cache(
-                    self.layer_number - self.transformer_layer_offset
+                    self.layer_number - pp_layer_offset
                 )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
