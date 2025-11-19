@@ -443,6 +443,10 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
         )
+        if request.sampling_params.top_n_logprobs > 0:
+            assert (
+                request.sampling_params.return_log_probs
+            ), "top_n_logprobs requires sampling_params.return_log_probs to be True"
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)

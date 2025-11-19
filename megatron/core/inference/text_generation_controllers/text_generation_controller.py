@@ -734,17 +734,23 @@ class TextGenerationController:
 
         active_request_count = context.total_request_count - context.paused_request_count
 
-        ret = context.calculate_log_probs(
+        ret, log_probs = context.calculate_log_probs(
             logits,
             self.sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=materialize_only_last_token_logits,
         )
-        return ret
+        return ret, log_probs
 
     def _dynamic_step_calculate_top_n_logprobs(
-        self, logits: Tensor
+        self, logits: Tensor, log_probs_tensor: Optional[Tensor] = None
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """Calculate top-n log probs from logits for dynamic batching.
+
+        Args:
+            logits (Tensor): The logits to compute top-n log probs from.
+            log_probs_tensor (Optional[Tensor]): Pre-computed log probabilities tensor.
+                If provided, avoids recomputing log_softmax. Should be the tensor
+                returned by calculate_log_probs.
 
         Returns:
             A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
@@ -759,9 +765,8 @@ class TextGenerationController:
         if materialize_only_last_token_logits or context.is_decode_only():
             # In decode mode or when only last token logits are materialized,
             # logits already represent only the last tokens
-            last_token_logits = logits.squeeze(0)
-            # Compute log probabilities only for last tokens
-            log_probs = F.log_softmax(last_token_logits.float(), dim=-1)
+            log_probs = log_probs_tensor[:active_request_count]
+
             top_n_results = {}
             for req_idx in range(active_request_count):
                 top_n = int(self.top_n_logprobs_cuda[req_idx].item())
@@ -776,7 +781,7 @@ class TextGenerationController:
         # Handle prefill mode - need to extract top-n for tokens per request
         # This follows the same pattern as calculate_log_probs in dynamic_context.py
         # Note: logits may be padded, so we only take the first active_token_count tokens
-        log_probs = F.log_softmax(logits.squeeze(0)[: context.active_token_count].float(), dim=-1)
+        log_probs = log_probs_tensor[: context.active_token_count]
 
         active_query_lengths = context.request_query_lengths[
             context.paused_request_count : context.total_request_count
@@ -906,14 +911,24 @@ class TextGenerationController:
         new_sample = self._dynamic_step_sample_logits(logits)
 
         return_log_probs = self._dynamic_step_log_probs_bookkeeping()
-        if return_log_probs:
-            log_probs = self._dynamic_step_calculate_log_probs(logits)
-        else:
-            log_probs = None
-
         return_top_n_logprobs = self._dynamic_step_top_n_logprobs_bookkeeping()
+
+        # Therefore, we can assert this constraint and always reuse log_probs_tensor for top_n calculation.
         if return_top_n_logprobs:
-            top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(logits)
+            assert return_log_probs, (
+                "top_n_logprobs requires return_log_probs to be True. "
+                "This constraint should be enforced in dynamic_engine.py"
+            )
+
+        log_probs = None
+        log_probs_tensor = None
+        if return_log_probs:
+            log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+
+        if return_top_n_logprobs:
+            # Since return_log_probs is guaranteed to be True (per assertion above),
+            # log_probs_tensor is always available, avoiding redundant softmax computation.
+            top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(logits, log_probs_tensor)
         else:
             top_n_logprobs = None
 
