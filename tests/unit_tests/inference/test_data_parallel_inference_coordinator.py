@@ -14,10 +14,7 @@ from tqdm import tqdm
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.engines.dynamic_engine import (
-    DynamicInferenceEngine,
-    RequestEntry,
-)
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,

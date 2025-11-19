@@ -98,6 +98,7 @@ def format_mem_bytes(mem_bytes):
 @dataclass(kw_only=True)
 class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
+
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
 
