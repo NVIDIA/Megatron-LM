@@ -14,8 +14,7 @@ on:
     inputs:
       baseline:
         description: 'Baseline git reference (tag/branch/commit)'
-        required: false
-        default: 'main'
+        required: true
 
 jobs:
   check-compatibility:
