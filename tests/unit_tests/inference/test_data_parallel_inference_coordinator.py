@@ -120,6 +120,7 @@ class CoordinatorTestConfig:
     """Test configuration args."""
 
     port: int = 46581
+    mp_port: int = 49581
     launch_inference_coordinator: bool = True
     stop_engines: bool = True
     verify_results: bool = True
@@ -187,6 +188,7 @@ class TestCoordinator:
         env.timing_data["start_time"] = time.time()
         await env.engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=test_config.port,
+            inference_mp_coordinator_port=test_config.mp_port,
             launch_inference_coordinator=test_config.launch_inference_coordinator,
         )
 
@@ -274,8 +276,27 @@ class TestCoordinator:
     @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
+    async def test_pp(self):
+        """Simple test with no TP, but PP."""
+        env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.asyncio
+    async def test_tp_pp(self):
+        """Simple test with both TP and PP."""
+        env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.asyncio
     async def test_throughput(self):
         """Throughput test with no TP or PP."""
+        import torch
+        import torch.distributed as dist
+
         env = await self._run_test(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
@@ -284,6 +305,13 @@ class TestCoordinator:
             min_time_offset=0.0,
             max_time_offset=0.0,
         )
+
+        flags = torch.tensor([1, 1, 1], dtype=torch.int, device=torch.cuda.current_device())
+
+        init_duration = golden_init_duration = None
+        run_duration = golden_run_duration = None
+        stop_duration = golden_stop_duration = None
+
         if dist.get_rank() == 0:
             init_duration = (env.timing_data["init_time"] - env.timing_data["start_time"]) * 10**3
             golden_init_duration = 4445.64  # ms
@@ -292,34 +320,47 @@ class TestCoordinator:
             stop_duration = (env.timing_data["stop_time"] - env.timing_data["done_time"]) * 10**3
             golden_stop_duration = 10.77  # ms
 
+            def clamp_to_golden_value(value, golden_value, delta=0.1):
+                return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
+
+            if not clamp_to_golden_value(init_duration, golden_init_duration, delta=0.5):
+                flags[0] = 0
+            if not clamp_to_golden_value(run_duration, golden_run_duration, delta=0.2):
+                flags[1] = 0
+            if not clamp_to_golden_value(stop_duration, golden_stop_duration, delta=1.0):
+                flags[2] = 0
+
+        # Synchronize results
+        dist.broadcast(flags, src=0)
+
+        if dist.get_rank() == 0:
             # Print current results.
             print(f"Initialization time: {init_duration:.2f} ms")
             print(f"Run time: {run_duration:.2f} ms")
             print(f"Stop time: {stop_duration:.2f} ms")
 
-            # Check against golden values.
-            def clamp_to_golden_value(value, golden_value, delta=0.1):
-                return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
-
-            assert clamp_to_golden_value(init_duration, golden_init_duration, delta=0.5), (
+            assert flags[0].item() == 1, (
                 f"WARNING: Init duration {init_duration:.2f}s deviates from "
                 f"golden value {golden_init_duration:.2f}s"
             )
-            assert clamp_to_golden_value(run_duration, golden_run_duration, delta=0.2), (
+            assert flags[1].item() == 1, (
                 f"WARNING: Run duration {run_duration:.2f}s deviates from "
                 f"golden value {golden_run_duration:.2f}s"
             )
-            assert clamp_to_golden_value(stop_duration, golden_stop_duration, delta=1.0), (
+            assert flags[2].item() == 1, (
                 f"WARNING: Stop duration {stop_duration:.2f}s deviates from "
                 f"golden value {golden_stop_duration:.2f}s"
             )
 
-            # Print summary.
             print(
                 f"ZMQ throughput is approximately "
                 f"{env.config.num_requests * env.config.num_iterations / (run_duration):.2f} "
                 f"requests/ms"
             )
+        else:
+            assert flags[0].item() == 1
+            assert flags[1].item() == 1
+            assert flags[2].item() == 1
 
 
 if __name__ == "__main__":
