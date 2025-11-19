@@ -24,14 +24,11 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-    Symbols,
-    get_layer_maps_from_layer_type_list,
-)
+from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
@@ -125,6 +122,13 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
         )
 
 
+class TensorStateDeallocatedError(ContextOverflowError):
+    """Context's tensor state is currently deallocated, such as when the engine
+    has been suspended."""
+
+    pass
+
+
 class ContextErrorFactory:
     """Factory class for serializing/deserializing context errors."""
 
@@ -195,37 +199,23 @@ class DynamicInferenceContext(BaseInferenceContext):
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
     that the context is defined to support. For the block-level KV cache, a memory
-    buffer is allocated up front (size `2 * active_buffer_size_gb`), that is
+    buffer is allocated up front (size `buffer_size_gb` if `unified_memory_level`
+    == 0, or `2 * buffer_size_gb` if `unified_memory_level` == 1), that is
     divided into blocks and dynamically assigned to requests. At any given step,
     any unassigned blocks equate to unused space.
 
-    Additionally, a fraction of the memory buffer (`gtd_request_fraction`, i.e.,
-    the 'guaranteed' request fraction) is reserved for guaranteeing that a
-    minimum number of active requests may continue to generate tokens on any step.
-    The reason for this is that the context manages two pools of requests: 1)
-    active requests, and 2) paused requests. Paused requests are requests where
-    insufficient memory blocks remain for future assignment, and these requests
-    are set aside until enough memory blocks are available. Active requests are
-    requests that have sufficient memory blocks to proceed with their generations.
-
-    The situation can arise where all requests eventually become paused due to all
-    memory blocks being assigned. In this case, there are no active requests and
-    thus no progress can be made. To handle this case, a fraction of the memory
-    buffer is reserved that only allows active requests, and no paused requests.
-    This fraction must be carefully tuned, as it can have an order of magnitude
-    impact on overall latency.
-
     Args:
         params_dtype (torch.dtype): Dtype used for KV cache.
-        num_layers (int): Number of layers.
+        num_layers (int): Number of layers on this pipeline parallel rank.
         kv_channels (int): Hidden dimension per attention head.
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
-        active_buffer_size_gb (float): Buffer size reserved for active requests
-            that live on the GPU. The total buffer size (stored in unified memory)
-            is 2x this value, with the the other half of the buffer reserved for
-            paused requests that live on the CPU.
+        buffer_size_gb (float): Buffer size reserved on the GPU for the KV cache.
+            if `unified_memory_level` >= 1, then CPU memory is additionally
+            utilized, resulting in a total buffer size of `2 * buffer_size_gb`.
+            Regardless of total buffer size, the KV cache is conceptually divided
+            into 50% active requests and 50% paused requests.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage. (Defaults to
             16384).
@@ -238,14 +228,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         materialize_only_last_token_logits (Optional[bool]): Whether to only
             materialize logits for the last token. This should be set to False
             if returning log probs.
-        layer_type_list (Optional[List[str]]): A list of strings that indicates
-            the layer type (Mamba / Attention / MLP) for each layer.
-            See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list
-            of symbols. This must be provided for hybrid models.
-        mamba_conv_states_shape: (Optional[Tuple[int]]): Mamba conv states shape per request.
-            This must be provided for hybrid models.
-        mamba_ssm_states_shape: (Optional[Tuple[int]]): Mamba ssm states shape per request.
-            This must be provided for hybrid models.
+        mamba_inference_state_config (Optional[MambaInferenceStateConfig]): The Mamba
+            inference state config if the model is a hybrid model.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
             engine steps.
         unified_memory_level (Optional[int]): Set unified memory usage within the
@@ -272,7 +256,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_channels: int,
         num_attention_heads: int,
         max_sequence_length: int,
-        active_buffer_size_gb: float,
+        buffer_size_gb: float,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
@@ -281,9 +265,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         qk_pos_emb_head_dim: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: Optional[bool] = True,
-        layer_type_list: Optional[List[str]] = None,
-        mamba_conv_states_shape: Optional[Tuple[int]] = None,
-        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 1,
@@ -306,12 +288,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Mamba states.
-        self.is_hybrid_model = layer_type_list is not None and Symbols.MAMBA in layer_type_list
+        self.is_hybrid_model = mamba_inference_state_config is not None
         if self.is_hybrid_model:
+            mamba_conv_states_shape = mamba_inference_state_config.mamba_conv_states_shape
+            mamba_ssm_states_shape = mamba_inference_state_config.mamba_ssm_states_shape
             assert (
                 mamba_conv_states_shape is not None
             ), "`mamba_conv_states_shape` must be specified for hybrid models"
@@ -326,16 +310,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
             attention_layer_map, mamba_layer_map, _, _ = get_layer_maps_from_layer_type_list(
-                layer_type_list
+                mamba_inference_state_config.layer_type_list
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
+            self.mamba_conv_states_shape = mamba_conv_states_shape
+            self.mamba_ssm_states_shape = mamba_ssm_states_shape
             self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = num_layers
             self.num_mamba_layers = 0
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (None, None)
+            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -348,10 +334,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.block_size_tokens = block_size_tokens
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
-            kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
-            self.kv_reduced_dim = kv_reduced_dim
+            self.kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.block_size_bytes = (
-                dtype_size_bytes * num_layers * self.block_size_tokens * kv_reduced_dim
+                dtype_size_bytes
+                * num_attention_layers
+                * self.block_size_tokens
+                * self.kv_reduced_dim
             )
         else:
             self.block_size_bytes = (
@@ -359,41 +347,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * 2  # key, value
                 * self.num_attention_layers
                 * self.block_size_tokens
-                * num_attention_heads_per_partition
-                * hidden_size_per_attention_head
+                * self.num_attention_heads_per_partition
+                * self.hidden_size_per_attention_head
             )
         assert self.block_size_bytes > 0
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += math.prod(mamba_conv_states_shape)
-            mamba_states_memory_per_request += math.prod(mamba_ssm_states_shape)
+            mamba_states_memory_per_request += math.prod(self.mamba_conv_states_shape)
+            mamba_states_memory_per_request += math.prod(self.mamba_ssm_states_shape)
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
-
-        # Initialize block allocator.
-        active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
-        active_block_count_total = active_buffer_size_bytes // (
-            self.block_size_bytes + mamba_states_memory_per_request
-        )
-        self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
-        del active_block_count_total  # use self.block_allocator.active_count
-        active_buffer_size_bytes = self.block_allocator.active_count * self.block_size_bytes
-
-        # Set max_total_requests, max_active_requests, max_tokens.
-        self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
-        self.max_active_requests = self.block_allocator.active_count
-        self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
-
-        assert self.max_tokens >= self.max_active_requests, (
-            f"max_tokens ({self.max_tokens}) must be >= "
-            f"max_active_requests ({self.max_active_requests}), "
-            "to have consistency between cuda graph sizes and the block table size."
-        )
-
-        # Initialize context state.
-        self.params_dtype = params_dtype
-        self.max_sequence_length = max_sequence_length
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
@@ -407,6 +371,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                     )
                 self.unified_memory_level = 0
 
+        # Initialize block allocator.
+        buffer_size_bytes = int(buffer_size_gb * 1024**3)
+        block_count_total = buffer_size_bytes // (
+            self.block_size_bytes + mamba_states_memory_per_request
+        )
+        self.block_allocator = BlockAllocator(
+            context=self,
+            total_count=(
+                block_count_total if self.unified_memory_level == 0 else 2 * block_count_total
+            ),
+        )
+
+        # Set max_total_requests, max_active_requests, max_tokens.
+        self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
+        self.max_active_requests = self.block_allocator.active_count
+        self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+
+        assert self.max_tokens >= self.max_active_requests, (
+            f"max_tokens ({self.max_tokens}) must be >= "
+            f"max_active_requests ({self.max_active_requests}), "
+            "to have consistency between cuda graph sizes and the block table size."
+        )
+
+        # Track request metadata.
+        if num_request_metadata is None:
+            num_request_metadata = len(DynamicInferenceRequest.get_metadata_labels())
+        self.num_request_metadata = num_request_metadata
+
+        # Initialize context state.
+        self.params_dtype = params_dtype
+        self.max_sequence_length = max_sequence_length
+
         # Request and token counts.
         self.total_request_count = 0
         self.active_token_count = 0
@@ -415,83 +411,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = None
         self.paused_tokens = None
 
-        # Per-request state.
-        self.request_ids = torch.full(
-            (self.max_total_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_query_lengths = torch.empty_like(self.request_ids)
-        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
-        self.request_output_lengths = torch.empty_like(self.request_ids)
-        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
-        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
-        self.request_kv_block_counts = torch.empty_like(self.request_ids)
-        self.request_last_kv_block_id = torch.empty_like(self.request_ids)
-        # request_last_kv_block_offset represents number of tokens in the last kv block
-        self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
-
-        # Track request metadata.
-        if num_request_metadata is None:
-            num_request_metadata = len(DynamicInferenceRequest.get_metadata_labels())
-        self.num_request_metadata = num_request_metadata
-        self.request_metadata = torch.empty(
-            (self.max_total_requests, self.num_request_metadata),
-            dtype=torch.float32,
-            device=torch.cuda.current_device(),
-        )
-
-        # Per-token state.
-        self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
-        )
-        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
-        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
-        self.token_to_block_idx = torch.empty_like(self.token_to_input_ids)
-        # i.e For a set of tokens A B C D E F ..  and block_size 4:
-        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
-        # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
-        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
-        self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
-
-        # Memory buffer.
-        def allocate_memory_buffer():
-            """Allocate the memory buffer. This function is called below within
-            `with ctx_manager:`."""
-            if cache_mla_latent:
-                self.memory_buffer = torch.full(
-                    (
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        kv_reduced_dim,
-                    ),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                self.memory_buffer = torch.full(
-                    (
-                        2,  # key and value
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        num_attention_heads_per_partition,
-                        hidden_size_per_attention_head,
-                    ),
-                    -1,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
-        self.request_to_kv_block_ids = torch.full(
-            (self.max_total_requests, self.max_kv_block_count),
-            -1,
-            dtype=torch.int,
-            device=torch.cuda.current_device(),
-        )
 
         # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
         self.cuda_graph_token_counts = None
@@ -558,6 +479,157 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen=self.max_sequence_length,
         )
 
+        # Deal with chunked prefill
+        self.chunked_prefill_request_id = -1
+
+        # FlashInfer.
+        if use_flashinfer_fused_rope is True:
+            assert HAVE_FLASHINFER, "flashinfer is not installed"
+        elif use_flashinfer_fused_rope is None:
+            use_flashinfer_fused_rope = HAVE_FLASHINFER
+        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+
+        # Allocate GPU state.
+        self.is_tensor_state_allocated = False
+        self.allocate_all_tensors(is_init=True)
+
+        # Print info.
+        logging.info(
+            "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
+            % (
+                get_mem_size_str(self.block_allocator.active_count * self.block_size_bytes),
+                self.block_allocator.active_count,
+            )
+        )
+
+    def allocate_all_tensors(self, *, is_init: bool) -> None:
+        """Allocate GPU state.
+
+        This method is used for both 1) initial allocation, and 2) resuming the
+        GPU state after a suspend.
+
+        Args:
+            is_init (bool): True if this is being called from `__init__()`.
+        """
+
+        # Only allocate tensors when not using unified memory at all (level 0),
+        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
+        # not perform any explicit allocations or deallocations after the initial
+        # call to `__init__()`.
+        if self.unified_memory_level != 0 and not is_init:
+            return
+
+        # Mark allocated.
+        if self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = True
+
+        # Validate no tensors allocated prior to this method.
+        for key in vars(self).keys():
+            value = getattr(self, key)
+            assert not isinstance(value, torch.Tensor), (
+                "All tensors should be allocated within `allocate_all_tensors()."
+                f"Please move tensor '{key}'."
+            )
+
+        # Per-request state.
+        self.request_ids = torch.full(
+            (self.max_total_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_query_lengths = torch.empty_like(self.request_ids)
+        # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
+        self.request_output_lengths = torch.empty_like(self.request_ids)
+        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        self.request_kv_length_offsets = torch.empty_like(self.request_ids)
+        self.request_kv_block_counts = torch.empty_like(self.request_ids)
+        self.request_last_kv_block_id = torch.empty_like(self.request_ids)
+        # request_last_kv_block_offset represents number of tokens in the last kv block
+        self.request_last_kv_block_offset = torch.empty_like(self.request_ids)
+        self.request_to_kv_block_ids = torch.full(
+            (self.max_total_requests, self.max_kv_block_count),
+            -1,
+            dtype=torch.int,
+            device=torch.cuda.current_device(),
+        )
+
+        # Track request metadata.
+        self.request_metadata = torch.empty(
+            (self.max_total_requests, self.num_request_metadata),
+            dtype=torch.float32,
+            device=torch.cuda.current_device(),
+        )
+
+        # Per-token state.
+        self.token_to_input_ids = torch.full(
+            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
+        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
+        self.token_to_block_idx = torch.empty_like(self.token_to_input_ids)
+        # i.e For a set of tokens A B C D E F ..  and block_size 4:
+        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
+        # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
+        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
+        self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
+
+        # Memory buffer.
+        def allocate_memory_buffer():
+            """Allocate the memory buffer. This function is called below within
+            `with ctx_manager:`."""
+            if self.cache_mla_latent:
+                self.memory_buffer = torch.full(
+                    (
+                        self.num_attention_layers,
+                        self.block_allocator.total_count,
+                        self.block_size_tokens,
+                        self.kv_reduced_dim,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.full(
+                    (
+                        2,  # key and value
+                        self.num_attention_layers,
+                        self.block_allocator.total_count,
+                        self.block_size_tokens,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
+                    ),
+                    -1,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
+        # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
+        # consistent input shapes, which is required to use cuda graphs.
+        # During these steps, the `*_cudagraph_only`
+        # tensors are used, otherwise their same-name but un-suffixed
+        # corresponding tensors are used.
+
+        self.query_seq_lengths_cudagraph_only = torch.full(
+            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.cu_query_seq_lengths_cudagraph_only = torch.full(
+            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.kv_seq_lengths_cudagraph_only = torch.full(
+            (self.max_total_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.cu_kv_seq_lengths_cudagraph_only = torch.full(
+            (self.max_total_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
+        self.request_to_kv_block_ids_cudagraph_only = torch.full(
+            (self.max_total_requests, self.max_kv_block_count),
+            0,
+            dtype=torch.int,
+            device=torch.cuda.current_device(),
+        )
+
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
             """Allocate Mamba states. This function is called below within
@@ -565,12 +637,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_hybrid_model:
                 self.mamba_metadata = MambaMetadata(max_requests=self.max_total_requests)
                 self.mamba_conv_states = torch.zeros(
-                    (self.num_mamba_layers, self.max_total_requests) + mamba_conv_states_shape,
+                    (self.num_mamba_layers, self.max_total_requests) + self.mamba_conv_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
                 self.mamba_ssm_states = torch.zeros(
-                    (self.num_mamba_layers, self.max_total_requests) + mamba_ssm_states_shape,
+                    (self.num_mamba_layers, self.max_total_requests) + self.mamba_ssm_states_shape,
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
@@ -589,25 +661,34 @@ class DynamicInferenceContext(BaseInferenceContext):
             allocate_memory_buffer()
             allocate_mamba_states()
 
-        # Deal with chunked prefill
-        self.chunked_prefill_request_id = -1
-
         # Reset attention and Mamba state.
         self.reset_attention_state()
         self.reset_mamba_state()
 
-        # FlashInfer.
-        if use_flashinfer_fused_rope is True:
-            assert HAVE_FLASHINFER, "flashinfer is not installed"
-        elif use_flashinfer_fused_rope is None:
-            use_flashinfer_fused_rope = HAVE_FLASHINFER
-        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
+    def deallocate_all_tensors(self):
+        """Deallocate GPU state.
 
-        # Print info.
-        logging.info(
-            "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
-            % (get_mem_size_str(active_buffer_size_bytes), self.block_allocator.active_count)
-        )
+        This method is used for suspending the dynamic engine.
+        """
+
+        # Only deallocate tensors when not using unified memory at all (level 0).
+        # For levels 1 and 2, we do not perform any explicit allocations or
+        # deallocations after the initial call to `__init__()`.
+        if self.unified_memory_level != 0:
+            return
+
+        # Mark deallocated.
+        if not self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = False
+
+        # Delete all tensor attributes.
+        # TODO(@lmcafee): check that device == 'cuda'?
+        keys = list(vars(self).keys())
+        for key in keys:
+            value = getattr(self, key)
+            if isinstance(value, torch.Tensor):
+                delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -636,8 +717,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         inference_config: InferenceWrapperConfig,
         model,
         max_batch_size: int,
-        active_buffer_size_gb: float = 40,
+        buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
     ):
         """
         Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
@@ -651,14 +733,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_sequence_length = max(max_sequence_length, max_batch_size)
         return cls(
             params_dtype=inference_config.params_dtype,
-            num_layers=model_config.num_layers,
+            num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=inference_config.inference_max_seq_length,
-            active_buffer_size_gb=active_buffer_size_gb,
+            buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
     @classmethod
@@ -799,6 +882,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             to blocks within the block-level memory buffer.
         """
         attention_layer_number = self.layer_map[layer_number - 1]
+
         if self.cache_mla_latent:
             return (
                 self.memory_buffer[attention_layer_number],
@@ -1206,6 +1290,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None
         """
+
+        # If tensor state is deallocated, do not add request.
+        if not self.is_tensor_state_allocated:
+            raise TensorStateDeallocatedError(req.request_id)
+
+        # Chunk length.
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
 
@@ -1404,6 +1494,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
+
+        # If tensor state is deallocated, do not add request.
+        if not self.is_tensor_state_allocated:
+            raise TensorStateDeallocatedError(req.request_id)
+
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
