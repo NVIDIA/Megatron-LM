@@ -94,7 +94,16 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "`suspend_resume_interval` steps. This is used to tet the suspend/resume "
         "system.",
     )
-    group.add_argument('--inference-repeat-n', type=int, default=1, help="Repeat inference iterations N times for benchmarking.")
+    group.add_argument(
+        "--inference-repeat-n", type=int, default=1,
+        help="Repeat inference iterations N times for benchmarking."
+    )
+    group.add_argument(
+        "--throughput-check-only",
+        action='store_true',
+        default=False,
+        help="If true, only run throughput check without verifying outputs."
+    )
 
     return parser
 

@@ -96,20 +96,40 @@ async def main(
         num_requests_added = 0
         while True:
             current_time = time.time_ns() / 10**9
-            # Only add requests that have arrived at the current time.
-            while num_requests_added < num_requests_total and requests[num_requests_added].time_arrival <= current_time:
-                request = requests[num_requests_added]
-                # These add-request calls will queue up the request on a zmq socket and return
-                # instantaneously. They will return an asyncio future which can be awaited for
-                # request completion.
-                futures.append(client.add_request(request.prompt_text, request.sampling_params))
-                num_requests_added += 1
+            if args.incoming_requests_per_step is None:
+                # Only add requests that have arrived at the current time.
+                while num_requests_added < num_requests_total and requests[num_requests_added].time_arrival <= current_time:
+                    request = requests[num_requests_added]
+                    # These add-request calls will queue up the request on a zmq socket and return
+                    # instantaneously. They will return an asyncio future which can be awaited for
+                    # request completion.
+                    futures.append(client.add_request(request.prompt_text, request.sampling_params))
+                    num_requests_added += 1
 
-                # Test suspend/resume.
-                if num_requests_added in suspend_idxs:
-                    client.suspend_engines()
-                if num_requests_added in resume_idxs:
-                    client.resume_engines()
+                    # Test suspend/resume.
+                    if num_requests_added in suspend_idxs:
+                        client.suspend_engines()
+                    if num_requests_added in resume_idxs:
+                        client.resume_engines()
+
+            else:
+                # Add deterministic number of requests (generally used for debugging).
+                for i in range(min(
+                    args.incoming_requests_per_step,
+                    num_requests_total - num_requests_added
+                )):
+                    # Change sampling parameters to force different generation lengths.
+                    request = requests[num_requests_added]
+                    n = request.sampling_params.num_tokens_to_generate
+                    request.sampling_params.num_tokens_to_generate = n + i
+                    futures.append(client.add_request(request.prompt_text, request.sampling_params))
+                    num_requests_added += 1
+
+                    # Test suspend/resume.
+                    if num_requests_added in suspend_idxs:
+                        client.suspend_engines()
+                    if num_requests_added in resume_idxs:
+                        client.resume_engines()
 
             if num_requests_added == num_requests_total:
                 break
@@ -122,6 +142,7 @@ async def main(
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
+            throughputs = []
 
             for record in results:
                 req = record.merge(engine.controller.tokenizer)
@@ -133,7 +154,12 @@ async def main(
                 }
                 if req.sampling_params["return_log_probs"]:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
+                throughput = len(req.generated_tokens) / req.latency
+                throughputs.append(throughput)
                 json_results[req.request_id] = result_dict
+            throughput_dict = {"throughput": throughputs}
+            if args.throughput_check_only:
+                json_results = throughput_dict
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=4)
         else:
