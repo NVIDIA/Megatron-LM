@@ -344,6 +344,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    @trace_async_exceptions
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,

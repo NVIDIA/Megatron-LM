@@ -20,6 +20,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
 stimer = StragglerDetector()
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
 
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
@@ -191,7 +193,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     seq_lengths = None
     attention_mask = None
 
-    if args.use_sequence_packing:
+    if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
         bin_idx = bin_tensor.item()

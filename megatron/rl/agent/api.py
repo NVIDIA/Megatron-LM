@@ -178,6 +178,7 @@ class GroupedRolloutGenerator(Agent, ABC):
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
+        print(f"Getting grouped rollouts ({self.parallel_generation_tasks})..")
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
@@ -194,7 +195,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        @trace_async_exceptions(verbose=True)
+        @trace_async_exceptions
         async def group_task():
             nonlocal submitted_groups
             while request.num_groups == -1 or submitted_groups < request.num_groups:
