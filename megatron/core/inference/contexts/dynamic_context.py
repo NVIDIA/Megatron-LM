@@ -202,25 +202,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
     that the context is defined to support. For the block-level KV cache, a memory
-    buffer is allocated up front (size `2 * active_buffer_size_gb`), that is
+    buffer is allocated up front (size `buffer_size_gb` if `unified_memory_level`
+    == 0, or `2 * buffer_size_gb` if `unified_memory_level` == 1), that is
     divided into blocks and dynamically assigned to requests. At any given step,
     any unassigned blocks equate to unused space.
-
-    Additionally, a fraction of the memory buffer (`gtd_request_fraction`, i.e.,
-    the 'guaranteed' request fraction) is reserved for guaranteeing that a
-    minimum number of active requests may continue to generate tokens on any step.
-    The reason for this is that the context manages two pools of requests: 1)
-    active requests, and 2) paused requests. Paused requests are requests where
-    insufficient memory blocks remain for future assignment, and these requests
-    are set aside until enough memory blocks are available. Active requests are
-    requests that have sufficient memory blocks to proceed with their generations.
-
-    The situation can arise where all requests eventually become paused due to all
-    memory blocks being assigned. In this case, there are no active requests and
-    thus no progress can be made. To handle this case, a fraction of the memory
-    buffer is reserved that only allows active requests, and no paused requests.
-    This fraction must be carefully tuned, as it can have an order of magnitude
-    impact on overall latency.
 
     Args:
         params_dtype (torch.dtype): Dtype used for KV cache.
@@ -229,10 +214,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads (int): Number of attention heads.
         max_sequence_length (int): Max possible sequence length (prompt + output)
             that will occur.
-        active_buffer_size_gb (float): Buffer size reserved for active requests
-            that live on the GPU. The total buffer size (stored in unified memory)
-            is 2x this value, with the the other half of the buffer reserved for
-            paused requests that live on the CPU.
+        buffer_size_gb (float): Buffer size reserved on the GPU for the KV cache.
+            if `unified_memory_level` >= 1, then CPU memory is additionally
+            utilized, resulting in a total buffer size of `2 * buffer_size_gb`.
+            Regardless of total buffer size, the KV cache is conceptually divided
+            into 50% active requests and 50% paused requests.
         max_tokens (int): Max number of tokens to use for forward passes. This is
             primarily limited by prefill activation memory usage. (Defaults to
             16384).
@@ -279,7 +265,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_channels: int,
         num_attention_heads: int,
         max_sequence_length: int,
-        active_buffer_size_gb: float,
+        buffer_size_gb: float,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         block_size_tokens: int = 256,
         tensor_model_parallel_size: Optional[int] = None,
@@ -382,14 +368,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
 
+        # Unified memory.
+        self.unified_memory_level = unified_memory_level
+        if unified_memory_level > 0:
+            try:
+                self.unified_memory_mempool = create_unified_mempool()
+            except UnifiedMemoryUnsupportedError:
+                if torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "Unified memory requested but not available; defaulting to GPU memory."
+                    )
+                self.unified_memory_level = 0
+
         # Initialize block allocator.
-        active_buffer_size_bytes = int(active_buffer_size_gb * 1024**3)
-        active_block_count_total = active_buffer_size_bytes // (
+        buffer_size_bytes = int(buffer_size_gb * 1024**3)
+        block_count_total = buffer_size_bytes // (
             self.block_size_bytes + mamba_states_memory_per_request
         )
-        self.block_allocator = BlockAllocator(context=self, active_count=active_block_count_total)
-        del active_block_count_total  # use self.block_allocator.active_count
-        active_buffer_size_bytes = self.block_allocator.active_count * self.block_size_bytes
+        self.block_allocator = BlockAllocator(
+            context=self,
+            total_count=(
+                block_count_total if self.unified_memory_level == 0 else 2 * block_count_total
+            ),
+        )
 
         # Set max_total_requests, max_active_requests, max_tokens.
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
@@ -410,18 +411,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Initialize context state.
         self.params_dtype = params_dtype
         self.max_sequence_length = max_sequence_length
-
-        # Unified memory.
-        self.unified_memory_level = unified_memory_level
-        if unified_memory_level > 0:
-            try:
-                self.unified_memory_mempool = create_unified_mempool()
-            except UnifiedMemoryUnsupportedError:
-                if torch.distributed.get_rank() == 0:
-                    warnings.warn(
-                        "Unified memory requested but not available; defaulting to GPU memory."
-                    )
-                self.unified_memory_level = 0
 
         # Request and token counts.
         self.total_request_count = 0
@@ -516,7 +505,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Print info.
         logging.info(
             "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
-            % (get_mem_size_str(active_buffer_size_bytes), self.block_allocator.active_count)
+            % (
+                get_mem_size_str(self.block_allocator.active_count * self.block_size_bytes),
+                self.block_allocator.active_count,
+            )
         )
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
@@ -734,7 +726,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         inference_config: InferenceWrapperConfig,
         model,
         max_batch_size: int,
-        active_buffer_size_gb: float = 40,
+        buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
     ):
         """
@@ -753,7 +745,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=inference_config.inference_max_seq_length,
-            active_buffer_size_gb=active_buffer_size_gb,
+            buffer_size_gb=buffer_size_gb,
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
