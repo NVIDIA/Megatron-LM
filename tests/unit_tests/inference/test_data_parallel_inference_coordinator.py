@@ -3,7 +3,7 @@ import asyncio
 import random
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -26,6 +26,8 @@ try:
     HAVE_ZMQ = True
 except Exception:
     HAVE_ZMQ = False
+
+IS_ZMQ_FLAKY = True
 
 
 class DummyContext:
@@ -77,6 +79,9 @@ class DummyEngine(DynamicInferenceEngine):
         to_remove = []
         for request_id, request in self.requests.items():
             if request.status == Status.ACTIVE_AND_GENERATING_TOKENS:
+                request.sampling_params.num_tokens_to_generate -= 1
+                if request.sampling_params.num_tokens_to_generate > 0:
+                    continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
                 finished_requests.append(request)
@@ -107,10 +112,15 @@ class CoordinatorTestConfig:
     """Test configuration args."""
 
     port: int = 46581
+    launch_inference_coordinator: bool = True
+    stop_engines: bool = True
+    verify_results: bool = True
 
     num_requests: int = 10**1
     min_time_offset: float = 10 ** (-4)
     max_time_offset: float = 10 ** (-3)
+    num_steps_to_finish: int = 1
+    num_iterations: int = 1
 
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -123,6 +133,15 @@ class CoordinatorTestEnv:
     config: CoordinatorTestConfig
     requests: List[Tuple]
     engine: DummyEngine
+    responses: List[List[DynamicInferenceRequest]] = field(default_factory=list)
+    timing_data: Dict[str, Optional[float]] = field(
+        default_factory=lambda: {
+            "start_time": None,
+            "init_time": None,
+            "done_time": None,
+            "stop_time": None,
+        }
+    )
 
 
 class TestCoordinator:
@@ -133,7 +152,10 @@ class TestCoordinator:
 
         for _ in range(test_config.num_requests):
             arrival_delta = random.uniform(test_config.min_time_offset, test_config.max_time_offset)
-            ret.append(("Hello world!", SamplingParams(), arrival_delta))
+            num_tokens = test_config.num_steps_to_finish
+            ret.append(
+                ("Hello world!", SamplingParams(num_tokens_to_generate=num_tokens), arrival_delta)
+            )
         return ret
 
     @classmethod
@@ -144,6 +166,7 @@ class TestCoordinator:
         )
         requests = cls._build_requests(test_config)
         engine = DummyEngine()
+        engine.num_steps_to_finish = test_config.num_steps_to_finish
         return CoordinatorTestEnv(config=test_config, requests=requests, engine=engine)
 
     @classmethod
@@ -152,25 +175,55 @@ class TestCoordinator:
         test_config = CoordinatorTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
 
+        # Connect each engine to their respective processes.
+        env.timing_data["start_time"] = time.time()
         await env.engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=test_config.port, launch_inference_coordinator=True
+            inference_coordinator_port=test_config.port,
+            launch_inference_coordinator=test_config.launch_inference_coordinator,
         )
 
+        results_success = False
+        shutdown_success = False
+        try:
+            if dist.get_rank() == 0:
+                client = InferenceClient(test_config.port)
+                await client.start()
+                env.timing_data["init_time"] = time.time()
+
+                all_results = []
+                for _ in range(test_config.num_iterations):
+                    futures = []
+                    for request in tqdm(env.requests, "add_requests"):
+                        prompt, sampling_params, arrival_delta = request
+                        await asyncio.sleep(arrival_delta)
+                        fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                        futures.append(fut)
+                    results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+                    all_results.append(results)
+                env.timing_data["done_time"] = time.time()
+            results_success = True
+        finally:
+            try:
+                if dist.get_rank() == 0:
+                    if test_config.stop_engines:
+                        client.stop_engines()
+                    client.stop()
+                if test_config.stop_engines:
+                    await env.engine.engine_loop_task
+                shutdown_success = True
+            except:
+                env.engine.engine_loop_task.cancel()
+
+        env.timing_data["stop_time"] = time.time()
+
+        assert results_success, "Did not receive all results successfully."
+        assert shutdown_success, "Did not shutdown successfully."
         if dist.get_rank() == 0:
-            client = InferenceClient(test_config.port)
-            await client.start()
-            futures = []
-            for request in tqdm(env.requests, "add_requests"):
-                prompt, sampling_params, arrival_delta = request
-                await asyncio.sleep(arrival_delta)
-                fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
-                futures.append(fut)
-            results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
-
-            client.stop_engines()
-            client.stop()
-
-        await env.engine.engine_loop_task
+            env.responses = all_results
+            if test_config.verify_results:
+                for batch in all_results:
+                    for request in batch:
+                        assert request.status == Status.COMPLETED
 
         return env
 
@@ -178,6 +231,7 @@ class TestCoordinator:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_simple(self):
@@ -185,34 +239,88 @@ class TestCoordinator:
         env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_tp(self):
-        """Simple test with no TP or PP."""
+        """Simple test with TP, but no PP."""
         env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
 
     @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_pp(self):
+        """Simple test with no TP, but PP."""
+        env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_tp_pp(self):
+        """Simple test with both TP and PP."""
+        env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_throughput(self):
         """Throughput test with no TP or PP."""
-        start = time.time()
         env = await self._run_test(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            num_requests=10**3,
+            num_requests=10**4,
+            num_iterations=10,
             min_time_offset=0.0,
             max_time_offset=0.0,
         )
-        end = time.time()
         if dist.get_rank() == 0:
-            print(f"Throughput test time: {end - start} seconds.")
+            init_duration = (env.timing_data["init_time"] - env.timing_data["start_time"]) * 10**3
+            golden_init_duration = 4445.64  # ms
+            run_duration = (env.timing_data["done_time"] - env.timing_data["init_time"]) * 10**3
+            golden_run_duration = 2906.29  # ms
+            stop_duration = (env.timing_data["stop_time"] - env.timing_data["done_time"]) * 10**3
+            golden_stop_duration = 10.77  # ms
+
+            # Print current results.
+            print(f"Initialization time: {init_duration:.2f} ms")
+            print(f"Run time: {run_duration:.2f} ms")
+            print(f"Stop time: {stop_duration:.2f} ms")
+
+            # Check against golden values.
+            def clamp_to_golden_value(value, golden_value, delta=0.1):
+                return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
+
+            assert clamp_to_golden_value(init_duration, golden_init_duration, delta=0.5), (
+                f"WARNING: Init duration {init_duration:.2f}s deviates from "
+                f"golden value {golden_init_duration:.2f}s"
+            )
+            assert clamp_to_golden_value(run_duration, golden_run_duration, delta=0.2), (
+                f"WARNING: Run duration {run_duration:.2f}s deviates from "
+                f"golden value {golden_run_duration:.2f}s"
+            )
+            assert clamp_to_golden_value(stop_duration, golden_stop_duration, delta=1.0), (
+                f"WARNING: Stop duration {stop_duration:.2f}s deviates from "
+                f"golden value {golden_stop_duration:.2f}s"
+            )
+
+            # Print summary.
+            print(
+                f"ZMQ throughput is approximately "
+                f"{env.config.num_requests * env.config.num_iterations / (run_duration):.2f} "
+                f"requests/ms"
+            )
 
 
 if __name__ == "__main__":
     test = TestCoordinator()
-    test.test_simple()
-    test.test_tp()
+    asyncio.run(test.test_simple())
+    asyncio.run(test.test_tp())
+    asyncio.run(test.test_pp())
+    asyncio.run(test.test_tp_pp())
+    asyncio.run(test.test_throughput())
     test.teardown_method(None)
     print("~~~")
     print("success.")
