@@ -94,36 +94,39 @@ async def chat_completions():
     total_completion_tokens = 0
     prompt_token_count = len(prompt_tokens)  # Calculated once
 
-    for i, result in enumerate(batch_results):
-        text_output = result.generated_text
+    request_idx = 0
+    for record in batch_results:
+        for result in record.requests:
+            text_output = result.generated_text
 
-        logprobs_content = None
-        if sampling_params.return_log_probs:
-            token_logprobs = getattr(result, 'log_probs', [])
-            tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
+            logprobs_content = None
+            if sampling_params.return_log_probs:
+                token_logprobs = getattr(result, 'log_probs', [])
+                tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
 
-            logprobs_content = []
-            for tok, lp in zip(tokens, token_logprobs):
-                # The original server's 'result' object only provides the
-                # logprob for the *chosen* token, not 'top_logprobs'.
-                # We map what we have to the new API format.
-                entry = {
-                    "token": tok,
-                    "logprob": lp,
-                    "bytes": list(tok.encode("utf-8")),  # OpenAI API includes this
-                    "top_logprobs": [],  # We don't have this data from the engine
-                }
-                logprobs_content.append(entry)
+                logprobs_content = []
+                for tok, lp in zip(tokens, token_logprobs):
+                    # The original server's 'result' object only provides the
+                    # logprob for the *chosen* token, not 'top_logprobs'.
+                    # We map what we have to the new API format.
+                    entry = {
+                        "token": tok,
+                        "logprob": lp,
+                        "bytes": list(tok.encode("utf-8")),  # OpenAI API includes this
+                        "top_logprobs": [],  # We don't have this data from the engine
+                    }
+                    logprobs_content.append(entry)
 
-        choice_data = {
-            "index": i,
-            "message": {"role": "assistant", "content": text_output},
-            # 'logprobs' in chat API is an object containing 'content'
-            "logprobs": {"content": logprobs_content} if logprobs_content else None,
-            "finish_reason": "length",  # Original code hardcoded this.
-        }
-        choices.append(choice_data)
-        total_completion_tokens += len(result.generated_tokens)
+            choice_data = {
+                "index": 0,
+                "message": {"role": "assistant", "content": text_output},
+                # 'logprobs' in chat API is an object containing 'content'
+                "logprobs": {"content": logprobs_content} if logprobs_content else None,
+                "finish_reason": "length",  # Original code hardcoded this.
+            }
+            choices.append(choice_data)
+            total_completion_tokens += len(result.generated_tokens)
+            request_idx += 0
 
     response = {
         "choices": choices,

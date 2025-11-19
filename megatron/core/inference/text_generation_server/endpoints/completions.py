@@ -106,25 +106,28 @@ async def completions():
     choices = []
     total_completion_tokens = 0
 
-    for i, result in enumerate(batch_results):
-        full_text = result.generated_text
-        text_output = (prompts_as_strings[i] + full_text) if echo else full_text
+    request_idx = 0
+    for record in batch_results:
+        for result in record.requests:
+            full_text = result.generated_text
+            text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
-        logprobs_data = None
-        if sampling_params.return_log_probs:
-            token_logprobs = getattr(result, 'log_probs', [])
-            tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
-            logprobs_data = {
-                "token_logprobs": token_logprobs,
-                "tokens": tokens,
-                "text_offset": [],
-                "top_logprobs": [],
-            }
+            logprobs_data = None
+            if sampling_params.return_log_probs:
+                token_logprobs = getattr(result, 'log_probs', [])
+                tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
+                logprobs_data = {
+                    "token_logprobs": token_logprobs,
+                    "tokens": tokens,
+                    "text_offset": [],
+                    "top_logprobs": [],
+                }
 
-        choices.append(
-            {"index": i, "text": text_output, "logprobs": logprobs_data, "finish_reason": "length"}
-        )
-        total_completion_tokens += len(result.generated_tokens)
+            choices.append(
+                {"index": 0, "text": text_output, "logprobs": logprobs_data, "finish_reason": "length"}
+            )
+            total_completion_tokens += len(result.generated_tokens)
+            request_idx += 1
 
     response = {
         "id": f"cmpl-{uuid.uuid4()}",
