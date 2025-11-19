@@ -682,6 +682,9 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        # here we need to set the right cp group for hybrid-cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            self.pg_collection.cp = packed_seq_params.cp_group
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -816,7 +819,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -831,7 +834,7 @@ class Attention(MegatronModule, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None:
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:

@@ -42,6 +42,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from packaging.version import Version as PkgVersion
@@ -57,6 +58,12 @@ try:
 except ImportError:
     HAVE_NVTX = False
 
+# Register the TE CUDA kernels
+import transformer_engine  # pylint: disable=unused-import
+
+# Alias the PyTorch wrapper so we can call tex.* APIs
+import transformer_engine_torch as tex
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,8 +74,6 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
-_mamba_ssm_version = None
-_causal_conv1d_version = None
 
 
 @contextmanager
@@ -1890,7 +1895,9 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any], cp_size: Optional[int] = None, cp_rank: Optional[int] = None
+):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
@@ -1901,12 +1908,19 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
-    cp_size = parallel_state.get_context_parallel_world_size()
-    if cp_size > 1:
+    if cp_size is not None or cp_rank is not None:
+        assert (
+            cp_size is not None and cp_rank is not None
+        ), "Both cp_size and cp_rank must be provided for batch slicing"
+
+    if cp_size is None:
+        cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_rank is None:
         cp_rank = parallel_state.get_context_parallel_rank()
+    if cp_size > 1:
         for key, val in batch.items():
             if val is not None:
-                seq_dim = 1 if key != "attention_mask" else 2
+                seq_dim = 1 if key != 'attention_mask' else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,
@@ -1921,6 +1935,67 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 batch[key] = val
 
     return batch
+
+
+def get_thd_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    max_seqlen: Optional[int] = None,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+    local_cp_size: Optional[int] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Slice each sub-sample in a packed sample batch input along
+    sequence dimension into multiple chunks, which are parallelized
+    across GPUs in a context parallel group.
+    """
+    if local_cp_size:
+        # enable hybrid context parallel
+        cp_size = local_cp_size
+        if cp_group is None:
+            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=cp_size)
+            cp_rank = torch.distributed.get_rank(group=cp_group)
+            assert cp_group.size() == cp_size
+        else:
+            assert cp_group.size() == local_cp_size
+    else:
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_group = None
+
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        local_cp_size=local_cp_size,
+        cp_group=cp_group,
+    )
+
+    for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
+        if key in batch:
+            batch[key] = batch[key].unsqueeze(0)
+
+    if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        # print(f"tokens shape before cp slice: {batch['tokens'].shape}")
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+        )
+        for key, data in batch.items():
+            if key in {'attention_mask'}:
+                continue
+            batch[key] = data.index_select(1, index)
+
+    return batch, packed_seq_params
 
 
 ######################

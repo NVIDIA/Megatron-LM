@@ -936,6 +936,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
+        # we need to create a single stream for cp=1 and enable hybrid cp case
+        if (
+            self.config.hybrid_context_parallel
+            and getattr(TEDotProductAttention, "cp_stream") is None
+        ):
+            TEDotProductAttention.cp_stream = torch.cuda.Stream()
+
         if self.config.deterministic_mode:
             if int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) != 0:
                 raise RuntimeError(
@@ -1017,6 +1024,27 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_params: PackedSeqParams = None,
     ):
         """Forward."""
+        if packed_seq_params is not None:
+            # If Dynamic CP group is provided, update TE DPA CP group
+            if packed_seq_params.cp_group is not None:
+                self.cp_group = packed_seq_params.cp_group
+                super().set_context_parallel_group(
+                    self.cp_group,
+                    torch.distributed.get_process_group_ranks(self.cp_group),
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+            # If cp_group is None but local_cp_size is provided,
+            # Indicates to turn off CP dynamically
+            elif packed_seq_params.local_cp_size is not None:
+                assert (
+                    packed_seq_params.local_cp_size == 1
+                ), f"local_cp_size must be == 1 if provided without cp_group, "
+                f"but got {packed_seq_params.local_cp_size}."
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("local_cp_size")
+
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
             if packed_seq_params is not None
