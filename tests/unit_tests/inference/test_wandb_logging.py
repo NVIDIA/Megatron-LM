@@ -48,7 +48,7 @@ class TestInferenceWandbLogging:
         kv_channels=8,
         num_attention_heads=2,
         max_sequence_length=512,
-        active_buffer_size_gb=0.03,
+        buffer_size_gb=0.03,
         block_size_tokens=128,
         metrics_writer=None,
     ):
@@ -60,7 +60,7 @@ class TestInferenceWandbLogging:
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
             num_cuda_graphs=None,
-            active_buffer_size_gb=active_buffer_size_gb,
+            buffer_size_gb=buffer_size_gb,
             block_size_tokens=block_size_tokens,
             metrics_writer=metrics_writer,
             unified_memory_level=0,  # unit tests currently broken with UVM
@@ -235,7 +235,7 @@ class TestInferenceWandbLogging:
             num_attention_heads=8,
             max_sequence_length=128,
             num_cuda_graphs=None,
-            active_buffer_size_gb=0.01,  # Small buffer to force pausing
+            buffer_size_gb=0.01,  # Small buffer to force pausing
             block_size_tokens=32,
             unified_memory_level=0,  # unit tests currently broken with UVM
         )
