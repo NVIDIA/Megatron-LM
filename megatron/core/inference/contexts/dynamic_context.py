@@ -351,7 +351,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.kv_reduced_dim = kv_reduced_dim
             self.block_size_bytes = (
-                dtype_size_bytes * num_layers * self.block_size_tokens * kv_reduced_dim
+                dtype_size_bytes * num_attention_layers * self.block_size_tokens * kv_reduced_dim
             )
         else:
             self.block_size_bytes = (
@@ -651,7 +651,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_sequence_length = max(max_sequence_length, max_batch_size)
         return cls(
             params_dtype=inference_config.params_dtype,
-            num_layers=model_config.num_layers,
+            num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
             max_sequence_length=inference_config.inference_max_seq_length,

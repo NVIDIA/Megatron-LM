@@ -335,7 +335,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             global_layer_number = layer_number + get_transformer_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
-
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:

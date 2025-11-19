@@ -157,6 +157,8 @@ class Attention(MegatronModule, ABC):
         # Import here to avoid circular imports
         from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+        # Set the transformer layer offset for PP inference. Virtual pipeline parallelism
+        # is not supported with inference so vp_stage is not necessary.
         self.transformer_layer_offset = get_transformer_layer_offset(
             self.config, vp_stage=None, pp_rank=get_pg_rank(pg_collection.pp)
         )
