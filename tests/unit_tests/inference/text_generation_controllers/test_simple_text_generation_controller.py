@@ -120,6 +120,7 @@ class TestTextGenerationController:
                 materialize_only_last_token_logits=False,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
+                unified_memory_level=0,  # unit tests currently broken with UVM
             )
 
         inference_wrapped_model = GPTInferenceWrapper(

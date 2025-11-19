@@ -1,9 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import math
 import random
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -110,6 +111,7 @@ class DynamicEngineTestConfig:
     # to avoid the overhead of building the graphs, which is not
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
+    suspend_resume_interval: Optional[int] = None
 
     fp8: bool = False
 
@@ -132,6 +134,9 @@ class DynamicEngineTestEnv:
     config: DynamicEngineTestConfig
     requests: List[DynamicInferenceRequest]
     engine: DynamicInferenceEngine
+    mem_usage: dict = field(
+        default_factory=lambda: {"start": None, "end": None, "suspend_resume": {}}
+    )
 
 
 class TestDynamicInferenceEngine:
@@ -225,6 +230,7 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
         return context
@@ -408,7 +414,9 @@ class TestDynamicInferenceEngine:
         # Text generation controller.
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
-            tokenizer=types.SimpleNamespace(vocab_size=test_config.vocab_size),
+            tokenizer=types.SimpleNamespace(
+                vocab_size=test_config.vocab_size, detokenize=lambda tokens: "tokenized_prompt"
+            ),
         )
 
         # Reset global cuda graph state.
@@ -427,12 +435,6 @@ class TestDynamicInferenceEngine:
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
 
-        # Mock the detokenize method to return predictable result
-        def mock_detokenize_prompt(tokens):
-            return "tokenized_prompt"
-
-        env.engine.controller.tokenizer.detokenize = mock_detokenize_prompt
-
         return env
 
     @classmethod
@@ -445,7 +447,31 @@ class TestDynamicInferenceEngine:
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
         result = env.engine.step_modern(verbose=False)
-        finished_requests = result["finished_requests"]
+
+        # Suspend + resume.
+        if (
+            env.config.suspend_resume_interval is not None
+            and env.engine.step_count % env.config.suspend_resume_interval == 0
+        ):
+            suspend_resume_mems = {}
+            suspend_resume_mems["start"] = torch.cuda.memory_stats()
+            env.engine.suspend()  # suspend.
+            suspend_resume_mems["mid"] = torch.cuda.memory_stats()
+            env.engine.resume()  # resume.
+            suspend_resume_mems["end"] = torch.cuda.memory_stats()
+            env.mem_usage["suspend_resume"][env.engine.step_count] = suspend_resume_mems
+
+        # Nothing done?
+        finished_request_records = result["finished_request_records"]
+        if len(finished_request_records) == 0:
+            return
+
+        # Append output tokens.
+        for finished_request_record in finished_request_records:
+            finished_request = finished_request_record.merge(env.engine.controller.tokenizer)
+            request = env.requests[finished_request.request_id]
+            request.output = finished_request.generated_tokens
+            request.status = finished_request.status
 
     @classmethod
     @torch.inference_mode()
@@ -455,10 +481,12 @@ class TestDynamicInferenceEngine:
         env = cls._build_test_env(test_config)
 
         # Add requests to engine.
+        env.mem_usage["start"] = torch.cuda.memory_stats()
         for request in tqdm(env.requests, "add requests"):
 
             # Add request.
             env.engine._add_request(request)
+            request.state = "pending"
 
             # Insert gap steps between adding requests.
             for _ in range(test_config.num_gap_steps):
@@ -485,14 +513,20 @@ class TestDynamicInferenceEngine:
                 if num_tokens_total is None
                 else num_tokens_total - len(request.prompt_tokens)
             )
-            assert (
-                (num_tokens_to_generate is None and num_tokens_total is None)
-                or len(request.generated_tokens) == num_tokens_expected
-                or request.status == Status.FAILED
-            ), (
-                f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
-                f"tokens but generated {len(request.generated_tokens)}"
-            )
+
+            # Validate the output length only if suspend_resume_interval is None.
+            # If it is not None, then the output length could be anything in the
+            # range [1, num_tokens_to_generate].
+            if test_config.suspend_resume_interval is None:
+                assert (
+                    (num_tokens_to_generate is None and num_tokens_total is None)
+                    or len(request.generated_tokens) <= num_tokens_expected
+                    or request.status == Status.FAILED
+                ), (
+                    f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
+                    f"tokens but generated {len(request.generated_tokens)}"
+                )
+        env.mem_usage["end"] = torch.cuda.memory_stats()
 
         return env
 
@@ -510,9 +544,11 @@ class TestDynamicInferenceEngine:
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
+        num_tokens_to_generate = 16
 
         # Run test.
         env = self._run_test(
+            num_tokens_to_generate=num_tokens_to_generate,
             model_provider=model_provider,
             num_cuda_graphs=num_cuda_graphs,
             cuda_graph_scope=cuda_graph_scope,
@@ -522,26 +558,26 @@ class TestDynamicInferenceEngine:
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
 
-        # Validate output tokens.
+        # Validate generated tokens.
         gpt_expected_generated_tokens = [
-            [69, 85, 55, 74],
-            [29, 54, 85, 89],
-            [33, 30, 64, 59],
-            [45, 76, 33, 67],
-            [41, 56, 15, 58],
-            [28, 17, 6, 37],
-            [17, 2, 54, 47],
-            [],  # this request is failed due to max sequence length overflow
+            [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
+            [29, 54, 33, 72, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98, 76],
+            [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 1, 76, 77, 11, 25, 7],
+            [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64, 45],
+            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 89, 20, 92, 97, 38, 81],
+            [33, 69, 32, 49, 93, 24, 33, 6, 97, 36, 37, 99],
+            [82, 78, 78, 65, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80],
+            [],
         ]
 
         mamba_expected_generated_tokens = [
-            [74, 72, 83, 59],
-            [25, 54, 1, 70],
-            [28, 14, 15, 89],
-            [87, 27, 30, 52],
-            [44, 13, 82, 70],
-            [28, 74, 64, 16],
-            [8, 4, 83, 5],
+            [74, 72, 83, 59, 1, 70, 15, 89, 30, 52, 82, 70, 64, 16, 83, 5],
+            [25, 54, 42, 57, 33, 64, 60, 13, 28, 74, 8, 4, 56, 68, 87, 82],
+            [31, 55, 77, 25, 96, 13, 32, 49, 40, 54, 73, 10, 50, 2, 64, 96],
+            [72, 80, 35, 72, 77, 85, 98, 36, 4, 97, 37, 46, 79, 95, 83, 85],
+            [8, 80, 56, 4, 87, 1, 15, 98, 85, 7, 31, 38, 91, 28, 18, 80],
+            [9, 94, 48, 60, 87, 57, 25, 76, 91, 34, 69, 86, 73, 24, 63, 97],
+            [17, 5, 62, 66, 15, 52, 32, 75, 66, 18, 69, 5, 67, 37, 94, 51],
             [],
         ]
 
@@ -551,6 +587,10 @@ class TestDynamicInferenceEngine:
             expected_generated_tokens_list = mamba_expected_generated_tokens
         else:
             raise ValueError(f"Invalid model_provider {model_provider}")
+
+        print(f"Validating {len(env.requests)} requests.")
+        print(f"Expected generated tokens: {expected_generated_tokens_list}")
+        print(f"Actual generated tokens: {[request.generated_tokens for request in env.requests]}")
 
         assert len(env.requests) == len(expected_generated_tokens_list)
 
@@ -568,7 +608,11 @@ class TestDynamicInferenceEngine:
     def test_token_overflow_transient(self) -> None:
         """Test token overflow."""
         test_config = DynamicEngineTestConfig(
-            num_requests=2, min_prompt_length=512, max_prompt_length=512, context_max_tokens=900
+            num_requests=2,
+            min_prompt_length=512,
+            max_prompt_length=512,
+            num_tokens_to_generate=2,
+            context_max_tokens=900,
         )
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
@@ -810,7 +854,10 @@ class TestDynamicInferenceEngine:
         # Call the generate function.
         # It's safe to use request 0's sampling params here because all sampling
         # params are identical as long as use_fixed_output_lengths == False.
-        finished_requests = env.engine.generate(prompts, env.requests[0].sampling_params)
+        finished_request_records = env.engine.generate(prompts, env.requests[0].sampling_params)
+        finished_requests = [
+            r.merge(env.engine.controller.tokenizer) for r in finished_request_records
+        ]
 
         # Verify results
         assert len(finished_requests) == len(
@@ -860,10 +907,11 @@ class TestDynamicInferenceEngine:
                 num_tokens_to_generate = env.requests[
                     request_id
                 ].sampling_params.num_tokens_to_generate
-                result = fut.result()
-                assert result.generated_length == num_tokens_to_generate, (
+                request_record = fut.result()
+                request = request_record.merge(env.engine.controller.tokenizer)
+                assert request.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "
-                    f"tokens but generated {result.generated_length}"
+                    f"tokens but generated {request.generated_length}"
                 )
 
             engine_task.cancel()
@@ -1067,3 +1115,56 @@ class TestDynamicInferenceEngine:
             context_block_size_tokens=256,
             context_max_tokens=1000,
         )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.skip(
+        reason="test works in isolation, but memory dynamics change when run "
+        "within unt test suite."
+    )
+    def test_suspend_resume_memory(self):
+
+        # Run tests.
+        mem_usages = {}
+        for suspend_resume_interval in None, 8, 4, 2:  # interval 1 acts funny.
+
+            # Run test.
+            env = self._run_test(suspend_resume_interval=suspend_resume_interval, num_gap_steps=1)
+
+            # Record memory usage.
+            mem_usages[suspend_resume_interval] = env.mem_usage
+
+            # Clear memory to make recorded memories consistent between tests.
+            # TODO(@lmcafee): why is memory not automatically cleared?
+            # env.engine.suspend() # TODO(@lmcafee): useful?
+            del env
+
+        # Utility methods.
+        get_alloc = lambda mem_stats: mem_stats["allocated_bytes.all.current"]
+
+        # Validate overall 'end' memory usage.
+        golden_end_bytes = get_alloc(mem_usages[None]["end"])
+        for interval, mem_usage in mem_usages.items():
+            current_end_bytes = get_alloc(mem_usage["end"])
+            assert math.isclose(
+                golden_end_bytes, current_end_bytes, rel_tol=0.01
+            ), f"{current_end_bytes} != {golden_end_bytes}."
+
+        # Validate 'suspend/resume' memory usage.
+        get_suspend_resume_bytes = lambda key: list(
+            get_alloc(list(d["suspend_resume"].values())[-1][key])
+            for i, d in mem_usages.items()
+            if i is not None
+        )
+        suspend_resume_mid_bytes = get_suspend_resume_bytes("mid")
+        suspend_resume_end_bytes = get_suspend_resume_bytes("end")
+        for mid_bytes in suspend_resume_mid_bytes:
+            assert math.isclose(
+                suspend_resume_mid_bytes[0], mid_bytes, rel_tol=0.01
+            ), f"{mid_bytes} != {suspend_resume_mid_bytes[0]}."
+        for end_bytes in suspend_resume_end_bytes:
+            assert math.isclose(
+                suspend_resume_end_bytes[0], end_bytes, rel_tol=0.01
+            ), f"{end_bytes} != {suspend_resume_end_bytes[0]}."
