@@ -133,7 +133,6 @@ class GPTFIMDataset(GPTDataset):
 
         sample_len = sample.shape[0]
         segment_breaks = np.argwhere(sample == self.eod_tok_id)
-        np_rng = self.np_rng
 
         if segment_breaks.shape != (0, 1):  # then there is an EOD token in this example
             curr_start_position = 0
@@ -142,17 +141,17 @@ class GPTFIMDataset(GPTDataset):
                 # Only permute non-empty segments.
                 if loc - curr_start_position > 0:
                     # permute {prefix, suffix, middle} or {suffix, prefix, middle}
-                    permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:loc], np_rng)
+                    permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:loc])
                     new_samples += [permuted, [self.eod_tok_id]]
 
                 curr_start_position = loc + 1  # jump over the EOD token
             # Permute the segment after the last EOD
-            permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:], np_rng)
+            permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:])
             new_samples.append(permuted)
 
             sample = np.concatenate(new_samples)
         else:
-            sample = self._fim_split_and_permute_sequence(sample, np_rng)
+            sample = self._fim_split_and_permute_sequence(sample)
 
         diff = sample.shape[0] - sample_len
         if diff > 0:  # too long
@@ -167,10 +166,10 @@ class GPTFIMDataset(GPTDataset):
             np.array(document_ids, dtype=np.int64),
         )
 
-    def _fim_permute_sequence(self, sequence, np_rng, rate):
+    def _fim_permute_sequence(self, sequence, rate):
         return self._permute(
             sequence,
-            np_rng,
+            self.np_rng,
             rate,
             self.fim_spm_rate,
             self.config.tokenizer,
@@ -182,21 +181,21 @@ class GPTFIMDataset(GPTDataset):
             no_fim_prefix=self.no_fim_prefix,
         )
 
-    def _fim_split_and_permute_sequence(self, sequence, np_rng):
+    def _fim_split_and_permute_sequence(self, sequence):
         """
         If self.fim_split_sample is not None, split the sequence.
         Then apply FIM on the fragments, or the whole sequence if self.fim_split_sample is None.
         """
         if self.fim_split_sample is None:
-            return self._fim_permute_sequence(sequence, np_rng, self.fim_rate)
+            return self._fim_permute_sequence(sequence, self.fim_rate)
         # fim_split_sample is set: split the sample on this token and permute each fragment separately.
         # Typically, if each sample is a repository, then we split again on the file level.
         # Each fragment is a file, and we permute the files.
         fragment_breaks = np.argwhere(sequence == self.fim_split_sample)
         if fragment_breaks.shape == (0, 1):
             # no split token in this sample
-            return self._fim_permute_sequence(sequence, np_rng, self.fim_rate)
-        if not np_rng.binomial(1, self.fim_rate):
+            return self._fim_permute_sequence(sequence, self.fim_rate)
+        if not self.np_rng.binomial(1, self.fim_rate):
             # don't do FIM preproc
             return sequence
         # Do FIM on each fragment
@@ -205,12 +204,12 @@ class GPTFIMDataset(GPTDataset):
         for loc in np.nditer(fragment_breaks):
             if loc - curr_start_position > 0:
                 permuted = self._fim_permute_sequence(
-                    sequence[curr_start_position:loc], np_rng, self.fragment_fim_rate
+                    sequence[curr_start_position:loc], self.fragment_fim_rate
                 )
                 new_samples += [permuted, [self.fim_split_sample]]
             curr_start_position = loc + 1  # Jump over the split token
         # Permute the segment after the last split token
-        permuted = self._fim_permute_sequence(sequence[curr_start_position:], np_rng, self.fragment_fim_rate)
+        permuted = self._fim_permute_sequence(sequence[curr_start_position:], self.fragment_fim_rate)
         new_samples.append(permuted)
 
         return np.concatenate(new_samples)
@@ -218,7 +217,6 @@ class GPTFIMDataset(GPTDataset):
     def _permute(
         self,
         sample,
-        np_rng,
         fim_rate,
         fim_spm_rate,
         tokenizer,
@@ -233,7 +231,7 @@ class GPTFIMDataset(GPTDataset):
         Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it.
         Maintain the same sample length (if transform creates a few extra tokens, drop them).
         """
-        if np_rng.binomial(1, fim_rate):  # sample bernoulli dist
+        if self.np_rng.binomial(1, fim_rate):  # sample bernoulli dist
 
             contents = tokenizer._tokenizer.ids_to_text(sample)
 
@@ -245,7 +243,7 @@ class GPTFIMDataset(GPTDataset):
                 # A boundary can be =0 (prefix will be empty)
                 # a boundary can be =len(contents) (suffix will be empty)
                 # The two boundaries can be equal (middle will be empty)
-                boundaries = list(np_rng.randint(low=0, high=len(contents) + 1, size=2))
+                boundaries = list(self.np_rng.randint(low=0, high=len(contents) + 1, size=2))
                 boundaries.sort()
             except ValueError as e:
                 print(len(contents), contents)
@@ -271,12 +269,12 @@ class GPTFIMDataset(GPTDataset):
                     if (
                         suffix.shape[0] <= diff
                     ):  # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
-                        return sample, np_rng
+                        return sample, self.np_rng
                     suffix = suffix[: suffix.shape[0] - diff]
                 elif diff < 0:  # too short
                     suffix = np.concatenate([suffix, np.full((-1 * diff), pad_tok_id)])
 
-            if np_rng.binomial(1, fim_spm_rate):
+            if self.np_rng.binomial(1, fim_spm_rate):
                 # SPM (variant 2 from FIM paper)
                 new_sample = np.concatenate([[prefix_tok_id, suffix_tok_id], suffix, [middle_tok_id], prefix, middle])
             else:
