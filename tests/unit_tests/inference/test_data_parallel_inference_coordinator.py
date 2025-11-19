@@ -299,9 +299,7 @@ class TestCoordinator:
     async def test_pause(self):
         """Pause/resume test."""
         test_config = CoordinatorTestConfig(
-            tensor_model_parallel_size=2,
-            pipeline_model_parallel_size=1,
-            num_requests=32,
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1, num_requests=32
         )
         env = self._build_test_env(test_config)
 

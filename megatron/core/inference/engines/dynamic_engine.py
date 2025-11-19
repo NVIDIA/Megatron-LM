@@ -1285,7 +1285,9 @@ class DynamicInferenceEngine(AbstractEngine):
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    self.pending_microbatch.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
+                    self.pending_microbatch.append(
+                        self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK)
+                    )
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
