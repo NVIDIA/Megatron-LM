@@ -66,6 +66,7 @@ except ImportError:
 if TYPE_CHECKING:
     import wandb as WandbModule
 
+RUN_ALL_IN_CUDA_GRAPHED_MODE = True
 
 class ContextOverflowError(Exception):
     """Base exception for when a new request does not fit.
@@ -384,6 +385,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_total_requests = self.block_allocator.total_count - 1  # -1 for dummy block
         self.max_active_requests = self.block_allocator.active_count
         self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+        if RUN_ALL_IN_CUDA_GRAPHED_MODE:
+            self.max_tokens = self.max_active_requests
 
         assert self.max_tokens >= self.max_active_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "

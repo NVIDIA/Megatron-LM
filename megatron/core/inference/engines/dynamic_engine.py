@@ -200,13 +200,13 @@ class DynamicInferenceEngine(AbstractEngine):
         config = controller.inference_wrapped_model.inference_wrapper_config
         moe_pad_experts = config.moe_pad_experts_for_cuda_graph_inference
 
-        if moe_pad_experts and context.non_decode_cuda_graphs:
-            context.non_decode_cuda_graphs = False
-            if torch.distributed.get_rank() == 0:
-                warnings.warn(
-                    "MoE models do not support non-decode cuda graphs. "
-                    "Forcing non_decode_cuda_graphs to False."
-                )
+        # if moe_pad_experts and context.non_decode_cuda_graphs:
+        #     context.non_decode_cuda_graphs = False
+        #     if torch.distributed.get_rank() == 0:
+        #         warnings.warn(
+        #             "MoE models do not support non-decode cuda graphs. "
+        #             "Forcing non_decode_cuda_graphs to False."
+        #         )
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -1042,29 +1042,44 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    def should_run_dummy_forward_for_expert_model_parallelism(self):
+    def get_local_and_global_work(self):
         """Determines if a dummy forward pass should be run on this rank. 
         This is used to keep expert parallel ranks in sync when some ranks have no work to do.
         """
-        range_push("should_run_dummy_forward_for_expert_model_parallelism")
-        if parallel_state.get_expert_model_parallel_world_size() == 1:
-            return False
+        range_push("get_local_and_global_work")
         local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
-        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group_gloo()
-        # all reduce local work across expert model parallel group
 
-        local_work_tensor = torch.tensor(
-            [local_work], device='cpu'
-        )
-        torch.distributed.all_reduce(
-            local_work_tensor,
-            op=torch.distributed.ReduceOp.SUM,
-            group=expert_model_parallel_group,
-        )
-        global_work = local_work_tensor.item()
+        if parallel_state.get_expert_model_parallel_world_size() > 1:
+            expert_model_parallel_group = parallel_state.get_expert_model_parallel_group_gloo()
+            # all reduce local work across expert model parallel group
+
+            local_work_tensor = torch.tensor(
+                [local_work], device='cpu'
+            )
+            torch.distributed.all_reduce(
+                local_work_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=expert_model_parallel_group,
+            )
+            global_work = local_work_tensor.item()
+        else:
+            global_work = local_work
         range_pop()
-        return (local_work == 0 and global_work > 0)
+        return local_work, global_work
             
+    def dummy_forward(self):
+        """Performs a dummy forward pass to keep expert parallel ranks in sync."""
+        range_push("dummy_forward")
+        input_ids, position_ids = self.controller._dynamic_step_context_init(
+            num_warmup_tokens=self.context.cuda_graph_token_counts[0], 
+            warmup_engine_mode=WarmupEngineMode.NON_DECODE
+        )
+        # Forward pass -> logits.
+        self.controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+        with torch.inference_mode():
+            self.context.reset()  # todo: @lmcafee, remove if unnecessary
+        range_pop()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
@@ -1075,22 +1090,21 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
-                if self.stopped:
-                    self.stop()
-                    return
-                local_work = self.context.get_active_request_count() + len(self.waiting_request_ids)
-                expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-                # all reduce local work across expert model parallel group
-                
+            
                 # we need to run dummy forwards in the case of expert model parallelism
                 # when there's some work on other EP ranks but not on this one.
-                if self.should_run_dummy_forward_for_expert_model_parallelism():
-                    self.controller.dummy_forward()
+                local_work, global_work = self.get_local_and_global_work()
+                if local_work == 0 and global_work > 0:
+                    self.dummy_forward()
                     # the continue is extremely important to avoid premature pauses/stops 
                     # example - say this rank has received a stop signal but others still have work
                     # if we don't continue here, this rank will process the stop signal
                     # and stop the engine prematurely 
                     continue
+
+                if self.stopped and global_work == 0:
+                    self.stop()
+                    return
 
                 # for the cases below (engine is paused or no active requests),
                 # do not use asyncio.sleep(0)
@@ -1104,7 +1118,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                if self.paused:
+                if self.paused and global_work == 0:
                     await asyncio.sleep(0.02)
                     continue
 

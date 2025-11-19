@@ -163,4 +163,7 @@ if __name__ == "__main__":
         asyncio.run(main(engine, 
                         requests,
                         args.inference_coordinator_port))
+        
+        if os.environ.get("NSIGHT_PREFIX"):
+            torch.cuda.cudart().cudaProfilerStop()
 
