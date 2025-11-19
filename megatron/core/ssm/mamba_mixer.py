@@ -153,6 +153,7 @@ class MambaMixer(MegatronModule):
         headdim=None,
         ngroups=None,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: int = 0,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -174,6 +175,7 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
@@ -440,7 +442,7 @@ class MambaMixer(MegatronModule):
         )
         assert sequence_packing_available, reason_for_no_sequence_packing
 
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number)
+        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         # Fast path: decode-only
         if context.is_decode_only():
@@ -923,6 +925,12 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+
+            # Upcast the batch_indices to prevent integer overflow errors in the case of
+            # large max request counts.
+            if batch_indices is not None:
+                batch_indices = batch_indices.to(torch.int64)
+
             y = selective_state_update(
                 ssm_state,
                 x_reshaped,

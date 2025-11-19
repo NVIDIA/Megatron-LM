@@ -23,6 +23,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
@@ -111,7 +112,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     # Inference context.
     inference_context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
-        num_layers=args.num_layers,
+        num_layers=args.num_layers // args.pipeline_model_parallel_size,
         kv_channels=args.kv_channels,
         num_attention_heads=(
             args.num_query_groups if args.group_query_attention else args.num_attention_heads

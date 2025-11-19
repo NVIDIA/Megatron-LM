@@ -547,6 +547,7 @@ class TestSerialization:
         not is_torch_min_version("2.3.0"),
         reason="remove_sharded_tensors relies on Torch APIs introduced in v2.3.0",
     )
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_remove_sharded_tensors(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
