@@ -688,14 +688,14 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [80]),
-            (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (64, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (1024, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (0, [40]),
+            (1, [40]),
+            (2, [40, 24]),
+            (4, [40, 32, 16]),
+            (8, [40, 32, 24, 16, 8]),
+            (16, [40, 32, 24, 16, 8]),
+            (64, [40, 32, 24, 16, 8]),
+            (1024, [40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
@@ -730,10 +730,6 @@ class TestDynamicInferenceEngine:
             (10, 16),
             (12, 16),
             (16, 16),
-            (20, 24),
-            (24, 24),
-            (28, 32),
-            (32, 32),
         ],
     )
     @torch.inference_mode()
@@ -757,8 +753,6 @@ class TestDynamicInferenceEngine:
         context = env.engine.context
         assert context.is_decode_only()
         assert context.cuda_graph_token_counts == [
-            32,
-            24,
             16,
             8,
         ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_token_counts)
