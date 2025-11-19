@@ -63,15 +63,89 @@ jobs:
       - name: Run compatibility check
         id: compat_check
         run: |
+          # Save output to file for later display
           python scripts/check_api_backwards_compatibility.py \
             --baseline ${{ steps.baseline.outputs.baseline }} \
-            --verbose
+            --verbose 2>&1 | tee compat_check_output.txt
+          
+          # Capture exit code
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
         continue-on-error: true
       
       - name: Fail job if breaking changes detected
         if: steps.compat_check.outcome == 'failure'
         run: |
-          echo "::error::Breaking API changes detected. See logs above for details."
+          echo "::group::❌ API Backward Compatibility Check Failed"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔍 WHAT IS THIS CHECK?"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "This check ensures that changes to Megatron Core's public API do not"
+          echo "break backward compatibility for users. It compares your PR against"
+          echo "the latest stable release to detect breaking changes in:"
+          echo ""
+          echo "  • Function signatures (parameters, order, types)"
+          echo "  • Class structures and methods"
+          echo "  • Return types and public interfaces"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛠️  HOW TO FIX THIS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Choose ONE of these resolution strategies:"
+          echo ""
+          echo "1️⃣  REVERT THE BREAKING CHANGE (Recommended)"
+          echo "   → Modify your code to preserve backward compatibility"
+          echo "   → Add new parameters as optional (with defaults)"
+          echo "   → Keep existing parameters in the same order"
+          echo ""
+          echo "2️⃣  MARK AS INTERNAL API (If this is internal code)"
+          echo "   → Add @internal_api decorator from megatron.core.utils"
+          echo ""
+          echo "   Example (for classes):"
+          echo "      from megatron.core.utils import internal_api"
+          echo ""
+          echo "      @internal_api"
+          echo "      class ExperimentalFeature:"
+          echo "          pass"
+          echo ""
+          echo "   Example (for functions):"
+          echo "      from megatron.core.utils import internal_api"
+          echo ""
+          echo "      @internal_api"
+          echo "      def internal_helper_function():"
+          echo "          pass"
+          echo ""
+          echo "3️⃣  USE DEPRECATION (For gradual API changes)"
+          echo "   → Add @deprecated decorator for transition period"
+          echo "   → Example:"
+          echo "      from megatron.core.utils import deprecated"
+          echo ""
+          echo "      @deprecated(version='1.0', removal_version='2.0',"
+          echo "                  alternative='new_function')"
+          echo "      def old_function():"
+          echo "          pass"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋 BREAKING CHANGES DETECTED"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          cat compat_check_output.txt
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📚 MORE INFORMATION"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "📖 Full documentation: docs/api-backwards-compatibility-checking.md"
+          echo "🔧 Checker script: scripts/check_api_backwards_compatibility.py"
+          echo "❓ Questions? Check the docs or ask in #megatron-core"
+          echo ""
+          echo "::endgroup::"
+          
+          echo "::error::Breaking API changes detected. Please review the output above and choose a resolution strategy."
           exit 1
       
       - name: Success message
