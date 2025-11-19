@@ -23,8 +23,9 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_attr_wrapped_model, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -106,12 +107,19 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     if args.enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
-    module = model.module.module if hasattr(model.module, "module") else model.module
+    # Layer type list for hybrid models
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+    else:
+        mamba_conv_states_shape = None
+        mamba_ssm_states_shape = None
 
     # Inference context.
     inference_context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
-        num_layers=args.num_layers,
+        num_layers=args.num_layers // args.pipeline_model_parallel_size,
         kv_channels=args.kv_channels,
         num_attention_heads=(
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
@@ -127,13 +135,9 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
         unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
-        is_hybrid_model=args.is_hybrid_model,
-        layer_type_list=module.decoder.layer_type_list if args.is_hybrid_model else None,
-        mamba_head_dim=args.mamba_head_dim,
-        mamba_num_groups=args.mamba_num_groups,
-        mamba_d_model=args.hidden_size,
-        mamba_d_conv=4 if args.is_hybrid_model else None,
-        mamba_d_state=args.mamba_state_dim,
+        layer_type_list=layer_type_list,
+        mamba_conv_states_shape=mamba_conv_states_shape,
+        mamba_ssm_states_shape=mamba_ssm_states_shape,
         metrics_writer=metrics_writer,
     )
 

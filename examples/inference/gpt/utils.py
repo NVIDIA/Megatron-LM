@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import json
 import itertools
 import random
@@ -15,7 +16,6 @@ from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
 from megatron.core.transformer.module import MegatronModule
 
 from megatron.core.inference.sampling_params import SamplingParams
-
 
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -53,6 +53,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=30,
         help='Number of tokens to generate for each prompt',
+    )
+    group.add_argument(
+        "--num-tokens-from-file",
+        action='store_true',
+        default=False,
+        help='Use per-prompt num_tokens_to_generate from prompt file',
     )
     group.add_argument(
         "--top-n-logprobs",
@@ -130,12 +136,6 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'will be used, in order.',
     )
     group.add_argument(
-        "--inference-coordinator-port",
-        type=int,
-        help="This port will be used to setup the inference co-ordinator on node-0",
-        default=12346
-    )
-    group.add_argument(
         "--use-flashinfer-fused-rope",
         action='store_true',
         default=False,
@@ -189,6 +189,7 @@ class Request:
         self.time_end = None
         self.state = "not-started"
         self.sampling_params: SamplingParams = sampling_params if sampling_params is not None else get_default_sampling_params(tokenizer.eod)
+        self.sampling_params = copy.deepcopy(self.sampling_params)
 
     def __str__(self) -> str:
         return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
@@ -311,9 +312,19 @@ def get_requests_from_file(
     # Load prompts.
     n_prompts = sum(1 for _ in open(args.prompt_file))
     prompts = []
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
+    sampling_params_list = []
     with open(args.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
-            prompts.append(json.loads(line)["text"])
+            line_dict = json.loads(line)
+            prompts.append(line_dict["text"])
+
+            sp = copy.deepcopy(sampling_params)
+            if args.num_tokens_from_file:
+                sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
+            sampling_params_list.append(sp)
+
             if len(prompts) == args.prompt_file_num_truncate:
                 break
 
@@ -327,8 +338,8 @@ def get_requests_from_file(
 
     # Init requests.
     requests = [
-        Request(p, t, tokenizer, sampling_params)
-        for p, t in tqdm(zip(prompts, time_offsets), "init requests", total=len(prompts))
+        Request(p, t, tokenizer, sp)
+        for p, t, sp in tqdm(zip(prompts, time_offsets, sampling_params_list), "init requests", total=len(prompts))
     ]
 
     return requests
@@ -382,7 +393,9 @@ def build_dynamic_engine_setup_prefix(
     # CUDA graph config
     if args.cuda_graph_impl == "local":
         cg_str = (
-            f"graphs {context.cuda_graph_token_counts[0]}:"
+            "graphs "
+            f"[{len(context.cuda_graph_token_counts)}] "
+            f"{context.cuda_graph_token_counts[0]}:"
             f"{context.cuda_graph_token_counts[-1]}"
         )
     else:
