@@ -1134,7 +1134,7 @@ def validate_args(args, defaults={}):
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
     if args.inference_dynamic_batching:
-        assert args.inference_dynamic_batching_active_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
     # MoE upcycling check
@@ -1440,12 +1440,17 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
-    group.add_argument('--inference-dynamic-batching-active-buffer-size-gb',
+    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Buffer size (GB) allocated for the active (on-GPU) '
-                       'portion of the chunked KV memory. The total buffer size '
-                       'is 2x this value, which includes the same-size on-CPU '
-                       'paused buffer.')
+                       help='Amount of on-GPU memory allocated for the KV cache. '
+                       'The total amount of memory allocated for the KV cache '
+                       '(CPU + GPU memory) depends on the value set for the '
+                       'unified virtual memory (UVM) level (via '
+                       '`--inference-dynamic-batching-unified-memory-level`).'
+                       'If the UVM level is 0, then only GPU memory is used and '
+                       'the total memory equals `buffer_size_gb`. If the UVM '
+                       'level is 1, then additional memory is utilized on the '
+                       'CPU and the total memory equals `2 * buffer_size_gb`.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
