@@ -41,6 +41,7 @@ jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
     environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
     permissions:
@@ -158,10 +159,10 @@ jobs:
     needs: [pre-flight]
     if: |
       (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'true'
       ) || (
-        needs.pre-flight.outputs.is_deployment_workflow == 'false' 
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
           && needs.pre-flight.outputs.is_ci_workload == 'false'
           && needs.pre-flight.outputs.docs_only == 'false'
       )
@@ -192,8 +193,8 @@ jobs:
           export GITLAB_ENDPOINT=github.com
           export CI_PROJECT_NAMESPACE=NVIDIA
           export BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
-          export CHECK_ONLY=true 
-          export SKIP_DOCS=false 
+          export CHECK_ONLY=true
+          export SKIP_DOCS=false
           bash tools/autoformat.sh
 
   cicd-wait-in-queue:
@@ -216,7 +217,7 @@ jobs:
     environment: nemo-ci
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -231,10 +232,25 @@ jobs:
         with:
           python-version: 3.12
 
+      - name: Install GH CLI
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y gh
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
+
+      - name: Has lts label
+        id: has-lts-label
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          HAS_LTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "container::lts")') || echo "false"
+          echo "main=$HAS_LTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Download test data
         shell: bash
@@ -274,6 +290,22 @@ jobs:
           echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
           echo "EOF" | tee -a $GITHUB_OUTPUT
 
+      - name: Parse baseimage
+        shell: bash
+        id: base-image
+        env:
+          HAS_LTS_LABEL: ${{ steps.has-lts-label.outputs.main }}
+        run: |
+          if [ "$HAS_LTS_LABEL" == "true" ]; then
+            NGC_VERSION=$(cat docker/.ngc_version.lts)
+            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
+            echo "image_type=lts" | tee -a $GITHUB_OUTPUT
+          else
+            NGC_VERSION=$(cat docker/.ngc_version.dev)
+            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
+            echo "image_type=dev" | tee -a $GITHUB_OUTPUT
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -285,7 +317,8 @@ jobs:
           context: .
           target: main
           build-args: |
-            FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:25.09-py3
+            FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
+            IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
           cache-from: |
             type=registry,ref=${{ env.container-registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
             type=registry,ref=${{ env.container-registry }}/megatron-lm:main-buildcache,mode=max
@@ -309,7 +342,7 @@ jobs:
       - cicd-container-build
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -339,7 +372,7 @@ jobs:
     environment: nemo-ci
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -372,7 +405,7 @@ jobs:
     environment: nemo-ci
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -410,16 +443,12 @@ jobs:
               --scope mr-github
               --enable-lightweight-mode
             )
-            echo ":warning: The Run tests label is not yet supported."
           else
             ARGS=(
               --scope mr-slim
+              --enable-lightweight-mode
             )
           fi
-
-          ARGS=(
-            --scope mr-slim
-          )
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -461,7 +490,7 @@ jobs:
       PIP_ROOT_USER_ACTION: ignore
     if: |
       (
-        success() 
+        success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
@@ -495,6 +524,7 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -506,7 +536,7 @@ jobs:
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
@@ -533,6 +563,7 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     environment: nemo-ci
     steps:
       - name: Generate fake coverage report
@@ -542,7 +573,7 @@ jobs:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
-              repo: context.repo.repo, 
+              repo: context.repo.repo,
               sha: context.sha,
               state: 'success',
               description: 'No code changes - coverage check skipped',
@@ -558,6 +589,7 @@ jobs:
         || success()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
         flag: [unit-test]

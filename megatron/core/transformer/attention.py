@@ -48,14 +48,25 @@ except ImportError:
     rearrange = None
 
 try:
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
-    from flashattn_hopper.flash_attn_interface import (
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
 
     HAVE_FA3 = True
-except:
+except ImportError as e:
     HAVE_FA3 = False
+
+if not HAVE_FA3:
+    try:
+        from flash_attn_3.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            flash_attn_with_kvcache as flash_attn3_with_kvcache,
+        )
+
+        HAVE_FA3 = True
+    except ImportError as e:
+        pass
 
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -205,12 +216,17 @@ class Attention(MegatronModule, ABC):
 
         if (
             HAVE_TE
-            and self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
             and isinstance(self.linear_proj, TELinear)
+            and (
+                (
+                    self.config.fp8
+                    and self.config.fp8_recipe != 'delayed'
+                    and is_te_min_version("2.6.0dev0")
+                )
+                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
+            )
         ):
-            # For fp8 training, the output of the fused core_attn is saved by itself, and
+            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
@@ -333,9 +349,15 @@ class Attention(MegatronModule, ABC):
                     inference_context.key_value_memory_dict[self.layer_number]
                 )
 
-        if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
+        if (
+            not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0
+        ) and (not self.training or not is_te_min_version("2.2.0")):
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
+            # Note: in ModelOpt, we may use inference_context for speculative decoding
+            # in training. In that case, we do not want to turn off masking as we need
+            # customized attention mask for speculative decoding.
+
             attn_mask_type = AttnMaskType.no_mask
 
         if inference_context.is_static_batching():
@@ -1129,7 +1151,7 @@ class SelfAttention(Attention):
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
+        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
         set_save_original_input(self.linear_qkv)
