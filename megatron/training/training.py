@@ -34,7 +34,7 @@ try:
 except ImportError:
     has_rl_utils = False
 try:
-    from megatron.post_training.algos.distillation import (
+    from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
     )
 
