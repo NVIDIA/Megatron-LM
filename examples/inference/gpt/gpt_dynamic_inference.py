@@ -30,6 +30,9 @@ from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
+from megatron.core.inference.context.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -38,10 +41,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -150,9 +152,7 @@ def get_inference_context(
     requests: List[Request],
     sampling_params: Optional[SamplingParams] = None,
     calculate_max_sequence_length_from_requests: bool = True,
-    layer_type_list: Optional[List[str]] = None,
-    mamba_conv_states_shape: Optional[Tuple[int]] = None,
-    mamba_ssm_states_shape: Optional[Tuple[int]] = None,
+    mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
 ):
     """The inference context manages the KV cache and other inference state."""
 
@@ -189,9 +189,7 @@ def get_inference_context(
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
-        layer_type_list=layer_type_list,
-        mamba_conv_states_shape=mamba_conv_states_shape,
-        mamba_ssm_states_shape=mamba_ssm_states_shape,
+        mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
         qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
@@ -443,23 +441,14 @@ def main():
 
     model = get_model()
 
-    # Layer type list for hybrid models
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-    else:
-        mamba_conv_states_shape = None
-        mamba_ssm_states_shape = None
+    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
     context = get_inference_context(
         requests,
         sampling_params,
-        layer_type_list=layer_type_list,
-        mamba_conv_states_shape=mamba_conv_states_shape,
-        mamba_ssm_states_shape=mamba_ssm_states_shape,
+        mamba_inference_state_config=mamba_inference_state_config,
     )
     controller = get_inference_controller(model, context)
 

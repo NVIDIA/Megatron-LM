@@ -13,6 +13,9 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -46,7 +49,7 @@ from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGl
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     check_mamba_sequence_packing_support,
-    get_attr_wrapped_model,
+    get_mamba_inference_state_config_from_model,
     is_fa_min_version,
     is_te_min_version,
 )
@@ -205,9 +208,7 @@ class TestDynamicInferenceEngine:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
-        layer_type_list: Optional[List[str]] = None,
-        mamba_conv_states_shape: Optional[Tuple[int]] = None,
-        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -225,9 +226,7 @@ class TestDynamicInferenceEngine:
             block_size_tokens=test_config.context_block_size_tokens,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
@@ -370,22 +369,7 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        # Layer type list for hybrid models
-        decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if test_config.model_provider == "mamba":
-            mamba_states_shapes = decoder.mamba_state_shapes_per_request()
-            if mamba_states_shapes is not None:
-                (mamba_conv_states_shape, mamba_ssm_states_shape) = mamba_states_shapes
-            else:
-                # A `MambaBlock` can only not have a `MambaLayer` if using pipeline parallelism
-                # and a particular pipeline stage was not assigned a `MambaLayer`.
-                assert test_config.pipeline_model_parallel_size > 1
-                mamba_conv_states_shape = None
-                mamba_ssm_states_shape = None
-        else:
-            mamba_conv_states_shape = None
-            mamba_ssm_states_shape = None
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
         # Inference config.
         inference_config = InferenceWrapperConfig(
@@ -402,9 +386,7 @@ class TestDynamicInferenceEngine:
             test_config=test_config,
             transformer_config=transformer_config,
             requests=requests,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         # Inference model wrapper.
