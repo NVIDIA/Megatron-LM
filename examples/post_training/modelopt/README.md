@@ -109,28 +109,34 @@ Then only the draft model is called during training. AL is no longer reported du
 
 ```sh
 \
+    # Convert to online eagle3 model for base model feature extraction
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
     ./convert.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
+    # Dump base model feature to disk
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3 \
     MLM_EXTRA_ARGS="--output-dir /tmp/offline_data" \
     ./offline_feature_extrach.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
+    # Convert to offline eagle3 model
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
     MLM_EXTRA_ARGS="--export-offline-model" \
     ./convert.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
+    # Train the offline eagle3 model using extracted features
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
     MLM_EXTRA_ARGS="--export-offline-model" \
+    DATASET="/tmp/offline_data" \
     ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
+    # Export the trained eagle3 checkpoint
     PP=1 \
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
