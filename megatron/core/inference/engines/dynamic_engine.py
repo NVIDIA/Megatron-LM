@@ -415,9 +415,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
-        # Get local IP.
-        local_ip = socket.gethostname()
-
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
@@ -434,6 +431,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
+            local_ip = socket.gethostname()
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
