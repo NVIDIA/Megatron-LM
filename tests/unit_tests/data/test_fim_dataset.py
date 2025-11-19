@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
@@ -9,7 +10,9 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from tests.unit_tests.test_utilities import Utils
 
 
-def test_fim_gpt_dataset():
+@pytest.mark.parametrize("spm_rate", [0.0, 1.0])
+@pytest.mark.parametrize("split_sample", [None, "python"])
+def test_fim_gpt_dataset(spm_rate, split_sample):
     if torch.distributed.is_available():
         Utils.initialize_distributed()
         if torch.distributed.get_rank() == 0:
@@ -19,14 +22,22 @@ def test_fim_gpt_dataset():
         compile_helpers()
 
     tokenizer = MegatronTokenizer.from_pretrained(
-        metadata_path={"library": "null"}, vocab_size=131072
+        tokenizer_path="/opt/data/tokenizers/huggingface",
+        metadata_path={"library": "huggingface"},
+        additional_special_tokens=["<prefix>", "<middle>", "<suffix>", "<pad>", "<eod>"],
+        include_special_tokens=True,
     )
-    blend = get_blend_from_list(["/opt/data/datasets/train/test_text_document"])
-    extra_tokens = {"prefix": "777", "middle": "888", "suffix": "999", "pad": "666", "eod": "000"}
-    seq_length = 8
-    rate = 0.2
-    spm_rate = 0.2
-    fragment_rate = 0.5
+    blend = get_blend_from_list(["/home/data/fim/fim_text_document"])
+    extra_tokens = {
+        "prefix": "<prefix>",
+        "middle": "<middle>",
+        "suffix": "<suffix>",
+        "pad": "<pad>",
+        "eod": "<eod>",
+    }
+    seq_length = 32
+    rate = 1.0
+    fragment_rate = 1.0
     config = GPTFIMDatasetConfig(
         blend=blend,
         random_seed=1234,
@@ -40,18 +51,36 @@ def test_fim_gpt_dataset():
         rate=rate,
         spm_rate=spm_rate,
         fragment_rate=fragment_rate,
-        no_prefix="111214",
+        split_sample=split_sample,
     )
 
     datasets = BlendedMegatronDatasetBuilder(
         GPTFIMDataset, [10, 10, 10], lambda: True, config
     ).build()
 
+    prefix_id = tokenizer.tokenize("<prefix>")[1]
+    suffix_id = tokenizer.tokenize("<suffix>")[1]
+    middle_id = tokenizer.tokenize("<middle>")[1]
+
     dataset = datasets[0]
     assert dataset.fim_rate == rate
     assert dataset.fim_spm_rate == spm_rate
-    assert dataset.fragment_fim_rate == 0.5
-    assert dataset[0]["tokens"].tolist() == [343, 54365900, 77, 131072, 111214, 343, 54365900, 77]
+    assert dataset.fragment_fim_rate == fragment_rate
+
+    tokens = dataset[0]["tokens"].tolist()
+    if split_sample:
+        split_sample_id = tokenizer.tokenize(split_sample)[1]
+        split_sample_index = tokens.index(split_sample_id)
+        assert prefix_id == tokens[split_sample_index + 1]
+    if spm_rate == 0.0:
+        assert prefix_id == tokens[0]
+        assert suffix_id in tokens
+        assert middle_id in tokens
+        assert tokens.index(suffix_id) < tokens.index(middle_id)
+    else:
+        assert prefix_id == tokens[0]
+        assert suffix_id == tokens[1]
+        assert middle_id in tokens
 
 
 if __name__ == "__main__":
