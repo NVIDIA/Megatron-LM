@@ -52,12 +52,7 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
-        # >>>
-        # self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
-        # self.request_completion_futures: Dict[int, asyncio.Future] = {}
-        # +++
         self.requests: Dict[int, RequestEntry] = {}
-        # <<<
         self.paused = False
         self.stopped = False
         self.suspend_signal = False
