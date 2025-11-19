@@ -46,6 +46,7 @@ except ImportError:
     HAVE_TE = False
 
 
+# pylint: disable=line-too-long
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
 

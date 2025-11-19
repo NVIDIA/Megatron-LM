@@ -1799,7 +1799,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         Returns:
             List of lists where each inner list contains log probs for a request in the
             same order as the active requests (from paused_request_count to total_request_count).
+            log_probs (Tensor): Used to compute top n logprobs later if required.
         """
+
         # Calculate log_probs (sequence_length x vocab_size)
         log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
 

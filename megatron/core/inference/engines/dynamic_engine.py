@@ -840,42 +840,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         else:
                             request.generated_log_probs.extend(request_log_probs)
 
-                # Process top_n_logprobs if available
-                # { req_idx: [{'token': 'logprob'}, {'token': 'logprob'}, ...]}
-                if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    # Initialize lists if they don't exist
-                    if request.prompt_top_n_logprobs is None:
-                        request.prompt_top_n_logprobs = []
-                    if request.generated_top_n_logprobs is None:
-                        request.generated_top_n_logprobs = []
-
-                    top_n_data_list = top_n_logprobs[req_idx]
-                    prompt_length = len(request.prompt_tokens)
-
-                    # Process each token's top-n logprobs
-                    for top_n_values, top_n_indices in top_n_data_list:
-                        logit_dict = {}
-                        for logprob, logprob_index in zip(
-                            top_n_values.tolist(), top_n_indices.tolist()
-                        ):
-                            key = self.controller.tokenizer.detokenize([logprob_index])
-                            logit_dict[key] = logprob
-
-                        # Simple decision: check total count accumulated so far
-                        total_accumulated = len(request.prompt_top_n_logprobs) + len(
-                            request.generated_top_n_logprobs
-                        )
-
-                        # If return_prompt_top_n_logprobs is True and we haven't reached prompt end,
-                        # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
-                        if (
-                            request.sampling_params.return_prompt_top_n_logprobs
-                            and total_accumulated < prompt_length - 1
-                        ):
-                            request.prompt_top_n_logprobs.append(logit_dict)
-                        else:
-                            request.generated_top_n_logprobs.append(logit_dict)
-
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
@@ -911,48 +875,42 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_log_probs.extend(request_log_probs)
                         request.generated_log_probs = []
 
-                # Process top_n_logprobs for chunked prefill if available
-                if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    # Initialize lists if they don't exist
-                    if (
-                        not hasattr(request, 'prompt_top_n_logprobs')
-                        or request.prompt_top_n_logprobs is None
-                    ):
-                        request.prompt_top_n_logprobs = []
-                    if (
-                        not hasattr(request, 'generated_top_n_logprobs')
-                        or request.generated_top_n_logprobs is None
-                    ):
-                        request.generated_top_n_logprobs = []
-
-                    top_n_data_list = top_n_logprobs[req_idx]
-                    prompt_length = len(request.prompt_tokens)
-
-                    for top_n_values, top_n_indices in top_n_data_list:
-                        # Convert to dictionary format: {token_str: logprob}
-                        logit_dict = {}
-                        for logprob, logprob_index in zip(
-                            top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
-                        ):
-                            key = self.controller.tokenizer.detokenize([logprob_index])
-                            logit_dict[key] = logprob
-
-                        # Simple decision: check total count accumulated so far
-                        total_accumulated = len(request.prompt_top_n_logprobs) + len(
-                            request.generated_top_n_logprobs
-                        )
-
-                        # If return_prompt_top_n_logprobs is True and we haven't reached prompt end,
-                        # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
-                        if (
-                            request.sampling_params.return_prompt_top_n_logprobs
-                            and total_accumulated < prompt_length - 1
-                        ):
-                            request.prompt_top_n_logprobs.append(logit_dict)
-                        else:
-                            request.generated_top_n_logprobs.append(logit_dict)
-
                 active_request_ids.append(request_id)
+
+            # Process top_n_logprobs if available (unified for both regular and chunked prefill)
+            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                # Initialize lists if they don't exist
+                if request.prompt_top_n_logprobs is None:
+                    request.prompt_top_n_logprobs = []
+                if request.generated_top_n_logprobs is None:
+                    request.generated_top_n_logprobs = []
+
+                top_n_data_list = top_n_logprobs[req_idx]
+                prompt_length = len(request.prompt_tokens)
+
+                # Process each token's top-n logprobs
+                for top_n_values, top_n_indices in top_n_data_list:
+                    logit_dict = {}
+                    for logprob, logprob_index in zip(
+                        top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
+                    ):
+                        key = self.controller.tokenizer.detokenize([logprob_index])
+                        logit_dict[key] = logprob
+
+                    # Simple decision: check total count accumulated so far
+                    total_accumulated = len(request.prompt_top_n_logprobs) + len(
+                        request.generated_top_n_logprobs
+                    )
+
+                    # If return_prompt_top_n_logprobs is True and we haven't reached prompt end,
+                    # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
+                    if (
+                        request.sampling_params.return_prompt_top_n_logprobs
+                        and total_accumulated < prompt_length - 1
+                    ):
+                        request.prompt_top_n_logprobs.append(logit_dict)
+                    else:
+                        request.generated_top_n_logprobs.append(logit_dict)
 
         return active_request_ids, finished_request_records
 
