@@ -29,20 +29,25 @@ class CompilationState(Enum):
     FAILURE = auto()  # Compilation attempted, but failed.
     SUCCESS = auto()  # Compilation attempted, and succeeded.
 
+
 class UnifiedMemoryUnsupportedError(Exception):
     """Unified memory is not supported on this system."""
 
+
 class UnifiedMemoryCompileTimeoutError(UnifiedMemoryUnsupportedError):
     """Unified memory compilation timed out."""
+
 
 # Compilation vars.
 _compilation_state = CompilationState.UNATTEMPTED
 _alloc = None  # must remain global until process exit.
 _mod = None  # must remain global until process exit.
 
+
 @contextmanager
 def _compile_timeout(timeout_s: int):
     """Context manager to timeout compilation."""
+
     def _handler(signum, frame):
         raise UnifiedMemoryCompileTimeoutError(
             "Unified memory compilation has been forcefully timed out. "
@@ -52,6 +57,7 @@ def _compile_timeout(timeout_s: int):
             "Alternately, the TORCH_EXTENSIONS_DIR env var may be set to a different path. "
             "Please clean up your stale cache and try again."
         )
+
     curr_handler = signal.signal(signal.SIGALRM, _handler)
     try:
         signal.alarm(timeout_s)
@@ -59,6 +65,7 @@ def _compile_timeout(timeout_s: int):
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, curr_handler)
+
 
 def compile_allocator():
     """Attempt to compile UVM allocator."""
