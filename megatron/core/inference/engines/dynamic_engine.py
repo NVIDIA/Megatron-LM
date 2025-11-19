@@ -910,7 +910,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         % (
                             step_type,
                             (
-                                "DIM %d:%d" % (padded_active_token_count, active_token_count)
+                                "DIM %d:%d"
+                                % (
+                                    context_state["padded_active_token_count"],
+                                    context_state["active_token_count"],
+                                )
                                 if context_state["using_cuda_graph_this_step"]
                                 else "OFF"
                             ),
