@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from typing import Callable, List, Optional
 
 import torch
@@ -18,6 +19,8 @@ from .optimizer import (
     MegatronOptimizer,
 )
 from .optimizer_config import OptimizerConfig
+
+logger = logging.getLogger(__name__)
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -236,6 +239,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             wrapped_state_dict = state_dict
         for sd in wrapped_state_dict.values():
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
+                logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
                 sd['fp32_from_fp16_params'] = [
                     v for k, v in sorted(sd['fp32_from_fp16_params'].items())
                 ]
@@ -279,7 +283,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     for group in sd['fp32_from_fp16_params']
                 ]
                 sd['fp32_from_fp16_params'] = {
-                    k: v for k, v in enumerate(sd['fp32_from_fp16_params'])
+                    i: v for i, v in enumerate(sd['fp32_from_fp16_params'])
                 }
             # state is a single dict and will be empty if optimizer is fully empty
             if not sd['optimizer']['state']:
@@ -292,6 +296,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 group['params'] = bool(local_params.unwrap())
                 all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
                 torch.distributed.all_gather_object(all_rank_groups, group)
+                # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params
                 sd['optimizer']['param_groups'][i] = nonempty_rank_group
