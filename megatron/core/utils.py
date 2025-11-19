@@ -2152,3 +2152,106 @@ def trace_async_exceptions(
         return wrapper
 
     return _decorate if func is None else _decorate(func)
+
+
+# ============================================================================
+# Backward Compatibility Decorators
+# ============================================================================
+
+
+def deprecated(
+    version: str,
+    removal_version: Optional[str] = None,
+    alternative: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Callable:
+    """
+    Mark a function as deprecated.
+
+    This decorator:
+    1. Adds deprecation metadata to the function
+    2. Issues a DeprecationWarning when the function is called
+    3. Allows the compatibility checker to track deprecation lifecycle
+
+    Args:
+        version: Version where deprecation starts (e.g., "1.0.0")
+        removal_version: Version where function will be removed (e.g., "2.0.0")
+        alternative: Name of the recommended replacement function
+        reason: Optional explanation for the deprecation
+
+    Returns:
+        Decorator function
+
+    Example:
+        @deprecated(
+            version="1.0.0",
+            removal_version="2.0.0",
+            alternative="new_train_model",
+            reason="Improved performance and cleaner API"
+        )
+        def old_train_model(config):
+            pass
+    """
+
+    def decorator(func: Callable) -> Callable:
+        # Add metadata
+        func._deprecated = True
+        func._deprecated_version = version
+        func._removal_version = removal_version
+        func._alternative = alternative
+        func._deprecation_reason = reason
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Build warning message
+            msg_parts = [f"{func.__name__} is deprecated since version {version}."]
+
+            if alternative:
+                msg_parts.append(f"Use {alternative} instead.")
+
+            if removal_version:
+                msg_parts.append(f"Will be removed in version {removal_version}.")
+
+            if reason:
+                msg_parts.append(f"Reason: {reason}")
+
+            warnings.warn(" ".join(msg_parts), DeprecationWarning, stacklevel=2)
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def internal_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as internal API (not for external use).
+
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
+
+    Args:
+        func: The function or class to mark as internal
+
+    Returns:
+        The original function/class with an internal API marker
+
+    Example:
+        @internal_api
+        def _internal_helper():
+            '''For internal use only'''
+            pass
+
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
+    """
+    func._internal_api = True
+    return func
