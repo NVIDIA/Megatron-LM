@@ -139,7 +139,7 @@ jobs:
           echo "📚 MORE INFORMATION"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "📖 Full documentation: docs/api-backwards-compatibility-checking.md"
+          echo "📖 Full documentation: docs/api-backwards-compatibility-check.md"
           echo "🔧 Checker script: scripts/check_api_backwards_compatibility.py"
           echo "❓ Questions? Check the docs or ask in #megatron-core"
           echo ""

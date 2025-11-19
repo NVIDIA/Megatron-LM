@@ -161,7 +161,7 @@ def main():
         print("\nYou're ready to use the API compatibility checker!")
         print("\nNext steps:")
         print("  1. Run: python scripts/check_api_backwards_compatibility.py --baseline <ref>")
-        print("  2. See: docs/api-backwards-compatibility-checking.md for full documentation")
+        print("  2. See: docs/api-backwards-compatibility-check.md for full documentation")
         return 0
     else:
         print(f"❌ Some tests failed ({passed}/{total} passed)")
