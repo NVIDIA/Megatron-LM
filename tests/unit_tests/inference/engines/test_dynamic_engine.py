@@ -726,15 +726,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize(
         "num_warmup_tokens, expected_cuda_graph_token_count",
-        [
-            (1, 8),
-            (2, 8),
-            (4, 8),
-            (8, 8),
-            (10, 16),
-            (12, 16),
-            (16, 16),
-        ],
+        [(1, 8), (2, 8), (4, 8), (8, 8), (10, 16), (12, 16), (16, 16)],
     )
     @torch.inference_mode()
     def test_cuda_graph_warmup(
@@ -756,10 +748,9 @@ class TestDynamicInferenceEngine:
 
         context = env.engine.context
         assert context.is_decode_only()
-        assert context.cuda_graph_token_counts == [
-            16,
-            8,
-        ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_token_counts)
+        assert context.cuda_graph_token_counts == [16, 8], "cuda_graph_token_counts: %s." % str(
+            context.cuda_graph_token_counts
+        )
 
         context.initialize_attention_state(
             num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode

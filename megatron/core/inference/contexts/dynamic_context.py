@@ -505,7 +505,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Print info.
         logging.info(
             "DynamicInferenceContext: allocated context with active buffer size %s (%d blocks)."
-            % (get_mem_size_str(self.block_allocator.active_count * self.block_size_bytes), self.block_allocator.active_count)
+            % (
+                get_mem_size_str(self.block_allocator.active_count * self.block_size_bytes),
+                self.block_allocator.active_count,
+            )
         )
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
