@@ -42,7 +42,7 @@ MODEL_ARGS:
   --top_k: 1
   --return-log-probs: true
   --num-tokens-to-generate: 30
-  --inference-dynamic-batching-active-buffer-size-gb: 20
+  --inference-dynamic-batching-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
   --output-path: ${TENSORBOARD_PATH}
