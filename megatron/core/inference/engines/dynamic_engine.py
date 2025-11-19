@@ -917,6 +917,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     ),
                     context_state["total_request_count"] - context_state["paused_request_count"],
+                    context_state["total_active_block_count"],
                     context_state["paused_request_count"],
                     context_state["total_paused_block_count"],
                     context_state["waiting_request_count"],
