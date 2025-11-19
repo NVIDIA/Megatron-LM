@@ -201,6 +201,6 @@ class ArgumentGroupFactory:
         if len(base_classes) > 0:
             parent_class = base_classes[0]
             if parent_class.__name__ not in builtins.__dict__:
-                field_docstrings.update(get_field_docstrings(base_classes[0]))
+                field_docstrings.update(self._get_field_docstrings(base_classes[0]))
 
         return field_docstrings
