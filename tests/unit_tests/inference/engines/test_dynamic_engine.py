@@ -205,7 +205,7 @@ class TestDynamicInferenceEngine:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
-        layer_type_list: Optional[List[str]],
+        layer_type_list: Optional[List[str]] = None,
         mamba_conv_states_shape: Optional[Tuple[int]] = None,
         mamba_ssm_states_shape: Optional[Tuple[int]] = None,
     ):
@@ -214,7 +214,8 @@ class TestDynamicInferenceEngine:
         # Inference context.
         context = DynamicInferenceContext(
             params_dtype=transformer_config.params_dtype,
-            num_layers=transformer_config.num_layers,
+            num_layers=transformer_config.num_layers
+            // transformer_config.pipeline_model_parallel_size,
             kv_channels=transformer_config.kv_channels,
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=test_config.max_sequence_length,
@@ -315,10 +316,13 @@ class TestDynamicInferenceEngine:
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
         elif test_config.model_provider == "mamba":
+            pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
-                num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+                num_layers=(
+                    3 if pp_size == 1 else 6
+                ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 mamba_num_heads=16,
                 num_attention_heads=16,
@@ -331,7 +335,7 @@ class TestDynamicInferenceEngine:
                 ),
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-                pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+                pipeline_model_parallel_size=pp_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
                 num_moe_experts=(
                     None
@@ -984,13 +988,6 @@ class TestDynamicInferenceEngine:
             pytest.skip(reason="Sequence parallelism requires tp_size > 1")
         elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
             pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
-        elif pp_size > 1 and model_provider == "mamba":
-            pytest.skip(
-                reason=(
-                    "Running hybrid models with pp_size > 1 and no attention on some "
-                    "pipeline stages is not supported yet."
-                )
-            )
         elif transformer_impl == "inference_optimized":
             if ep_size > 1:
                 pytest.skip(
