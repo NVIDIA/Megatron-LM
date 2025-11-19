@@ -9,6 +9,7 @@ import time
 import warnings
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -92,6 +93,15 @@ def format_mem_bytes(mem_bytes):
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+@dataclass(kw_only=True)
+class RequestEntry:
+    """Entry in the engine's `self.requests` dict."""
+    record: DynamicInferenceRequestRecord
+    future: asyncio.Future
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 # pylint: disable=line-too-long
@@ -214,8 +224,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
-        self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
-        self.request_completion_futures: Dict[int, asyncio.Future] = {}
+        # >>>
+        # self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
+        # self.request_completion_futures: Dict[int, asyncio.Future] = {}
+        # +++
+        self.requests: Dict[int, RequestEntry] = {}
+        # <<<
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
@@ -549,13 +563,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Maintain references to requests before reset.
         waiting_request_ids = list(self.waiting_request_ids)
-        active_request_ids = set(self.request_records.keys()) - set(waiting_request_ids)
+        active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
         # Suspend requests objects.
         for request_id in active_request_ids:
-            self.request_records[request_id].suspend(self.controller.tokenizer)
+            self.requests[request_id].record.suspend(self.controller.tokenizer)
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -632,7 +646,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             (DynamicInferenceRequest) The most recent request in the record.
         """
-        return self.request_records[request_id][-1]
+        return self.requests[request_id].record[-1]
 
     def _add_request(
         self, request: DynamicInferenceRequest
@@ -642,8 +656,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Add request to self.request_records. If the engine has previously been
         # suspended, then the request may already exist.
-        if request_id not in self.request_records:
-            self.request_records[request_id] = DynamicInferenceRequestRecord.from_request(request)
+        if request_id not in self.requests:
+            self.requests[request_id] = RequestEntry(
+                record=DynamicInferenceRequestRecord.from_request(request),
+                future=self._loop.create_future(),
+            )
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -686,13 +703,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
 
-        # Create a new asyncio Future to notify the user when the request has
-        # completed. If the engine has previously been suspended, then the future
-        # may already exist.
-        if request_id not in self.request_completion_futures:
-            self.request_completion_futures[request_id] = self._loop.create_future()
-
-        return self.request_completion_futures[request_id]
+        return self.requests[request_id].future
 
     def add_request(
         self,
@@ -813,8 +824,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id in finished_request_ids:
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    finished_request_record = self.request_records.pop(request_id)
-                    finished_request = finished_request_record[-1]
+                    finished_entry = self.requests.pop(request_id)
+                    finished_request = finished_entry.record[-1]
                     if finished_request.prompt is None:
                         finished_request.prompt = self.controller.tokenizer.detokenize(
                             finished_request.prompt_tokens.tolist()
@@ -823,8 +834,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_text = self.controller.tokenizer.detokenize(
                         finished_request.generated_tokens
                     )
-                    finished_request_records.append(finished_request_record)
-                    self.request_completion_futures[request_id].set_result(finished_request_record)
+                    finished_request_records.append(finished_entry.record)
+                    finished_entry.future.set_result(finished_entry.record)
                 else:
                     active_request_ids.append(request_id)
             else:
@@ -1007,12 +1018,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Failed requests.
         for failed_request_id in self.failed_request_ids:
-            failed_request_record = self.request_records.pop(failed_request_id)
-            failed_request = failed_request_record[-1]
+            failed_entry = self.requests.pop(failed_request_id)
+            failed_request = failed_entry.record[-1]
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
-            finished_request_records.append(failed_request_record)
-            self.request_completion_futures[failed_request_id].set_result(failed_request_record)
+            finished_request_records.append(failed_entry.record)
+            failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
 
         # Log KV cache utilization stats to W&B
