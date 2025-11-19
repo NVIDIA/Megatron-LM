@@ -41,6 +41,7 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     )
     group.add_argument(
         "--num-tokens-to-prompt",
+        type=int,
         nargs="+",
         default=[64, 1024],
         help='Number of tokens to use for simulated prompts. This should be a '
