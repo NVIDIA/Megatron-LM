@@ -95,13 +95,11 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 @dataclass(kw_only=True)
 class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
 # pylint: disable=line-too-long
@@ -224,12 +222,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids = []  # deque()
         self.request_counter = Counter()
-        # >>>
-        # self.request_records: Dict[int, DynamicInferenceRequestRecord] = {}
-        # self.request_completion_futures: Dict[int, asyncio.Future] = {}
-        # +++
         self.requests: Dict[int, RequestEntry] = {}
-        # <<<
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
@@ -654,7 +647,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
 
-        # Add request to self.request_records. If the engine has previously been
+        # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
         if request_id not in self.requests:
             self.requests[request_id] = RequestEntry(
