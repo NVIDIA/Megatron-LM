@@ -416,11 +416,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         # Get local IP.
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tmp_sock:
-            tmp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            tmp_sock.connect(('<broadcast>', 0))
-            local_ip = tmp_sock.getsockname()[0]
-        del tmp_sock
+        local_ip = socket.gethostname()
 
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
