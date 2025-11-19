@@ -225,7 +225,7 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
-            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
+            extra_args (dict): Extra arguments for the node: is_moe.
         """
         # determine whether to free input memory
         config = extra_args.get("config", None)
@@ -327,10 +327,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
-    enable_deepep = (
-        layer.config.moe_token_dispatcher_type == "flex"
-        and layer.config.moe_flex_dispatcher_backend == "deepep"
-    )
+    use_flex_dispatcher = layer.config.moe_token_dispatcher_type == "flex"
 
     class _BackwardDWWrapper:
         def __init__(self):
@@ -447,7 +444,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if use_flex_dispatcher:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -463,7 +460,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep:
+        if use_flex_dispatcher:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
