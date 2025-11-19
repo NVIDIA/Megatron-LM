@@ -168,7 +168,6 @@ class GPTFIMDataset(GPTDataset):
     def _fim_permute_sequence(self, sequence, rate):
         return self._permute(
             sequence,
-            self.np_rng,
             rate,
             self.fim_spm_rate,
             self.config.tokenizer,
