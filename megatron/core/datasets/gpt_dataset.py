@@ -20,9 +20,6 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
-_PAD_TOKEN_ID = -1
-
-
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
@@ -104,11 +101,6 @@ class GPTDataset(MegatronDataset):
         self.cached_attention_mask = None
         self.cached_loss_mask = None
         self.cached_position_ids = None
-
-        try:
-            self._pad_token_id = self.config.tokenizer.pad
-        except Exception:
-            self._pad_token_id = _PAD_TOKEN_ID
 
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()

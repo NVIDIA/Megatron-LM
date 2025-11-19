@@ -61,8 +61,9 @@ RUN bash -ex <<"EOF"
         ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
-    git clone --branch v1.2.1 https://github.com/deepseek-ai/DeepEP.git
+    git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
+        git checkout ef73fd9a4c098e09929e48dfd696505ddc8e2043
         patch -p1 < /workspace/deepep.patch
     popd
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.

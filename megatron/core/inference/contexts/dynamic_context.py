@@ -852,7 +852,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 warming up cuda graphs. Must be less than or equal to
                 `max_requests`.
             warmup_engine_mode (WarmupEngineMode): Denote whether to setup
-            for a decode or a non-decode cuda-graph warmup.
+                for a decode or a non-decode cuda-graph warmup.
             num_warmup_requests (Optional[int]): [DEPRECATED] Use num_warmup_tokens instead.
             This argument is kept for backward compatibility with the legacy API.
         Return:

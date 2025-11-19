@@ -26,6 +26,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
+    get_torch_version,
     is_te_min_version,
     log_on_each_pipeline_stage,
     log_single_rank,
@@ -57,6 +58,18 @@ except:
 _IS_GRAPH_CAPTURING = False
 
 logger = logging.getLogger(__name__)
+
+# Freeze GC during capture.
+# TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
+FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
+try:
+    from packaging.version import Version as PkgVersion
+
+    FREEZE_GC_MAX_TORCH_VERSION = PkgVersion("2.9.0a0")
+    if get_torch_version() >= FREEZE_GC_MAX_TORCH_VERSION:
+        FREEZE_GC = False
+except ImportError:
+    pass
 
 
 def is_graph_capturing():
@@ -616,8 +629,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         # save grads and other variables that may be affected by graph warmup
@@ -706,7 +718,7 @@ class _CudaGraphRunner(torch.nn.Module):
             restore_fp8_tensors([self.base_module], saved_fp8_tensors)
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             # gc.collect() drops references to unreachable tensors created during capture,
@@ -721,8 +733,7 @@ class _CudaGraphRunner(torch.nn.Module):
         'create_cudagraphs()'."""
 
         # Freeze GC, to speed up capture time ~15-20x.
-        freeze_gc = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
-        if freeze_gc:
+        if FREEZE_GC:
             gc.freeze()
 
         self.bwd_graph = torch.cuda.CUDAGraph()
@@ -782,7 +793,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = static_grad_inputs
 
         # Unfreeze GC.
-        if freeze_gc:
+        if FREEZE_GC:
             gc.unfreeze()
 
             if self.is_first_layer:

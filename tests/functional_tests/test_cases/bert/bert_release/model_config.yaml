@@ -33,6 +33,7 @@ MODEL_ARGS:
   # EVAL_AND_LOGGING_ARGS
   --log-interval: 100
   --save-interval: 2000
+  --save-retain-interval: 10000
   --eval-interval: 1000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
@@ -47,6 +48,7 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
   --exit-interval: 20000
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
   - "lm loss"
