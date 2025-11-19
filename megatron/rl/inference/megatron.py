@@ -25,7 +25,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model, log_single_rank
+from megatron.core.utils import get_mamba_inference_state_config_from_model, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -107,14 +107,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     if args.enable_cuda_graph:
         num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
 
-    # Layer type list for hybrid models
-    decoder = get_attr_wrapped_model(model, "decoder")
-    layer_type_list = getattr(decoder, "layer_type_list", None)
-    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
-    else:
-        mamba_conv_states_shape = None
-        mamba_ssm_states_shape = None
+    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -135,9 +128,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
         unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
-        layer_type_list=layer_type_list,
-        mamba_conv_states_shape=mamba_conv_states_shape,
-        mamba_ssm_states_shape=mamba_ssm_states_shape,
+        mamba_inference_state_config=mamba_inference_state_config,
         metrics_writer=metrics_writer,
     )
 

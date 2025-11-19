@@ -30,8 +30,7 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model
 
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_args
@@ -225,28 +224,16 @@ if __name__ == "__main__":
 
         # Requests, context, conroller.
         model = get_model()
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
         requests = (
             build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
         )
-
-        # Layer type list for hybrid models
-        decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
-                decoder.mamba_state_shapes_per_request()
-            )
-        else:
-            mamba_conv_states_shape = None
-            mamba_ssm_states_shape = None
 
         context = get_inference_context(
             None,
             None,
             calculate_max_sequence_length_from_requests=False,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         controller = get_inference_controller(model, context)
