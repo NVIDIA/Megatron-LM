@@ -1107,10 +1107,10 @@ def validate_args(args, defaults={}):
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
         # Disable nan check for fake process group
         args.check_for_nan_in_loss_and_grad = False
-        print('Warning: check_for_nan_in_loss_and_grad is set to False for fake process group.')
+        warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
         # Disable gloo process groups for fake process group
         args.enable_gloo_process_groups = False
-        print('Warning: enable_gloo_process_groups is set to False for fake process group.')
+        warn_rank_0('enable_gloo_process_groups is set to False for fake process group.')
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
