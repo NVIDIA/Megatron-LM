@@ -124,7 +124,12 @@ async def completions():
                 }
 
             choices.append(
-                {"index": 0, "text": text_output, "logprobs": logprobs_data, "finish_reason": "length"}
+                {
+                    "index": 0,
+                    "text": text_output,
+                    "logprobs": logprobs_data,
+                    "finish_reason": "length",
+                }
             )
             total_completion_tokens += len(result.generated_tokens)
             request_idx += 1

@@ -24,14 +24,11 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-    Symbols,
-    get_layer_maps_from_layer_type_list,
-)
+from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
@@ -231,14 +228,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         materialize_only_last_token_logits (Optional[bool]): Whether to only
             materialize logits for the last token. This should be set to False
             if returning log probs.
-        layer_type_list (Optional[List[str]]): A list of strings that indicates
-            the layer type (Mamba / Attention / MLP) for each layer.
-            See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list
-            of symbols. This must be provided for hybrid models.
-        mamba_conv_states_shape: (Optional[Tuple[int]]): Mamba conv states shape per request.
-            This must be provided for hybrid models.
-        mamba_ssm_states_shape: (Optional[Tuple[int]]): Mamba ssm states shape per request.
-            This must be provided for hybrid models.
+        mamba_inference_state_config (Optional[MambaInferenceStateConfig]): The Mamba
+            inference state config if the model is a hybrid model.
         use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
             engine steps.
         unified_memory_level (Optional[int]): Set unified memory usage within the
@@ -274,9 +265,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         qk_pos_emb_head_dim: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: Optional[bool] = True,
-        layer_type_list: Optional[List[str]] = None,
-        mamba_conv_states_shape: Optional[Tuple[int]] = None,
-        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
         use_cuda_graphs_for_non_decode_steps: bool = True,
         use_flashinfer_fused_rope: bool = False,
         unified_memory_level: Optional[int] = 1,
@@ -303,8 +292,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Mamba states.
-        self.is_hybrid_model = layer_type_list is not None and Symbols.MAMBA in layer_type_list
+        self.is_hybrid_model = mamba_inference_state_config is not None
         if self.is_hybrid_model:
+            mamba_conv_states_shape = mamba_inference_state_config.mamba_conv_states_shape
+            mamba_ssm_states_shape = mamba_inference_state_config.mamba_ssm_states_shape
             assert (
                 mamba_conv_states_shape is not None
             ), "`mamba_conv_states_shape` must be specified for hybrid models"
@@ -319,7 +310,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
             attention_layer_map, mamba_layer_map, _, _ = get_layer_maps_from_layer_type_list(
-                layer_type_list
+                mamba_inference_state_config.layer_type_list
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
@@ -728,6 +719,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_batch_size: int,
         buffer_size_gb: float = 40,
         num_cuda_graphs: int = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
     ):
         """
         Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
@@ -749,6 +741,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             materialize_only_last_token_logits=False,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
     @classmethod

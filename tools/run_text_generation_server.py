@@ -16,7 +16,7 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server import run_text_generation_server
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_mamba_inference_metadata_from_model
+from megatron.core.utils import get_mamba_inference_state_config_from_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args, get_tokenizer
 from megatron.training.initialize import initialize_megatron
@@ -45,17 +45,13 @@ if __name__ == "__main__":
         else:
             tokenizer = build_tokenizer(args)
 
-        (layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape) = (
-            get_mamba_inference_metadata_from_model(model)
-        )
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
         context = get_inference_context(
             None,
             None,
             calculate_max_sequence_length_from_requests=False,
-            layer_type_list=layer_type_list,
-            mamba_conv_states_shape=mamba_conv_states_shape,
-            mamba_ssm_states_shape=mamba_ssm_states_shape,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         controller = get_inference_controller(model, context)
